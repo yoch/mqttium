@@ -12,6 +12,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   and report `passed` only when the whole requested profile has completed;
   an interrupted run is `incomplete` rather than a false success.
 
+- Close the SQLite store when rolling back a failed or rollback-only `batch()`
+  also fails, keeping the original error with a note, so a later operation
+  cannot commit the failed batch through the still-open transaction.
+
 - Accept one-shot topic iterables such as generators in `subscribe()` and
   `unsubscribe()` when admission has to wait for earlier protocol effects;
   the request was re-read after the wait and rejected as empty.

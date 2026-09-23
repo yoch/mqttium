@@ -494,13 +494,13 @@ class SqliteInflightStore:
             self._batch_depth += 1
             try:
                 yield
-            except BaseException:
+            except BaseException as failure:
                 self._batch_depth -= 1
                 self._rollback_only = True
                 if outermost:
                     try:
                         if self._transaction_started:
-                            self._conn.rollback()
+                            self._rollback_or_close(failure)
                     finally:
                         self._transaction_started = False
                         self._rollback_only = False
@@ -510,17 +510,18 @@ class SqliteInflightStore:
                 if not outermost:
                     return
                 rollback_only = self._rollback_only
+                refusal = RuntimeError("Cannot commit SQLite batch after nested batch failure")
                 try:
                     if self._transaction_started:
                         if rollback_only:
-                            self._conn.rollback()
+                            self._rollback_or_close(refusal)
                         else:
                             self._commit()
                 finally:
                     self._transaction_started = False
                     self._rollback_only = False
                 if rollback_only:
-                    raise RuntimeError("Cannot commit SQLite batch after nested batch failure")
+                    raise refusal
 
     def _ensure_write_transaction(self) -> None:
         """Open the batch transaction on its first actual mutation."""
@@ -532,16 +533,20 @@ class SqliteInflightStore:
         try:
             self._conn.commit()
         except BaseException as failure:
-            try:
-                self._conn.rollback()
-            except BaseException as rollback_failure:
-                # A live failed transaction must never be reused or committed
-                # by a later operation. Preserve the original commit failure.
-                failure.add_note(f"Rollback also failed; closing store: {rollback_failure!r}")
-                with suppress(BaseException):
-                    self._conn.close()
-                self._closed = True
+            self._rollback_or_close(failure)
             raise
+
+    def _rollback_or_close(self, failure: BaseException) -> None:
+        """Roll back after ``failure``, or close the store if that also fails."""
+        try:
+            self._conn.rollback()
+        except BaseException as rollback_failure:
+            # A live failed transaction must never be reused or committed by a
+            # later operation. The caller re-raises its original failure.
+            failure.add_note(f"Rollback also failed; closing store: {rollback_failure!r}")
+            with suppress(BaseException):
+                self._conn.close()
+            self._closed = True
 
     def _commit_if_needed(self) -> None:
         if self._batch_depth == 0:
