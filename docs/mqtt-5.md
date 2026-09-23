@@ -41,6 +41,16 @@ Properties deeply own their input. Repeated values become tuples and binary
 values become owned bytes. Reusing a `Properties` instance is safe; create a
 new instance when different values are needed.
 
+Incoming property tables have a local resource limit of 1024 values for
+repeatable property identifiers, counting User Property and Subscription
+Identifier together. This is an MQTTium decoding limit, not an MQTT 5 protocol
+limit. It applies in the shared decoder, including CONNACK before connection
+establishment and later PUBLISH/control packets. Values within the budget
+retain their order. An excess value raises `ProtocolError` before it is
+decoded, and the partial repeated-property collection is discarded. The
+configured `maximum_packet_size` byte limit still applies independently;
+this count limit does not enlarge it. Outgoing property encoding is unchanged.
+
 ## Session expiry
 
 `clean_start=False` asks the broker to resume a session. A positive session
