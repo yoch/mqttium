@@ -285,7 +285,7 @@ class PushStreamTransport(StreamTransportBase):
         base = super().stats()
         sink = self._protocol.sink
         # The base class assumes bytes wait in a StreamReader; here they wait in
-        # the decoder, and reporting 0 would hide real inbound backlog.
+        # the decoder, whose occupancy is directly measurable.
         buffered = 0 if sink is None else sink.buffered
         return replace(base, buffered_read_bytes=buffered)
 

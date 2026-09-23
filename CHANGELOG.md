@@ -8,6 +8,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Report unknown transport receive backlog as `None` instead of a misleading
+  zero for pull streams, WebSocket and unsupported transports. Push transport
+  measurements and disconnected zero remain available. The Provisional
+  `transport.buffered_read_bytes` field is now `int | None` (see migration guidance).
+
 - Type `PublishBatchError.receipt` as `PublishBatchReceipt | None` so typed
   consumers can inspect and await the committed prefix without a cast.
 

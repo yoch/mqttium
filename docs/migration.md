@@ -71,7 +71,7 @@ scheduling detail:
 | `outbound.queued_messages`, `flow_inflight`, `flow_limit` | `outbound.awaiting_slot`, `inflight`, `inflight_limit` |
 | `inbound.receive_maximum`, `pending_bytes`, `pending_high_water_bytes`, `pending_byte_limit` | `inbound.inflight_limit`, `inflight_bytes`, `inflight_high_water_bytes`, `inflight_byte_limit` |
 | `delivery.pending_bytes`, `pending_high_water_bytes`, `max_bytes` | `delivery.iterator_bytes`, `iterator_high_water_bytes`, `iterator_byte_limit` |
-| `transport.fragmented_read_bytes`, `pending_control_frames`, `pending_control_bytes` | removed; `buffered_read_bytes` includes a fragment under reassembly |
+| `transport.fragmented_read_bytes`, `pending_control_frames`, `pending_control_bytes` | removed; `buffered_read_bytes` is `None` when total transport backlog is unavailable |
 
 ## Delivery handles and disconnect diagnostics
 
@@ -225,6 +225,14 @@ The decoder owns packet-boundary bytes; no reusable-buffer view escapes into
 protocol state or the application. Ingress remains bounded and connection-scoped.
 The current native API removes the direct QoS 0 adapter path and uses the
 common engine/effect pipeline for every message.
+
+### Transport receive backlog availability
+
+The Provisional `transport.buffered_read_bytes` field is now `int | None`.
+Handle `None` as unavailable in displays and calculations, rather than coercing
+it to zero. Pull streams and WebSocket do not expose complete occupancy through
+public asyncio APIs; push transports retain their measured byte count and
+disconnected clients report zero. No replacement statistics field is added.
 
 ### Finite timeout values
 

@@ -195,18 +195,13 @@ class WebSocketTransport:
         transport = self._writer.transport
         return 0 if transport is None else transport.get_write_buffer_size()
 
-    @property
-    def buffered_read_bytes(self) -> int:
-        # A fragmented message under reassembly is received but not yet readable.
-        fragment = 0 if self._fragment is None else len(self._fragment)
-        return len(self._recv_buf) + fragment
-
     def stats(self) -> TransportStats:
         return TransportStats(
             kind=type(self).__name__,
             closing=self.is_closing(),
             pending_write_bytes=self.pending_write_bytes,
-            buffered_read_bytes=self.buffered_read_bytes,
+            # Frame buffers alone omit the unknown StreamReader backlog.
+            buffered_read_bytes=None,
         )
 
     async def _flush_control(self) -> None:

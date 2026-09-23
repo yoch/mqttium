@@ -162,6 +162,8 @@ def test_transport_without_a_stats_method_reports_unavailable() -> None:
     assert snapshot.transport.kind == "_RecordingTransport"
     assert snapshot.transport.closing is False
     assert snapshot.transport.pending_write_bytes == 0
+    # Unknown, not an empty receive queue.
+    assert snapshot.transport.buffered_read_bytes is None
 
 
 async def test_writer_decision_counters_describe_the_batches_it_wrote() -> None:

@@ -13,12 +13,16 @@ from dataclasses import dataclass
 
 @dataclass(slots=True, frozen=True)
 class TransportStats:
-    """Bytes the transport holds in either direction, and its closing state."""
+    """Transport occupancy; receive bytes are None when not measurable.
+
+    Zero denotes a measured empty buffer or no transport, not an unknown
+    StreamReader backlog. OS socket buffers are outside this snapshot.
+    """
 
     kind: str | None
     closing: bool
     pending_write_bytes: int
-    buffered_read_bytes: int
+    buffered_read_bytes: int | None
 
     @classmethod
     def unavailable(cls, transport: object | None) -> TransportStats:
@@ -27,7 +31,7 @@ class TransportStats:
             kind=None if transport is None else type(transport).__name__,
             closing=bool(getattr(transport, "is_closing", bool)()) if transport else False,
             pending_write_bytes=0,
-            buffered_read_bytes=0,
+            buffered_read_bytes=0 if transport is None else None,
         )
 
 

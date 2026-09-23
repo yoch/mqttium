@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -64,3 +65,6 @@ def test_runtime_stats_example(protocol: str) -> None:
     assert '"effective_client_id"' in result.stdout
     assert '"negotiated"' in result.stdout
     assert '"stats"' in result.stdout
+    backlog = json.loads(result.stdout)["stats"]["transport"]["buffered_read_bytes"]
+    # Measured on a push transport; null (not 0) where the transport cannot measure.
+    assert backlog is None or isinstance(backlog, int)

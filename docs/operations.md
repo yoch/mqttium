@@ -127,6 +127,12 @@ in the same vocabulary as the constructor bound it is measured against:
 | `receipts` | `publish`, `publish_batches`, `subscribe`, `unsubscribe`, `publish_waiters` | — |
 | `transport` | `kind`, `closing`, `pending_write_bytes`, `buffered_read_bytes` | — |
 
+`transport.buffered_read_bytes` is `None` when the transport cannot measure its
+complete receive backlog through its supported APIs (pull streams, including TLS
+and Unix, WebSocket, and transports without statistics). Push transports report
+measured decoder occupancy; a disconnected client reports zero. Do not interpret
+`None` as an empty queue. OS socket buffers are outside this metric.
+
 `waiters` fields count producers currently parked on that bound; a non-zero
 value with occupancy at the limit is sustained pressure, a high-water mark at
 the limit with zero waiters is a burst that has drained. How the runtime
