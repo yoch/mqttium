@@ -101,7 +101,8 @@ def test_failed_gate_retains_log_and_raises_a_release_failure(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     local_release = _local_release(monkeypatch)
-    recorder = local_release.Recorder(tmp_path, "performance")
+    output = tmp_path / "run"
+    recorder = local_release.Recorder(output, "performance")
 
     with pytest.raises(local_release.ReleaseGateFailed) as exc_info:
         recorder.run(
@@ -112,6 +113,6 @@ def test_failed_gate_retains_log_and_raises_a_release_failure(
     failure = exc_info.value
     assert failure.name == "example-gate"
     assert failure.returncode == 2
-    assert failure.log == tmp_path / "00-example-gate.log"
-    assert failure.manifest == tmp_path / "manifest.json"
+    assert failure.log == output / "00-example-gate.log"
+    assert failure.manifest == output / "manifest.json"
     assert failure.log.read_text(encoding="utf-8") == "gate reason\n"

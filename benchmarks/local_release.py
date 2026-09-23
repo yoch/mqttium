@@ -1,4 +1,11 @@
-"""Run reproducible release gates locally without consuming GitHub runners."""
+"""Run reproducible release gates locally without consuming GitHub runners.
+
+Runs retain a fresh private output directory and print its path. An explicit
+--output-dir must not exist, and its parent must already exist. POSIX ancestors
+must be controlled by the caller or root, without unprotected group/other write
+access. Run the gate as the normal developer account; Windows ACLs remain the
+deployment's responsibility. Existing evidence is never reused or overwritten.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +16,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -17,6 +25,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,14 +59,56 @@ class ReleaseGateFailed(Exception):
         self.manifest = manifest
 
 
+def _private_output_directory(output: Path | None) -> Path:
+    parent = Path(tempfile.gettempdir()) if output is None else output.parent
+    parent = parent.resolve(strict=True)
+    if os.name == "posix":
+        for ancestor in (parent, *parent.parents):
+            info = ancestor.stat()
+            if info.st_uid not in (os.geteuid(), 0) or (
+                info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX
+            ):
+                raise PermissionError(f"Untrusted release output ancestor: {ancestor}")
+    if output is None:
+        return Path(tempfile.mkdtemp(prefix="mqttium-release-", dir=parent))
+    output = parent / output.name
+    # Exclusive mkdir rejects all pre-existing entries, including dangling
+    # symlinks. Never resolve the final component before this check.
+    output.mkdir(mode=0o700)
+    return output
+
+
+def _open_private_file(path: Path) -> BinaryIO:
+    # O_EXCL | O_CREAT refuses existing files and symlinks on every platform.
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    return os.fdopen(descriptor, "wb")
+
+
+def _write_private_text(path: Path, text: str) -> None:
+    with _open_private_file(path) as output:
+        output.write(text.encode("utf-8"))
+
+
+def _replace_manifest(path: Path, text: str) -> None:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise FileExistsError(f"Refusing non-regular release manifest: {path}")
+    descriptor, temporary = tempfile.mkstemp(prefix=".manifest-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            output.write(text)
+        # Replace the directory entry; never open an old manifest's target.
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 class Recorder:
-    def __init__(self, output: Path, profile: str) -> None:
-        self.output = output
+    def __init__(self, output: Path | None, profile: str) -> None:
+        self.output = _private_output_directory(output)
         self.profile = profile
         self.started_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.started = time.perf_counter()
         self.results: list[CommandResult] = []
-        self.output.mkdir(parents=True, exist_ok=True)
         self.source_sha256 = _source_fingerprint()
         self.worktree_status = subprocess.check_output(
             ["git", "status", "--porcelain"], cwd=ROOT, text=True
@@ -103,9 +154,7 @@ class Recorder:
                 else "failed"
             ),
         }
-        (self.output / "manifest.json").write_text(
-            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
-        )
+        _replace_manifest(self.output / "manifest.json", json.dumps(payload, indent=2) + "\n")
 
     def run(
         self,
@@ -119,19 +168,20 @@ class Recorder:
         print(f"[{name}] {' '.join(command)}", flush=True)
         started_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         started = time.perf_counter()
-        completed = subprocess.run(
-            command,
-            cwd=cwd,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            check=False,
-        )
-        elapsed = time.perf_counter() - started
         log_name = f"{len(self.results):02d}-{_slug(name)}.log"
-        (self.output / log_name).write_text(completed.stdout, encoding="utf-8")
+        with _open_private_file(self.output / log_name) as log:
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+            )
+            log.write(completed.stdout.encode("utf-8"))
+        elapsed = time.perf_counter() - started
         self.results.append(
             CommandResult(
                 name=name,
@@ -215,7 +265,8 @@ def managed_mosquitto(output: Path, port: int) -> Iterator[None]:
         raise RuntimeError("mosquitto is required for local release validation")
     config = output / "mosquitto.conf"
     log_path = output / "mosquitto.log"
-    config.write_text(
+    _write_private_text(
+        config,
         "\n".join(
             (
                 "persistence false",
@@ -229,9 +280,8 @@ def managed_mosquitto(output: Path, port: int) -> Iterator[None]:
                 "",
             )
         ),
-        encoding="utf-8",
     )
-    with log_path.open("wb") as log:
+    with _open_private_file(log_path) as log:
         process = subprocess.Popen([executable, "-c", str(config)], stdout=log, stderr=log)
         try:
             _wait_port(port, process)
@@ -254,7 +304,7 @@ def managed_artifact_mosquitto(
     if executable is None or openssl is None:
         raise RuntimeError("mosquitto and openssl are required for artifact validation")
     root = output / "artifact-broker"
-    root.mkdir(parents=True, exist_ok=True)
+    root.mkdir(mode=0o700)
     ca = root / "ca.crt"
     commands = (
         [
@@ -290,9 +340,9 @@ def managed_artifact_mosquitto(
     for command in commands:
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     extension = root / "server.ext"
-    extension.write_text(
+    _write_private_text(
+        extension,
         "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n",
-        encoding="utf-8",
     )
     subprocess.run(
         [
@@ -329,7 +379,8 @@ def managed_artifact_mosquitto(
     if unix_socket.exists():
         unix_socket.unlink()
     config = root / "mosquitto.conf"
-    config.write_text(
+    _write_private_text(
+        config,
         "\n".join(
             (
                 "persistence false",
@@ -352,9 +403,8 @@ def managed_artifact_mosquitto(
                 "",
             )
         ),
-        encoding="utf-8",
     )
-    with (root / "mosquitto.log").open("wb") as log:
+    with _open_private_file(root / "mosquitto.log") as log:
         process = subprocess.Popen([executable, "-c", str(config)], stdout=log, stderr=log)
         try:
             _wait_port(port, process)
@@ -753,7 +803,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=11883)
     parser.add_argument("--network-repeat", type=int, default=8)
     parser.add_argument("--cpu", type=int)
-    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="new output directory (must not exist); default: retained private temporary directory",
+    )
     args = parser.parse_args()
     if args.network_repeat <= 0 or args.network_repeat % 2:
         parser.error("--network-repeat must be a positive even number")
@@ -764,9 +818,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    revision = _capture(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT)
-    output = args.output_dir or Path("/tmp") / "mqttium-release" / revision / args.profile
-    recorder = Recorder(output.resolve(), args.profile)
+    try:
+        recorder = Recorder(args.output_dir, args.profile)
+    except (FileExistsError, FileNotFoundError, PermissionError) as exc:
+        # An unusable output path is an expected refusal, not a crash.
+        print(f"local release output refused: {exc}", file=sys.stderr)
+        return 2
+    print(f"release output: {recorder.output}", flush=True)
     try:
         with managed_mosquitto(recorder.output, args.port):
             if args.profile in ("quick", "rc"):
