@@ -1,7 +1,7 @@
 # MQTT inbound session ownership model
 
 This directory contains the bounded TLA+ state-machine specification used to
-review inbound QoS/session ownership around issues #505 and #506.
+review inbound QoS/session ownership around issues #498 and #499.
 
 The model deliberately separates:
 
