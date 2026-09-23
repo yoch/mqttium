@@ -37,8 +37,10 @@ class CommandResult:
     command: list[str]
     started_utc: str
     elapsed_s: float
-    returncode: int
+    # None when the command timed out or could not be started.
+    returncode: int | None
     log: str
+    error: str | None = None
 
 
 class ReleaseGateFailed(Exception):
@@ -48,11 +50,16 @@ class ReleaseGateFailed(Exception):
         self,
         *,
         name: str,
-        returncode: int,
+        returncode: int | None,
         log: Path,
         manifest: Path,
+        error: str | None = None,
     ) -> None:
-        super().__init__(f"{name} exited with status {returncode}")
+        super().__init__(
+            f"{name} exited with status {returncode}"
+            if error is None
+            else f"{name} did not complete: {error}"
+        )
         self.name = name
         self.returncode = returncode
         self.log = log
@@ -109,6 +116,8 @@ class Recorder:
         self.started_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         self.started = time.perf_counter()
         self.results: list[CommandResult] = []
+        # Set only after every phase of the requested profile has run.
+        self.profile_completed = False
         self.source_sha256 = _source_fingerprint()
         self.worktree_status = subprocess.check_output(
             ["git", "status", "--porcelain"], cwd=ROOT, text=True
@@ -148,13 +157,14 @@ class Recorder:
             "platform": sys.platform,
             "package_versions": self.package_versions,
             "commands": [asdict(result) for result in self.results],
-            "status": (
-                "passed"
-                if self.results and all(result.returncode == 0 for result in self.results)
-                else "failed"
-            ),
+            "status": self._status(),
         }
         _replace_manifest(self.output / "manifest.json", json.dumps(payload, indent=2) + "\n")
+
+    def _status(self) -> str:
+        if any(result.returncode != 0 for result in self.results):
+            return "failed"
+        return "passed" if self.profile_completed and self.results else "incomplete"
 
     def run(
         self,
@@ -169,36 +179,50 @@ class Recorder:
         started_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         started = time.perf_counter()
         log_name = f"{len(self.results):02d}-{_slug(name)}.log"
+        returncode: int | None = None
+        error: str | None = None
         with _open_private_file(self.output / log_name) as log:
-            completed = subprocess.run(
-                command,
-                cwd=cwd,
-                env=env,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=timeout,
-                check=False,
-            )
-            log.write(completed.stdout.encode("utf-8"))
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                error = f"timed out after {exc.timeout}s"
+                output = exc.stdout or ""
+                log.write(output.encode("utf-8") if isinstance(output, str) else output)
+            except OSError as exc:
+                error = f"could not start: {exc}"
+            else:
+                returncode = completed.returncode
+                log.write(completed.stdout.encode("utf-8"))
         elapsed = time.perf_counter() - started
+        # Record every attempted gate, so a manifest cannot pass without it.
         self.results.append(
             CommandResult(
                 name=name,
                 command=command,
                 started_utc=started_utc,
                 elapsed_s=elapsed,
-                returncode=completed.returncode,
+                returncode=returncode,
                 log=log_name,
+                error=error,
             )
         )
         self.write_manifest()
-        if completed.returncode:
+        if returncode != 0:
             raise ReleaseGateFailed(
                 name=name,
-                returncode=completed.returncode,
+                returncode=returncode,
                 log=self.output / log_name,
                 manifest=self.output / "manifest.json",
+                error=error,
             )
 
 
@@ -842,6 +866,7 @@ def main() -> int:
                 run_robustness(recorder, port=args.port)
             if args.profile == "rc":
                 run_package(recorder)
+        recorder.profile_completed = True
     except ReleaseGateFailed as exc:
         print(f"local release gate failed: {exc}", file=sys.stderr)
         print(f"log: {exc.log}", file=sys.stderr)

@@ -49,6 +49,12 @@ preserves the previous manifest. Readers never see a partial manifest, but the
 runner does not flush it for durability across a power loss. These safeguards
 protect output paths, not against malicious code executing as the same account.
 
+The manifest `status` is `passed` only when every phase of the requested
+profile has run and every recorded command exited with status 0. A command that
+times out or cannot be started is recorded without an exit status and makes the
+run `failed`, like a non-zero exit. Any other interruption leaves `incomplete`.
+Only `passed` is qualification evidence.
+
 The runner manages Mosquitto with guaranteed cleanup and fails if a local
 quality, performance, memory, artifact, or smoke gate is missing. An expected
 non-zero gate result exits without a Python traceback and prints the retained

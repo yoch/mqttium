@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Record local release gate commands that time out or cannot start as failures,
+  and report `passed` only when the whole requested profile has completed;
+  an interrupted run is `incomplete` rather than a false success.
+
 - Close the SQLite store when rolling back a failed or rollback-only `batch()`
   also fails, keeping the original error with a note, so a later operation
   cannot commit the failed batch through the still-open transaction.
