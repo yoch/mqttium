@@ -1375,6 +1375,9 @@ class AsyncClient:
         """
         if timeout is not None:
             _positive("timeout", timeout)
+        # Admission may validate more than once; consume a one-shot iterable once.
+        if not isinstance(topics, str):
+            topics = tuple(topics)
         loop = asyncio.get_running_loop()
         while True:
             async with self._engine_lock:
@@ -1415,6 +1418,9 @@ class AsyncClient:
         """
         if timeout is not None:
             _positive("timeout", timeout)
+        # Admission may validate more than once; consume a one-shot iterable once.
+        if not isinstance(topics, str):
+            topics = tuple(topics)
         loop = asyncio.get_running_loop()
         while True:
             async with self._engine_lock:

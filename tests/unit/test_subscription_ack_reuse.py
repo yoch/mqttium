@@ -278,3 +278,45 @@ async def test_cancellation_before_admission_admits_nothing(protocol, unsubscrib
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await client.disconnect()
+
+
+@_matrix
+@pytest.mark.parametrize("pressure", [False, True])
+async def test_one_shot_topic_iterable_is_consumed_once(protocol, unsubscribe, pressure):
+    transport, client = await _connected(protocol)
+    request = client.unsubscribe if unsubscribe else client.subscribe
+    consumed = []
+
+    def topics():
+        # A generator is a valid Iterable request and can only be read once.
+        for topic in ("one/a", "one/b"):
+            consumed.append(topic)
+            yield topic
+
+    task = None
+    try:
+        if pressure:
+            # Admission must wait on an unrelated deferred effect and retry.
+            await _saturate_writer(transport, client)
+            transport.push_rx(_incoming(protocol, 7))
+            await wait_until(lambda: client._write_pump.waiters == 1)
+        task = asyncio.create_task(request(topics()))
+        if pressure:
+            await wait_until(lambda: client._effect_pump.waiters >= 1)
+            assert not transport.requests
+            transport.gate.set()
+        await wait_until(lambda: len(transport.requests) == 1)
+        mid = transport.requests[0]
+        codes = b"\x00\x00" if protocol is MQTTProtocolVersion.MQTTv5 or not unsubscribe else b""
+        properties = transport.properties
+        kind = PacketType.UNSUBACK if unsubscribe else PacketType.SUBACK
+        transport.push_rx(encode_frame(kind, 0, mid.to_bytes(2, "big") + properties + codes))
+        result = await asyncio.wait_for(task, 1)
+        assert result.mid == mid
+        assert consumed == ["one/a", "one/b"]
+    finally:
+        transport.gate.set()
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await client.disconnect()
