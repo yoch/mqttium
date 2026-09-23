@@ -66,7 +66,13 @@ class SessionDiscardedError(MQTTError):
 
 
 class PublishBatchError(MQTTError):
-    """One or more publications in a batch failed."""
+    """One or more publications in a batch failed.
+
+    Attributes:
+        receipt (PublishBatchReceipt | None): Receipt for the committed prefix
+            when submission stopped early, or ``None``. Await
+            ``receipt.wait()`` to settle that prefix.
+    """
 
     def __init__(
         self,
