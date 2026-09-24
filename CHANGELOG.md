@@ -19,6 +19,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   throttling register in benchmark runner preflights, and reject samples taken
   while the firmware reports a current limit (#493).
 
+### Fixed
+
+- End a resumed session with the new `SessionReplayError` when its CONNACK
+  forbids resending an unacknowledged QoS 1/2 publication (lower Maximum QoS,
+  `Retain Available` of 0 or a smaller Maximum Packet Size). The client
+  previously deleted the exchange, failed its receipt and could reuse its
+  packet identifier on the same broker session. The exchange and its packet
+  identifier are now kept, and the reconnect policy does not retry; connect
+  with `clean_start=True` to discard the session (#539).
+
 ## [1.0.0rc15] - 2026-09-23
 
 ### Fixed

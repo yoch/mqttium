@@ -44,6 +44,10 @@ All MQTTium-specific public errors derive from `MQTTError`.
     options:
       heading_level: 3
 
+::: mqttium.SessionReplayError
+    options:
+      heading_level: 3
+
 ::: mqttium.PublishBatchError
     options:
       heading_level: 3

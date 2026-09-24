@@ -33,6 +33,7 @@ from mqttium.errors import (
     PacketTooLargeError,
     ProtocolError,
     SessionDiscardedError,
+    SessionReplayError,
 )
 from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
 from mqttium.protocol.flow_control import FlowControl
@@ -1025,17 +1026,53 @@ class OutboundSession:
         ):
             self.flow.try_acquire()
 
-    def _replay_message(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
+    def check_session_replayable(self) -> None:
+        """Refuse to resume a session whose mandatory replay is now forbidden.
+
+        Every WAIT_* exchange must be resent with its original packet id on a
+        resumed session [MQTT-4.4.0-1]. If the new negotiation forbids that
+        packet, discarding the exchange would free a packet id the broker
+        session may still hold (#539). Raised before any state changes; only
+        never-sent QUEUED work may fail individually.
+        """
+        negotiated = self._engine.negotiated
+        if (
+            negotiated.maximum_qos >= QoS.EXACTLY_ONCE
+            and negotiated.retain_available
+            and negotiated.maximum_packet_size is None
+        ):
+            # Only these limits can forbid a resent PUBLISH or PUBREL (replay
+            # strips topic aliases), so no stored exchange needs a pass.
+            return
+        for page in self.store_summary_pages():
+            for msg in page:
+                if msg.state is not OutboundQoSState.QUEUED:
+                    self._validate_replay(msg)
+
+    def _validate_replay(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
         try:
             self.validate_against_negotiated(msg)
         except (ProtocolError, PacketTooLargeError) as exc:
-            self.discard_record(msg.mid, msg)
-            self.packet_ids.release(msg.mid)
-            self._fail(msg.mid, exc)
-            return
+            raise SessionReplayError(
+                f"Resumed session must resend mid {msg.mid} ({msg.state.name}), "
+                f"which the new CONNACK forbids: {exc}"
+            ) from exc
+
+    def _replay_message(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
         if msg.state is OutboundQoSState.QUEUED:
+            # Never sent: not part of the broker session, so it may fail alone.
+            try:
+                self.validate_against_negotiated(msg)
+            except (ProtocolError, PacketTooLargeError) as exc:
+                self.discard_record(msg.mid, msg)
+                self.packet_ids.release(msg.mid)
+                self._fail(msg.mid, exc)
+                return
             self._queued.append(msg)
             return
+        # A live exchange is never discarded for its negotiation:
+        # check_session_replayable() has already refused a session that
+        # cannot resend it, before the engine became CONNECTED.
         if msg.state is OutboundQoSState.WAIT_PUBCOMP:
             # Receive Maximum constrains QoS>0 PUBLISH packets only. A resumed
             # QoS 2 exchange retransmits PUBREL without consuming the new
