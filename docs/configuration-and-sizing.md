@@ -17,7 +17,7 @@ the process memory budget.
 | `keepalive` | `60` | Requested keepalive interval in seconds |
 | `username`, `password` | `None` | CONNECT credentials |
 | `connect_properties` | `None` | MQTT 5 CONNECT properties |
-| `will`, `will_properties` | `None` | Last Will message and MQTT 5 properties |
+| `will` | `None` | Last Will as a `PublishMessage`; its `properties` are the MQTT 5 Will Properties |
 | `store` | `None` | Optional supplied memory or SQLite store |
 
 A supplied `store` only resumes the session it holds when `clean_start=False`.
@@ -29,7 +29,7 @@ pair deliberately: `store` + `clean_start=False` for restart recovery,
 
 ### MQTT 5 options on an MQTT 3.1.1 client
 
-`connect_properties`, `will_properties`, `topic_alias_maximum` and
+`connect_properties`, `will` properties, `topic_alias_maximum` and
 `auth_handler` describe MQTT 5 features. Passing any of them with the default
 MQTT 3.1.1 protocol raises `ProtocolError` from the constructor: there is no
 wire representation to degrade to, so the client refuses rather than ignores.

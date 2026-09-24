@@ -126,7 +126,6 @@ def test_async_client_constructor_keywords_and_defaults() -> None:
         "password": None,
         "connect_properties": None,
         "will": None,
-        "will_properties": None,
         "maximum_packet_size": None,
         "topic_alias_maximum": 0,
         "max_inbound_inflight": 100,
@@ -255,7 +254,7 @@ def test_constructor_refuses_configuration_without_effect() -> None:
     AsyncClient("c", manual_ack=True)
     for option in (
         {"connect_properties": Properties({"session_expiry_interval": 10})},
-        {"will_properties": Properties({"message_expiry_interval": 10}), "will": Message("w", b"")},
+        {"will": PublishMessage("w", b"", properties=Properties({"message_expiry_interval": 10}))},
         {"topic_alias_maximum": 5},
         {"auth_handler": lambda packet: None},
     ):
@@ -401,3 +400,19 @@ def test_store_classes_keep_only_their_lifecycle_supported(tmp_path: Path) -> No
     # The protocol methods exist but are Internal; the contract says so.
     doc = (Path(__file__).resolve().parents[2] / "docs" / "api-stability.md").read_text()
     assert "Their protocol methods" in doc and "are Internal" in doc
+
+
+def test_will_is_a_publish_message() -> None:
+    will = PublishMessage("w/t", "bye", qos=1, properties=Properties({"will_delay_interval": 5}))
+    client = AsyncClient("c", protocol=MQTTProtocolVersion.MQTTv5, will=will)
+    config = client._engine.config
+    assert config.will is not None and config.will.payload == b"bye"
+    assert config.will_properties is will.properties
+    with pytest.raises(TypeError, match="PublishMessage"):
+        AsyncClient("c", will=Message("w/t", b"bye"))  # type: ignore[arg-type]
+
+
+def test_will_properties_a_will_cannot_carry_are_refused_at_construction() -> None:
+    will = PublishMessage("w/t", b"", properties=Properties({"topic_alias": 3}))
+    with pytest.raises(ProtocolError, match="not allowed on WILL"):
+        AsyncClient("c", protocol=MQTTProtocolVersion.MQTTv5, will=will)

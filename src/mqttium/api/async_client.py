@@ -204,6 +204,25 @@ def _validate_client_arguments(
         raise ValueError("password must be bytes, str, or None")
 
 
+def _will_config(will: PublishMessage | None) -> tuple[Message | None, Properties | None]:
+    """Split a Will into the engine's message and Will Properties.
+
+    A ``Message`` is the inbound delivery type; its ``dup`` and ``mid`` have no
+    meaning for a Will, so only a ``PublishMessage`` is accepted.
+    """
+    if will is None:
+        return None, None
+    if not isinstance(will, PublishMessage):
+        raise TypeError("will must be a PublishMessage")
+    message = Message(
+        topic=will.topic,
+        payload=_owned_payload(will.payload),
+        qos=QoS(will.qos),
+        retain=will.retain,
+    )
+    return message, will.properties
+
+
 class AsyncClient:
     """Asyncio-native MQTT 3.1.1 and MQTT 5 client.
 
@@ -224,8 +243,8 @@ class AsyncClient:
         username: Optional CONNECT username.
         password: Optional CONNECT password. Strings are encoded as UTF-8.
         connect_properties: MQTT 5 CONNECT properties.
-        will: Last Will message.
-        will_properties: MQTT 5 Will properties.
+        will: Last Will message. Its ``properties`` are the MQTT 5 Will
+            Properties, such as ``will_delay_interval``.
         maximum_packet_size: Largest inbound packet accepted by the decoder;
             advertised to an MQTT 5 broker. Larger packets end the connection.
         topic_alias_maximum: Inbound topic aliases accepted from an MQTT 5
@@ -292,8 +311,7 @@ class AsyncClient:
         username: str | None = None,
         password: bytes | str | None = None,
         connect_properties: Properties | None = None,
-        will: Message | None = None,
-        will_properties: Properties | None = None,
+        will: PublishMessage | None = None,
         maximum_packet_size: int | None = None,
         topic_alias_maximum: int = 0,
         max_inbound_inflight: int = 100,
@@ -360,6 +378,7 @@ class AsyncClient:
         )
         initial_decoder_max_packet_size = effective_max_packet_size
         pwd = password.encode("utf-8") if isinstance(password, str) else password
+        will_message, will_properties = _will_config(will)
         self._engine = ProtocolEngine(
             EngineConfig(
                 client_id=client_id,
@@ -374,7 +393,7 @@ class AsyncClient:
                 max_unacknowledged_messages=max_unacknowledged_messages,
                 max_unacknowledged_bytes=max_unacknowledged_bytes,
                 connect_properties=connect_properties,
-                will=will,
+                will=will_message,
                 will_properties=will_properties,
                 maximum_packet_size=effective_max_packet_size,
                 topic_alias_maximum=topic_alias_maximum,
