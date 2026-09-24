@@ -55,6 +55,11 @@ removes contracts that had no effect, no use, or duplicated another.
 | `PublishBatchError.receipt` could be `None` | Always the batch receipt; no narrowing needed |
 | `PublishBatchReceipt.completed` | `receipt.submitted - receipt.pending_count` |
 
+| Mutable `PublishReceipt.mid` / `.qos`; value equality; constructor fields `_waiters`, `_error`, `_settled` | Read-only `mid` and `qos`; identity equality; `PublishReceipt(mid, qos)` |
+| Mutable `SubscribeResult` / `UnsubscribeResult` | Frozen; construct a new value instead of assigning fields |
+| Nested statistics types imported from `mqttium.api.stats` or other modules | Import them from `mqttium.api` |
+| `__all__` lists of Internal packages (`mqttium.packets`, `codec`, `transport`, `dispatch`, `protocol`, `api.models`, `api.stats`) | None; these packages are Internal |
+
 `MQTTTimeoutError` now also derives from `TimeoutError`; existing
 `except MQTTTimeoutError` handlers are unchanged.
 

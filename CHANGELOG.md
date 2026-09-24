@@ -11,6 +11,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - `MQTTTimeoutError` also derives from `TimeoutError`, so `except TimeoutError`
   catches client deadlines.
 - `PublishBatchError.receipt` is always the batch receipt, never `None`.
+- `PublishReceipt.mid` and `qos` are read-only and receipts compare by
+  identity; `SubscribeResult` and `UnsubscribeResult` are frozen.
+- Export the nested statistics snapshots (`OutboundStats`, `InboundStats`,
+  `WriterStats`, `DecoderStats`, `DeliveryStats`, `ReceiptStats`,
+  `TransportStats`) from `mqttium.api`, and define `MessageDelivery` there.
+- Annotate `store=` with the two supported store classes instead of the
+  Internal store protocol. Internal packages no longer declare `__all__`, and
+  the callback type aliases of `AsyncClient` are private.
 
 ### Removed
 

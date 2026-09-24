@@ -91,15 +91,3 @@ class ClientStats:
     delivery: DeliveryStats
     receipts: ReceiptStats
     transport: TransportStats
-
-
-__all__ = [
-    "ClientStats",
-    "DecoderStats",
-    "DeliveryStats",
-    "InboundStats",
-    "OutboundStats",
-    "ReceiptStats",
-    "TransportStats",
-    "WriterStats",
-]
