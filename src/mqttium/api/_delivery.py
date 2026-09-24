@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Literal, cast
 
+from mqttium.api._cancel import owner_cancelled
 from mqttium.api.stats import DeliveryStats
 from mqttium.enums import MQTTProtocolVersion
 from mqttium.errors import MessageDeliveryError, MQTTError
@@ -359,8 +360,7 @@ class ApplicationDelivery:
     def _propagate_callback_cancellation(
         self, callback: Callable[..., Any] | None, exc: asyncio.CancelledError
     ) -> None:
-        task = asyncio.current_task()
-        if task is None or task.cancelling():
+        if owner_cancelled():
             raise exc
         self.report_callback_error(callback, exc)
 

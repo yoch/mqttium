@@ -11,6 +11,7 @@ import asyncio
 from collections import deque
 from typing import TYPE_CHECKING, Protocol
 
+from mqttium.api._cancel import dependency_failure, owner_cancelled
 from mqttium.protocol.effects import EffectKind, EngineEffect
 
 if TYPE_CHECKING:
@@ -221,7 +222,7 @@ class EffectPump:
         self.task = task
         task.add_done_callback(self._done)
 
-    async def _run_scheduled(self) -> None:  # noqa: C901
+    async def _run_scheduled(self) -> None:
         async with self.lock:
             while True:
                 self.flush_requested = False
@@ -231,51 +232,55 @@ class EffectPump:
                     if epoch != self.owner._connection_epoch:
                         self.discard_connection_effects()
                         continue
+                    failure: BaseException | None = None
                     try:
                         await self.owner._apply_effect(effect, nowait=False, epoch=epoch)
-                    except asyncio.CancelledError:
-                        raise
+                    except asyncio.CancelledError as exc:
+                        # Only a cancelled pump task stops here. A dependency
+                        # (transport close, user hook) raising CancelledError
+                        # fails the connection like any other effect error.
+                        if owner_cancelled():
+                            raise
+                        failure = dependency_failure(exc, f"{effect.kind.name} effect")
                     except StaleConnectionEffect:
-                        if self.pending and self.pending[0] is effect:
-                            self.pending.popleft()
-                            self._complete()
+                        pass
                     except Exception as exc:
-                        if self.pending and self.pending[0] is effect:
-                            self.pending.popleft()
-                            self._complete()
-                        failure_at = self.applied
-                        owners = {
-                            waiter_id
-                            for waiter_id, target in self._waiter_targets.items()
-                            if target >= failure_at
-                        }
-                        if owners:
-                            self.error = exc
-                            self._error_waiters = owners
-                            self.progress.set()
-                        connack_fut = getattr(self.owner, "_connack_fut", None)
-                        if connack_fut is not None and not connack_fut.done():
-                            connack_fut.set_exception(exc)
-
-                        # Connection health always belongs to AsyncClient's
-                        # reader-owned lifecycle. Active drain() calls still
-                        # receive the same original exception below.
-                        self.owner._disconnect_exc = exc
-                        self._failing_close = True
-                        try:
-                            self.discard_connection_effects(settle_publish=True)
-                            await self.owner._close_transport_after_connection_failure()
-                            return
-                        finally:
-                            if self.pending:
-                                self.discard_connection_effects(settle_publish=True)
-                            self._failing_close = False
-                    else:
-                        if self.pending and self.pending[0] is effect:
-                            self.pending.popleft()
-                            self._complete()
+                        failure = exc
+                    if self.pending and self.pending[0] is effect:
+                        self.pending.popleft()
+                        self._complete()
+                    if failure is not None:
+                        await self._fail_connection(failure)
+                        return
                 if not self.flush_requested:
                     return
+
+    async def _fail_connection(self, exc: BaseException) -> None:
+        """Route one effect failure to its drain() owners and the reader lifecycle."""
+        failure_at = self.applied
+        owners = {
+            waiter_id for waiter_id, target in self._waiter_targets.items() if target >= failure_at
+        }
+        if owners:
+            self.error = exc
+            self._error_waiters = owners
+            self.progress.set()
+        connack_fut = getattr(self.owner, "_connack_fut", None)
+        if connack_fut is not None and not connack_fut.done():
+            connack_fut.set_exception(exc)
+
+        # Connection health always belongs to AsyncClient's reader-owned
+        # lifecycle. Active drain() calls still receive the same original
+        # exception above.
+        self.owner._disconnect_exc = exc
+        self._failing_close = True
+        try:
+            self.discard_connection_effects(settle_publish=True)
+            await self.owner._close_transport_after_connection_failure()
+        finally:
+            if self.pending:
+                self.discard_connection_effects(settle_publish=True)
+            self._failing_close = False
 
     def _done(self, task: asyncio.Task[None]) -> None:
         owned = self.task is task
