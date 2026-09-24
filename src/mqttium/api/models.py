@@ -74,11 +74,6 @@ class PublishBatchReceipt:
         return self._submitted
 
     @property
-    def completed(self) -> int:
-        """Number of admitted messages that reached terminal completion."""
-        return self._submitted - len(self._pending)
-
-    @property
     def pending_count(self) -> int:
         """Number of admitted QoS 1/2 messages still awaiting completion."""
         return len(self._pending)
@@ -112,20 +107,9 @@ class PublishBatchReceipt:
         """
         await self._done.wait()
         if self._fatal is not None:
-            raise PublishBatchError(
-                self._failures,
-                failure_count=self.failure_count,
-                failure_counts=self._failure_counts,
-                cause=self._fatal,
-                receipt=self,
-            ) from self._fatal
+            raise PublishBatchError(self, cause=self._fatal) from self._fatal
         if self._failure_counts:
-            raise PublishBatchError(
-                self._failures,
-                failure_count=self.failure_count,
-                failure_counts=self._failure_counts,
-                receipt=self,
-            )
+            raise PublishBatchError(self)
 
     def _register(self, mid: int | None) -> None:
         index = self._submitted

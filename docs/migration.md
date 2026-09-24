@@ -37,6 +37,18 @@ is the version an application actually upgrades from.
 | Custom engine/store/transport integration guarantees | Internal implementation interfaces |
 | `SubscribeResult.from_packet()` / `UnsubscribeResult.from_packet()` | Use the results returned by `subscribe()` / `unsubscribe()`, or construct `SubscribeResult(mid=..., reason_codes=...)`; decoded SUBACK/UNSUBACK packets remain Internal |
 
+## Changes since 1.0.0rc16
+
+| 1.0.0rc16 contract | Replacement |
+| --- | --- |
+| `PublishBatchError.failures`, `.failure_count`, `.failure_counts` | The same fields on `PublishBatchError.receipt` |
+| `PublishBatchError.cause` | `PublishBatchError.__cause__` (the error is raised `from` its cause) |
+| `PublishBatchError.receipt` could be `None` | Always the batch receipt; no narrowing needed |
+| `PublishBatchReceipt.completed` | `receipt.submitted - receipt.pending_count` |
+
+`MQTTTimeoutError` now also derives from `TimeoutError`; existing
+`except MQTTTimeoutError` handlers are unchanged.
+
 ## Frozen constructor and snapshot vocabulary
 
 The constructor names every bound after the thing it bounds and refuses

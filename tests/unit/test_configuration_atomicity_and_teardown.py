@@ -79,7 +79,7 @@ async def test_final_teardown_settles_a_pending_publish_failure() -> None:
     assert receipt._error is failure
     with pytest.raises(PublishBatchError) as exc_info:
         await batch.wait()
-    assert exc_info.value.failures[0] is failure
+    assert exc_info.value.receipt.failures[0] is failure
     with pytest.raises(RuntimeError) as receipt_failure:
         await receipt.wait()
     assert receipt_failure.value is failure

@@ -6,6 +6,19 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- `MQTTTimeoutError` also derives from `TimeoutError`, so `except TimeoutError`
+  catches client deadlines.
+- `PublishBatchError.receipt` is always the batch receipt, never `None`.
+
+### Removed
+
+- Remove duplicate batch fields before 1.0 (see the migration guide):
+  `PublishBatchError.failures`, `failure_count`, `failure_counts` and `cause`,
+  which repeated its `receipt` and `__cause__`, and
+  `PublishBatchReceipt.completed`, which equals `submitted - pending_count`.
+
 ### Fixed
 
 - Keep the packet identifier of a sealed publication reserved when the

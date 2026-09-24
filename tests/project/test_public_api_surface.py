@@ -334,3 +334,16 @@ def test_retired_entry_points_are_absent() -> None:
     assert not hasattr(api, "PublishBackpressure")
     assert not hasattr(AsyncClient, "set_auth_handler")
     assert not hasattr(AsyncClient(), "on_publish")
+
+
+def test_client_timeouts_are_builtin_timeouts() -> None:
+    assert issubclass(MQTTTimeoutError, MQTTError)
+    assert issubclass(MQTTTimeoutError, TimeoutError)
+
+
+def test_batch_error_carries_only_its_receipt() -> None:
+    receipt = PublishBatchReceipt()
+    error = PublishBatchError(receipt)
+    assert error.receipt is receipt
+    assert not hasattr(error, "failures") and not hasattr(error, "cause")
+    assert not hasattr(receipt, "completed")
