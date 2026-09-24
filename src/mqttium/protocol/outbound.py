@@ -90,6 +90,7 @@ class OutboundSession:
         "_engine",
         "_is_v5",
         "_parked_entries",
+        "_slotless",
         "_queued",
         "_pending_bytes",
         "_pending_high_water_bytes",
@@ -126,6 +127,11 @@ class OutboundSession:
         # `_unpark`). Zero on every path that does not involve a
         # resumed session whose retransmissions exceeded the send quota.
         self._parked_entries = 0
+        # Live WAIT_* exchanges resumed on this connection that hold no send
+        # quota slot: their PUBLISH was not sent on it (a replayed PUBREL, or
+        # a parked exchange the broker advanced). Their terminal ACK must not
+        # release a slot another exchange owns (#545).
+        self._slotless: set[int] = set()
         self._pending_messages = 0
         self._pending_bytes = 0
         self._pending_high_water_messages = 0
@@ -562,18 +568,28 @@ class OutboundSession:
 
     # --- broker acknowledgements -------------------------------------------
 
-    def _settle(self, mid: int, expected_state: OutboundQoSState) -> bool:
-        """Conditionally settle one outbound record without reading its payload."""
+    def _settle(self, mid: int, expected_state: OutboundQoSState) -> bool | None:
+        """Conditionally settle one outbound record without reading its payload.
+
+        Returns None when nothing was settled, otherwise whether the exchange
+        held a send-quota slot on this connection. One that never sent its
+        PUBLISH here releases none, so in-flight PUBLISHes never exceed the
+        broker's Receive Maximum (#545).
+        """
         meta = self.store.complete_out(mid, expected_state)
         if meta is None:
-            return False
+            return None
         self._release_reservation(meta.logical_size)
-        if self._parked_entries:
-            self._unpark(mid)
+        if self._parked_entries and self._unpark(mid):
+            return False
+        slotless = self._slotless
+        if slotless and mid in slotless:
+            slotless.remove(mid)
+            return False
         return True
 
-    def _unpark(self, mid: int) -> None:
-        """Drop the replay-parked queue entry of `mid`, if any.
+    def _unpark(self, mid: int) -> bool:
+        """Drop the replay-parked queue entry of `mid`; whether there was one.
 
         `replay_session()` parks a WAIT_* record in `_queued` when the send
         quota cannot admit its retransmission. The broker can still settle or
@@ -589,7 +605,8 @@ class OutboundSession:
             if stored.mid == mid:
                 del queued[index]
                 self._parked_entries -= 1
-                return
+                return True
+        return False
 
     def on_puback(self, raw: RawPacket) -> None:
         mid, reason_code, properties = self._decode_puback(raw.remaining)
@@ -605,9 +622,10 @@ class OutboundSession:
             else:
                 self._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
             raise
-        if not settled:
+        if settled is None:
             return
-        self.flow.release()
+        if settled:
+            self.flow.release()
         # Emit before freeing the packet id so FIFO receipt settlement remains
         # ordered even if a concurrent publish reuses the mid immediately.
         if reason_code >= 128:
@@ -650,9 +668,10 @@ class OutboundSession:
             compact=True,
         )
         if changed is not None:
-            if self._parked_entries:
-                # PUBREL needs no send quota: the parked entry just leaves.
-                self._unpark(mid)
+            if self._parked_entries and self._unpark(mid):
+                # PUBREL needs no send quota: the parked entry just leaves,
+                # still holding no slot until its PUBCOMP.
+                self._slotless.add(mid)
             self._engine._send(_encode_pubrel_success(mid))
             return
         record = self.store.out_meta(mid)
@@ -678,9 +697,10 @@ class OutboundSession:
             # terminal outcome regardless of the cleanup failure.
             self._fail(mid, ProtocolError(f"PUBREC reason_code={reason_code}"))
             raise
-        if not settled:
+        if settled is None:
             return
-        self.flow.release()
+        if settled:
+            self.flow.release()
         self._fail(mid, ProtocolError(f"PUBREC reason_code={reason_code}"))
         self.packet_ids.release(mid)
         self.drain()
@@ -697,9 +717,10 @@ class OutboundSession:
             else:
                 self._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
             raise
-        if not settled:
+        if settled is None:
             return
-        self.flow.release()
+        if settled:
+            self.flow.release()
         if reason_code >= 128:
             self._fail(mid, ProtocolError(f"PUBCOMP reason_code={reason_code}"))
         else:
@@ -1085,14 +1106,15 @@ class OutboundSession:
         if msg.state is OutboundQoSState.WAIT_PUBCOMP:
             # Receive Maximum constrains QoS>0 PUBLISH packets only. A resumed
             # QoS 2 exchange retransmits PUBREL without consuming the new
-            # connection's send quota; a later PUBCOMP may still replenish that
-            # quota, capped by FlowControl at the current connection limit.
+            # connection's send quota, so its PUBCOMP releases none either.
             try:
                 self._retransmit(self.materialize(msg))
             except Exception as exc:
                 self.discard_record(msg.mid, msg)
                 self.packet_ids.release(msg.mid)
                 self._fail(msg.mid, exc)
+                return
+            self._slotless.add(msg.mid)
             return
         if not self.flow.try_acquire():
             # Parked: retransmission must wait for a send-quota slot. The
@@ -1120,6 +1142,7 @@ class OutboundSession:
         self.reset_flow_for_connection()
         self._queued.clear()
         self._parked_entries = 0
+        self._slotless.clear()
         for page in self.store_summary_pages():
             for msg in page:
                 self._replay_message(msg)
@@ -1144,6 +1167,7 @@ class OutboundSession:
         if any(m.state is not OutboundQoSState.QUEUED for m in self._queued):
             self._queued = deque(m for m in self._queued if m.state is OutboundQoSState.QUEUED)
         self._parked_entries = 0
+        self._slotless.clear()
         clear_abandoned_packet_ids = not self._queued and not sub_mids_pending
         for page in self.store_summary_pages():
             for msg in page:

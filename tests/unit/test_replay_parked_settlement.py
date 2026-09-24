@@ -129,28 +129,29 @@ def test_settled_parked_identifier_can_be_reused_without_collision(
 
     _feed(engine, encode_frame(PacketType.PUBACK, 0, b"\x00\x02"))
     engine.take_effects()
-    # Settling the parked exchange replenished the send quota it never held on
-    # this connection — the same §4.9 credit semantics a resumed PUBCOMP has.
-    assert engine.outbound.flow.inflight == 0
+    # The parked exchange never held a send-quota slot on this connection, so
+    # settling it releases none: mid 1 still owns the only one (#545).
+    assert engine.outbound.flow.inflight == 1
 
-    # The freed identifier is reallocated by a fresh publication, which
-    # launches on the replenished quota without a duplicate queue entry.
+    # The freed identifier is reallocated by a fresh publication, which waits
+    # for the slot instead of exceeding Receive Maximum.
     handle = engine.queue_publish("t/new", b"fresh", qos=QoS.AT_LEAST_ONCE)
-    assert _sent_packet_types(engine).count(PacketType.PUBLISH.value) == 1
+    assert PacketType.PUBLISH.value not in _sent_packet_types(engine)
     assert handle.mid == 2
-    assert [stored.mid for stored in engine.outbound._queued] == []
+    assert [stored.mid for stored in engine.outbound._queued] == [2]
     records = {
         record.mid: record.state
         for record in (
             store.get_out(summary.mid) for page in store.out_summary_pages() for summary in page
         )
     }
-    assert records == {1: OutboundQoSState.WAIT_PUBACK, 2: OutboundQoSState.WAIT_PUBACK}
+    assert records == {1: OutboundQoSState.WAIT_PUBACK, 2: OutboundQoSState.QUEUED}
     assert engine.outbound.unacknowledged_messages == 2
 
-    # Settling mid=1 must not resurrect anything through a stale queue entry.
+    # Settling mid 1 frees the slot: the new publication launches once, and
+    # no stale queue entry resurrects the settled exchange.
     _feed(engine, encode_frame(PacketType.PUBACK, 0, b"\x00\x01"))
-    assert PacketType.PUBLISH.value not in _sent_packet_types(engine)
+    assert _sent_packet_types(engine).count(PacketType.PUBLISH.value) == 1
     records = {
         record.mid: record.state
         for record in (
@@ -159,3 +160,4 @@ def test_settled_parked_identifier_can_be_reused_without_collision(
     }
     assert records == {2: OutboundQoSState.WAIT_PUBACK}
     assert engine.outbound.unacknowledged_messages == 1
+    assert engine.outbound.flow.inflight == 1

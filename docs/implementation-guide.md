@@ -168,6 +168,12 @@ one in WAIT_PUBCOMP resends it without changing phase or ownership. A
 replay-parked exchange leaves the queue at its PUBREC, so later draining
 neither resends that PUBREL nor spends a send-quota slot on it.
 
+Only an exchange whose PUBLISH was sent on the current connection holds a
+send-quota slot. After a resumed session, a replay-parked exchange, a replayed
+PUBREL and a parked exchange advanced by PUBREC hold none, and their terminal
+ACK releases none: unacknowledged PUBLISHes on the connection never exceed the
+broker's Receive Maximum, even though MQTT 5 section 4.9 would credit the quota.
+
 ### Inbound QoS 1 and 2
 
 QoS 1 is delivered once and acknowledged immediately unless manual
