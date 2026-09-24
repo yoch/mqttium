@@ -47,15 +47,24 @@ class LifecycleHooks:
         self._reconnect_ready = asyncio.Event()
         self._reconnect_ready.set()
 
-    def begin_operation(self, *, replace_connection: bool = True) -> asyncio.Task[None] | None:
-        """Supersede old notifications; return a directly calling hook owner."""
+    def begin_operation(
+        self, *, replace_connection: bool = True, preserve_hook: bool = False
+    ) -> asyncio.Task[None] | None:
+        """Supersede old notifications and return the hook owner to preserve.
+
+        Automatic reconnect preserves a running hook (#508): it may await work
+        only the replacement connection completes, and a later on_connect
+        still waits behind it in the worker.
+        """
         current = asyncio.current_task()
-        origin = self.hook_task if self.hook_task is current else None
+        direct_origin = self.hook_task if self.hook_task is current else None
+        origin = self.hook_task if preserve_hook else direct_origin
         if replace_connection:
             self.token += 1
         self.pending = None
         self._reconnect_ready.set()
-        self._cancel_obsolete(origin)
+        if not preserve_hook:
+            self._cancel_obsolete(direct_origin)
         return origin
 
     def _cancel_obsolete(self, origin: asyncio.Task[None] | None) -> None:
@@ -121,6 +130,11 @@ class LifecycleHooks:
             pass
         if event.token != self.token:
             return
+        if not event.connected:
+            # The disconnect hook is now the lifecycle owner, no longer a
+            # pending state a retry could overwrite: automatic reconnect may
+            # proceed while it runs (#508).
+            self._reconnect_ready.set()
         try:
             await ApplicationDelivery.invoke(event.callback, event.value)
         except asyncio.CancelledError as exc:

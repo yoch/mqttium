@@ -5,7 +5,10 @@
   "issues": [
     508
   ],
-  "tests": [],
+  "tests": [
+    "tests/unit/test_disconnect_hook_reconnect_progress.py",
+    "tests/unit/test_callback_lifecycle_regressions.py"
+  ],
   "configs": [
     {
       "config": "LifecycleReconnectHook-rc15.cfg",
