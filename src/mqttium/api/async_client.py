@@ -63,7 +63,6 @@ from mqttium.packets import (
     SubAckPacket,
     SubscribeOptions,
     UnsubAckPacket,
-    encode_disconnect,
 )
 from mqttium.protocol.engine import (
     DisconnectInfo,
@@ -96,6 +95,7 @@ _FATAL_DISCONNECT_DRAIN_TIMEOUT = 0.25
 # Together with the 256-packet bound it caps the size of one delivery lot; it is
 # not an application memory bound and is deliberately not configurable.
 _MAX_INGRESS_BATCH_BYTES = 1 * 1024 * 1024
+_TERMINAL_ENGINE_STATES = (ConnectionState.DISCONNECTING, ConnectionState.DISCONNECTED)
 _DEFAULT_MAX_ITERATOR_MESSAGES = 65_536
 _DEFAULT_MAX_ITERATOR_BYTES = 64 * 1024 * 1024
 
@@ -1517,8 +1517,16 @@ class AsyncClient:
             raise
         await self._effect_pump.drain()
 
-    def _process_ingress_batch(self) -> tuple[int, int, bool]:
-        """Decode until a byte/count bound or an auto-PUBACK handoff boundary."""
+    def _process_ingress_batch(self) -> tuple[int, int, bool, MQTTError | None]:
+        """Decode until a byte/count bound, an auto-PUBACK handoff boundary,
+        or the first peer error.
+
+        A malformed, oversized or protocol-violating packet ends the lot at
+        that packet. It is returned, not raised, so the valid prefix before it
+        commits and completes like any lot: the peer error must neither roll
+        back nor fence packets already observed, and nothing after it is
+        processed (#511, #513).
+        """
         decoder = self._decoder
         engine = self._engine
         handle_raw = engine.handle_raw
@@ -1527,10 +1535,23 @@ class AsyncClient:
         count = 0
         decoded_bytes = 0
         for _ in range(256):
-            packet = decoder.next_packet()
+            try:
+                packet = decoder.next_packet()
+            except (MalformedPacketError, PacketTooLargeError) as exc:
+                if engine.state in _TERMINAL_ENGINE_STATES:
+                    # Bytes after DISCONNECT belong to no connection: the
+                    # engine ignores whole packets there, and undecodable
+                    # ones must not replace the terminal reason either.
+                    return count, decoded_bytes, False, None
+                return count, decoded_bytes, False, exc
             if packet is None:
                 break
-            handle_raw(packet)
+            peer_error = handle_raw(packet)
+            if peer_error is not None:
+                # handle_raw() emitted it as the lot's last effect; the reader
+                # raises it after the prefix instead, so drop that copy.
+                engine._effects.pop()
+                return count + 1, decoded_bytes, False, peer_error
             count += 1
             decoded_bytes += len(packet.remaining) + 5
             # Auto-PUBACK slots remain owned until take_effects(). Stop exactly
@@ -1538,10 +1559,10 @@ class AsyncClient:
             # the effect handoff below can release them before another PUBLISH.
             # Control packets and QoS 0 traffic retain the full 256-packet batch.
             if inbound._autoack_handoff_required:
-                return count, decoded_bytes, True
+                return count, decoded_bytes, True, None
             if decoded_bytes >= max_bytes:
                 break
-        return count, decoded_bytes, False
+        return count, decoded_bytes, False, None
 
     async def _read_loop(self) -> None:  # noqa: C901
         assert self._transport is not None
@@ -1581,7 +1602,7 @@ class AsyncClient:
                         effect_start = len(self._engine._effects)
                         try:
                             with self._engine.store.batch():
-                                handled, handled_bytes, handoff_required = (
+                                handled, handled_bytes, handoff_required, peer_error = (
                                     self._process_ingress_batch()
                                 )
                         except (
@@ -1633,6 +1654,11 @@ class AsyncClient:
                         protocol_target = self._effect_pump.enqueued
                     await self._effect_pump.drain(target=protocol_target)
                     await self._delivery_lane.drain()
+                    if peer_error is not None:
+                        # The valid prefix is committed, acknowledged and
+                        # delivered; only now does the peer error retire the
+                        # connection.
+                        raise peer_error
                     # A batch that stopped short of both bounds emptied the
                     # buffer, so there is nothing to decode until the next
                     # read(). Re-entering only to observe handled == 0 cost a
@@ -2394,13 +2420,13 @@ class AsyncClient:
             reason = 0x95  # Packet too large
         elif isinstance(exc, MalformedPacketError):
             reason = 0x81  # Malformed Packet
+        if self._engine.state not in (ConnectionState.CONNECTING, ConnectionState.CONNECTED):
+            # The engine already ended the connection and emitted its own
+            # normative DISCONNECT (or found none it could send): never a second.
+            return
         try:
-            if self._engine.state in (ConnectionState.CONNECTING, ConnectionState.CONNECTED):
-                # Retire public admission before terminal drainage can suspend.
-                packet = self._engine.begin_disconnect(reason)
-            else:
-                packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
-                self._engine._check_outbound_size(packet)
+            # Retire public admission before terminal drainage can suspend.
+            packet = self._engine.begin_disconnect(reason)
             await self._flush_terminal_packet(packet, _FATAL_DISCONNECT_DRAIN_TIMEOUT)
         except Exception:
             pass

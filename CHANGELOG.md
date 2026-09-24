@@ -19,6 +19,17 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   throttling register in benchmark runner preflights, and reject samples taken
   while the firmware reports a current limit (#493).
 
+### Fixed
+
+- End an ingress lot at the first malformed, oversized or protocol-violating
+  packet, and first commit, complete and deliver the packets decoded before it.
+  A later bad packet no longer rolls back an observed PUBACK, PUBCOMP, SUBACK or
+  UNSUBACK, fails its receipt, or drops a message already acknowledged. No
+  packet after the violation is processed, however the bytes were split into
+  reads (#511, #513). Bytes after a broker DISCONNECT no longer replace its
+  reason, and the client no longer sends a second DISCONNECT after the one the
+  protocol engine already sent.
+
 ## [1.0.0rc15] - 2026-09-23
 
 ### Fixed
