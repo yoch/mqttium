@@ -19,11 +19,14 @@ if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
 
 
-# Facts the engine already observed. Applying them depends on no earlier
-# output, so they never wait in the lane behind SENDs blocked on writer
-# capacity or user code (#531 #532 #536 #540 #524 #526).
-SETTLED_OBSERVATIONS = frozenset(
+# Facts the engine already observed, applied when collected: their
+# application depends on no earlier output, so they never wait in the lane
+# behind SENDs blocked on writer capacity (#531 #532 #536 #540 #524 #526).
+# AUTH is handed to its owned task at the same point, so user code never runs
+# inside the lane or the reader (#501 #502 #523 #527).
+IMMEDIATE_EFFECTS = frozenset(
     {
+        EffectKind.AUTH,
         EffectKind.CONNACK,
         EffectKind.PUBLISH_COMPLETE,
         EffectKind.PUBLISH_FAILED,
@@ -61,7 +64,7 @@ def _partition_effects(
             sends.append(effect)
         elif kind in _DELIVERIES:
             deliveries.append(effect)
-        elif kind in SETTLED_OBSERVATIONS:
+        elif kind in IMMEDIATE_EFFECTS:
             observed.append(effect)
         else:
             if kind in EARLY_OBSERVATIONS:
@@ -206,7 +209,7 @@ class EffectPump:
         if not self.pending and self.owner._apply_effect_inline(effect, epoch):
             self.inline_effects += 1
             return True
-        if kind in SETTLED_OBSERVATIONS or kind in EARLY_OBSERVATIONS:
+        if kind in IMMEDIATE_EFFECTS or kind in EARLY_OBSERVATIONS:
             # Behind pending output: observe now, never wait behind it.
             self.observations += 1
             return self.owner._apply_observation(effect)

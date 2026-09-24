@@ -103,6 +103,11 @@ class ProtocolEngine:
         # Server's terminal AUTH Success (0x00). Initial enhanced authentication
         # is represented by CONNECTING and completes with CONNACK instead.
         self._reauth_in_progress = False
+        # Server AUTH challenges (0x18) are numbered. A handler's response is
+        # sent only while the exchange still waits on that challenge; one that
+        # arrives after Success, a new challenge or teardown is dropped.
+        self._auth_challenges = 0
+        self._auth_response_due: int | None = None
         # What a state accepts and what handles it are one table, so `handle_raw`
         # resolves both in a single lookup and adding a packet type is one edit.
         # Anything absent is refused — PINGREQ included.
@@ -336,6 +341,7 @@ class ProtocolEngine:
             str(configured_auth_method) if configured_auth_method is not None else None
         )
         self._reauth_in_progress = False
+        self._auth_response_due = None
         self._sent_client_id = client_id
         self._sent_clean_start = clean_start
         self._sent_session_expiry_interval = (
@@ -537,6 +543,7 @@ class ProtocolEngine:
         self.outbound.transport_closed()
         self.inbound.transport_closed()
         self._reauth_in_progress = False
+        self._auth_response_due = None
         # Release sub/unsub MIDs still in flight — no ACK will arrive now.
         self._release_pending_subscription_requests()
         if was != ConnectionState.DISCONNECTED:
@@ -675,6 +682,7 @@ class ProtocolEngine:
             self._validate_connack_v5(connack)
         if connack.reason_code != 0:
             self._reauth_in_progress = False
+            self._auth_response_due = None
             self.state = ConnectionState.DISCONNECTED
             self._emit(EffectKind.CONNACK, connack)
             self._emit(
@@ -707,6 +715,7 @@ class ProtocolEngine:
             and peer_maximum_packet_size < 4
         ):
             self._reauth_in_progress = False
+            self._auth_response_due = None
             self.state = ConnectionState.DISCONNECTED
             raise MandatoryResponseTooLargeError(
                 f"Broker maximum_packet_size {peer_maximum_packet_size} is below the "
@@ -714,6 +723,7 @@ class ProtocolEngine:
             )
 
         self._reauth_in_progress = False
+        self._auth_response_due = None
         self.state = ConnectionState.CONNECTED
         self.session_present = connack.session_present
         self._update_session_resume_preference()
@@ -841,6 +851,7 @@ class ProtocolEngine:
     def _on_disconnect(self, raw: RawPacket) -> None:
         reason_code, properties = self.codec.decode_disconnect(raw.remaining)
         self._reauth_in_progress = False
+        self._auth_response_due = None
         self.state = ConnectionState.DISCONNECTED
         self._release_pending_subscription_requests()
         self._emit(
@@ -903,6 +914,7 @@ class ProtocolEngine:
                 )
             if packet.reason_code == 0x00:
                 self._reauth_in_progress = False
+                self._auth_response_due = None
             elif packet.reason_code != 0x18:
                 self._protocol_disconnect(0x82)
                 raise ProtocolError("Invalid Server AUTH reason during re-authentication")
@@ -911,7 +923,11 @@ class ProtocolEngine:
             # a protocol failure on the active connection, not a CONNACK refusal.
             self._protocol_disconnect(0x82)
             return
-        self._emit(EffectKind.AUTH, packet)
+        challenge = None
+        if packet.reason_code == 0x18:
+            self._auth_challenges += 1
+            challenge = self._auth_response_due = self._auth_challenges
+        self._effects.append(EngineEffect(EffectKind.AUTH, packet, exchange_token=challenge))
 
     def _protocol_disconnect(self, reason_code: int) -> None:
         """Tear the connection down, announcing why when the version allows it."""
@@ -928,12 +944,33 @@ class ProtocolEngine:
             else:
                 self._send(packet)
         self._reauth_in_progress = False
+        self._auth_response_due = None
         self.state = ConnectionState.DISCONNECTED
         self._release_pending_subscription_requests()
         self._emit(
             EffectKind.DISCONNECTED,
             DisconnectInfo(reason_code=reason_code, from_broker=False),
         )
+
+    def respond_auth(
+        self,
+        challenge: object,
+        reason_code: int = 0x18,
+        properties: Properties | None = None,
+    ) -> bool:
+        """Answer a Server AUTH challenge if the exchange still waits on it.
+
+        ``challenge`` is the AUTH effect's ``exchange_token``. Returns False,
+        sending nothing, when the exchange has since succeeded, moved to a
+        newer challenge or ended with its connection: the answer is stale,
+        not a local error (#528, #535).
+        """
+        if challenge is None or challenge != self._auth_response_due:
+            return False
+        if self.state not in (ConnectionState.CONNECTING, ConnectionState.CONNECTED):
+            return False
+        self.queue_auth(reason_code=reason_code, properties=properties)
+        return True
 
     def queue_auth(
         self,
@@ -979,6 +1016,8 @@ class ProtocolEngine:
         ).encode(self.config.protocol)
         self._check_outbound_size(wire)
         self._send(wire)
+        # One answer per challenge; a Re-authenticate starts a new exchange.
+        self._auth_response_due = None
         if reason_code == 0x19:
             self._reauth_in_progress = True
 

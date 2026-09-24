@@ -70,6 +70,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   fails `connect()` with its protocol error instead of a timeout. A broker
   DISCONNECT ends the connection and reaches `on_disconnect` instead of hanging
   behind a pending acknowledgement (#524, #526, #531, #532, #536, #540).
+- Run `auth_handler` in its own task instead of inside protocol processing.
+  The handler can now await `publish()`, `subscribe()`, `disconnect()`, an
+  existing receipt, or a message from the same read without deadlocking the
+  client. Its response is sent only while the broker still waits for that
+  Continue authentication challenge: the return value for AUTH Success is
+  ignored instead of breaking the connection, and a late response can no longer
+  follow a broker DISCONNECT or replace its reason (#501, #502, #523, #527,
+  #528, #535).
 
 ## [1.0.0rc15] - 2026-09-23
 

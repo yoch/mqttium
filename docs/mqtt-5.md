@@ -151,7 +151,13 @@ when the handler needs to await application work. A synchronous handler
 returning an awaitable is a handler error.
 
 The handler's returned response is part of the active AUTH exchange. Return it
-instead of awaiting `client.auth()` from inside the handler. Application code
+instead of awaiting `client.auth()` from inside the handler. The handler runs in
+its own task, one call at a time, so it may await other client operations
+(`publish()`, `subscribe()`, `disconnect()`), existing receipts or messages
+without blocking protocol processing. A response is sent only when it answers
+the broker's current Continue authentication (`0x18`) challenge: the return
+value for AUTH Success (`0x00`) is ignored, and a response that arrives after
+the broker ended the exchange or the connection closed is dropped. Application code
 outside the handler can initiate re-authentication with `await client.auth(...)`
 after connection; a handler is required because the broker can continue the
 exchange.

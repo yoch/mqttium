@@ -239,7 +239,10 @@ operations cancel obsolete hooks, while an operation directly awaited by the
 current hook preserves its caller. Network operation completion does not await
 hook completion. `on_connect` is not an incoming-data readiness barrier.
 Automatic retry awaits the current disconnect hook and rechecks user intent.
-Authentication alone remains awaited as protocol work with `auth_timeout`.
+Authentication runs in its own owned task with `auth_timeout`; neither the
+effect lane nor the reader waits for it. Its answer goes through
+`ProtocolEngine.respond_auth(challenge, ...)`, which refuses an answer the
+exchange no longer waits for.
 
 
 `iterator_admission_timeout=None` has no deadline. A positive timeout covers both byte
