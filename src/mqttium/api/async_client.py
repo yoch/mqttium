@@ -31,7 +31,7 @@ from mqttium.api._delivery import (
     CallbackTarget,
     MessageRoute,
 )
-from mqttium.api._effects import EffectPump, StaleConnectionEffect
+from mqttium.api._effects import SETTLED_OBSERVATIONS, EffectPump, StaleConnectionEffect
 from mqttium.api._lifecycle import LifecycleHooks
 from mqttium.api._delivery_lane import DeliveryLane
 from mqttium.api._writer import WritePump
@@ -1680,6 +1680,14 @@ class AsyncClient:
                         if handled and self._engine.has_pending_effects:
                             self._effect_pump.collect_from_engine()
                         protocol_target = self._effect_pump.enqueued
+                        if peer_error is not None:
+                            # Raised only after the prefix drains, but observed
+                            # now, as its PROTOCOL_ERROR effect would be.
+                            self._observe_peer_error(peer_error)
+                    if self._write_pump.sealed and self._write_pump.waiters:
+                        # A broker DISCONNECT sealed the writer: output parked
+                        # for capacity fails now instead of blocking this lot.
+                        await self._write_pump.wake_waiters()
                     await self._effect_pump.drain(target=protocol_target)
                     await self._delivery_lane.drain()
                     if peer_error is not None:
@@ -2132,6 +2140,50 @@ class AsyncClient:
             self._raise_protocol_effect(effect.data)
         return False
 
+    def _apply_observation(self, effect: EngineEffect) -> bool:
+        """Apply a fact the engine has already observed; True when fully done.
+
+        Settling a receipt, resolving CONNACK/SUBACK/UNSUBACK or clearing the
+        ping deadline depends on no earlier output. A broker DISCONNECT and a
+        peer protocol error establish the connection's cause and unblock their
+        waiters now; their ordered remainder (closing the transport, raising
+        the error) stays in the effect lane.
+        """
+        kind = effect.kind
+        if kind in SETTLED_OBSERVATIONS:
+            return self._apply_effect_inline(effect, self._connection_epoch)
+        if kind is EffectKind.DISCONNECTED:
+            info = effect.data
+            if isinstance(info, DisconnectInfo) and info.from_broker:
+                self._observe_broker_disconnect(info)
+        elif kind is EffectKind.PROTOCOL_ERROR and isinstance(
+            effect.data, (MalformedPacketError, ProtocolError)
+        ):
+            self._observe_peer_error(effect.data)
+        return False
+
+    def _observe_peer_error(self, exc: MQTTError) -> None:
+        """Latch a peer violation and fail a pending CONNACK wait with it now.
+
+        Its ordered remainder (normative DISCONNECT, close) may wait for writer
+        capacity; connect() must report the violation, not a timeout (#540).
+        """
+        self._propose_disconnect_cause(exc, _CAUSE_PROTOCOL)
+        connack_fut = self._connack_fut
+        if connack_fut is not None and not connack_fut.done():
+            connack_fut.set_exception(exc)
+
+    def _observe_broker_disconnect(self, info: DisconnectInfo) -> None:
+        """Latch the broker's verdict and stop output it will never read."""
+        self._last_disconnect = info
+        self._propose_disconnect_cause(
+            BrokerDisconnectError(info.reason_code, info.properties)
+            if info.reason_code != 0
+            else MQTTError("Connection closed"),
+            _CAUSE_BROKER,
+        )
+        self._write_pump.seal()
+
     def _raise_protocol_effect(self, data: object) -> Never:
         if not isinstance(data, (MalformedPacketError, ProtocolError)):
             raise TypeError(
@@ -2207,12 +2259,7 @@ class AsyncClient:
                     # The broker's verdict is the connection's cause from the
                     # moment it is observed; closing the transport below can
                     # make the writer fail, and that must not replace it (#543).
-                    self._propose_disconnect_cause(
-                        BrokerDisconnectError(info.reason_code, info.properties)
-                        if info.reason_code != 0
-                        else MQTTError("Connection closed"),
-                        _CAUSE_BROKER,
-                    )
+                    self._observe_broker_disconnect(info)
                 if self._transport is not None and not self._transport.is_closing():
                     if not info.from_broker:
                         try:

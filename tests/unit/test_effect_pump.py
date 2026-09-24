@@ -160,7 +160,7 @@ def _collect(client: AsyncClient, kinds: list[EffectKind]) -> list[EffectKind]:
 
 def test_ordered_batch_is_queued_untouched() -> None:
     client = AsyncClient(client_id="effect-ordered")
-    kinds = [EffectKind.SEND, EffectKind.SEND, EffectKind.PUBLISH_COMPLETE]
+    kinds = [EffectKind.SEND, EffectKind.SEND, EffectKind.AUTH]
 
     assert _collect(client, kinds) == kinds
     assert client._effect_pump.multi_effect_batches == 1
@@ -168,12 +168,12 @@ def test_ordered_batch_is_queued_untouched() -> None:
 
 
 def test_completion_before_send_is_reordered_send_first() -> None:
-    """The shape every pipelined PUBACK batch produces."""
+    """Output keeps wire order ahead of the lane's remaining ordered work."""
     client = AsyncClient(client_id="effect-puback")
 
-    order = _collect(client, [EffectKind.PUBLISH_COMPLETE, EffectKind.SEND])
+    order = _collect(client, [EffectKind.AUTH, EffectKind.SEND])
 
-    assert order == [EffectKind.SEND, EffectKind.PUBLISH_COMPLETE]
+    assert order == [EffectKind.SEND, EffectKind.AUTH]
     assert client._effect_pump.reordered_batches == 1
 
 
@@ -184,17 +184,17 @@ def test_interleaved_batch_keeps_relative_order_within_each_group() -> None:
         client,
         [
             EffectKind.SEND,
-            EffectKind.PUBLISH_COMPLETE,
+            EffectKind.AUTH,
             EffectKind.SEND,
-            EffectKind.SUBACK,
+            EffectKind.DISCONNECTED,
         ],
     )
 
     assert order == [
         EffectKind.SEND,
         EffectKind.SEND,
-        EffectKind.PUBLISH_COMPLETE,
-        EffectKind.SUBACK,
+        EffectKind.AUTH,
+        EffectKind.DISCONNECTED,
     ]
     assert client._effect_pump.reordered_batches == 1
 
@@ -211,7 +211,7 @@ def test_all_send_batch_is_not_counted_as_reordered() -> None:
 
 def test_no_send_batch_is_not_counted_as_reordered() -> None:
     client = AsyncClient(client_id="effect-others")
-    kinds = [EffectKind.PUBLISH_COMPLETE, EffectKind.SUBACK, EffectKind.UNSUBACK]
+    kinds = [EffectKind.AUTH, EffectKind.DISCONNECTED, EffectKind.PROTOCOL_ERROR]
 
     assert _collect(client, kinds) == kinds
     assert client._effect_pump.reordered_batches == 0
@@ -220,17 +220,36 @@ def test_no_send_batch_is_not_counted_as_reordered() -> None:
 def test_paired_benchmark_scenarios_exercise_the_branch_they_name() -> None:
     """A benchmark arm that measures the wrong branch is worse than none.
 
-    The pump reorders as soon as a SEND follows a non-SEND, so an interleaved
-    batch is reordered too. This pins each named arm to the branch it claims.
+    Completions are observed facts: both arms apply them at collection and
+    queue only their SENDs, in wire order. The arms differ only in how the
+    batch interleaves, which is what they measure.
     """
     ordered = [EffectKind.SEND] * 4 + [EffectKind.PUBLISH_COMPLETE] * 4
     reordered = [EffectKind.PUBLISH_COMPLETE, EffectKind.SEND] * 4
 
     client = AsyncClient(client_id="effect-scenario-ordered")
-    assert _collect(client, ordered) == ordered
+    assert _collect(client, ordered) == [EffectKind.SEND] * 4
     assert client._effect_pump.multi_effect_batches == 1
-    assert client._effect_pump.reordered_batches == 0, "the ordered arm must not reorder"
+    assert client._effect_pump.observations == 4
 
     other = AsyncClient(client_id="effect-scenario-reordered")
-    _collect(other, reordered)
-    assert other._effect_pump.reordered_batches == 1, "the reordered arm must reorder"
+    assert _collect(other, reordered) == [EffectKind.SEND] * 4
+    assert other._effect_pump.observations == 4
+
+
+def test_observed_facts_never_wait_behind_pending_output() -> None:
+    """#531 #532 #536 #524 #526: an observation is applied at collection."""
+    client = AsyncClient(client_id="effect-observations")
+    pump = client._effect_pump
+    client._engine._emit(EffectKind.SEND, b"blocked-output")
+    client._engine._emit(EffectKind.AUTH, None)
+    pump.collect_from_engine()
+    assert [effect.kind for effect in pump.pending] == [EffectKind.SEND, EffectKind.AUTH]
+
+    client._ping_pending = True
+    client._engine._emit(EffectKind.PINGRESP, None)
+    pump.collect_from_engine()
+
+    assert client._ping_pending is False
+    assert [effect.kind for effect in pump.pending] == [EffectKind.SEND, EffectKind.AUTH]
+    assert pump.enqueued == 2

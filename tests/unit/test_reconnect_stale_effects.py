@@ -132,22 +132,22 @@ async def test_collecting_after_an_epoch_bump_does_not_tag_fresh_effects_stale()
     client = AsyncClient(client_id="c")
     # More than one effect skips the single-effect inline fast path, so these
     # stay pending and tagged with the current epoch.
-    client._engine._emit(EffectKind.PINGRESP, None)
-    client._engine._emit(EffectKind.PINGRESP, None)
+    client._engine._emit(EffectKind.AUTH, None)
+    client._engine._emit(EffectKind.AUTH, None)
     client._effect_pump.collect_from_engine()
     assert len(client._effect_pump.pending) == 2
     stale = list(client._effect_pump.pending)
 
     await client._invalidate_connection_epoch()
 
-    client._engine._emit(EffectKind.SUBACK, None)
-    client._engine._emit(EffectKind.UNSUBACK, None)
+    client._engine._emit(EffectKind.AUTH, None)
+    client._engine._emit(EffectKind.DISCONNECTED, None)
     client._effect_pump.collect_from_engine()
 
     assert client._effect_pump.pending_epoch == client._connection_epoch
     assert [effect.kind for effect in client._effect_pump.pending] == [
-        EffectKind.SUBACK,
-        EffectKind.UNSUBACK,
+        EffectKind.AUTH,
+        EffectKind.DISCONNECTED,
     ], "stale effects must be dropped, not merged under the new tag"
     assert not any(effect is old for old in stale for effect in client._effect_pump.pending)
     assert client._effect_pump.enqueued == client._effect_pump.applied + len(

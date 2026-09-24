@@ -63,6 +63,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Keep the broker's DISCONNECT reason as the connection's cause when closing
   the transport afterwards makes a pending write fail; `on_disconnect` now
   receives `BrokerDisconnectError` rather than the secondary `OSError` (#543).
+- Apply facts the client has already observed without waiting behind outgoing
+  packets blocked on writer capacity. A received PUBACK or PUBCOMP settles its
+  receipt, CONNACK completes `connect()`, SUBACK/UNSUBACK complete their
+  request, and PINGRESP clears the keepalive deadline. An invalid CONNACK now
+  fails `connect()` with its protocol error instead of a timeout. A broker
+  DISCONNECT ends the connection and reaches `on_disconnect` instead of hanging
+  behind a pending acknowledgement (#524, #526, #531, #532, #536, #540).
 
 ## [1.0.0rc15] - 2026-09-23
 
