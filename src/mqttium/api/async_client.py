@@ -1680,6 +1680,10 @@ class AsyncClient:
                         if handled and self._engine.has_pending_effects:
                             self._effect_pump.collect_from_engine()
                         protocol_target = self._effect_pump.enqueued
+                        if peer_error is not None:
+                            # Raised only after the prefix drains, but observed
+                            # now, as its PROTOCOL_ERROR effect would be.
+                            self._observe_peer_error(peer_error)
                     if self._write_pump.sealed and self._write_pump.waiters:
                         # A broker DISCONNECT sealed the writer: output parked
                         # for capacity fails now instead of blocking this lot.
@@ -2155,11 +2159,19 @@ class AsyncClient:
         elif kind is EffectKind.PROTOCOL_ERROR and isinstance(
             effect.data, (MalformedPacketError, ProtocolError)
         ):
-            self._propose_disconnect_cause(effect.data, _CAUSE_PROTOCOL)
-            connack_fut = self._connack_fut
-            if connack_fut is not None and not connack_fut.done():
-                connack_fut.set_exception(effect.data)
+            self._observe_peer_error(effect.data)
         return False
+
+    def _observe_peer_error(self, exc: MQTTError) -> None:
+        """Latch a peer violation and fail a pending CONNACK wait with it now.
+
+        Its ordered remainder (normative DISCONNECT, close) may wait for writer
+        capacity; connect() must report the violation, not a timeout (#540).
+        """
+        self._propose_disconnect_cause(exc, _CAUSE_PROTOCOL)
+        connack_fut = self._connack_fut
+        if connack_fut is not None and not connack_fut.done():
+            connack_fut.set_exception(exc)
 
     def _observe_broker_disconnect(self, info: DisconnectInfo) -> None:
         """Latch the broker's verdict and stop output it will never read."""
