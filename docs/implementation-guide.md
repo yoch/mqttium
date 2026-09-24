@@ -163,7 +163,10 @@ cleanup never vetoes it.
 PUBLISH remains persisted until PUBREC. A successful PUBREC atomically replaces
 the durable record with PUBREL. PUBCOMP is the terminal boundary under the same
 rule as PUBACK above. A terminal negative PUBREC fails the receipt and releases
-the transaction.
+the transaction. Every successful PUBREC is answered with PUBREL: a repeated
+one in WAIT_PUBCOMP resends it without changing phase or ownership. A
+replay-parked exchange leaves the queue at its PUBREC, so later draining
+neither resends that PUBREL nor spends a send-quota slot on it.
 
 ### Inbound QoS 1 and 2
 

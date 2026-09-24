@@ -21,6 +21,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Answer every successful PUBREC with PUBREL: a repeated PUBREC for a QoS 2
+  publication already waiting for PUBCOMP was silently ignored (#503). A
+  successful PUBREC for an exchange still waiting behind the send quota after
+  a session resume now removes it from the queue, so it no longer sends a
+  second PUBREL and spends a send-quota slot later (#497).
 - Retire the writer generation before a synchronous `write_nowait()` failure
   reaches the publisher, and never retry the possibly partly written frame.
   Another producer could previously keep writing into the failed transport
