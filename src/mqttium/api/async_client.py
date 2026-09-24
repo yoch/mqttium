@@ -1985,7 +1985,11 @@ class AsyncClient:
                         return
                     # Dropped again during the stability window — keep retrying.
                     continue
-                except Exception as exc:
+                except (Exception, asyncio.CancelledError) as exc:
+                    if isinstance(exc, asyncio.CancelledError):
+                        task = asyncio.current_task()
+                        if task is None or task.cancelling():
+                            raise
                     self._disconnect_exc = exc
                     cause = self._local_terminal_failure
                     if self._permanent_connection_failure() or cause is not None:
