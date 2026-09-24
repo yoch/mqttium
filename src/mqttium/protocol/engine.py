@@ -530,7 +530,7 @@ class ProtocolEngine:
         """Release connection-scoped SUBSCRIBE/UNSUBSCRIBE packet identifiers."""
         if not self._pending_sub_requests:
             return
-        if self.outbound.unacknowledged_messages == 0:
+        if not self.outbound.holds_packet_ids:
             # No publish MID survives this connection: reset in constant time.
             self.outbound.packet_ids.clear()
         else:

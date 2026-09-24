@@ -14,6 +14,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   resumed session although its caller had seen the failure, and a later
   publication could overwrite it. The row is now sealed like a failed receipt:
   kept for recovery, never sent by this client, its identifier reserved.
+- Keep the packet identifier of a sealed publication reserved when the
+  connection closes with a SUBSCRIBE or UNSUBSCRIBE in flight. The engine reset
+  the whole identifier pool once no publication counted as unacknowledged,
+  which ignored sealed rows, so a later publication could reuse a sealed
+  identifier and overwrite its stored row.
 
 ## [1.0.0rc16] - 2026-09-24
 
