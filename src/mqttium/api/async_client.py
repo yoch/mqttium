@@ -63,6 +63,7 @@ from mqttium.errors import (
     PublishBatchError,
     PacketTooLargeError,
     ProtocolError,
+    SessionReplayError,
 )
 from mqttium.packets import (
     AuthPacket,
@@ -1638,6 +1639,7 @@ class AsyncClient:
                                 )
                         except (
                             MandatoryResponseTooLargeError,
+                            SessionReplayError,
                             PacketTooLargeError,
                             MalformedPacketError,
                             ProtocolError,
@@ -1719,13 +1721,14 @@ class AsyncClient:
             self._propose_disconnect_cause(failure, _CAUSE_TRANSPORT)
             if self._local_terminal_failure is None and not self._will_reconnect():
                 self._fail_pending(failure)
-        except MandatoryResponseTooLargeError as exc:
+        except (MandatoryResponseTooLargeError, SessionReplayError) as exc:
             connack_fut = self._connack_fut
             if connack_fut is not None and not connack_fut.done():
                 connack_fut.set_exception(exc)
-            # The broker negotiated a legal limit, but mqttium cannot produce
-            # the mandatory automatic response within it. This is a local
-            # terminal capability failure, not a peer protocol violation.
+            # The broker negotiated legal limits, but mqttium cannot produce a
+            # mandatory response (automatic ACK, resumed-session replay) within
+            # them. This is a local terminal capability failure, not a peer
+            # protocol violation; durable session state is kept.
             self._propose_disconnect_cause(exc, _CAUSE_LOCAL)
             self._fail_pending(exc)
         except (PacketTooLargeError, MalformedPacketError, ProtocolError) as exc:
@@ -1859,6 +1862,7 @@ class AsyncClient:
             (
                 MessageDeliveryError,
                 MandatoryResponseTooLargeError,
+                SessionReplayError,
                 AssertionError,
                 ssl.SSLCertVerificationError,
                 MalformedPacketError,

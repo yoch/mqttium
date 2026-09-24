@@ -21,6 +21,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- End a resumed session with the new `SessionReplayError` when its CONNACK
+  forbids resending an unacknowledged QoS 1/2 publication (lower Maximum QoS,
+  `Retain Available` of 0 or a smaller Maximum Packet Size). The client
+  previously deleted the exchange, failed its receipt and could reuse its
+  packet identifier on the same broker session. The exchange and its packet
+  identifier are now kept, and the reconnect policy does not retry; connect
+  with `clean_start=True` to discard the session (#539).
 - End an ingress lot at the first malformed, oversized or protocol-violating
   packet, and first commit, complete and deliver the packets decoded before it.
   A later bad packet no longer rolls back an observed PUBACK, PUBCOMP, SUBACK or

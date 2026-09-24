@@ -7,7 +7,7 @@ another module does not grant the same stability tier.
 
 | Entry point | Native names |
 | --- | --- |
-| `mqttium` | `MQTTError`, `MalformedPacketError`, `ProtocolError`, `PacketTooLargeError`, `MandatoryResponseTooLargeError`, `FlowControlError`, `MessageDeliveryError`, `NotConnectedError`, `MQTTTimeoutError`, `SessionDiscardedError`, `PublishBatchError`, `BrokerDisconnectError`, `MQTTProtocolVersion`, `QoS`, `ConnectionState`, `__version__` |
+| `mqttium` | `MQTTError`, `MalformedPacketError`, `ProtocolError`, `PacketTooLargeError`, `MandatoryResponseTooLargeError`, `FlowControlError`, `MessageDeliveryError`, `NotConnectedError`, `MQTTTimeoutError`, `SessionDiscardedError`, `SessionReplayError`, `PublishBatchError`, `BrokerDisconnectError`, `MQTTProtocolVersion`, `QoS`, `ConnectionState`, `__version__` |
 | `mqttium.api` | `AsyncClient`, `Message`, `Properties`, `PublishMessage`, `PublishReceipt`, `PublishBatchReceipt`, `SubscribeResult`, `UnsubscribeResult`, `SubscribeOptions`, `ConnAckPacket`, `AuthPacket`, `NegotiatedSettings`, `ReconnectPolicy`, `MessageDelivery`, `ClientStats` |
 
 `mqttium.persistence` supports `MemoryInflightStore` and `SqliteInflightStore`.

@@ -54,6 +54,7 @@ from mqttium.errors import (
     NotConnectedError,
     PacketTooLargeError,
     ProtocolError,
+    SessionReplayError,
 )
 
 # Encoder for an allocated identifier, expected ACK type and ACK entry count.
@@ -721,6 +722,14 @@ class ProtocolEngine:
                 f"Broker maximum_packet_size {peer_maximum_packet_size} is below the "
                 "4-byte minimum required for mandatory QoS acknowledgements"
             )
+
+        if connack.session_present:
+            try:
+                self.outbound.check_session_replayable()
+            except SessionReplayError:
+                self._reauth_in_progress = False
+                self.state = ConnectionState.DISCONNECTED
+                raise
 
         self._reauth_in_progress = False
         self._auth_response_due = None
