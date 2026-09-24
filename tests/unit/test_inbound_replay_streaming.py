@@ -70,9 +70,10 @@ def test_replay_emits_a_bounded_first_batch_and_asks_for_more() -> None:
 
     assert len(message_mids(effects)) == REPLAY_BATCH_MESSAGES
     assert effects[-1].kind is EffectKind.CONTINUE_INBOUND_REPLAY
-    # The receive window is restored in full before the first redelivery, not
-    # progressively as batches are emitted.
-    assert engine.inbound._inflight == 500
+    # Replay restores durable application/protocol state, not PUBLISH quota
+    # ownership on the replacement Network Connection.
+    assert engine.inbound._inflight == 0
+    assert store.in_count() == 500
     assert engine.inbound.replay_pending is True
 
 
@@ -207,10 +208,12 @@ def test_continue_after_transport_close_cannot_drain_stale_replay() -> None:
 
 
 @pytest.mark.parametrize("kind", ["memory", "sqlite"])
-def test_completed_cursor_held_record_is_not_redelivered(
+def test_released_cursor_held_record_is_delivered_before_pubcomp(
     kind: str,
     tmp_path: Path,
 ) -> None:
+    # #520: PUBREL for a recovered row the replay has not delivered yet must
+    # not delete the last durable copy. PUBCOMP follows the delivery mark.
     store = (
         MemoryInflightStore()
         if kind == "memory"
@@ -220,18 +223,30 @@ def test_completed_cursor_held_record_is_not_redelivered(
     engine = ProtocolEngine(
         EngineConfig(client_id="completed-replay", clean_start=False), store=store
     )
-    resume_effects(engine)
+    first = resume_effects(engine)
+    assert 70 not in message_mids(first)
 
     feed_engine(engine, PubRelPacket(mid=70).encode())
-    engine.take_effects()
-    assert store.get_in(70) is None
+    assert engine.take_effects() == []
+    assert store.get_in(70) is not None
 
     later: list[int] = []
+    pubcomp_after_mark = False
     while engine.inbound.replay_pending:
         engine.continue_inbound_replay()
-        later.extend(message_mids(engine.take_effects()))
+        for effect in engine.take_effects():
+            if effect.kind is not EffectKind.MESSAGE:
+                continue
+            mid = effect.data.mid
+            later.append(mid)
+            engine.mark_inbound_delivered(mid, effect.exchange_token)
+            if mid == 70:
+                completion = engine.take_effects()
+                pubcomp_after_mark = [e.data for e in completion] == [b"\x70\x02\x00\x46"]
 
-    assert 70 not in later
+    assert later.count(70) == 1
+    assert pubcomp_after_mark
+    assert store.get_in(70) is None
     if isinstance(store, SqliteInflightStore):
         store.close()
 

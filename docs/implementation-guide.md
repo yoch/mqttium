@@ -175,6 +175,21 @@ PUBACK has been emitted but not yet handed off.
 Duplicate PUBLISH and PUBREL packets repeat the required protocol response but
 never redeliver application data. Orphan PUBREL is answered idempotently.
 
+A persisted exchange completes only after the application owns its message.
+Emitting a MESSAGE effect is not a delivery: until the runtime marks it, PUBREL
+for an undelivered QoS 2 row, and the retransmission of a recovered QoS 1 row
+in an automatically acknowledging session, record a pending completion and
+send nothing. The delivery mark then deletes the row, sends PUBCOMP or PUBACK
+and releases the slot. A pending completion is connection-scoped; the broker
+resends PUBREL (or the PUBLISH) after reconnect and finds the row again.
+
+Every persisted exchange has an identity independent of its packet
+identifier. The MESSAGE effect carries it as `exchange_token`, and
+`mark_inbound_delivered(mid, token)` ignores a token whose exchange has
+completed, so a late mark never reaches a later exchange that legally reuses
+the identifier. Direct `ProtocolEngine` consumers must mark every MESSAGE that
+`requires_delivery_mark`, exactly as they pump `continue_inbound_replay()`.
+
 ## Backpressure and rollback
 
 Logical outbound size is payload bytes plus encoded topic and properties. The
@@ -238,9 +253,15 @@ in iterator mode and completed callback invocation in callback mode.
 
 `accept()` returns `None` after an immediate handoff and an awaitable only for
 the waiting path or the fairness yield, so the common case creates no
-coroutine. Persisted marks follow the handoff and retain fail-stop semantics;
-they run synchronously when the engine lock is free and otherwise acquire it.
-No user callback executes under that lock.
+coroutine. A waiting admission reports whether it committed; one retired by a
+replaced connection or stream commits nothing. The persisted mark is taken
+synchronously with the commit, before any await, and keeps fail-stop
+semantics. It is tied to the exchange, not to the connection epoch: a message
+committed to a stream that survives reconnect stays delivered. This relies on
+the rule that no coroutine suspends while holding the engine lock
+(`tests/project/test_engine_lock_discipline.py`). Completions released by
+marks are handed to the writer once per delivery lot. No user callback
+executes under the engine lock.
 
 `EffectPump` owns only protocol work. A reader-owned `DeliveryLane` holds MESSAGE,
 DECODED_MESSAGE and CONTINUE_INBOUND_REPLAY. Each bounded lot records an epoch
@@ -293,6 +314,18 @@ EXPOSE (an effect becomes application- or wire-visible). Packets are not
 rollbackable once observed; only local state is. The read loop opens one
 outer `store.batch()` around the whole ingress lot and collects effects after
 it closes; per-packet atomicity is explicitly not specified.
+
+A peer error ends the lot at the offending packet, which may be malformed,
+oversized, or a protocol violation. The packets decoded before it form the
+lot: their store batch commits, their effects apply and their messages are
+delivered, and only then does the error retire the connection. No packet
+after it is processed. The outcome therefore does not depend on how the
+peer's bytes were split into reads (`IngressLot` formal model). Bytes after
+the connection's terminal packet (a broker DISCONNECT, for example) belong to
+no connection: whole packets there are ignored by the engine, and
+undecodable ones do not replace the terminal reason. When the engine has
+already sent its own normative DISCONNECT for a violation, the runtime sends
+no second one.
 
 A propagated failure reaches the read-loop `finally`, which advances the
 epoch, calls `notify_transport_closed()`, and collects whatever sits in

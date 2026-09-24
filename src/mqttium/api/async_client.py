@@ -70,7 +70,6 @@ from mqttium.packets import (
     SubAckPacket,
     SubscribeOptions,
     UnsubAckPacket,
-    encode_disconnect,
 )
 from mqttium.protocol.engine import (
     DisconnectInfo,
@@ -103,6 +102,7 @@ _FATAL_DISCONNECT_DRAIN_TIMEOUT = 0.25
 # Together with the 256-packet bound it caps the size of one delivery lot; it is
 # not an application memory bound and is deliberately not configurable.
 _MAX_INGRESS_BATCH_BYTES = 1 * 1024 * 1024
+_TERMINAL_ENGINE_STATES = (ConnectionState.DISCONNECTING, ConnectionState.DISCONNECTED)
 
 # Terminal-cause precedence for one connection. Real causes are first-wins:
 # the fact observed first ended the connection, and failures caused by
@@ -1548,8 +1548,16 @@ class AsyncClient:
             raise
         await self._effect_pump.drain()
 
-    def _process_ingress_batch(self) -> tuple[int, int, bool]:
-        """Decode until a byte/count bound or an auto-PUBACK handoff boundary."""
+    def _process_ingress_batch(self) -> tuple[int, int, bool, MQTTError | None]:
+        """Decode until a byte/count bound, an auto-PUBACK handoff boundary,
+        or the first peer error.
+
+        A malformed, oversized or protocol-violating packet ends the lot at
+        that packet. It is returned, not raised, so the valid prefix before it
+        commits and completes like any lot: the peer error must neither roll
+        back nor fence packets already observed, and nothing after it is
+        processed (#511, #513).
+        """
         decoder = self._decoder
         engine = self._engine
         handle_raw = engine.handle_raw
@@ -1558,10 +1566,23 @@ class AsyncClient:
         count = 0
         decoded_bytes = 0
         for _ in range(256):
-            packet = decoder.next_packet()
+            try:
+                packet = decoder.next_packet()
+            except (MalformedPacketError, PacketTooLargeError) as exc:
+                if engine.state in _TERMINAL_ENGINE_STATES:
+                    # Bytes after DISCONNECT belong to no connection: the
+                    # engine ignores whole packets there, and undecodable
+                    # ones must not replace the terminal reason either.
+                    return count, decoded_bytes, False, None
+                return count, decoded_bytes, False, exc
             if packet is None:
                 break
-            handle_raw(packet)
+            peer_error = handle_raw(packet)
+            if peer_error is not None:
+                # handle_raw() emitted it as the lot's last effect; the reader
+                # raises it after the prefix instead, so drop that copy.
+                engine._effects.pop()
+                return count + 1, decoded_bytes, False, peer_error
             count += 1
             decoded_bytes += len(packet.remaining) + 5
             # Auto-PUBACK slots remain owned until take_effects(). Stop exactly
@@ -1569,10 +1590,10 @@ class AsyncClient:
             # the effect handoff below can release them before another PUBLISH.
             # Control packets and QoS 0 traffic retain the full 256-packet batch.
             if inbound._autoack_handoff_required:
-                return count, decoded_bytes, True
+                return count, decoded_bytes, True, None
             if decoded_bytes >= max_bytes:
                 break
-        return count, decoded_bytes, False
+        return count, decoded_bytes, False, None
 
     async def _read_loop(self) -> None:  # noqa: C901
         assert self._transport is not None
@@ -1612,7 +1633,7 @@ class AsyncClient:
                         effect_start = len(self._engine._effects)
                         try:
                             with self._engine.store.batch():
-                                handled, handled_bytes, handoff_required = (
+                                handled, handled_bytes, handoff_required, peer_error = (
                                     self._process_ingress_batch()
                                 )
                         except (
@@ -1662,12 +1683,21 @@ class AsyncClient:
                         if handled and self._engine.has_pending_effects:
                             self._effect_pump.collect_from_engine()
                         protocol_target = self._effect_pump.enqueued
+                        if peer_error is not None:
+                            # Raised only after the prefix drains, but observed
+                            # now, as its PROTOCOL_ERROR effect would be.
+                            self._observe_peer_error(peer_error)
                     if self._write_pump.sealed and self._write_pump.waiters:
                         # A broker DISCONNECT sealed the writer: output parked
                         # for capacity fails now instead of blocking this lot.
                         await self._write_pump.wake_waiters()
                     await self._effect_pump.drain(target=protocol_target)
                     await self._delivery_lane.drain()
+                    if peer_error is not None:
+                        # The valid prefix is committed, acknowledged and
+                        # delivered; only now does the peer error retire the
+                        # connection.
+                        raise peer_error
                     # A batch that stopped short of both bounds emptied the
                     # buffer, so there is nothing to decode until the next
                     # read(). Re-entering only to observe handled == 0 cost a
@@ -2149,11 +2179,19 @@ class AsyncClient:
         elif kind is EffectKind.PROTOCOL_ERROR and isinstance(
             effect.data, (MalformedPacketError, ProtocolError)
         ):
-            self._propose_disconnect_cause(effect.data, _CAUSE_PROTOCOL)
-            connack_fut = self._connack_fut
-            if connack_fut is not None and not connack_fut.done():
-                connack_fut.set_exception(effect.data)
+            self._observe_peer_error(effect.data)
         return False
+
+    def _observe_peer_error(self, exc: MQTTError) -> None:
+        """Latch a peer violation and fail a pending CONNACK wait with it now.
+
+        Its ordered remainder (normative DISCONNECT, close) may wait for writer
+        capacity; connect() must report the violation, not a timeout (#540).
+        """
+        self._propose_disconnect_cause(exc, _CAUSE_PROTOCOL)
+        connack_fut = self._connack_fut
+        if connack_fut is not None and not connack_fut.done():
+            connack_fut.set_exception(exc)
 
     def _observe_broker_disconnect(self, info: DisconnectInfo) -> None:
         """Latch the broker's verdict and stop output it will never read."""
@@ -2239,13 +2277,13 @@ class AsyncClient:
         else:
             raise MQTTError(f"Non-protocol effect in protocol pump: {kind!r}")
 
-    def _apply_delivery_effect(self, effect: EngineEffect, epoch: int) -> Awaitable[None] | None:
+    def _apply_delivery_effect(self, effect: EngineEffect, epoch: int) -> Awaitable[object] | None:
         """Apply one effect of the reader's delivery lot outside protocol locks.
 
         The common case -- a message handed to its destination immediately --
         completes synchronously and returns ``None``. Waiting for delivery
-        capacity, the fairness yield, durable delivery marks and replay
-        continuation return the awaitable that finishes the effect.
+        capacity, the fairness yield and replay continuation return the
+        awaitable that finishes the effect.
         """
         kind = effect.kind
         if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
@@ -2253,22 +2291,29 @@ class AsyncClient:
             pending = self._delivery.accept(
                 message, self._message_callback, effect.decoded_property_wire_size
             )
-            if effect.requires_delivery_mark and message.mid is not None:
-                if pending is None and not self._engine_lock.locked():
-                    # No await separates the handoff from this mark, so the
-                    # free lock cannot be contended before the mark completes.
-                    self._mark_delivered_locked(message.mid)
-                    return None
-                return self._mark_delivered(message.mid, epoch, pending)
-            return pending
+            if not effect.requires_delivery_mark or message.mid is None:
+                return pending
+            if pending is None or self._delivery.mode == "callback":
+                # The application owns the message now: a callback already ran,
+                # or the iterator queue accepted it. Mark before any await, so
+                # neither teardown nor cancellation can separate the two (#517).
+                self._mark_delivered_locked(message.mid, effect.exchange_token)
+                return pending
+            return self._mark_after_admission(message.mid, effect.exchange_token, pending)
         if kind is EffectKind.CONTINUE_INBOUND_REPLAY:
             return self._continue_inbound_replay(epoch)
         raise MQTTError(f"Non-delivery effect in reader lane: {kind!r}")
 
-    def _mark_delivered_locked(self, mid: int) -> None:
-        """Record delivery of ``mid`` while the engine is exclusively owned."""
+    def _mark_delivered_locked(self, mid: int, token: object | None = None) -> None:
+        """Record delivery of ``mid`` and apply the completion it releases.
+
+        No coroutine awaits while holding ``_engine_lock``, so a synchronous
+        caller can never interleave with another engine mutation. The mark is
+        tied to the exchange (``token``), not to the connection: a message
+        committed to a stream that survives reconnect stays delivered.
+        """
         try:
-            self._engine.inbound.mark_delivered(mid)
+            self._engine.inbound.mark_delivered(mid, token)
         except Exception as exc:
             # Queue acceptance is observable, but failed durable completion
             # must retire this session before any new admission. Reader
@@ -2278,13 +2323,25 @@ class AsyncClient:
             self._engine.notify_transport_closed()
             raise
 
-    async def _mark_delivered(self, mid: int, epoch: int, pending: Awaitable[None] | None) -> None:
-        if pending is not None:
-            await pending
-        async with self._engine_lock:
-            if epoch != self._connection_epoch:
-                return
-            self._mark_delivered_locked(mid)
+    def _flush_released_completions(self) -> None:
+        """Hand the PUBCOMP/PUBACKs released by delivery marks to the writer.
+
+        The reader calls this once per delivery lot, so completions released
+        by one lot leave as a batch instead of one effect collection per
+        message.
+        """
+        if self._engine.has_pending_effects:
+            self._effect_pump.collect_from_engine()
+            self._effect_pump.drain_inline()
+
+    async def _mark_after_admission(
+        self, mid: int, token: object | None, pending: Awaitable[bool | None]
+    ) -> None:
+        # The waiting admission commits synchronously with its return, so no
+        # suspension separates the commit from the mark. A retired admission
+        # (replaced connection or stream) commits nothing and marks nothing.
+        if await pending:
+            self._mark_delivered_locked(mid, token)
 
     async def _continue_inbound_replay(self, epoch: int) -> None:
         # This marker follows its messages in the reader-owned lane. Only
@@ -2447,6 +2504,7 @@ class AsyncClient:
         """Publish a new connection epoch to every stale-work guard at once."""
         self._connection_epoch += 1
         self._delivery_lane.discard()
+        self._delivery.invalidate_waiting_admissions()
         self._write_pump.set_epoch(self._connection_epoch)
 
     async def _invalidate_connection_epoch(self) -> None:
@@ -2504,13 +2562,13 @@ class AsyncClient:
             reason = 0x95  # Packet too large
         elif isinstance(exc, MalformedPacketError):
             reason = 0x81  # Malformed Packet
+        if self._engine.state not in (ConnectionState.CONNECTING, ConnectionState.CONNECTED):
+            # The engine already ended the connection and emitted its own
+            # normative DISCONNECT (or found none it could send): never a second.
+            return
         try:
-            if self._engine.state in (ConnectionState.CONNECTING, ConnectionState.CONNECTED):
-                # Retire public admission before terminal drainage can suspend.
-                packet = self._engine.begin_disconnect(reason)
-            else:
-                packet = encode_disconnect(reason, MQTTProtocolVersion.MQTTv5)
-                self._engine._check_outbound_size(packet)
+            # Retire public admission before terminal drainage can suspend.
+            packet = self._engine.begin_disconnect(reason)
             await self._flush_terminal_packet(packet, _FATAL_DISCONNECT_DRAIN_TIMEOUT)
         except Exception:
             pass
