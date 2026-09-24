@@ -1957,7 +1957,7 @@ class AsyncClient:
                     async with self._lifecycle_lock:
                         if self._intentional_disconnect:
                             return
-                        self._lifecycle_hooks.begin_operation()
+                        hook_origin = self._lifecycle_hooks.begin_operation(preserve_hook=True)
                         lifecycle_token = self._lifecycle_hooks.token
                         previous_connack = self._connack_fut
                         await self._force_close(preserve_reconnect=True)
@@ -1998,7 +1998,11 @@ class AsyncClient:
                         # TLS setup can fail before allocating a new CONNACK
                         # waiter/reader, leaving no reader to report its cause.
                         if self._connack_fut is previous_connack:
-                            self._lifecycle_hooks.disconnected(terminal, lifecycle_token)
+                            self._lifecycle_hooks.disconnected(
+                                terminal,
+                                lifecycle_token,
+                                hook_origin,
+                            )
                         return
                     continue
         except asyncio.CancelledError:
