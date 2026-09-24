@@ -17,6 +17,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Treat a transport-originated `CancelledError` as a writer failure when the
   writer task itself has no cancellation request, so the failed generation is
   retired and pending QoS work cannot be left behind a dead writer (#509).
+- Fail-stop synchronous eager `write_nowait()` exceptions before control returns
+  to the producer, retaining ambiguous bytes only as writer ownership records
+  so they are retired without retry on the failed transport (#504).
 
 ## [1.0.0rc15] - 2026-09-23
 

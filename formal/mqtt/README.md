@@ -6,6 +6,8 @@ Current model on this branch:
 
 - `WritePumpCancellation.tla` — distinguishes lifecycle task cancellation from
   dependency-originated `CancelledError` in the writer (#509).
+- `WritePumpEagerFailure.tla` — fences synchronous eager transport failures
+  before producer control returns and prohibits retry of ambiguous bytes (#504).
 
 The models supplement executable regressions and state exploration. A committed
 TLA+ file is not, by itself, a claim that TLC was executed.

@@ -84,9 +84,9 @@ class WritePump:
         # connection.
         self._eager_generation = 0
         self._eager_rearm_scheduled = False
-        # An eager latency flush can fail after exposing bytes. Restored frames
-        # then remain ownership records only; the writer must retire them and
-        # report this failure before attempting any further transport write.
+        # A producer-side eager/latency write can fail after exposing bytes.
+        # Retained frames then remain ownership records only; the writer must
+        # retire them and report the failure before any further transport write.
         self._sealed = False
         self._latency_failure: BaseException | None = None
 
@@ -251,6 +251,15 @@ class WritePump:
             f"{size}-byte write with {self.queued_bytes} bytes already queued"
         )
 
+    def _latch_eager_failure(self, item: bytes, exc: BaseException) -> None:
+        """Retain one ambiguous eager frame for ownership-only writer retirement."""
+        self._latency_failure = exc
+        self._drop_eager_binding()
+        self.epoch += 1
+        self.queue.put_nowait(item)
+        self.queued_bytes += len(item)
+        self._admit_queued()
+
     def _try_write_data_eager(self, item: WriteItem) -> bool:
         """Write one ordinary frame straight through when doing so preserves order.
 
@@ -268,7 +277,12 @@ class WritePump:
             or not self.queue.empty()
         ):
             return False
-        if not write_nowait(item):
+        try:
+            accepted = write_nowait(item)
+        except BaseException as exc:
+            self._latch_eager_failure(item, exc)
+            raise
+        if not accepted:
             return False
         self._eager_armed = False
         self._schedule_eager_rearm()
@@ -288,7 +302,12 @@ class WritePump:
             or not self.queue.empty()
         ):
             return False
-        if not write_nowait(item):
+        try:
+            accepted = write_nowait(item)
+        except BaseException as exc:
+            self._latch_eager_failure(item, exc)
+            raise
+        if not accepted:
             return False
         self._ack_eager_armed = False
         self._schedule_eager_rearm()
