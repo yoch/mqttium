@@ -1,0 +1,22 @@
+{
+  "module": "SendQuotaOwnership.tla",
+  "status": "refinement",
+  "summary": "After a resumed session, only an exchange that sent its PUBLISH on this connection releases a send-quota slot, so unacknowledged PUBLISHes never exceed Receive Maximum.",
+  "issues": [
+    545
+  ],
+  "tests": [
+    "tests/unit/test_parked_send_quota.py"
+  ],
+  "configs": [
+    {
+      "config": "SendQuotaOwnership-rc15.cfg",
+      "expect": "violation",
+      "invariant": "WithinReceiveMaximum"
+    },
+    {
+      "config": "SendQuotaOwnership-fixed.cfg",
+      "expect": "pass"
+    }
+  ]
+}

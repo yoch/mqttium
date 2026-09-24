@@ -73,8 +73,14 @@ def test_resumed_session_replays_pubrel_when_send_quota_is_exhausted() -> None:
     assert PacketType.PUBREL.value in packet_types
     assert engine.flow.inflight == 1
 
-    # MQTT 5 §4.9 also says a PUBCOMP replenishes the current connection's
-    # send quota even when it completes a PUBREL retransmitted after reconnect.
+    # The replayed PUBREL never took a slot on this connection, so its PUBCOMP
+    # releases none: mid 1's PUBLISH still holds the only one (#545). Crediting
+    # it, as the literal §4.9 counter would, lets a second PUBLISH out while
+    # mid 1 is still unacknowledged on this connection.
     _feed(engine, encode_frame(PacketType.PUBCOMP, 0, b"\x00\x02"))
+    engine.take_effects()
+    assert engine.flow.inflight == 1
+    _feed(engine, encode_frame(PacketType.PUBREC, 0, b"\x00\x01"))
+    _feed(engine, encode_frame(PacketType.PUBCOMP, 0, b"\x00\x01"))
     engine.take_effects()
     assert engine.flow.inflight == 0

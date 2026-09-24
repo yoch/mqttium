@@ -1141,7 +1141,12 @@ class _RuntimeHarness:
         outbound = stats.outbound
         assert 0 <= outbound.inflight <= outbound.inflight_limit
         assert outbound.awaiting_slot + outbound.inflight <= outbound.unacknowledged_messages
-        assert outbound.packet_ids_in_use == outbound.unacknowledged_messages
+        # Publications sealed after their receipts failed (#521) keep their
+        # identifiers reserved but no longer count as this client's work.
+        sealed = len(self.client._engine.outbound._sealed)
+        assert outbound.packet_ids_in_use == outbound.unacknowledged_messages + sealed, (
+            "packet identifiers diverged from unfinished and sealed publications"
+        )
         if not self.client._teardown_final:
             # Receipts mirror unfinished engine records only until terminal
             # teardown fails them; durable session records legitimately

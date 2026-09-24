@@ -32,6 +32,11 @@ identifiers, and does not retry automatically. Connect again with
 only queued offline are not part of the broker session; a narrowed CONNACK
 fails each of them individually.
 
+A client that has already failed a publication's receipt (after a refused
+CONNACK, a final connection loss or `disconnect()`) never sends it again: its
+row stays in the store and is recovered by the next client or process that
+opens the store, not silently by the client that reported the failure.
+
 MQTTium does not periodically retransmit QoS messages on a healthy connection.
 Protocol replay happens after reconnect, with DUP set where MQTT requires it.
 

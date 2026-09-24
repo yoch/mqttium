@@ -1,0 +1,22 @@
+{
+  "module": "SealedFailedReceipt.tla",
+  "status": "refinement",
+  "summary": "A client never sends a publication whose receipt it already failed, while its durable row stays recoverable by another client or process.",
+  "issues": [
+    521
+  ],
+  "tests": [
+    "tests/unit/test_failed_receipt_seal.py"
+  ],
+  "configs": [
+    {
+      "config": "SealedFailedReceipt-rc15.cfg",
+      "expect": "violation",
+      "invariant": "NoSendAfterFailure"
+    },
+    {
+      "config": "SealedFailedReceipt-fixed.cfg",
+      "expect": "pass"
+    }
+  ]
+}
