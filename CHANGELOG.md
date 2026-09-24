@@ -12,6 +12,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   throttling register in benchmark runner preflights, and reject samples taken
   while the firmware reports a current limit (#493).
 
+### Fixed
+
+- Let automatic transport reconnect progress after a running `on_disconnect`
+  hook has safely entered, while keeping the later `on_connect` notification
+  serialized behind it. A hook may therefore await a durable receipt whose ACK
+  requires reconnect without deadlocking retry progress (#508).
+
 ## [1.0.0rc15] - 2026-09-23
 
 ### Fixed
