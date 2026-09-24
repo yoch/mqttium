@@ -122,7 +122,7 @@ class OutboundSession:
         self.flow = FlowControl(self.config.max_inbound_inflight)
         self._queued: deque[OutboundMessage | OutboundMessageSummary] = deque()
         # Replay-parked WAIT_* entries currently in `_queued` (see
-        # `_unpark_settled`). Zero on every path that does not involve a
+        # `_unpark`). Zero on every path that does not involve a
         # resumed session whose retransmissions exceeded the send quota.
         self._parked_entries = 0
         self._pending_messages = 0
@@ -568,18 +568,19 @@ class OutboundSession:
             return False
         self._release_reservation(meta.logical_size)
         if self._parked_entries:
-            self._unpark_settled(mid)
+            self._unpark(mid)
         return True
 
-    def _unpark_settled(self, mid: int) -> None:
-        """Drop the replay-parked queue entry of a settled exchange.
+    def _unpark(self, mid: int) -> None:
+        """Drop the replay-parked queue entry of `mid`, if any.
 
         `replay_session()` parks a WAIT_* record in `_queued` when the send
-        quota cannot admit its retransmission. The broker can still settle the
-        exchange while it is parked; the stale entry must leave the queue with
-        the record, or `drain()` would re-materialise the deleted record,
-        resurrect it through `update_out` and retransmit a settled
-        publication — and a reallocated packet identifier could later collide
+        quota cannot admit its retransmission. The broker can still settle or
+        advance the exchange while it is parked; the stale entry must leave
+        the queue with that phase, or `drain()` would re-materialise the
+        record, retransmit an exchange the broker already answered (a
+        resurrected publication, or a second PUBREL, #497) and consume a send
+        quota slot for it. A reallocated packet identifier could later collide
         with it in the queue.
         """
         queued = self._queued
@@ -637,7 +638,7 @@ class OutboundSession:
             if record is None:
                 self._send_orphan_pubrel(mid)
                 return
-            if record.state is not OutboundQoSState.WAIT_PUBREC:
+            if record.state not in (OutboundQoSState.WAIT_PUBREC, OutboundQoSState.WAIT_PUBCOMP):
                 return
             self._require_pubrel_capacity(4)
             return
@@ -648,10 +649,18 @@ class OutboundSession:
             compact=True,
         )
         if changed is not None:
+            if self._parked_entries:
+                # PUBREL needs no send quota: the parked entry just leaves.
+                self._unpark(mid)
             self._engine._send(_encode_pubrel_success(mid))
             return
-        if self.store.out_meta(mid) is None:
+        record = self.store.out_meta(mid)
+        if record is None:
             self._send_orphan_pubrel(mid)
+        elif record.state is OutboundQoSState.WAIT_PUBCOMP:
+            # A repeated successful PUBREC still requires PUBREL
+            # [MQTT-4.3.3-4]; the exchange keeps its phase and ownership (#503).
+            self._engine._send(_encode_pubrel_success(mid))
 
     def _send_orphan_pubrel(self, mid: int) -> None:
         """Answer a PUBREC with no matching record: PUBREL, 0x92 when MQTT 5."""

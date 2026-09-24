@@ -19,6 +19,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   throttling register in benchmark runner preflights, and reject samples taken
   while the firmware reports a current limit (#493).
 
+### Fixed
+
+- Answer every successful PUBREC with PUBREL: a repeated PUBREC for a QoS 2
+  publication already waiting for PUBCOMP was silently ignored (#503). A
+  successful PUBREC for an exchange still waiting behind the send quota after
+  a session resume now removes it from the queue, so it no longer sends a
+  second PUBREL and spends a send-quota slot later (#497).
+
 ## [1.0.0rc15] - 2026-09-23
 
 ### Fixed
