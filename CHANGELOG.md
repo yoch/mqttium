@@ -21,6 +21,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Release a send-quota slot only for an exchange whose PUBLISH was sent on
+  the current connection. After a resumed session, settling an exchange still
+  waiting behind the quota, or completing a replayed PUBREL, freed a slot that
+  another exchange held, so more PUBLISHes than the broker's Receive Maximum
+  could be unacknowledged at once (#545).
 - Keep the Receive Maximum slot and packet identifier of a completed inbound
   QoS 2 exchange until its PUBCOMP leaves the protocol engine, as automatic
   QoS 1 PUBACKs already did. A PUBLISH that the broker sent before it could
