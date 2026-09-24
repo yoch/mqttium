@@ -19,7 +19,7 @@ class _CancelledPublishTransport(ScriptedBrokerTransport):
         self.publish_attempts = 0
 
     async def write(self, data: bytes) -> None:
-        if data and data[0] >> 4 == int(PacketType.PUBLISH):
+        if data and data[0] & 0xF0 == int(PacketType.PUBLISH):
             self.publish_attempts += 1
             raise self.failure
         await super().write(data)
