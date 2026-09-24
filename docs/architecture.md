@@ -54,8 +54,18 @@ tested without a broker.
 ### Effects
 
 `EffectPump` owns protocol-effect ordering, connection epochs, completion
-counters and its flush task. SEND/SEND_ACK keep wire order before dependent
-application-visible work. A ready single protocol effect can apply inline.
+counters and its flush task. SEND/SEND_ACK keep wire order among themselves and
+ahead of the remaining ordered work (a local DISCONNECT's close, AUTH, a
+protocol error). A ready single protocol effect can apply inline.
+
+Facts the engine has already observed never wait in that lane. CONNACK,
+PUBLISH_COMPLETE/FAILED, SUBACK, UNSUBACK and PINGRESP are applied when their
+batch is collected, even while earlier SENDs wait for writer capacity. Their
+application depends on no earlier output, and publish admission already
+collects pending effects before it reuses an identifier. A broker DISCONNECT
+latches its cause and seals the writer at collection, so output parked for
+capacity fails at once. A peer protocol error fails a pending CONNACK wait at
+collection.
 MESSAGE, DECODED_MESSAGE and CONTINUE_INBOUND_REPLAY belong to a separate
 reader-owned `DeliveryLane`, which creates no task of its own.
 
