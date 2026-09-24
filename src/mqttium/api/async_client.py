@@ -2067,7 +2067,7 @@ class AsyncClient:
                     async with self._lifecycle_lock:
                         if self._intentional_disconnect:
                             return
-                        self._lifecycle_hooks.begin_operation()
+                        hook_origin = self._lifecycle_hooks.begin_operation(preserve_hook=True)
                         lifecycle_token = self._lifecycle_hooks.token
                         previous_connack = self._connack_fut
                         await self._force_close(preserve_reconnect=True)
@@ -2080,10 +2080,14 @@ class AsyncClient:
                         )
                     if self.is_connected:
                         self._lifecycle_hooks.connected(connack, lifecycle_token)
-                    # Only clear backoff after the connection stays up.
+                    # Only clear backoff after the connection stays up, but
+                    # retry at once if it drops first: stable_after is a
+                    # backoff-reset threshold, not a dwell time (#542).
                     policy = self._reconnect.policy
                     assert policy is not None
-                    await asyncio.sleep(policy.stable_after)
+                    reader = self._reader_task
+                    if reader is not None and not reader.done():
+                        await asyncio.wait({reader}, timeout=policy.stable_after)
                     cause = self._local_terminal_failure
                     if cause is not None:
                         # A local-terminal failure landed while this attempt
@@ -2116,7 +2120,9 @@ class AsyncClient:
                         # TLS setup can fail before allocating a new CONNACK
                         # waiter/reader, leaving no reader to report its cause.
                         if self._connack_fut is previous_connack:
-                            self._lifecycle_hooks.disconnected(terminal, lifecycle_token)
+                            self._lifecycle_hooks.disconnected(
+                                terminal, lifecycle_token, hook_origin
+                            )
                         return
                     continue
         finally:

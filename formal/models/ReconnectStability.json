@@ -1,0 +1,22 @@
+{
+  "module": "ReconnectStability.tla",
+  "status": "refinement",
+  "summary": "A replacement connection lost inside stable_after makes the next retry runnable at once instead of after the stability timer.",
+  "issues": [
+    542
+  ],
+  "tests": [
+    "tests/unit/test_disconnect_hook_reconnect_progress.py"
+  ],
+  "configs": [
+    {
+      "config": "ReconnectStability-rc15.cfg",
+      "expect": "violation",
+      "invariant": "NoSleepThroughLoss"
+    },
+    {
+      "config": "ReconnectStability-fixed.cfg",
+      "expect": "pass"
+    }
+  ]
+}
