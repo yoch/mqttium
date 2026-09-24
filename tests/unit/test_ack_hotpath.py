@@ -21,6 +21,7 @@ from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
 from mqttium.types import Properties
+from tests.support import mark_delivered_messages
 
 
 def test_auto_qos1_puback_skips_packet_dataclass(monkeypatch) -> None:
@@ -157,7 +158,7 @@ def test_success_pubrel_uses_the_bound_v311_decoder() -> None:
             pack_utf8("ack/hot") + pack_u16(9) + b"payload",
         )
     )
-    engine.take_effects()
+    mark_delivered_messages(engine, engine.take_effects())
 
     engine.handle_raw(RawPacket(PacketType.PUBREL, 0x02, pack_u16(9)))
     effects = engine.take_effects()

@@ -15,6 +15,7 @@ from mqttium.persistence import MemoryInflightStore, SqliteInflightStore
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
 from mqttium.types import InboundMessage, Properties
+from tests.support import mark_delivered_messages
 
 
 class FailingInboundStore(MemoryInflightStore):
@@ -225,7 +226,7 @@ def test_qos2_pubrel_releases_reserved_bytes() -> None:
 
     feed(engine, packet.encode())
     assert engine.inbound.stats().inflight_bytes > 0
-    engine.take_effects()
+    mark_delivered_messages(engine, engine.take_effects())
 
     feed(engine, PubRelPacket(mid=12).encode())
 
@@ -273,6 +274,7 @@ def test_sqlite_reopen_restores_and_releases_bytes_without_payload_read(tmp_path
         mid=19,
     )
     feed(first, packet.encode())
+    mark_delivered_messages(first, first.take_effects())
     expected = first.inbound.stats().inflight_bytes
     first_store.close()
 

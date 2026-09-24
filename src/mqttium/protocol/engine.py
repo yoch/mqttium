@@ -49,6 +49,7 @@ from mqttium.transport.writes import WriteItem, item_size
 from mqttium.types import Message, Properties
 from mqttium.errors import (
     MalformedPacketError,
+    MQTTError,
     MandatoryResponseTooLargeError,
     NotConnectedError,
     PacketTooLargeError,
@@ -202,9 +203,12 @@ class ProtocolEngine:
         *,
         requires_delivery_mark: bool = False,
         decoded_property_wire_size: int | None = None,
+        exchange_token: object | None = None,
     ) -> None:
         self._effects.append(
-            EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)
+            EngineEffect(
+                kind, data, requires_delivery_mark, decoded_property_wire_size, exchange_token
+            )
         )
 
     def _send(self, packet: WriteItem) -> None:
@@ -538,7 +542,12 @@ class ProtocolEngine:
         if was != ConnectionState.DISCONNECTED:
             self._emit(EffectKind.DISCONNECTED, DisconnectInfo(from_broker=False))
 
-    def handle_raw(self, raw: RawPacket) -> None:
+    def handle_raw(self, raw: RawPacket) -> MQTTError | None:
+        """Apply one packet; return the peer error turned into PROTOCOL_ERROR.
+
+        A returned error is also the last effect emitted. Packets after it
+        belong to a failed connection: the caller stops feeding this lot.
+        """
         # DISCONNECT is the client's final MQTT Control Packet. The peer may still
         # have packets already in flight before the transport actually closes, but
         # dispatching them could emit ACKs or user-visible effects after DISCONNECT.
@@ -547,7 +556,7 @@ class ProtocolEngine:
         # packets would otherwise surface as a PROTOCOL_ERROR that masks the
         # real disconnect reason at the runtime boundary.
         if self.state in (ConnectionState.DISCONNECTING, ConnectionState.DISCONNECTED):
-            return
+            return None
         try:
             validate_raw_packet(raw)
             handlers = self._handlers_by_state.get(self.state)
@@ -572,6 +581,7 @@ class ProtocolEngine:
             # failures that did not already call _protocol_disconnect(). Keep
             # the category so it can select the normative MQTT 5 reason code.
             self._emit(EffectKind.PROTOCOL_ERROR, exc)
+            return exc
         except Exception:
             # Any other exception (store/persistence failure, unexpected bug)
             # is local, not a peer protocol violation: it propagates with its
@@ -579,6 +589,7 @@ class ProtocolEngine:
             # reconnect-gates it as a local failure. Terminal broker outcomes
             # already observed were emitted by the handler before raising.
             raise
+        return None
 
     def _validate_connack_v5(self, connack: ConnAckPacket) -> None:
         """Enforce the MQTT 5 CONNACK property obligations before acceptance."""
@@ -733,8 +744,16 @@ class ProtocolEngine:
         """
         self.inbound.drain_replay()
 
-    def mark_inbound_delivered(self, mid: int) -> None:
-        self.inbound.mark_delivered(mid)
+    def mark_inbound_delivered(self, mid: int, token: object | None = None) -> None:
+        """Record that the application owns an inbound message.
+
+        ``token`` is the MESSAGE effect's ``exchange_token``; a mark for an
+        exchange that has since completed is ignored. A persisted QoS 2
+        exchange (or a recovered QoS 1 exchange acknowledged automatically)
+        is completed only after this commit, so direct engine consumers must
+        mark every MESSAGE that ``requires_delivery_mark``.
+        """
+        self.inbound.mark_delivered(mid, token)
 
     def ack(self, mid: int, *, message: Message | None = None) -> None:
         """Complete a deferred inbound ACK in manual-ack mode."""

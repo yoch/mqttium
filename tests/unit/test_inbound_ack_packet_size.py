@@ -22,6 +22,7 @@ from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
 from mqttium.protocol.reconnect import ReconnectPolicy
 from mqttium.types import Properties
+from tests.support import mark_delivered_messages
 
 
 def _feed(engine: ProtocolEngine, wire: bytes) -> None:
@@ -98,7 +99,7 @@ def test_automatic_puback_at_exact_broker_packet_limit_is_emitted() -> None:
 def test_qos2_at_exact_broker_packet_limit_completes_exchange() -> None:
     engine = _connected_engine()
     _feed(engine, _publish(QoS.EXACTLY_ONCE))
-    first = engine.take_effects()
+    first = mark_delivered_messages(engine, engine.take_effects())
     assert [e.data for e in first if e.kind is EffectKind.SEND_ACK] == [b"\x50\x02\x00\x07"]
     assert engine.store.get_in(7) is not None
     _feed(engine, encode_pubrel_success(7))

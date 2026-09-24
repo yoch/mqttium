@@ -117,6 +117,12 @@ bounded replay batch. This places delivery backpressure between batches and
 keeps memory proportional to one batch. Direct `ProtocolEngine` consumers must
 pump `continue_inbound_replay()` while replay remains pending.
 
+A persisted inbound exchange completes (PUBCOMP, or PUBACK of a recovered
+QoS 1 row) only after its delivery is marked. The runtime marks at the
+application commit, with the MESSAGE effect's `exchange_token`; direct engine
+consumers must call `mark_inbound_delivered(mid, token)` themselves. No
+coroutine may await while holding `_engine_lock`.
+
 ## Persistence
 
 `InflightStore` is a complete internal protocol with required paged replay and
