@@ -13,7 +13,10 @@ this guide takes precedence over the higher-level description in `architecture.m
    non-segmented frame straight through the transport's optional
    `write_nowait`, which saves the event-loop turn the writer task would
    otherwise cost. A segmented frame is never written that way, because it is
-   two consecutive writes and nothing may land between them.
+   two consecutive writes and nothing may land between them. If `write_nowait`
+   raises, the transport may already own any prefix of the frame: the writer
+   generation is retired before the exception reaches the producer, and the
+   frame is kept only as an ownership record, never written again.
 2. **One effect stream.** Engine sessions emit through `ProtocolEngine`; no
    component keeps a second effect list.
 3. **Register completion before sending.** A receipt or SUBACK/UNSUBACK future

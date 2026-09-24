@@ -21,6 +21,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Retire the writer generation before a synchronous `write_nowait()` failure
+  reaches the publisher, and never retry the possibly partly written frame.
+  Another producer could previously keep writing into the failed transport
+  while the connection stayed up (#504, ported from #515).
 - Report a `CancelledError` raised by a dependency (transport read, write,
   `write_nowait` or close, transport factory, publication source, keepalive)
   as an `MQTTError` that keeps it as `__cause__`, instead of treating it as a
