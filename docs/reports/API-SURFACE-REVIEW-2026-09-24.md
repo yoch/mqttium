@@ -18,6 +18,17 @@ accepted change updates together with `docs/api-stability.md`,
 Legend: **K** keep · **R** remove · **P** make private or Internal ·
 **S** reshape.
 
+## Decisions recorded (maintainer, 2026-09-24)
+
+| Scope | Decision |
+| --- | --- |
+| §1 dead items D1–D6 | Remove or make Internal as proposed. |
+| §2 duplicates U2–U5 | Remove as proposed. U7 kept. |
+| §3 leaks L1–L6, L8 | Fix as proposed. |
+| E2 `MQTTTimeoutError` | Also derive from `TimeoutError`. |
+| §6 stores | Classes public (both), protocol methods Internal. |
+| Pending | D7 (`will`), §5 statistics, U1, U6, L7, E5. |
+
 ## 1. Dead or misleading items
 
 | # | Item | Tier | Evidence | Proposal | Reason | Migration |
