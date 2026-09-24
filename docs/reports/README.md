@@ -20,6 +20,7 @@ Status meanings:
 
 | Report | Status | Use instead or interpretation |
 | --- | --- | --- |
+| [API-SURFACE-REVIEW-2026-09-24](API-SURFACE-REVIEW-2026-09-24.md) | Current evidence | Pre-1.0 inventory of the supported surface with remove, privatise or reshape proposals; store decision recorded (classes public, protocol methods Internal) |
 | [RELEASE-CANDIDATE-1.0.0rc16](RELEASE-CANDIDATE-1.0.0rc16.md) | Current evidence | RC16 content (rc15 formal audit, 39 findings), CI/soak/interoperability, ARM64 network and open-loop gates against RC15 showing no further loop-lag regression; issue #493 against RC14 remains open for 1.0 |
 | [RELEASE-CANDIDATE-1.0.0rc15](RELEASE-CANDIDATE-1.0.0rc15.md) | Current evidence | RC15 audit blockers closed (#490–#492), CI/soak/interoperability, and the accepted 64-byte saturation loop-lag finding with the open-loop gate reliability caveat (issue #493) |
 | [RELEASE-PREPARATION-2026-09-22](RELEASE-PREPARATION-2026-09-22.md) | Current evidence | #457 integration, applied PR triage, API/documentation audit, exact-source validation and release-note draft; long campaigns and final promotion remain explicitly pending at this checkpoint |
