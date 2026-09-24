@@ -11,7 +11,7 @@ refuses silent reuse.
 
 from __future__ import annotations
 
-from tests.support import stored_record
+from tests.support import stored_record, mark_delivered_messages
 
 import asyncio
 from collections.abc import Iterator
@@ -510,7 +510,7 @@ def _qos2_exchange(engine: ProtocolEngine, mid: int = 31) -> None:
             ).encode()
         )
     )
-    engine.take_effects()
+    mark_delivered_messages(engine, engine.take_effects())
 
 
 def test_pubrel_store_divergence_traverses_unchanged() -> None:

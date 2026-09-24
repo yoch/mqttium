@@ -207,8 +207,24 @@ class WritePump:
     async def join(self) -> None:
         await self.queue.join()
 
-    async def advance_epoch(self, epoch: int) -> None:
+    @property
+    def sealed(self) -> bool:
+        return self._sealed
+
+    def seal(self) -> None:
+        """Refuse every later admission on this connection until reset().
+
+        Producers already parked for capacity fail once woken
+        (wake_waiters()).
+        """
+        self._sealed = True
+
+    def set_epoch(self, epoch: int) -> None:
+        """Invalidate earlier-epoch admissions without suspending."""
         self.epoch = epoch
+
+    async def advance_epoch(self, epoch: int) -> None:
+        self.set_epoch(epoch)
         await self.wake_waiters()
 
     async def wake_waiters(self) -> None:

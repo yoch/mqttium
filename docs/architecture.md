@@ -54,8 +54,26 @@ tested without a broker.
 ### Effects
 
 `EffectPump` owns protocol-effect ordering, connection epochs, completion
-counters and its flush task. SEND/SEND_ACK keep wire order before dependent
-application-visible work. A ready single protocol effect can apply inline.
+counters and its flush task. SEND/SEND_ACK keep wire order among themselves and
+ahead of the remaining ordered work (a local DISCONNECT's close, a protocol
+error). A ready single protocol effect can apply inline.
+
+Facts the engine has already observed never wait in that lane. CONNACK,
+PUBLISH_COMPLETE/FAILED, SUBACK, UNSUBACK and PINGRESP are applied when their
+batch is collected, even while earlier SENDs wait for writer capacity. Their
+application depends on no earlier output, and publish admission already
+collects pending effects before it reuses an identifier. A broker DISCONNECT
+latches its cause and seals the writer at collection, so output parked for
+capacity fails at once. A peer protocol error fails a pending CONNACK wait at
+collection.
+A Server AUTH is handed at collection to one `AuthExchange` task per client,
+which runs `auth_handler` calls in arrival order outside the effect lane and the
+reader. The handler may therefore await client operations, messages from the
+same read, existing receipts or `disconnect()`. Each AUTH Continue carries a
+challenge token; `ProtocolEngine.respond_auth()` sends the handler's answer only
+while the exchange still waits for that challenge, so an answer to AUTH Success
+or after the connection ended is dropped. Connection retirement cancels the
+task without joining it.
 MESSAGE, DECODED_MESSAGE and CONTINUE_INBOUND_REPLAY belong to a separate
 reader-owned `DeliveryLane`, which creates no task of its own.
 
@@ -100,6 +118,12 @@ inline synchronous callback invocation, stream close/reset, and delivery
 statistics. It deliberately does not own MQTT state, transport state, or
 reconnect policy.
 
+Handing a message to the application is the commit point of a persisted
+inbound exchange. The reader marks the delivery synchronously at that commit,
+with the exchange identity the engine attached to the MESSAGE effect, and only
+then may the engine send the PUBCOMP (or the PUBACK of a recovered QoS 1 row)
+that ends the exchange.
+
 Topic-filtered callbacks live on `AsyncClient`. `TopicMatcher` chooses which
 application callable receives a delivered message; the protocol engine still
 emits undifferentiated MESSAGE effects and never imports dispatch code.
@@ -133,7 +157,8 @@ active hooks; an operation awaited directly by the current hook preserves its
 caller. The supervisor reaps the old child before invoking its successor.
 Network operations do not wait for hook completion, and `on_connect` does not
 hold incoming delivery. Automatic reconnect waits for `on_disconnect`, then
-rechecks explicit intent. AUTH retains its separate protocol timeout.
+rechecks explicit intent. AUTH retains its separate protocol timeout and
+task (see Effects).
 
 `messages()` captures the delivery generation when called, even if its returned
 iterator is never advanced. Closing and reopening delivery leaves old iterators

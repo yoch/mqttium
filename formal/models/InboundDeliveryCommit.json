@@ -1,0 +1,37 @@
+{
+  "module": "InboundDeliveryCommit.tla",
+  "status": "refinement",
+  "summary": "A persisted inbound exchange completes only after the application owns its message, and delivery marks carry the exchange identity instead of the connection epoch.",
+  "issues": [
+    517,
+    519,
+    520,
+    534
+  ],
+  "tests": [
+    "tests/unit/test_inbound_delivery_commit.py",
+    "tests/unit/test_inbound_replay_streaming.py",
+    "tests/fuzz/test_stateful_invariants.py"
+  ],
+  "configs": [
+    {
+      "config": "InboundDeliveryCommit-rc15-completion.cfg",
+      "expect": "violation",
+      "invariant": "CompletedOnlyAfterOwnership"
+    },
+    {
+      "config": "InboundDeliveryCommit-rc15-reuse.cfg",
+      "expect": "violation",
+      "invariant": "MarkBelongsToItsExchange"
+    },
+    {
+      "config": "InboundDeliveryCommit-rc15-mark.cfg",
+      "expect": "violation",
+      "invariant": "OwnedMessagesStayMarked"
+    },
+    {
+      "config": "InboundDeliveryCommit-fixed.cfg",
+      "expect": "pass"
+    }
+  ]
+}

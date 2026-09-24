@@ -1,0 +1,31 @@
+{
+  "module": "ResumedSessionReplay.tla",
+  "status": "refinement",
+  "summary": "A resumed session whose CONNACK forbids resending a live exchange ends the connection and keeps the exchange and its packet id, instead of discarding it and reusing the id.",
+  "issues": [
+    539
+  ],
+  "tests": [
+    "tests/unit/test_resumed_session_replay_conflict.py"
+  ],
+  "configs": [
+    {
+      "config": "ResumedSessionReplay-rc15-forbidden.cfg",
+      "expect": "violation",
+      "invariant": "ResumedKeepsExchange"
+    },
+    {
+      "config": "ResumedSessionReplay-rc15-reuse.cfg",
+      "expect": "violation",
+      "invariant": "NoLiveMidReuse"
+    },
+    {
+      "config": "ResumedSessionReplay-fixed-forbidden.cfg",
+      "expect": "pass"
+    },
+    {
+      "config": "ResumedSessionReplay-fixed-allowed.cfg",
+      "expect": "pass"
+    }
+  ]
+}

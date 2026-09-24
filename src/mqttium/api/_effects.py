@@ -19,30 +19,65 @@ if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
 
 
+# Facts the engine already observed, applied when collected: their
+# application depends on no earlier output, so they never wait in the lane
+# behind SENDs blocked on writer capacity (#531 #532 #536 #540 #524 #526).
+# AUTH is handed to its owned task at the same point, so user code never runs
+# inside the lane or the reader (#501 #502 #523 #527).
+IMMEDIATE_EFFECTS = frozenset(
+    {
+        EffectKind.AUTH,
+        EffectKind.CONNACK,
+        EffectKind.PUBLISH_COMPLETE,
+        EffectKind.PUBLISH_FAILED,
+        EffectKind.SUBACK,
+        EffectKind.UNSUBACK,
+        EffectKind.PINGRESP,
+    }
+)
+# Facts whose cause and waiters are established at collection while their
+# ordered remainder (closing the transport, raising the error) stays queued.
+EARLY_OBSERVATIONS = frozenset({EffectKind.DISCONNECTED, EffectKind.PROTOCOL_ERROR})
+_DELIVERIES = frozenset(
+    {EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE, EffectKind.CONTINUE_INBOUND_REPLAY}
+)
+
+
 def _partition_effects(
     effects: list[EngineEffect],
-) -> tuple[list[EngineEffect], list[EngineEffect], bool]:
-    """Preserve wire/result order while separating reader-owned delivery."""
+) -> tuple[list[EngineEffect], list[EngineEffect], list[EngineEffect], bool]:
+    """Split one batch in a single pass.
+
+    Returns the ordered lane (SENDs first, in wire order, then the remaining
+    ordered work), reader-owned deliveries, and observations to apply now.
+    """
     sends: list[EngineEffect] = []
     others: list[EngineEffect] = []
     deliveries: list[EngineEffect] = []
+    observed: list[EngineEffect] = []
     reordered = False
     for effect in effects:
-        if effect.kind is EffectKind.SEND or effect.kind is EffectKind.SEND_ACK:
+        kind = effect.kind
+        if kind is EffectKind.SEND or kind is EffectKind.SEND_ACK:
             if others or deliveries:
                 reordered = True
             sends.append(effect)
-        elif effect.kind in (
-            EffectKind.MESSAGE,
-            EffectKind.DECODED_MESSAGE,
-            EffectKind.CONTINUE_INBOUND_REPLAY,
-        ):
+        elif kind in _DELIVERIES:
             deliveries.append(effect)
+        elif kind in IMMEDIATE_EFFECTS:
+            observed.append(effect)
         else:
+            if kind in EARLY_OBSERVATIONS:
+                observed.append(effect)
             others.append(effect)
-    if reordered or deliveries:
+    if reordered or deliveries or observed:
         effects = sends + others
-    return effects, deliveries, reordered
+    return effects, deliveries, observed, reordered
+
+
+# Rank of an effect-application failure in AsyncClient's terminal-cause
+# precedence (a transport-level failure of the connection).
+_CAUSE_TRANSPORT = 1
 
 
 class StaleConnectionEffect(Exception):
@@ -57,6 +92,8 @@ class EffectOwner(Protocol):
 
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool: ...
 
+    def _apply_observation(self, effect: EngineEffect) -> bool: ...
+
     async def _apply_effect(
         self,
         effect: EngineEffect,
@@ -68,6 +105,8 @@ class EffectOwner(Protocol):
     async def _close_transport_after_connection_failure(self) -> None: ...
 
     def _settle_terminal_effect(self, effect: EngineEffect) -> None: ...
+
+    def _propose_disconnect_cause(self, exc: BaseException, rank: int) -> BaseException: ...
 
 
 class EffectPump:
@@ -105,6 +144,7 @@ class EffectPump:
         self.reordered_batches = 0
         self.inline_effects = 0
         self.apply_suspensions = 0
+        self.observations = 0
 
     def collect_from_engine(self) -> None:
         effects = self.owner._engine.take_effects()
@@ -130,27 +170,20 @@ class EffectPump:
             return
 
         deliveries: list[EngineEffect] = []
-        if len(effects) == 1:
-            effect = effects[0]
-            if effect.kind in (
-                EffectKind.MESSAGE,
-                EffectKind.DECODED_MESSAGE,
-                EffectKind.CONTINUE_INBOUND_REPLAY,
-            ):
-                self.owner._delivery_lane.collect(effects, epoch, self.enqueued)
-                self.pending_high_water = max(
-                    self.pending_high_water,
-                    len(self.pending) + self.owner._delivery_lane.outstanding,
-                )
-                return
-            if not self.pending and self.owner._apply_effect_inline(effect, epoch):
-                self.inline_effects += 1
-                return
+        if len(effects) == 1 and self._collect_single(effects, epoch):
+            return
 
         if len(effects) > 1:
             self.multi_effect_batches += 1
-            effects, deliveries, reordered = _partition_effects(effects)
+            effects, deliveries, observed, reordered = _partition_effects(effects)
             self.reordered_batches += reordered
+            if observed:
+                self.observations += len(observed)
+                apply_observation = self.owner._apply_observation
+                for effect in observed:
+                    apply_observation(effect)
+                if not effects and not deliveries:
+                    return
         if not self.pending:
             self.pending_epoch = epoch
         self.pending.extend(effects)
@@ -161,6 +194,26 @@ class EffectPump:
             self.pending_high_water,
             len(self.pending) + self.owner._delivery_lane.outstanding,
         )
+
+    def _collect_single(self, effects: list[EngineEffect], epoch: int) -> bool:
+        """Handle a one-effect batch without queueing it when possible."""
+        effect = effects[0]
+        kind = effect.kind
+        if kind in _DELIVERIES:
+            self.owner._delivery_lane.collect(effects, epoch, self.enqueued)
+            self.pending_high_water = max(
+                self.pending_high_water,
+                len(self.pending) + self.owner._delivery_lane.outstanding,
+            )
+            return True
+        if not self.pending and self.owner._apply_effect_inline(effect, epoch):
+            self.inline_effects += 1
+            return True
+        if kind in IMMEDIATE_EFFECTS or kind in EARLY_OBSERVATIONS:
+            # Behind pending output: observe now, never wait behind it.
+            self.observations += 1
+            return self.owner._apply_observation(effect)
+        return False
 
     def counters(self) -> dict[str, int]:
         """Deque occupancy and the scheduling decisions taken so far.
@@ -181,6 +234,7 @@ class EffectPump:
             "reordered_batches": self.reordered_batches,
             "inline_effects": self.inline_effects,
             "apply_suspensions": self.apply_suspensions,
+            "observations": self.observations,
         }
 
     def _complete(self) -> None:
@@ -272,7 +326,7 @@ class EffectPump:
         # Connection health always belongs to AsyncClient's reader-owned
         # lifecycle. Active drain() calls still receive the same original
         # exception above.
-        self.owner._disconnect_exc = exc
+        self.owner._propose_disconnect_cause(exc, _CAUSE_TRANSPORT)
         self._failing_close = True
         try:
             self.discard_connection_effects(settle_publish=True)

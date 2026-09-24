@@ -185,23 +185,22 @@ async def test_ack_released_between_drain_and_lock_is_settled_first(protocol, un
         transport.gate.set()
         await reached.wait()
 
-        # The old ACK frees its identifier after the drain and before the lock.
+        # The old ACK frees its identifier after the drain and before the lock,
+        # while output (the incoming PUBLISH's PUBACK) is blocked on capacity.
         await _saturate_writer(transport, client)
         transport.push_rx(transport.acknowledgement(mid, unsubscribe) + _incoming(protocol, 8))
         await wait_until(lambda: client._write_pump.waiters == 1)
         assert not client._engine.outbound.packet_ids.in_use(mid)
-        assert not first.done()
+        # The observed ACK settles its request at once, behind no output
+        # (#524); the identifier is therefore safe to reuse from here on.
+        assert (await asyncio.wait_for(first, 1)).mid == mid
+        assert mid not in futures
         resume.set()
-        # The lock recheck must send the request back to drain, not allocate.
-        await wait_until(lambda: drains[0] >= 2 or client._engine.outbound.packet_ids.in_use(mid))
-        assert not client._engine.outbound.packet_ids.in_use(mid)
-        assert transport.requests == [mid]
-        assert list(futures) == [mid]
 
         transport.gate.set()
         await wait_until(lambda: len(transport.requests) == 2)
         assert transport.requests == [mid, mid]
-        assert (await asyncio.wait_for(first, 1)).mid == mid
+        assert list(futures) == [mid]
         assert not second.done()
         transport.push_rx(transport.acknowledgement(mid, unsubscribe))
         assert (await asyncio.wait_for(second, 1)).mid == mid
