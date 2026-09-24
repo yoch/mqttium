@@ -1,0 +1,16 @@
+{
+  "module": "InboundSession.tla",
+  "status": "legacy-flag",
+  "summary": "Durable inbound QoS state is independent of the current connection's Receive Maximum; QoS 2 phases are monotonic.",
+  "issues": [
+    498,
+    499
+  ],
+  "tests": [],
+  "configs": [
+    {
+      "config": "InboundSession.cfg",
+      "expect": "pass"
+    }
+  ]
+}

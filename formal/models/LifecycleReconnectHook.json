@@ -1,0 +1,20 @@
+{
+  "module": "LifecycleReconnectHook.tla",
+  "status": "legacy-flag",
+  "summary": "Automatic reconnect must not wait for an on_disconnect hook that waits for work the replacement connection completes.",
+  "issues": [
+    508
+  ],
+  "tests": [],
+  "configs": [
+    {
+      "config": "LifecycleReconnectHook-rc15.cfg",
+      "expect": "violation",
+      "invariant": "NoHookReceiptReconnectCycle"
+    },
+    {
+      "config": "LifecycleReconnectHook-fixed.cfg",
+      "expect": "pass"
+    }
+  ]
+}
