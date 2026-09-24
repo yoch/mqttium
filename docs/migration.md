@@ -37,6 +37,20 @@ is the version an application actually upgrades from.
 | Custom engine/store/transport integration guarantees | Internal implementation interfaces |
 | `SubscribeResult.from_packet()` / `UnsubscribeResult.from_packet()` | Use the results returned by `subscribe()` / `unsubscribe()`, or construct `SubscribeResult(mid=..., reason_codes=...)`; decoded SUBACK/UNSUBACK packets remain Internal |
 
+## Changes since 1.0.0rc16
+
+The pre-1.0 surface review (`docs/reports/API-SURFACE-REVIEW-2026-09-24.md`)
+removes contracts that had no effect or no use.
+
+| 1.0.0rc16 contract | Replacement |
+| --- | --- |
+| `MQTTProtocolVersion.MQTTv31` (always refused) | None; MQTT 3.1 is unsupported. Use `MQTTv311` or `MQTTv5` |
+| `ConnectionState.RECONNECTING` (never reported) | None; automatic retry reports `CONNECTING` then `CONNECTED` or `DISCONNECTED` |
+| `NegotiatedSettings.effective_keepalive` | `NegotiatedSettings.server_keep_alive` (`None` means the requested keepalive applies) |
+| `NegotiatedSettings.effective_client_id(local)` | `AsyncClient.effective_client_id` |
+| `NegotiatedSettings.from_connack()` | Internal; read `AsyncClient.negotiated` |
+| Encoding and decoding methods of `SubscribeOptions`, `ConnAckPacket`, `AuthPacket` | Internal; construct the models and read their fields |
+
 ## Frozen constructor and snapshot vocabulary
 
 The constructor names every bound after the thing it bounds and refuses

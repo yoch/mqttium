@@ -61,7 +61,8 @@ def test_negotiated_settings_applied() -> None:
     assert n.maximum_packet_size == 200
     assert n.topic_alias_maximum == 3
     assert n.server_keep_alive == 25
-    assert n.effective_client_id("c") == "broker-id"
+    assert n.assigned_client_identifier == "broker-id"
+    assert engine.effective_client_id == "broker-id"
 
     with pytest.raises(ProtocolError, match="maximum_qos"):
         engine.queue_publish("t", b"x", qos=2)
@@ -167,7 +168,7 @@ def test_reconnect_policy_terminal_codes() -> None:
 
 
 def test_negotiated_from_empty_props_defaults() -> None:
-    n = NegotiatedSettings.from_connack(None, requested_keepalive=60)
+    n = NegotiatedSettings._from_connack(None, requested_keepalive=60)
     assert n.receive_maximum == 65535
     assert n.maximum_qos == 2
     assert n.retain_available is True
