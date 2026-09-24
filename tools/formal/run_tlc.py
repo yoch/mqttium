@@ -157,8 +157,11 @@ def run_check(check: Check, jar: Path, java: str) -> Outcome:
             "-cp",
             str(jar),
             "tlc2.TLC",
+            # One worker keeps breadth-first order deterministic: with several,
+            # a deadlock one level below a violation can be reported first, so
+            # the declared outcome would depend on thread scheduling.
             "-workers",
-            "auto",
+            "1",
             "-metadir",
             metadir,
             "-config",
