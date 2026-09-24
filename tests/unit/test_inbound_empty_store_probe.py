@@ -12,7 +12,7 @@ from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
 from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.engine import EffectKind, ProtocolEngine
-from tests.support import feed_engine
+from tests.support import feed_engine, mark_delivered_messages
 
 
 class CountingMemoryStore(MemoryInflightStore):
@@ -134,7 +134,7 @@ def test_qos2_occupancy_restores_probes_then_releases_them() -> None:
     engine = _connect(store)
 
     _publish(engine, 7, QoS.EXACTLY_ONCE, b"held")
-    engine.take_effects()
+    mark_delivered_messages(engine, engine.take_effects())
     assert engine.inbound._stored_inbound == 1
     qos2_probes = store.contains_in_calls + store.in_meta_calls
     assert qos2_probes == 0, "the first QoS 2 PUBLISH finds an empty store"
@@ -160,7 +160,7 @@ def test_recovered_qos2_occupancy_returns_to_empty_probe_fast_path() -> None:
     store = CountingMemoryStore()
     first = _connect(store)
     _publish(first, 17, QoS.EXACTLY_ONCE, b"persisted")
-    first.take_effects()
+    mark_delivered_messages(first, first.take_effects())
     assert first.inbound._stored_inbound == 1
 
     recovered = _connect(store, clean_start=False, session_present=True)

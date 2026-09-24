@@ -46,6 +46,10 @@ class EngineEffect:
     # this fresh PUBLISH. None means no trusted decode-time size is available;
     # store/replay effects deliberately omit it.
     decoded_property_wire_size: int | None = None
+    # MESSAGE only: identity of the persisted inbound exchange this delivery
+    # belongs to. A delivery mark carrying it can never reach a later exchange
+    # that legally reuses the same packet identifier.
+    exchange_token: object | None = None
 
 
 @dataclass(slots=True)

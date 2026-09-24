@@ -2158,13 +2158,13 @@ class AsyncClient:
         else:
             raise MQTTError(f"Non-protocol effect in protocol pump: {kind!r}")
 
-    def _apply_delivery_effect(self, effect: EngineEffect, epoch: int) -> Awaitable[None] | None:
+    def _apply_delivery_effect(self, effect: EngineEffect, epoch: int) -> Awaitable[object] | None:
         """Apply one effect of the reader's delivery lot outside protocol locks.
 
         The common case -- a message handed to its destination immediately --
         completes synchronously and returns ``None``. Waiting for delivery
-        capacity, the fairness yield, durable delivery marks and replay
-        continuation return the awaitable that finishes the effect.
+        capacity, the fairness yield and replay continuation return the
+        awaitable that finishes the effect.
         """
         kind = effect.kind
         if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
@@ -2172,22 +2172,29 @@ class AsyncClient:
             pending = self._delivery.accept(
                 message, self._message_callback, effect.decoded_property_wire_size
             )
-            if effect.requires_delivery_mark and message.mid is not None:
-                if pending is None and not self._engine_lock.locked():
-                    # No await separates the handoff from this mark, so the
-                    # free lock cannot be contended before the mark completes.
-                    self._mark_delivered_locked(message.mid)
-                    return None
-                return self._mark_delivered(message.mid, epoch, pending)
-            return pending
+            if not effect.requires_delivery_mark or message.mid is None:
+                return pending
+            if pending is None or self._delivery.mode == "callback":
+                # The application owns the message now: a callback already ran,
+                # or the iterator queue accepted it. Mark before any await, so
+                # neither teardown nor cancellation can separate the two (#517).
+                self._mark_delivered_locked(message.mid, effect.exchange_token)
+                return pending
+            return self._mark_after_admission(message.mid, effect.exchange_token, pending)
         if kind is EffectKind.CONTINUE_INBOUND_REPLAY:
             return self._continue_inbound_replay(epoch)
         raise MQTTError(f"Non-delivery effect in reader lane: {kind!r}")
 
-    def _mark_delivered_locked(self, mid: int) -> None:
-        """Record delivery of ``mid`` while the engine is exclusively owned."""
+    def _mark_delivered_locked(self, mid: int, token: object | None = None) -> None:
+        """Record delivery of ``mid`` and apply the completion it releases.
+
+        No coroutine awaits while holding ``_engine_lock``, so a synchronous
+        caller can never interleave with another engine mutation. The mark is
+        tied to the exchange (``token``), not to the connection: a message
+        committed to a stream that survives reconnect stays delivered.
+        """
         try:
-            self._engine.inbound.mark_delivered(mid)
+            self._engine.inbound.mark_delivered(mid, token)
         except Exception as exc:
             # Queue acceptance is observable, but failed durable completion
             # must retire this session before any new admission. Reader
@@ -2197,13 +2204,25 @@ class AsyncClient:
             self._engine.notify_transport_closed()
             raise
 
-    async def _mark_delivered(self, mid: int, epoch: int, pending: Awaitable[None] | None) -> None:
-        if pending is not None:
-            await pending
-        async with self._engine_lock:
-            if epoch != self._connection_epoch:
-                return
-            self._mark_delivered_locked(mid)
+    def _flush_released_completions(self) -> None:
+        """Hand the PUBCOMP/PUBACKs released by delivery marks to the writer.
+
+        The reader calls this once per delivery lot, so completions released
+        by one lot leave as a batch instead of one effect collection per
+        message.
+        """
+        if self._engine.has_pending_effects:
+            self._effect_pump.collect_from_engine()
+            self._effect_pump.drain_inline()
+
+    async def _mark_after_admission(
+        self, mid: int, token: object | None, pending: Awaitable[bool | None]
+    ) -> None:
+        # The waiting admission commits synchronously with its return, so no
+        # suspension separates the commit from the mark. A retired admission
+        # (replaced connection or stream) commits nothing and marks nothing.
+        if await pending:
+            self._mark_delivered_locked(mid, token)
 
     async def _continue_inbound_replay(self, epoch: int) -> None:
         # This marker follows its messages in the reader-owned lane. Only
@@ -2364,6 +2383,7 @@ class AsyncClient:
     async def _invalidate_connection_epoch(self) -> None:
         self._connection_epoch += 1
         self._delivery_lane.discard()
+        self._delivery.invalidate_waiting_admissions()
         await self._write_pump.advance_epoch(self._connection_epoch)
 
     def _settle_terminal_effect(self, effect: EngineEffect) -> None:

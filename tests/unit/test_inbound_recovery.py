@@ -68,7 +68,7 @@ def test_sqlite_store_iterates_inbound_in_insertion_order(tmp_path) -> None:
         store.close()
 
 
-def test_session_resume_restores_receive_window_count() -> None:
+def test_session_resume_keeps_durable_state_outside_connection_receive_window() -> None:
     store = MemoryInflightStore()
     store.put_in(_inbound(1))
     store.put_in(_inbound(2))
@@ -80,7 +80,10 @@ def test_session_resume_restores_receive_window_count() -> None:
     _resume(engine)
 
     assert engine.state is ConnectionState.CONNECTED
-    assert engine.inbound._inflight == 2
+    # Durable session records survive, but no QoS>0 PUBLISH for them has been
+    # observed on this replacement Network Connection yet.
+    assert engine.inbound._inflight == 0
+    assert engine.store.in_count() == 2
 
 
 def test_undelivered_qos2_is_replayed_once_after_restart() -> None:
@@ -94,7 +97,9 @@ def test_undelivered_qos2_is_replayed_once_after_restart() -> None:
     assert len(messages) == 1
     assert messages[0].mid == 7
     assert messages[0].dup is True
-    assert engine.inbound._inflight == 1
+    # Application redelivery of durable state is not a PUBLISH received on this
+    # Network Connection and therefore owns no Receive Maximum slot.
+    assert engine.inbound._inflight == 0
     assert engine.inbound._recovered_mids == set()
 
 
