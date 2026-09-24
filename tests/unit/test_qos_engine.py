@@ -16,6 +16,7 @@ from mqttium.packets import (
 from mqttium.protocol.engine import EffectKind, EngineConfig, ProtocolEngine
 from mqttium.protocol.flow_control import FlowControl
 from mqttium.protocol.packet_ids import PacketIdPool
+from tests.support import mark_delivered_messages
 
 
 def _feed_connack_ok(engine: ProtocolEngine, session_present: bool = False) -> None:
@@ -117,7 +118,7 @@ def test_qos2_inbound_dedup() -> None:
     dec = IncrementalDecoder()
     dec.feed(publish)
     engine.handle_raw(dec.next_packet())  # type: ignore[arg-type]
-    effects = engine.take_effects()
+    effects = mark_delivered_messages(engine, engine.take_effects())
     messages = [e for e in effects if e.kind is EffectKind.MESSAGE]
     assert len(messages) == 1
     sends = [e.data for e in effects if e.kind is EffectKind.SEND_ACK]

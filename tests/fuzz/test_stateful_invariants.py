@@ -142,6 +142,54 @@ def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> 
         )
 
 
+def _emitted_deliveries(engine: ProtocolEngine) -> list[tuple[int, object]]:
+    """Take this step's effects; return the deliveries the runtime must commit."""
+    return [
+        (effect.data.mid, effect.exchange_token)
+        for effect in engine.take_effects()
+        if effect.kind is EffectKind.MESSAGE and effect.requires_delivery_mark
+    ]
+
+
+def _deliver_one(
+    engine: ProtocolEngine,
+    rng: random.Random,
+    undelivered: list[tuple[int, object]],
+    history: list[str],
+    step: int,
+) -> set[int]:
+    """Commit one pending delivery; return the identifiers it really owned."""
+    if not undelivered:
+        return set()
+    mid, token = undelivered.pop(rng.randrange(len(undelivered)))
+    history.append(f"{step}: application owns mid={mid}")
+    current = engine.inbound._exchange_tokens.get(mid) is token
+    engine.mark_inbound_delivered(mid, token)
+    return {mid} if current else set()
+
+
+def _check_completed_only_after_delivery(
+    engine: ProtocolEngine,
+    before: dict[int, bool],
+    committed: set[int],
+    step: int,
+    history: list[str],
+) -> None:
+    # MESSAGE emitted is not MESSAGE committed: a persisted exchange is never
+    # completed before the application owns it (#519, #520).
+    after = _inbound_delivery_states(engine)
+    for mid, delivered in before.items():
+        if mid not in after and not delivered and mid not in committed:
+            raise AssertionError(
+                f"step {step}: undelivered inbound mid={mid} was completed\n"
+                + "\n".join(history[-25:])
+            )
+
+
+def _inbound_delivery_states(engine: ProtocolEngine) -> dict[int, bool]:
+    return {meta.mid: meta.delivered for page in engine.store.in_index_pages() for meta in page}
+
+
 @pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
 @pytest.mark.parametrize("seed", range(SEEDS))
 def test_engine_invariants_hold(protocol: MQTTProtocolVersion, seed: int) -> None:
@@ -172,13 +220,21 @@ def test_engine_invariants_hold(protocol: MQTTProtocolVersion, seed: int) -> Non
         "pubcomp",
         "inbound_publish",
         "inbound_pubrel",
+        "deliver",
         "drop",
         "reconnect",
     ]
-    weights = [40, 14, 12, 12, 10, 6, 4, 6]
+    weights = [40, 14, 12, 12, 10, 6, 8, 4, 6]
+    # Deliveries the runtime has not committed yet, in emission order. A
+    # "deliver" step commits one of them, possibly after its exchange ended
+    # and the identifier was reused (a late mark must then be ignored).
+    undelivered: list[tuple[int, object]] = []
 
     for step in range(STEPS):
         operation = rng.choices(operations, weights=weights)[0]
+        before = _inbound_delivery_states(engine)
+        committed: set[int] = set()
+        discarded_session = False
         try:
             if operation == "publish":
                 qos = rng.choice(list(QoS))
@@ -227,6 +283,8 @@ def test_engine_invariants_hold(protocol: MQTTProtocolVersion, seed: int) -> Non
                 mid = rng.randint(1, 12)
                 history.append(f"{step}: inbound PUBREL mid={mid}")
                 _feed(engine, PubRelPacket(mid=mid).encode(protocol))
+            elif operation == "deliver":
+                committed = _deliver_one(engine, rng, undelivered, history, step)
             elif operation == "drop":
                 history.append(f"{step}: transport closed")
                 engine.notify_transport_closed()
@@ -234,13 +292,16 @@ def test_engine_invariants_hold(protocol: MQTTProtocolVersion, seed: int) -> Non
                 if engine.state in (ConnectionState.CONNECTED, ConnectionState.CONNECTING):
                     engine.notify_transport_closed()
                 session_present = rng.random() < 0.75
+                discarded_session = not session_present
                 history.append(f"{step}: reconnect session_present={session_present}")
                 engine.begin_connect()
                 _connack(engine, session_present=session_present)
         except MQTTError as exc:
             history.append(f"    -> refused: {type(exc).__name__}: {exc}")
-        engine.take_effects()
+        undelivered.extend(_emitted_deliveries(engine))
         _check_invariants(engine, step, history)
+        if not discarded_session:
+            _check_completed_only_after_delivery(engine, before, committed, step, history)
 
 
 # ---------------------------------------------------------------------- stores

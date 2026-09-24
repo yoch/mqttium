@@ -28,6 +28,18 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Reject an inbound QoS 2 PUBLISH for an exchange that has already advanced
   through PUBREL into manual `WAIT_USER_ACK`, instead of rewinding the phase
   and sending PUBREC again (#499).
+- Complete a persisted inbound exchange only after the application owns its
+  message. PUBREL for an undelivered QoS 2 message, including one that arrives
+  in the same read as its PUBLISH or before a bounded replay page reaches it,
+  no longer sends PUBCOMP and deletes the last durable copy. A recovered QoS 1
+  row resumed by an automatically acknowledging client is likewise
+  acknowledged only after replay delivers it (#519, #520).
+- Take the durable delivered mark when the application commit happens and tie
+  it to the exchange rather than the connection, so a committed message is not
+  redelivered after a reconnect or reader cancellation (#517), and a late mark
+  can no longer flag a later exchange that reuses the packet identifier
+  (#534). An iterator admission waiting for capacity no longer commits into a
+  replaced connection or stream (#500).
 
 ## [1.0.0rc15] - 2026-09-23
 
