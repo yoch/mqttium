@@ -39,8 +39,17 @@ is the version an application actually upgrades from.
 
 ## Changes since 1.0.0rc16
 
+The pre-1.0 surface review (`docs/reports/API-SURFACE-REVIEW-2026-09-24.md`)
+removes contracts that had no effect, no use, or duplicated another.
+
 | 1.0.0rc16 contract | Replacement |
 | --- | --- |
+| `MQTTProtocolVersion.MQTTv31` (always refused) | None; MQTT 3.1 is unsupported. Use `MQTTv311` or `MQTTv5` |
+| `ConnectionState.RECONNECTING` (never reported) | None; automatic retry reports `CONNECTING` then `CONNECTED` or `DISCONNECTED` |
+| `NegotiatedSettings.effective_keepalive` | `NegotiatedSettings.server_keep_alive` (`None` means the requested keepalive applies) |
+| `NegotiatedSettings.effective_client_id(local)` | `AsyncClient.effective_client_id` |
+| `NegotiatedSettings.from_connack()` | Internal; read `AsyncClient.negotiated` |
+| Encoding and decoding methods of `SubscribeOptions`, `ConnAckPacket`, `AuthPacket` | Internal; construct the models and read their fields |
 | `PublishBatchError.failures`, `.failure_count`, `.failure_counts` | The same fields on `PublishBatchError.receipt` |
 | `PublishBatchError.cause` | `PublishBatchError.__cause__` (the error is raised `from` its cause) |
 | `PublishBatchError.receipt` could be `None` | Always the batch receipt; no narrowing needed |

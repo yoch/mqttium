@@ -347,3 +347,20 @@ def test_batch_error_carries_only_its_receipt() -> None:
     assert error.receipt is receipt
     assert not hasattr(error, "failures") and not hasattr(error, "cause")
     assert not hasattr(receipt, "completed")
+
+
+def test_stable_enumerations_have_no_unused_members() -> None:
+    # MQTT 3.1 is unsupported and no state is reported while reconnecting.
+    assert [level.name for level in MQTTProtocolVersion] == ["MQTTv311", "MQTTv5"]
+    assert [state.name for state in ConnectionState] == [
+        "NEW",
+        "CONNECTING",
+        "CONNECTED",
+        "DISCONNECTING",
+        "DISCONNECTED",
+    ]
+
+
+def test_negotiated_settings_expose_fields_only() -> None:
+    public = {name for name in dir(NegotiatedSettings) if not name.startswith("_")}
+    assert public == {field.name for field in dataclasses.fields(NegotiatedSettings)}

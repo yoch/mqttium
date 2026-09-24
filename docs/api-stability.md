@@ -34,7 +34,10 @@ guarantee for these objects, even when they can be imported.
 The engine, codecs, packet plumbing, directional sessions, transport extension
 protocols, store implementation protocol and persistence records are Internal.
 Importability and `__all__` are not support promises. Packet models needed by
-the native API have their canonical imports in `mqttium.api`.
+the native API have their canonical imports in `mqttium.api`. For
+`SubscribeOptions`, `ConnAckPacket`, `AuthPacket` and `NegotiatedSettings`,
+construction and field inspection are supported; their encoding, decoding and
+factory methods are Internal.
 
 Paho, one-shot helpers and the root `PacketType` import are removed. The native
 client belongs to one event loop. Synchronous methods are loop-confined, not

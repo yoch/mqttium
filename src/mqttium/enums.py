@@ -10,7 +10,6 @@ from mqttium.errors import MalformedPacketError
 class MQTTProtocolVersion(IntEnum):
     """MQTT wire-protocol level used for a client connection."""
 
-    MQTTv31 = 3
     MQTTv311 = 4
     MQTTv5 = 5
 
@@ -95,4 +94,3 @@ class ConnectionState(IntEnum):
     CONNECTED = 3
     DISCONNECTING = 4
     DISCONNECTED = 5
-    RECONNECTING = 6
