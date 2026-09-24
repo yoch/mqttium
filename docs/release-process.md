@@ -8,7 +8,7 @@ published release, from that same tag. Validation mode never publishes.
 ## Preparing the next release
 
 Between releases, `main` keeps the version of the last published release
-(currently `1.0.0rc15`); never upload a tree under an already-used version.
+(currently `1.0.0rc16`); never upload a tree under an already-used version.
 Keep changes in `[Unreleased]`, record the candidate commit and source
 fingerprint, and validate the current installation and migration instructions
 before deciding the next version.
@@ -16,7 +16,7 @@ before deciding the next version.
 For the release cut, update `src/mqttium/__init__.py`, freeze the changelog
 section and comparison links, and align README installation commands, security
 and support status, documentation version notices and the development-status
-classifier. RC15 remains a pre-release/Beta; a final 1.0 release uses the
+classifier. RC16 remains a pre-release/Beta; a final 1.0 release uses the
 Production/Stable classifier. Validate that exact reviewed release commit
 before tagging. Preparation alone does not authorize publication.
 

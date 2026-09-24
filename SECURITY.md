@@ -7,10 +7,10 @@ development branch. Users should upgrade to the newest patch release; older
 pre-release and superseded minor lines may not receive fixes.
 
 No final 1.0 release has been published yet. The latest published candidate is
-`1.0.0rc15`, the native API that `main` continues. During this pre-release
+`1.0.0rc16`, the native API that `main` continues. During this pre-release
 period, fixes land on `main` and ship in a subsequent candidate or final
 release. A source revision is not a new PyPI release, even while its version
-string still reads `1.0.0rc15`.
+string still reads `1.0.0rc16`.
 
 | Version | Security fixes |
 | --- | --- |

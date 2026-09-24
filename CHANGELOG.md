@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc16] - 2026-09-24
+
 ### Added
 
 - Check the TLA+ models under `formal/models/` with a pinned, hash-verified
@@ -1470,7 +1472,8 @@ See the [migration guide](docs/migration.md) for the breaking changes since
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc15...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc16...HEAD
+[1.0.0rc16]: https://github.com/yoch/mqttium/compare/v1.0.0rc15...v1.0.0rc16
 [1.0.0rc15]: https://github.com/yoch/mqttium/compare/v1.0.0rc14...v1.0.0rc15
 [1.0.0rc14]: https://github.com/yoch/mqttium/compare/v1.0.0rc13...v1.0.0rc14
 [1.0.0rc13]: https://github.com/yoch/mqttium/compare/v1.0.0rc12...v1.0.0rc13
