@@ -43,6 +43,11 @@ class _Owner:
         self.applies = 0
         self.closed = 0
 
+    def _propose_disconnect_cause(self, exc: BaseException, rank: int) -> BaseException:
+        if self._disconnect_exc is None:
+            self._disconnect_exc = exc
+        return self._disconnect_exc
+
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool:
         del effect, epoch
         return False
