@@ -10,7 +10,7 @@ devices that need explicit completion, bounded resource use, and reliable
 recovery.
 
 These pages describe the current source API; the latest published candidate
-is `1.0.0rc15`. Follow the [installation instructions](getting-started.md)
+is `1.0.0rc16`. Follow the [installation instructions](getting-started.md)
 to run the examples, or select documentation for your installed release.
 
 ## Choose a path

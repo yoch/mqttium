@@ -37,8 +37,8 @@ a changelog entry and migration guidance. Engine, codec, transport and store
 extension protocols are Internal and have no compatibility guarantee.
 The Paho facade and one-shot helpers have been removed.
 
-The latest published release, `1.0.0rc15`, is an incompatible pre-v1 revision
-of `1.0.0rc14`. Use documentation matching your installed release. See the
+The latest published release, `1.0.0rc16`, keeps the API of `1.0.0rc15`, an
+incompatible pre-v1 revision of `1.0.0rc14`. Use documentation matching your installed release. See the
 [migration guide](docs/migration.md) before upgrading an application or database
 from `1.0.0rc14`.
 
