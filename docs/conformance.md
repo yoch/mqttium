@@ -198,6 +198,10 @@ Recorded as observations, not as evidence. All were probed and held:
   (`protocol/inbound.py`). The identifier is provably still the broker's:
   reuse is permitted only once the sender has processed the acknowledgement,
   and a record in `WAIT_PUBREL` or `WAIT_USER_ACK` proves no PUBCOMP was seen.
+  Automatic QoS 1 and QoS 2 exchanges keep the identifier until their
+  acknowledgement is handed to the writer. After that handoff, and after a
+  manual `ack()`, a broker that reuses the identifier before receiving the
+  acknowledgement is not detected (#541); a conforming broker never does so.
 - **Topic and filter rules** (`topics.py`) — wildcard placement, zero-length
   names, `$`-prefixed topics, UTF-8 validation.
 - **Property table** (`codec/properties.py`) — per-packet-type allowlists,
