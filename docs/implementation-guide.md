@@ -328,6 +328,30 @@ Four guarantees, all normative:
 
 Covered by `tests/unit/test_ingress_failure_semantics.py`.
 
+### Cancellation ownership
+
+`CancelledError` does not say who cancelled. A runtime task (writer, effect
+pump, reader, keepalive, reconnect supervisor, lifecycle worker) or an API
+call (`connect()`, `publish_many()`) can receive one raised by a dependency it
+awaits (transport read, write, `write_nowait` or close; a transport factory; a
+publication source) while nobody asked it to stop. Every boundary decides
+ownership through `mqttium.api._cancel.owner_cancelled()`, which reads the
+task's pending cancel requests:
+
+- an owner-requested cancellation propagates unchanged;
+- a dependency-raised one is an ordinary failure of that dependency. It is
+  reported as an `MQTTError` whose `__cause__` is the original
+  `CancelledError`, and it follows the same retirement, reconnect and receipt
+  settlement as any other failure of that boundary;
+- teardown that closes an already failing transport ignores the dependency's
+  failure, but never absorbs a cancellation of its own task.
+
+`tests/project/test_cancellation_discipline.py` rejects any other decision in
+the asyncio layers. Handlers that absorb `CancelledError` without asking, such
+as joins of a task the same code just cancelled, are listed there with a
+reason. The `CancellationOwnership` formal model checks the rule for every
+boundary.
+
 ## API completion and errors
 
 - QoS 0 receipts complete at writer admission. A ready QoS 0

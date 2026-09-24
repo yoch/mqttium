@@ -19,6 +19,18 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   throttling register in benchmark runner preflights, and reject samples taken
   while the firmware reports a current limit (#493).
 
+### Fixed
+
+- Report a `CancelledError` raised by a dependency (transport read, write,
+  `write_nowait` or close, transport factory, publication source, keepalive)
+  as an `MQTTError` that keeps it as `__cause__`, instead of treating it as a
+  cancellation of the client's own task. The writer now retires its
+  generation, and the effect pump and reconnect supervisor keep running.
+  `connect()` and `publish_many()` fail with the dependency's cause, and
+  `publish_many()` keeps the prefix receipt. The reader and keepalive keep the
+  original cause. A cancellation requested on the task itself still propagates
+  unchanged (#509, #510, #522, #525, #529, #538).
+
 ## [1.0.0rc15] - 2026-09-23
 
 ### Fixed
