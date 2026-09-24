@@ -112,6 +112,8 @@ class InboundSession:
         "_on_qos1",
         "_autoack_handoff_required",
         "_pending_auto_qos1_mids",
+        "_pending_pubcomps",
+        "_pending_pubcomp_slots",
         "_pending_manual_qos1_acks",
         "_manual_qos1_order",
         "_pending_bytes",
@@ -162,6 +164,12 @@ class InboundSession:
         # (or connection teardown) so a pipelined PUBLISH is admitted by the
         # ordinary acquire path instead of a second decode.
         self._pending_auto_qos1_mids: set[int] = set()
+        # QoS 2 exchanges whose PUBCOMP is still inside the engine batch, and
+        # how many of them hold a current-connection Receive Maximum slot. The
+        # broker cannot have received that PUBCOMP, so both the slot and the
+        # packet identifier stay owned until take_effects() (#537 #541).
+        self._pending_pubcomps: set[int] = set()
+        self._pending_pubcomp_slots = 0
         self._pending_manual_qos1_acks: set[int] = set()
         self._replay: InboundReplayCursor | None = None
         (
@@ -211,6 +219,8 @@ class InboundSession:
         self._current_persisted_mids.clear()
         self._autoack_handoff_required = False
         self._pending_auto_qos1_mids.clear()
+        self._pending_pubcomps.clear()
+        self._pending_pubcomp_slots = 0
         self._pending_manual_qos1_acks.clear()
         # A replay belongs to the connection that started it: its continuation
         # effect is dropped with the epoch, so the cursor must go too.
@@ -223,7 +233,7 @@ class InboundSession:
         # the durable row and its exchange identity stay.
         self._pending_completions.clear()
         self._pending_manual_qos1_acks.clear()
-        self.release_pending_auto_qos1()
+        self.release_pending_acks()
         # A continuation is scoped to the connection that created its cursor.
         # Direct engine consumers have no runtime epoch filter, so invalidate it
         # here as well as during the next start_connection().
@@ -245,14 +255,25 @@ class InboundSession:
         self._session_state_qos2 = 0
         self._autoack_handoff_required = False
         self._pending_auto_qos1_mids.clear()
+        self._pending_pubcomps.clear()
+        self._pending_pubcomp_slots = 0
         self._pending_manual_qos1_acks.clear()
         self._manual_qos1_order.clear()
 
-    def release_pending_auto_qos1(self) -> None:
-        """Free Receive Maximum slots once auto-PUBACKs leave the engine batch."""
+    def release_pending_acks(self) -> None:
+        """Free what acknowledgements in the engine batch still owned.
+
+        Auto-PUBACKs and PUBCOMPs keep their Receive Maximum slot, and PUBCOMPs
+        their packet identifier, until the batch leaves the engine.
+        """
         self._autoack_handoff_required = False
         pending = self._pending_auto_qos1_mids
         n = len(pending)
+        pubcomps = self._pending_pubcomps
+        if pubcomps:
+            n += self._pending_pubcomp_slots
+            self._pending_pubcomp_slots = 0
+            pubcomps.clear()
         if not n:
             return
         pending.clear()
@@ -432,8 +453,11 @@ class InboundSession:
             state = existing.state
             if state is InboundQoSState.WAIT_PUBACK:
                 self._reject_packet_id_collision(mid, "QoS 2", "QoS 1")
-            if state is InboundQoSState.WAIT_USER_ACK:
-                # Receipt of PUBREL proves the sender has advanced to phase 2.
+            if state is InboundQoSState.WAIT_USER_ACK or (
+                self._pending_completions and mid in self._pending_completions
+            ):
+                # Receipt of PUBREL proves the sender has advanced to phase 2,
+                # including a PUBREL whose completion waits for delivery.
                 # MQTT-4.3.3-6 forbids re-sending PUBLISH after that point.
                 self._protocol_disconnect(0x82)
                 raise ProtocolError(f"QoS 2 PUBLISH for mid={mid} received after PUBREL")
@@ -447,6 +471,8 @@ class InboundSession:
                 current.add(mid)
             engine._send_ack(_encode_pubrec_success(mid))
             return
+        if self._pending_pubcomps and mid in self._pending_pubcomps:
+            self._reject_packet_id_collision(mid, "QoS 2", "QoS 2 awaiting PUBCOMP handoff")
         if mid in self._pending_auto_qos1_mids:
             # The same identifier cannot start a QoS 2 exchange while the QoS 1
             # auto-PUBACK is still outstanding from the broker's point of view.
@@ -574,6 +600,8 @@ class InboundSession:
             # owns while leaving the QoS 2 record live.
             self._reject_packet_id_collision(mid, "QoS 1", "QoS 2")
 
+        if self._pending_pubcomps and mid in self._pending_pubcomps:
+            self._reject_packet_id_collision(mid, "QoS 1", "QoS 2 awaiting PUBCOMP handoff")
         # A retransmission of an auto-ACK identifier still in this effect batch
         # already holds its Receive Maximum slot, and the handoff flag was
         # decided when the identifier first entered the set.
@@ -641,6 +669,8 @@ class InboundSession:
                 self._emit_message(inbound, dup=True)
                 return
             self._reject_packet_id_collision(mid, "QoS 1", "QoS 2")
+        if self._pending_pubcomps and mid in self._pending_pubcomps:
+            self._reject_packet_id_collision(mid, "QoS 1", "QoS 2 awaiting PUBCOMP handoff")
 
         logical_size = self.logical_size(topic, payload, properties, decoded_property_wire_size)
         self._acquire_slot(logical_size)
@@ -727,7 +757,7 @@ class InboundSession:
         self._forget_inbound()
         self._session_state_qos2 -= 1
         self._engine._send_ack(_encode_pubcomp_success(mid))
-        self._release_persisted_slot(mid, logical_size)
+        self._hold_until_pubcomp_handoff(mid, logical_size)
 
     def _complete_recovered_qos1_after_delivery(self, mid: int) -> None:
         logical_size = self._complete_stored_inbound(
@@ -796,7 +826,7 @@ class InboundSession:
         self._forget_inbound()
         self._session_state_qos2 -= 1
         self._engine._send_ack(wire)
-        self._release_persisted_slot(mid, logical_size)
+        self._hold_until_pubcomp_handoff(mid, logical_size)
 
     def _drain_manual_qos1_acks(self) -> None:
         """Emit the ready prefix of manual QoS 1 acknowledgements in arrival order."""
@@ -952,7 +982,7 @@ class InboundSession:
         # slots that take_effects() can release. QoS 2 (or another acquiring
         # path) can fill the remainder after that QoS 1 handler returned, so
         # detect the handoff boundary at the shared counter owner as well.
-        if inflight >= receive_maximum and self._pending_auto_qos1_mids:
+        if inflight >= receive_maximum and (self._pending_auto_qos1_mids or self._pending_pubcomps):
             self._autoack_handoff_required = True
         if logical_size is not None:
             pending = self._pending_bytes + logical_size
@@ -975,6 +1005,22 @@ class InboundSession:
             if self._inflight > 0:
                 self._inflight -= 1
         self._release_pending_bytes(logical_size)
+
+    def _hold_until_pubcomp_handoff(self, mid: int, logical_size: int) -> None:
+        """Keep a completed QoS 2 exchange's slot and identifier until handoff.
+
+        The durable row and its byte reservation are gone, but the broker still
+        counts the PUBLISH against Receive Maximum and owns the identifier
+        until it receives the PUBCOMP [MQTT-3.3.4-9] [MQTT-2.2.1-4].
+        """
+        self._release_pending_bytes(logical_size)
+        current = self._current_persisted_mids
+        self._pending_pubcomps.add(mid)
+        if mid in current:
+            current.remove(mid)
+            self._pending_pubcomp_slots += 1
+            if self._inflight >= self._receive_maximum:
+                self._autoack_handoff_required = True
 
     def _release_pending_bytes(self, logical_size: int | None) -> None:
         if logical_size is None:

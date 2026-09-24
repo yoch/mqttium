@@ -172,6 +172,16 @@ through the ordinary acquire path. Packet-identifier reuse across unfinished
 QoS 1 and QoS 2 exchanges is a protocol error, including when the QoS 1
 PUBACK has been emitted but not yet handed off.
 
+A completed QoS 2 exchange keeps its Receive Maximum slot and its packet
+identifier the same way, until `take_effects()` hands its PUBCOMP to the
+runtime: the broker cannot have received it before. A PUBLISH decoded earlier
+into that slot exceeds Receive Maximum (`0x93`), and one reusing that
+identifier, or repeating a PUBLISH whose PUBREL has arrived, is a protocol
+error (`0x82`). The read loop stops the ingress batch at that boundary as it
+does for automatic PUBACKs, so a PUBLISH decoded after the handoff is admitted.
+Direct `ProtocolEngine` consumers can reuse an identifier only after taking
+the batch that carries its PUBCOMP.
+
 Duplicate PUBLISH and PUBREL packets repeat the required protocol response but
 never redeliver application data. Orphan PUBREL is answered idempotently.
 

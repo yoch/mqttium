@@ -21,6 +21,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Keep the Receive Maximum slot and packet identifier of a completed inbound
+  QoS 2 exchange until its PUBCOMP leaves the protocol engine, as automatic
+  QoS 1 PUBACKs already did. A PUBLISH that the broker sent before it could
+  have received that PUBCOMP (a second exchange beyond Receive Maximum, or a
+  reused packet identifier) was accepted instead of refused, and a PUBLISH
+  repeated after its PUBREL was acknowledged as a retransmission (#537, #541).
 - Keep inbound MQTT Session State separate from Receive Maximum ownership on a
   replacement Network Connection. Resumed durable rows no longer precharge the
   current connection's PUBLISH quota; a persisted exchange acquires a slot only

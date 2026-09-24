@@ -159,6 +159,9 @@ def test_handle_survives_resumed_session_but_not_replacement(protocol, qos):
     assert engine.inbound._ack_tokens == {}
     with pytest.raises(ProtocolError):
         engine.ack(9, message=original)
+    # The identifier is free for a new exchange once its PUBCOMP has left the
+    # engine (#541); the runtime takes the batch right after ack().
+    engine.take_effects()
     another = _deliver(engine, qos)
     _resume(engine, present=False)
     replacement = _deliver(engine, qos)
