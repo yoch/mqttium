@@ -40,7 +40,9 @@ async def test_transport_cancelled_error_retires_writer_generation_and_receipt()
 
         assert transport.publish_attempts == 1
         assert client._disconnect_exc is transport.failure
-        assert receipt.is_done()
+        # Connection state flips before terminal receipt settlement finishes.
+        # Observe the actual ownership boundary rather than racing teardown.
+        await wait_until(receipt.is_done)
         assert not client._receipts
         assert client._write_pump.epoch == client._connection_epoch
         with pytest.raises(asyncio.CancelledError) as caught:
