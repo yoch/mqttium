@@ -42,6 +42,7 @@ from mqttium.errors import (
     ProtocolError,
     PublishBatchError,
     SessionDiscardedError,
+    SessionReplayError,
 )
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.packets import AuthPacket, ConnAckPacket, SubscribeOptions
@@ -66,6 +67,7 @@ STABLE_ROOT_EXPORTS = {
     "PublishBatchError": PublishBatchError,
     "QoS": QoS,
     "SessionDiscardedError": SessionDiscardedError,
+    "SessionReplayError": SessionReplayError,
 }
 
 STABLE_API_EXPORTS = {

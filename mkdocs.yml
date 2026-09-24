@@ -148,6 +148,7 @@ plugins:
           - network-release-gate.md
           - memory-benchmark.md
           - fuzzing.md
+          - formal-models.md
           - stability.md
           - release-process.md
           - roadmap.md
@@ -209,6 +210,7 @@ nav:
       - Network release gate: network-release-gate.md
       - Memory methodology: memory-benchmark.md
       - Fuzzing: fuzzing.md
+      - Formal models: formal-models.md
       - Stability campaign: stability.md
       - Release procedure: release-process.md
       - Roadmap: roadmap.md

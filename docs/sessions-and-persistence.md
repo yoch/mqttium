@@ -21,6 +21,22 @@ restores inbound QoS 2 deduplication state. When it is false, the broker can no
 longer complete those old exchanges; MQTTium fails pending receipts with
 `SessionDiscardedError` and releases the stale local state.
 
+A resumed session must resend every unacknowledged QoS 1/2 PUBLISH with its
+original packet identifier. If the new CONNACK forbids one of them (a lower
+Maximum QoS, `Retain Available` of 0, or a smaller Maximum Packet Size), the
+session cannot be resumed. MQTTium ends the connection with
+`SessionReplayError`, keeps the durable exchanges and their packet
+identifiers, and does not retry automatically. Connect again with
+`clean_start=True` to discard that session (pending receipts then fail with
+`SessionDiscardedError`), or restore the broker limits. Publications that were
+only queued offline are not part of the broker session; a narrowed CONNACK
+fails each of them individually.
+
+A client that has already failed a publication's receipt (after a refused
+CONNACK, a final connection loss or `disconnect()`) never sends it again: its
+row stays in the store and is recovered by the next client or process that
+opens the store, not silently by the client that reported the failure.
+
 MQTTium does not periodically retransmit QoS messages on a healthy connection.
 Protocol replay happens after reconnect, with DUP set where MQTT requires it.
 

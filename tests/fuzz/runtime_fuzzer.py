@@ -711,23 +711,27 @@ class _RuntimeHarness:
 
     def _install_mutation(self) -> None:  # noqa: C901
         if self.mutation is RuntimeMutation.WRITER_FAILURE_NO_WAKE:
+            # Every epoch change (advance_epoch, the reader's synchronous
+            # retirement) wakes parked producers through wake_waiters().
 
-            async def advance_without_wakeup(pump: object, epoch: int) -> None:
-                pump.epoch = epoch  # type: ignore[attr-defined]
+            async def epoch_without_wakeup(_pump: object) -> None:
+                return None
 
             self._replace(
                 self.client._write_pump,
-                "advance_epoch",
-                MethodType(advance_without_wakeup, self.client._write_pump),
+                "wake_waiters",
+                MethodType(epoch_without_wakeup, self.client._write_pump),
             )
         elif self.mutation is RuntimeMutation.EPOCH_NOT_INVALIDATED:
+            # The single synchronous step every teardown path publishes the
+            # new epoch through (_invalidate_connection_epoch included).
 
-            async def keep_epoch(_client: AsyncClient) -> None:
+            def keep_epoch(_client: AsyncClient) -> None:
                 return None
 
             self._replace(
                 self.client,
-                "_invalidate_connection_epoch",
+                "_retire_connection_epoch",
                 MethodType(keep_epoch, self.client),
             )
         elif self.mutation is RuntimeMutation.EFFECT_NOT_SETTLED:
@@ -1137,7 +1141,12 @@ class _RuntimeHarness:
         outbound = stats.outbound
         assert 0 <= outbound.inflight <= outbound.inflight_limit
         assert outbound.awaiting_slot + outbound.inflight <= outbound.unacknowledged_messages
-        assert outbound.packet_ids_in_use == outbound.unacknowledged_messages
+        # Publications sealed after their receipts failed (#521) keep their
+        # identifiers reserved but no longer count as this client's work.
+        sealed = len(self.client._engine.outbound._sealed)
+        assert outbound.packet_ids_in_use == outbound.unacknowledged_messages + sealed, (
+            "packet identifiers diverged from unfinished and sealed publications"
+        )
         if not self.client._teardown_final:
             # Receipts mirror unfinished engine records only until terminal
             # teardown fails them; durable session records legitimately

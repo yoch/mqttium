@@ -72,6 +72,15 @@ benchmark preflight rejects excessive background load, a non-performance
 governor, or missing/unsafe temperature readings. This is intentionally stricter
 than ordinary ARM64 CI.
 
+Each preflight sample also records every CPU's current and maximum frequency,
+its cumulative `cpufreq/stats/time_in_state` residency, and the Raspberry Pi
+firmware `vcgencmd get_throttled` register. Differencing residency between
+successive block preflights shows the frequencies a block actually ran at. A
+sample is rejected while the firmware reports a current under-voltage,
+frequency cap, throttling or soft temperature limit; limits recorded only since
+boot are kept as evidence. `vcgencmd` needs the runner account in the `video`
+group; without it the register is recorded as unavailable and not enforced.
+
 If the host can reboot unattended, make the governor selection persistent with
 a root-owned host configuration rather than granting the runner account
 privilege to change it. A reboot that restores `ondemand` is safe: strict

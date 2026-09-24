@@ -11,6 +11,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 
+from mqttium.api._cancel import dependency_failure, failure_for, owner_cancelled
 from mqttium.api._effects import StaleConnectionEffect
 from mqttium.errors import FlowControlError
 from mqttium.api.stats import WriterStats
@@ -84,9 +85,9 @@ class WritePump:
         # connection.
         self._eager_generation = 0
         self._eager_rearm_scheduled = False
-        # An eager latency flush can fail after exposing bytes. Restored frames
-        # then remain ownership records only; the writer must retire them and
-        # report this failure before attempting any further transport write.
+        # A producer-side eager or latency write can fail after exposing bytes.
+        # Retained frames then remain ownership records only; the writer must
+        # retire them and report the failure before any further transport write.
         self._sealed = False
         self._latency_failure: BaseException | None = None
 
@@ -206,8 +207,24 @@ class WritePump:
     async def join(self) -> None:
         await self.queue.join()
 
-    async def advance_epoch(self, epoch: int) -> None:
+    @property
+    def sealed(self) -> bool:
+        return self._sealed
+
+    def seal(self) -> None:
+        """Refuse every later admission on this connection until reset().
+
+        Producers already parked for capacity fail once woken
+        (wake_waiters()).
+        """
+        self._sealed = True
+
+    def set_epoch(self, epoch: int) -> None:
+        """Invalidate earlier-epoch admissions without suspending."""
         self.epoch = epoch
+
+    async def advance_epoch(self, epoch: int) -> None:
+        self.set_epoch(epoch)
         await self.wake_waiters()
 
     async def wake_waiters(self) -> None:
@@ -251,6 +268,25 @@ class WritePump:
             f"{size}-byte write with {self.queued_bytes} bytes already queued"
         )
 
+    def _fence_eager_failure(self, failure: BaseException) -> None:
+        """Retire this generation after a producer-side write_nowait raised.
+
+        The transport may already own any prefix of the bytes, so they are
+        never retried: the caller keeps them only as ownership records, which
+        the writer task retires on this latch before any wire exposure. The
+        epoch advances before control returns to the producer, so no other
+        producer can admit into the failed generation (#504).
+        """
+        self._latency_failure = failure
+        self._drop_eager_binding()
+        self.epoch += 1
+
+    def _retain_failed_eager(self, item: bytes, failure: BaseException) -> None:
+        self._fence_eager_failure(failure)
+        self.queue.put_nowait(item)
+        self.queued_bytes += len(item)
+        self._admit_queued()
+
     def _try_write_data_eager(self, item: WriteItem) -> bool:
         """Write one ordinary frame straight through when doing so preserves order.
 
@@ -268,7 +304,13 @@ class WritePump:
             or not self.queue.empty()
         ):
             return False
-        if not write_nowait(item):
+        try:
+            accepted = write_nowait(item)
+        except BaseException as exc:
+            failure = failure_for(exc, "transport write_nowait")
+            self._retain_failed_eager(item, failure)
+            raise failure from failure.__cause__
+        if not accepted:
             return False
         self._eager_armed = False
         self._schedule_eager_rearm()
@@ -288,7 +330,13 @@ class WritePump:
             or not self.queue.empty()
         ):
             return False
-        if not write_nowait(item):
+        try:
+            accepted = write_nowait(item)
+        except BaseException as exc:
+            failure = failure_for(exc, "transport write_nowait")
+            self._retain_failed_eager(item, failure)
+            raise failure from failure.__cause__
+        if not accepted:
             return False
         self._ack_eager_armed = False
         self._schedule_eager_rearm()
@@ -385,14 +433,10 @@ class WritePump:
         try:
             accepted = write_nowait(combined)
         except BaseException as exc:
-            # The transport may already own any prefix of these bytes. Restore
-            # accounting ownership, never a retry: the existing writer checks
-            # this latch before wire exposure and releases its normal batch.
-            self._latency_failure = exc
-            self._drop_eager_binding()
-            self.epoch += 1
+            failure = failure_for(exc, "transport write_nowait")
+            self._fence_eager_failure(failure)
             self._restore_latency_items(items)
-            raise
+            raise failure from failure.__cause__
         if not accepted:
             self._restore_latency_items(items)
             return False
@@ -566,19 +610,19 @@ class WritePump:
                     async with self.space:
                         self.queued_bytes = max(0, self.queued_bytes - released)
                         self._release_resident(n_batch)
-                        if batch_completed and self.waiters and not writer_task.cancelling():
+                        if batch_completed and self.waiters and not owner_cancelled(writer_task):
                             # Resident accounting is released even on lifecycle
                             # cancellation/failure, but only a successfully written
                             # batch releases usable admission capacity.
                             self.space.notify(min(self.waiters, n_batch))
-        except (Exception, asyncio.CancelledError) as exc:
-            # A transport can raise cancellation synchronously without this
-            # writer being cancelled. Report that latched failure; ordinary
-            # lifecycle cancellation must still leave teardown with its caller.
-            if isinstance(exc, asyncio.CancelledError) and (
-                writer_task.cancelling() or self._latency_failure is None
-            ):
+        except asyncio.CancelledError as exc:
+            # Lifecycle cancellation leaves teardown with its caller. A transport
+            # can also raise CancelledError while nobody cancelled this writer:
+            # that is a transport failure and must retire the generation.
+            if owner_cancelled(writer_task):
                 raise
+            failure: BaseException = dependency_failure(exc, "transport write")
+        except Exception as exc:
             failure = exc
         # The transport has failed and this task is giving up on it. Drop
         # the eager binding first: the reconnect path does not call stop()

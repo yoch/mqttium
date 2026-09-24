@@ -33,6 +33,7 @@ from mqttium.errors import (
     PacketTooLargeError,
     ProtocolError,
     SessionDiscardedError,
+    SessionReplayError,
 )
 from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
 from mqttium.protocol.flow_control import FlowControl
@@ -89,6 +90,8 @@ class OutboundSession:
         "_engine",
         "_is_v5",
         "_parked_entries",
+        "_slotless",
+        "_sealed",
         "_queued",
         "_pending_bytes",
         "_pending_high_water_bytes",
@@ -122,9 +125,20 @@ class OutboundSession:
         self.flow = FlowControl(self.config.max_inbound_inflight)
         self._queued: deque[OutboundMessage | OutboundMessageSummary] = deque()
         # Replay-parked WAIT_* entries currently in `_queued` (see
-        # `_unpark_settled`). Zero on every path that does not involve a
+        # `_unpark`). Zero on every path that does not involve a
         # resumed session whose retransmissions exceeded the send quota.
         self._parked_entries = 0
+        # Live WAIT_* exchanges resumed on this connection that hold no send
+        # quota slot: their PUBLISH was not sent on it (a replayed PUBREL, or
+        # a parked exchange the broker advanced). Their terminal ACK must not
+        # release a slot another exchange owns (#545).
+        self._slotless: set[int] = set()
+        # Publications whose receipts this client already failed terminally
+        # (#521): mid -> whether its PUBLISH was ever sent. Their rows stay in
+        # the store for another client or process to recover, but this one
+        # never sends them again, and their identifiers stay reserved until
+        # the broker completes the exchange or a clean session drops it.
+        self._sealed: dict[int, bool] = {}
         self._pending_messages = 0
         self._pending_bytes = 0
         self._pending_high_water_messages = 0
@@ -561,25 +575,40 @@ class OutboundSession:
 
     # --- broker acknowledgements -------------------------------------------
 
-    def _settle(self, mid: int, expected_state: OutboundQoSState) -> bool:
-        """Conditionally settle one outbound record without reading its payload."""
+    def _settle(self, mid: int, expected_state: OutboundQoSState) -> bool | None:
+        """Conditionally settle one outbound record without reading its payload.
+
+        Returns None when nothing was settled, otherwise whether the exchange
+        held a send-quota slot on this connection. One that never sent its
+        PUBLISH here releases none, so in-flight PUBLISHes never exceed the
+        broker's Receive Maximum (#545).
+        """
         meta = self.store.complete_out(mid, expected_state)
         if meta is None:
+            return None
+        sealed = self._sealed
+        if sealed and sealed.pop(mid, None) is not None:
+            # Its reservation left with the seal; it was never resent here.
             return False
         self._release_reservation(meta.logical_size)
-        if self._parked_entries:
-            self._unpark_settled(mid)
+        if self._parked_entries and self._unpark(mid):
+            return False
+        slotless = self._slotless
+        if slotless and mid in slotless:
+            slotless.remove(mid)
+            return False
         return True
 
-    def _unpark_settled(self, mid: int) -> None:
-        """Drop the replay-parked queue entry of a settled exchange.
+    def _unpark(self, mid: int) -> bool:
+        """Drop the replay-parked queue entry of `mid`; whether there was one.
 
         `replay_session()` parks a WAIT_* record in `_queued` when the send
-        quota cannot admit its retransmission. The broker can still settle the
-        exchange while it is parked; the stale entry must leave the queue with
-        the record, or `drain()` would re-materialise the deleted record,
-        resurrect it through `update_out` and retransmit a settled
-        publication — and a reallocated packet identifier could later collide
+        quota cannot admit its retransmission. The broker can still settle or
+        advance the exchange while it is parked; the stale entry must leave
+        the queue with that phase, or `drain()` would re-materialise the
+        record, retransmit an exchange the broker already answered (a
+        resurrected publication, or a second PUBREL, #497) and consume a send
+        quota slot for it. A reallocated packet identifier could later collide
         with it in the queue.
         """
         queued = self._queued
@@ -587,7 +616,8 @@ class OutboundSession:
             if stored.mid == mid:
                 del queued[index]
                 self._parked_entries -= 1
-                return
+                return True
+        return False
 
     def on_puback(self, raw: RawPacket) -> None:
         mid, reason_code, properties = self._decode_puback(raw.remaining)
@@ -603,9 +633,10 @@ class OutboundSession:
             else:
                 self._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
             raise
-        if not settled:
+        if settled is None:
             return
-        self.flow.release()
+        if settled:
+            self.flow.release()
         # Emit before freeing the packet id so FIFO receipt settlement remains
         # ordered even if a concurrent publish reuses the mid immediately.
         if reason_code >= 128:
@@ -637,7 +668,7 @@ class OutboundSession:
             if record is None:
                 self._send_orphan_pubrel(mid)
                 return
-            if record.state is not OutboundQoSState.WAIT_PUBREC:
+            if record.state not in (OutboundQoSState.WAIT_PUBREC, OutboundQoSState.WAIT_PUBCOMP):
                 return
             self._require_pubrel_capacity(4)
             return
@@ -648,10 +679,19 @@ class OutboundSession:
             compact=True,
         )
         if changed is not None:
+            if self._parked_entries and self._unpark(mid):
+                # PUBREL needs no send quota: the parked entry just leaves,
+                # still holding no slot until its PUBCOMP.
+                self._slotless.add(mid)
             self._engine._send(_encode_pubrel_success(mid))
             return
-        if self.store.out_meta(mid) is None:
+        record = self.store.out_meta(mid)
+        if record is None:
             self._send_orphan_pubrel(mid)
+        elif record.state is OutboundQoSState.WAIT_PUBCOMP:
+            # A repeated successful PUBREC still requires PUBREL
+            # [MQTT-4.3.3-4]; the exchange keeps its phase and ownership (#503).
+            self._engine._send(_encode_pubrel_success(mid))
 
     def _send_orphan_pubrel(self, mid: int) -> None:
         """Answer a PUBREC with no matching record: PUBREL, 0x92 when MQTT 5."""
@@ -668,9 +708,10 @@ class OutboundSession:
             # terminal outcome regardless of the cleanup failure.
             self._fail(mid, ProtocolError(f"PUBREC reason_code={reason_code}"))
             raise
-        if not settled:
+        if settled is None:
             return
-        self.flow.release()
+        if settled:
+            self.flow.release()
         self._fail(mid, ProtocolError(f"PUBREC reason_code={reason_code}"))
         self.packet_ids.release(mid)
         self.drain()
@@ -687,9 +728,10 @@ class OutboundSession:
             else:
                 self._engine._emit(EffectKind.PUBLISH_COMPLETE, mid)
             raise
-        if not settled:
+        if settled is None:
             return
-        self.flow.release()
+        if settled:
+            self.flow.release()
         if reason_code >= 128:
             self._fail(mid, ProtocolError(f"PUBCOMP reason_code={reason_code}"))
         else:
@@ -1002,7 +1044,41 @@ class OutboundSession:
         # Hydration reserves a flow slot for every persisted WAIT_* exchange it
         # can admit. The window is never reset before CONNACK, so a non-zero
         # count is an O(1) proof that at least one sent QoS 1/2 exchange exists.
-        return self.flow.inflight > 0
+        return self.flow.inflight > 0 or any(self._sealed.values())
+
+    def seal(self, mids: Iterable[int]) -> None:
+        """Never send again the publications whose receipts failed (#521).
+
+        The client told its caller they failed. Their durable rows stay for
+        another client or process to recover (the store's purpose), but this
+        client neither launches nor replays them, and keeps their packet
+        identifiers reserved.
+        """
+        sealed = self._sealed
+        parked = (
+            {m.mid for m in self._queued if m.state is not OutboundQoSState.QUEUED}
+            if self._parked_entries
+            else set()
+        )
+        newly: set[int] = set()
+        for mid in mids:
+            if mid in sealed:
+                continue
+            meta = self.store.out_meta(mid)
+            if meta is None:
+                continue
+            sent = meta.state is not OutboundQoSState.QUEUED
+            sealed[mid] = sent
+            newly.add(mid)
+            self._release_reservation(meta.logical_size)
+            if sent and mid not in parked and mid not in self._slotless:
+                self.flow.release()
+            self._slotless.discard(mid)
+        if newly and self._queued:
+            self._queued = deque(m for m in self._queued if m.mid not in newly)
+            self._parked_entries = sum(
+                1 for m in self._queued if m.state is not OutboundQoSState.QUEUED
+            )
 
     def hydrate(self) -> None:
         """Recover packet ids and the offline queue from a durable store."""
@@ -1025,28 +1101,68 @@ class OutboundSession:
         ):
             self.flow.try_acquire()
 
-    def _replay_message(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
+    def check_session_replayable(self) -> None:
+        """Refuse to resume a session whose mandatory replay is now forbidden.
+
+        Every WAIT_* exchange must be resent with its original packet id on a
+        resumed session [MQTT-4.4.0-1]. If the new negotiation forbids that
+        packet, discarding the exchange would free a packet id the broker
+        session may still hold (#539). Raised before any state changes; only
+        never-sent QUEUED work may fail individually.
+        """
+        negotiated = self._engine.negotiated
+        if (
+            negotiated.maximum_qos >= QoS.EXACTLY_ONCE
+            and negotiated.retain_available
+            and negotiated.maximum_packet_size is None
+        ):
+            # Only these limits can forbid a resent PUBLISH or PUBREL (replay
+            # strips topic aliases), so no stored exchange needs a pass.
+            return
+        sealed = self._sealed
+        for page in self.store_summary_pages():
+            for msg in page:
+                if msg.state is not OutboundQoSState.QUEUED and msg.mid not in sealed:
+                    self._validate_replay(msg)
+
+    def _validate_replay(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
         try:
             self.validate_against_negotiated(msg)
         except (ProtocolError, PacketTooLargeError) as exc:
-            self.discard_record(msg.mid, msg)
-            self.packet_ids.release(msg.mid)
-            self._fail(msg.mid, exc)
-            return
+            raise SessionReplayError(
+                f"Resumed session must resend mid {msg.mid} ({msg.state.name}), "
+                f"which the new CONNACK forbids: {exc}"
+            ) from exc
+
+    def _replay_message(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
+        if self._sealed and msg.mid in self._sealed:
+            return  # already failed to its caller: never resent by this client
         if msg.state is OutboundQoSState.QUEUED:
+            # Never sent: not part of the broker session, so it may fail alone.
+            try:
+                self.validate_against_negotiated(msg)
+            except (ProtocolError, PacketTooLargeError) as exc:
+                self.discard_record(msg.mid, msg)
+                self.packet_ids.release(msg.mid)
+                self._fail(msg.mid, exc)
+                return
             self._queued.append(msg)
             return
+        # A live exchange is never discarded for its negotiation:
+        # check_session_replayable() has already refused a session that
+        # cannot resend it, before the engine became CONNECTED.
         if msg.state is OutboundQoSState.WAIT_PUBCOMP:
             # Receive Maximum constrains QoS>0 PUBLISH packets only. A resumed
             # QoS 2 exchange retransmits PUBREL without consuming the new
-            # connection's send quota; a later PUBCOMP may still replenish that
-            # quota, capped by FlowControl at the current connection limit.
+            # connection's send quota, so its PUBCOMP releases none either.
             try:
                 self._retransmit(self.materialize(msg))
             except Exception as exc:
                 self.discard_record(msg.mid, msg)
                 self.packet_ids.release(msg.mid)
                 self._fail(msg.mid, exc)
+                return
+            self._slotless.add(msg.mid)
             return
         if not self.flow.try_acquire():
             # Parked: retransmission must wait for a send-quota slot. The
@@ -1074,6 +1190,7 @@ class OutboundSession:
         self.reset_flow_for_connection()
         self._queued.clear()
         self._parked_entries = 0
+        self._slotless.clear()
         for page in self.store_summary_pages():
             for msg in page:
                 self._replay_message(msg)
@@ -1098,10 +1215,26 @@ class OutboundSession:
         if any(m.state is not OutboundQoSState.QUEUED for m in self._queued):
             self._queued = deque(m for m in self._queued if m.state is OutboundQoSState.QUEUED)
         self._parked_entries = 0
-        clear_abandoned_packet_ids = not self._queued and not sub_mids_pending
+        self._slotless.clear()
+        sealed = self._sealed
+        # A sealed, never-sent row survives like any queued one and keeps its
+        # identifier, so the pool cannot be reset wholesale around it.
+        clear_abandoned_packet_ids = (
+            not self._queued
+            and not sub_mids_pending
+            and not any(not sent for sent in sealed.values())
+        )
         for page in self.store_summary_pages():
             for msg in page:
                 if msg.state is OutboundQoSState.QUEUED:
+                    continue
+                if msg.mid in sealed:
+                    # The broker dropped it with its session; its receipt
+                    # already failed and its reservation left with the seal.
+                    del sealed[msg.mid]
+                    self.store.delete_out(msg.mid)
+                    if not clear_abandoned_packet_ids:
+                        self.packet_ids.release(msg.mid)
                     continue
                 self.complete_record(msg.mid, msg)
                 if not clear_abandoned_packet_ids:

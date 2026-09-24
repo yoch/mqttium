@@ -85,7 +85,9 @@ def _recovered_engine(receive_maximum: int) -> ProtocolEngine:
     _feed(engine, encode_frame(PacketType.CONNACK, 0, body))
     engine.take_effects()
     assert engine.state is ConnectionState.CONNECTED
-    assert engine.inbound._inflight == 1
+    # The durable WAIT_PUBACK row itself is not a PUBLISH on this replacement
+    # connection. Its retransmission below acquires the slot.
+    assert engine.inbound._inflight == 0
     return engine
 
 

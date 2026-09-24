@@ -6,6 +6,112 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Check the TLA+ models under `formal/models/` with a pinned, hash-verified
+  TLC in a dedicated workflow. Every configuration declares the outcome TLC
+  must report, so a released-behaviour counterexample and its repair are both
+  kept under regression; see the formal models guide.
+
+### Changed
+
+- Record per-CPU frequency, frequency residency and the Raspberry Pi firmware
+  throttling register in benchmark runner preflights, and reject samples taken
+  while the firmware reports a current limit (#493).
+
+### Fixed
+
+- Never send a publication whose receipt the client already failed. After a
+  refused CONNACK, a final connection loss or `disconnect()`, a later
+  `connect()` of the same client published the offline queue or replayed the
+  session with no receipt left to report the outcome. The durable row now stays
+  for another client or a restarted process to recover, while the failing
+  client seals it and keeps its packet identifier reserved (#521).
+- Release a send-quota slot only for an exchange whose PUBLISH was sent on
+  the current connection. After a resumed session, settling an exchange still
+  waiting behind the quota, or completing a replayed PUBREL, freed a slot that
+  another exchange held, so more PUBLISHes than the broker's Receive Maximum
+  could be unacknowledged at once (#545).
+- Keep the Receive Maximum slot and packet identifier of a completed inbound
+  QoS 2 exchange until its PUBCOMP leaves the protocol engine, as automatic
+  QoS 1 PUBACKs already did. A PUBLISH that the broker sent before it could
+  have received that PUBCOMP (a second exchange beyond Receive Maximum, or a
+  reused packet identifier) was accepted instead of refused, and a PUBLISH
+  repeated after its PUBREL was acknowledged as a retransmission (#537, #541).
+- Answer every successful PUBREC with PUBREL: a repeated PUBREC for a QoS 2
+  publication already waiting for PUBCOMP was silently ignored (#503). A
+  successful PUBREC for an exchange still waiting behind the send quota after
+  a session resume now removes it from the queue, so it no longer sends a
+  second PUBREL and spends a send-quota slot later (#497).
+- Retire the writer generation before a synchronous `write_nowait()` failure
+  reaches the publisher, and never retry the possibly partly written frame.
+  Another producer could previously keep writing into the failed transport
+  while the connection stayed up (#504, ported from #515).
+- End a resumed session with the new `SessionReplayError` when its CONNACK
+  forbids resending an unacknowledged QoS 1/2 publication (lower Maximum QoS,
+  `Retain Available` of 0 or a smaller Maximum Packet Size). The client
+  previously deleted the exchange, failed its receipt and could reuse its
+  packet identifier on the same broker session. The exchange and its packet
+  identifier are now kept, and the reconnect policy does not retry; connect
+  with `clean_start=True` to discard the session (#539).
+- End an ingress lot at the first malformed, oversized or protocol-violating
+  packet, and first commit, complete and deliver the packets decoded before it.
+  A later bad packet no longer rolls back an observed PUBACK, PUBCOMP, SUBACK or
+  UNSUBACK, fails its receipt, or drops a message already acknowledged. No
+  packet after the violation is processed, however the bytes were split into
+  reads (#511, #513). Bytes after a broker DISCONNECT no longer replace its
+  reason, and the client no longer sends a second DISCONNECT after the one the
+  protocol engine already sent.
+- Keep inbound MQTT Session State separate from Receive Maximum ownership on a
+  replacement Network Connection. Resumed durable rows no longer precharge the
+  current connection's PUBLISH quota; a persisted exchange acquires a slot only
+  when its QoS>0 PUBLISH is actually observed on that connection (#498).
+- Reject an inbound QoS 2 PUBLISH for an exchange that has already advanced
+  through PUBREL into manual `WAIT_USER_ACK`, instead of rewinding the phase
+  and sending PUBREC again (#499).
+- Complete a persisted inbound exchange only after the application owns its
+  message. PUBREL for an undelivered QoS 2 message, including one that arrives
+  in the same read as its PUBLISH or before a bounded replay page reaches it,
+  no longer sends PUBCOMP and deletes the last durable copy. A recovered QoS 1
+  row resumed by an automatically acknowledging client is likewise
+  acknowledged only after replay delivers it (#519, #520).
+- Take the durable delivered mark when the application commit happens and tie
+  it to the exchange rather than the connection, so a committed message is not
+  redelivered after a reconnect or reader cancellation (#517), and a late mark
+  can no longer flag a later exchange that reuses the packet identifier
+  (#534). An iterator admission waiting for capacity no longer commits into a
+  replaced connection or stream (#500).
+- Report a `CancelledError` raised by a dependency (transport read, write,
+  `write_nowait` or close, transport factory, publication source, keepalive)
+  as an `MQTTError` that keeps it as `__cause__`, instead of treating it as a
+  cancellation of the client's own task. The writer now retires its
+  generation, and the effect pump and reconnect supervisor keep running.
+  `connect()` and `publish_many()` fail with the dependency's cause, and
+  `publish_many()` keeps the prefix receipt. The reader and keepalive keep the
+  original cause. A cancellation requested on the task itself still propagates
+  unchanged (#509, #510, #522, #525, #529, #538).
+- Retire the connection epoch and the protocol engine in one synchronous step
+  when the reader observes a lost connection, so a concurrent `publish_nowait()`
+  can no longer be accepted and written into the dead transport (#544).
+- Keep the broker's DISCONNECT reason as the connection's cause when closing
+  the transport afterwards makes a pending write fail; `on_disconnect` now
+  receives `BrokerDisconnectError` rather than the secondary `OSError` (#543).
+- Apply facts the client has already observed without waiting behind outgoing
+  packets blocked on writer capacity. A received PUBACK or PUBCOMP settles its
+  receipt, CONNACK completes `connect()`, SUBACK/UNSUBACK complete their
+  request, and PINGRESP clears the keepalive deadline. An invalid CONNACK now
+  fails `connect()` with its protocol error instead of a timeout. A broker
+  DISCONNECT ends the connection and reaches `on_disconnect` instead of hanging
+  behind a pending acknowledgement (#524, #526, #531, #532, #536, #540).
+- Run `auth_handler` in its own task instead of inside protocol processing.
+  The handler can now await `publish()`, `subscribe()`, `disconnect()`, an
+  existing receipt, or a message from the same read without deadlocking the
+  client. Its response is sent only while the broker still waits for that
+  Continue authentication challenge: the return value for AUTH Success is
+  ignored instead of breaking the connection, and a late response can no longer
+  follow a broker DISCONNECT or replace its reason (#501, #502, #523, #527,
+  #528, #535).
+
 ## [1.0.0rc15] - 2026-09-23
 
 ### Fixed

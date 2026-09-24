@@ -1,0 +1,37 @@
+{
+  "module": "IngressLot.tla",
+  "status": "refinement",
+  "summary": "A peer error inside an ingress lot ends the lot: the valid prefix commits, completes and is delivered, nothing after it is processed, for every cut of the byte stream.",
+  "issues": [
+    511,
+    513
+  ],
+  "tests": [
+    "tests/unit/test_ingress_prefix_commit.py"
+  ],
+  "configs": [
+    {
+      "config": "IngressLot-rc15-malformed.cfg",
+      "expect": "violation",
+      "invariant": "ObservedOutcomeKept"
+    },
+    {
+      "config": "IngressLot-rc15-protocol-after.cfg",
+      "expect": "violation",
+      "invariant": "NothingAfterFatal"
+    },
+    {
+      "config": "IngressLot-rc15-protocol-delivery.cfg",
+      "expect": "violation",
+      "invariant": "AckedIsDelivered"
+    },
+    {
+      "config": "IngressLot-fixed-malformed.cfg",
+      "expect": "pass"
+    },
+    {
+      "config": "IngressLot-fixed-protocol.cfg",
+      "expect": "pass"
+    }
+  ]
+}

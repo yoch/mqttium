@@ -78,7 +78,10 @@ def test_success_pubrel_capacity_is_checked_before_qos2_transition() -> None:
     assert engine.take_effects() == []
 
 
-def test_tiny_limit_does_not_fail_pubrec_when_no_pubrel_would_be_sent() -> None:
+def test_repeated_pubrec_pubrel_capacity_is_checked_without_phase_change() -> None:
+    # A repeated successful PUBREC in WAIT_PUBCOMP still requires PUBREL
+    # [MQTT-4.3.3-4] (#503), so a limit below its size is the same local
+    # mandatory-response failure as for the first PUBREC.
     engine = _engine()
     mid = _start_qos2(engine)
     engine.handle_raw(_pubrec(mid))
@@ -88,7 +91,11 @@ def test_tiny_limit_does_not_fail_pubrec_when_no_pubrel_would_be_sent() -> None:
     assert record.state is OutboundQoSState.WAIT_PUBCOMP
 
     engine.negotiated = NegotiatedSettings(maximum_packet_size=3)
-    engine.handle_raw(_pubrec(mid))
+    with pytest.raises(
+        MandatoryResponseTooLargeError,
+        match=r"Mandatory PUBREL size 4 exceeds broker maximum_packet_size 3",
+    ):
+        engine.handle_raw(_pubrec(mid))
 
     assert engine.take_effects() == []
     record = engine.store.get_out(mid)

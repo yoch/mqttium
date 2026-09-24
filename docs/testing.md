@@ -53,6 +53,13 @@ MQTTIUM_REQUIRE_BROKER=1 python -m pytest -q tests/integration
 
 TLS tests also require OpenSSL on `PATH`.
 
+TLA+ models of runtime ownership and ordering rules run under TLC with Java.
+See [Formal models](formal-models.md):
+
+```bash
+python tools/formal/run_tlc.py
+```
+
 ## Coverage semantics
 
 The authoritative repository gate is coverage.py's branch-inclusive total for

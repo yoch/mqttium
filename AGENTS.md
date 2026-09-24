@@ -19,6 +19,7 @@ python -m pytest -q tests/unit tests/project --cov=mqttium
 PYTHONPATH=src python tests/fuzz/fuzz.py --seed 1 --iterations 20000
 python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py tests/fuzz/test_stateful_invariants.py
 mkdocs build --strict
+python tools/formal/run_tlc.py   # requires Java; see docs/formal-models.md
 ```
 
 `pyproject.toml` supplies `pythonpath = ["src"]` and asyncio auto mode. Do not
@@ -94,10 +95,20 @@ and flow slot. All failures unwind through the outbound session's rollback
 path. Extend `tests/unit/test_outbound_transaction.py` whenever an acquisition
 step is added.
 
+## Formal models
+
+TLA+ models in `formal/models/` declare the outcome TLC must report for each
+configuration: the released-behaviour configuration keeps its counterexample
+and the repaired one passes. New models must encode the implementation's real
+predicates and name the deterministic tests that replay their counterexample;
+see `docs/formal-models.md`.
+
 ## Effect and replay pipeline
 
 The common single-effect case is applied inline. Deferred effects live in the
-`EffectPump`; SEND effects retain wire order before application-visible events.
+`EffectPump`; SEND effects retain wire order among themselves. Observed facts
+(CONNACK, completions, SUBACK/UNSUBACK, PINGRESP, a broker DISCONNECT) are
+applied at collection and never wait behind SENDs blocked on writer capacity.
 Every connection-scoped effect carries an epoch, and stale effects from a dead
 connection must not affect a new one. Application delivery pressure must not
 block already-decoded protocol work or extend an earlier collection's fence.
@@ -107,6 +118,12 @@ The bounded reader still cannot process an ACK it has not read.
 bounded replay batch. This places delivery backpressure between batches and
 keeps memory proportional to one batch. Direct `ProtocolEngine` consumers must
 pump `continue_inbound_replay()` while replay remains pending.
+
+A persisted inbound exchange completes (PUBCOMP, or PUBACK of a recovered
+QoS 1 row) only after its delivery is marked. The runtime marks at the
+application commit, with the MESSAGE effect's `exchange_token`; direct engine
+consumers must call `mark_inbound_delivered(mid, token)` themselves. No
+coroutine may await while holding `_engine_lock`.
 
 ## Persistence
 
