@@ -12,6 +12,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   throttling register in benchmark runner preflights, and reject samples taken
   while the firmware reports a current limit (#493).
 
+### Fixed
+
+- Treat a transport-originated `CancelledError` as a writer failure when the
+  writer task itself has no cancellation request, so the failed generation is
+  retired and pending QoS work cannot be left behind a dead writer (#509).
+
 ## [1.0.0rc15] - 2026-09-23
 
 ### Fixed
