@@ -156,8 +156,12 @@ replace obsolete pending states. External lifecycle operations cancel obsolete
 active hooks; an operation awaited directly by the current hook preserves its
 caller. The supervisor reaps the old child before invoking its successor.
 Network operations do not wait for hook completion, and `on_connect` does not
-hold incoming delivery. Automatic reconnect waits for `on_disconnect`, then
-rechecks explicit intent. AUTH retains its separate protocol timeout and
+hold incoming delivery. Automatic reconnect waits until `on_disconnect` has
+started, not until it returns: the hook may await work that only the
+replacement connection completes, and that connection's `on_connect` still runs
+after it. Reconnect then rechecks explicit intent. A replacement that drops
+before `stable_after` is retried at once; the window only decides whether retry
+progression resets. AUTH retains its separate protocol timeout and
 task (see Effects).
 
 `messages()` captures the delivery generation when called, even if its returned

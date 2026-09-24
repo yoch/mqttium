@@ -781,13 +781,17 @@ async def test_disconnect_hook_errors_do_not_own_protocol_lifecycle(task_factory
         loop.set_exception_handler(previous)
 
 
-async def test_reconnect_during_stability_waits_for_new_disconnect_hook(task_factory):
+async def test_reconnect_proceeds_while_disconnect_hook_runs(task_factory):
+    # #508: automatic reconnect no longer waits for a running on_disconnect
+    # hook (it may await work only the new connection completes), but the new
+    # connection's on_connect is still serialized behind that hook.
     client = AsyncClient(
         "hook-retry-gate",
         reconnect=ReconnectPolicy(initial_delay=0, max_delay=0, stable_after=0.02),
     )
     brokers = install_brokers(client)
     entered, release = asyncio.Event(), asyncio.Event()
+    connected_on: list[int] = []
 
     async def disconnected(_error):
         if len(brokers) == 2:
@@ -795,16 +799,19 @@ async def test_reconnect_during_stability_waits_for_new_disconnect_hook(task_fac
             await release.wait()
 
     client.on_disconnect = disconnected
+    client.on_connect = lambda _connack: connected_on.append(len(brokers))
     try:
         await client.connect("fake")
         await brokers[0].close()
         await wait_until(lambda: len(brokers) == 2 and client.is_connected)
+        await wait_until(lambda: 2 in connected_on)
         await brokers[1].close()
         await asyncio.wait_for(entered.wait(), 1)
-        await asyncio.sleep(0.05)
-        assert len(brokers) == 2
-        release.set()
         await wait_until(lambda: len(brokers) == 3 and client.is_connected)
+        await asyncio.sleep(0.05)
+        assert 3 not in connected_on
+        release.set()
+        await wait_until(lambda: 3 in connected_on)
     finally:
         release.set()
         await finish(client)

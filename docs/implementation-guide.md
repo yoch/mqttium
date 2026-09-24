@@ -279,7 +279,12 @@ latest pending state; obsolete states may be coalesced. External lifecycle
 operations cancel obsolete hooks, while an operation directly awaited by the
 current hook preserves its caller. Network operation completion does not await
 hook completion. `on_connect` is not an incoming-data readiness barrier.
-Automatic retry awaits the current disconnect hook and rechecks user intent.
+Automatic retry waits until the current disconnect hook has started (it may
+await work the replacement connection completes, #508), preserves it, and
+rechecks user intent; `on_connect` stays serialized behind it. `stable_after`
+is a backoff-reset threshold: the supervisor waits for the replacement reader
+or the timer, whichever comes first, so a replacement lost inside the window is
+retried immediately without resetting retry progression (#542).
 Authentication runs in its own owned task with `auth_timeout`; neither the
 effect lane nor the reader waits for it. Its answer goes through
 `ProtocolEngine.respond_auth(challenge, ...)`, which refuses an answer the

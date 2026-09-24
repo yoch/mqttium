@@ -21,6 +21,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Let automatic reconnect proceed once `on_disconnect` has started instead of
+  waiting for it to return. A hook awaiting a receipt that only the replacement
+  connection could settle deadlocked reconnect; `on_connect` for the new
+  connection still runs after the hook (#508, ported from #518).
+- Retry at once when a replacement connection drops inside the `stable_after`
+  window. The supervisor slept through the whole window (30 s by default)
+  before noticing the loss (#542).
 - Never send a publication whose receipt the client already failed. After a
   refused CONNACK, a final connection loss or `disconnect()`, a later
   `connect()` of the same client published the offline queue or replayed the
