@@ -70,9 +70,10 @@ def test_replay_emits_a_bounded_first_batch_and_asks_for_more() -> None:
 
     assert len(message_mids(effects)) == REPLAY_BATCH_MESSAGES
     assert effects[-1].kind is EffectKind.CONTINUE_INBOUND_REPLAY
-    # The receive window is restored in full before the first redelivery, not
-    # progressively as batches are emitted.
-    assert engine.inbound._inflight == 500
+    # Replay restores durable application/protocol state, not PUBLISH quota
+    # ownership on the replacement Network Connection.
+    assert engine.inbound._inflight == 0
+    assert store.in_count() == 500
     assert engine.inbound.replay_pending is True
 
 
