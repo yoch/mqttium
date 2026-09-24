@@ -141,9 +141,9 @@ class ProtocolEngine:
     def take_effects(self) -> list[EngineEffect]:
         """Take pending effects; the ownership-transfer boundary.
 
-        Taking the batch also releases the Receive Maximum slots held by the
-        auto-PUBACKs in that batch (see
-        ``InboundSession.release_pending_auto_qos1``; the read loop stops
+        Taking the batch also releases the Receive Maximum slots and packet
+        identifiers held by the auto-PUBACKs and PUBCOMPs in that batch (see
+        ``InboundSession.release_pending_acks``; the read loop stops
         ingress on ``_autoack_handoff_required``). The two operations are
         intentionally atomic, not separable primitives.
         """
@@ -155,8 +155,8 @@ class ProtocolEngine:
         # `_autoack_handoff_required` is only ever set alongside a non-empty
         # mid set, so an empty set means there is nothing to release.
         inbound = self.inbound
-        if inbound._pending_auto_qos1_mids:
-            inbound.release_pending_auto_qos1()
+        if inbound._pending_auto_qos1_mids or inbound._pending_pubcomps:
+            inbound.release_pending_acks()
         return effects
 
     @property

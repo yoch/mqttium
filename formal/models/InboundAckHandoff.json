@@ -1,0 +1,32 @@
+{
+  "module": "InboundAckHandoff.tla",
+  "status": "refinement",
+  "summary": "A completed inbound QoS 2 exchange keeps its Receive Maximum slot and packet identifier until its PUBCOMP leaves the engine batch; a PUBLISH decoded earlier is refused, one decoded after is admitted.",
+  "issues": [
+    537,
+    541
+  ],
+  "tests": [
+    "tests/unit/test_inbound_ack_handoff.py"
+  ],
+  "configs": [
+    {
+      "config": "InboundAckHandoff-rc15-quota.cfg",
+      "expect": "violation",
+      "invariant": "NoAdmissionBeforeHandoff"
+    },
+    {
+      "config": "InboundAckHandoff-rc15-reuse.cfg",
+      "expect": "violation",
+      "invariant": "NoAdmissionBeforeHandoff"
+    },
+    {
+      "config": "InboundAckHandoff-fixed-quota.cfg",
+      "expect": "pass"
+    },
+    {
+      "config": "InboundAckHandoff-fixed-reuse.cfg",
+      "expect": "pass"
+    }
+  ]
+}

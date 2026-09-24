@@ -21,6 +21,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Keep the Receive Maximum slot and packet identifier of a completed inbound
+  QoS 2 exchange until its PUBCOMP leaves the protocol engine, as automatic
+  QoS 1 PUBACKs already did. A PUBLISH that the broker sent before it could
+  have received that PUBCOMP (a second exchange beyond Receive Maximum, or a
+  reused packet identifier) was accepted instead of refused, and a PUBLISH
+  repeated after its PUBREL was acknowledged as a retransmission (#537, #541).
 - Answer every successful PUBREC with PUBREL: a repeated PUBREC for a QoS 2
   publication already waiting for PUBCOMP was silently ignored (#503). A
   successful PUBREC for an exchange still waiting behind the send quota after
