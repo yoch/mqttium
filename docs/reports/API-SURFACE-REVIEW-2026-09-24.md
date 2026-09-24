@@ -27,7 +27,12 @@ Legend: **K** keep · **R** remove · **P** make private or Internal ·
 | §3 leaks L1–L6, L8 | Fix as proposed. |
 | E2 `MQTTTimeoutError` | Also derive from `TimeoutError`. |
 | §6 stores | Classes public (both), protocol methods Internal. |
-| Pending | D7 (`will`), §5 statistics, U1, U6, L7, E5. |
+| D7 `will` | `will=PublishMessage(...)`; `will_properties` removed. |
+| §5 statistics | Remove `TransportStats.kind` and `DecoderStats.max_packet_size`; keep the other fields; rename `connection_epoch` to `connections`; one naming scheme (`*_limit`). |
+| U1 `is_connected` | Keep. |
+| U6 `failure_count` | Keep. |
+| L7 callback aliases | Make private. |
+| E5 local argument errors | `ValueError` / `TypeError` for invalid argument types or values; state-dependent misuse stays `MQTTError`. |
 
 ## 1. Dead or misleading items
 
