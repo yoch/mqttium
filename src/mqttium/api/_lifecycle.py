@@ -46,15 +46,22 @@ class LifecycleHooks:
         self._reconnect_ready = asyncio.Event()
         self._reconnect_ready.set()
 
-    def begin_operation(self, *, replace_connection: bool = True) -> asyncio.Task[None] | None:
-        """Supersede old notifications; return a directly calling hook owner."""
+    def begin_operation(
+        self,
+        *,
+        replace_connection: bool = True,
+        preserve_hook: bool = False,
+    ) -> asyncio.Task[None] | None:
+        """Supersede old notifications and return the hook owner to preserve."""
         current = asyncio.current_task()
-        origin = self.hook_task if self.hook_task is current else None
+        direct_origin = self.hook_task if self.hook_task is current else None
+        origin = self.hook_task if preserve_hook else direct_origin
         if replace_connection:
             self.token += 1
         self.pending = None
         self._reconnect_ready.set()
-        self._cancel_obsolete(origin)
+        if not preserve_hook:
+            self._cancel_obsolete(direct_origin)
         return origin
 
     def _cancel_obsolete(self, origin: asyncio.Task[None] | None) -> None:
@@ -115,6 +122,12 @@ class LifecycleHooks:
             pass
         if event.token != self.token:
             return
+        if not event.connected:
+            # Once the disconnect hook has passed its token check, automatic
+            # transport recovery may proceed in parallel. The hook remains the
+            # lifecycle owner until it returns; on_connect stays serialized
+            # behind it in the worker.
+            self._reconnect_ready.set()
         try:
             await ApplicationDelivery.invoke(event.callback, event.value)
         except asyncio.CancelledError as exc:
