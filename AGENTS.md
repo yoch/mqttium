@@ -106,7 +106,9 @@ see `docs/formal-models.md`.
 ## Effect and replay pipeline
 
 The common single-effect case is applied inline. Deferred effects live in the
-`EffectPump`; SEND effects retain wire order before application-visible events.
+`EffectPump`; SEND effects retain wire order among themselves. Observed facts
+(CONNACK, completions, SUBACK/UNSUBACK, PINGRESP, a broker DISCONNECT) are
+applied at collection and never wait behind SENDs blocked on writer capacity.
 Every connection-scoped effect carries an epoch, and stale effects from a dead
 connection must not affect a new one. Application delivery pressure must not
 block already-decoded protocol work or extend an earlier collection's fence.
@@ -116,6 +118,12 @@ The bounded reader still cannot process an ACK it has not read.
 bounded replay batch. This places delivery backpressure between batches and
 keeps memory proportional to one batch. Direct `ProtocolEngine` consumers must
 pump `continue_inbound_replay()` while replay remains pending.
+
+A persisted inbound exchange completes (PUBCOMP, or PUBACK of a recovered
+QoS 1 row) only after its delivery is marked. The runtime marks at the
+application commit, with the MESSAGE effect's `exchange_token`; direct engine
+consumers must call `mark_inbound_delivered(mid, token)` themselves. No
+coroutine may await while holding `_engine_lock`.
 
 ## Persistence
 

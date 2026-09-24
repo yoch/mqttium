@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from mqttium.api._cancel import DependencyCancelledError
 from mqttium.api._delivery_lane import DeliveryLane
 from mqttium.api._effects import EffectPump
 from mqttium.errors import ProtocolError
@@ -41,6 +42,15 @@ class _Owner:
         self.block_first = block_first
         self.applies = 0
         self.closed = 0
+
+    def _propose_disconnect_cause(self, exc: BaseException, rank: int) -> BaseException:
+        if self._disconnect_exc is None:
+            self._disconnect_exc = exc
+        return self._disconnect_exc
+
+    def _apply_observation(self, effect: EngineEffect) -> bool:
+        del effect
+        return False
 
     def _apply_effect_inline(self, effect: EngineEffect, epoch: int) -> bool:
         del effect, epoch
@@ -334,3 +344,21 @@ async def test_unobserved_protocol_error_routes_to_connection_owner() -> None:
     assert owner.closed == 1
     assert contexts == []
     assert pump.error is None
+
+
+async def test_dependency_cancelled_error_fails_connection_instead_of_killing_pump() -> None:
+    # #525: a dependency raising CancelledError while applying an effect must
+    # not end the flush task silently and strand the waiting drain() target.
+    failure = asyncio.CancelledError("dependency self-cancel")
+    owner = _Owner([EngineEffect(EffectKind.SEND, b"fail")], failure)
+    pump = EffectPump(owner)  # type: ignore[arg-type]
+
+    pump.collect_from_engine()
+    with pytest.raises(DependencyCancelledError) as caught:
+        await asyncio.wait_for(pump.drain(), timeout=1.0)
+    await _wait_idle(pump)
+
+    assert caught.value.__cause__ is failure
+    assert owner._disconnect_exc is caught.value
+    assert owner.closed == 1
+    assert not pump.pending

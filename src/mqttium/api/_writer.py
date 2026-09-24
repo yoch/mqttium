@@ -11,6 +11,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 
+from mqttium.api._cancel import dependency_failure, failure_for, owner_cancelled
 from mqttium.api._effects import StaleConnectionEffect
 from mqttium.errors import FlowControlError
 from mqttium.api.stats import WriterStats
@@ -206,8 +207,24 @@ class WritePump:
     async def join(self) -> None:
         await self.queue.join()
 
-    async def advance_epoch(self, epoch: int) -> None:
+    @property
+    def sealed(self) -> bool:
+        return self._sealed
+
+    def seal(self) -> None:
+        """Refuse every later admission on this connection until reset().
+
+        Producers already parked for capacity fail once woken
+        (wake_waiters()).
+        """
+        self._sealed = True
+
+    def set_epoch(self, epoch: int) -> None:
+        """Invalidate earlier-epoch admissions without suspending."""
         self.epoch = epoch
+
+    async def advance_epoch(self, epoch: int) -> None:
+        self.set_epoch(epoch)
         await self.wake_waiters()
 
     async def wake_waiters(self) -> None:
@@ -388,11 +405,12 @@ class WritePump:
             # The transport may already own any prefix of these bytes. Restore
             # accounting ownership, never a retry: the existing writer checks
             # this latch before wire exposure and releases its normal batch.
-            self._latency_failure = exc
+            failure = failure_for(exc, "transport write_nowait")
+            self._latency_failure = failure
             self._drop_eager_binding()
             self.epoch += 1
             self._restore_latency_items(items)
-            raise
+            raise failure from failure.__cause__
         if not accepted:
             self._restore_latency_items(items)
             return False
@@ -566,19 +584,19 @@ class WritePump:
                     async with self.space:
                         self.queued_bytes = max(0, self.queued_bytes - released)
                         self._release_resident(n_batch)
-                        if batch_completed and self.waiters and not writer_task.cancelling():
+                        if batch_completed and self.waiters and not owner_cancelled(writer_task):
                             # Resident accounting is released even on lifecycle
                             # cancellation/failure, but only a successfully written
                             # batch releases usable admission capacity.
                             self.space.notify(min(self.waiters, n_batch))
-        except (Exception, asyncio.CancelledError) as exc:
-            # A transport can raise cancellation synchronously without this
-            # writer being cancelled. Report that latched failure; ordinary
-            # lifecycle cancellation must still leave teardown with its caller.
-            if isinstance(exc, asyncio.CancelledError) and (
-                writer_task.cancelling() or self._latency_failure is None
-            ):
+        except asyncio.CancelledError as exc:
+            # Lifecycle cancellation leaves teardown with its caller. A transport
+            # can also raise CancelledError while nobody cancelled this writer:
+            # that is a transport failure and must retire the generation.
+            if owner_cancelled(writer_task):
                 raise
+            failure: BaseException = dependency_failure(exc, "transport write")
+        except Exception as exc:
             failure = exc
         # The transport has failed and this task is giving up on it. Drop
         # the eager binding first: the reconnect path does not call stop()

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
 
 from mqttium.api.async_client import AsyncClient
 from mqttium.enums import ConnectionState, MQTTProtocolVersion
@@ -91,9 +90,11 @@ async def test_missing_auth_handler_effect_failure_closes_active_connection() ->
     await asyncio.sleep(0)
 
     client._engine._emit(EffectKind.AUTH, AuthPacket(reason_code=0x18))
+    # The challenge goes to the owned AUTH task, never into the effect pump:
+    # its failure retires the connection rather than a drain() caller.
     client._effect_pump.collect_from_engine()
-    with pytest.raises(MQTTError, match="no longer available"):
-        await client._effect_pump.drain()
+    await client._effect_pump.drain()
+    await wait_until(lambda: transport.closed)
     reader = client._reader_task
     if reader is not None:
         try:

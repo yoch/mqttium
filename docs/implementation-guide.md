@@ -179,6 +179,21 @@ PUBACK has been emitted but not yet handed off.
 Duplicate PUBLISH and PUBREL packets repeat the required protocol response but
 never redeliver application data. Orphan PUBREL is answered idempotently.
 
+A persisted exchange completes only after the application owns its message.
+Emitting a MESSAGE effect is not a delivery: until the runtime marks it, PUBREL
+for an undelivered QoS 2 row, and the retransmission of a recovered QoS 1 row
+in an automatically acknowledging session, record a pending completion and
+send nothing. The delivery mark then deletes the row, sends PUBCOMP or PUBACK
+and releases the slot. A pending completion is connection-scoped; the broker
+resends PUBREL (or the PUBLISH) after reconnect and finds the row again.
+
+Every persisted exchange has an identity independent of its packet
+identifier. The MESSAGE effect carries it as `exchange_token`, and
+`mark_inbound_delivered(mid, token)` ignores a token whose exchange has
+completed, so a late mark never reaches a later exchange that legally reuses
+the identifier. Direct `ProtocolEngine` consumers must mark every MESSAGE that
+`requires_delivery_mark`, exactly as they pump `continue_inbound_replay()`.
+
 ## Backpressure and rollback
 
 Logical outbound size is payload bytes plus encoded topic and properties. The
@@ -228,7 +243,10 @@ operations cancel obsolete hooks, while an operation directly awaited by the
 current hook preserves its caller. Network operation completion does not await
 hook completion. `on_connect` is not an incoming-data readiness barrier.
 Automatic retry awaits the current disconnect hook and rechecks user intent.
-Authentication alone remains awaited as protocol work with `auth_timeout`.
+Authentication runs in its own owned task with `auth_timeout`; neither the
+effect lane nor the reader waits for it. Its answer goes through
+`ProtocolEngine.respond_auth(challenge, ...)`, which refuses an answer the
+exchange no longer waits for.
 
 
 `iterator_admission_timeout=None` has no deadline. A positive timeout covers both byte
@@ -239,9 +257,15 @@ in iterator mode and completed callback invocation in callback mode.
 
 `accept()` returns `None` after an immediate handoff and an awaitable only for
 the waiting path or the fairness yield, so the common case creates no
-coroutine. Persisted marks follow the handoff and retain fail-stop semantics;
-they run synchronously when the engine lock is free and otherwise acquire it.
-No user callback executes under that lock.
+coroutine. A waiting admission reports whether it committed; one retired by a
+replaced connection or stream commits nothing. The persisted mark is taken
+synchronously with the commit, before any await, and keeps fail-stop
+semantics. It is tied to the exchange, not to the connection epoch: a message
+committed to a stream that survives reconnect stays delivered. This relies on
+the rule that no coroutine suspends while holding the engine lock
+(`tests/project/test_engine_lock_discipline.py`). Completions released by
+marks are handed to the writer once per delivery lot. No user callback
+executes under the engine lock.
 
 `EffectPump` owns only protocol work. A reader-owned `DeliveryLane` holds MESSAGE,
 DECODED_MESSAGE and CONTINUE_INBOUND_REPLAY. Each bounded lot records an epoch
@@ -295,10 +319,34 @@ rollbackable once observed; only local state is. The read loop opens one
 outer `store.batch()` around the whole ingress lot and collects effects after
 it closes; per-packet atomicity is explicitly not specified.
 
+A peer error ends the lot at the offending packet, which may be malformed,
+oversized, or a protocol violation. The packets decoded before it form the
+lot: their store batch commits, their effects apply and their messages are
+delivered, and only then does the error retire the connection. No packet
+after it is processed. The outcome therefore does not depend on how the
+peer's bytes were split into reads (`IngressLot` formal model). Bytes after
+the connection's terminal packet (a broker DISCONNECT, for example) belong to
+no connection: whole packets there are ignored by the engine, and
+undecodable ones do not replace the terminal reason. When the engine has
+already sent its own normative DISCONNECT for a violation, the runtime sends
+no second one.
+
 A propagated failure reaches the read-loop `finally`, which advances the
 epoch, calls `notify_transport_closed()`, and collects whatever sits in
 `engine._effects` under the new epoch before draining it: rollback alone
-does not retract effects. Latch, filter, and transport-closed retire
+does not retract effects. These three steps form one synchronous ownership
+transition before the first await. A producer can never observe the new
+epoch while the dead connection's engine still reports CONNECTED and admit
+work into it. This relies on no coroutine suspending while it holds the
+engine lock (`tests/project/test_engine_lock_discipline.py`).
+
+The connection's terminal cause follows one precedence. Real causes
+(transport, writer, keepalive and effect failures, a broker DISCONNECT or a
+refused CONNACK) are first-wins. A broker DISCONNECT is latched when it is
+applied, so a writer failure caused by closing the transport afterwards cannot
+replace it. A peer protocol violation outranks those causes, because a
+malformed DISCONNECT is not a valid verdict. A local capability failure
+outranks everything. "Connection closed" is used only when no cause is known. Latch, filter, and transport-closed retire
 therefore run synchronously under the engine lock with no await
 between them. The read loop groups an ingress lot inside `store.batch()`.
 For a transactional store, an exception rolls back the durable mutations
@@ -331,6 +379,30 @@ Four guarantees, all normative:
    recovery and absence of duplication are not guaranteed.
 
 Covered by `tests/unit/test_ingress_failure_semantics.py`.
+
+### Cancellation ownership
+
+`CancelledError` does not say who cancelled. A runtime task (writer, effect
+pump, reader, keepalive, reconnect supervisor, lifecycle worker) or an API
+call (`connect()`, `publish_many()`) can receive one raised by a dependency it
+awaits (transport read, write, `write_nowait` or close; a transport factory; a
+publication source) while nobody asked it to stop. Every boundary decides
+ownership through `mqttium.api._cancel.owner_cancelled()`, which reads the
+task's pending cancel requests:
+
+- an owner-requested cancellation propagates unchanged;
+- a dependency-raised one is an ordinary failure of that dependency. It is
+  reported as an `MQTTError` whose `__cause__` is the original
+  `CancelledError`, and it follows the same retirement, reconnect and receipt
+  settlement as any other failure of that boundary;
+- teardown that closes an already failing transport ignores the dependency's
+  failure, but never absorbs a cancellation of its own task.
+
+`tests/project/test_cancellation_discipline.py` rejects any other decision in
+the asyncio layers. Handlers that absorb `CancelledError` without asking, such
+as joins of a task the same code just cancelled, are listed there with a
+reason. The `CancellationOwnership` formal model checks the rule for every
+boundary.
 
 ## API completion and errors
 

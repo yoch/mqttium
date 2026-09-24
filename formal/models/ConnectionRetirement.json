@@ -1,0 +1,29 @@
+{
+  "module": "ConnectionRetirement.tla",
+  "status": "refinement",
+  "summary": "Reader teardown retires the connection epoch and the protocol engine in one synchronous step, and the fact that ended a connection stays its public cause.",
+  "issues": [
+    543,
+    544
+  ],
+  "tests": [
+    "tests/unit/test_connection_retirement.py",
+    "tests/project/test_engine_lock_discipline.py"
+  ],
+  "configs": [
+    {
+      "config": "ConnectionRetirement-rc15-admission.cfg",
+      "expect": "violation",
+      "invariant": "NoAdmissionAfterLoss"
+    },
+    {
+      "config": "ConnectionRetirement-rc15-cause.cfg",
+      "expect": "violation",
+      "invariant": "BrokerReasonKept"
+    },
+    {
+      "config": "ConnectionRetirement-fixed.cfg",
+      "expect": "pass"
+    }
+  ]
+}

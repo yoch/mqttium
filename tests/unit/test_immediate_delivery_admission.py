@@ -122,8 +122,9 @@ async def test_delivery_mark_keeps_lock_and_failure_boundary(monkeypatch, mark, 
     observed = []
     failure = OSError("durable mark failed")
 
-    def mark_delivered(self, mid):
+    def mark_delivered(self, mid, token=None):
         assert self is client._engine.inbound
+        assert token is None
         observed.append((mid, client._engine_lock.locked(), delivery.messages_queue.qsize()))
         raise failure
 
@@ -133,9 +134,10 @@ async def test_delivery_mark_keeps_lock_and_failure_boundary(monkeypatch, mark, 
     blocker = Message(topic="t", payload=b"0")
     if path == "waiting":
         assert delivery.accept(blocker, None) is None
-    # The mark is deferred behind a contended lock or a capacity wait; the
-    # free-lock immediate handoff completes it synchronously.
-    deferred = path == "waiting" or (path == "locked" and mark)
+    # The mark is taken synchronously with the commit. No coroutine awaits
+    # while holding the engine lock, so a held lock can only belong to the
+    # synchronous caller itself; only a capacity wait defers the commit.
+    deferred = path == "waiting"
     if path == "locked":
         await client._engine_lock.acquire()
     try:
@@ -143,7 +145,7 @@ async def test_delivery_mark_keeps_lock_and_failure_boundary(monkeypatch, mark, 
             with pytest.raises(OSError) as caught:
                 client._apply_delivery_effect(effect, client._connection_epoch)
             assert caught.value is failure
-            assert observed == [(7, False, 1)]
+            assert observed == [(7, path == "locked", 1)]
             pending = None
         else:
             pending = client._apply_delivery_effect(effect, client._connection_epoch)
@@ -159,7 +161,7 @@ async def test_delivery_mark_keeps_lock_and_failure_boundary(monkeypatch, mark, 
             with pytest.raises(OSError) as caught:
                 await pending
             assert caught.value is failure
-            assert observed == [(7, True, 1)]
+            assert observed == [(7, False, 1)]
         else:
             await pending
             assert not observed
