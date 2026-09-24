@@ -5,7 +5,9 @@
   "issues": [
     504
   ],
-  "tests": [],
+  "tests": [
+    "tests/unit/test_write_pump_eager_failure.py"
+  ],
   "configs": [
     {
       "config": "WritePumpEagerFailure-rc15.cfg",

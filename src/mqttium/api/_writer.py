@@ -85,9 +85,9 @@ class WritePump:
         # connection.
         self._eager_generation = 0
         self._eager_rearm_scheduled = False
-        # An eager latency flush can fail after exposing bytes. Restored frames
-        # then remain ownership records only; the writer must retire them and
-        # report this failure before attempting any further transport write.
+        # A producer-side eager or latency write can fail after exposing bytes.
+        # Retained frames then remain ownership records only; the writer must
+        # retire them and report the failure before any further transport write.
         self._sealed = False
         self._latency_failure: BaseException | None = None
 
@@ -268,6 +268,25 @@ class WritePump:
             f"{size}-byte write with {self.queued_bytes} bytes already queued"
         )
 
+    def _fence_eager_failure(self, failure: BaseException) -> None:
+        """Retire this generation after a producer-side write_nowait raised.
+
+        The transport may already own any prefix of the bytes, so they are
+        never retried: the caller keeps them only as ownership records, which
+        the writer task retires on this latch before any wire exposure. The
+        epoch advances before control returns to the producer, so no other
+        producer can admit into the failed generation (#504).
+        """
+        self._latency_failure = failure
+        self._drop_eager_binding()
+        self.epoch += 1
+
+    def _retain_failed_eager(self, item: bytes, failure: BaseException) -> None:
+        self._fence_eager_failure(failure)
+        self.queue.put_nowait(item)
+        self.queued_bytes += len(item)
+        self._admit_queued()
+
     def _try_write_data_eager(self, item: WriteItem) -> bool:
         """Write one ordinary frame straight through when doing so preserves order.
 
@@ -285,7 +304,13 @@ class WritePump:
             or not self.queue.empty()
         ):
             return False
-        if not write_nowait(item):
+        try:
+            accepted = write_nowait(item)
+        except BaseException as exc:
+            failure = failure_for(exc, "transport write_nowait")
+            self._retain_failed_eager(item, failure)
+            raise failure from failure.__cause__
+        if not accepted:
             return False
         self._eager_armed = False
         self._schedule_eager_rearm()
@@ -305,7 +330,13 @@ class WritePump:
             or not self.queue.empty()
         ):
             return False
-        if not write_nowait(item):
+        try:
+            accepted = write_nowait(item)
+        except BaseException as exc:
+            failure = failure_for(exc, "transport write_nowait")
+            self._retain_failed_eager(item, failure)
+            raise failure from failure.__cause__
+        if not accepted:
             return False
         self._ack_eager_armed = False
         self._schedule_eager_rearm()
@@ -402,13 +433,8 @@ class WritePump:
         try:
             accepted = write_nowait(combined)
         except BaseException as exc:
-            # The transport may already own any prefix of these bytes. Restore
-            # accounting ownership, never a retry: the existing writer checks
-            # this latch before wire exposure and releases its normal batch.
             failure = failure_for(exc, "transport write_nowait")
-            self._latency_failure = failure
-            self._drop_eager_binding()
-            self.epoch += 1
+            self._fence_eager_failure(failure)
             self._restore_latency_items(items)
             raise failure from failure.__cause__
         if not accepted:

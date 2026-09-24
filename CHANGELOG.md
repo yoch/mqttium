@@ -21,6 +21,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Retire the writer generation before a synchronous `write_nowait()` failure
+  reaches the publisher, and never retry the possibly partly written frame.
+  Another producer could previously keep writing into the failed transport
+  while the connection stayed up (#504, ported from #515).
 - End a resumed session with the new `SessionReplayError` when its CONNACK
   forbids resending an unacknowledged QoS 1/2 publication (lower Maximum QoS,
   `Retain Available` of 0 or a smaller Maximum Packet Size). The client
