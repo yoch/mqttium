@@ -575,9 +575,7 @@ class WritePump:
             # A transport can raise cancellation synchronously without this
             # writer being cancelled. Report that latched failure; ordinary
             # lifecycle cancellation must still leave teardown with its caller.
-            if isinstance(exc, asyncio.CancelledError) and (
-                writer_task.cancelling() or self._latency_failure is None
-            ):
+            if isinstance(exc, asyncio.CancelledError) and writer_task.cancelling():
                 raise
             failure = exc
         # The transport has failed and this task is giving up on it. Drop
