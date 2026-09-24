@@ -312,6 +312,18 @@ rollbackable once observed; only local state is. The read loop opens one
 outer `store.batch()` around the whole ingress lot and collects effects after
 it closes; per-packet atomicity is explicitly not specified.
 
+A peer error ends the lot at the offending packet, which may be malformed,
+oversized, or a protocol violation. The packets decoded before it form the
+lot: their store batch commits, their effects apply and their messages are
+delivered, and only then does the error retire the connection. No packet
+after it is processed. The outcome therefore does not depend on how the
+peer's bytes were split into reads (`IngressLot` formal model). Bytes after
+the connection's terminal packet (a broker DISCONNECT, for example) belong to
+no connection: whole packets there are ignored by the engine, and
+undecodable ones do not replace the terminal reason. When the engine has
+already sent its own normative DISCONNECT for a violation, the runtime sends
+no second one.
+
 A propagated failure reaches the read-loop `finally`, which advances the
 epoch, calls `notify_transport_closed()`, and collects whatever sits in
 `engine._effects` under the new epoch before draining it: rollback alone

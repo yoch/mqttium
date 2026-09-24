@@ -21,6 +21,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- End an ingress lot at the first malformed, oversized or protocol-violating
+  packet, and first commit, complete and deliver the packets decoded before it.
+  A later bad packet no longer rolls back an observed PUBACK, PUBCOMP, SUBACK or
+  UNSUBACK, fails its receipt, or drops a message already acknowledged. No
+  packet after the violation is processed, however the bytes were split into
+  reads (#511, #513). Bytes after a broker DISCONNECT no longer replace its
+  reason, and the client no longer sends a second DISCONNECT after the one the
+  protocol engine already sent.
 - Keep inbound MQTT Session State separate from Receive Maximum ownership on a
   replacement Network Connection. Resumed durable rows no longer precharge the
   current connection's PUBLISH quota; a persisted exchange acquires a slot only
