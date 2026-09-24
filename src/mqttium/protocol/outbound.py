@@ -91,6 +91,7 @@ class OutboundSession:
         "_is_v5",
         "_parked_entries",
         "_slotless",
+        "_sealed",
         "_queued",
         "_pending_bytes",
         "_pending_high_water_bytes",
@@ -132,6 +133,12 @@ class OutboundSession:
         # a parked exchange the broker advanced). Their terminal ACK must not
         # release a slot another exchange owns (#545).
         self._slotless: set[int] = set()
+        # Publications whose receipts this client already failed terminally
+        # (#521): mid -> whether its PUBLISH was ever sent. Their rows stay in
+        # the store for another client or process to recover, but this one
+        # never sends them again, and their identifiers stay reserved until
+        # the broker completes the exchange or a clean session drops it.
+        self._sealed: dict[int, bool] = {}
         self._pending_messages = 0
         self._pending_bytes = 0
         self._pending_high_water_messages = 0
@@ -579,6 +586,10 @@ class OutboundSession:
         meta = self.store.complete_out(mid, expected_state)
         if meta is None:
             return None
+        sealed = self._sealed
+        if sealed and sealed.pop(mid, None) is not None:
+            # Its reservation left with the seal; it was never resent here.
+            return False
         self._release_reservation(meta.logical_size)
         if self._parked_entries and self._unpark(mid):
             return False
@@ -1033,7 +1044,41 @@ class OutboundSession:
         # Hydration reserves a flow slot for every persisted WAIT_* exchange it
         # can admit. The window is never reset before CONNACK, so a non-zero
         # count is an O(1) proof that at least one sent QoS 1/2 exchange exists.
-        return self.flow.inflight > 0
+        return self.flow.inflight > 0 or any(self._sealed.values())
+
+    def seal(self, mids: Iterable[int]) -> None:
+        """Never send again the publications whose receipts failed (#521).
+
+        The client told its caller they failed. Their durable rows stay for
+        another client or process to recover (the store's purpose), but this
+        client neither launches nor replays them, and keeps their packet
+        identifiers reserved.
+        """
+        sealed = self._sealed
+        parked = (
+            {m.mid for m in self._queued if m.state is not OutboundQoSState.QUEUED}
+            if self._parked_entries
+            else set()
+        )
+        newly: set[int] = set()
+        for mid in mids:
+            if mid in sealed:
+                continue
+            meta = self.store.out_meta(mid)
+            if meta is None:
+                continue
+            sent = meta.state is not OutboundQoSState.QUEUED
+            sealed[mid] = sent
+            newly.add(mid)
+            self._release_reservation(meta.logical_size)
+            if sent and mid not in parked and mid not in self._slotless:
+                self.flow.release()
+            self._slotless.discard(mid)
+        if newly and self._queued:
+            self._queued = deque(m for m in self._queued if m.mid not in newly)
+            self._parked_entries = sum(
+                1 for m in self._queued if m.state is not OutboundQoSState.QUEUED
+            )
 
     def hydrate(self) -> None:
         """Recover packet ids and the offline queue from a durable store."""
@@ -1074,9 +1119,10 @@ class OutboundSession:
             # Only these limits can forbid a resent PUBLISH or PUBREL (replay
             # strips topic aliases), so no stored exchange needs a pass.
             return
+        sealed = self._sealed
         for page in self.store_summary_pages():
             for msg in page:
-                if msg.state is not OutboundQoSState.QUEUED:
+                if msg.state is not OutboundQoSState.QUEUED and msg.mid not in sealed:
                     self._validate_replay(msg)
 
     def _validate_replay(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
@@ -1089,6 +1135,8 @@ class OutboundSession:
             ) from exc
 
     def _replay_message(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
+        if self._sealed and msg.mid in self._sealed:
+            return  # already failed to its caller: never resent by this client
         if msg.state is OutboundQoSState.QUEUED:
             # Never sent: not part of the broker session, so it may fail alone.
             try:
@@ -1168,10 +1216,25 @@ class OutboundSession:
             self._queued = deque(m for m in self._queued if m.state is OutboundQoSState.QUEUED)
         self._parked_entries = 0
         self._slotless.clear()
-        clear_abandoned_packet_ids = not self._queued and not sub_mids_pending
+        sealed = self._sealed
+        # A sealed, never-sent row survives like any queued one and keeps its
+        # identifier, so the pool cannot be reset wholesale around it.
+        clear_abandoned_packet_ids = (
+            not self._queued
+            and not sub_mids_pending
+            and not any(not sent for sent in sealed.values())
+        )
         for page in self.store_summary_pages():
             for msg in page:
                 if msg.state is OutboundQoSState.QUEUED:
+                    continue
+                if msg.mid in sealed:
+                    # The broker dropped it with its session; its receipt
+                    # already failed and its reservation left with the seal.
+                    del sealed[msg.mid]
+                    self.store.delete_out(msg.mid)
+                    if not clear_abandoned_packet_ids:
+                        self.packet_ids.release(msg.mid)
                     continue
                 self.complete_record(msg.mid, msg)
                 if not clear_abandoned_packet_ids:

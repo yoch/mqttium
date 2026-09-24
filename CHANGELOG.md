@@ -21,6 +21,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Never send a publication whose receipt the client already failed. After a
+  refused CONNACK, a final connection loss or `disconnect()`, a later
+  `connect()` of the same client published the offline queue or replayed the
+  session with no receipt left to report the outcome. The durable row now stays
+  for another client or a restarted process to recover, while the failing
+  client seals it and keeps its packet identifier reserved (#521).
 - Release a send-quota slot only for an exchange whose PUBLISH was sent on
   the current connection. After a resumed session, settling an exchange still
   waiting behind the quota, or completing a replayed PUBREL, freed a slot that

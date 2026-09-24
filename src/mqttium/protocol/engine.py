@@ -755,6 +755,10 @@ class ProtocolEngine:
             self.inbound.replay_session()
         outbound.drain()
 
+    def seal_publications(self, mids: Iterable[int]) -> None:
+        """Never send again publications whose receipts failed terminally (#521)."""
+        self.outbound.seal(mids)
+
     def continue_inbound_replay(self) -> None:
         """Emit the next bounded batch of restart redeliveries.
 
