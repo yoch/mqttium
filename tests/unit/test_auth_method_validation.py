@@ -138,3 +138,46 @@ def test_duplicate_client_reauthenticate_is_rejected_locally() -> None:
 
     with pytest.raises(ProtocolError, match="already in progress"):
         engine.queue_auth(reason_code=0x19)
+
+
+def _challenge(effects: list) -> object:
+    (auth,) = [e for e in effects if e.kind is EffectKind.AUTH]
+    return auth.exchange_token
+
+
+def test_respond_auth_answers_only_the_current_challenge() -> None:
+    # #528 #535: an answer is sent only while the exchange waits for it.
+    engine = _engine()
+    _connect(engine)
+    engine.queue_auth(reason_code=0x19)
+    engine.take_effects()
+
+    first = _challenge(_feed(engine, _auth(0x18)))
+    assert first is not None
+    assert engine.respond_auth(first)
+    assert any(e.kind is EffectKind.SEND for e in engine.take_effects())
+    assert not engine.respond_auth(first)  # already answered
+
+    second = _challenge(_feed(engine, _auth(0x18)))
+    assert second != first
+    assert not engine.respond_auth(first)
+    success = _challenge(_feed(engine, _auth(0x00)))
+    assert success is None
+    assert not engine.respond_auth(success)
+    assert not engine.respond_auth(second)  # the exchange succeeded
+    assert engine.take_effects() == []
+
+
+def test_respond_auth_after_local_disconnect_is_stale() -> None:
+    engine = _engine()
+    _connect(engine)
+    engine.queue_auth(reason_code=0x19)
+    engine.take_effects()
+    challenge = _challenge(_feed(engine, _auth(0x18)))
+
+    engine.begin_disconnect()
+    engine.take_effects()
+
+    assert engine.state is ConnectionState.DISCONNECTING
+    assert not engine.respond_auth(challenge)
+    assert engine.take_effects() == []

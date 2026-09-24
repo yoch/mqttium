@@ -1,0 +1,32 @@
+{
+  "module": "OutboundQoS2Phases.tla",
+  "status": "refinement",
+  "summary": "Every successful PUBREC is answered by a PUBREL, including a repeated one in WAIT_PUBCOMP, and a replay-parked exchange leaves the queue at its phase change so drain() never resends PUBREL for it.",
+  "issues": [
+    497,
+    503
+  ],
+  "tests": [
+    "tests/unit/test_outbound_pubrec_phases.py"
+  ],
+  "configs": [
+    {
+      "config": "OutboundQoS2Phases-rc15-repeat.cfg",
+      "expect": "violation",
+      "invariant": "EveryPubrecAnswered"
+    },
+    {
+      "config": "OutboundQoS2Phases-rc15-parked.cfg",
+      "expect": "violation",
+      "invariant": "NoStalePubrel"
+    },
+    {
+      "config": "OutboundQoS2Phases-fixed-active.cfg",
+      "expect": "pass"
+    },
+    {
+      "config": "OutboundQoS2Phases-fixed-parked.cfg",
+      "expect": "pass"
+    }
+  ]
+}

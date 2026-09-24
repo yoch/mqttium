@@ -39,31 +39,20 @@ async def test_terminal_publish_effect_survives_connection_epoch_change() -> Non
     client = AsyncClient()
     receipt, batch = _register_publish_handles(client, 7)
 
-    # SEND is intentionally ordered ahead of completion. If it blocks until the
-    # transport epoch changes, the terminal result must still settle locally.
+    # The completion is an observed fact: it settles at collection even when
+    # a SEND ahead of it would block until the transport epoch changes.
     client._engine._emit(EffectKind.PUBLISH_COMPLETE, 7)
     client._engine._emit(EffectKind.SEND, b"next")
     client._effect_pump.collect_from_engine()
-    assert [effect.kind for effect in client._effect_pump.pending] == [
-        EffectKind.SEND,
-        EffectKind.PUBLISH_COMPLETE,
-    ]
+    assert EffectKind.PUBLISH_COMPLETE not in [e.kind for e in client._effect_pump.pending]
+    assert receipt.is_done()
+    assert batch.is_done()
 
     await client._invalidate_connection_epoch()
-    client._engine._emit(EffectKind.PINGRESP, None)
-    client._effect_pump.collect_from_engine()
-    assert [effect.kind for effect in client._effect_pump.pending] == [
-        EffectKind.PUBLISH_COMPLETE,
-        EffectKind.PINGRESP,
-    ]
+    await client._effect_pump.drain()
     assert client._effect_pump.enqueued == client._effect_pump.applied + len(
         client._effect_pump.pending
     )
-
-    await client._effect_pump.drain()
-
-    assert receipt.is_done()
-    assert batch.is_done()
     await receipt.wait()
     await batch.wait()
     assert client._delivery.callback_invocations == 0

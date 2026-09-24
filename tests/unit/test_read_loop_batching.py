@@ -91,8 +91,9 @@ class _CountingDecoder:
         return packet
 
 
-# _read_loop's finally block takes the engine lock once to notify closure.
-TEARDOWN_ACQUISITIONS = 1
+# _read_loop's finally block retires the connection synchronously, without
+# taking the engine lock: nothing awaits while holding it (#544).
+TEARDOWN_ACQUISITIONS = 0
 
 
 async def _run_reads(

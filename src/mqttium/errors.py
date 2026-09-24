@@ -45,6 +45,21 @@ class MandatoryResponseTooLargeError(PacketTooLargeError):
     """
 
 
+class SessionReplayError(MQTTError):
+    """A resumed session holds an exchange the new CONNACK forbids resending.
+
+    With Session Present, MQTT requires every unacknowledged QoS 1/2 PUBLISH
+    and PUBREL to be resent with its original Packet Identifier
+    [MQTT-4.4.0-1]. When the new CONNACK's Maximum QoS, Retain Available or
+    Maximum Packet Size forbids one of them, the session cannot be resumed:
+    the connection is ended locally, durable state and packet identifiers are
+    kept, and a reconnect policy never retries it. Reported through
+    ``on_disconnect`` or raised by ``connect()``. Connecting with
+    ``clean_start=True`` discards the session and fails those publications
+    with ``SessionDiscardedError``.
+    """
+
+
 class FlowControlError(MQTTError):
     """Immediate operation refused because bounded client capacity is unavailable."""
 

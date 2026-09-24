@@ -138,7 +138,7 @@ def test_effect_collection_stably_prioritizes_sends() -> None:
     client = AsyncClient(client_id="stable-effect-partition")
     client._engine._emit(EffectKind.MESSAGE, Message(topic="first", payload=b"1"))
     client._engine._send(b"send-1")
-    client._engine._emit(EffectKind.PINGRESP)
+    client._engine._emit(EffectKind.DISCONNECTED)
     client._engine._send(b"send-2")
 
     client._effect_pump.collect_from_engine()
@@ -146,7 +146,7 @@ def test_effect_collection_stably_prioritizes_sends() -> None:
     assert [(effect.kind, effect.data) for effect in client._effect_pump.pending] == [
         (EffectKind.SEND, b"send-1"),
         (EffectKind.SEND, b"send-2"),
-        (EffectKind.PINGRESP, None),
+        (EffectKind.DISCONNECTED, None),
     ]
     epoch, protocol_target, deliveries = client._delivery_lane.pending[0]
     assert epoch == client._connection_epoch

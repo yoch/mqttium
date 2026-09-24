@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from mqttium.api import AsyncClient, PublishMessage
+from mqttium.api._cancel import DependencyCancelledError
 from mqttium.api._effects import StaleConnectionEffect
 from mqttium.api._writer import WritePump
 from mqttium.errors import PublishBatchError
@@ -102,10 +103,13 @@ async def test_ambiguous_latency_failure_is_retired_by_existing_writer(
     # This producer already belongs to the failed generation, even though its
     # task has not run yet. It must fail instead of reusing released credits.
     late = asyncio.create_task(pump.enqueue(b"late", epoch=initial_epoch))
+    # A transport raising CancelledError without a cancel request fails like
+    # any transport error, keeping the original exception as its cause.
+    reported_type = DependencyCancelledError if failure_type is asyncio.CancelledError else OSError
     try:
-        with pytest.raises(failure_type) as caught:
+        with pytest.raises(reported_type) as caught:
             pump._try_flush_latency_batch()
-        assert caught.value is failure
+        assert caught.value is failure or caught.value.__cause__ is failure
         assert pump.epoch == initial_epoch + 1
         assert pump._write_nowait is None
         assert pump.queued_messages == pump.resident_messages == 16
@@ -123,7 +127,7 @@ async def test_ambiguous_latency_failure_is_retired_by_existing_writer(
             await asyncio.wait_for(late, 1)
         await asyncio.wait_for(reported.wait(), 1)
         await asyncio.wait_for(pump.join(), 1)
-        assert failures == [failure]
+        assert failures == [caught.value]
         assert transport.eager_calls == [b"".join(parts)]
         assert not transport.awaited_calls
         assert pump.queued_messages == pump.resident_messages == pump.queued_bytes == 0

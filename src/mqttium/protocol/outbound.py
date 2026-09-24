@@ -33,6 +33,7 @@ from mqttium.errors import (
     PacketTooLargeError,
     ProtocolError,
     SessionDiscardedError,
+    SessionReplayError,
 )
 from mqttium.protocol.effects import EffectKind, PublishFailure, PublishHandle
 from mqttium.protocol.flow_control import FlowControl
@@ -122,7 +123,7 @@ class OutboundSession:
         self.flow = FlowControl(self.config.max_inbound_inflight)
         self._queued: deque[OutboundMessage | OutboundMessageSummary] = deque()
         # Replay-parked WAIT_* entries currently in `_queued` (see
-        # `_unpark_settled`). Zero on every path that does not involve a
+        # `_unpark`). Zero on every path that does not involve a
         # resumed session whose retransmissions exceeded the send quota.
         self._parked_entries = 0
         self._pending_messages = 0
@@ -568,18 +569,19 @@ class OutboundSession:
             return False
         self._release_reservation(meta.logical_size)
         if self._parked_entries:
-            self._unpark_settled(mid)
+            self._unpark(mid)
         return True
 
-    def _unpark_settled(self, mid: int) -> None:
-        """Drop the replay-parked queue entry of a settled exchange.
+    def _unpark(self, mid: int) -> None:
+        """Drop the replay-parked queue entry of `mid`, if any.
 
         `replay_session()` parks a WAIT_* record in `_queued` when the send
-        quota cannot admit its retransmission. The broker can still settle the
-        exchange while it is parked; the stale entry must leave the queue with
-        the record, or `drain()` would re-materialise the deleted record,
-        resurrect it through `update_out` and retransmit a settled
-        publication — and a reallocated packet identifier could later collide
+        quota cannot admit its retransmission. The broker can still settle or
+        advance the exchange while it is parked; the stale entry must leave
+        the queue with that phase, or `drain()` would re-materialise the
+        record, retransmit an exchange the broker already answered (a
+        resurrected publication, or a second PUBREL, #497) and consume a send
+        quota slot for it. A reallocated packet identifier could later collide
         with it in the queue.
         """
         queued = self._queued
@@ -637,7 +639,7 @@ class OutboundSession:
             if record is None:
                 self._send_orphan_pubrel(mid)
                 return
-            if record.state is not OutboundQoSState.WAIT_PUBREC:
+            if record.state not in (OutboundQoSState.WAIT_PUBREC, OutboundQoSState.WAIT_PUBCOMP):
                 return
             self._require_pubrel_capacity(4)
             return
@@ -648,10 +650,18 @@ class OutboundSession:
             compact=True,
         )
         if changed is not None:
+            if self._parked_entries:
+                # PUBREL needs no send quota: the parked entry just leaves.
+                self._unpark(mid)
             self._engine._send(_encode_pubrel_success(mid))
             return
-        if self.store.out_meta(mid) is None:
+        record = self.store.out_meta(mid)
+        if record is None:
             self._send_orphan_pubrel(mid)
+        elif record.state is OutboundQoSState.WAIT_PUBCOMP:
+            # A repeated successful PUBREC still requires PUBREL
+            # [MQTT-4.3.3-4]; the exchange keeps its phase and ownership (#503).
+            self._engine._send(_encode_pubrel_success(mid))
 
     def _send_orphan_pubrel(self, mid: int) -> None:
         """Answer a PUBREC with no matching record: PUBREL, 0x92 when MQTT 5."""
@@ -1025,17 +1035,53 @@ class OutboundSession:
         ):
             self.flow.try_acquire()
 
-    def _replay_message(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
+    def check_session_replayable(self) -> None:
+        """Refuse to resume a session whose mandatory replay is now forbidden.
+
+        Every WAIT_* exchange must be resent with its original packet id on a
+        resumed session [MQTT-4.4.0-1]. If the new negotiation forbids that
+        packet, discarding the exchange would free a packet id the broker
+        session may still hold (#539). Raised before any state changes; only
+        never-sent QUEUED work may fail individually.
+        """
+        negotiated = self._engine.negotiated
+        if (
+            negotiated.maximum_qos >= QoS.EXACTLY_ONCE
+            and negotiated.retain_available
+            and negotiated.maximum_packet_size is None
+        ):
+            # Only these limits can forbid a resent PUBLISH or PUBREL (replay
+            # strips topic aliases), so no stored exchange needs a pass.
+            return
+        for page in self.store_summary_pages():
+            for msg in page:
+                if msg.state is not OutboundQoSState.QUEUED:
+                    self._validate_replay(msg)
+
+    def _validate_replay(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
         try:
             self.validate_against_negotiated(msg)
         except (ProtocolError, PacketTooLargeError) as exc:
-            self.discard_record(msg.mid, msg)
-            self.packet_ids.release(msg.mid)
-            self._fail(msg.mid, exc)
-            return
+            raise SessionReplayError(
+                f"Resumed session must resend mid {msg.mid} ({msg.state.name}), "
+                f"which the new CONNACK forbids: {exc}"
+            ) from exc
+
+    def _replay_message(self, msg: OutboundMessage | OutboundMessageSummary) -> None:
         if msg.state is OutboundQoSState.QUEUED:
+            # Never sent: not part of the broker session, so it may fail alone.
+            try:
+                self.validate_against_negotiated(msg)
+            except (ProtocolError, PacketTooLargeError) as exc:
+                self.discard_record(msg.mid, msg)
+                self.packet_ids.release(msg.mid)
+                self._fail(msg.mid, exc)
+                return
             self._queued.append(msg)
             return
+        # A live exchange is never discarded for its negotiation:
+        # check_session_replayable() has already refused a session that
+        # cannot resend it, before the engine became CONNECTED.
         if msg.state is OutboundQoSState.WAIT_PUBCOMP:
             # Receive Maximum constrains QoS>0 PUBLISH packets only. A resumed
             # QoS 2 exchange retransmits PUBREL without consuming the new
