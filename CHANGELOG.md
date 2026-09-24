@@ -6,6 +6,15 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Never send a publication whose admission failed after its durable row was
+  written, when the cleanup delete also fails. The row stayed in the store with
+  its packet identifier released, so the same client replayed it on its next
+  resumed session although its caller had seen the failure, and a later
+  publication could overwrite it. The row is now sealed like a failed receipt:
+  kept for recovery, never sent by this client, its identifier reserved.
+
 ## [1.0.0rc16] - 2026-09-24
 
 ### Added
