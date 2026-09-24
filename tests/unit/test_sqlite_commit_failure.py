@@ -141,3 +141,32 @@ def test_failed_batch_rollback_never_becomes_durable(tmp_path, nested, deny_roll
         if not store._closed:
             store._conn.set_authorizer(None)
             store.close()
+
+
+def test_successful_batches_do_not_build_the_rollback_only_refusal(tmp_path, monkeypatch):
+    from mqttium.persistence import sqlite as sqlite_module
+
+    built = []
+
+    class CountingRuntimeError(RuntimeError):
+        def __init__(self, *args):
+            built.append(args)
+            super().__init__(*args)
+
+    # Module globals shadow builtins, so this counts every construction there.
+    monkeypatch.setattr(sqlite_module, "RuntimeError", CountingRuntimeError, raising=False)
+    store = SqliteInflightStore(tmp_path / "quiet.db")
+    try:
+        for mid in range(1, 101):
+            with store.batch():
+                if mid % 2:
+                    store.put_out(_record(mid))
+        assert built == []
+        with pytest.raises(CountingRuntimeError, match="nested batch failure"):
+            with store.batch():
+                with pytest.raises(ValueError):
+                    with store.batch():
+                        raise ValueError("inner")
+        assert len(built) == 1
+    finally:
+        store.close()
