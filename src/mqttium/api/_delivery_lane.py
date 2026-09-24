@@ -18,7 +18,9 @@ class DeliveryOwner(Protocol):
 
     def _apply_delivery_effect(
         self, effect: EngineEffect, epoch: int
-    ) -> Awaitable[None] | None: ...
+    ) -> Awaitable[object] | None: ...
+
+    def _flush_released_completions(self) -> None: ...
 
 
 class DeliveryLane:
@@ -67,6 +69,11 @@ class DeliveryLane:
                         await pending
                     self.active_count -= 1
                     self.applied += 1
+                # Completions released by this bounded lot leave together. A
+                # lot waiting for application capacity holds them back, which
+                # carries that backpressure to the broker's send quota.
+                if epoch == owner._connection_epoch:
+                    owner._flush_released_completions()
             finally:
                 self.applied += self.active_count
                 self.active_count = 0

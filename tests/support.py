@@ -205,3 +205,21 @@ def sqlite_logical_snapshot(path):
         outbound = conn.execute("SELECT * FROM outbound ORDER BY mid").fetchall()
         inbound = conn.execute("SELECT * FROM inbound ORDER BY mid").fetchall()
         return version, journal, schema, outbound, inbound
+
+
+def mark_delivered_messages(engine: object, effects: list[EngineEffect]) -> list[EngineEffect]:
+    """Commit every persisted MESSAGE in ``effects`` as the runtime would.
+
+    A persisted QoS 2 exchange completes on PUBREL only after its delivery is
+    marked; direct engine consumers own that step. Returns ``effects``.
+    """
+    for effect in effects:
+        if (
+            effect.kind in (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE)
+            and effect.requires_delivery_mark
+            and effect.data.mid is not None
+        ):
+            engine.mark_inbound_delivered(  # type: ignore[attr-defined]
+                effect.data.mid, effect.exchange_token
+            )
+    return effects

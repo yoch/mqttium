@@ -28,7 +28,7 @@ class MessageRoute:
 
 CallbackTarget = Callable[..., Any] | MessageRoute
 IteratorQueueItem = Message | tuple[Message, int]
-IteratorAcceptor = Callable[[Message, int | None], Awaitable[None] | None]
+IteratorAcceptor = Callable[[Message, int | None], Awaitable[bool | None] | None]
 # Synchronous callback invocations, including route fan-out, charged between
 # two cooperative yields of the delivering reader. The yield happens at a
 # message boundary, so one message's routes always run contiguously.
@@ -81,6 +81,10 @@ class ApplicationDelivery:
         self.message_ready = asyncio.Event()
         self.closed = asyncio.Event()
         self._stream_generation = 0
+        # Slow iterator admissions are not committed application messages yet.
+        # Retire them independently when either their connection owner or the
+        # application stream generation is replaced.
+        self._admission_generation = 0
         self.iterator_admission_timeout = iterator_admission_timeout
         self.callback_invocations = 0
         self._since_yield = 0
@@ -120,6 +124,11 @@ class ApplicationDelivery:
         if self.waiters:
             self.space.set()
 
+    def invalidate_waiting_admissions(self) -> None:
+        """Retire uncommitted iterator handoffs from an older owner generation."""
+        self._admission_generation += 1
+        self._wake_waiters()
+
     def release(self, size: int) -> None:
         self.pending_bytes -= size
         self._wake_waiters()
@@ -140,7 +149,7 @@ class ApplicationDelivery:
         message: Message,
         callback: CallbackTarget | None,
         property_wire_size: int | None = None,
-    ) -> Awaitable[None] | None:
+    ) -> Awaitable[bool | None] | None:
         """Hand one message to its destination now, or return the waiting path.
 
         Callback mode runs every matching synchronous callback contiguously
@@ -168,9 +177,9 @@ class ApplicationDelivery:
         self,
         message: Message,
         _property_wire_size: int | None = None,
-    ) -> Awaitable[None] | None:
+    ) -> Awaitable[bool | None] | None:
         if self.messages_queue.full():
-            return self._accept_waiting_unaccounted(message)
+            return self._accept_waiting_unaccounted(message, self._admission_generation)
         self._enqueue_unaccounted(message)
         return None
 
@@ -178,7 +187,7 @@ class ApplicationDelivery:
         self,
         message: Message,
         property_wire_size: int | None = None,
-    ) -> Awaitable[None] | None:
+    ) -> Awaitable[bool | None] | None:
         # This is the bounded iterator hot path. Call the shared sizing primitive
         # directly rather than paying a forwarding method frame per message;
         # logical_size() remains the diagnostic/test surface for the same rule.
@@ -196,15 +205,19 @@ class ApplicationDelivery:
                 f"Message requires {size} delivery bytes, exceeding limit {limit}"
             )
         if self.pending_bytes + size > limit or self.messages_queue.full():
-            return self._accept_waiting_accounted(message, size)
+            return self._accept_waiting_accounted(message, size, self._admission_generation)
         self._enqueue_accounted(message, size)
         return None
 
-    async def _accept_waiting_unaccounted(self, message: Message) -> None:
-        """Wait only for iterator count capacity when byte accounting is disabled."""
+    async def _accept_waiting_unaccounted(self, message: Message, generation: int) -> bool:
+        """Wait for count capacity; return whether the message was committed.
+
+        The commit is synchronous with the return, so a caller that marks the
+        delivery right after awaiting this cannot be cancelled in between.
+        """
         try:
             async with asyncio.timeout(self.iterator_admission_timeout):
-                while self.messages_queue.full():
+                while generation == self._admission_generation and self.messages_queue.full():
                     self.space.clear()
                     self.waiters += 1
                     try:
@@ -213,15 +226,25 @@ class ApplicationDelivery:
                         self.waiters -= 1
         except TimeoutError as exc:
             raise MessageDeliveryError("Application delivery capacity timed out") from exc
+        if generation != self._admission_generation:
+            return False
         self._enqueue_unaccounted(message)
+        return True
 
-    async def _accept_waiting_accounted(self, message: Message, size: int) -> None:
-        """Wait for iterator byte and count capacity under one shared deadline."""
+    async def _accept_waiting_accounted(
+        self,
+        message: Message,
+        size: int,
+        generation: int,
+    ) -> bool:
+        """Wait for byte/count capacity; return whether the message was committed."""
         limit = self.max_iterator_bytes
         assert limit is not None
         try:
             async with asyncio.timeout(self.iterator_admission_timeout):
-                while self.pending_bytes + size > limit or self.messages_queue.full():
+                while generation == self._admission_generation and (
+                    self.pending_bytes + size > limit or self.messages_queue.full()
+                ):
                     self.space.clear()
                     self.waiters += 1
                     try:
@@ -230,7 +253,10 @@ class ApplicationDelivery:
                         self.waiters -= 1
         except TimeoutError as exc:
             raise MessageDeliveryError("Application delivery capacity timed out") from exc
+        if generation != self._admission_generation:
+            return False
         self._enqueue_accounted(message, size)
+        return True
 
     def messages(self) -> AsyncIterator[Message]:
         generation = self._stream_generation
@@ -272,6 +298,7 @@ class ApplicationDelivery:
     def reset_stream(self) -> None:
         if not self.closed.is_set():
             return
+        self.invalidate_waiting_admissions()
         self._stream_generation += 1
         if self.max_iterator_bytes is None:
             while not self.messages_queue.empty():

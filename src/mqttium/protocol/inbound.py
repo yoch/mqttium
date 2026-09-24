@@ -105,6 +105,9 @@ class InboundSession:
         "_decode_pubrel",
         "_engine",
         "_inflight",
+        "_current_persisted_mids",
+        "_exchange_tokens",
+        "_pending_completions",
         "_is_v5",
         "_on_qos1",
         "_autoack_handoff_required",
@@ -142,6 +145,17 @@ class InboundSession:
         self._topic_alias_maximum = self.config.topic_alias_maximum
         self._receive_maximum = self.config.max_inbound_inflight
         self._inflight = 0
+        # Durable inbound records are MQTT Session State; Receive Maximum
+        # ownership is scoped to one Network Connection. Track only persisted
+        # exchanges whose QoS>0 PUBLISH was actually observed on this connection.
+        self._current_persisted_mids: set[int] = set()
+        # Identity of each persisted exchange, independent of its reusable
+        # packet identifier. Delivery marks carry it back from the runtime.
+        self._exchange_tokens: dict[int, object] = {}
+        # Exchanges whose protocol completion (PUBCOMP, or the PUBACK of a
+        # recovered QoS 1 row) waits for the application to own the message.
+        # Deleting the row first would drop the last durable copy (#519, #520).
+        self._pending_completions: dict[int, InboundQoSState] = {}
         self._autoack_handoff_required = False
         # Auto-ACK QoS 1 identifiers whose PUBACK is still inside the current
         # effect batch. The Receive Maximum slot stays held until take_effects()
@@ -194,6 +208,7 @@ class InboundSession:
         self._receive_maximum = receive_maximum
         self._topic_alias_maximum = topic_alias_maximum
         self._inflight = 0
+        self._current_persisted_mids.clear()
         self._autoack_handoff_required = False
         self._pending_auto_qos1_mids.clear()
         self._pending_manual_qos1_acks.clear()
@@ -203,6 +218,10 @@ class InboundSession:
 
     def transport_closed(self) -> None:
         self._aliases.clear()
+        self._current_persisted_mids.clear()
+        # The broker resends PUBREL (or the QoS 1 PUBLISH) after reconnect;
+        # the durable row and its exchange identity stay.
+        self._pending_completions.clear()
         self._pending_manual_qos1_acks.clear()
         self.release_pending_auto_qos1()
         # A continuation is scoped to the connection that created its cursor.
@@ -218,6 +237,9 @@ class InboundSession:
         self._recovered_mids.clear()
         self._replay = None
         self._inflight = 0
+        self._current_persisted_mids.clear()
+        self._exchange_tokens.clear()
+        self._pending_completions.clear()
         self._pending_bytes = 0
         self._stored_inbound = 0
         self._session_state_qos2 = 0
@@ -283,7 +305,16 @@ class InboundSession:
             raise RuntimeError(f"Inbound mid={mid} changed while {action}")
         if self._ack_tokens is not None:
             self._ack_tokens.pop(mid, None)
+        self._exchange_tokens.pop(mid, None)
+        self._pending_completions.pop(mid, None)
         return completed.logical_size
+
+    def _exchange_token(self, mid: int) -> object:
+        """Identity of the persisted exchange currently owning ``mid``."""
+        token = self._exchange_tokens.get(mid)
+        if token is None:
+            token = self._exchange_tokens[mid] = object()
+        return token
 
     def _bind_ack_token(self, message: Message) -> Message:
         """Attach the active exchange identity before application exposure."""
@@ -398,8 +429,22 @@ class InboundSession:
             # inlined: it keeps the whole probe off the fresh-PUBLISH path.
             existing = store.in_meta(mid)
         if existing is not None:
-            if existing.state is InboundQoSState.WAIT_PUBACK:
+            state = existing.state
+            if state is InboundQoSState.WAIT_PUBACK:
                 self._reject_packet_id_collision(mid, "QoS 2", "QoS 1")
+            if state is InboundQoSState.WAIT_USER_ACK:
+                # Receipt of PUBREL proves the sender has advanced to phase 2.
+                # MQTT-4.3.3-6 forbids re-sending PUBLISH after that point.
+                self._protocol_disconnect(0x82)
+                raise ProtocolError(f"QoS 2 PUBLISH for mid={mid} received after PUBREL")
+            if state is not InboundQoSState.WAIT_PUBREL:
+                # No conforming peer can cause this: the store holds a state
+                # the engine never writes. Local divergence, not a wire error.
+                raise RuntimeError(f"Inbound mid={mid} is in unexpected state {state!r}")
+            current = self._current_persisted_mids
+            if mid not in current:
+                self._acquire_slot()
+                current.add(mid)
             engine._send_ack(_encode_pubrec_success(mid))
             return
         if mid in self._pending_auto_qos1_mids:
@@ -428,6 +473,8 @@ class InboundSession:
         except Exception:
             self._release_slot(logical_size)
             raise
+        self._current_persisted_mids.add(mid)
+        exchange_token = self._exchange_tokens[mid] = object()
         self._remember_inbound()
         self._session_state_qos2 += 1
         # Runtime effect application is SEND-first. Produce the protocol ACK in
@@ -453,6 +500,7 @@ class InboundSession:
             message,
             requires_delivery_mark=True,
             decoded_property_wire_size=decoded_property_wire_size,
+            exchange_token=exchange_token,
         )
 
     def _complete_recovered_qos1_auto(self, mid: int) -> None:
@@ -461,10 +509,30 @@ class InboundSession:
         A durable session may be reopened without manual_ack. Complete the old
         record rather than leaking it behind the automatic PUBACK that this
         retransmission triggers.
+
+        The PUBACK retires the last durable copy, so it waits until the
+        application owns the redelivered message (#519).
         """
-        recovered_logical_size = self._complete_stored_inbound(
-            mid, InboundQoSState.WAIT_PUBACK, "acknowledging"
-        )
+        if mid in self._pending_completions:
+            # A further retransmission while the completion still waits for
+            # delivery: the slot and the pending PUBACK are already owned.
+            return
+        record = self._lookup_stored_inbound(mid)
+        if record is not None and not record.delivered:
+            current = self._current_persisted_mids
+            if mid not in current:
+                self._acquire_slot()
+                current.add(mid)
+            self._pending_completions[mid] = InboundQoSState.WAIT_PUBACK
+            return
+        self._acquire_slot()
+        try:
+            recovered_logical_size = self._complete_stored_inbound(
+                mid, InboundQoSState.WAIT_PUBACK, "acknowledging"
+            )
+        except Exception:
+            self._release_slot()
+            raise
         self._forget_inbound()
         self._engine._send_ack(_encode_puback_success(mid))
         # The restored Receive Maximum slot remains owned until this PUBACK
@@ -559,8 +627,16 @@ class InboundSession:
             # but is surfaced again so an application can complete manual ACK
             # after a reconnect or callback cancellation.
             if existing.state is InboundQoSState.WAIT_PUBACK:
+                current = self._current_persisted_mids
+                acquired = mid not in current
+                if acquired:
+                    self._acquire_slot()
+                    current.add(mid)
                 inbound = store.get_in(mid)
                 if inbound is None:
+                    if acquired:
+                        current.remove(mid)
+                        self._release_slot()
                     raise RuntimeError(f"Inbound mid={mid} disappeared while redelivering")
                 self._emit_message(inbound, dup=True)
                 return
@@ -585,6 +661,8 @@ class InboundSession:
         except Exception:
             self._release_slot(logical_size)
             raise
+        self._current_persisted_mids.add(mid)
+        exchange_token = self._exchange_tokens[mid] = object()
         self._remember_inbound()
         self._manual_qos1_order.append(mid)
         message = Message(
@@ -607,6 +685,7 @@ class InboundSession:
             message,
             requires_delivery_mark=True,
             decoded_property_wire_size=decoded_property_wire_size,
+            exchange_token=exchange_token,
         )
 
     def on_pubrel(self, raw: RawPacket) -> None:
@@ -634,17 +713,50 @@ class InboundSession:
             if changed is None:
                 raise RuntimeError(f"Inbound mid={mid} changed while processing PUBREL")
             return
+        if not record.delivered and not record.user_acked:
+            # PUBCOMP ends the broker's ownership, and deleting the row ends
+            # ours: the application must own the message first (#520). The
+            # delivery mark completes the exchange; a PUBREL resent after a
+            # reconnect finds the row again.
+            self._pending_completions[mid] = state
+            return
+        self._complete_pubrel(mid, state)
+
+    def _complete_pubrel(self, mid: int, state: InboundQoSState) -> None:
         logical_size = self._complete_stored_inbound(mid, state, "completing PUBREL")
         self._forget_inbound()
         self._session_state_qos2 -= 1
-        engine._send_ack(_encode_pubcomp_success(mid))
-        self._release_slot(logical_size)
+        self._engine._send_ack(_encode_pubcomp_success(mid))
+        self._release_persisted_slot(mid, logical_size)
+
+    def _complete_recovered_qos1_after_delivery(self, mid: int) -> None:
+        logical_size = self._complete_stored_inbound(
+            mid, InboundQoSState.WAIT_PUBACK, "acknowledging"
+        )
+        self._forget_inbound()
+        self._engine._send_ack(_encode_puback_success(mid))
+        self._release_persisted_slot(mid, logical_size)
 
     # --- application acknowledgement and replay ---------------------------
 
-    def mark_delivered(self, mid: int) -> None:
-        if self._stored_inbound:
-            self.store.mark_in_delivered(mid)
+    def mark_delivered(self, mid: int, token: object | None = None) -> None:
+        """Record application ownership of ``mid``, then run a waiting completion.
+
+        A ``token`` from an exchange that is no longer current is ignored: the
+        packet identifier may already belong to a later exchange (#534).
+        """
+        if token is not None and self._exchange_tokens.get(mid) is not token:
+            return
+        waiting = self._pending_completions.pop(mid, None)
+        if waiting is None:
+            if self._stored_inbound:
+                self.store.mark_in_delivered(mid)
+        elif waiting is InboundQoSState.WAIT_PUBACK:
+            self._complete_recovered_qos1_after_delivery(mid)
+        else:
+            # complete_in() is conditional on this state: a row that changed
+            # meanwhile still fails the exchange instead of completing it.
+            self._complete_pubrel(mid, waiting)
 
     def ack(self, mid: int, *, message: Message | None = None) -> None:
         """Complete a deferred PUBACK or PUBCOMP in manual-ack mode."""
@@ -684,7 +796,7 @@ class InboundSession:
         self._forget_inbound()
         self._session_state_qos2 -= 1
         self._engine._send_ack(wire)
-        self._release_slot(logical_size)
+        self._release_persisted_slot(mid, logical_size)
 
     def _drain_manual_qos1_acks(self) -> None:
         """Emit the ready prefix of manual QoS 1 acknowledgements in arrival order."""
@@ -702,12 +814,13 @@ class InboundSession:
             ready.remove(mid)
             self._forget_inbound()
             self._engine._send_ack(_encode_puback_success(mid))
-            self._release_slot(logical_size)
+            self._release_persisted_slot(mid, logical_size)
 
     def replay_session(self) -> None:
-        """Restore Receive Maximum accounting and start bounded redelivery."""
+        """Restore durable state without carrying connection quota across reconnect."""
         persisted = self.store.in_count()
-        self._inflight = persisted
+        self._inflight = 0
+        self._current_persisted_mids.clear()
         if persisted == 0:
             self._recovered_mids.clear()
             return
@@ -773,6 +886,7 @@ class InboundSession:
             EffectKind.MESSAGE,
             message,
             requires_delivery_mark=True,
+            exchange_token=self._exchange_token(inbound.mid),
         )
 
     # --- aliases and Receive Maximum --------------------------------------
@@ -851,6 +965,15 @@ class InboundSession:
     def _release_slot(self, logical_size: int | None = None) -> None:
         if self._inflight > 0:
             self._inflight -= 1
+        self._release_pending_bytes(logical_size)
+
+    def _release_persisted_slot(self, mid: int, logical_size: int) -> None:
+        """Release durable bytes and current-connection quota owned by ``mid``."""
+        current = self._current_persisted_mids
+        if mid in current:
+            current.remove(mid)
+            if self._inflight > 0:
+                self._inflight -= 1
         self._release_pending_bytes(logical_size)
 
     def _release_pending_bytes(self, logical_size: int | None) -> None:
