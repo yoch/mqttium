@@ -45,6 +45,11 @@ def _partition_effects(
     return effects, deliveries, reordered
 
 
+# Rank of an effect-application failure in AsyncClient's terminal-cause
+# precedence (a transport-level failure of the connection).
+_CAUSE_TRANSPORT = 1
+
+
 class StaleConnectionEffect(Exception):
     """An effect was produced for a transport epoch that is no longer current."""
 
@@ -68,6 +73,8 @@ class EffectOwner(Protocol):
     async def _close_transport_after_connection_failure(self) -> None: ...
 
     def _settle_terminal_effect(self, effect: EngineEffect) -> None: ...
+
+    def _propose_disconnect_cause(self, exc: BaseException, rank: int) -> BaseException: ...
 
 
 class EffectPump:
@@ -272,7 +279,7 @@ class EffectPump:
         # Connection health always belongs to AsyncClient's reader-owned
         # lifecycle. Active drain() calls still receive the same original
         # exception above.
-        self.owner._disconnect_exc = exc
+        self.owner._propose_disconnect_cause(exc, _CAUSE_TRANSPORT)
         self._failing_close = True
         try:
             self.discard_connection_effects(settle_publish=True)

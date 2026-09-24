@@ -30,6 +30,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   `publish_many()` keeps the prefix receipt. The reader and keepalive keep the
   original cause. A cancellation requested on the task itself still propagates
   unchanged (#509, #510, #522, #525, #529, #538).
+- Retire the connection epoch and the protocol engine in one synchronous step
+  when the reader observes a lost connection, so a concurrent `publish_nowait()`
+  can no longer be accepted and written into the dead transport (#544).
+- Keep the broker's DISCONNECT reason as the connection's cause when closing
+  the transport afterwards makes a pending write fail; `on_disconnect` now
+  receives `BrokerDisconnectError` rather than the secondary `OSError` (#543).
 
 ## [1.0.0rc15] - 2026-09-23
 

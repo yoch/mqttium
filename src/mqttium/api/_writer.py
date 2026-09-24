@@ -207,8 +207,12 @@ class WritePump:
     async def join(self) -> None:
         await self.queue.join()
 
-    async def advance_epoch(self, epoch: int) -> None:
+    def set_epoch(self, epoch: int) -> None:
+        """Invalidate earlier-epoch admissions without suspending."""
         self.epoch = epoch
+
+    async def advance_epoch(self, epoch: int) -> None:
+        self.set_epoch(epoch)
         await self.wake_waiters()
 
     async def wake_waiters(self) -> None:

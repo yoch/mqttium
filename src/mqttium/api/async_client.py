@@ -102,6 +102,19 @@ _FATAL_DISCONNECT_DRAIN_TIMEOUT = 0.25
 # Together with the 256-packet bound it caps the size of one delivery lot; it is
 # not an application memory bound and is deliberately not configurable.
 _MAX_INGRESS_BATCH_BYTES = 1 * 1024 * 1024
+
+# Terminal-cause precedence for one connection. Real causes are first-wins:
+# the fact observed first ended the connection, and failures caused by
+# retiring it afterwards (a writer error while closing after a broker
+# DISCONNECT) cannot replace it (#543). The broker's verdict is therefore
+# latched as soon as its DISCONNECT is applied, not derived at teardown. A peer
+# protocol violation outranks them, since a malformed DISCONNECT is no valid
+# verdict, and a local capability failure outranks everything.
+_CAUSE_SYNTHETIC = 0  # "Connection closed" with nothing better known
+_CAUSE_TRANSPORT = 1  # transport, writer, keepalive and effect failures
+_CAUSE_BROKER = 1  # broker DISCONNECT or refused CONNACK (first-wins with transport)
+_CAUSE_PROTOCOL = 2  # peer protocol or decoding violations
+_CAUSE_LOCAL = 3  # local capability failures that make the session unusable
 _DEFAULT_MAX_ITERATOR_MESSAGES = 65_536
 _DEFAULT_MAX_ITERATOR_BYTES = 64 * 1024 * 1024
 
@@ -402,6 +415,7 @@ class AsyncClient:
         self._sub_futs: dict[int, asyncio.Future[SubscribeResult]] = {}
         self._unsub_futs: dict[int, asyncio.Future[UnsubscribeResult]] = {}
         self._disconnect_exc: BaseException | None = None
+        self._disconnect_rank = _CAUSE_TRANSPORT
         # Set once by a local-terminal ingress failure (inside the read-loop
         # batch or while applying an effect that touches persistence). While
         # set, the protocol/persistence state is unfit for automatic
@@ -845,6 +859,7 @@ class AsyncClient:
             self._delivery.reopen()
             self._disconnect_hook_origin = None
             self._disconnect_exc = None
+            self._disconnect_rank = _CAUSE_TRANSPORT
             self._teardown_final = False
             self._last_disconnect = None
             self._decoder.clear()
@@ -877,7 +892,7 @@ class AsyncClient:
                     refusal = ProtocolError(
                         f"Connection refused: reason_code={connack.reason_code}"
                     )
-                    self._disconnect_exc = refusal
+                    self._propose_disconnect_cause(refusal, _CAUSE_BROKER)
                 raise refusal
             self._write_pump.last_outbound = time.monotonic()
             self._keepalive_task = asyncio.create_task(
@@ -1524,7 +1539,7 @@ class AsyncClient:
         except PacketTooLargeError as exc:
             # A broker limit below the mandatory ACK size makes this QoS
             # exchange impossible to complete without violating negotiation.
-            self._disconnect_exc = exc
+            self._propose_disconnect_cause(exc, _CAUSE_LOCAL)
             self._intentional_disconnect = True
             await self._force_close_after_local_packet_failure()
             raise
@@ -1664,7 +1679,7 @@ class AsyncClient:
             if owner_cancelled():
                 raise
             failure = dependency_failure(exc, "transport read")
-            self._disconnect_exc = failure
+            self._propose_disconnect_cause(failure, _CAUSE_TRANSPORT)
             if self._local_terminal_failure is None and not self._will_reconnect():
                 self._fail_pending(failure)
         except MandatoryResponseTooLargeError as exc:
@@ -1674,17 +1689,17 @@ class AsyncClient:
             # The broker negotiated a legal limit, but mqttium cannot produce
             # the mandatory automatic response within it. This is a local
             # terminal capability failure, not a peer protocol violation.
-            self._disconnect_exc = exc
+            self._propose_disconnect_cause(exc, _CAUSE_LOCAL)
             self._fail_pending(exc)
         except (PacketTooLargeError, MalformedPacketError, ProtocolError) as exc:
             # Fatal wire/protocol error: send a normative DISCONNECT (v5) before
             # tearing down, so a strict broker sees *why* we left.
             await self._send_fatal_disconnect(exc)
-            self._disconnect_exc = exc
+            self._propose_disconnect_cause(exc, _CAUSE_PROTOCOL)
             if not self._will_reconnect():
                 self._fail_pending(exc)
         except Exception as exc:
-            self._disconnect_exc = exc
+            self._propose_disconnect_cause(exc, _CAUSE_TRANSPORT)
             if self._local_terminal_failure is None and not self._will_reconnect():
                 # Terminal publish effects preserved from a failed lot are
                 # applied by the finally drain below; failing receipts here
@@ -1704,14 +1719,15 @@ class AsyncClient:
                 # Once that call exits, later external loss cancels it normally.
                 hook_origin = connect_owner
             self._lifecycle_hooks.retiring(lifecycle_token, hook_origin)
-            await self._invalidate_connection_epoch()
-            # Retire protocol-visible ownership before joining any child task.
-            # Keepalive cancellation can suspend, and while it does callers
-            # must not observe the dead transport's engine as CONNECTED and
-            # admit work that a following clean reconnect will discard.
-            async with self._engine_lock:
-                self._engine.notify_transport_closed()
-                self._effect_pump.collect_from_engine()
+            # One synchronous ownership transition, before the first await:
+            # producers must never see the new epoch while the old engine is
+            # still CONNECTED, or they admit work into the dead transport
+            # (#544). No coroutine suspends while holding the engine lock, so
+            # this synchronous step cannot interleave with an engine mutation.
+            self._retire_connection_epoch()
+            self._engine.notify_transport_closed()
+            self._effect_pump.collect_from_engine()
+            await self._write_pump.wake_waiters()
             # The keepalive loop belongs to this reader's transport epoch. An
             # EOF or reader-side failure can end the reader without entering
             # _force_close(), so retire the task here before a reconnect can
@@ -1738,15 +1754,18 @@ class AsyncClient:
                     and info.from_broker
                     and info.reason_code != 0
                 ):
-                    self._disconnect_exc = BrokerDisconnectError(info.reason_code, info.properties)
+                    self._propose_disconnect_cause(
+                        BrokerDisconnectError(info.reason_code, info.properties), _CAUSE_BROKER
+                    )
                 else:
-                    self._disconnect_exc = MQTTError("Connection closed")
+                    self._propose_disconnect_cause(MQTTError("Connection closed"), _CAUSE_SYNTHETIC)
             # A latched local-terminal failure is authoritative: a secondary
             # writer/keepalive error that overwrote _disconnect_exc must never
             # replace it for settlement and callbacks. The explicit None test
             # (not truthiness) keeps even a falsey backend exception identical.
             terminal_cause = self._local_terminal_failure
             if terminal_cause is None:
+                assert self._disconnect_exc is not None
                 terminal_cause = self._disconnect_exc
             if (
                 reader_connack is not None
@@ -1838,9 +1857,20 @@ class AsyncClient:
             if reader is not None and reader is not asyncio.current_task() and not reader.done():
                 reader.cancel()
 
+    def _propose_disconnect_cause(self, exc: BaseException, rank: int) -> BaseException:
+        """Offer a terminal cause for the current connection; return the winner.
+
+        With no cause yet, any proposal wins. A cause recorded without a rank
+        counts as a real (transport-tier) cause.
+        """
+        if self._disconnect_exc is None or rank > self._disconnect_rank:
+            self._disconnect_exc = exc
+            self._disconnect_rank = rank
+        return self._disconnect_exc
+
     async def _writer_failed(self, exc: BaseException) -> None:
         """Hand a writer failure to the reader-owned connection lifecycle."""
-        self._disconnect_exc = exc
+        self._propose_disconnect_cause(exc, _CAUSE_TRANSPORT)
         connack_fut = self._connack_fut
         if connack_fut is not None and not connack_fut.done():
             connack_fut.set_exception(exc)
@@ -1916,7 +1946,9 @@ class AsyncClient:
                 now = time.monotonic()
                 if self._ping_pending:
                     if now >= self._ping_deadline:
-                        self._disconnect_exc = MQTTTimeoutError("PINGRESP timed out")
+                        self._propose_disconnect_cause(
+                            MQTTTimeoutError("PINGRESP timed out"), _CAUSE_TRANSPORT
+                        )
                         # The reader is the single owner of connection teardown:
                         # it emits on_disconnect once and decides reconnect vs
                         # terminal delivery shutdown after the transport breaks.
@@ -1933,7 +1965,7 @@ class AsyncClient:
                     except PacketTooLargeError as exc:
                         # A broker limit below the two-byte PINGREQ leaves no
                         # conforming keepalive packet to send.
-                        self._disconnect_exc = exc
+                        self._propose_disconnect_cause(exc, _CAUSE_LOCAL)
                         self._intentional_disconnect = True
                         await self._close_transport_after_connection_failure()
                         return
@@ -1954,7 +1986,7 @@ class AsyncClient:
                 raise
             # A PINGREQ dependency raised CancelledError: without keepalive
             # the connection cannot detect a dead peer, so retire it.
-            self._disconnect_exc = dependency_failure(exc, "keepalive")
+            self._propose_disconnect_cause(dependency_failure(exc, "keepalive"), _CAUSE_TRANSPORT)
             await self._close_transport_after_connection_failure()
 
     async def _reconnect_loop(self) -> None:
@@ -2014,7 +2046,10 @@ class AsyncClient:
                     if isinstance(caught, asyncio.CancelledError) and owner_cancelled():
                         raise
                     exc = failure_for(caught, "reconnect attempt")
+                    # A failed attempt has no live connection: its outcome
+                    # replaces the previous cause outright.
                     self._disconnect_exc = exc
+                    self._disconnect_rank = _CAUSE_TRANSPORT
                     cause = self._local_terminal_failure
                     if self._permanent_connection_failure() or cause is not None:
                         # Stop on permanent setup/peer failures as well as
@@ -2077,7 +2112,7 @@ class AsyncClient:
                 "PROTOCOL_ERROR effect payload must be MalformedPacketError or ProtocolError"
             )
         if self._engine.state is ConnectionState.DISCONNECTED:
-            self._disconnect_exc = data
+            self._propose_disconnect_cause(data, _CAUSE_PROTOCOL)
         raise data
 
     def _resolve_suback(self, packet: SubAckPacket) -> None:
@@ -2142,6 +2177,16 @@ class AsyncClient:
             info = effect.data
             if isinstance(info, DisconnectInfo):
                 self._last_disconnect = info
+                if info.from_broker:
+                    # The broker's verdict is the connection's cause from the
+                    # moment it is observed; closing the transport below can
+                    # make the writer fail, and that must not replace it (#543).
+                    self._propose_disconnect_cause(
+                        BrokerDisconnectError(info.reason_code, info.properties)
+                        if info.reason_code != 0
+                        else MQTTError("Connection closed"),
+                        _CAUSE_BROKER,
+                    )
                 if self._transport is not None and not self._transport.is_closing():
                     if not info.from_broker:
                         try:
@@ -2296,8 +2341,9 @@ class AsyncClient:
     def _resolve_connack(self, connack: ConnAckPacket) -> None:
         if connack.reason_code != 0:
             self._last_connack_reason = connack.reason_code
-            self._disconnect_exc = ProtocolError(
-                f"Connection refused: reason_code={connack.reason_code}"
+            self._propose_disconnect_cause(
+                ProtocolError(f"Connection refused: reason_code={connack.reason_code}"),
+                _CAUSE_BROKER,
             )
         if self._connack_fut is not None and not self._connack_fut.done():
             self._connack_fut.set_result(connack)
@@ -2361,10 +2407,15 @@ class AsyncClient:
         self._delivery.close()
         self._delivery.reset_stream()
 
-    async def _invalidate_connection_epoch(self) -> None:
+    def _retire_connection_epoch(self) -> None:
+        """Publish a new connection epoch to every stale-work guard at once."""
         self._connection_epoch += 1
         self._delivery_lane.discard()
-        await self._write_pump.advance_epoch(self._connection_epoch)
+        self._write_pump.set_epoch(self._connection_epoch)
+
+    async def _invalidate_connection_epoch(self) -> None:
+        self._retire_connection_epoch()
+        await self._write_pump.wake_waiters()
 
     def _settle_terminal_effect(self, effect: EngineEffect) -> None:
         """Settle one terminal publish effect during final teardown."""

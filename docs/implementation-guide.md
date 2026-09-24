@@ -294,7 +294,19 @@ it closes; per-packet atomicity is explicitly not specified.
 A propagated failure reaches the read-loop `finally`, which advances the
 epoch, calls `notify_transport_closed()`, and collects whatever sits in
 `engine._effects` under the new epoch before draining it: rollback alone
-does not retract effects. Latch, filter, and transport-closed retire
+does not retract effects. These three steps form one synchronous ownership
+transition before the first await. A producer can never observe the new
+epoch while the dead connection's engine still reports CONNECTED and admit
+work into it. This relies on no coroutine suspending while it holds the
+engine lock (`tests/project/test_engine_lock_discipline.py`).
+
+The connection's terminal cause follows one precedence. Real causes
+(transport, writer, keepalive and effect failures, a broker DISCONNECT or a
+refused CONNACK) are first-wins. A broker DISCONNECT is latched when it is
+applied, so a writer failure caused by closing the transport afterwards cannot
+replace it. A peer protocol violation outranks those causes, because a
+malformed DISCONNECT is not a valid verdict. A local capability failure
+outranks everything. "Connection closed" is used only when no cause is known. Latch, filter, and transport-closed retire
 therefore run synchronously under the engine lock with no await
 between them. The read loop groups an ingress lot inside `store.batch()`.
 For a transactional store, an exception rolls back the durable mutations
