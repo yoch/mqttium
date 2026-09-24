@@ -49,10 +49,12 @@ from mqttium.transport.writes import WriteItem, item_size
 from mqttium.types import Message, Properties
 from mqttium.errors import (
     MalformedPacketError,
+    MQTTError,
     MandatoryResponseTooLargeError,
     NotConnectedError,
     PacketTooLargeError,
     ProtocolError,
+    SessionReplayError,
 )
 
 # Encoder for an allocated identifier, expected ACK type and ACK entry count.
@@ -102,6 +104,11 @@ class ProtocolEngine:
         # Server's terminal AUTH Success (0x00). Initial enhanced authentication
         # is represented by CONNECTING and completes with CONNACK instead.
         self._reauth_in_progress = False
+        # Server AUTH challenges (0x18) are numbered. A handler's response is
+        # sent only while the exchange still waits on that challenge; one that
+        # arrives after Success, a new challenge or teardown is dropped.
+        self._auth_challenges = 0
+        self._auth_response_due: int | None = None
         # What a state accepts and what handles it are one table, so `handle_raw`
         # resolves both in a single lookup and adding a packet type is one edit.
         # Anything absent is refused — PINGREQ included.
@@ -202,9 +209,12 @@ class ProtocolEngine:
         *,
         requires_delivery_mark: bool = False,
         decoded_property_wire_size: int | None = None,
+        exchange_token: object | None = None,
     ) -> None:
         self._effects.append(
-            EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)
+            EngineEffect(
+                kind, data, requires_delivery_mark, decoded_property_wire_size, exchange_token
+            )
         )
 
     def _send(self, packet: WriteItem) -> None:
@@ -332,6 +342,7 @@ class ProtocolEngine:
             str(configured_auth_method) if configured_auth_method is not None else None
         )
         self._reauth_in_progress = False
+        self._auth_response_due = None
         self._sent_client_id = client_id
         self._sent_clean_start = clean_start
         self._sent_session_expiry_interval = (
@@ -533,12 +544,18 @@ class ProtocolEngine:
         self.outbound.transport_closed()
         self.inbound.transport_closed()
         self._reauth_in_progress = False
+        self._auth_response_due = None
         # Release sub/unsub MIDs still in flight — no ACK will arrive now.
         self._release_pending_subscription_requests()
         if was != ConnectionState.DISCONNECTED:
             self._emit(EffectKind.DISCONNECTED, DisconnectInfo(from_broker=False))
 
-    def handle_raw(self, raw: RawPacket) -> None:
+    def handle_raw(self, raw: RawPacket) -> MQTTError | None:
+        """Apply one packet; return the peer error turned into PROTOCOL_ERROR.
+
+        A returned error is also the last effect emitted. Packets after it
+        belong to a failed connection: the caller stops feeding this lot.
+        """
         # DISCONNECT is the client's final MQTT Control Packet. The peer may still
         # have packets already in flight before the transport actually closes, but
         # dispatching them could emit ACKs or user-visible effects after DISCONNECT.
@@ -547,7 +564,7 @@ class ProtocolEngine:
         # packets would otherwise surface as a PROTOCOL_ERROR that masks the
         # real disconnect reason at the runtime boundary.
         if self.state in (ConnectionState.DISCONNECTING, ConnectionState.DISCONNECTED):
-            return
+            return None
         try:
             validate_raw_packet(raw)
             handlers = self._handlers_by_state.get(self.state)
@@ -572,6 +589,7 @@ class ProtocolEngine:
             # failures that did not already call _protocol_disconnect(). Keep
             # the category so it can select the normative MQTT 5 reason code.
             self._emit(EffectKind.PROTOCOL_ERROR, exc)
+            return exc
         except Exception:
             # Any other exception (store/persistence failure, unexpected bug)
             # is local, not a peer protocol violation: it propagates with its
@@ -579,6 +597,7 @@ class ProtocolEngine:
             # reconnect-gates it as a local failure. Terminal broker outcomes
             # already observed were emitted by the handler before raising.
             raise
+        return None
 
     def _validate_connack_v5(self, connack: ConnAckPacket) -> None:
         """Enforce the MQTT 5 CONNACK property obligations before acceptance."""
@@ -664,6 +683,7 @@ class ProtocolEngine:
             self._validate_connack_v5(connack)
         if connack.reason_code != 0:
             self._reauth_in_progress = False
+            self._auth_response_due = None
             self.state = ConnectionState.DISCONNECTED
             self._emit(EffectKind.CONNACK, connack)
             self._emit(
@@ -696,13 +716,23 @@ class ProtocolEngine:
             and peer_maximum_packet_size < 4
         ):
             self._reauth_in_progress = False
+            self._auth_response_due = None
             self.state = ConnectionState.DISCONNECTED
             raise MandatoryResponseTooLargeError(
                 f"Broker maximum_packet_size {peer_maximum_packet_size} is below the "
                 "4-byte minimum required for mandatory QoS acknowledgements"
             )
 
+        if connack.session_present:
+            try:
+                self.outbound.check_session_replayable()
+            except SessionReplayError:
+                self._reauth_in_progress = False
+                self.state = ConnectionState.DISCONNECTED
+                raise
+
         self._reauth_in_progress = False
+        self._auth_response_due = None
         self.state = ConnectionState.CONNECTED
         self.session_present = connack.session_present
         self._update_session_resume_preference()
@@ -733,8 +763,16 @@ class ProtocolEngine:
         """
         self.inbound.drain_replay()
 
-    def mark_inbound_delivered(self, mid: int) -> None:
-        self.inbound.mark_delivered(mid)
+    def mark_inbound_delivered(self, mid: int, token: object | None = None) -> None:
+        """Record that the application owns an inbound message.
+
+        ``token`` is the MESSAGE effect's ``exchange_token``; a mark for an
+        exchange that has since completed is ignored. A persisted QoS 2
+        exchange (or a recovered QoS 1 exchange acknowledged automatically)
+        is completed only after this commit, so direct engine consumers must
+        mark every MESSAGE that ``requires_delivery_mark``.
+        """
+        self.inbound.mark_delivered(mid, token)
 
     def ack(self, mid: int, *, message: Message | None = None) -> None:
         """Complete a deferred inbound ACK in manual-ack mode."""
@@ -822,6 +860,7 @@ class ProtocolEngine:
     def _on_disconnect(self, raw: RawPacket) -> None:
         reason_code, properties = self.codec.decode_disconnect(raw.remaining)
         self._reauth_in_progress = False
+        self._auth_response_due = None
         self.state = ConnectionState.DISCONNECTED
         self._release_pending_subscription_requests()
         self._emit(
@@ -884,6 +923,7 @@ class ProtocolEngine:
                 )
             if packet.reason_code == 0x00:
                 self._reauth_in_progress = False
+                self._auth_response_due = None
             elif packet.reason_code != 0x18:
                 self._protocol_disconnect(0x82)
                 raise ProtocolError("Invalid Server AUTH reason during re-authentication")
@@ -892,7 +932,11 @@ class ProtocolEngine:
             # a protocol failure on the active connection, not a CONNACK refusal.
             self._protocol_disconnect(0x82)
             return
-        self._emit(EffectKind.AUTH, packet)
+        challenge = None
+        if packet.reason_code == 0x18:
+            self._auth_challenges += 1
+            challenge = self._auth_response_due = self._auth_challenges
+        self._effects.append(EngineEffect(EffectKind.AUTH, packet, exchange_token=challenge))
 
     def _protocol_disconnect(self, reason_code: int) -> None:
         """Tear the connection down, announcing why when the version allows it."""
@@ -909,12 +953,33 @@ class ProtocolEngine:
             else:
                 self._send(packet)
         self._reauth_in_progress = False
+        self._auth_response_due = None
         self.state = ConnectionState.DISCONNECTED
         self._release_pending_subscription_requests()
         self._emit(
             EffectKind.DISCONNECTED,
             DisconnectInfo(reason_code=reason_code, from_broker=False),
         )
+
+    def respond_auth(
+        self,
+        challenge: object,
+        reason_code: int = 0x18,
+        properties: Properties | None = None,
+    ) -> bool:
+        """Answer a Server AUTH challenge if the exchange still waits on it.
+
+        ``challenge`` is the AUTH effect's ``exchange_token``. Returns False,
+        sending nothing, when the exchange has since succeeded, moved to a
+        newer challenge or ended with its connection: the answer is stale,
+        not a local error (#528, #535).
+        """
+        if challenge is None or challenge != self._auth_response_due:
+            return False
+        if self.state not in (ConnectionState.CONNECTING, ConnectionState.CONNECTED):
+            return False
+        self.queue_auth(reason_code=reason_code, properties=properties)
+        return True
 
     def queue_auth(
         self,
@@ -960,6 +1025,8 @@ class ProtocolEngine:
         ).encode(self.config.protocol)
         self._check_outbound_size(wire)
         self._send(wire)
+        # One answer per challenge; a Re-authenticate starts a new exchange.
+        self._auth_response_due = None
         if reason_code == 0x19:
             self._reauth_in_progress = True
 

@@ -16,6 +16,7 @@ from mqttium.errors import (
     ProtocolError,
     PublishBatchError,
     SessionDiscardedError,
+    SessionReplayError,
 )
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "PublishBatchError",
     "QoS",
     "SessionDiscardedError",
+    "SessionReplayError",
     "__version__",
 ]
 

@@ -1,0 +1,35 @@
+{
+  "module": "ObservedFacts.tla",
+  "status": "refinement",
+  "summary": "A fact the engine observed (completion, CONNACK, SUBACK, PINGRESP, broker DISCONNECT) reaches its waiter even while the writer admits no output.",
+  "issues": [
+    524,
+    526,
+    531,
+    532,
+    536,
+    540
+  ],
+  "tests": [
+    "tests/unit/test_observed_facts_under_backpressure.py",
+    "tests/unit/test_effect_pump.py"
+  ],
+  "configs": [
+    {
+      "config": "ObservedFacts-rc15-completion.cfg",
+      "expect": "deadlock"
+    },
+    {
+      "config": "ObservedFacts-rc15-brokerDisconnect.cfg",
+      "expect": "deadlock"
+    },
+    {
+      "config": "ObservedFacts-fixed-completion.cfg",
+      "expect": "pass"
+    },
+    {
+      "config": "ObservedFacts-fixed-brokerDisconnect.cfg",
+      "expect": "pass"
+    }
+  ]
+}

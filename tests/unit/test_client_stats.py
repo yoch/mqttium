@@ -38,7 +38,15 @@ def test_initial_stats_snapshot_is_immutable_and_side_effect_free() -> None:
     assert snapshot.receipts.publish == 0
     assert snapshot.transport.kind is None
     tasks = client._running_tasks()
-    assert set(tasks) == {"reader", "writer", "keepalive", "reconnect", "effect_flush", "lifecycle"}
+    assert set(tasks) == {
+        "reader",
+        "writer",
+        "keepalive",
+        "reconnect",
+        "effect_flush",
+        "lifecycle",
+        "auth",
+    }
     assert not any(tasks.values())
 
     with pytest.raises(FrozenInstanceError):
