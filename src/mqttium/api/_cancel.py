@@ -73,5 +73,6 @@ def ignoring_dependency_failures() -> Iterator[None]:
     except asyncio.CancelledError:
         if owner_cancelled():
             raise
-    except Exception:  # nosec B110 - teardown must not replace the connection cause
+    # Teardown must not replace the connection cause.
+    except Exception:  # nosec B110
         pass

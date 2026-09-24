@@ -205,6 +205,14 @@ does for automatic PUBACKs, so a PUBLISH decoded after the handoff is admitted.
 Direct `ProtocolEngine` consumers can reuse an identifier only after taking
 the batch that carries its PUBCOMP.
 
+The identifier boundary is that engine handoff, not the transport write.
+Detecting reuse is a check on a non-conforming broker, never needed for a
+conforming one. MQTTium does not detect reuse later than the handoff: an
+identifier that a manual `ack()` releases, or whose PUBACK or PUBCOMP still
+waits for writer capacity, is accepted as a new exchange if the broker reuses
+it before it could have received the acknowledgement. Closing that window
+would need a writer-to-engine signal on every acknowledgement write (#541).
+
 Duplicate PUBLISH and PUBREL packets repeat the required protocol response but
 never redeliver application data. Orphan PUBREL is answered idempotently.
 
