@@ -140,7 +140,14 @@ retry created while the automatic reader is joined.
 Permanent authentication, authorisation, and protocol errors stop retrying.
 Temporary broker-unavailable errors and network failures may retry. Pending
 receipts survive only while the broker session can still settle them; a clean
-CONNACK fails them with `SessionDiscardedError`. A resumed CONNACK whose limits
+CONNACK fails them with `SessionDiscardedError`. A receipt failed terminally (a
+refused CONNACK, a final connection loss, `disconnect()`) is a final answer:
+this client never sends that publication again, neither from its offline
+queue nor by session replay, and keeps its packet identifier reserved until
+the broker completes the exchange or a clean session drops it. The durable row
+stays in the store, so another client or a restarted process still recovers
+it. A producer parked on outbound capacity when the connection ends for good
+fails with the same cause. A resumed CONNACK whose limits
 forbid resending a live WAIT_* exchange (`MQTT-4.4.0-1`, `MQTT-3.2.2-11`) is a
 local terminal `SessionReplayError`: the engine refuses it before any state
 change, keeps the exchange and its packet identifier, and the reconnect policy

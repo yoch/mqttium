@@ -1198,6 +1198,12 @@ class AsyncClient:
                     self._write_pump._try_flush_latency_batch()
                 return receipt
             await self._wait_publish_space(waiter)
+            terminal = self._publish_wait_failure()
+            if terminal is not None:
+                # Parked through a final teardown, which failed every pending
+                # publication: this one fails with them instead of queueing on
+                # the budget their abandonment freed (#521).
+                raise terminal
 
     def _publish_ready_prefix(
         self,
@@ -2531,6 +2537,9 @@ class AsyncClient:
         self._unsub_futs.clear()
 
     def _fail_pending(self, exc: BaseException) -> None:
+        # A receipt failed here is a final answer: the same client must never
+        # send its publication later (#521).
+        abandoned = [*self._receipts, *self._batch_receipts]
         for current in self._receipts.values():
             receipts = current if isinstance(current, deque) else (current,)
             for receipt in receipts:
@@ -2546,6 +2555,14 @@ class AsyncClient:
         for batch in batches:
             batch._fail_remaining(exc)
         self._fail_non_replayable(exc)
+        if abandoned:
+            try:
+                self._engine.seal_publications(abandoned)
+            except Exception as store_exc:
+                # A publication this client cannot seal could still be sent
+                # later: refuse every later use of this client instead.
+                if self._local_terminal_failure is None:
+                    self._local_terminal_failure = store_exc
         # Producers parked on outbound admission hold no receipt, so the loops
         # above cannot reach them. Wake them to re-check _publish_wait_failure().
         self._teardown_final = True
