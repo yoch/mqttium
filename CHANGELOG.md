@@ -12,6 +12,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   throttling register in benchmark runner preflights, and reject samples taken
   while the firmware reports a current limit (#493).
 
+### Fixed
+
+- Route a dependency-originated `CancelledError` from an automatic reconnect
+  attempt through normal retry/terminal policy unless cancellation was actually
+  requested on the reconnect task, preventing a zombie preserved stream (#510).
+
 ## [1.0.0rc15] - 2026-09-23
 
 ### Fixed
