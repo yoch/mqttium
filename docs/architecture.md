@@ -55,8 +55,8 @@ tested without a broker.
 
 `EffectPump` owns protocol-effect ordering, connection epochs, completion
 counters and its flush task. SEND/SEND_ACK keep wire order among themselves and
-ahead of the remaining ordered work (a local DISCONNECT's close, AUTH, a
-protocol error). A ready single protocol effect can apply inline.
+ahead of the remaining ordered work (a local DISCONNECT's close, a protocol
+error). A ready single protocol effect can apply inline.
 
 Facts the engine has already observed never wait in that lane. CONNACK,
 PUBLISH_COMPLETE/FAILED, SUBACK, UNSUBACK and PINGRESP are applied when their
@@ -66,6 +66,14 @@ collects pending effects before it reuses an identifier. A broker DISCONNECT
 latches its cause and seals the writer at collection, so output parked for
 capacity fails at once. A peer protocol error fails a pending CONNACK wait at
 collection.
+A Server AUTH is handed at collection to one `AuthExchange` task per client,
+which runs `auth_handler` calls in arrival order outside the effect lane and the
+reader. The handler may therefore await client operations, messages from the
+same read, existing receipts or `disconnect()`. Each AUTH Continue carries a
+challenge token; `ProtocolEngine.respond_auth()` sends the handler's answer only
+while the exchange still waits for that challenge, so an answer to AUTH Success
+or after the connection ended is dropped. Connection retirement cancels the
+task without joining it.
 MESSAGE, DECODED_MESSAGE and CONTINUE_INBOUND_REPLAY belong to a separate
 reader-owned `DeliveryLane`, which creates no task of its own.
 
@@ -143,7 +151,8 @@ active hooks; an operation awaited directly by the current hook preserves its
 caller. The supervisor reaps the old child before invoking its successor.
 Network operations do not wait for hook completion, and `on_connect` does not
 hold incoming delivery. Automatic reconnect waits for `on_disconnect`, then
-rechecks explicit intent. AUTH retains its separate protocol timeout.
+rechecks explicit intent. AUTH retains its separate protocol timeout and
+task (see Effects).
 
 `messages()` captures the delivery generation when called, even if its returned
 iterator is never advanced. Closing and reopening delivery leaves old iterators

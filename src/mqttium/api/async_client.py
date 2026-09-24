@@ -19,6 +19,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from typing import Any, Never, TypeVar
 
+from mqttium.api._auth import AuthExchange
 from mqttium.api._cancel import (
     dependency_failure,
     failure_for,
@@ -31,7 +32,7 @@ from mqttium.api._delivery import (
     CallbackTarget,
     MessageRoute,
 )
-from mqttium.api._effects import SETTLED_OBSERVATIONS, EffectPump, StaleConnectionEffect
+from mqttium.api._effects import IMMEDIATE_EFFECTS, EffectPump, StaleConnectionEffect
 from mqttium.api._lifecycle import LifecycleHooks
 from mqttium.api._delivery_lane import DeliveryLane
 from mqttium.api._writer import WritePump
@@ -439,6 +440,7 @@ class AsyncClient:
         self._ping_timeout = ping_timeout
         self._subscribe_timeout = subscribe_timeout
         self._auth_timeout = auth_timeout
+        self._auth_exchange = AuthExchange(self)
         self._intentional_disconnect = False
         self._transport_factory: Callable[..., Awaitable[AsyncTransport]] = TcpTransport.connect
         self._last_disconnect: DisconnectInfo | None = None
@@ -509,6 +511,7 @@ class AsyncClient:
             "reconnect": running(self._reconnect_task),
             "effect_flush": running(self._effect_pump.task),
             "lifecycle": running(self._lifecycle_hooks.task),
+            "auth": running(self._auth_exchange.task),
         }
 
     @property
@@ -1731,6 +1734,7 @@ class AsyncClient:
             self._retire_connection_epoch()
             self._engine.notify_transport_closed()
             self._effect_pump.collect_from_engine()
+            self._auth_exchange.retire()
             await self._write_pump.wake_waiters()
             # The keepalive loop belongs to this reader's transport epoch. An
             # EOF or reader-side failure can end the reader without entering
@@ -1860,6 +1864,19 @@ class AsyncClient:
             reader = self._reader_task
             if reader is not None and reader is not asyncio.current_task() and not reader.done():
                 reader.cancel()
+
+    def _invoke_auth_handler(
+        self, handler: Callable[[AuthPacket], Any], packet: AuthPacket
+    ) -> Awaitable[Any]:
+        return self._delivery.invoke(handler, packet)
+
+    async def _auth_failed(self, exc: BaseException) -> None:
+        """An auth_handler failure ends its (still current) connection."""
+        connack_fut = self._connack_fut
+        if connack_fut is not None and not connack_fut.done():
+            connack_fut.set_exception(exc)
+        self._propose_disconnect_cause(exc, _CAUSE_TRANSPORT)
+        await self._close_transport_after_connection_failure()
 
     def _propose_disconnect_cause(self, exc: BaseException, rank: int) -> BaseException:
         """Offer a terminal cause for the current connection; return the winner.
@@ -2106,6 +2123,9 @@ class AsyncClient:
         if kind is EffectKind.PINGRESP:
             self._ping_pending = False
             return True
+        if kind is EffectKind.AUTH:
+            self._auth_exchange.hand_off(effect.data, effect.exchange_token, epoch)
+            return True
         if kind is EffectKind.PROTOCOL_ERROR:
             self._raise_protocol_effect(effect.data)
         return False
@@ -2120,7 +2140,7 @@ class AsyncClient:
         the error) stays in the effect lane.
         """
         kind = effect.kind
-        if kind in SETTLED_OBSERVATIONS:
+        if kind in IMMEDIATE_EFFECTS:
             return self._apply_effect_inline(effect, self._connection_epoch)
         if kind is EffectKind.DISCONNECTED:
             info = effect.data
@@ -2183,27 +2203,8 @@ class AsyncClient:
             connack: ConnAckPacket = effect.data
             self._resolve_connack(connack)
         elif kind is EffectKind.AUTH:
-            challenge: AuthPacket = effect.data
-            handler = self.auth_handler
-            if handler is None:
-                raise MQTTError("AUTH handler is no longer available")
-            try:
-                response = await asyncio.wait_for(
-                    self._delivery.invoke(handler, challenge), timeout=self._auth_timeout
-                )
-            except TimeoutError as exc:
-                raise MQTTTimeoutError("AUTH handler timed out") from exc
-            except asyncio.CancelledError as exc:
-                if owner_cancelled():
-                    raise
-                raise dependency_failure(exc, "AUTH handler", "AUTH handler cancelled") from exc
-            if isinstance(response, AuthPacket):
-                async with self._engine_lock:
-                    self._engine.queue_auth(
-                        reason_code=response.reason_code,
-                        properties=response.properties,
-                    )
-                    self._effect_pump.collect_from_engine()
+            # Never queued in practice (IMMEDIATE_EFFECTS); kept total.
+            self._auth_exchange.hand_off(effect.data, effect.exchange_token, self._connection_epoch)
         elif kind is EffectKind.PUBLISH_COMPLETE or kind is EffectKind.PUBLISH_FAILED:
             mid, reason = _terminal_publish_result(effect)
             self._settle_publish(mid, reason)
@@ -2538,6 +2539,7 @@ class AsyncClient:
 
     async def _force_close_transport(self, *, preserve_reconnect: bool) -> None:
         await self._invalidate_connection_epoch()
+        self._auth_exchange.retire()
         current = asyncio.current_task()
         old_reader = self._reader_task
         tasks = [

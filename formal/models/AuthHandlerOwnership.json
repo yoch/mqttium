@@ -1,0 +1,43 @@
+{
+  "module": "AuthHandlerOwnership.tla",
+  "status": "refinement",
+  "summary": "auth_handler runs in its own task: an operation it awaits never waits for the pump or reader running it, and its answer is sent only while the exchange still waits for that challenge.",
+  "issues": [
+    501,
+    502,
+    523,
+    527,
+    528,
+    535
+  ],
+  "tests": [
+    "tests/unit/test_auth_handler_ownership.py"
+  ],
+  "configs": [
+    {
+      "config": "AuthHandlerOwnership-rc15-pump.cfg",
+      "expect": "deadlock"
+    },
+    {
+      "config": "AuthHandlerOwnership-rc15-reader.cfg",
+      "expect": "deadlock"
+    },
+    {
+      "config": "AuthHandlerOwnership-rc15-stale.cfg",
+      "expect": "violation",
+      "invariant": "NoStaleAnswer"
+    },
+    {
+      "config": "AuthHandlerOwnership-fixed-pump.cfg",
+      "expect": "pass"
+    },
+    {
+      "config": "AuthHandlerOwnership-fixed-reader.cfg",
+      "expect": "pass"
+    },
+    {
+      "config": "AuthHandlerOwnership-fixed-none.cfg",
+      "expect": "pass"
+    }
+  ]
+}

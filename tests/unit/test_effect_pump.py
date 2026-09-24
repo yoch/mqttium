@@ -160,7 +160,7 @@ def _collect(client: AsyncClient, kinds: list[EffectKind]) -> list[EffectKind]:
 
 def test_ordered_batch_is_queued_untouched() -> None:
     client = AsyncClient(client_id="effect-ordered")
-    kinds = [EffectKind.SEND, EffectKind.SEND, EffectKind.AUTH]
+    kinds = [EffectKind.SEND, EffectKind.SEND, EffectKind.DISCONNECTED]
 
     assert _collect(client, kinds) == kinds
     assert client._effect_pump.multi_effect_batches == 1
@@ -171,9 +171,9 @@ def test_completion_before_send_is_reordered_send_first() -> None:
     """Output keeps wire order ahead of the lane's remaining ordered work."""
     client = AsyncClient(client_id="effect-puback")
 
-    order = _collect(client, [EffectKind.AUTH, EffectKind.SEND])
+    order = _collect(client, [EffectKind.DISCONNECTED, EffectKind.SEND])
 
-    assert order == [EffectKind.SEND, EffectKind.AUTH]
+    assert order == [EffectKind.SEND, EffectKind.DISCONNECTED]
     assert client._effect_pump.reordered_batches == 1
 
 
@@ -184,7 +184,7 @@ def test_interleaved_batch_keeps_relative_order_within_each_group() -> None:
         client,
         [
             EffectKind.SEND,
-            EffectKind.AUTH,
+            EffectKind.DISCONNECTED,
             EffectKind.SEND,
             EffectKind.DISCONNECTED,
         ],
@@ -193,7 +193,7 @@ def test_interleaved_batch_keeps_relative_order_within_each_group() -> None:
     assert order == [
         EffectKind.SEND,
         EffectKind.SEND,
-        EffectKind.AUTH,
+        EffectKind.DISCONNECTED,
         EffectKind.DISCONNECTED,
     ]
     assert client._effect_pump.reordered_batches == 1
@@ -211,7 +211,7 @@ def test_all_send_batch_is_not_counted_as_reordered() -> None:
 
 def test_no_send_batch_is_not_counted_as_reordered() -> None:
     client = AsyncClient(client_id="effect-others")
-    kinds = [EffectKind.AUTH, EffectKind.DISCONNECTED, EffectKind.PROTOCOL_ERROR]
+    kinds = [EffectKind.DISCONNECTED, EffectKind.DISCONNECTED, EffectKind.PROTOCOL_ERROR]
 
     assert _collect(client, kinds) == kinds
     assert client._effect_pump.reordered_batches == 0
@@ -242,14 +242,14 @@ def test_observed_facts_never_wait_behind_pending_output() -> None:
     client = AsyncClient(client_id="effect-observations")
     pump = client._effect_pump
     client._engine._emit(EffectKind.SEND, b"blocked-output")
-    client._engine._emit(EffectKind.AUTH, None)
+    client._engine._emit(EffectKind.DISCONNECTED, None)
     pump.collect_from_engine()
-    assert [effect.kind for effect in pump.pending] == [EffectKind.SEND, EffectKind.AUTH]
+    assert [effect.kind for effect in pump.pending] == [EffectKind.SEND, EffectKind.DISCONNECTED]
 
     client._ping_pending = True
     client._engine._emit(EffectKind.PINGRESP, None)
     pump.collect_from_engine()
 
     assert client._ping_pending is False
-    assert [effect.kind for effect in pump.pending] == [EffectKind.SEND, EffectKind.AUTH]
+    assert [effect.kind for effect in pump.pending] == [EffectKind.SEND, EffectKind.DISCONNECTED]
     assert pump.enqueued == 2
