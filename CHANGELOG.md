@@ -16,6 +16,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Export the nested statistics snapshots (`OutboundStats`, `InboundStats`,
   `WriterStats`, `DecoderStats`, `DeliveryStats`, `ReceiptStats`,
   `TransportStats`) from `mqttium.api`, and define `MessageDelivery` there.
+- Declare the store protocol methods (`put_out`, `get_out`, `complete_out`,
+  `batch`, ...) Internal. Both store classes stay public (Provisional) through
+  their constructors, `store=`, and `SqliteInflightStore.close()` or its
+  context manager.
 - Annotate `store=` with the two supported store classes instead of the
   Internal store protocol. Internal packages no longer declare `__all__`, and
   the callback type aliases of `AsyncClient` are private.

@@ -18,6 +18,11 @@ The deliberate pre-v1 break from RC14 is recorded in the migration guide.
 `MemoryInflightStore` and `SqliteInflightStore`. These remain supported and
 tested, but may evolve in a minor release with a changelog entry and migration
 guidance. Freezing their current vocabulary does not promote them to Stable.
+For the stores, the supported surface is construction (`MemoryInflightStore()`,
+`SqliteInflightStore(path)`), passing the store as `store=`,
+`SqliteInflightStore.close()` and its context manager. Their protocol methods
+(`put_out`, `get_out`, `complete_out`, `batch`, ...) and the records they
+exchange are Internal.
 
 **Internal** covers engine, codec, transport and store extension protocols,
 implementation records and underscore modules. There is no compatibility
