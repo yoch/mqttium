@@ -49,17 +49,19 @@ def _assert_dependency_failure(error: BaseException | None, cause: BaseException
 
 async def test_owner_cancelled_tracks_pending_cancel_requests() -> None:
     assert not owner_cancelled()
-    task = asyncio.current_task()
-    assert task is not None
+    started = asyncio.Event()
+
+    async def child() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(child())
+    await started.wait()
+    assert not owner_cancelled(task)
     task.cancel()
-    try:
-        assert owner_cancelled()
-    finally:
-        task.uncancel()
-    assert not owner_cancelled()
-    # Consume the cancellation already scheduled for this task.
+    assert owner_cancelled(task)
     with pytest.raises(asyncio.CancelledError):
-        await asyncio.sleep(0)
+        await task
 
 
 async def test_failure_for_converts_only_unowned_cancellation() -> None:
