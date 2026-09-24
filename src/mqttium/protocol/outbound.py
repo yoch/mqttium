@@ -293,8 +293,8 @@ class OutboundSession:
         while self.flow.inflight > inflight_start:
             self.flow.release()
         for mid in mids:
-            self.delete_record(mid)
-            self.packet_ids.release(mid)
+            if self._delete_failed_admission(mid):
+                self.packet_ids.release(mid)
         self._pending_messages = messages_start
         self._pending_bytes = bytes_start
 
@@ -911,14 +911,28 @@ class OutboundSession:
         self.store.delete_out(mid)
         self._release_reservation(self.stored_logical_size(stored))
 
-    def delete_record(self, mid: int) -> None:
+    def _delete_failed_admission(self, mid: int) -> bool:
+        """Remove the row of a publication whose admission failed.
+
+        Returns whether its identifier is free again. The caller re-raises the
+        original admission failure, so a delete failure is not raised over it.
+        A row that could not be deleted is sealed instead (#521): its caller
+        already saw the failure, so this client must never send it, and its
+        identifier stays reserved so no later publication overwrites it.
+        """
         try:
             self.store.delete_out(mid)
         except Exception:
-            # Preserve the original admission failure. Transactional stores have
-            # already rolled their batch back when _rollback reaches this helper;
-            # unlike discard_record(), this is best-effort cleanup only.
-            pass
+            try:
+                stored = self.store.out_meta(mid) is not None
+            except Exception:
+                # The store cannot tell: keep the identifier reserved.
+                stored = True
+            if not stored:
+                return True
+            self._sealed[mid] = True
+            return False
+        return True
 
     # A successful settlement releases exactly the same durable ownership as a
     # discard; the two names keep call sites saying which one is happening.
