@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from mqttium.api._cancel import owner_cancelled
 from mqttium.api._delivery import ApplicationDelivery
 from mqttium.packets import ConnAckPacket
 
@@ -59,7 +60,12 @@ class LifecycleHooks:
 
     def _cancel_obsolete(self, origin: asyncio.Task[None] | None) -> None:
         task = self.hook_task
-        if task is not None and task is not origin and not task.done() and not task.cancelling():
+        if (
+            task is not None
+            and task is not origin
+            and not task.done()
+            and not owner_cancelled(task)
+        ):
             task.cancel()
 
     def hold(self) -> None:
@@ -118,8 +124,7 @@ class LifecycleHooks:
         try:
             await ApplicationDelivery.invoke(event.callback, event.value)
         except asyncio.CancelledError as exc:
-            task = asyncio.current_task()
-            if task is None or task.cancelling():
+            if owner_cancelled():
                 raise
             ApplicationDelivery.report_callback_error(event.callback, exc)
         except Exception as exc:
@@ -148,8 +153,9 @@ class LifecycleHooks:
                     try:
                         await task
                     except asyncio.CancelledError:
-                        current = asyncio.current_task()
-                        if current is not None and current.cancelling():
+                        # A hook that ends by raising CancelledError on its own
+                        # (or is superseded) must not stop the lifecycle worker.
+                        if owner_cancelled():
                             raise
                     finally:
                         self.hook_task = None

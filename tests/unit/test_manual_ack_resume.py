@@ -33,7 +33,9 @@ def test_wait_user_ack_completes_when_reopened_without_manual_ack() -> None:
         store=store,
     )
     engine.state = ConnectionState.CONNECTED
-    engine.inbound._inflight = 1
+    # WAIT_USER_ACK is durable session state from a prior connection; it owns
+    # no current Receive Maximum slot until a PUBLISH is observed here.
+    engine.inbound._inflight = 0
 
     feed_engine(engine, PubRelPacket(mid=17).encode())
 
@@ -67,7 +69,8 @@ def test_wait_puback_completes_when_reopened_without_manual_ack() -> None:
         store=store,
     )
     engine.state = ConnectionState.CONNECTED
-    engine.inbound._inflight = 1
+    # The retransmitted PUBLISH below acquires the replacement connection slot.
+    engine.inbound._inflight = 0
 
     feed_engine(
         engine,

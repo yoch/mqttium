@@ -203,9 +203,12 @@ class ProtocolEngine:
         *,
         requires_delivery_mark: bool = False,
         decoded_property_wire_size: int | None = None,
+        exchange_token: object | None = None,
     ) -> None:
         self._effects.append(
-            EngineEffect(kind, data, requires_delivery_mark, decoded_property_wire_size)
+            EngineEffect(
+                kind, data, requires_delivery_mark, decoded_property_wire_size, exchange_token
+            )
         )
 
     def _send(self, packet: WriteItem) -> None:
@@ -741,8 +744,16 @@ class ProtocolEngine:
         """
         self.inbound.drain_replay()
 
-    def mark_inbound_delivered(self, mid: int) -> None:
-        self.inbound.mark_delivered(mid)
+    def mark_inbound_delivered(self, mid: int, token: object | None = None) -> None:
+        """Record that the application owns an inbound message.
+
+        ``token`` is the MESSAGE effect's ``exchange_token``; a mark for an
+        exchange that has since completed is ignored. A persisted QoS 2
+        exchange (or a recovered QoS 1 exchange acknowledged automatically)
+        is completed only after this commit, so direct engine consumers must
+        mark every MESSAGE that ``requires_delivery_mark``.
+        """
+        self.inbound.mark_delivered(mid, token)
 
     def ack(self, mid: int, *, message: Message | None = None) -> None:
         """Complete a deferred inbound ACK in manual-ack mode."""

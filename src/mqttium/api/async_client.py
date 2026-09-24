@@ -19,6 +19,12 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from typing import Any, Never, TypeVar
 
+from mqttium.api._cancel import (
+    dependency_failure,
+    failure_for,
+    ignoring_dependency_failures,
+    owner_cancelled,
+)
 from mqttium.api._delivery import (
     ApplicationDelivery,
     MessageDelivery,
@@ -878,7 +884,10 @@ class AsyncClient:
                 self._keepalive_loop(), name="mqttium-keepalive"
             )
             return connack
-        except BaseException:
+        except BaseException as exc:
+            # The transport factory or CONNECT write can raise CancelledError
+            # although the caller was not cancelled (#529).
+            failure = failure_for(exc, "connection setup")
             if not reconnect_attempt:
                 self._intentional_disconnect = True
             if self._connack_fut is not None and not self._connack_fut.done():
@@ -890,7 +899,7 @@ class AsyncClient:
             except BaseException:
                 pass
             self._retire_engine_connection()
-            raise
+            raise failure from failure.__cause__
 
     async def _await_connack_or_disconnect(self, timeout: float) -> ConnAckPacket:
         connack_fut = self._connack_fut
@@ -1250,9 +1259,13 @@ class AsyncClient:
                     )
                 if receipt.submitted % 256 == 0:
                     await asyncio.sleep(0)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as caught:
+            # Caller cancellation propagates unchanged and leaves the committed
+            # prefix active. A dependency raising CancelledError is an admission
+            # failure: the caller still needs the prefix receipt.
+            if isinstance(caught, asyncio.CancelledError) and owner_cancelled():
+                raise
+            exc = failure_for(caught, "publication admission")
             raise PublishBatchError(
                 receipt.failures,
                 failure_count=receipt.failure_count,
@@ -1670,8 +1683,16 @@ class AsyncClient:
                     ):
                         break
                     await asyncio.sleep(0)
-        except asyncio.CancelledError:
-            raise
+        except asyncio.CancelledError as exc:
+            # The client cancels its reader to retire the connection. A
+            # transport read raising CancelledError on its own is a transport
+            # failure whose cause must survive teardown.
+            if owner_cancelled():
+                raise
+            failure = dependency_failure(exc, "transport read")
+            self._disconnect_exc = failure
+            if self._local_terminal_failure is None and not self._will_reconnect():
+                self._fail_pending(failure)
         except MandatoryResponseTooLargeError as exc:
             connack_fut = self._connack_fut
             if connack_fut is not None and not connack_fut.done():
@@ -1767,10 +1788,8 @@ class AsyncClient:
             # replacement. Replayable state remains in the protocol store.
             await self._write_pump.wake_waiters()
             await self._write_pump.stop()
-            try:
+            with ignoring_dependency_failures():
                 await reader_transport.close()
-            except Exception:
-                pass
             if self._transport is reader_transport:
                 self._transport = None
             if not will_reconnect:
@@ -1835,9 +1854,8 @@ class AsyncClient:
         if transport is None:
             return
         try:
-            await transport.close()
-        except Exception:
-            pass
+            with ignoring_dependency_failures():
+                await transport.close()
         finally:
             # The reader can be waiting for application delivery rather than
             # read(). Closing the socket alone cannot wake that wait. Never
@@ -1957,8 +1975,13 @@ class AsyncClient:
                     self._ping_deadline = now + ping_to
                 else:
                     await asyncio.sleep(min(1.0, due - now))
-        except asyncio.CancelledError:
-            raise
+        except asyncio.CancelledError as exc:
+            if owner_cancelled():
+                raise
+            # A PINGREQ dependency raised CancelledError: without keepalive
+            # the connection cannot detect a dead peer, so retire it.
+            self._disconnect_exc = dependency_failure(exc, "keepalive")
+            await self._close_transport_after_connection_failure()
 
     async def _reconnect_loop(self) -> None:
         try:
@@ -2011,7 +2034,12 @@ class AsyncClient:
                         return
                     # Dropped again during the stability window — keep retrying.
                     continue
-                except Exception as exc:
+                except (Exception, asyncio.CancelledError) as caught:
+                    # Only disconnect()/explicit connect cancel the supervisor.
+                    # A dependency raising CancelledError is one failed attempt.
+                    if isinstance(caught, asyncio.CancelledError) and owner_cancelled():
+                        raise
+                    exc = failure_for(caught, "reconnect attempt")
                     self._disconnect_exc = exc
                     cause = self._local_terminal_failure
                     if self._permanent_connection_failure() or cause is not None:
@@ -2027,8 +2055,6 @@ class AsyncClient:
                             self._lifecycle_hooks.disconnected(terminal, lifecycle_token)
                         return
                     continue
-        except asyncio.CancelledError:
-            raise
         finally:
             self._reconnect_task = None
 
@@ -2119,10 +2145,9 @@ class AsyncClient:
             except TimeoutError as exc:
                 raise MQTTTimeoutError("AUTH handler timed out") from exc
             except asyncio.CancelledError as exc:
-                task = asyncio.current_task()
-                if task is None or task.cancelling():
+                if owner_cancelled():
                     raise
-                raise MQTTError("AUTH handler cancelled") from exc
+                raise dependency_failure(exc, "AUTH handler", "AUTH handler cancelled") from exc
             if isinstance(response, AuthPacket):
                 async with self._engine_lock:
                     self._engine.queue_auth(
@@ -2152,22 +2177,20 @@ class AsyncClient:
                             )
                         except TimeoutError:
                             pass
-                    try:
+                    with ignoring_dependency_failures():
                         await self._transport.close()
-                    except Exception:
-                        pass
         elif kind is EffectKind.PROTOCOL_ERROR:
             self._raise_protocol_effect(effect.data)
         else:
             raise MQTTError(f"Non-protocol effect in protocol pump: {kind!r}")
 
-    def _apply_delivery_effect(self, effect: EngineEffect, epoch: int) -> Awaitable[None] | None:
+    def _apply_delivery_effect(self, effect: EngineEffect, epoch: int) -> Awaitable[object] | None:
         """Apply one effect of the reader's delivery lot outside protocol locks.
 
         The common case -- a message handed to its destination immediately --
         completes synchronously and returns ``None``. Waiting for delivery
-        capacity, the fairness yield, durable delivery marks and replay
-        continuation return the awaitable that finishes the effect.
+        capacity, the fairness yield and replay continuation return the
+        awaitable that finishes the effect.
         """
         kind = effect.kind
         if kind is EffectKind.MESSAGE or kind is EffectKind.DECODED_MESSAGE:
@@ -2175,22 +2198,29 @@ class AsyncClient:
             pending = self._delivery.accept(
                 message, self._message_callback, effect.decoded_property_wire_size
             )
-            if effect.requires_delivery_mark and message.mid is not None:
-                if pending is None and not self._engine_lock.locked():
-                    # No await separates the handoff from this mark, so the
-                    # free lock cannot be contended before the mark completes.
-                    self._mark_delivered_locked(message.mid)
-                    return None
-                return self._mark_delivered(message.mid, epoch, pending)
-            return pending
+            if not effect.requires_delivery_mark or message.mid is None:
+                return pending
+            if pending is None or self._delivery.mode == "callback":
+                # The application owns the message now: a callback already ran,
+                # or the iterator queue accepted it. Mark before any await, so
+                # neither teardown nor cancellation can separate the two (#517).
+                self._mark_delivered_locked(message.mid, effect.exchange_token)
+                return pending
+            return self._mark_after_admission(message.mid, effect.exchange_token, pending)
         if kind is EffectKind.CONTINUE_INBOUND_REPLAY:
             return self._continue_inbound_replay(epoch)
         raise MQTTError(f"Non-delivery effect in reader lane: {kind!r}")
 
-    def _mark_delivered_locked(self, mid: int) -> None:
-        """Record delivery of ``mid`` while the engine is exclusively owned."""
+    def _mark_delivered_locked(self, mid: int, token: object | None = None) -> None:
+        """Record delivery of ``mid`` and apply the completion it releases.
+
+        No coroutine awaits while holding ``_engine_lock``, so a synchronous
+        caller can never interleave with another engine mutation. The mark is
+        tied to the exchange (``token``), not to the connection: a message
+        committed to a stream that survives reconnect stays delivered.
+        """
         try:
-            self._engine.inbound.mark_delivered(mid)
+            self._engine.inbound.mark_delivered(mid, token)
         except Exception as exc:
             # Queue acceptance is observable, but failed durable completion
             # must retire this session before any new admission. Reader
@@ -2200,13 +2230,25 @@ class AsyncClient:
             self._engine.notify_transport_closed()
             raise
 
-    async def _mark_delivered(self, mid: int, epoch: int, pending: Awaitable[None] | None) -> None:
-        if pending is not None:
-            await pending
-        async with self._engine_lock:
-            if epoch != self._connection_epoch:
-                return
-            self._mark_delivered_locked(mid)
+    def _flush_released_completions(self) -> None:
+        """Hand the PUBCOMP/PUBACKs released by delivery marks to the writer.
+
+        The reader calls this once per delivery lot, so completions released
+        by one lot leave as a batch instead of one effect collection per
+        message.
+        """
+        if self._engine.has_pending_effects:
+            self._effect_pump.collect_from_engine()
+            self._effect_pump.drain_inline()
+
+    async def _mark_after_admission(
+        self, mid: int, token: object | None, pending: Awaitable[bool | None]
+    ) -> None:
+        # The waiting admission commits synchronously with its return, so no
+        # suspension separates the commit from the mark. A retired admission
+        # (replaced connection or stream) commits nothing and marks nothing.
+        if await pending:
+            self._mark_delivered_locked(mid, token)
 
     async def _continue_inbound_replay(self, epoch: int) -> None:
         # This marker follows its messages in the reader-owned lane. Only
@@ -2367,6 +2409,7 @@ class AsyncClient:
     async def _invalidate_connection_epoch(self) -> None:
         self._connection_epoch += 1
         self._delivery_lane.discard()
+        self._delivery.invalidate_waiting_admissions()
         await self._write_pump.advance_epoch(self._connection_epoch)
 
     def _settle_terminal_effect(self, effect: EngineEffect) -> None:
@@ -2509,10 +2552,8 @@ class AsyncClient:
         if not preserve_reconnect and self._reconnect_task is not current:
             self._reconnect_task = None
         if self._transport is not None:
-            try:
+            with ignoring_dependency_failures():
                 await self._transport.close()
-            except Exception:
-                pass
             self._transport = None
         if not preserve_reconnect:
             # Only the really-terminal teardown closes the application stream.

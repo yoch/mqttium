@@ -1,0 +1,14 @@
+{
+  "module": "CancellationOwnership.tla",
+  "status": "refinement",
+  "summary": "Every runtime boundary propagates only owner-requested cancellation and reports a dependency-raised CancelledError as a failure.",
+  "issues": [509, 510, 522, 525, 529, 538],
+  "tests": [
+    "tests/unit/test_dependency_cancellation.py",
+    "tests/project/test_cancellation_discipline.py"
+  ],
+  "configs": [
+    {"config": "CancellationOwnership-rc15.cfg", "expect": "violation", "invariant": "NoSilentDependencyDeath"},
+    {"config": "CancellationOwnership-fixed.cfg", "expect": "pass"}
+  ]
+}

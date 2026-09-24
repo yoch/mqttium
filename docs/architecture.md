@@ -100,6 +100,12 @@ inline synchronous callback invocation, stream close/reset, and delivery
 statistics. It deliberately does not own MQTT state, transport state, or
 reconnect policy.
 
+Handing a message to the application is the commit point of a persisted
+inbound exchange. The reader marks the delivery synchronously at that commit,
+with the exchange identity the engine attached to the MESSAGE effect, and only
+then may the engine send the PUBCOMP (or the PUBACK of a recovered QoS 1 row)
+that ends the exchange.
+
 Topic-filtered callbacks live on `AsyncClient`. `TopicMatcher` chooses which
 application callable receives a delivered message; the protocol engine still
 emits undifferentiated MESSAGE effects and never imports dispatch code.
