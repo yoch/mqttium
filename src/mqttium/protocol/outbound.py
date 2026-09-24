@@ -189,6 +189,15 @@ class OutboundSession:
         return self._pending_messages
 
     @property
+    def holds_packet_ids(self) -> bool:
+        """Whether any publication, sealed ones included, owns an identifier.
+
+        A sealed row released its reservation but keeps its identifier (#521),
+        so the unacknowledged count alone cannot tell the pool may be reset.
+        """
+        return self._pending_messages > 0 or bool(self._sealed)
+
+    @property
     def unacknowledged_bytes(self) -> int:
         return self._pending_bytes
 
