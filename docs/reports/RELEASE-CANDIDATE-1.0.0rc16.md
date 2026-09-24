@@ -41,7 +41,7 @@ membership by identity).
 | [Soak and broker interoperability 36021308762](https://github.com/yoch/mqttium/actions/runs/36021308762) | Passed: Linux and macOS soaks for MQTT 3.1.1 and 5, EMQX 5.8.9 and HiveMQ CE 2026.5 |
 | Strict ARM64 network gate vs RC15, [36021312003](https://github.com/yoch/mqttium/actions/runs/36021312003) | Passed: QoS 1 receipt ACK throughput at windows 1, 20 and 64 within 0.94–1.07 of RC15 per ABBA cycle |
 | Strict ARM64 open-loop gate vs RC15, [36025710297](https://github.com/yoch/mqttium/actions/runs/36025710297) | Passed; see below |
-| ARM64 paired regression vs RC15 | PENDING |
+| ARM64 paired regression vs RC15, [36026430855](https://github.com/yoch/mqttium/actions/runs/36026430855) | Passed: strict writer-capacity A/B 0.999 (QoS 0) and 0.989 (QoS 1), A/A 1.002 and 1.003; strict paced writer-latency A/B lag 1.001 at 2,500 and 1.000 at 10,000 msgs/s |
 
 ### Measurements on the x86 development host
 
