@@ -1,0 +1,20 @@
+{
+  "module": "ReconnectCancellation.tla",
+  "status": "legacy-flag",
+  "summary": "A dependency-raised CancelledError must not end the reconnect supervisor while the message stream stays open.",
+  "issues": [
+    510
+  ],
+  "tests": [],
+  "configs": [
+    {
+      "config": "ReconnectCancellation-rc15.cfg",
+      "expect": "violation",
+      "invariant": "SupervisorDoesNotDisappearWithOpenDeadStream"
+    },
+    {
+      "config": "ReconnectCancellation-fixed.cfg",
+      "expect": "pass"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "module": "ActiveDeliveryGeneration.tla",
+  "status": "legacy-flag",
+  "summary": "Iterator admissions waiting for capacity must not commit into a replaced connection or stream generation.",
+  "issues": [
+    500
+  ],
+  "tests": [],
+  "configs": [
+    {
+      "config": "ActiveDeliveryGeneration-rc15.cfg",
+      "expect": "violation",
+      "invariant": "NoStaleCommit"
+    },
+    {
+      "config": "ActiveDeliveryGeneration-fixed.cfg",
+      "expect": "pass"
+    }
+  ]
+}

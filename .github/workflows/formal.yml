@@ -1,0 +1,39 @@
+name: Formal models
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "formal/**"
+      - "tools/formal/**"
+      - ".github/workflows/formal.yml"
+  pull_request:
+    paths:
+      - "formal/**"
+      - "tools/formal/**"
+      - ".github/workflows/formal.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tlc:
+    name: TLC model checking
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      # The runner image provides a JDK; run_tlc.py pins and hash-checks TLC.
+      - run: java -version
+      - run: python tools/formal/run_tlc.py --list
+      - run: python tools/formal/run_tlc.py

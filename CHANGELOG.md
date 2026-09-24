@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Check the TLA+ models under `formal/models/` with a pinned, hash-verified
+  TLC in a dedicated workflow. Every configuration declares the outcome TLC
+  must report, so a released-behaviour counterexample and its repair are both
+  kept under regression; see the formal models guide.
+
 ### Changed
 
 - Record per-CPU frequency, frequency residency and the Raspberry Pi firmware

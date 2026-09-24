@@ -19,6 +19,7 @@ python -m pytest -q tests/unit tests/project --cov=mqttium
 PYTHONPATH=src python tests/fuzz/fuzz.py --seed 1 --iterations 20000
 python -m pytest -q tests/fuzz/test_hypothesis_fuzz.py tests/fuzz/test_stateful_invariants.py
 mkdocs build --strict
+python tools/formal/run_tlc.py   # requires Java; see docs/formal-models.md
 ```
 
 `pyproject.toml` supplies `pythonpath = ["src"]` and asyncio auto mode. Do not
@@ -93,6 +94,14 @@ QoS 1/2 outbound admission is a transaction over budget, packet id, store row,
 and flow slot. All failures unwind through the outbound session's rollback
 path. Extend `tests/unit/test_outbound_transaction.py` whenever an acquisition
 step is added.
+
+## Formal models
+
+TLA+ models in `formal/models/` declare the outcome TLC must report for each
+configuration: the released-behaviour configuration keeps its counterexample
+and the repaired one passes. New models must encode the implementation's real
+predicates and name the deterministic tests that replay their counterexample;
+see `docs/formal-models.md`.
 
 ## Effect and replay pipeline
 
