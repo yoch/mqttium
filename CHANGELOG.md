@@ -6,6 +6,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep the packet identifier of a sealed publication reserved when the
+  connection closes with a SUBSCRIBE or UNSUBSCRIBE in flight. The engine reset
+  the whole identifier pool once no publication counted as unacknowledged,
+  which ignored sealed rows, so a later publication could reuse a sealed
+  identifier and overwrite its stored row.
+
 ## [1.0.0rc16] - 2026-09-24
 
 ### Added

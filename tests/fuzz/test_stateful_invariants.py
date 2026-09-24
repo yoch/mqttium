@@ -103,13 +103,19 @@ def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> 
         if not pool.in_use(record.mid):
             fail(f"durable record mid={record.mid} ({record.state.name}) is not held in the pool")
 
-    if outbound.unacknowledged_messages != len(records):
+    # A sealed row (#521) keeps its record and identifier but no reservation.
+    sealed = outbound._sealed
+    unsealed = [r for r in records if r.mid not in sealed]
+    if outbound.unacknowledged_messages != len(unsealed):
         fail(
             f"pending_messages={outbound.unacknowledged_messages} but the store holds "
-            f"{len(records)} records"
+            f"{len(unsealed)} unsealed records"
         )
+    stray_sealed = set(sealed) - {r.mid for r in records}
+    if stray_sealed:
+        fail(f"sealed mids with no durable record: {sorted(stray_sealed)}")
 
-    expected_bytes = sum(outbound.stored_logical_size(r) for r in records)
+    expected_bytes = sum(outbound.stored_logical_size(r) for r in unsealed)
     if outbound.unacknowledged_bytes != expected_bytes:
         fail(
             f"pending_bytes={outbound.unacknowledged_bytes} but the records sum to {expected_bytes}"
@@ -186,6 +192,23 @@ def _check_completed_only_after_delivery(
             )
 
 
+def _subscription_or_seal(
+    engine: ProtocolEngine, rng: random.Random, operation: str, history: list[str], step: int
+) -> None:
+    """Share the packet identifier pool with SUBSCRIBE and sealed rows (#521)."""
+    if operation == "subscribe":
+        if engine.state is ConnectionState.CONNECTED:
+            history.append(f"{step}: SUBSCRIBE")
+            engine.queue_subscribe([(f"s/{rng.randint(0, 3)}", 1)])
+        return
+    # A terminal receipt failure seals what is still stored.
+    mids = [summary.mid for page in engine.store.out_summary_pages() for summary in page]
+    if mids:
+        chosen = rng.sample(mids, rng.randint(1, len(mids)))
+        history.append(f"{step}: seal {sorted(chosen)}")
+        engine.seal_publications(chosen)
+
+
 def _inbound_delivery_states(engine: ProtocolEngine) -> dict[int, bool]:
     return {meta.mid: meta.delivered for page in engine.store.in_index_pages() for meta in page}
 
@@ -223,8 +246,10 @@ def test_engine_invariants_hold(protocol: MQTTProtocolVersion, seed: int) -> Non
         "deliver",
         "drop",
         "reconnect",
+        "subscribe",
+        "seal",
     ]
-    weights = [40, 14, 12, 12, 10, 6, 8, 4, 6]
+    weights = [40, 14, 12, 12, 10, 6, 8, 4, 6, 4, 3]
     # Deliveries the runtime has not committed yet, in emission order. A
     # "deliver" step commits one of them, possibly after its exchange ended
     # and the identifier was reused (a late mark must then be ignored).
@@ -285,6 +310,8 @@ def test_engine_invariants_hold(protocol: MQTTProtocolVersion, seed: int) -> Non
                 _feed(engine, PubRelPacket(mid=mid).encode(protocol))
             elif operation == "deliver":
                 committed = _deliver_one(engine, rng, undelivered, history, step)
+            elif operation in ("subscribe", "seal"):
+                _subscription_or_seal(engine, rng, operation, history, step)
             elif operation == "drop":
                 history.append(f"{step}: transport closed")
                 engine.notify_transport_closed()

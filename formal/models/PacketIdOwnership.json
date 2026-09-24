@@ -1,0 +1,22 @@
+{
+  "module": "PacketIdOwnership.tla",
+  "status": "refinement",
+  "summary": "Releasing SUBSCRIBE/UNSUBSCRIBE identifiers on transport loss never frees the identifier of a sealed publication whose row is still stored.",
+  "issues": [
+    521
+  ],
+  "tests": [
+    "tests/unit/test_sealed_packet_id_release.py"
+  ],
+  "configs": [
+    {
+      "config": "PacketIdOwnership-rc16.cfg",
+      "expect": "violation",
+      "invariant": "NoFreeIdWithRow"
+    },
+    {
+      "config": "PacketIdOwnership-fixed.cfg",
+      "expect": "pass"
+    }
+  ]
+}
