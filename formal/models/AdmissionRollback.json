@@ -1,0 +1,22 @@
+{
+  "module": "AdmissionRollback.tla",
+  "status": "refinement",
+  "summary": "A publication whose admission failed after its row was written is never sent by the same client, and its stored row keeps its packet identifier, even when the rollback delete fails.",
+  "issues": [
+    521
+  ],
+  "tests": [
+    "tests/unit/test_admission_rollback_store_failure.py"
+  ],
+  "configs": [
+    {
+      "config": "AdmissionRollback-rc16.cfg",
+      "expect": "violation",
+      "invariant": "NoFreeIdWithRow"
+    },
+    {
+      "config": "AdmissionRollback-fixed.cfg",
+      "expect": "pass"
+    }
+  ]
+}

@@ -90,7 +90,9 @@ lifecycle hooks with separate bounded ownership. Network operations do not wait
 for hook completion, and incoming delivery does not wait for `on_connect`.
 Obsolete pending lifecycle states are coalesced. External lifecycle operations
 cancel obsolete active hooks; direct self-reentry preserves the invoking hook.
-Automatic retry waits for the current disconnect hook, then rechecks intent.
+Automatic retry waits until the current disconnect hook has started, not until
+it returns, then rechecks intent; `on_connect` for the replacement connection
+still runs after that hook.
 See the [hook contract](reference/async-client.md#lifecycle-hooks) for ordering,
 cancellation and error behavior. Authentication remains protocol-specific and
 is awaited with `auth_timeout`.
