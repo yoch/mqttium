@@ -24,23 +24,23 @@ if TYPE_CHECKING:
 # behind SENDs blocked on writer capacity (#531 #532 #536 #540 #524 #526).
 # AUTH is handed to its owned task at the same point, so user code never runs
 # inside the lane or the reader (#501 #502 #523 #527).
-IMMEDIATE_EFFECTS = frozenset(
-    {
-        EffectKind.AUTH,
-        EffectKind.CONNACK,
-        EffectKind.PUBLISH_COMPLETE,
-        EffectKind.PUBLISH_FAILED,
-        EffectKind.SUBACK,
-        EffectKind.UNSUBACK,
-        EffectKind.PINGRESP,
-    }
+#
+# These kind groups are tuples on purpose: tuple membership compares by
+# identity in C, while a frozenset calls Enum.__hash__, which is Python code,
+# once per effect on the delivery hot path.
+IMMEDIATE_EFFECTS = (
+    EffectKind.AUTH,
+    EffectKind.CONNACK,
+    EffectKind.PUBLISH_COMPLETE,
+    EffectKind.PUBLISH_FAILED,
+    EffectKind.SUBACK,
+    EffectKind.UNSUBACK,
+    EffectKind.PINGRESP,
 )
 # Facts whose cause and waiters are established at collection while their
 # ordered remainder (closing the transport, raising the error) stays queued.
-EARLY_OBSERVATIONS = frozenset({EffectKind.DISCONNECTED, EffectKind.PROTOCOL_ERROR})
-_DELIVERIES = frozenset(
-    {EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE, EffectKind.CONTINUE_INBOUND_REPLAY}
-)
+EARLY_OBSERVATIONS = (EffectKind.DISCONNECTED, EffectKind.PROTOCOL_ERROR)
+_DELIVERIES = (EffectKind.MESSAGE, EffectKind.DECODED_MESSAGE, EffectKind.CONTINUE_INBOUND_REPLAY)
 
 
 def _partition_effects(
