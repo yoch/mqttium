@@ -1,7 +1,7 @@
 {
   "module": "LifecycleReconnectHook.tla",
-  "status": "legacy-flag",
-  "summary": "Automatic reconnect must not wait for an on_disconnect hook that waits for work the replacement connection completes.",
+  "status": "refinement",
+  "summary": "Automatic reconnect proceeds once the on_disconnect hook owns the lifecycle, so a hook awaiting work the replacement connection completes never waits for the reconnect it blocks; on_connect still runs behind it.",
   "issues": [
     508
   ],
@@ -12,8 +12,7 @@
   "configs": [
     {
       "config": "LifecycleReconnectHook-rc15.cfg",
-      "expect": "violation",
-      "invariant": "NoHookReceiptReconnectCycle"
+      "expect": "deadlock"
     },
     {
       "config": "LifecycleReconnectHook-fixed.cfg",
