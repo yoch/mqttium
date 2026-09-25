@@ -389,3 +389,15 @@ def test_result_models_are_read_only() -> None:
         result = result_type(mid=1, reason_codes=(0,))
         with pytest.raises(dataclasses.FrozenInstanceError):
             result.mid = 2  # type: ignore[misc]
+
+
+def test_store_classes_keep_only_their_lifecycle_supported(tmp_path: Path) -> None:
+    from mqttium.persistence import MemoryInflightStore, SqliteInflightStore
+
+    assert list(inspect.signature(MemoryInflightStore).parameters) == []
+    assert list(inspect.signature(SqliteInflightStore).parameters) == ["path"]
+    with SqliteInflightStore(tmp_path / "s.db") as store:
+        assert callable(store.close)
+    # The protocol methods exist but are Internal; the contract says so.
+    doc = (Path(__file__).resolve().parents[2] / "docs" / "api-stability.md").read_text()
+    assert "Their protocol methods" in doc and "are Internal" in doc
