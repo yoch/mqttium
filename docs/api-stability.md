@@ -28,7 +28,7 @@ guarantee for these objects, even when they can be imported.
 | Entry point | Supported names |
 | --- | --- |
 | `mqttium` | Operational `MQTTError` subclasses, `MQTTProtocolVersion`, `QoS`, `ConnectionState`, `__version__` |
-| `mqttium.api` | `AsyncClient`, `Message`, `Properties`, `PublishMessage`, `PublishReceipt`, `PublishBatchReceipt`, `SubscribeResult`, `UnsubscribeResult`, `SubscribeOptions`, `ConnAckPacket`, `AuthPacket`, `NegotiatedSettings`, `ReconnectPolicy`, `MessageDelivery`, `ClientStats` |
+| `mqttium.api` | `AsyncClient`, `Message`, `Properties`, `PublishMessage`, `PublishReceipt`, `PublishBatchReceipt`, `SubscribeResult`, `UnsubscribeResult`, `SubscribeOptions`, `ConnAckPacket`, `AuthPacket`, `NegotiatedSettings`, `ReconnectPolicy`, `MessageDelivery`, `ClientStats` and its nested snapshots (`OutboundStats`, `InboundStats`, `WriterStats`, `DecoderStats`, `DeliveryStats`, `ReceiptStats`, `TransportStats`) |
 | `mqttium.persistence` | `MemoryInflightStore`, `SqliteInflightStore` |
 
 The engine, codecs, packet plumbing, directional sessions, transport extension

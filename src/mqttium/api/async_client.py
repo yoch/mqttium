@@ -17,7 +17,7 @@ import ssl
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
-from typing import Any, Never, TypeVar
+from typing import TYPE_CHECKING, Any, Never, TypeVar
 
 from mqttium.api._auth import AuthExchange
 from mqttium.api._cancel import (
@@ -28,7 +28,6 @@ from mqttium.api._cancel import (
 )
 from mqttium.api._delivery import (
     ApplicationDelivery,
-    MessageDelivery,
     CallbackTarget,
     MessageRoute,
 )
@@ -37,6 +36,7 @@ from mqttium.api._lifecycle import LifecycleHooks
 from mqttium.api._delivery_lane import DeliveryLane
 from mqttium.api._writer import WritePump
 from mqttium.api.models import (
+    MessageDelivery,
     PublishBatchReceipt,
     PublishMessage,
     PublishReceipt,
@@ -83,7 +83,7 @@ from mqttium.protocol.engine import (
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.outbound import _PreparedPublish
 from mqttium.protocol.reconnect import ReconnectPolicy, _ReconnectState
-from mqttium.persistence.memory import InflightStore
+from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.topics import validate_subscribe_filter
 from mqttium.transport._stream import AsyncTransport, DecoderPushTransport, PullTransport
 from mqttium.transport.tcp import TcpTransport
@@ -92,10 +92,13 @@ from mqttium.transport.websocket import WebSocketTransport
 from mqttium.transport.writes import WriteItem, item_size
 from mqttium.types import Message, Properties, _owned_payload
 
-OnMessage = Callable[[Message], None]
-OnConnect = Callable[[ConnAckPacket], Any]
-OnDisconnect = Callable[[BaseException | None], Any]
-OnAuth = Callable[[AuthPacket], Any]
+if TYPE_CHECKING:
+    from mqttium.persistence.sqlite import SqliteInflightStore
+
+_OnMessage = Callable[[Message], None]
+_OnConnect = Callable[[ConnAckPacket], Any]
+_OnDisconnect = Callable[[BaseException | None], Any]
+_OnAuth = Callable[[AuthPacket], Any]
 
 _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT = 5.0
 _FATAL_DISCONNECT_DRAIN_TIMEOUT = 0.25
@@ -305,12 +308,12 @@ class AsyncClient:
         max_iterator_messages: int = _DEFAULT_MAX_ITERATOR_MESSAGES,
         max_iterator_bytes: int | None = _DEFAULT_MAX_ITERATOR_BYTES,
         iterator_admission_timeout: float | None = None,
-        store: InflightStore | None = None,
+        store: MemoryInflightStore | SqliteInflightStore | None = None,
         reconnect: ReconnectPolicy | None = None,
         connect_timeout: float = 30.0,
         ping_timeout: float | None = None,
         subscribe_timeout: float = 30.0,
-        auth_handler: OnAuth | None = None,
+        auth_handler: _OnAuth | None = None,
         auth_timeout: float = 10.0,
     ) -> None:
         _validate_client_arguments(
@@ -447,11 +450,11 @@ class AsyncClient:
         self._last_disconnect: DisconnectInfo | None = None
         self._last_connack_reason: int | None = None
 
-        self._on_message: OnMessage | None = None
+        self._on_message: _OnMessage | None = None
         self._message_callback: CallbackTarget | None = None
         self._topic_callbacks: TopicMatcher | None = None
-        self.on_connect: OnConnect | None = None
-        self.on_disconnect: OnDisconnect | None = None
+        self.on_connect: _OnConnect | None = None
+        self.on_disconnect: _OnDisconnect | None = None
         self._auth_handler = auth_handler
         self._routes_frozen = False
 
@@ -1310,7 +1313,7 @@ class AsyncClient:
         await self._effect_pump.drain()
 
     @property
-    def auth_handler(self) -> OnAuth | None:
+    def auth_handler(self) -> _OnAuth | None:
         """Enhanced-authentication handler fixed at construction."""
         return self._auth_handler
 
@@ -1319,12 +1322,12 @@ class AsyncClient:
             raise MQTTError("Message routing is frozen after the first connection attempt")
 
     @property
-    def on_message(self) -> OnMessage | None:
+    def on_message(self) -> _OnMessage | None:
         """Synchronous callback used when no topic-specific callback matches."""
         return self._on_message
 
     @on_message.setter
-    def on_message(self, callback: OnMessage | None) -> None:
+    def on_message(self, callback: _OnMessage | None) -> None:
         self._check_routes_mutable()
         if callback is not None:
             self._delivery.validate_message_callback(callback)
@@ -1343,7 +1346,7 @@ class AsyncClient:
             else self._on_message
         )
 
-    def message_callback_add(self, topic_filter: str, callback: OnMessage) -> None:
+    def message_callback_add(self, topic_filter: str, callback: _OnMessage) -> None:
         """Register a synchronous filtered callback before the first connection attempt.
 
         Matches run in registration order instead of on_message. Replacing a
@@ -1369,7 +1372,7 @@ class AsyncClient:
                 self._topic_callbacks = None
         self._refresh_message_callback()
 
-    def _dispatch_topic_message(self, message: Message) -> Iterator[OnMessage]:
+    def _dispatch_topic_message(self, message: Message) -> Iterator[_OnMessage]:
         matcher = self._topic_callbacks
         matched = False
         if matcher:

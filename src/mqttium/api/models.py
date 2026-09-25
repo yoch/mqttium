@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Literal
 from types import MappingProxyType
 from collections.abc import Mapping
 
 from mqttium.enums import QoS
 from mqttium.errors import PublishBatchError
-from mqttium.packets import ConnAckPacket
-from mqttium.types import Message, Properties, _owned_payload
+from mqttium.types import Properties, _owned_payload
+
+MessageDelivery = Literal["iterator", "callback"]
+"""How the client hands inbound messages to the application."""
 
 
 @dataclass(slots=True, frozen=True)
@@ -163,7 +166,6 @@ class PublishBatchReceipt:
             self._done.set()
 
 
-@dataclass(slots=True)
 class PublishReceipt:
     """Handle returned by ``AsyncClient.publish``.
 
@@ -182,11 +184,28 @@ class PublishReceipt:
 
     """
 
-    mid: int | None
-    qos: QoS
-    _waiters: list[asyncio.Future[None]] | None = None
-    _error: BaseException | None = None
-    _settled: bool = False
+    __slots__ = ("_error", "_mid", "_qos", "_settled", "_waiters")
+
+    def __init__(self, mid: int | None, qos: QoS) -> None:
+        self._mid = mid
+        self._qos = qos
+        self._waiters: list[asyncio.Future[None]] | None = None
+        self._error: BaseException | None = None
+        self._settled = False
+
+    @property
+    def mid(self) -> int | None:
+        """Packet identifier of the publication, or ``None`` for QoS 0."""
+        return self._mid
+
+    @property
+    def qos(self) -> QoS:
+        """QoS level the publication was admitted with."""
+        return self._qos
+
+    def __repr__(self) -> str:
+        state = "done" if self.is_done() else "pending"
+        return f"PublishReceipt(mid={self._mid!r}, qos={self._qos!r}, {state})"
 
     def _settle(self) -> None:
         """Mark completion and wake every parked waiter."""
@@ -209,7 +228,7 @@ class PublishReceipt:
         parks on its own future, so cancelling one waiter does not cancel the
         receipt or any other waiter.
         """
-        if self.qos != QoS.AT_MOST_ONCE and not self._settled:
+        if self._qos != QoS.AT_MOST_ONCE and not self._settled:
             waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             waiters = self._waiters
             if waiters is None:
@@ -237,10 +256,10 @@ class PublishReceipt:
 
     def is_done(self) -> bool:
         """Whether the publication reached its completion boundary."""
-        return self.qos == QoS.AT_MOST_ONCE or self._settled
+        return self._qos == QoS.AT_MOST_ONCE or self._settled
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class SubscribeResult:
     """Broker acknowledgement for one subscribe request.
 
@@ -253,7 +272,7 @@ class SubscribeResult:
     reason_codes: tuple[int, ...]
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class UnsubscribeResult:
     """Broker acknowledgement for one unsubscribe request.
 
@@ -263,14 +282,3 @@ class UnsubscribeResult:
 
     mid: int
     reason_codes: tuple[int, ...]
-
-
-__all__ = [
-    "ConnAckPacket",
-    "Message",
-    "PublishBatchReceipt",
-    "PublishMessage",
-    "PublishReceipt",
-    "SubscribeResult",
-    "UnsubscribeResult",
-]

@@ -11,7 +11,8 @@ import pytest
 import mqttium
 import mqttium.api as api
 import mqttium.protocol as protocol
-from mqttium.api.async_client import AsyncClient, MessageDelivery
+from mqttium.api.async_client import AsyncClient
+from mqttium.api.models import MessageDelivery
 from mqttium.api.models import (
     PublishBatchReceipt,
     PublishMessage,
@@ -96,9 +97,18 @@ def test_root_exports_operational_errors_and_connection_state() -> None:
 
 
 def test_api_exports_every_type_used_by_supported_signatures() -> None:
+    # ClientStats and its nested snapshots are Provisional, importable from the
+    # supported entry point so applications can annotate them.
     expected = {
         **STABLE_API_EXPORTS,
         "ClientStats": ClientStats,
+        "DecoderStats": DecoderStats,
+        "DeliveryStats": DeliveryStats,
+        "InboundStats": InboundStats,
+        "OutboundStats": OutboundStats,
+        "ReceiptStats": ReceiptStats,
+        "TransportStats": TransportStats,
+        "WriterStats": WriterStats,
     }
 
     assert set(api.__all__) == set(expected)
@@ -298,8 +308,10 @@ def test_internal_pumps_are_not_promoted_to_supported_entry_points() -> None:
 
 
 def test_protocol_lazy_exports_are_complete_and_discoverable() -> None:
-    assert set(protocol.__all__) <= set(dir(protocol))
-    for name in protocol.__all__:
+    assert not hasattr(protocol, "__all__")
+    lazy = set(protocol._EXPORT_MODULES)
+    assert lazy <= set(dir(protocol))
+    for name in lazy:
         value = getattr(protocol, name)
         assert value.__module__.startswith("mqttium.protocol")
 
@@ -364,3 +376,16 @@ def test_stable_enumerations_have_no_unused_members() -> None:
 def test_negotiated_settings_expose_fields_only() -> None:
     public = {name for name in dir(NegotiatedSettings) if not name.startswith("_")}
     assert public == {field.name for field in dataclasses.fields(NegotiatedSettings)}
+
+
+def test_result_models_are_read_only() -> None:
+    receipt = PublishReceipt(mid=3, qos=QoS.AT_LEAST_ONCE)
+    assert (receipt.mid, receipt.qos) == (3, QoS.AT_LEAST_ONCE)
+    with pytest.raises(AttributeError):
+        receipt.mid = 4  # type: ignore[misc]
+    assert receipt != PublishReceipt(mid=3, qos=QoS.AT_LEAST_ONCE)  # identity
+    assert list(inspect.signature(PublishReceipt).parameters) == ["mid", "qos"]
+    for result_type in (SubscribeResult, UnsubscribeResult):
+        result = result_type(mid=1, reason_codes=(0,))
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            result.mid = 2  # type: ignore[misc]
