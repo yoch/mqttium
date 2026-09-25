@@ -6,8 +6,18 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- `MQTTTimeoutError` also derives from `TimeoutError`, so `except TimeoutError`
+  catches client deadlines.
+- `PublishBatchError.receipt` is always the batch receipt, never `None`.
+
 ### Removed
 
+- Remove duplicate batch fields before 1.0 (see the migration guide):
+  `PublishBatchError.failures`, `failure_count`, `failure_counts` and `cause`,
+  which repeated its `receipt` and `__cause__`, and
+  `PublishBatchReceipt.completed`, which equals `submitted - pending_count`.
 - Remove contracts with no effect or no use before 1.0 (see the migration guide):
   `MQTTProtocolVersion.MQTTv31`, which was always refused;
   `ConnectionState.RECONNECTING`, which was never reported;

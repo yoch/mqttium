@@ -336,6 +336,19 @@ def test_retired_entry_points_are_absent() -> None:
     assert not hasattr(AsyncClient(), "on_publish")
 
 
+def test_client_timeouts_are_builtin_timeouts() -> None:
+    assert issubclass(MQTTTimeoutError, MQTTError)
+    assert issubclass(MQTTTimeoutError, TimeoutError)
+
+
+def test_batch_error_carries_only_its_receipt() -> None:
+    receipt = PublishBatchReceipt()
+    error = PublishBatchError(receipt)
+    assert error.receipt is receipt
+    assert not hasattr(error, "failures") and not hasattr(error, "cause")
+    assert not hasattr(receipt, "completed")
+
+
 def test_stable_enumerations_have_no_unused_members() -> None:
     # MQTT 3.1 is unsupported and no state is reported while reconnecting.
     assert [level.name for level in MQTTProtocolVersion] == ["MQTTv311", "MQTTv5"]

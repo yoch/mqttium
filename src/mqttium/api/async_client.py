@@ -1291,13 +1291,7 @@ class AsyncClient:
             if isinstance(caught, asyncio.CancelledError) and owner_cancelled():
                 raise
             exc = failure_for(caught, "publication admission")
-            raise PublishBatchError(
-                receipt.failures,
-                failure_count=receipt.failure_count,
-                failure_counts=dict(receipt.failure_counts),
-                cause=exc,
-                receipt=receipt,
-            ) from exc
+            raise PublishBatchError(receipt, cause=exc) from exc
         finally:
             receipt._seal()
         return receipt
