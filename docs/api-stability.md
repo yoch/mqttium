@@ -132,7 +132,7 @@ dedicated constructor arguments, never precedence between duplicate property
 keys and arguments.
 
 The constructor refuses configuration that would have no effect instead of
-accepting it: MQTT 5 options (`connect_properties`, `will_properties`,
+accepting it: MQTT 5 options (`connect_properties`, `will` properties,
 `topic_alias_maximum`, `auth_handler`) with MQTT 3.1.1 raise `ProtocolError`;
 iterator bounds or `manual_ack` with callback delivery raise `ValueError`.
 

@@ -16,6 +16,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Export the nested statistics snapshots (`OutboundStats`, `InboundStats`,
   `WriterStats`, `DecoderStats`, `DeliveryStats`, `ReceiptStats`,
   `TransportStats`) from `mqttium.api`, and define `MessageDelivery` there.
+- **Breaking:** `will` takes a `PublishMessage`, whose `properties` are the
+  MQTT 5 Will Properties, and `will_properties` is removed. A `Message` Will
+  silently dropped its `properties`, `dup` and `mid`; it is now refused with
+  `TypeError`.
 - Declare the store protocol methods (`put_out`, `get_out`, `complete_out`,
   `batch`, ...) Internal. Both store classes stay public (Provisional) through
   their constructors, `store=`, and `SqliteInflightStore.close()` or its

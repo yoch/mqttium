@@ -58,6 +58,7 @@ removes contracts that had no effect, no use, or duplicated another.
 | Mutable `PublishReceipt.mid` / `.qos`; value equality; constructor fields `_waiters`, `_error`, `_settled` | Read-only `mid` and `qos`; identity equality; `PublishReceipt(mid, qos)` |
 | Mutable `SubscribeResult` / `UnsubscribeResult` | Frozen; construct a new value instead of assigning fields |
 | Nested statistics types imported from `mqttium.api.stats` or other modules | Import them from `mqttium.api` |
+| `will=Message(...)` plus `will_properties=Properties(...)` | `will=PublishMessage(topic, payload, qos=..., retain=..., properties=...)`; a `Message` is refused with `TypeError` |
 | Store methods (`put_out`, `get_out`, `complete_out`, `in_replay_pages`, `batch`, ...) called by applications | Internal; use `client.stats()` for a running client. Construction, `store=`, `close()` and `with` stay supported |
 | `__all__` lists of Internal packages (`mqttium.packets`, `codec`, `transport`, `dispatch`, `protocol`, `api.models`, `api.stats`) | None; these packages are Internal |
 
