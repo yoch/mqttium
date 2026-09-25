@@ -698,7 +698,7 @@ class ProtocolEngine:
 
         self._validate_accepted_connack(connack)
 
-        self.negotiated = NegotiatedSettings.from_connack(
+        self.negotiated = NegotiatedSettings._from_connack(
             connack.properties,
             requested_keepalive=self.config.keepalive,
             requested_session_expiry=self._sent_session_expiry_interval,

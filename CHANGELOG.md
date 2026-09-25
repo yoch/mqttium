@@ -6,6 +6,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Removed
+
+- Remove contracts with no effect or no use before 1.0 (see the migration guide):
+  `MQTTProtocolVersion.MQTTv31`, which was always refused;
+  `ConnectionState.RECONNECTING`, which was never reported;
+  `NegotiatedSettings.effective_keepalive` and `effective_client_id()`, which
+  duplicated `server_keep_alive` and `AsyncClient.effective_client_id`.
+  `NegotiatedSettings.from_connack()` and the encoding and decoding methods of
+  `SubscribeOptions`, `ConnAckPacket` and `AuthPacket` are Internal.
+
 ### Fixed
 
 - Never send a publication whose admission failed after its durable row was

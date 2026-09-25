@@ -36,6 +36,7 @@ a submission error carries a receipt for the committed prefix.
 ::: mqttium.api.SubscribeOptions
     options:
       heading_level: 3
+      members: [qos, no_local, retain_as_published, retain_handling]
 
 ::: mqttium.api.SubscribeResult
     options:
@@ -59,10 +60,15 @@ filter. Inspect every returned code for multi-topic operations.
 ::: mqttium.api.ConnAckPacket
     options:
       heading_level: 3
+      members: [session_present, reason_code, properties]
 
 ::: mqttium.api.AuthPacket
     options:
       heading_level: 3
+      members: [reason_code, properties]
+
+These models support value construction and inspection of their fields. Their
+encoding and decoding methods belong to the Internal codec.
 
 ## Negotiated settings
 
