@@ -652,6 +652,11 @@ class InboundSession:
                 if acquired:
                     self._acquire_slot()
                     current.add(mid)
+                if mid in self._pending_manual_qos1_acks:
+                    # The application already acknowledged the replayed
+                    # message; its PUBACK waited for this resend.
+                    self._drain_manual_qos1_acks()
+                    return
                 inbound = store.get_in(mid)
                 if inbound is None:
                     if acquired:
@@ -817,10 +822,20 @@ class InboundSession:
         self._complete_qos2(mid, state, "acknowledging")
 
     def _drain_manual_qos1_acks(self) -> None:
-        """Emit the ready prefix of manual QoS 1 acknowledgements in arrival order."""
+        """Emit the ready prefix of manual QoS 1 acknowledgements in arrival order.
+
+        A PUBACK only ever answers a PUBLISH observed on this connection. A row
+        from an earlier connection waits for the broker's resend, which a
+        resumed session guarantees [MQTT-4.4.0-1]: acknowledged before it, the
+        resend would arrive after our PUBACK, and the receiver must treat it as
+        a new message [MQTT-4.3.2-5] that the broker no longer counts. That
+        phantom exchange held a Receive Maximum slot (a false 0x93) and
+        swallowed a later message reusing its identifier.
+        """
         order = self._manual_qos1_order
         ready = self._pending_manual_qos1_acks
-        while order and order[0] in ready:
+        current = self._current_persisted_mids
+        while order and order[0] in ready and order[0] in current:
             mid = order[0]
             record = self._lookup_stored_inbound(mid)
             if record is None or record.state is not InboundQoSState.WAIT_PUBACK:
