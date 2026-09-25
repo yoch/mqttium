@@ -7,7 +7,6 @@ from typing import Any
 from collections.abc import Mapping
 from types import MappingProxyType
 
-from mqttium.errors import ProtocolError
 
 from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
 
@@ -29,7 +28,7 @@ def _freeze_property_value(value: Any) -> Any:
         return tuple(_freeze_property_value(item) for item in value)
     if value is None or isinstance(value, (str, bytes, int, float)):
         return value
-    raise ProtocolError(f"Unsupported property value type: {type(value).__name__}")
+    raise TypeError(f"Unsupported property value type: {type(value).__name__}")
 
 
 @dataclass(slots=True, frozen=True)
@@ -48,7 +47,7 @@ class Properties:
         values = {}
         for name, value in self.values.items():
             if not isinstance(name, str):
-                raise ProtocolError("Property names must be strings")
+                raise TypeError("Property names must be strings")
             frozen = _freeze_property_value(value)
             if name == "user_property" and isinstance(frozen, tuple):
                 if len(frozen) == 2 and all(isinstance(item, str) for item in frozen):
