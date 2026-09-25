@@ -104,7 +104,8 @@ async def _run_reads(
 ):
     client = AsyncClient(max_inbound_inflight=max_inbound_inflight)
     client._engine.state = ConnectionState.CONNECTED
-    client._engine.inbound._inflight = initial_inflight
+    # Slots owned by persisted exchanges observed earlier on this connection.
+    client._engine.inbound._current_persisted_mids.update(range(60001, 60001 + initial_inflight))
     client._transport = _ScriptedTransport(reads)
     lock = _CountingLock()
     client._engine_lock = lock
