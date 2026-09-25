@@ -180,6 +180,9 @@ send-quota slot. After a resumed session, a replay-parked exchange, a replayed
 PUBREL and a parked exchange advanced by PUBREC hold none, and their terminal
 ACK releases none: unacknowledged PUBLISHes on the connection never exceed the
 broker's Receive Maximum, even though MQTT 5 section 4.9 would credit the quota.
+Each slot is recorded under the packet identifier that owns it, so a release
+names its owner and frees nothing for an exchange that holds none; a sealed
+exchange (#521) gives its slot up when it is sealed.
 
 ### Inbound QoS 1 and 2
 
@@ -402,7 +405,7 @@ provenance mechanism.
 Four guarantees, all normative:
 
 1. An ingress lot that fails locally exposes none of its ordinary unexposed
-   effects. The normal hot path stays `_settle()` then emit; only a cleanup
+   effects. The normal hot path stays durable completion then emit; only a cleanup
    failure emits the already-observed outcome first.
 2. An observed terminal publish broker outcome determines its receipt
    despite cleanup failure. Durable cleanup never vetoes the terminal effect.
