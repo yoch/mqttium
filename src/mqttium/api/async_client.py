@@ -1678,8 +1678,7 @@ class AsyncClient:
                             # original cause instead of timing out on CONNACK.
                             # First cause wins: a later local failure must not
                             # replace it.
-                            if self._local_terminal_failure is None:
-                                self._local_terminal_failure = exc
+                            self._latch_local_failure(exc)
                             connack_fut = self._connack_fut
                             if connack_fut is not None and not connack_fut.done():
                                 connack_fut.set_exception(exc)
@@ -1769,98 +1768,113 @@ class AsyncClient:
                 # defer to that terminal settlement.
                 self._fail_pending(exc)
         finally:
-            clean_disconnect = (
-                self._intentional_disconnect
-                and self._engine.state in (ConnectionState.CONNECTED, ConnectionState.DISCONNECTING)
-                and self._disconnect_exc is None
-            )
-            hook_origin = self._disconnect_hook_origin
-            connect_owner = self._explicit_connect_task
-            if connect_owner is not None and connect_owner is self._lifecycle_hooks.hook_task:
-                # Failure of a directly awaited connect belongs to its caller.
-                # Once that call exits, later external loss cancels it normally.
-                hook_origin = connect_owner
-            self._lifecycle_hooks.retiring(lifecycle_token, hook_origin)
-            # One synchronous ownership transition, before the first await:
-            # producers must never see the new epoch while the old engine is
-            # still CONNECTED, or they admit work into the dead transport
-            # (#544). No coroutine suspends while holding the engine lock, so
-            # this synchronous step cannot interleave with an engine mutation.
-            self._retire_connection_epoch()
-            self._engine.notify_transport_closed()
-            self._effect_pump.collect_from_engine()
-            self._auth_exchange.retire()
-            await self._write_pump.wake_waiters()
-            # The keepalive loop belongs to this reader's transport epoch. An
-            # EOF or reader-side failure can end the reader without entering
-            # _force_close(), so retire the task here before a reconnect can
-            # replace its reference with a new epoch's keepalive owner.
-            keepalive = self._keepalive_task
-            if keepalive is not None and keepalive is not asyncio.current_task():
-                if not keepalive.done():
-                    keepalive.cancel()
-                try:
-                    await keepalive
-                except (asyncio.CancelledError, Exception):
-                    pass
-                if self._keepalive_task is keepalive:
-                    self._keepalive_task = None
+            await self._retire_reader_connection(lifecycle_token, reader_transport, reader_connack)
+
+    async def _retire_reader_connection(
+        self,
+        lifecycle_token: int,
+        reader_transport: AsyncTransport,
+        reader_connack: asyncio.Future[ConnAckPacket] | None,
+    ) -> None:
+        """End the connection a reader served, whatever ended the reader.
+
+        Runs in the reader's ``finally``: it retires the epoch and the engine
+        in one synchronous step, settles the terminal cause, releases the
+        connection's resources and hands the loss to the lifecycle hooks and
+        the reconnect policy.
+        """
+        clean_disconnect = (
+            self._intentional_disconnect
+            and self._engine.state in (ConnectionState.CONNECTED, ConnectionState.DISCONNECTING)
+            and self._disconnect_exc is None
+        )
+        hook_origin = self._disconnect_hook_origin
+        connect_owner = self._explicit_connect_task
+        if connect_owner is not None and connect_owner is self._lifecycle_hooks.hook_task:
+            # Failure of a directly awaited connect belongs to its caller.
+            # Once that call exits, later external loss cancels it normally.
+            hook_origin = connect_owner
+        self._lifecycle_hooks.retiring(lifecycle_token, hook_origin)
+        # One synchronous ownership transition, before the first await:
+        # producers must never see the new epoch while the old engine is
+        # still CONNECTED, or they admit work into the dead transport
+        # (#544). No coroutine suspends while holding the engine lock, so
+        # this synchronous step cannot interleave with an engine mutation.
+        self._retire_connection_epoch()
+        self._engine.notify_transport_closed()
+        self._effect_pump.collect_from_engine()
+        self._auth_exchange.retire()
+        await self._write_pump.wake_waiters()
+        # The keepalive loop belongs to this reader's transport epoch. An
+        # EOF or reader-side failure can end the reader without entering
+        # _force_close(), so retire the task here before a reconnect can
+        # replace its reference with a new epoch's keepalive owner.
+        keepalive = self._keepalive_task
+        if keepalive is not None and keepalive is not asyncio.current_task():
+            if not keepalive.done():
+                keepalive.cancel()
             try:
-                await self._effect_pump.drain()
-            except (Exception, asyncio.CancelledError):
+                await keepalive
+            except (asyncio.CancelledError, Exception):
                 pass
-            if self._disconnect_exc is None:
-                info = self._last_disconnect
-                if (
-                    self._local_terminal_failure is None
-                    and info is not None
-                    and info.from_broker
-                    and info.reason_code != 0
-                ):
-                    self._propose_disconnect_cause(
-                        BrokerDisconnectError(info.reason_code, info.properties), _CAUSE_BROKER
-                    )
-                else:
-                    self._propose_disconnect_cause(MQTTError("Connection closed"), _CAUSE_SYNTHETIC)
-            # A latched local-terminal failure is authoritative: a secondary
-            # writer/keepalive error that overwrote _disconnect_exc must never
-            # replace it for settlement and callbacks. The explicit None test
-            # (not truthiness) keeps even a falsey backend exception identical.
-            terminal_cause = self._local_terminal_failure
-            if terminal_cause is None:
-                assert self._disconnect_exc is not None
-                terminal_cause = self._disconnect_exc
+            if self._keepalive_task is keepalive:
+                self._keepalive_task = None
+        try:
+            await self._effect_pump.drain()
+        except (Exception, asyncio.CancelledError):
+            pass
+        if self._disconnect_exc is None:
+            info = self._last_disconnect
             if (
-                reader_connack is not None
-                and not reader_connack.done()
-                and not self._intentional_disconnect
+                self._local_terminal_failure is None
+                and info is not None
+                and info.from_broker
+                and info.reason_code != 0
             ):
-                reader_connack.set_exception(terminal_cause)
-            self._fail_non_replayable(terminal_cause)
-            will_reconnect = self._will_reconnect()
-            if not will_reconnect:
-                self._fail_pending(terminal_cause)
-            # Retire resources before lifecycle user code can install a
-            # replacement. Replayable state remains in the protocol store.
-            await self._write_pump.wake_waiters()
-            await self._write_pump.stop()
-            with ignoring_dependency_failures():
-                await reader_transport.close()
-            if self._transport is reader_transport:
-                self._transport = None
-            if not will_reconnect:
-                # A reconnectable loss must not terminate the application
-                # message stream: the same iterator resumes after reconnect.
-                self._delivery.close()
-            self._lifecycle_hooks.disconnected(
-                None if clean_disconnect else terminal_cause,
-                lifecycle_token,
-                hook_origin,
-            )
-            if will_reconnect and (self._reconnect_task is None or self._reconnect_task.done()):
-                self._reconnect_task = asyncio.create_task(
-                    self._reconnect_loop(), name="mqttium-reconnect"
+                self._propose_disconnect_cause(
+                    BrokerDisconnectError(info.reason_code, info.properties), _CAUSE_BROKER
                 )
+            else:
+                self._propose_disconnect_cause(MQTTError("Connection closed"), _CAUSE_SYNTHETIC)
+        # A latched local-terminal failure is authoritative: a secondary
+        # writer/keepalive error that overwrote _disconnect_exc must never
+        # replace it for settlement and callbacks. The explicit None test
+        # (not truthiness) keeps even a falsey backend exception identical.
+        terminal_cause = self._local_terminal_failure
+        if terminal_cause is None:
+            assert self._disconnect_exc is not None
+            terminal_cause = self._disconnect_exc
+        if (
+            reader_connack is not None
+            and not reader_connack.done()
+            and not self._intentional_disconnect
+        ):
+            reader_connack.set_exception(terminal_cause)
+        self._fail_non_replayable(terminal_cause)
+        will_reconnect = self._will_reconnect()
+        if not will_reconnect:
+            self._fail_pending(terminal_cause)
+        # Retire resources before lifecycle user code can install a
+        # replacement. Replayable state remains in the protocol store.
+        await self._write_pump.wake_waiters()
+        await self._write_pump.stop()
+        with ignoring_dependency_failures():
+            await reader_transport.close()
+        if self._transport is reader_transport:
+            self._transport = None
+        if not will_reconnect:
+            # A reconnectable loss must not terminate the application
+            # message stream: the same iterator resumes after reconnect.
+            self._delivery.close()
+        self._lifecycle_hooks.disconnected(
+            None if clean_disconnect else terminal_cause,
+            lifecycle_token,
+            hook_origin,
+        )
+        if will_reconnect and (self._reconnect_task is None or self._reconnect_task.done()):
+            self._reconnect_task = asyncio.create_task(
+                self._reconnect_loop(), name="mqttium-reconnect"
+            )
 
     def _terminal_shutdown(self, exc: BaseException) -> None:
         """Fail pending work and close the application stream, terminally.
@@ -2350,8 +2364,7 @@ class AsyncClient:
             # Queue acceptance is observable, but failed durable completion
             # must retire this session before any new admission. Reader
             # teardown preserves this first cause.
-            if self._local_terminal_failure is None:
-                self._local_terminal_failure = exc
+            self._latch_local_failure(exc)
             self._engine.notify_transport_closed()
             raise
 
@@ -2384,8 +2397,7 @@ class AsyncClient:
             try:
                 self._engine.continue_inbound_replay()
             except Exception as exc:
-                if self._local_terminal_failure is None:
-                    self._local_terminal_failure = exc
+                self._latch_local_failure(exc)
                 self._engine.notify_transport_closed()
                 raise
             self._effect_pump.collect_from_engine()
@@ -2548,6 +2560,11 @@ class AsyncClient:
         mid, reason = _terminal_publish_result(effect)
         self._settle_publish(mid, reason)
 
+    def _latch_local_failure(self, exc: BaseException) -> None:
+        """Record the first local terminal failure; a later one never replaces it."""
+        if self._local_terminal_failure is None:
+            self._local_terminal_failure = exc
+
     def _fail_non_replayable(self, exc: BaseException) -> None:
         for sub_fut in self._sub_futs.values():
             if not sub_fut.done():
@@ -2583,8 +2600,7 @@ class AsyncClient:
             except Exception as store_exc:
                 # A publication this client cannot seal could still be sent
                 # later: refuse every later use of this client instead.
-                if self._local_terminal_failure is None:
-                    self._local_terminal_failure = store_exc
+                self._latch_local_failure(store_exc)
         # Producers parked on outbound admission hold no receipt, so the loops
         # above cannot reach them. Wake them to re-check _publish_wait_failure().
         self._teardown_final = True

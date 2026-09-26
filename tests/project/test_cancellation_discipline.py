@@ -35,7 +35,7 @@ _SWALLOW_ALLOWED = {
     ("api/async_client.py", "_force_close_transport"): "joins the tasks it just cancelled",
     (
         "api/async_client.py",
-        "_read_loop",
+        "_retire_reader_connection",
     ): "reader teardown joins cancelled children and must finish",
     (
         "api/async_client.py",
