@@ -64,7 +64,8 @@ Init ==
   /\ discReturned = FALSE
   /\ connRan = FALSE
 
-\* _read_loop teardown: retiring(token) before cleanup can suspend.
+\* Reader teardown (_retire_reader_connection): retiring(token) before cleanup
+\* can suspend.
 Retiring ==
   /\ phase = "connected"
   /\ phase' = "retiring"

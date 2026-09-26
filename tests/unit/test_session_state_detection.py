@@ -17,7 +17,7 @@ from mqttium.enums import (
     PacketType,
     QoS,
 )
-from mqttium.packets import encode_frame
+from mqttium.packets import PubAckPacket, PublishPacket, encode_frame
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
 from mqttium.protocol.config import EngineConfig
@@ -155,7 +155,13 @@ def test_session_present_accepted_with_incomplete_inbound_qos2(state) -> None:
     assert engine.state is ConnectionState.CONNECTED
 
 
-def test_manual_qos1_inbound_record_is_not_client_session_state() -> None:
+def test_stored_inbound_qos1_record_resumes_the_session() -> None:
+    """A stored QoS 1 row completes only through the resumed session.
+
+    MQTT 5 section 4.1 does not list inbound QoS 1 as Client Session State,
+    but refusing Session Present=1 here would refuse every reconnect and
+    strand the row, which waits for the broker's resend.
+    """
     store = MemoryInflightStore()
     store.put_in(
         stored_record(
@@ -169,10 +175,29 @@ def test_manual_qos1_inbound_record_is_not_client_session_state() -> None:
             )
         )
     )
-    engine = _engine(store)
+    engine = ProtocolEngine(
+        EngineConfig(
+            client_id="bug239",
+            protocol=MQTTProtocolVersion.MQTTv5,
+            clean_start=False,
+            manual_ack=True,
+        ),
+        store,
+    )
+    engine.begin_connect()
     effects = _feed(engine, _connack(present=True, protocol=MQTTProtocolVersion.MQTTv5))
-    assert engine.state is ConnectionState.DISCONNECTED
-    assert any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
+    assert engine.state is ConnectionState.CONNECTED
+    assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
+    replayed = [effect.data for effect in effects if effect.kind is EffectKind.MESSAGE]
+    assert [message.mid for message in replayed] == [2]
+
+    engine.ack(2)
+    resend = PublishPacket(
+        topic="in", payload=b"x", qos=QoS.AT_LEAST_ONCE, retain=False, dup=True, mid=2
+    ).encode(MQTTProtocolVersion.MQTTv5)
+    acks = [effect.data for effect in _feed(engine, resend) if effect.kind is EffectKind.SEND_ACK]
+    assert acks == [PubAckPacket(mid=2).encode(MQTTProtocolVersion.MQTTv5)]
+    assert store.get_in(2) is None
 
 
 def test_session_present_zero_still_discards_stale_state() -> None:
