@@ -105,7 +105,7 @@ async def test_publish_many_qos0_encodes_mqtt5_properties() -> None:
     await asyncio.wait_for(client._write_pump.queue.join(), timeout=2.0)
     await receipt.wait()
 
-    assert receipt.completed == 40
+    assert receipt.submitted - receipt.pending_count == 40
     assert [packet.topic for packet in broker.publishes] == ["batch/mqtt5"] * 40
     assert [packet.properties for packet in broker.publishes] == [properties] * 40
     assert broker.publishes[0].payload == b'{"index": 0}'
@@ -121,7 +121,7 @@ async def test_publish_many_qos0_uses_immediate_aggregate_receipt() -> None:
     )
     await asyncio.wait_for(client._write_pump.queue.join(), timeout=2.0)
     assert receipt.submitted == 200
-    assert receipt.completed == 200
+    assert receipt.submitted - receipt.pending_count == 200
     assert receipt.pending_count == 0
     assert receipt.is_done()
     await receipt.wait()
@@ -138,7 +138,7 @@ async def test_publish_many_qos_acknowledged_without_per_message_waiters(qos: Qo
     )
     await asyncio.wait_for(receipt.wait(), timeout=5.0)
     assert receipt.submitted == 160
-    assert receipt.completed == 160
+    assert receipt.submitted - receipt.pending_count == 160
     assert receipt.pending_count == 0
     assert not client._receipts
     assert not client._batch_receipts
@@ -157,7 +157,7 @@ async def test_batch_receipt_aggregates_failures() -> None:
 
     with pytest.raises(PublishBatchError) as raised:
         await receipt.wait()
-    assert raised.value.failures == {1: failure}
+    assert raised.value.receipt.failures == {1: failure}
 
 
 def test_batch_receipt_failure_indexes_survive_mid_reuse() -> None:
@@ -169,7 +169,7 @@ def test_batch_receipt_failure_indexes_survive_mid_reuse() -> None:
     receipt._complete(7, failure)
     receipt._seal()
 
-    assert receipt.completed == 2
+    assert receipt.submitted - receipt.pending_count == 2
     assert receipt.failures == {1: failure}
 
 
@@ -182,7 +182,7 @@ def test_batch_receipt_does_not_retain_completed_mid_history() -> None:
     receipt._seal()
 
     assert receipt.submitted == 10_000
-    assert receipt.completed == 10_000
+    assert receipt.submitted - receipt.pending_count == 10_000
     assert receipt.pending_count == 0
     assert not hasattr(receipt, "mids")
     assert not hasattr(receipt, "_mids")

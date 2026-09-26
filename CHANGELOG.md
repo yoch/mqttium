@@ -6,8 +6,34 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- `MQTTTimeoutError` also derives from `TimeoutError`, so `except TimeoutError`
+  catches client deadlines.
+- `PublishBatchError.receipt` is always the batch receipt, never `None`.
+- `PublishReceipt.mid` and `qos` are read-only and receipts compare by
+  identity; `SubscribeResult` and `UnsubscribeResult` are frozen.
+- Export the nested statistics snapshots (`OutboundStats`, `InboundStats`,
+  `WriterStats`, `DecoderStats`, `DeliveryStats`, `ReceiptStats`,
+  `TransportStats`) from `mqttium.api`, and define `MessageDelivery` there.
+- **Breaking:** `will` takes a `PublishMessage`, whose `properties` are the
+  MQTT 5 Will Properties, and `will_properties` is removed. A `Message` Will
+  silently dropped its `properties`, `dup` and `mid`; it is now refused with
+  `TypeError`.
+- Declare the store protocol methods (`put_out`, `get_out`, `complete_out`,
+  `batch`, ...) Internal. Both store classes stay public (Provisional) through
+  their constructors, `store=`, and `SqliteInflightStore.close()` or its
+  context manager.
+- Annotate `store=` with the two supported store classes instead of the
+  Internal store protocol. Internal packages no longer declare `__all__`, and
+  the callback type aliases of `AsyncClient` are private.
+
 ### Removed
 
+- Remove duplicate batch fields before 1.0 (see the migration guide):
+  `PublishBatchError.failures`, `failure_count`, `failure_counts` and `cause`,
+  which repeated its `receipt` and `__cause__`, and
+  `PublishBatchReceipt.completed`, which equals `submitted - pending_count`.
 - Remove contracts with no effect or no use before 1.0 (see the migration guide):
   `MQTTProtocolVersion.MQTTv31`, which was always refused;
   `ConnectionState.RECONNECTING`, which was never reported;

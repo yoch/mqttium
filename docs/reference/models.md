@@ -27,6 +27,9 @@
     options:
       heading_level: 3
 
+Receipts are created by the client; applications read them. A receipt's
+`mid` and `qos` are read-only, and receipts compare by identity.
+
 A batch receipt keeps exact aggregate counts while retaining at most the
 configured finite number of individual failures. Admissions are progressive;
 a submission error carries a receipt for the committed prefix.

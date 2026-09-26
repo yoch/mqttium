@@ -227,8 +227,10 @@ does not admit more work until usage falls below the limit. Inbound replay is
 also accounted against the configured inbound byte budget.
 
 The store interface, records, paging and transitions are internal. Only the
-shipped `MemoryInflightStore` and `SqliteInflightStore` are supported. Their
-mutations are atomic. Internal `batch()` groups protocol operations: SQLite
+shipped `MemoryInflightStore` and `SqliteInflightStore` are supported, and only
+through their constructors, `store=`, and `SqliteInflightStore.close()` or its
+context manager; their other methods are Internal. Their mutations are atomic.
+Internal `batch()` groups protocol operations: SQLite
 uses a lazy transaction, while the engine compensates its own acquisitions.
 Memory `batch()` does not provide universal application rollback.
 
