@@ -1180,7 +1180,8 @@ class AsyncClient:
             # A broker ACK can free an identifier while its completion effect
             # still waits behind delivery. Settle that old receipt before the
             # identifier can be registered again, including within one batch.
-            await self._effect_pump.drain()
+            if not self._effect_pump.settled():
+                await self._effect_pump.drain()
             if qos == QoS.AT_MOST_ONCE:
                 direct = self._try_direct_qos0_publish(
                     topic, data, retain=retain, properties=properties, batch=batch
@@ -1714,8 +1715,11 @@ class AsyncClient:
                         # A broker DISCONNECT sealed the writer: output parked
                         # for capacity fails now instead of blocking this lot.
                         await self._write_pump.wake_waiters()
-                    await self._effect_pump.drain(target=protocol_target)
-                    await self._delivery_lane.drain()
+                    # Most lots leave no protocol work and no delivery lot.
+                    if not self._effect_pump.settled(protocol_target):
+                        await self._effect_pump.drain(target=protocol_target)
+                    if self._delivery_lane.pending:
+                        await self._delivery_lane.drain()
                     if peer_error is not None:
                         # The valid prefix is committed, acknowledged and
                         # delivered; only now does the peer error retire the
