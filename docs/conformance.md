@@ -117,6 +117,12 @@ its next connection even with no incomplete local QoS exchange. A fresh client
 with neither that marker nor persisted Client Session State still rejects an
 unexpected Session Present value as required by `[MQTT-3.2.2-4]`.
 
+Persisted Client Session State includes every stored inbound row, a QoS 1 row
+too. MQTT 5 section 4.1 lists only inbound QoS 2, but a stored QoS 1 row
+(manual acknowledgement, or one recovered into an automatic session) completes
+only when the broker resends its PUBLISH on a resumed session. Rejecting
+Session Present for it would reject every reconnect and strand the row.
+
 **`[MQTT-3.1.2-22]` (MQTT 3.1.1)** — *"If the User Name Flag is set to 0, the
 Password Flag MUST be set to 0."*
 

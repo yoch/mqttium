@@ -121,7 +121,6 @@ class InboundSession:
         "_recovered_mids",
         "_replay",
         "_stored_inbound",
-        "_session_state_qos2",
         "_topic_alias_maximum",
         "config",
         "handle_publish",
@@ -181,7 +180,6 @@ class InboundSession:
         (
             self._recovered_mids,
             self._pending_bytes,
-            self._session_state_qos2,
             recovered_qos1,
         ) = self._load_recovered_state()
         self._manual_qos1_order: deque[int] = deque(
@@ -193,26 +191,20 @@ class InboundSession:
         # inbound table is empty must not probe SQLite on every PUBLISH.
         self._stored_inbound = len(self._recovered_mids)
 
-    def _load_recovered_state(self) -> tuple[set[int], int, int, tuple[int, ...]]:
+    def _load_recovered_state(self) -> tuple[set[int], int, tuple[int, ...]]:
         """Restore identifiers and accounting from the payload-free store index."""
         mids: set[int] = set()
         recovered_qos1: list[int] = []
         pending_bytes = 0
-        session_state_qos2 = 0
         for page in self.store.in_index_pages(REPLAY_PAGE_SIZE):
             for meta in page:
                 mids.add(meta.mid)
-                if meta.state in (
-                    InboundQoSState.WAIT_PUBREL,
-                    InboundQoSState.WAIT_USER_ACK,
-                ):
-                    session_state_qos2 += 1
                 if meta.state is InboundQoSState.WAIT_PUBACK:
                     recovered_qos1.append(meta.mid)
                 if meta.logical_size <= 0:
                     raise ValueError("Persisted inbound logical_size must be positive")
                 pending_bytes += meta.logical_size
-        return mids, pending_bytes, session_state_qos2, tuple(recovered_qos1)
+        return mids, pending_bytes, tuple(recovered_qos1)
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -254,7 +246,6 @@ class InboundSession:
         self._pending_completions.clear()
         self._pending_bytes = 0
         self._stored_inbound = 0
-        self._session_state_qos2 = 0
         self._autoack_handoff_required = False
         self._pending_auto_qos1_mids.clear()
         self._pending_pubcomps.clear()
@@ -292,8 +283,15 @@ class InboundSession:
         return self._replay is not None
 
     def has_client_session_state(self) -> bool:
-        """Whether an incomplete inbound QoS 2 exchange can be resumed."""
-        return self._session_state_qos2 > 0
+        """Whether a stored inbound exchange waits for the resumed session.
+
+        MQTT 5 section 4.1 lists only inbound QoS 2 as Client Session State,
+        but a stored QoS 1 row (manual acknowledgement, or one recovered into
+        an automatic session) completes only when the broker resends its
+        PUBLISH. Refusing Session Present=1 for it [MQTT-3.2.2-4] would strand
+        that row: every reconnect would be refused the same way.
+        """
+        return self._stored_inbound > 0
 
     def stats(self) -> InboundStats:
         """Snapshot this session's own accounting."""
@@ -499,7 +497,6 @@ class InboundSession:
         self._current_persisted_mids.add(mid)
         exchange_token = self._exchange_tokens[mid] = object()
         self._remember_inbound()
-        self._session_state_qos2 += 1
         # Runtime effect application is SEND-first. Produce the protocol ACK in
         # that order here so every QoS2 delivery avoids EffectPump repartition.
         engine._send_ack(_encode_pubrec_success(mid))
@@ -754,7 +751,6 @@ class InboundSession:
         """Retire a QoS 2 row in `state` and answer PUBCOMP."""
         logical_size = self._complete_stored_inbound(mid, state, action)
         self._forget_inbound()
-        self._session_state_qos2 -= 1
         self._engine._send_ack(_encode_pubcomp_success(mid))
         self._hold_until_pubcomp_handoff(mid, logical_size)
 
