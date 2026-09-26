@@ -20,19 +20,19 @@ Legend: **K** keep · **R** remove · **P** make private or Internal ·
 
 ## Decisions recorded (maintainer, 2026-09-24)
 
-| Scope | Decision |
-| --- | --- |
-| §1 dead items D1–D6 | Remove or make Internal as proposed. |
-| §2 duplicates U2–U5 | Remove as proposed. U7 kept. |
-| §3 leaks L1–L6, L8 | Fix as proposed. |
-| E2 `MQTTTimeoutError` | Also derive from `TimeoutError`. |
-| §6 stores | Classes public (both), protocol methods Internal. |
-| D7 `will` | `will=PublishMessage(...)`; `will_properties` removed. |
-| §5 statistics | Remove `TransportStats.kind` and `DecoderStats.max_packet_size`; keep the other fields; rename `connection_epoch` to `connections`; one naming scheme (`*_limit`). |
-| U1 `is_connected` | Keep. |
-| U6 `failure_count` | Keep. |
-| L7 callback aliases | Make private. |
-| E5 local argument errors | `ValueError` / `TypeError` for invalid argument types or values; state-dependent misuse stays `MQTTError`. |
+| Scope | Decision | Implemented in |
+| --- | --- | --- |
+| §1 dead items D1–D6 | Remove or make Internal as proposed. | #569 |
+| §2 duplicates U2–U5 | Remove as proposed. U7 kept. | #570 |
+| §3 leaks L1–L6, L8 | Fix as proposed. | #571 |
+| E2 `MQTTTimeoutError` | Also derive from `TimeoutError`. | #570 |
+| §6 stores | Classes public (both), protocol methods Internal. | #572 |
+| D7 `will` | `will=PublishMessage(...)`; `will_properties` removed. | #573 |
+| §5 statistics | Remove `TransportStats.kind` and `DecoderStats.max_packet_size`; keep the other fields; replace `connection_epoch`, an internal epoch, with a `connections` counter of accepted CONNACKs; one naming scheme (`*_limit`). | #574 |
+| U1 `is_connected` | Keep. | — |
+| U6 `failure_count` | Keep. | — |
+| L7 callback aliases | Make private. | #571 |
+| E5 local argument errors | `ValueError` / `TypeError` for invalid argument types or values; state-dependent misuse stays `MQTTError`. | #575 |
 
 ## 1. Dead or misleading items
 
