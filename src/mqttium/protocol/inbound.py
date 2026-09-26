@@ -29,7 +29,13 @@ from mqttium.packets._publish import (
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol._sizing import publish_logical_size
 from mqttium.protocol.stats import InboundStats
-from mqttium.types import InboundMessage, InboundRecordMeta, Message, Properties
+from mqttium.types import (
+    InboundMessage,
+    InboundRecordMeta,
+    Message,
+    Properties,
+    _decoded_message,
+)
 
 if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
@@ -378,14 +384,14 @@ class InboundSession:
             if not message.topic or properties.get("topic_alias") is not None:
                 topic = self._resolve_topic_fields(message.topic, properties)
                 if topic != message.topic:
-                    message = Message(
-                        topic=topic,
-                        payload=message.payload,
-                        qos=QoS.AT_MOST_ONCE,
-                        retain=message.retain,
-                        dup=False,
-                        mid=None,
-                        properties=properties,
+                    message = _decoded_message(
+                        topic,
+                        message.payload,
+                        QoS.AT_MOST_ONCE,
+                        message.retain,
+                        False,
+                        None,
+                        properties,
                     )
             decoded_property_wire_size = property_wire_size if properties.values else None
             self._engine._emit(
@@ -506,14 +512,14 @@ class InboundSession:
         # Runtime effect application is SEND-first. Produce the protocol ACK in
         # that order here so every QoS2 delivery avoids EffectPump repartition.
         engine._send_ack(_encode_pubrec_success(mid))
-        message = Message(
-            topic=topic,
-            payload=payload,
-            qos=QoS.EXACTLY_ONCE,
-            retain=retain,
-            dup=dup,
-            mid=mid,
-            properties=properties,
+        message = _decoded_message(
+            topic,
+            payload,
+            QoS.EXACTLY_ONCE,
+            retain,
+            dup,
+            mid,
+            properties,
         )
         if self._ack_tokens is not None:
             self._bind_ack_token(message)
@@ -617,14 +623,14 @@ class InboundSession:
                 if decoded_property_wire_size is not None
                 else EffectKind.MESSAGE
             ),
-            Message(
-                topic=topic,
-                payload=payload,
-                qos=QoS.AT_LEAST_ONCE,
-                retain=retain,
-                dup=dup,
-                mid=mid,
-                properties=properties,
+            _decoded_message(
+                topic,
+                payload,
+                QoS.AT_LEAST_ONCE,
+                retain,
+                dup,
+                mid,
+                properties,
             ),
             decoded_property_wire_size=decoded_property_wire_size,
         )
@@ -695,14 +701,14 @@ class InboundSession:
         exchange_token = self._exchange_tokens[mid] = object()
         self._remember_inbound()
         self._manual_qos1_order.append(mid)
-        message = Message(
-            topic=topic,
-            payload=payload,
-            qos=QoS.AT_LEAST_ONCE,
-            retain=retain,
-            dup=dup,
-            mid=mid,
-            properties=properties,
+        message = _decoded_message(
+            topic,
+            payload,
+            QoS.AT_LEAST_ONCE,
+            retain,
+            dup,
+            mid,
+            properties,
         )
         if self._ack_tokens is not None:
             self._bind_ack_token(message)
@@ -901,14 +907,14 @@ class InboundSession:
         return inbound.state is InboundQoSState.WAIT_PUBREL and not inbound.user_acked
 
     def _emit_message(self, inbound: InboundMessage, *, dup: bool) -> None:
-        message = Message(
-            topic=inbound.topic,
-            payload=inbound.payload,
-            qos=inbound.qos,
-            retain=inbound.retain,
-            dup=dup,
-            mid=inbound.mid,
-            properties=inbound.properties,
+        message = _decoded_message(
+            inbound.topic,
+            inbound.payload,
+            inbound.qos,
+            inbound.retain,
+            dup,
+            inbound.mid,
+            inbound.properties,
         )
         if self._ack_tokens is not None:
             self._bind_ack_token(message)

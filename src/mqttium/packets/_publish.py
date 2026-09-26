@@ -16,7 +16,7 @@ from mqttium.errors import MalformedPacketError, PacketTooLargeError, ProtocolEr
 from mqttium.packets._common import _require_outbound_mid, validate_payload_format
 from mqttium.topics import validate_received_publish_topic
 from mqttium.transport.writes import SEGMENT_THRESHOLD, WriteItem
-from mqttium.types import Message, Properties
+from mqttium.types import Message, Properties, _decoded_message
 
 
 def decode_qos0_message_v311(raw: RawPacket) -> Message:
@@ -26,7 +26,7 @@ def decode_qos0_message_v311(raw: RawPacket) -> Message:
     if not topic:
         raise MalformedPacketError("PUBLISH topic must not be empty")
     validate_received_publish_topic(topic, utf8_validated=True)
-    return Message(
+    return _decoded_message(
         topic,
         raw.remaining[payload_pos:],
         QoS.AT_MOST_ONCE,
@@ -47,7 +47,7 @@ def decode_qos0_message_v5(raw: RawPacket) -> tuple[Message, int]:
     property_wire_size = pos - properties_pos
     validate_received_publish_topic(topic, utf8_validated=True)
     return (
-        Message(
+        _decoded_message(
             topic,
             raw.remaining[pos:],
             QoS.AT_MOST_ONCE,
