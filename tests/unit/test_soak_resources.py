@@ -44,14 +44,14 @@ async def test_forced_reconnect_waits_for_reconnect_task_to_settle() -> None:
     class Client:
         def __init__(self) -> None:
             self.is_connected = True
-            self.epoch = 1
+            self.connections = 1
             self.reconnect_running = False
             self.settled = asyncio.Event()
             self.settle_task: asyncio.Task[None] | None = None
             self._transport = SimpleNamespace(close=self.close_transport)
 
         async def close_transport(self) -> None:
-            self.epoch += 1
+            self.connections += 1
             self.reconnect_running = True
             self.settle_task = asyncio.create_task(self.finish_reconnect())
 
@@ -61,7 +61,7 @@ async def test_forced_reconnect_waits_for_reconnect_task_to_settle() -> None:
             self.settled.set()
 
         def stats(self) -> SimpleNamespace:
-            return SimpleNamespace(connection_epoch=self.epoch)
+            return SimpleNamespace(connections=self.connections)
 
         def _running_tasks(self) -> dict[str, bool]:
             return {"reconnect": self.reconnect_running}

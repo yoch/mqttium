@@ -31,4 +31,4 @@ async def test_pending_wait_rechecks_after_clear_to_avoid_lost_wakeup() -> None:
     await asyncio.wait_for(receipt._wait_pending_at_most(0), timeout=0.1)
 
     assert receipt.pending_count == 0
-    assert receipt.completed == 1
+    assert receipt.submitted - receipt.pending_count == 1

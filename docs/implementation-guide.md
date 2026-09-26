@@ -180,6 +180,9 @@ send-quota slot. After a resumed session, a replay-parked exchange, a replayed
 PUBREL and a parked exchange advanced by PUBREC hold none, and their terminal
 ACK releases none: unacknowledged PUBLISHes on the connection never exceed the
 broker's Receive Maximum, even though MQTT 5 section 4.9 would credit the quota.
+Each slot is recorded under the packet identifier that owns it, so a release
+names its owner and frees nothing for an exchange that holds none; a sealed
+exchange (#521) gives its slot up when it is sealed.
 
 ### Inbound QoS 1 and 2
 
@@ -194,6 +197,13 @@ identifier in the same batch reuses the slot; a new identifier is admitted
 through the ordinary acquire path. Packet-identifier reuse across unfinished
 QoS 1 and QoS 2 exchanges is a protocol error, including when the QoS 1
 PUBACK has been emitted but not yet handed off.
+
+A manual QoS 1 PUBACK leaves in PUBLISH arrival order and only for a PUBLISH
+observed on the current connection. A row replayed from an earlier connection
+keeps the application's acknowledgement until the broker's resend arrives
+[MQTT-4.4.0-1]; a PUBACK sent before it would make the resend a new exchange
+[MQTT-4.3.2-5] that the broker no longer counts, holding a Receive Maximum
+slot and answering a later reuse of the identifier with the old payload.
 
 A completed QoS 2 exchange keeps its Receive Maximum slot and its packet
 identifier the same way, until `take_effects()` hands its PUBCOMP to the
@@ -402,7 +412,7 @@ provenance mechanism.
 Four guarantees, all normative:
 
 1. An ingress lot that fails locally exposes none of its ordinary unexposed
-   effects. The normal hot path stays `_settle()` then emit; only a cleanup
+   effects. The normal hot path stays durable completion then emit; only a cleanup
    failure emits the already-observed outcome first.
 2. An observed terminal publish broker outcome determines its receipt
    despite cleanup failure. Durable cleanup never vetoes the terminal effect.

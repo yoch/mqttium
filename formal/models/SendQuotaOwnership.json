@@ -1,18 +1,25 @@
 {
   "module": "SendQuotaOwnership.tla",
   "status": "refinement",
-  "summary": "After a resumed session, only an exchange that sent its PUBLISH on this connection releases a send-quota slot, so unacknowledged PUBLISHes never exceed Receive Maximum.",
+  "summary": "Only an exchange that sent its PUBLISH on this connection owns a send-quota slot; parked, PUBREL-replayed and sealed exchanges own none, so unacknowledged PUBLISHes never exceed Receive Maximum and the slots in use equal their owners.",
   "issues": [
     545
   ],
   "tests": [
-    "tests/unit/test_parked_send_quota.py"
+    "tests/unit/test_parked_send_quota.py",
+    "tests/unit/test_replay_parked_settlement.py",
+    "tests/unit/test_pubrel_replay_receive_maximum.py",
+    "tests/fuzz/test_stateful_invariants.py"
   ],
   "configs": [
     {
       "config": "SendQuotaOwnership-rc15.cfg",
       "expect": "violation",
       "invariant": "WithinReceiveMaximum"
+    },
+    {
+      "config": "SendQuotaOwnership-rc16.cfg",
+      "expect": "pass"
     },
     {
       "config": "SendQuotaOwnership-fixed.cfg",

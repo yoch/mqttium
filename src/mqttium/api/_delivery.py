@@ -7,16 +7,15 @@ import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from mqttium.api._cancel import owner_cancelled
 from mqttium.api.stats import DeliveryStats
 from mqttium.enums import MQTTProtocolVersion
+from mqttium.api.models import MessageDelivery
 from mqttium.errors import MessageDeliveryError, MQTTError
 from mqttium.protocol._sizing import publish_logical_size
 from mqttium.types import Message
-
-MessageDelivery = Literal["iterator", "callback"]
 
 
 @dataclass(frozen=True, slots=True)

@@ -7,7 +7,6 @@ from typing import Any
 from collections.abc import Mapping
 from types import MappingProxyType
 
-from mqttium.errors import ProtocolError
 
 from mqttium.enums import InboundQoSState, OutboundQoSState, QoS
 
@@ -29,7 +28,7 @@ def _freeze_property_value(value: Any) -> Any:
         return tuple(_freeze_property_value(item) for item in value)
     if value is None or isinstance(value, (str, bytes, int, float)):
         return value
-    raise ProtocolError(f"Unsupported property value type: {type(value).__name__}")
+    raise TypeError(f"Unsupported property value type: {type(value).__name__}")
 
 
 @dataclass(slots=True, frozen=True)
@@ -48,7 +47,7 @@ class Properties:
         values = {}
         for name, value in self.values.items():
             if not isinstance(name, str):
-                raise ProtocolError("Property names must be strings")
+                raise TypeError("Property names must be strings")
             frozen = _freeze_property_value(value)
             if name == "user_property" and isinstance(frozen, tuple):
                 if len(frozen) == 2 and all(isinstance(item, str) for item in frozen):
@@ -91,6 +90,51 @@ class Message:
         # pay the coercion.
         if type(self.payload) is not bytes:
             object.__setattr__(self, "payload", _owned_payload(self.payload))
+
+
+_new_object = object.__new__
+(
+    _set_topic,
+    _set_payload,
+    _set_qos,
+    _set_retain,
+    _set_dup,
+    _set_mid,
+    _set_properties,
+    _set_ack_token,
+) = (
+    Message.__dict__[name].__set__
+    for name in ("topic", "payload", "qos", "retain", "dup", "mid", "properties", "_ack_token")
+)
+
+
+def _decoded_message(
+    topic: str,
+    payload: bytes,
+    qos: QoS,
+    retain: bool,
+    dup: bool,
+    mid: int | None,
+    properties: Properties | None,
+) -> Message:
+    """Build a delivered ``Message`` without the frozen dataclass ``__init__``.
+
+    Internal to the decode and delivery paths, whose payload is already owned
+    ``bytes`` (the decoder copies at packet boundaries), so ``__post_init__``
+    would have nothing to do. The generated frozen ``__init__`` routes each of
+    the eight fields through ``object.__setattr__``; the slot descriptors
+    cost about 40 % of it, on every received message.
+    """
+    message = _new_object(Message)
+    _set_topic(message, topic)
+    _set_payload(message, payload)
+    _set_qos(message, qos)
+    _set_retain(message, retain)
+    _set_dup(message, dup)
+    _set_mid(message, mid)
+    _set_properties(message, properties)
+    _set_ack_token(message, None)
+    return message
 
 
 @dataclass(slots=True)

@@ -82,6 +82,71 @@ def _connack(engine: ProtocolEngine, *, session_present: bool) -> None:
     _feed(engine, encode_frame(PacketType.CONNACK, 0, remaining))
 
 
+def _check_send_quota(
+    engine: ProtocolEngine,
+    records: list[Any],
+    fail: Callable[[str], None],
+) -> None:
+    outbound = engine.outbound
+    sealed = outbound._sealed
+    # Send Quota slots are owned by packet identifier. Only a live exchange
+    # that is neither sealed nor parked may own one; a resumed WAIT_PUBCOMP
+    # (PUBREL replay) may own none, so its PUBCOMP frees nothing (#545).
+    flow = outbound.flow
+    holders = flow._holders
+    parked = outbound._parked
+    if len(holders) > flow.limit:
+        fail(f"flow holds {len(holders)} slots over its limit {flow.limit}")
+    live = {
+        r.mid: r.state
+        for r in records
+        if r.state is not OutboundQoSState.QUEUED and r.mid not in sealed
+    }
+    stray_holders = holders - (live.keys() - parked)
+    if stray_holders:
+        fail(f"send quota slots owned by no sendable live exchange: {sorted(stray_holders)}")
+    queued_live = {m.mid for m in outbound._queued if m.state is not OutboundQoSState.QUEUED}
+    if parked != queued_live:
+        fail(f"parked={sorted(parked)} but the queue parks {sorted(queued_live)}")
+    if engine.state is ConnectionState.CONNECTED:
+        # Every PUBLISH outstanding on this connection owns its slot.
+        unowned = {
+            mid
+            for mid, state in live.items()
+            if state is not OutboundQoSState.WAIT_PUBCOMP
+            and mid not in parked
+            and mid not in holders
+        }
+        if unowned:
+            fail(f"outstanding PUBLISHes own no send quota slot: {sorted(unowned)}")
+
+
+def _check_receive_maximum(
+    engine: ProtocolEngine,
+    records: list[Any],
+    fail: Callable[[str], None],
+) -> None:
+    """Inbound Receive Maximum slots have exactly one owner each."""
+    inbound = engine.inbound
+    current = inbound._current_persisted_mids
+    auto = inbound._pending_auto_qos1_mids
+    pubcomps = inbound._pending_pubcomps
+    for label, left, right in (
+        ("persisted/auto-PUBACK", current, auto),
+        ("persisted/PUBCOMP", current, pubcomps),
+        ("auto-PUBACK/PUBCOMP", auto, pubcomps),
+    ):
+        if left & right:
+            fail(f"inbound slot owned twice ({label}): {sorted(left & right)}")
+    stray = current - {r.mid for r in records}
+    if stray:
+        fail(f"inbound slots owned by no persisted exchange: {sorted(stray)}")
+    if not 0 <= inbound._pending_pubcomp_slots <= len(pubcomps):
+        fail(f"PUBCOMP slots={inbound._pending_pubcomp_slots} for {len(pubcomps)} pending PUBCOMPs")
+    if inbound._inflight > inbound._receive_maximum:
+        fail(f"inbound inflight={inbound._inflight} over {inbound._receive_maximum}")
+
+
 def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> None:
     def fail(message: str) -> None:
         trail = "\n    ".join(history[-25:])
@@ -103,25 +168,25 @@ def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> 
         if not pool.in_use(record.mid):
             fail(f"durable record mid={record.mid} ({record.state.name}) is not held in the pool")
 
-    if outbound.unacknowledged_messages != len(records):
+    # A sealed row (#521) keeps its record and identifier but no reservation.
+    sealed = outbound._sealed
+    unsealed = [r for r in records if r.mid not in sealed]
+    if outbound.unacknowledged_messages != len(unsealed):
         fail(
             f"pending_messages={outbound.unacknowledged_messages} but the store holds "
-            f"{len(records)} records"
+            f"{len(unsealed)} unsealed records"
         )
+    stray_sealed = set(sealed) - {r.mid for r in records}
+    if stray_sealed:
+        fail(f"sealed mids with no durable record: {sorted(stray_sealed)}")
 
-    expected_bytes = sum(outbound.stored_logical_size(r) for r in records)
+    expected_bytes = sum(outbound.stored_logical_size(r) for r in unsealed)
     if outbound.unacknowledged_bytes != expected_bytes:
         fail(
             f"pending_bytes={outbound.unacknowledged_bytes} but the records sum to {expected_bytes}"
         )
 
-    # Send Quota is connection-scoped credit, not durable-record occupancy.
-    # A resumed WAIT_PUBCOMP retransmits PUBREL without consuming quota, while
-    # its later PUBCOMP can replenish quota consumed by another PUBLISH. After
-    # reconnect there is therefore no one-to-one mapping from durable WAIT_*
-    # states to flow.inflight; the negotiated bounds remain invariant.
-    if not 0 <= outbound.flow.inflight <= outbound.flow.limit:
-        fail(f"flow.inflight={outbound.flow.inflight} outside [0, {outbound.flow.limit}]")
+    _check_send_quota(engine, records, fail)
 
     queued = [m.mid for m in outbound._queued]
     if len(queued) != len(set(queued)):
@@ -140,6 +205,7 @@ def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> 
             f"inbound pending_bytes={inbound._pending_bytes} but the records sum to "
             f"{expected_inbound}"
         )
+    _check_receive_maximum(engine, inbound_records, fail)
 
 
 def _emitted_deliveries(engine: ProtocolEngine) -> list[tuple[int, object]]:
@@ -186,6 +252,43 @@ def _check_completed_only_after_delivery(
             )
 
 
+def _client_operation(
+    engine: ProtocolEngine, rng: random.Random, operation: str, history: list[str], step: int
+) -> None:
+    """SUBSCRIBE and sealed rows (#521) share the packet identifier pool;
+    manual acknowledgement completes inbound exchanges out of band."""
+    if operation == "ack":
+        _manual_ack_one(engine, rng, history, step)
+        return
+    if operation == "subscribe":
+        if engine.state is ConnectionState.CONNECTED:
+            history.append(f"{step}: SUBSCRIBE")
+            engine.queue_subscribe([(f"s/{rng.randint(0, 3)}", 1)])
+        return
+    # A terminal receipt failure seals what is still stored.
+    mids = [summary.mid for page in engine.store.out_summary_pages() for summary in page]
+    if mids:
+        chosen = rng.sample(mids, rng.randint(1, len(mids)))
+        history.append(f"{step}: seal {sorted(chosen)}")
+        engine.seal_publications(chosen)
+
+
+def _manual_ack_one(
+    engine: ProtocolEngine, rng: random.Random, history: list[str], step: int
+) -> None:
+    """Acknowledge one delivered message, as a manual-ack application would."""
+    if not engine.config.manual_ack or engine.state is not ConnectionState.CONNECTED:
+        return
+    delivered = [
+        meta.mid for page in engine.store.in_index_pages() for meta in page if meta.delivered
+    ]
+    if not delivered:
+        return
+    mid = rng.choice(delivered)
+    history.append(f"{step}: manual ack mid={mid}")
+    engine.ack(mid)
+
+
 def _inbound_delivery_states(engine: ProtocolEngine) -> dict[int, bool]:
     return {meta.mid: meta.delivered for page in engine.store.in_index_pages() for meta in page}
 
@@ -203,6 +306,7 @@ def test_engine_invariants_hold(protocol: MQTTProtocolVersion, seed: int) -> Non
             max_inbound_inflight=rng.choice([2, 5, 20]),
             max_unacknowledged_messages=rng.choice([None, 6, 12]),
             max_unacknowledged_bytes=rng.choice([None, 4096]),
+            manual_ack=seed % 2 == 1,
         ),
         MemoryInflightStore(),
     )
@@ -223,8 +327,11 @@ def test_engine_invariants_hold(protocol: MQTTProtocolVersion, seed: int) -> Non
         "deliver",
         "drop",
         "reconnect",
+        "subscribe",
+        "seal",
+        "ack",
     ]
-    weights = [40, 14, 12, 12, 10, 6, 8, 4, 6]
+    weights = [40, 14, 12, 12, 10, 6, 8, 4, 6, 4, 3, 6]
     # Deliveries the runtime has not committed yet, in emission order. A
     # "deliver" step commits one of them, possibly after its exchange ended
     # and the identifier was reused (a late mark must then be ignored).
@@ -285,6 +392,8 @@ def test_engine_invariants_hold(protocol: MQTTProtocolVersion, seed: int) -> Non
                 _feed(engine, PubRelPacket(mid=mid).encode(protocol))
             elif operation == "deliver":
                 committed = _deliver_one(engine, rng, undelivered, history, step)
+            elif operation in ("subscribe", "seal", "ack"):
+                _client_operation(engine, rng, operation, history, step)
             elif operation == "drop":
                 history.append(f"{step}: transport closed")
                 engine.notify_transport_closed()

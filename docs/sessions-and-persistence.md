@@ -227,8 +227,10 @@ does not admit more work until usage falls below the limit. Inbound replay is
 also accounted against the configured inbound byte budget.
 
 The store interface, records, paging and transitions are internal. Only the
-shipped `MemoryInflightStore` and `SqliteInflightStore` are supported. Their
-mutations are atomic. Internal `batch()` groups protocol operations: SQLite
+shipped `MemoryInflightStore` and `SqliteInflightStore` are supported, and only
+through their constructors, `store=`, and `SqliteInflightStore.close()` or its
+context manager; their other methods are Internal. Their mutations are atomic.
+Internal `batch()` groups protocol operations: SQLite
 uses a lazy transaction, while the engine compensates its own acquisitions.
 Memory `batch()` does not provide universal application rollback.
 
@@ -283,6 +285,13 @@ resumes the same session. A replacement session invalidates them. Process/store
 recovery creates fresh handles on redelivery; the identities are not persisted.
 Only active manual exchanges occupy the identity index, and auto acknowledgement
 does not allocate that index. QoS 0 acknowledgement remains a no-op.
+
+A QoS 1 PUBACK only answers a PUBLISH received on the current connection. When
+the application acknowledges a message replayed from an earlier connection,
+the PUBACK waits for the broker's resend of that PUBLISH, which a resumed
+session delivers first; the resend is then not delivered again. Sent earlier,
+the PUBACK would precede the resend, which MQTT then requires the client to
+treat as a new message the broker no longer counts.
 
 It does not create exactly-once business processing. A crash can occur after
 the business transaction commits but before the acknowledgement reaches the

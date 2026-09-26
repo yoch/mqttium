@@ -8,9 +8,11 @@ another module does not grant the same stability tier.
 | Entry point | Native names |
 | --- | --- |
 | `mqttium` | `MQTTError`, `MalformedPacketError`, `ProtocolError`, `PacketTooLargeError`, `MandatoryResponseTooLargeError`, `FlowControlError`, `MessageDeliveryError`, `NotConnectedError`, `MQTTTimeoutError`, `SessionDiscardedError`, `SessionReplayError`, `PublishBatchError`, `BrokerDisconnectError`, `MQTTProtocolVersion`, `QoS`, `ConnectionState`, `__version__` |
-| `mqttium.api` | `AsyncClient`, `Message`, `Properties`, `PublishMessage`, `PublishReceipt`, `PublishBatchReceipt`, `SubscribeResult`, `UnsubscribeResult`, `SubscribeOptions`, `ConnAckPacket`, `AuthPacket`, `NegotiatedSettings`, `ReconnectPolicy`, `MessageDelivery`, `ClientStats` |
+| `mqttium.api` | `AsyncClient`, `Message`, `Properties`, `PublishMessage`, `PublishReceipt`, `PublishBatchReceipt`, `SubscribeResult`, `UnsubscribeResult`, `SubscribeOptions`, `ConnAckPacket`, `AuthPacket`, `NegotiatedSettings`, `ReconnectPolicy`, `MessageDelivery`, `ClientStats` and its nested snapshots (`OutboundStats`, `InboundStats`, `WriterStats`, `DecoderStats`, `DeliveryStats`, `ReceiptStats`, `TransportStats`) |
 
-`mqttium.persistence` supports `MemoryInflightStore` and `SqliteInflightStore`.
+`mqttium.persistence` supports `MemoryInflightStore` and `SqliteInflightStore`:
+construct one, pass it as `store=`, and close a SQLite store with `close()` or
+a `with` block. Their protocol methods are Internal.
 Statistics and the two stores are Provisional; the other names in the table
 are Stable. Statistics are immutable diagnostic snapshots. Low-level packet enums and
 extension protocols are internal; the root `PacketType` export is removed.

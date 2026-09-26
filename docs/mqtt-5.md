@@ -106,8 +106,9 @@ not carry the previous connection's alias onto the replacement connection.
 
 ## Last Will
 
-Pass a `Message` as `will` and a separate `Properties` bag as
-`will_properties`. Broker publication of a Will is controlled by MQTT session
+Pass a `PublishMessage` as `will`. Its `properties` are the MQTT 5 Will
+Properties (for example `will_delay_interval` or `message_expiry_interval`);
+properties that a Will cannot carry are refused. Broker publication of a Will is controlled by MQTT session
 and disconnect semantics; an orderly DISCONNECT normally suppresses it.
 
 ## Enhanced authentication

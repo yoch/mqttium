@@ -1,11 +1,14 @@
 {
   "module": "ActiveDeliveryGeneration.tla",
-  "status": "legacy-flag",
-  "summary": "Iterator admissions waiting for capacity must not commit into a replaced connection or stream generation.",
+  "status": "refinement",
+  "summary": "A delivery waiting for iterator capacity captures its admission generation and never commits into a replaced connection epoch or application stream.",
   "issues": [
     500
   ],
-  "tests": [],
+  "tests": [
+    "tests/unit/test_active_delivery_generation.py",
+    "tests/unit/test_message_stream_generations.py"
+  ],
   "configs": [
     {
       "config": "ActiveDeliveryGeneration-rc15.cfg",

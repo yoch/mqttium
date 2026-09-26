@@ -214,7 +214,7 @@ async def test_publish_many_shares_direct_path_without_unit_receipts(monkeypatch
         receipt = await client.publish_many(PublishMessage("t", bytes([i])) for i in range(3))
         await receipt.wait()
         await client._write_pump.join()
-        assert receipt.submitted == receipt.completed == len(broker.publishes) == 3
+        assert receipt.pending_count == 0 and receipt.submitted == len(broker.publishes) == 3
         assert receipt.pending_count == 0
     finally:
         await client.disconnect()
@@ -250,7 +250,7 @@ async def test_batch_registration_precedes_wire_without_unit_receipts(
         broker.on_wire = lambda: at_wire.append(batch_seen[-1].submitted)
         receipt = await client.publish_many(PublishMessage("t", bytes([i])) for i in range(8))
         await client._write_pump.join()
-        assert receipt.submitted == receipt.completed == 8
+        assert receipt.pending_count == 0 and receipt.submitted == 8
         assert all(batch is receipt for batch in batch_seen)
         assert all(count >= index for index, count in enumerate(at_wire, 1))
         assert len(at_wire) == 8
@@ -294,8 +294,8 @@ async def test_batch_partial_handoff_failure_keeps_prefix_and_never_retries(
             with pytest.raises(PublishBatchError) as caught:
                 await client.publish_many(messages())
         receipt = caught.value.receipt
-        assert caught.value.cause is cause
-        assert receipt.submitted == receipt.completed == 2
+        assert caught.value.__cause__ is cause
+        assert receipt.pending_count == 0 and receipt.submitted == 2
         assert consumed == [0, 1]
         assert len(attempts) == 2
         await client._write_pump.join()
@@ -352,7 +352,7 @@ async def test_batch_clean_refusal_rolls_back_registration_before_fallback(monke
         )
         await receipt.wait()
         await client._write_pump.join()
-        assert receipt.submitted == receipt.completed == 2
+        assert receipt.pending_count == 0 and receipt.submitted == 2
         assert len(attempts) == 3
         assert len(broker.publishes) == 2
         assert client._engine.outbound._topic_aliases == {1: "alias/topic"}
@@ -380,7 +380,7 @@ async def test_direct_batch_keeps_mixed_qos_order_with_tight_bounds(task_factory
         await asyncio.wait_for(receipt.wait(), 2)
         await client._write_pump.join()
         assert [message.payload for message in broker.publishes] == [bytes([i]) for i in range(18)]
-        assert receipt.submitted == receipt.completed == 18
+        assert receipt.pending_count == 0 and receipt.submitted == 18
         assert receipt.pending_count == 0
         assert client.stats().outbound.unacknowledged_messages == 0
     finally:

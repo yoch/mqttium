@@ -37,6 +37,40 @@ is the version an application actually upgrades from.
 | Custom engine/store/transport integration guarantees | Internal implementation interfaces |
 | `SubscribeResult.from_packet()` / `UnsubscribeResult.from_packet()` | Use the results returned by `subscribe()` / `unsubscribe()`, or construct `SubscribeResult(mid=..., reason_codes=...)`; decoded SUBACK/UNSUBACK packets remain Internal |
 
+## Changes since 1.0.0rc16
+
+The pre-1.0 surface review (`docs/reports/API-SURFACE-REVIEW-2026-09-24.md`)
+removes contracts that had no effect, no use, or duplicated another.
+
+| 1.0.0rc16 contract | Replacement |
+| --- | --- |
+| `MQTTProtocolVersion.MQTTv31` (always refused) | None; MQTT 3.1 is unsupported. Use `MQTTv311` or `MQTTv5` |
+| `ConnectionState.RECONNECTING` (never reported) | None; automatic retry reports `CONNECTING` then `CONNECTED` or `DISCONNECTED` |
+| `NegotiatedSettings.effective_keepalive` | `NegotiatedSettings.server_keep_alive` (`None` means the requested keepalive applies) |
+| `NegotiatedSettings.effective_client_id(local)` | `AsyncClient.effective_client_id` |
+| `NegotiatedSettings.from_connack()` | Internal; read `AsyncClient.negotiated` |
+| Encoding and decoding methods of `SubscribeOptions`, `ConnAckPacket`, `AuthPacket` | Internal; construct the models and read their fields |
+| `PublishBatchError.failures`, `.failure_count`, `.failure_counts` | The same fields on `PublishBatchError.receipt` |
+| `PublishBatchError.cause` | `PublishBatchError.__cause__` (the error is raised `from` its cause) |
+| `PublishBatchError.receipt` could be `None` | Always the batch receipt; no narrowing needed |
+| `PublishBatchReceipt.completed` | `receipt.submitted - receipt.pending_count` |
+
+| Mutable `PublishReceipt.mid` / `.qos`; value equality; constructor fields `_waiters`, `_error`, `_settled` | Read-only `mid` and `qos`; identity equality; `PublishReceipt(mid, qos)` |
+| Mutable `SubscribeResult` / `UnsubscribeResult` | Frozen; construct a new value instead of assigning fields |
+| Nested statistics types imported from `mqttium.api.stats` or other modules | Import them from `mqttium.api` |
+| `will=Message(...)` plus `will_properties=Properties(...)` | `will=PublishMessage(topic, payload, qos=..., retain=..., properties=...)`; a `Message` is refused with `TypeError` |
+| Store methods (`put_out`, `get_out`, `complete_out`, `in_replay_pages`, `batch`, ...) called by applications | Internal; use `client.stats()` for a running client. Construction, `store=`, `close()` and `with` stay supported |
+| `ClientStats.connection_epoch` (an internal epoch, advanced about twice per connection) | `ClientStats.connections`: connections established since construction |
+| `WriterStats.max_messages`, `max_bytes` | `WriterStats.message_limit`, `byte_limit` |
+| `DecoderStats.max_packet_size` | The `maximum_packet_size` you configured |
+| `TransportStats.kind` | None; the application knows which transport it opened |
+| `ProtocolError` for a `Properties` value or name of the wrong type | `TypeError` |
+| `ProtocolError` for a `SubscribeOptions` QoS or `retain_handling` out of range | `ValueError`, like an invalid QoS given to `publish()` |
+| `__all__` lists of Internal packages (`mqttium.packets`, `codec`, `transport`, `dispatch`, `protocol`, `api.models`, `api.stats`) | None; these packages are Internal |
+
+`MQTTTimeoutError` now also derives from `TimeoutError`; existing
+`except MQTTTimeoutError` handlers are unchanged.
+
 ## Frozen constructor and snapshot vocabulary
 
 The constructor names every bound after the thing it bounds and refuses

@@ -6,6 +6,83 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Build each received `Message` through its slot descriptors instead of the
+  frozen dataclass constructor, which set its eight fields through
+  `object.__setattr__`. Engine-level reception is about 20 % faster for QoS 0
+  and QoS 1; the delivered `Message` is unchanged.
+
+- `MQTTTimeoutError` also derives from `TimeoutError`, so `except TimeoutError`
+  catches client deadlines.
+- `PublishBatchError.receipt` is always the batch receipt, never `None`.
+- `PublishReceipt.mid` and `qos` are read-only and receipts compare by
+  identity; `SubscribeResult` and `UnsubscribeResult` are frozen.
+- Export the nested statistics snapshots (`OutboundStats`, `InboundStats`,
+  `WriterStats`, `DecoderStats`, `DeliveryStats`, `ReceiptStats`,
+  `TransportStats`) from `mqttium.api`, and define `MessageDelivery` there.
+- **Breaking:** `will` takes a `PublishMessage`, whose `properties` are the
+  MQTT 5 Will Properties, and `will_properties` is removed. A `Message` Will
+  silently dropped its `properties`, `dup` and `mid`; it is now refused with
+  `TypeError`.
+- Statistics (Provisional): `ClientStats.connections` counts connections
+  established since construction and replaces the internal
+  `connection_epoch`; `WriterStats.max_messages`/`max_bytes` become
+  `message_limit`/`byte_limit`; `DecoderStats.max_packet_size` (a copy of the
+  configuration) and `TransportStats.kind` (an internal class name) are removed.
+- Invalid arguments raise builtin exceptions: a `Properties` value or name of
+  the wrong type raises `TypeError`, and a `SubscribeOptions` QoS or
+  `retain_handling` out of range raises `ValueError` (as an invalid `publish()`
+  QoS already did). `ProtocolError` stays for MQTT rules and peer violations.
+- Declare the store protocol methods (`put_out`, `get_out`, `complete_out`,
+  `batch`, ...) Internal. Both store classes stay public (Provisional) through
+  their constructors, `store=`, and `SqliteInflightStore.close()` or its
+  context manager.
+- Annotate `store=` with the two supported store classes instead of the
+  Internal store protocol. Internal packages no longer declare `__all__`, and
+  the callback type aliases of `AsyncClient` are private.
+
+### Removed
+
+- Remove duplicate batch fields before 1.0 (see the migration guide):
+  `PublishBatchError.failures`, `failure_count`, `failure_counts` and `cause`,
+  which repeated its `receipt` and `__cause__`, and
+  `PublishBatchReceipt.completed`, which equals `submitted - pending_count`.
+- Remove contracts with no effect or no use before 1.0 (see the migration guide):
+  `MQTTProtocolVersion.MQTTv31`, which was always refused;
+  `ConnectionState.RECONNECTING`, which was never reported;
+  `NegotiatedSettings.effective_keepalive` and `effective_client_id()`, which
+  duplicated `server_keep_alive` and `AsyncClient.effective_client_id`.
+  `NegotiatedSettings.from_connack()` and the encoding and decoding methods of
+  `SubscribeOptions`, `ConnAckPacket` and `AuthPacket` are Internal.
+
+### Fixed
+
+- With MQTT 5, a client whose store holds only inbound QoS 1 rows no longer
+  refuses CONNACK Session Present=1 after a restart. The rows complete only
+  when the broker resends their PUBLISH on the resumed session, so every
+  reconnect was refused and the rows were stranded. Any stored inbound row now
+  counts as local Session State.
+
+- With `manual_ack=True`, acknowledging a QoS 1 message replayed on a resumed
+  session no longer sends its PUBACK before the broker resends that PUBLISH.
+  The resend then counted as a new message the broker had already settled: it
+  held a Receive Maximum slot, so a later legal PUBLISH could be refused with
+  DISCONNECT 0x93, and a new message reusing its identifier was answered with
+  the old payload and lost. The PUBACK now waits for the resend.
+
+- Never send a publication whose admission failed after its durable row was
+  written, when the cleanup delete also fails. The row stayed in the store with
+  its packet identifier released, so the same client replayed it on its next
+  resumed session although its caller had seen the failure, and a later
+  publication could overwrite it. The row is now sealed like a failed receipt:
+  kept for recovery, never sent by this client, its identifier reserved.
+- Keep the packet identifier of a sealed publication reserved when the
+  connection closes with a SUBSCRIBE or UNSUBSCRIBE in flight. The engine reset
+  the whole identifier pool once no publication counted as unacknowledged,
+  which ignored sealed rows, so a later publication could reuse a sealed
+  identifier and overwrite its stored row.
+
 ## [1.0.0rc16] - 2026-09-24
 
 ### Added

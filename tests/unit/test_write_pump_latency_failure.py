@@ -205,11 +205,11 @@ async def test_client_latency_failure_closes_connection_and_settles_batch_receip
         with pytest.raises(PublishBatchError) as caught:
             await client.publish_many(PublishMessage("batch", b"x", qos=1) for _ in range(16))
         receipt = caught.value.receipt
-        assert caught.value.cause is broker.failure
+        assert caught.value.__cause__ is broker.failure
         assert receipt.submitted == 16
         with pytest.raises(PublishBatchError) as completed:
             await asyncio.wait_for(receipt.wait(), 1)
-        assert completed.value.cause is broker.failure
+        assert completed.value.__cause__ is broker.failure
         await wait_until(lambda: client._transport is None)
         await asyncio.wait_for(client._write_pump.join(), 1)
         assert len(broker.latency_attempts) == 1

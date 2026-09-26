@@ -160,7 +160,7 @@ async def test_progressive_batch_reads_one_ahead_and_can_exceed_one_message_budg
             broker.ack(index)
         receipt = await asyncio.wait_for(task, 2)
         await asyncio.wait_for(receipt.wait(), 2)
-        assert receipt.submitted == receipt.completed == 8
+        assert receipt.pending_count == 0 and receipt.submitted == 8
         assert receipt.pending_count == 0
         assert [p.payload for p in broker.publishes] == [str(i).encode() for i in range(8)]
     finally:
@@ -186,13 +186,13 @@ async def test_generator_failure_returns_sealed_committed_prefix() -> None:
         with pytest.raises(PublishBatchError) as caught:
             await client.publish_many(source())
         receipt = caught.value.receipt
-        assert caught.value.cause is failure
+        assert caught.value.__cause__ is failure
         assert receipt._sealed
         assert receipt.submitted == 1
         await wait_until(lambda: len(broker.publishes) == 1)
         broker.ack(0)
         await asyncio.wait_for(receipt.wait(), 2)
-        assert receipt.completed == 1
+        assert receipt.submitted - receipt.pending_count == 1
     finally:
         await client.disconnect()
 

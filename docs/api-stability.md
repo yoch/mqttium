@@ -18,6 +18,11 @@ The deliberate pre-v1 break from RC14 is recorded in the migration guide.
 `MemoryInflightStore` and `SqliteInflightStore`. These remain supported and
 tested, but may evolve in a minor release with a changelog entry and migration
 guidance. Freezing their current vocabulary does not promote them to Stable.
+For the stores, the supported surface is construction (`MemoryInflightStore()`,
+`SqliteInflightStore(path)`), passing the store as `store=`,
+`SqliteInflightStore.close()` and its context manager. Their protocol methods
+(`put_out`, `get_out`, `complete_out`, `batch`, ...) and the records they
+exchange are Internal.
 
 **Internal** covers engine, codec, transport and store extension protocols,
 implementation records and underscore modules. There is no compatibility
@@ -28,13 +33,16 @@ guarantee for these objects, even when they can be imported.
 | Entry point | Supported names |
 | --- | --- |
 | `mqttium` | Operational `MQTTError` subclasses, `MQTTProtocolVersion`, `QoS`, `ConnectionState`, `__version__` |
-| `mqttium.api` | `AsyncClient`, `Message`, `Properties`, `PublishMessage`, `PublishReceipt`, `PublishBatchReceipt`, `SubscribeResult`, `UnsubscribeResult`, `SubscribeOptions`, `ConnAckPacket`, `AuthPacket`, `NegotiatedSettings`, `ReconnectPolicy`, `MessageDelivery`, `ClientStats` |
+| `mqttium.api` | `AsyncClient`, `Message`, `Properties`, `PublishMessage`, `PublishReceipt`, `PublishBatchReceipt`, `SubscribeResult`, `UnsubscribeResult`, `SubscribeOptions`, `ConnAckPacket`, `AuthPacket`, `NegotiatedSettings`, `ReconnectPolicy`, `MessageDelivery`, `ClientStats` and its nested snapshots (`OutboundStats`, `InboundStats`, `WriterStats`, `DecoderStats`, `DeliveryStats`, `ReceiptStats`, `TransportStats`) |
 | `mqttium.persistence` | `MemoryInflightStore`, `SqliteInflightStore` |
 
 The engine, codecs, packet plumbing, directional sessions, transport extension
 protocols, store implementation protocol and persistence records are Internal.
 Importability and `__all__` are not support promises. Packet models needed by
-the native API have their canonical imports in `mqttium.api`.
+the native API have their canonical imports in `mqttium.api`. For
+`SubscribeOptions`, `ConnAckPacket`, `AuthPacket` and `NegotiatedSettings`,
+construction and field inspection are supported; their encoding, decoding and
+factory methods are Internal.
 
 Paho, one-shot helpers and the root `PacketType` import are removed. The native
 client belongs to one event loop. Synchronous methods are loop-confined, not
@@ -87,7 +95,9 @@ lifecycle hooks with separate bounded ownership. Network operations do not wait
 for hook completion, and incoming delivery does not wait for `on_connect`.
 Obsolete pending lifecycle states are coalesced. External lifecycle operations
 cancel obsolete active hooks; direct self-reentry preserves the invoking hook.
-Automatic retry waits for the current disconnect hook, then rechecks intent.
+Automatic retry waits until the current disconnect hook has started, not until
+it returns, then rechecks intent; `on_connect` for the replacement connection
+still runs after that hook.
 See the [hook contract](reference/async-client.md#lifecycle-hooks) for ordering,
 cancellation and error behavior. Authentication remains protocol-specific and
 is awaited with `auth_timeout`.
@@ -122,7 +132,7 @@ dedicated constructor arguments, never precedence between duplicate property
 keys and arguments.
 
 The constructor refuses configuration that would have no effect instead of
-accepting it: MQTT 5 options (`connect_properties`, `will_properties`,
+accepting it: MQTT 5 options (`connect_properties`, `will` properties,
 `topic_alias_maximum`, `auth_handler`) with MQTT 3.1.1 raise `ProtocolError`;
 iterator bounds or `manual_ack` with callback delivery raise `ValueError`.
 

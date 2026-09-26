@@ -241,7 +241,6 @@ def test_mqtt_3_1_2_21_server_keep_alive_replaces_the_requested_value() -> None:
     _feed(engine, encode_frame(PacketType.CONNACK, 0, b"\x00\x00\x03\x13\x00\x1e"))
     engine.take_effects()
     assert engine.negotiated.server_keep_alive == 30
-    assert engine.negotiated.effective_keepalive == 30
 
 
 # ------------------------------------------------------------------- receiving

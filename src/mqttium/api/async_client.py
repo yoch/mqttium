@@ -17,7 +17,7 @@ import ssl
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
-from typing import Any, Never, TypeVar
+from typing import TYPE_CHECKING, Any, Never, TypeVar
 
 from mqttium.api._auth import AuthExchange
 from mqttium.api._cancel import (
@@ -28,7 +28,6 @@ from mqttium.api._cancel import (
 )
 from mqttium.api._delivery import (
     ApplicationDelivery,
-    MessageDelivery,
     CallbackTarget,
     MessageRoute,
 )
@@ -37,6 +36,7 @@ from mqttium.api._lifecycle import LifecycleHooks
 from mqttium.api._delivery_lane import DeliveryLane
 from mqttium.api._writer import WritePump
 from mqttium.api.models import (
+    MessageDelivery,
     PublishBatchReceipt,
     PublishMessage,
     PublishReceipt,
@@ -83,7 +83,7 @@ from mqttium.protocol.engine import (
 from mqttium.protocol.negotiated import NegotiatedSettings
 from mqttium.protocol.outbound import _PreparedPublish
 from mqttium.protocol.reconnect import ReconnectPolicy, _ReconnectState
-from mqttium.persistence.memory import InflightStore
+from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.topics import validate_subscribe_filter
 from mqttium.transport._stream import AsyncTransport, DecoderPushTransport, PullTransport
 from mqttium.transport.tcp import TcpTransport
@@ -92,10 +92,13 @@ from mqttium.transport.websocket import WebSocketTransport
 from mqttium.transport.writes import WriteItem, item_size
 from mqttium.types import Message, Properties, _owned_payload
 
-OnMessage = Callable[[Message], None]
-OnConnect = Callable[[ConnAckPacket], Any]
-OnDisconnect = Callable[[BaseException | None], Any]
-OnAuth = Callable[[AuthPacket], Any]
+if TYPE_CHECKING:
+    from mqttium.persistence.sqlite import SqliteInflightStore
+
+_OnMessage = Callable[[Message], None]
+_OnConnect = Callable[[ConnAckPacket], Any]
+_OnDisconnect = Callable[[BaseException | None], Any]
+_OnAuth = Callable[[AuthPacket], Any]
 
 _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT = 5.0
 _FATAL_DISCONNECT_DRAIN_TIMEOUT = 0.25
@@ -201,6 +204,25 @@ def _validate_client_arguments(
         raise ValueError("password must be bytes, str, or None")
 
 
+def _will_config(will: PublishMessage | None) -> tuple[Message | None, Properties | None]:
+    """Split a Will into the engine's message and Will Properties.
+
+    A ``Message`` is the inbound delivery type; its ``dup`` and ``mid`` have no
+    meaning for a Will, so only a ``PublishMessage`` is accepted.
+    """
+    if will is None:
+        return None, None
+    if not isinstance(will, PublishMessage):
+        raise TypeError("will must be a PublishMessage")
+    message = Message(
+        topic=will.topic,
+        payload=_owned_payload(will.payload),
+        qos=QoS(will.qos),
+        retain=will.retain,
+    )
+    return message, will.properties
+
+
 class AsyncClient:
     """Asyncio-native MQTT 3.1.1 and MQTT 5 client.
 
@@ -221,8 +243,8 @@ class AsyncClient:
         username: Optional CONNECT username.
         password: Optional CONNECT password. Strings are encoded as UTF-8.
         connect_properties: MQTT 5 CONNECT properties.
-        will: Last Will message.
-        will_properties: MQTT 5 Will properties.
+        will: Last Will message. Its ``properties`` are the MQTT 5 Will
+            Properties, such as ``will_delay_interval``.
         maximum_packet_size: Largest inbound packet accepted by the decoder;
             advertised to an MQTT 5 broker. Larger packets end the connection.
         topic_alias_maximum: Inbound topic aliases accepted from an MQTT 5
@@ -289,8 +311,7 @@ class AsyncClient:
         username: str | None = None,
         password: bytes | str | None = None,
         connect_properties: Properties | None = None,
-        will: Message | None = None,
-        will_properties: Properties | None = None,
+        will: PublishMessage | None = None,
         maximum_packet_size: int | None = None,
         topic_alias_maximum: int = 0,
         max_inbound_inflight: int = 100,
@@ -305,12 +326,12 @@ class AsyncClient:
         max_iterator_messages: int = _DEFAULT_MAX_ITERATOR_MESSAGES,
         max_iterator_bytes: int | None = _DEFAULT_MAX_ITERATOR_BYTES,
         iterator_admission_timeout: float | None = None,
-        store: InflightStore | None = None,
+        store: MemoryInflightStore | SqliteInflightStore | None = None,
         reconnect: ReconnectPolicy | None = None,
         connect_timeout: float = 30.0,
         ping_timeout: float | None = None,
         subscribe_timeout: float = 30.0,
-        auth_handler: OnAuth | None = None,
+        auth_handler: _OnAuth | None = None,
         auth_timeout: float = 10.0,
     ) -> None:
         _validate_client_arguments(
@@ -357,6 +378,7 @@ class AsyncClient:
         )
         initial_decoder_max_packet_size = effective_max_packet_size
         pwd = password.encode("utf-8") if isinstance(password, str) else password
+        will_message, will_properties = _will_config(will)
         self._engine = ProtocolEngine(
             EngineConfig(
                 client_id=client_id,
@@ -371,7 +393,7 @@ class AsyncClient:
                 max_unacknowledged_messages=max_unacknowledged_messages,
                 max_unacknowledged_bytes=max_unacknowledged_bytes,
                 connect_properties=connect_properties,
-                will=will,
+                will=will_message,
                 will_properties=will_properties,
                 maximum_packet_size=effective_max_packet_size,
                 topic_alias_maximum=topic_alias_maximum,
@@ -392,6 +414,7 @@ class AsyncClient:
         self._engine_lock = asyncio.Lock()
         self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._connection_epoch = 0
+        self._connections = 0
         self._effect_pump = EffectPump(self)
         self._delivery_lane = DeliveryLane(self)
         self._write_pump = WritePump(
@@ -447,11 +470,11 @@ class AsyncClient:
         self._last_disconnect: DisconnectInfo | None = None
         self._last_connack_reason: int | None = None
 
-        self._on_message: OnMessage | None = None
+        self._on_message: _OnMessage | None = None
         self._message_callback: CallbackTarget | None = None
         self._topic_callbacks: TopicMatcher | None = None
-        self.on_connect: OnConnect | None = None
-        self.on_disconnect: OnDisconnect | None = None
+        self.on_connect: _OnConnect | None = None
+        self.on_disconnect: _OnDisconnect | None = None
         self._auth_handler = auth_handler
         self._routes_frozen = False
 
@@ -474,11 +497,11 @@ class AsyncClient:
 
         transport = self._transport
         report = getattr(transport, "stats", None)
-        transport_stats = report() if report is not None else TransportStats.unavailable(transport)
+        transport_stats = report() if report is not None else TransportStats._unavailable(transport)
         engine = self._engine
         return ClientStats(
             state=engine.state,
-            connection_epoch=self._connection_epoch,
+            connections=self._connections,
             reconnect_attempt=self._reconnect.attempt,
             outbound=engine.outbound.stats(),
             inbound=engine.inbound.stats(),
@@ -486,7 +509,6 @@ class AsyncClient:
             decoder=DecoderStats(
                 buffered_bytes=self._decoder.buffered,
                 high_water_bytes=self._decoder.high_water,
-                max_packet_size=self._decoder.max_packet_size,
             ),
             delivery=self._delivery.stats(),
             receipts=ReceiptStats(
@@ -1291,13 +1313,7 @@ class AsyncClient:
             if isinstance(caught, asyncio.CancelledError) and owner_cancelled():
                 raise
             exc = failure_for(caught, "publication admission")
-            raise PublishBatchError(
-                receipt.failures,
-                failure_count=receipt.failure_count,
-                failure_counts=dict(receipt.failure_counts),
-                cause=exc,
-                receipt=receipt,
-            ) from exc
+            raise PublishBatchError(receipt, cause=exc) from exc
         finally:
             receipt._seal()
         return receipt
@@ -1316,7 +1332,7 @@ class AsyncClient:
         await self._effect_pump.drain()
 
     @property
-    def auth_handler(self) -> OnAuth | None:
+    def auth_handler(self) -> _OnAuth | None:
         """Enhanced-authentication handler fixed at construction."""
         return self._auth_handler
 
@@ -1325,12 +1341,12 @@ class AsyncClient:
             raise MQTTError("Message routing is frozen after the first connection attempt")
 
     @property
-    def on_message(self) -> OnMessage | None:
+    def on_message(self) -> _OnMessage | None:
         """Synchronous callback used when no topic-specific callback matches."""
         return self._on_message
 
     @on_message.setter
-    def on_message(self, callback: OnMessage | None) -> None:
+    def on_message(self, callback: _OnMessage | None) -> None:
         self._check_routes_mutable()
         if callback is not None:
             self._delivery.validate_message_callback(callback)
@@ -1349,7 +1365,7 @@ class AsyncClient:
             else self._on_message
         )
 
-    def message_callback_add(self, topic_filter: str, callback: OnMessage) -> None:
+    def message_callback_add(self, topic_filter: str, callback: _OnMessage) -> None:
         """Register a synchronous filtered callback before the first connection attempt.
 
         Matches run in registration order instead of on_message. Replacing a
@@ -1375,7 +1391,7 @@ class AsyncClient:
                 self._topic_callbacks = None
         self._refresh_message_callback()
 
-    def _dispatch_topic_message(self, message: Message) -> Iterator[OnMessage]:
+    def _dispatch_topic_message(self, message: Message) -> Iterator[_OnMessage]:
         matcher = self._topic_callbacks
         matched = False
         if matcher:
@@ -1662,8 +1678,7 @@ class AsyncClient:
                             # original cause instead of timing out on CONNACK.
                             # First cause wins: a later local failure must not
                             # replace it.
-                            if self._local_terminal_failure is None:
-                                self._local_terminal_failure = exc
+                            self._latch_local_failure(exc)
                             connack_fut = self._connack_fut
                             if connack_fut is not None and not connack_fut.done():
                                 connack_fut.set_exception(exc)
@@ -1753,98 +1768,113 @@ class AsyncClient:
                 # defer to that terminal settlement.
                 self._fail_pending(exc)
         finally:
-            clean_disconnect = (
-                self._intentional_disconnect
-                and self._engine.state in (ConnectionState.CONNECTED, ConnectionState.DISCONNECTING)
-                and self._disconnect_exc is None
-            )
-            hook_origin = self._disconnect_hook_origin
-            connect_owner = self._explicit_connect_task
-            if connect_owner is not None and connect_owner is self._lifecycle_hooks.hook_task:
-                # Failure of a directly awaited connect belongs to its caller.
-                # Once that call exits, later external loss cancels it normally.
-                hook_origin = connect_owner
-            self._lifecycle_hooks.retiring(lifecycle_token, hook_origin)
-            # One synchronous ownership transition, before the first await:
-            # producers must never see the new epoch while the old engine is
-            # still CONNECTED, or they admit work into the dead transport
-            # (#544). No coroutine suspends while holding the engine lock, so
-            # this synchronous step cannot interleave with an engine mutation.
-            self._retire_connection_epoch()
-            self._engine.notify_transport_closed()
-            self._effect_pump.collect_from_engine()
-            self._auth_exchange.retire()
-            await self._write_pump.wake_waiters()
-            # The keepalive loop belongs to this reader's transport epoch. An
-            # EOF or reader-side failure can end the reader without entering
-            # _force_close(), so retire the task here before a reconnect can
-            # replace its reference with a new epoch's keepalive owner.
-            keepalive = self._keepalive_task
-            if keepalive is not None and keepalive is not asyncio.current_task():
-                if not keepalive.done():
-                    keepalive.cancel()
-                try:
-                    await keepalive
-                except (asyncio.CancelledError, Exception):
-                    pass
-                if self._keepalive_task is keepalive:
-                    self._keepalive_task = None
+            await self._retire_reader_connection(lifecycle_token, reader_transport, reader_connack)
+
+    async def _retire_reader_connection(
+        self,
+        lifecycle_token: int,
+        reader_transport: AsyncTransport,
+        reader_connack: asyncio.Future[ConnAckPacket] | None,
+    ) -> None:
+        """End the connection a reader served, whatever ended the reader.
+
+        Runs in the reader's ``finally``: it retires the epoch and the engine
+        in one synchronous step, settles the terminal cause, releases the
+        connection's resources and hands the loss to the lifecycle hooks and
+        the reconnect policy.
+        """
+        clean_disconnect = (
+            self._intentional_disconnect
+            and self._engine.state in (ConnectionState.CONNECTED, ConnectionState.DISCONNECTING)
+            and self._disconnect_exc is None
+        )
+        hook_origin = self._disconnect_hook_origin
+        connect_owner = self._explicit_connect_task
+        if connect_owner is not None and connect_owner is self._lifecycle_hooks.hook_task:
+            # Failure of a directly awaited connect belongs to its caller.
+            # Once that call exits, later external loss cancels it normally.
+            hook_origin = connect_owner
+        self._lifecycle_hooks.retiring(lifecycle_token, hook_origin)
+        # One synchronous ownership transition, before the first await:
+        # producers must never see the new epoch while the old engine is
+        # still CONNECTED, or they admit work into the dead transport
+        # (#544). No coroutine suspends while holding the engine lock, so
+        # this synchronous step cannot interleave with an engine mutation.
+        self._retire_connection_epoch()
+        self._engine.notify_transport_closed()
+        self._effect_pump.collect_from_engine()
+        self._auth_exchange.retire()
+        await self._write_pump.wake_waiters()
+        # The keepalive loop belongs to this reader's transport epoch. An
+        # EOF or reader-side failure can end the reader without entering
+        # _force_close(), so retire the task here before a reconnect can
+        # replace its reference with a new epoch's keepalive owner.
+        keepalive = self._keepalive_task
+        if keepalive is not None and keepalive is not asyncio.current_task():
+            if not keepalive.done():
+                keepalive.cancel()
             try:
-                await self._effect_pump.drain()
-            except (Exception, asyncio.CancelledError):
+                await keepalive
+            except (asyncio.CancelledError, Exception):
                 pass
-            if self._disconnect_exc is None:
-                info = self._last_disconnect
-                if (
-                    self._local_terminal_failure is None
-                    and info is not None
-                    and info.from_broker
-                    and info.reason_code != 0
-                ):
-                    self._propose_disconnect_cause(
-                        BrokerDisconnectError(info.reason_code, info.properties), _CAUSE_BROKER
-                    )
-                else:
-                    self._propose_disconnect_cause(MQTTError("Connection closed"), _CAUSE_SYNTHETIC)
-            # A latched local-terminal failure is authoritative: a secondary
-            # writer/keepalive error that overwrote _disconnect_exc must never
-            # replace it for settlement and callbacks. The explicit None test
-            # (not truthiness) keeps even a falsey backend exception identical.
-            terminal_cause = self._local_terminal_failure
-            if terminal_cause is None:
-                assert self._disconnect_exc is not None
-                terminal_cause = self._disconnect_exc
+            if self._keepalive_task is keepalive:
+                self._keepalive_task = None
+        try:
+            await self._effect_pump.drain()
+        except (Exception, asyncio.CancelledError):
+            pass
+        if self._disconnect_exc is None:
+            info = self._last_disconnect
             if (
-                reader_connack is not None
-                and not reader_connack.done()
-                and not self._intentional_disconnect
+                self._local_terminal_failure is None
+                and info is not None
+                and info.from_broker
+                and info.reason_code != 0
             ):
-                reader_connack.set_exception(terminal_cause)
-            self._fail_non_replayable(terminal_cause)
-            will_reconnect = self._will_reconnect()
-            if not will_reconnect:
-                self._fail_pending(terminal_cause)
-            # Retire resources before lifecycle user code can install a
-            # replacement. Replayable state remains in the protocol store.
-            await self._write_pump.wake_waiters()
-            await self._write_pump.stop()
-            with ignoring_dependency_failures():
-                await reader_transport.close()
-            if self._transport is reader_transport:
-                self._transport = None
-            if not will_reconnect:
-                # A reconnectable loss must not terminate the application
-                # message stream: the same iterator resumes after reconnect.
-                self._delivery.close()
-            self._lifecycle_hooks.disconnected(
-                None if clean_disconnect else terminal_cause,
-                lifecycle_token,
-                hook_origin,
-            )
-            if will_reconnect and (self._reconnect_task is None or self._reconnect_task.done()):
-                self._reconnect_task = asyncio.create_task(
-                    self._reconnect_loop(), name="mqttium-reconnect"
+                self._propose_disconnect_cause(
+                    BrokerDisconnectError(info.reason_code, info.properties), _CAUSE_BROKER
                 )
+            else:
+                self._propose_disconnect_cause(MQTTError("Connection closed"), _CAUSE_SYNTHETIC)
+        # A latched local-terminal failure is authoritative: a secondary
+        # writer/keepalive error that overwrote _disconnect_exc must never
+        # replace it for settlement and callbacks. The explicit None test
+        # (not truthiness) keeps even a falsey backend exception identical.
+        terminal_cause = self._local_terminal_failure
+        if terminal_cause is None:
+            assert self._disconnect_exc is not None
+            terminal_cause = self._disconnect_exc
+        if (
+            reader_connack is not None
+            and not reader_connack.done()
+            and not self._intentional_disconnect
+        ):
+            reader_connack.set_exception(terminal_cause)
+        self._fail_non_replayable(terminal_cause)
+        will_reconnect = self._will_reconnect()
+        if not will_reconnect:
+            self._fail_pending(terminal_cause)
+        # Retire resources before lifecycle user code can install a
+        # replacement. Replayable state remains in the protocol store.
+        await self._write_pump.wake_waiters()
+        await self._write_pump.stop()
+        with ignoring_dependency_failures():
+            await reader_transport.close()
+        if self._transport is reader_transport:
+            self._transport = None
+        if not will_reconnect:
+            # A reconnectable loss must not terminate the application
+            # message stream: the same iterator resumes after reconnect.
+            self._delivery.close()
+        self._lifecycle_hooks.disconnected(
+            None if clean_disconnect else terminal_cause,
+            lifecycle_token,
+            hook_origin,
+        )
+        if will_reconnect and (self._reconnect_task is None or self._reconnect_task.done()):
+            self._reconnect_task = asyncio.create_task(
+                self._reconnect_loop(), name="mqttium-reconnect"
+            )
 
     def _terminal_shutdown(self, exc: BaseException) -> None:
         """Fail pending work and close the application stream, terminally.
@@ -2334,8 +2364,7 @@ class AsyncClient:
             # Queue acceptance is observable, but failed durable completion
             # must retire this session before any new admission. Reader
             # teardown preserves this first cause.
-            if self._local_terminal_failure is None:
-                self._local_terminal_failure = exc
+            self._latch_local_failure(exc)
             self._engine.notify_transport_closed()
             raise
 
@@ -2368,8 +2397,7 @@ class AsyncClient:
             try:
                 self._engine.continue_inbound_replay()
             except Exception as exc:
-                if self._local_terminal_failure is None:
-                    self._local_terminal_failure = exc
+                self._latch_local_failure(exc)
                 self._engine.notify_transport_closed()
                 raise
             self._effect_pump.collect_from_engine()
@@ -2448,7 +2476,9 @@ class AsyncClient:
         self._wake_publish_waiters(len(self._publish_waiter_futs))
 
     def _resolve_connack(self, connack: ConnAckPacket) -> None:
-        if connack.reason_code != 0:
+        if connack.reason_code == 0:
+            self._connections += 1
+        else:
             self._last_connack_reason = connack.reason_code
             self._propose_disconnect_cause(
                 ProtocolError(f"Connection refused: reason_code={connack.reason_code}"),
@@ -2532,6 +2562,11 @@ class AsyncClient:
         mid, reason = _terminal_publish_result(effect)
         self._settle_publish(mid, reason)
 
+    def _latch_local_failure(self, exc: BaseException) -> None:
+        """Record the first local terminal failure; a later one never replaces it."""
+        if self._local_terminal_failure is None:
+            self._local_terminal_failure = exc
+
     def _fail_non_replayable(self, exc: BaseException) -> None:
         for sub_fut in self._sub_futs.values():
             if not sub_fut.done():
@@ -2567,8 +2602,7 @@ class AsyncClient:
             except Exception as store_exc:
                 # A publication this client cannot seal could still be sent
                 # later: refuse every later use of this client instead.
-                if self._local_terminal_failure is None:
-                    self._local_terminal_failure = store_exc
+                self._latch_local_failure(store_exc)
         # Producers parked on outbound admission hold no receipt, so the loops
         # above cannot reach them. Wake them to re-check _publish_wait_failure().
         self._teardown_final = True

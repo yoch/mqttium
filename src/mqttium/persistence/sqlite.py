@@ -107,7 +107,7 @@ def _props_from_json(raw: str | None) -> Properties | None:
         raise ValueError("Invalid properties JSON payload")
     try:
         return Properties(values=values)
-    except ProtocolError as exc:
+    except (ProtocolError, TypeError) as exc:
         raise ValueError("Invalid persisted properties value") from exc
 
 

@@ -40,9 +40,13 @@ def test_legacy_inbound_diagnostics_are_views_not_duplicate_state() -> None:
     assert engine.inbound._aliases is engine.inbound._aliases
     assert engine.inbound._recovered_mids is engine.inbound._recovered_mids
 
-    engine.inbound._inflight = 3
-    assert engine.inbound._inflight == 3
-    assert engine.inbound._inflight == 3
+    # Receive Maximum occupancy is derived from its owners, never stored.
+    inbound = engine.inbound
+    inbound._current_persisted_mids.update({1, 2})
+    inbound._pending_auto_qos1_mids.add(3)
+    assert inbound._inflight == 3
+    inbound.release_pending_acks()
+    assert inbound._inflight == 2
 
 
 @pytest.mark.parametrize(

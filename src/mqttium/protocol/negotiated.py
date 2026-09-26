@@ -31,7 +31,7 @@ class NegotiatedSettings:
     response_information: str | None = None
 
     @classmethod
-    def from_connack(
+    def _from_connack(
         cls,
         properties: Properties | None,
         *,
@@ -62,12 +62,3 @@ class NegotiatedSettings:
             server_reference=props.get("server_reference"),
             response_information=props.get("response_information"),
         )
-
-    @property
-    def effective_keepalive(self) -> int | None:
-        """Return None to mean 'use client-requested keepalive'."""
-        return self.server_keep_alive
-
-    def effective_client_id(self, local: str) -> str:
-        """Return the broker-assigned identifier or the configured fallback."""
-        return self.assigned_client_identifier or local

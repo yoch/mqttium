@@ -1,6 +1,6 @@
 {
   "module": "WritePumpEagerFailure.tla",
-  "status": "legacy-flag",
+  "status": "refinement",
   "summary": "A synchronous eager write_nowait failure retires the writer generation and never retries the ambiguous frame.",
   "issues": [
     504
@@ -12,7 +12,7 @@
     {
       "config": "WritePumpEagerFailure-rc15.cfg",
       "expect": "violation",
-      "invariant": "EagerFailureRetiresGeneration"
+      "invariant": "NothingAdmittedAfterFailure"
     },
     {
       "config": "WritePumpEagerFailure-fixed.cfg",

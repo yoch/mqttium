@@ -42,8 +42,6 @@ _EXPORT_MODULES = {
     "ReconnectPolicy": "mqttium.protocol.reconnect",
 }
 
-__all__ = list(_EXPORT_MODULES)
-
 
 def __getattr__(name: str) -> Any:
     module_name = _EXPORT_MODULES.get(name)
@@ -55,4 +53,4 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(__all__))
+    return sorted(set(globals()) | set(_EXPORT_MODULES))

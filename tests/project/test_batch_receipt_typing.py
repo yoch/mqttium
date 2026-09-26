@@ -16,11 +16,9 @@ async def publish_work(client: AsyncClient) -> None:
         result = await client.publish_many([PublishMessage("t", b"body", qos=1)])
         assert_type(result, PublishBatchReceipt)
     except PublishBatchError as error:
-        assert_type(error.receipt, PublishBatchReceipt | None)
-        if error.receipt is not None:
-            assert_type(error.receipt, PublishBatchReceipt)
-            assert_type(error.receipt.submitted, int)
-            await error.receipt.wait()
+        assert_type(error.receipt, PublishBatchReceipt)
+        assert_type(error.receipt.submitted, int)
+        await error.receipt.wait()
 """
 
 _UNNARROWED = """from mqttium import PublishBatchError
@@ -62,7 +60,7 @@ def _mypy(tmp_path, *consumers):
         raise AssertionError(f"mypy timed out:\n{exc.stdout or ''}{exc.stderr or ''}") from exc
 
 
-def test_batch_failure_receipt_supports_typed_recovery_and_requires_narrowing(tmp_path):
+def test_batch_failure_receipt_supports_typed_recovery_without_narrowing(tmp_path):
     recovery = tmp_path / "recovery.py"
     recovery.write_text(_TYPED_RECOVERY)
     unnarrowed = tmp_path / "unnarrowed.py"
@@ -72,11 +70,8 @@ def test_batch_failure_receipt_supports_typed_recovery_and_requires_narrowing(tm
 
     report = result.stdout + result.stderr
     errors = [line for line in result.stdout.splitlines() if ": error:" in line]
-    assert result.returncode == 1, report
-    assert errors == [
-        'unnarrowed.py:4: error: Item "None" of "PublishBatchReceipt | None" '
-        'has no attribute "submitted"  [union-attr]'
-    ], report
+    assert result.returncode == 0, report
+    assert errors == [], report
 
 
 def test_receipt_annotation_is_deferred_and_the_runtime_value_is_unchanged():
@@ -87,8 +82,7 @@ def test_receipt_annotation_is_deferred_and_the_runtime_value_is_unchanged():
 
     parameter = inspect.signature(PublishBatchError).parameters["receipt"]
     # Postponed annotations keep the TYPE_CHECKING-only import out of runtime.
-    assert parameter.annotation == "PublishBatchReceipt | None"
-    assert parameter.default is None
-    assert PublishBatchError().receipt is None
+    assert parameter.annotation == "PublishBatchReceipt"
+    assert parameter.default is inspect.Parameter.empty
     receipt = PublishBatchReceipt()
-    assert PublishBatchError(receipt=receipt).receipt is receipt
+    assert PublishBatchError(receipt).receipt is receipt

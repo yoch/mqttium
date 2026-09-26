@@ -105,14 +105,16 @@ attempt receives that operation's failure normally; this caller preservation
 ends when the connection call exits.
 
 `on_disconnect` runs after the old connection resources are retired, with the
-original cause or `None` for clean closure. Automatic retry waits for that
-hook to finish, then rechecks explicit user intent. Hook exceptions and a
+original cause or `None` for clean closure. Automatic retry waits until that
+hook has started, not until it returns, then rechecks explicit user intent, so
+a hook may await work that only the replacement connection can complete. The
+replacement's `on_connect` still runs after the hook returns. Hook exceptions and a
 manually raised `CancelledError` are reported to the event loop's exception
 handler; actual task cancellation retires the hook.
 
-Lifecycle hooks have no implicit execution deadline. An unfinished `on_disconnect` can
-delay automatic retry; an explicit replacement can still proceed without waiting
-for that hook. Use an application deadline when a hook must finish within a
+Lifecycle hooks have no implicit execution deadline. An unfinished `on_disconnect`
+does not delay automatic or explicit reconnection, but it delays the replacement's
+`on_connect`. Use an application deadline when a hook must finish within a
 fixed interval, and allow cancellation to propagate.
 
 `auth_handler` accepts synchronous or asynchronous functions. Its response
