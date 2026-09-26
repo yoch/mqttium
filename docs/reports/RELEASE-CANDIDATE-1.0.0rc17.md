@@ -38,7 +38,29 @@ fixes. `InboundSession` holds 25 state slots instead of 27, `OutboundSession`
 
 | Evidence | Result |
 | --- | --- |
-| RUNS_PENDING | |
+| [CI 36266676868](https://github.com/yoch/mqttium/actions/runs/36266676868) and [ARM64 CI 36266676903](https://github.com/yoch/mqttium/actions/runs/36266676903) | Passed |
+| [Soak and broker interoperability 36267800944](https://github.com/yoch/mqttium/actions/runs/36267800944) | Passed: Linux and macOS soaks for MQTT 3.1.1 and 5, EMQX 5.8.9 and HiveMQ CE 2026.5 |
+| NETWORK_GATE_PENDING |
+| Strict ARM64 open-loop gate vs RC16, [36267803906](https://github.com/yoch/mqttium/actions/runs/36267803906) | Passed; see below |
+| ARM64 paired regression vs RC16, [36267722844](https://github.com/yoch/mqttium/actions/runs/36267722844) | Passed: strict writer-capacity A/B 0.999 (QoS 0) and 0.987 (QoS 1), A/A 0.998 and 1.000; strict paced writer-latency A/B lag 1.002 at 2,500 and 1.000 at 10,000 msgs/s |
+
+### ARM64 paired microbenchmarks against RC16
+
+Median candidate/base throughput over 11 pairs (run 36267722844):
+
+| Scenario | Ratio |
+| --- | --- |
+| `ingress_engine_qos0` | 1.153 |
+| `ingress_engine_qos0_v5` | 1.137 |
+| `ingress_publish_qos1` | 1.189 |
+| `mqtt5_puback_reason_cycle` | 0.985 |
+| `qos1_cycle_memory` | 0.990 |
+| Every other scenario (encode, writer, publish, effects, delivery, receipts, persistence) | 0.992–1.013 |
+
+The advisory network sweep (MQTT 3.1.1 and 5, 64 B and 4096 B, windows 1 to
+128) measured QoS 1 receipt ACK throughput at 0.997–1.018 of RC16 with
+unchanged p50 latency. One cell (3.1.1, 4096 B, window 1) had a candidate
+variation of 9 %, above the advisory threshold; its ratio was 1.017.
 
 ### Measurements on the x86 development host
 
@@ -54,6 +76,23 @@ Paired, interleaved rounds; the noise is about ±5 %.
 
 [Issue #493](https://github.com/yoch/mqttium/issues/493) remains open for 1.0.
 RC17 was checked only for a further regression against RC16.
+
+Open-loop gate against RC16 (run 36267803906): per-load ratios of the candidate
+over RC16, at matched offered rates.
+
+| Protocol, payload | Load | Throughput | Loop lag p95 |
+| --- | --- | --- | --- |
+| 3.1.1, 64 B | 0.50 / 0.75 / 0.90 / 1.00 | 1.00 / 1.01 / 1.00 / 1.00 | 1.00 / 1.01 / 1.02 / 1.12 |
+| 5, 64 B | 0.50 / 0.75 / 0.90 / 1.00 | 0.99 / 1.00 / 1.00 / 1.00 | 0.96 / 1.01 / 1.07 / 0.99 |
+| 3.1.1, 4096 B | 0.50 / 0.75 / 0.90 / 1.00 | 1.00 / 0.99 / 1.00 / 0.99 | 1.00 / 1.00 / 1.03 / 1.02 |
+| 5, 4096 B | 0.50 / 0.75 / 0.90 / 1.00 | 1.00 / 1.00 / 1.00 / 1.00 | 0.96 / 1.00 / 1.03 / 1.07 |
+
+The runner preflight was eligible. No cell exceeds the same-code A/A spread
+documented for RC15 (up to about 1.12); the 3.1.1/64 B saturation cell sits at
+that bound. The gate therefore shows no further lag regression from RC16 to
+RC17. It does not qualify #493 itself, and the RC15 caveat still applies:
+capacity calibration still moves between levels (5/4096 B calibrated at about
+21,600 msgs/s for the baseline against 16,600 for the candidate diagnostic).
 
 ## Not performed for this candidate
 
