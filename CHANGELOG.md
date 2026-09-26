@@ -8,6 +8,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Build each received `Message` through its slot descriptors instead of the
+  frozen dataclass constructor, which set its eight fields through
+  `object.__setattr__`. Engine-level reception is about 20 % faster for QoS 0
+  and QoS 1; the delivered `Message` is unchanged.
+
 - `MQTTTimeoutError` also derives from `TimeoutError`, so `except TimeoutError`
   catches client deadlines.
 - `PublishBatchError.receipt` is always the batch receipt, never `None`.
