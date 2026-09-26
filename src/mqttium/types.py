@@ -92,6 +92,51 @@ class Message:
             object.__setattr__(self, "payload", _owned_payload(self.payload))
 
 
+_new_object = object.__new__
+(
+    _set_topic,
+    _set_payload,
+    _set_qos,
+    _set_retain,
+    _set_dup,
+    _set_mid,
+    _set_properties,
+    _set_ack_token,
+) = (
+    Message.__dict__[name].__set__
+    for name in ("topic", "payload", "qos", "retain", "dup", "mid", "properties", "_ack_token")
+)
+
+
+def _decoded_message(
+    topic: str,
+    payload: bytes,
+    qos: QoS,
+    retain: bool,
+    dup: bool,
+    mid: int | None,
+    properties: Properties | None,
+) -> Message:
+    """Build a delivered ``Message`` without the frozen dataclass ``__init__``.
+
+    Internal to the decode and delivery paths, whose payload is already owned
+    ``bytes`` (the decoder copies at packet boundaries), so ``__post_init__``
+    would have nothing to do. The generated frozen ``__init__`` routes each of
+    the eight fields through ``object.__setattr__``; the slot descriptors
+    cost about 40 % of it, on every received message.
+    """
+    message = _new_object(Message)
+    _set_topic(message, topic)
+    _set_payload(message, payload)
+    _set_qos(message, qos)
+    _set_retain(message, retain)
+    _set_dup(message, dup)
+    _set_mid(message, mid)
+    _set_properties(message, properties)
+    _set_ack_token(message, None)
+    return message
+
+
 @dataclass(slots=True)
 class OutboundMessage:
     mid: int
