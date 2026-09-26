@@ -121,6 +121,32 @@ def _check_send_quota(
             fail(f"outstanding PUBLISHes own no send quota slot: {sorted(unowned)}")
 
 
+def _check_receive_maximum(
+    engine: ProtocolEngine,
+    records: list[Any],
+    fail: Callable[[str], None],
+) -> None:
+    """Inbound Receive Maximum slots have exactly one owner each."""
+    inbound = engine.inbound
+    current = inbound._current_persisted_mids
+    auto = inbound._pending_auto_qos1_mids
+    pubcomps = inbound._pending_pubcomps
+    for label, left, right in (
+        ("persisted/auto-PUBACK", current, auto),
+        ("persisted/PUBCOMP", current, pubcomps),
+        ("auto-PUBACK/PUBCOMP", auto, pubcomps),
+    ):
+        if left & right:
+            fail(f"inbound slot owned twice ({label}): {sorted(left & right)}")
+    stray = current - {r.mid for r in records}
+    if stray:
+        fail(f"inbound slots owned by no persisted exchange: {sorted(stray)}")
+    if not 0 <= inbound._pending_pubcomp_slots <= len(pubcomps):
+        fail(f"PUBCOMP slots={inbound._pending_pubcomp_slots} for {len(pubcomps)} pending PUBCOMPs")
+    if inbound._inflight > inbound._receive_maximum:
+        fail(f"inbound inflight={inbound._inflight} over {inbound._receive_maximum}")
+
+
 def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> None:
     def fail(message: str) -> None:
         trail = "\n    ".join(history[-25:])
@@ -179,6 +205,7 @@ def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> 
             f"inbound pending_bytes={inbound._pending_bytes} but the records sum to "
             f"{expected_inbound}"
         )
+    _check_receive_maximum(engine, inbound_records, fail)
 
 
 def _emitted_deliveries(engine: ProtocolEngine) -> list[tuple[int, object]]:
@@ -225,10 +252,14 @@ def _check_completed_only_after_delivery(
             )
 
 
-def _subscription_or_seal(
+def _client_operation(
     engine: ProtocolEngine, rng: random.Random, operation: str, history: list[str], step: int
 ) -> None:
-    """Share the packet identifier pool with SUBSCRIBE and sealed rows (#521)."""
+    """SUBSCRIBE and sealed rows (#521) share the packet identifier pool;
+    manual acknowledgement completes inbound exchanges out of band."""
+    if operation == "ack":
+        _manual_ack_one(engine, rng, history, step)
+        return
     if operation == "subscribe":
         if engine.state is ConnectionState.CONNECTED:
             history.append(f"{step}: SUBSCRIBE")
@@ -240,6 +271,22 @@ def _subscription_or_seal(
         chosen = rng.sample(mids, rng.randint(1, len(mids)))
         history.append(f"{step}: seal {sorted(chosen)}")
         engine.seal_publications(chosen)
+
+
+def _manual_ack_one(
+    engine: ProtocolEngine, rng: random.Random, history: list[str], step: int
+) -> None:
+    """Acknowledge one delivered message, as a manual-ack application would."""
+    if not engine.config.manual_ack or engine.state is not ConnectionState.CONNECTED:
+        return
+    delivered = [
+        meta.mid for page in engine.store.in_index_pages() for meta in page if meta.delivered
+    ]
+    if not delivered:
+        return
+    mid = rng.choice(delivered)
+    history.append(f"{step}: manual ack mid={mid}")
+    engine.ack(mid)
 
 
 def _inbound_delivery_states(engine: ProtocolEngine) -> dict[int, bool]:
@@ -259,6 +306,7 @@ def test_engine_invariants_hold(protocol: MQTTProtocolVersion, seed: int) -> Non
             max_inbound_inflight=rng.choice([2, 5, 20]),
             max_unacknowledged_messages=rng.choice([None, 6, 12]),
             max_unacknowledged_bytes=rng.choice([None, 4096]),
+            manual_ack=seed % 2 == 1,
         ),
         MemoryInflightStore(),
     )
@@ -281,8 +329,9 @@ def test_engine_invariants_hold(protocol: MQTTProtocolVersion, seed: int) -> Non
         "reconnect",
         "subscribe",
         "seal",
+        "ack",
     ]
-    weights = [40, 14, 12, 12, 10, 6, 8, 4, 6, 4, 3]
+    weights = [40, 14, 12, 12, 10, 6, 8, 4, 6, 4, 3, 6]
     # Deliveries the runtime has not committed yet, in emission order. A
     # "deliver" step commits one of them, possibly after its exchange ended
     # and the identifier was reused (a late mark must then be ignored).
@@ -343,8 +392,8 @@ def test_engine_invariants_hold(protocol: MQTTProtocolVersion, seed: int) -> Non
                 _feed(engine, PubRelPacket(mid=mid).encode(protocol))
             elif operation == "deliver":
                 committed = _deliver_one(engine, rng, undelivered, history, step)
-            elif operation in ("subscribe", "seal"):
-                _subscription_or_seal(engine, rng, operation, history, step)
+            elif operation in ("subscribe", "seal", "ack"):
+                _client_operation(engine, rng, operation, history, step)
             elif operation == "drop":
                 history.append(f"{step}: transport closed")
                 engine.notify_transport_closed()
