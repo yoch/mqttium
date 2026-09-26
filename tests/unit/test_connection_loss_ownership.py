@@ -363,7 +363,7 @@ async def test_eof_retires_connected_state_before_joining_keepalive() -> None:
     cancellation_seen = asyncio.Event()
     try:
         await client.connect("fake", 1, timeout=1.0)
-        previous_epoch = client.stats().connection_epoch
+        previous_epoch = client._connection_epoch
         original_keepalive = client._keepalive_task
         assert original_keepalive is not None
         original_keepalive.cancel()
@@ -384,7 +384,7 @@ async def test_eof_retires_connected_state_before_joining_keepalive() -> None:
         await broker.close()
         await asyncio.wait_for(cancellation_seen.wait(), timeout=1.0)
 
-        assert client.stats().connection_epoch > previous_epoch
+        assert client._connection_epoch > previous_epoch
         assert not client.is_connected
     finally:
         release_cleanup.set()

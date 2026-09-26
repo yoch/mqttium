@@ -23,20 +23,20 @@ def test_initial_stats_snapshot_is_immutable_and_side_effect_free() -> None:
 
     assert isinstance(snapshot, ClientStats)
     assert snapshot.state is ConnectionState.NEW
-    assert snapshot.connection_epoch == 0
+    assert snapshot.connections == 0
     assert snapshot.outbound.unacknowledged_messages == 0
     assert snapshot.outbound.unacknowledged_bytes == 0
     assert snapshot.inbound.inflight == 0
     assert snapshot.inbound.replay_pending is False
     assert snapshot.writer.queued_messages == 0
     assert snapshot.writer.queued_bytes == 0
-    assert snapshot.writer.max_messages == 7
-    assert snapshot.writer.max_bytes == 1234
+    assert snapshot.writer.message_limit == 7
+    assert snapshot.writer.byte_limit == 1234
     assert snapshot.delivery.iterator_limit == 11
     assert snapshot.delivery.iterator_queued == 0
     assert snapshot.decoder.buffered_bytes == 0
     assert snapshot.receipts.publish == 0
-    assert snapshot.transport.kind is None
+    assert snapshot.transport.pending_write_bytes == 0
     tasks = client._running_tasks()
     assert set(tasks) == {
         "reader",
@@ -50,7 +50,7 @@ def test_initial_stats_snapshot_is_immutable_and_side_effect_free() -> None:
     assert not any(tasks.values())
 
     with pytest.raises(FrozenInstanceError):
-        snapshot.connection_epoch = 1  # type: ignore[misc]
+        snapshot.connections = 1  # type: ignore[misc]
 
 
 def test_stats_reports_current_state_and_lifetime_high_water_marks() -> None:
@@ -157,7 +157,7 @@ def test_each_owner_produces_its_own_snapshot() -> None:
     assert snapshot.inbound == client._engine.inbound.stats()
     assert snapshot.writer == client._write_pump.stats()
     assert snapshot.delivery == client._delivery.stats()
-    assert snapshot.transport == TransportStats.unavailable(None)
+    assert snapshot.transport == TransportStats._unavailable(None)
 
 
 def test_transport_without_a_stats_method_reports_unavailable() -> None:
@@ -167,7 +167,6 @@ def test_transport_without_a_stats_method_reports_unavailable() -> None:
 
     snapshot = client.stats()
 
-    assert snapshot.transport.kind == "_RecordingTransport"
     assert snapshot.transport.closing is False
     assert snapshot.transport.pending_write_bytes == 0
     # Unknown, not an empty receive queue.
@@ -256,3 +255,20 @@ async def test_effect_high_water_retains_combined_protocol_and_delivery_peak() -
     assert client._effect_pump.counters()["pending"] == 0
     assert client._effect_pump.counters()["pending_high_water"] == 3
     await client._force_close()
+
+
+async def test_connections_counts_accepted_connacks() -> None:
+    from tests.support import ScriptedBrokerTransport, transport_factory
+
+    broker = ScriptedBrokerTransport()
+    client = AsyncClient("c", keepalive=0)
+    client._transport_factory = transport_factory(broker)
+    await client.connect("fake")
+    await client.disconnect()
+    second = ScriptedBrokerTransport()
+    client._transport_factory = transport_factory(second)
+    await client.connect("fake")
+    try:
+        assert client.stats().connections == 2
+    finally:
+        await client.disconnect()

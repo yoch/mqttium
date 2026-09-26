@@ -137,7 +137,7 @@ async def _wait_idle(client: AsyncClient, *, timeout: float) -> None:
 
 
 async def _force_reconnect(client: AsyncClient, *, cycle: int, timeout: float) -> None:
-    previous_epoch = client.stats().connection_epoch
+    previous_connections = client.stats().connections
     transport = client._transport
     if transport is None:
         raise RuntimeError("publisher transport disappeared before forced reconnect")
@@ -145,7 +145,7 @@ async def _force_reconnect(client: AsyncClient, *, cycle: int, timeout: float) -
     await _wait_until(
         lambda: (
             client.is_connected
-            and client.stats().connection_epoch > previous_epoch
+            and client.stats().connections > previous_connections
             and not client._running_tasks()["reconnect"]
         ),
         timeout=timeout,

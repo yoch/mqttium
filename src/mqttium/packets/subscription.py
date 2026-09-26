@@ -40,13 +40,13 @@ class SubscribeOptions:
         try:
             qos = QoS(self.qos)
         except ValueError as exc:
-            raise ProtocolError(f"Invalid subscribe QoS {self.qos!r}") from exc
+            raise ValueError(f"Invalid subscribe QoS {self.qos!r}") from exc
         if protocol != MQTTProtocolVersion.MQTTv5:
             if self.no_local or self.retain_as_published or self.retain_handling:
                 raise ProtocolError("SubscribeOptions v5 flags require MQTT 5")
             return int(qos)
         if self.retain_handling not in (0, 1, 2):
-            raise ProtocolError("retain_handling must be 0, 1, or 2")
+            raise ValueError("retain_handling must be 0, 1, or 2")
         return (
             int(qos)
             | (int(self.no_local) << 2)

@@ -20,6 +20,15 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   MQTT 5 Will Properties, and `will_properties` is removed. A `Message` Will
   silently dropped its `properties`, `dup` and `mid`; it is now refused with
   `TypeError`.
+- Statistics (Provisional): `ClientStats.connections` counts connections
+  established since construction and replaces the internal
+  `connection_epoch`; `WriterStats.max_messages`/`max_bytes` become
+  `message_limit`/`byte_limit`; `DecoderStats.max_packet_size` (a copy of the
+  configuration) and `TransportStats.kind` (an internal class name) are removed.
+- Invalid arguments raise builtin exceptions: a `Properties` value or name of
+  the wrong type raises `TypeError`, and a `SubscribeOptions` QoS or
+  `retain_handling` out of range raises `ValueError` (as an invalid `publish()`
+  QoS already did). `ProtocolError` stays for MQTT rules and peer violations.
 - Declare the store protocol methods (`put_out`, `get_out`, `complete_out`,
   `batch`, ...) Internal. Both store classes stay public (Provisional) through
   their constructors, `store=`, and `SqliteInflightStore.close()` or its
