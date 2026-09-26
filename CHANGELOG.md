@@ -58,6 +58,19 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- With MQTT 5, a client whose store holds only inbound QoS 1 rows no longer
+  refuses CONNACK Session Present=1 after a restart. The rows complete only
+  when the broker resends their PUBLISH on the resumed session, so every
+  reconnect was refused and the rows were stranded. Any stored inbound row now
+  counts as local Session State.
+
+- With `manual_ack=True`, acknowledging a QoS 1 message replayed on a resumed
+  session no longer sends its PUBACK before the broker resends that PUBLISH.
+  The resend then counted as a new message the broker had already settled: it
+  held a Receive Maximum slot, so a later legal PUBLISH could be refused with
+  DISCONNECT 0x93, and a new message reusing its identifier was answered with
+  the old payload and lost. The PUBACK now waits for the resend.
+
 - Never send a publication whose admission failed after its durable row was
   written, when the cleanup delete also fails. The row stayed in the store with
   its packet identifier released, so the same client replayed it on its next

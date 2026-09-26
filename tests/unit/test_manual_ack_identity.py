@@ -119,7 +119,7 @@ async def test_stale_public_handle_does_not_ack_reused_mid(protocol, qos, reconn
         assert tuple(brokers[-1].written) == before
         await client.ack(new)
         assert client._engine.store.in_count() == 0
-        assert client._engine.inbound._ack_tokens == {}
+        assert client._engine.inbound._exchange_tokens == {}
     finally:
         await client.disconnect()
 
@@ -156,7 +156,11 @@ def test_handle_survives_resumed_session_but_not_replacement(protocol, qos):
         if isinstance(effect.data, Message):
             assert effect.data._ack_token is original._ack_token
     engine.ack(9, message=original)
-    assert engine.inbound._ack_tokens == {}
+    if qos == 1:
+        # The PUBACK of a resumed row answers the broker's resend only.
+        assert engine.inbound._exchange_tokens
+        feed_engine(engine, _wire(protocol, 1, dup=True))
+    assert engine.inbound._exchange_tokens == {}
     with pytest.raises(ProtocolError):
         engine.ack(9, message=original)
     # The identifier is free for a new exchange once its PUBCOMP has left the
@@ -182,8 +186,11 @@ def test_qos1_duplicate_and_ordered_ack_intent_keep_exchange_identity():
     _resume(engine)
     engine.ack(2, message=second)
     engine.ack(1, message=first)
+    assert engine.store.in_count() == 2
+    for mid in (1, 2):
+        feed_engine(engine, _wire(engine.config.protocol, 1, mid=mid, dup=True))
     assert engine.store.in_count() == 0
-    assert engine.inbound._ack_tokens == {}
+    assert engine.inbound._exchange_tokens == {}
 
 
 @pytest.mark.parametrize("protocol", PROTOCOLS)
@@ -192,11 +199,11 @@ def test_qos2_ack_before_pubrel_keeps_token_until_terminal_completion(protocol):
     message = _deliver(engine, 2)
     engine.ack(9, message=message)
     engine.ack(9, message=message)
-    assert engine.inbound._ack_tokens[9] is message._ack_token
+    assert engine.inbound._exchange_tokens[9] is message._ack_token
     _resume(engine)
     engine.ack(9, message=message)
     feed_engine(engine, PubRelPacket(mid=9).encode(protocol))
-    assert engine.inbound._ack_tokens == {}
+    assert engine.inbound._exchange_tokens == {}
     with pytest.raises(ProtocolError):
         engine.ack(9, message=message)
 
@@ -220,8 +227,10 @@ def test_sqlite_recovery_issues_new_client_identity(tmp_path, qos):
         with pytest.raises(ProtocolError):
             engine.ack(9, message=original)
         engine.ack(9, message=recovered)
+        if qos == 1:
+            feed_engine(engine, _wire(engine.config.protocol, 1, dup=True))
         assert store.in_count() == 0
-        assert engine.inbound._ack_tokens == {}
+        assert engine.inbound._exchange_tokens == {}
 
 
 @pytest.mark.parametrize("failure", ("raise", "refuse"))
@@ -239,16 +248,16 @@ def test_store_completion_failure_preserves_token(monkeypatch, failure):
     with pytest.raises((OSError, RuntimeError)):
         engine.ack(9, message=message)
     assert engine.store.in_count() == 1
-    assert engine.inbound._ack_tokens[9] is message._ack_token
+    assert engine.inbound._exchange_tokens[9] is message._ack_token
     monkeypatch.setattr(MemoryInflightStore, "complete_in", original)
     engine.ack(9, message=message)
-    assert engine.inbound._ack_tokens == {}
+    assert engine.inbound._exchange_tokens == {}
 
 
 def test_auto_ack_does_not_allocate_identity_index():
     engine = _engine(manual=False)
     message = _deliver(engine, 2)
-    assert engine.inbound._ack_tokens is None
+    assert not engine.inbound._binds_ack_tokens
     assert message._ack_token is None
 
 
@@ -264,6 +273,9 @@ async def test_public_handle_survives_actual_session_resume(protocol, qos, autom
         def handle_packet(self, raw):
             if raw.packet_type is PacketType.CONNECT:
                 self.push_rx(_connack(protocol, present=self.present))
+                if self.present and qos == 1:
+                    # A resumed session resends its unacknowledged PUBLISH.
+                    self.push_rx(_wire(protocol, 1, dup=True))
             else:
                 super().handle_packet(raw)
 
@@ -304,7 +316,7 @@ async def test_public_handle_survives_actual_session_resume(protocol, qos, autom
             await client.disconnect()
             await client.connect("fake")
         await client.ack(message)
-        assert client._engine.store.in_count() == 0
-        assert client._engine.inbound._ack_tokens == {}
+        await wait_until(lambda: client._engine.store.in_count() == 0)
+        assert client._engine.inbound._exchange_tokens == {}
     finally:
         await client.disconnect()
