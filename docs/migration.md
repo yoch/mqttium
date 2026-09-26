@@ -64,6 +64,8 @@ removes contracts that had no effect, no use, or duplicated another.
 | `WriterStats.max_messages`, `max_bytes` | `WriterStats.message_limit`, `byte_limit` |
 | `DecoderStats.max_packet_size` | The `maximum_packet_size` you configured |
 | `TransportStats.kind` | None; the application knows which transport it opened |
+| `ProtocolError` for a `Properties` value or name of the wrong type | `TypeError` |
+| `ProtocolError` for a `SubscribeOptions` QoS or `retain_handling` out of range | `ValueError`, like an invalid QoS given to `publish()` |
 | `__all__` lists of Internal packages (`mqttium.packets`, `codec`, `transport`, `dispatch`, `protocol`, `api.models`, `api.stats`) | None; these packages are Internal |
 
 `MQTTTimeoutError` now also derives from `TimeoutError`; existing
