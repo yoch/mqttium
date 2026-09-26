@@ -156,6 +156,10 @@ def test_handle_survives_resumed_session_but_not_replacement(protocol, qos):
         if isinstance(effect.data, Message):
             assert effect.data._ack_token is original._ack_token
     engine.ack(9, message=original)
+    if qos == 1:
+        # The PUBACK of a resumed row answers the broker's resend only.
+        assert engine.inbound._exchange_tokens
+        feed_engine(engine, _wire(protocol, 1, dup=True))
     assert engine.inbound._exchange_tokens == {}
     with pytest.raises(ProtocolError):
         engine.ack(9, message=original)
@@ -182,6 +186,9 @@ def test_qos1_duplicate_and_ordered_ack_intent_keep_exchange_identity():
     _resume(engine)
     engine.ack(2, message=second)
     engine.ack(1, message=first)
+    assert engine.store.in_count() == 2
+    for mid in (1, 2):
+        feed_engine(engine, _wire(engine.config.protocol, 1, mid=mid, dup=True))
     assert engine.store.in_count() == 0
     assert engine.inbound._exchange_tokens == {}
 
@@ -220,6 +227,8 @@ def test_sqlite_recovery_issues_new_client_identity(tmp_path, qos):
         with pytest.raises(ProtocolError):
             engine.ack(9, message=original)
         engine.ack(9, message=recovered)
+        if qos == 1:
+            feed_engine(engine, _wire(engine.config.protocol, 1, dup=True))
         assert store.in_count() == 0
         assert engine.inbound._exchange_tokens == {}
 
@@ -264,6 +273,9 @@ async def test_public_handle_survives_actual_session_resume(protocol, qos, autom
         def handle_packet(self, raw):
             if raw.packet_type is PacketType.CONNECT:
                 self.push_rx(_connack(protocol, present=self.present))
+                if self.present and qos == 1:
+                    # A resumed session resends its unacknowledged PUBLISH.
+                    self.push_rx(_wire(protocol, 1, dup=True))
             else:
                 super().handle_packet(raw)
 
@@ -304,7 +316,7 @@ async def test_public_handle_survives_actual_session_resume(protocol, qos, autom
             await client.disconnect()
             await client.connect("fake")
         await client.ack(message)
-        assert client._engine.store.in_count() == 0
+        await wait_until(lambda: client._engine.store.in_count() == 0)
         assert client._engine.inbound._exchange_tokens == {}
     finally:
         await client.disconnect()

@@ -1,15 +1,40 @@
 {
   "module": "InboundSession.tla",
-  "status": "legacy-flag",
-  "summary": "Durable inbound QoS state is independent of the current connection's Receive Maximum; QoS 2 phases are monotonic.",
+  "status": "refinement",
+  "summary": "A persisted inbound exchange owns a Receive Maximum slot only once its PUBLISH is observed on the current connection, and a manual QoS 1 PUBACK answers only such a PUBLISH, so no phantom exchange holds a slot or swallows a reused identifier.",
   "issues": [
     498,
     499
   ],
-  "tests": [],
+  "tests": [
+    "tests/unit/test_manual_ack_resend_race.py",
+    "tests/unit/test_manual_ack_wire_ordering.py",
+    "tests/unit/test_inbound_recovery.py",
+    "tests/unit/test_manual_ack_resume.py",
+    "tests/fuzz/test_stateful_invariants.py"
+  ],
   "configs": [
     {
-      "config": "InboundSession.cfg",
+      "config": "InboundSession-rc15.cfg",
+      "expect": "violation",
+      "invariant": "NoFalseRefusal"
+    },
+    {
+      "config": "InboundSession-rc16-quota.cfg",
+      "expect": "violation",
+      "invariant": "NoFalseRefusal"
+    },
+    {
+      "config": "InboundSession-rc16-reuse.cfg",
+      "expect": "violation",
+      "invariant": "NoSwallowedMessage"
+    },
+    {
+      "config": "InboundSession-fixed.cfg",
+      "expect": "pass"
+    },
+    {
+      "config": "InboundSession-fixed-wide.cfg",
       "expect": "pass"
     }
   ]
