@@ -193,7 +193,9 @@ def test_binary_property_rejects_values_larger_than_mqtt_u16_length() -> None:
     ],
 )
 def test_user_property_rejects_malformed_pairs(value: object) -> None:
-    with pytest.raises(ProtocolError):
+    # A value of an unsupported Python type is refused when Properties is
+    # built (TypeError); a supported but malformed pair when it is encoded.
+    with pytest.raises((ProtocolError, TypeError)):
         encode_properties(Properties({"user_property": value}), PUBLISH)
 
 

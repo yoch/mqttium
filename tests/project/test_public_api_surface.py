@@ -178,7 +178,7 @@ def test_client_stats_fields_follow_the_constructor_vocabulary() -> None:
 
     assert names(ClientStats) == (
         "state",
-        "connection_epoch",
+        "connections",
         "reconnect_attempt",
         "outbound",
         "inbound",
@@ -212,12 +212,12 @@ def test_client_stats_fields_follow_the_constructor_vocabulary() -> None:
         "queued_bytes",
         "high_water_messages",
         "high_water_bytes",
-        "max_messages",
-        "max_bytes",
+        "message_limit",
+        "byte_limit",
         "waiters",
         "last_outbound",
     )
-    assert names(DecoderStats) == ("buffered_bytes", "high_water_bytes", "max_packet_size")
+    assert names(DecoderStats) == ("buffered_bytes", "high_water_bytes")
     assert names(DeliveryStats) == (
         "iterator_queued",
         "iterator_limit",
@@ -234,7 +234,6 @@ def test_client_stats_fields_follow_the_constructor_vocabulary() -> None:
         "publish_waiters",
     )
     assert names(TransportStats) == (
-        "kind",
         "closing",
         "pending_write_bytes",
         "buffered_read_bytes",
