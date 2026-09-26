@@ -48,10 +48,10 @@ native client free of background threads.
 
 ## Install
 
-The native API below is published as the pre-release `1.0.0rc16`:
+The native API below is published as the pre-release `1.0.0rc17`:
 
 ```bash
-python -m pip install mqttium==1.0.0rc16
+python -m pip install mqttium==1.0.0rc17
 ```
 
 To try unreleased changes, install a checkout instead and record the Git commit
@@ -63,7 +63,8 @@ cd mqttium
 python -m pip install .
 ```
 
-`1.0.0rc16` keeps the `1.0.0rc15` API; its changelog lists the behaviour fixes.
+`1.0.0rc17` revises the `1.0.0rc16` API before 1.0; see the
+[changes since 1.0.0rc16](https://mqttium.readthedocs.io/en/latest/migration/#changes-since-100rc16).
 Applications still on `1.0.0rc14` should use its
 [RC14 documentation](https://mqttium.readthedocs.io/en/v1.0.0rc14/) and read the
 migration guide before upgrading.
@@ -230,8 +231,8 @@ statistics vocabulary, progressive batch publication, synchronous message
 callbacks, receipt-based publication completion, and the new SQLite schema.
 Historical databases are not upgraded automatically.
 
-Use the Read the Docs version matching your installed release: `v1.0.0rc16`
-for this API, `v1.0.0rc15` or `v1.0.0rc14` for earlier candidates, and `latest`
+Use the Read the Docs version matching your installed release: `v1.0.0rc17`
+for this API, `v1.0.0rc16`, `v1.0.0rc15` or `v1.0.0rc14` for earlier candidates, and `latest`
 for the current source. The legacy `stable` URL redirects to the latest published
 candidate until a final release provides Read the Docs' automatic stable version.
 

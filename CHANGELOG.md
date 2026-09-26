@@ -6,6 +6,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0rc17] - 2026-09-26
+
 ### Changed
 
 - Build each received `Message` through its slot descriptors instead of the
@@ -1552,7 +1554,8 @@ See the [migration guide](docs/migration.md) for the breaking changes since
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc16...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc17...HEAD
+[1.0.0rc17]: https://github.com/yoch/mqttium/compare/v1.0.0rc16...v1.0.0rc17
 [1.0.0rc16]: https://github.com/yoch/mqttium/compare/v1.0.0rc15...v1.0.0rc16
 [1.0.0rc15]: https://github.com/yoch/mqttium/compare/v1.0.0rc14...v1.0.0rc15
 [1.0.0rc14]: https://github.com/yoch/mqttium/compare/v1.0.0rc13...v1.0.0rc14
