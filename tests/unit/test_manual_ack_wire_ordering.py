@@ -13,6 +13,7 @@ from mqttium.persistence.sqlite import SqliteInflightStore
 from mqttium.protocol.config import EngineConfig
 from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
+from mqttium.types import Properties
 
 
 def _feed(engine: ProtocolEngine, wire: bytes) -> None:
@@ -49,6 +50,7 @@ def _engine(store: MemoryInflightStore | SqliteInflightStore | None = None) -> P
             clean_start=False,
             manual_ack=True,
             max_inbound_inflight=8,
+            connect_properties=Properties({"session_expiry_interval": 60}),
         ),
         store,
     )
@@ -124,7 +126,12 @@ def test_unflushed_ack_intent_is_connection_scoped() -> None:
     engine.take_effects()
 
     engine.inbound.ack(1)
+    # A resumed row's PUBACK answers the broker's resend on this connection.
+    assert _puback_mids(engine) == []
+    _feed(engine, _qos1_publish(1, dup=True))
     assert _puback_mids(engine) == [1]
+    _feed(engine, _qos1_publish(2, dup=True))
+    engine.take_effects()
     engine.inbound.ack(2)
     assert _puback_mids(engine) == [2]
 
@@ -150,13 +157,15 @@ def test_sqlite_recovery_preserves_qos1_arrival_order(tmp_path: Path) -> None:
         ),
         reopened,
     )
-    resumed.begin_connect()
-    _feed(resumed, _connack(session_present=True))
-    resumed.take_effects()
+    # Resumed connection: the recovered rows own nothing on it yet.
+    resumed.state = ConnectionState.CONNECTED
 
     resumed.inbound.ack(8)
     resumed.inbound.ack(4)
     assert _puback_mids(resumed) == []
     resumed.inbound.ack(7)
+    assert _puback_mids(resumed) == []
+    for mid in (7, 4, 8):
+        _feed(resumed, _qos1_publish(mid, dup=True))
     assert _puback_mids(resumed) == [7, 4, 8]
     reopened.close()

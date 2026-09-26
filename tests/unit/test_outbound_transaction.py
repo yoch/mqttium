@@ -52,8 +52,8 @@ class _FailingFlow:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._flow, name)
 
-    def try_acquire(self) -> bool:
-        self._flow.try_acquire()
+    def try_acquire(self, mid: int) -> bool:
+        self._flow.try_acquire(mid)
         raise _Boom()
 
 

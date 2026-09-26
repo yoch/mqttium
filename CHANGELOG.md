@@ -20,6 +20,15 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   MQTT 5 Will Properties, and `will_properties` is removed. A `Message` Will
   silently dropped its `properties`, `dup` and `mid`; it is now refused with
   `TypeError`.
+- Statistics (Provisional): `ClientStats.connections` counts connections
+  established since construction and replaces the internal
+  `connection_epoch`; `WriterStats.max_messages`/`max_bytes` become
+  `message_limit`/`byte_limit`; `DecoderStats.max_packet_size` (a copy of the
+  configuration) and `TransportStats.kind` (an internal class name) are removed.
+- Invalid arguments raise builtin exceptions: a `Properties` value or name of
+  the wrong type raises `TypeError`, and a `SubscribeOptions` QoS or
+  `retain_handling` out of range raises `ValueError` (as an invalid `publish()`
+  QoS already did). `ProtocolError` stays for MQTT rules and peer violations.
 - Declare the store protocol methods (`put_out`, `get_out`, `complete_out`,
   `batch`, ...) Internal. Both store classes stay public (Provisional) through
   their constructors, `store=`, and `SqliteInflightStore.close()` or its
@@ -43,6 +52,19 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   `SubscribeOptions`, `ConnAckPacket` and `AuthPacket` are Internal.
 
 ### Fixed
+
+- With MQTT 5, a client whose store holds only inbound QoS 1 rows no longer
+  refuses CONNACK Session Present=1 after a restart. The rows complete only
+  when the broker resends their PUBLISH on the resumed session, so every
+  reconnect was refused and the rows were stranded. Any stored inbound row now
+  counts as local Session State.
+
+- With `manual_ack=True`, acknowledging a QoS 1 message replayed on a resumed
+  session no longer sends its PUBACK before the broker resends that PUBLISH.
+  The resend then counted as a new message the broker had already settled: it
+  held a Receive Maximum slot, so a later legal PUBLISH could be refused with
+  DISCONNECT 0x93, and a new message reusing its identifier was answered with
+  the old payload and lost. The PUBACK now waits for the resend.
 
 - Never send a publication whose admission failed after its durable row was
   written, when the cleanup delete also fails. The row stayed in the store with

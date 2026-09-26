@@ -123,8 +123,8 @@ class WritePump:
             queued_bytes=self.queued_bytes,
             high_water_messages=max(self.high_water_messages, queued_messages),
             high_water_bytes=max(self.high_water_bytes, self.queued_bytes),
-            max_messages=self.max_messages,
-            max_bytes=self.max_bytes,
+            message_limit=self.max_messages,
+            byte_limit=self.max_bytes,
             waiters=self.waiters,
             last_outbound=self.last_outbound,
         )
