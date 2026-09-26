@@ -82,6 +82,45 @@ def _connack(engine: ProtocolEngine, *, session_present: bool) -> None:
     _feed(engine, encode_frame(PacketType.CONNACK, 0, remaining))
 
 
+def _check_send_quota(
+    engine: ProtocolEngine,
+    records: list[Any],
+    fail: Callable[[str], None],
+) -> None:
+    outbound = engine.outbound
+    sealed = outbound._sealed
+    # Send Quota slots are owned by packet identifier. Only a live exchange
+    # that is neither sealed nor parked may own one; a resumed WAIT_PUBCOMP
+    # (PUBREL replay) may own none, so its PUBCOMP frees nothing (#545).
+    flow = outbound.flow
+    holders = flow._holders
+    parked = outbound._parked
+    if len(holders) > flow.limit:
+        fail(f"flow holds {len(holders)} slots over its limit {flow.limit}")
+    live = {
+        r.mid: r.state
+        for r in records
+        if r.state is not OutboundQoSState.QUEUED and r.mid not in sealed
+    }
+    stray_holders = holders - (live.keys() - parked)
+    if stray_holders:
+        fail(f"send quota slots owned by no sendable live exchange: {sorted(stray_holders)}")
+    queued_live = {m.mid for m in outbound._queued if m.state is not OutboundQoSState.QUEUED}
+    if parked != queued_live:
+        fail(f"parked={sorted(parked)} but the queue parks {sorted(queued_live)}")
+    if engine.state is ConnectionState.CONNECTED:
+        # Every PUBLISH outstanding on this connection owns its slot.
+        unowned = {
+            mid
+            for mid, state in live.items()
+            if state is not OutboundQoSState.WAIT_PUBCOMP
+            and mid not in parked
+            and mid not in holders
+        }
+        if unowned:
+            fail(f"outstanding PUBLISHes own no send quota slot: {sorted(unowned)}")
+
+
 def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> None:
     def fail(message: str) -> None:
         trail = "\n    ".join(history[-25:])
@@ -121,13 +160,7 @@ def _check_invariants(engine: ProtocolEngine, step: int, history: list[str]) -> 
             f"pending_bytes={outbound.unacknowledged_bytes} but the records sum to {expected_bytes}"
         )
 
-    # Send Quota is connection-scoped credit, not durable-record occupancy.
-    # A resumed WAIT_PUBCOMP retransmits PUBREL without consuming quota, while
-    # its later PUBCOMP can replenish quota consumed by another PUBLISH. After
-    # reconnect there is therefore no one-to-one mapping from durable WAIT_*
-    # states to flow.inflight; the negotiated bounds remain invariant.
-    if not 0 <= outbound.flow.inflight <= outbound.flow.limit:
-        fail(f"flow.inflight={outbound.flow.inflight} outside [0, {outbound.flow.limit}]")
+    _check_send_quota(engine, records, fail)
 
     queued = [m.mid for m in outbound._queued]
     if len(queued) != len(set(queued)):
