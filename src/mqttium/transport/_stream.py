@@ -142,7 +142,6 @@ class StreamTransportBase:
 
     def stats(self) -> TransportStats:
         return TransportStats(
-            kind=type(self).__name__,
             closing=self.is_closing(),
             pending_write_bytes=self.pending_write_bytes,
             # StreamReader has no public buffer-occupancy API.

@@ -414,6 +414,7 @@ class AsyncClient:
         self._engine_lock = asyncio.Lock()
         self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._connection_epoch = 0
+        self._connections = 0
         self._effect_pump = EffectPump(self)
         self._delivery_lane = DeliveryLane(self)
         self._write_pump = WritePump(
@@ -496,11 +497,11 @@ class AsyncClient:
 
         transport = self._transport
         report = getattr(transport, "stats", None)
-        transport_stats = report() if report is not None else TransportStats.unavailable(transport)
+        transport_stats = report() if report is not None else TransportStats._unavailable(transport)
         engine = self._engine
         return ClientStats(
             state=engine.state,
-            connection_epoch=self._connection_epoch,
+            connections=self._connections,
             reconnect_attempt=self._reconnect.attempt,
             outbound=engine.outbound.stats(),
             inbound=engine.inbound.stats(),
@@ -508,7 +509,6 @@ class AsyncClient:
             decoder=DecoderStats(
                 buffered_bytes=self._decoder.buffered,
                 high_water_bytes=self._decoder.high_water,
-                max_packet_size=self._decoder.max_packet_size,
             ),
             delivery=self._delivery.stats(),
             receipts=ReceiptStats(
@@ -2464,7 +2464,9 @@ class AsyncClient:
         self._wake_publish_waiters(len(self._publish_waiter_futs))
 
     def _resolve_connack(self, connack: ConnAckPacket) -> None:
-        if connack.reason_code != 0:
+        if connack.reason_code == 0:
+            self._connections += 1
+        else:
             self._last_connack_reason = connack.reason_code
             self._propose_disconnect_cause(
                 ProtocolError(f"Connection refused: reason_code={connack.reason_code}"),
