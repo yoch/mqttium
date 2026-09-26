@@ -40,7 +40,7 @@ is the version an application actually upgrades from.
 ## Changes since 1.0.0rc16
 
 The pre-1.0 surface review (`docs/reports/API-SURFACE-REVIEW-2026-09-24.md`)
-removes contracts that had no effect or no use.
+removes contracts that had no effect, no use, or duplicated another.
 
 | 1.0.0rc16 contract | Replacement |
 | --- | --- |
@@ -50,6 +50,20 @@ removes contracts that had no effect or no use.
 | `NegotiatedSettings.effective_client_id(local)` | `AsyncClient.effective_client_id` |
 | `NegotiatedSettings.from_connack()` | Internal; read `AsyncClient.negotiated` |
 | Encoding and decoding methods of `SubscribeOptions`, `ConnAckPacket`, `AuthPacket` | Internal; construct the models and read their fields |
+| `PublishBatchError.failures`, `.failure_count`, `.failure_counts` | The same fields on `PublishBatchError.receipt` |
+| `PublishBatchError.cause` | `PublishBatchError.__cause__` (the error is raised `from` its cause) |
+| `PublishBatchError.receipt` could be `None` | Always the batch receipt; no narrowing needed |
+| `PublishBatchReceipt.completed` | `receipt.submitted - receipt.pending_count` |
+
+| Mutable `PublishReceipt.mid` / `.qos`; value equality; constructor fields `_waiters`, `_error`, `_settled` | Read-only `mid` and `qos`; identity equality; `PublishReceipt(mid, qos)` |
+| Mutable `SubscribeResult` / `UnsubscribeResult` | Frozen; construct a new value instead of assigning fields |
+| Nested statistics types imported from `mqttium.api.stats` or other modules | Import them from `mqttium.api` |
+| `will=Message(...)` plus `will_properties=Properties(...)` | `will=PublishMessage(topic, payload, qos=..., retain=..., properties=...)`; a `Message` is refused with `TypeError` |
+| Store methods (`put_out`, `get_out`, `complete_out`, `in_replay_pages`, `batch`, ...) called by applications | Internal; use `client.stats()` for a running client. Construction, `store=`, `close()` and `with` stay supported |
+| `__all__` lists of Internal packages (`mqttium.packets`, `codec`, `transport`, `dispatch`, `protocol`, `api.models`, `api.stats`) | None; these packages are Internal |
+
+`MQTTTimeoutError` now also derives from `TimeoutError`; existing
+`except MQTTTimeoutError` handlers are unchanged.
 
 ## Frozen constructor and snapshot vocabulary
 

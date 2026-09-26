@@ -1,159 +1,148 @@
 ---- MODULE WritePumpEagerFailure ----
-EXTENDS Naturals
+EXTENDS Naturals, Sequences
 
 (***************************************************************************
-WritePump producer-side eager failure ownership model for mqttium issue #504.
+A producer-side eager write that raises (#504).
 
-write_nowait() is allowed to be ambiguous: it may raise after exposing any
-prefix of the supplied bytes. Therefore the failed frame may be retained only
-as an ownership/accounting record. It must never be retried on the wire.
+Refines WritePump in api/_writer.py:
+- try_enqueue / try_enqueue_ack admit only when no failure is latched and
+  the caller's epoch is current (else StaleConnectionEffect);
+- the eager path (_try_write_data_eager / _try_write_ack_eager) writes
+  straight to the transport only when armed, idle, with no waiter and an
+  empty queue; a success disarms it until the next turn;
+- write_nowait() may raise after exposing any prefix of the frame, so the
+  frame can never be written again. _retain_failed_eager() latches the
+  failure, drops the eager binding, advances the epoch and queues the frame
+  as an ownership-only marker;
+- the writer task (_run) re-arms the eager path at its idle wait, takes the
+  queued batch, and raises the latched failure before writing any of it.
 
-FenceEagerFailure=FALSE models rc15: the exception returns to the producer while
-the writer generation and eager transport binding remain usable.
+Variant = "rc15": the exception returns to the producer; nothing is latched,
+  the binding stays armed and the epoch stays current.
+Variant = "fixed": _retain_failed_eager as above.
 
-FenceEagerFailure=TRUE models the candidate:
-- latch failure,
-- drop eager transport binding,
-- invalidate writer generation,
-- retain one ownership-only marker for the existing writer task,
-- let the writer report failure without attempting the marker on the wire.
+Invariants:
+- NothingAdmittedAfterFailure: after the eager failure no frame is admitted
+  to that connection, eagerly or through the queue.
+- MarkerNeverWritten: the ambiguous frame never reaches the wire again.
 ***************************************************************************)
 
-CONSTANT FenceEagerFailure
-ASSUME FenceEagerFailure \in BOOLEAN
+CONSTANT Variant
+ASSUME Variant \in {"rc15", "fixed"}
 
 VARIABLES
-  protocolCommitted,
-  producerFailed,
-  generationValid,
-  eagerBound,
-  markerOwned,
-  writerAlive,
-  failureReported,
-  connectionLive,
-  receiptRegistered,
-  wireRetry
+  epoch,       \* WritePump.epoch
+  latched,     \* _latency_failure is not None
+  armed,       \* _eager_armed
+  queue,       \* queued items: "frame" or "marker"
+  writer,      \* "idle", "writing", "dead"
+  batch,       \* the writer's current batch
+  failed,      \* an eager write raised on this connection
+  produced,    \* producer attempts (bound)
+  admittedAfter,
+  markerWritten
 
-vars == <<
-  protocolCommitted,
-  producerFailed,
-  generationValid,
-  eagerBound,
-  markerOwned,
-  writerAlive,
-  failureReported,
-  connectionLive,
-  receiptRegistered,
-  wireRetry
->>
+vars == <<epoch, latched, armed, queue, writer, batch, failed, produced,
+          admittedAfter, markerWritten>>
 
 Init ==
-  /\ protocolCommitted = FALSE
-  /\ producerFailed = FALSE
-  /\ generationValid = TRUE
-  /\ eagerBound = TRUE
-  /\ markerOwned = FALSE
-  /\ writerAlive = TRUE
-  /\ failureReported = FALSE
-  /\ connectionLive = TRUE
-  /\ receiptRegistered = FALSE
-  /\ wireRetry = FALSE
+  /\ epoch = 0
+  /\ latched = FALSE
+  /\ armed = TRUE
+  /\ queue = <<>>
+  /\ writer = "idle"
+  /\ batch = <<>>
+  /\ failed = FALSE
+  /\ produced = 0
+  /\ admittedAfter = FALSE
+  /\ markerWritten = FALSE
 
-TypeOK ==
-  /\ protocolCommitted \in BOOLEAN
-  /\ producerFailed \in BOOLEAN
-  /\ generationValid \in BOOLEAN
-  /\ eagerBound \in BOOLEAN
-  /\ markerOwned \in BOOLEAN
-  /\ writerAlive \in BOOLEAN
-  /\ failureReported \in BOOLEAN
-  /\ connectionLive \in BOOLEAN
-  /\ receiptRegistered \in BOOLEAN
-  /\ wireRetry \in BOOLEAN
+\* The producer captured epoch 0 when its effect was produced.
+Admissible == ~latched /\ epoch = 0
 
-CommitQoS ==
-  /\ connectionLive
-  /\ ~protocolCommitted
-  /\ protocolCommitted' = TRUE
-  /\ receiptRegistered' = TRUE
-  /\ UNCHANGED <<
-       producerFailed, generationValid, eagerBound, markerOwned,
-       writerAlive, failureReported, connectionLive, wireRetry
-     >>
+EagerPossible == armed /\ writer = "idle" /\ queue = <<>>
 
-EagerFailRc15 ==
-  /\ ~FenceEagerFailure
-  /\ connectionLive
-  /\ eagerBound
-  /\ ~producerFailed
-  /\ producerFailed' = TRUE
-  /\ UNCHANGED <<
-       protocolCommitted, generationValid, eagerBound, markerOwned,
-       writerAlive, failureReported, connectionLive, receiptRegistered,
-       wireRetry
-     >>
+EagerSuccess ==
+  /\ produced < 3
+  /\ Admissible
+  /\ EagerPossible
+  /\ produced' = produced + 1
+  /\ armed' = FALSE
+  /\ admittedAfter' = (admittedAfter \/ failed)
+  /\ UNCHANGED <<epoch, latched, queue, writer, batch, failed, markerWritten>>
 
-EagerFailCandidate ==
-  /\ FenceEagerFailure
-  /\ connectionLive
-  /\ eagerBound
-  /\ writerAlive
-  /\ ~producerFailed
-  /\ producerFailed' = TRUE
-  /\ generationValid' = FALSE
-  /\ eagerBound' = FALSE
-  /\ markerOwned' = TRUE
-  /\ UNCHANGED <<
-       protocolCommitted, writerAlive, failureReported, connectionLive,
-       receiptRegistered, wireRetry
-     >>
+EagerRaises ==
+  /\ produced < 3
+  /\ ~failed
+  /\ Admissible
+  /\ EagerPossible
+  /\ produced' = produced + 1
+  /\ failed' = TRUE
+  /\ IF Variant = "fixed"
+     THEN /\ latched' = TRUE
+          /\ armed' = FALSE
+          /\ epoch' = epoch + 1
+          /\ queue' = Append(queue, "marker")
+     ELSE UNCHANGED <<latched, armed, epoch, queue>>
+  /\ UNCHANGED <<writer, batch, admittedAfter, markerWritten>>
 
-AdmitAfterFailedEager ==
-  /\ producerFailed
-  /\ generationValid
-  /\ eagerBound
-  /\ connectionLive
-  /\ wireRetry' = TRUE
-  /\ UNCHANGED <<
-       protocolCommitted, producerFailed, generationValid, eagerBound,
-       markerOwned, writerAlive, failureReported, connectionLive,
-       receiptRegistered
-     >>
+Enqueue ==
+  /\ produced < 3
+  /\ Admissible
+  /\ ~EagerPossible
+  /\ produced' = produced + 1
+  /\ queue' = Append(queue, "frame")
+  /\ admittedAfter' = (admittedAfter \/ failed)
+  /\ UNCHANGED <<epoch, latched, armed, writer, batch, failed, markerWritten>>
 
-WriterRetireMarker ==
-  /\ markerOwned
-  /\ writerAlive
-  /\ markerOwned' = FALSE
-  /\ writerAlive' = FALSE
-  /\ failureReported' = TRUE
-  /\ UNCHANGED <<
-       protocolCommitted, producerFailed, generationValid, eagerBound,
-       connectionLive, receiptRegistered, wireRetry
-     >>
+\* _run's idle wait re-arms the eager path (the binding is still present).
+WriterRearm ==
+  /\ writer = "idle"
+  /\ queue = <<>>
+  /\ ~armed
+  /\ armed' = TRUE
+  /\ UNCHANGED <<epoch, latched, queue, writer, batch, failed, produced,
+                 admittedAfter, markerWritten>>
 
-SettleFailure ==
-  /\ failureReported
-  /\ connectionLive' = FALSE
-  /\ receiptRegistered' = FALSE
-  /\ UNCHANGED <<
-       protocolCommitted, producerFailed, generationValid, eagerBound,
-       markerOwned, writerAlive, failureReported, wireRetry
-     >>
+WriterTake ==
+  /\ writer = "idle"
+  /\ queue # <<>>
+  /\ writer' = "writing"
+  /\ batch' = queue
+  /\ queue' = <<>>
+  /\ armed' = FALSE
+  /\ UNCHANGED <<epoch, latched, failed, produced, admittedAfter, markerWritten>>
+
+Contains(s, x) == \E i \in 1..Len(s) : s[i] = x
+
+WriterWrite ==
+  /\ writer = "writing"
+  /\ IF latched
+     THEN /\ writer' = "dead"
+          /\ UNCHANGED markerWritten
+     ELSE /\ writer' = "idle"
+          /\ markerWritten' = (markerWritten \/ Contains(batch, "marker"))
+  /\ batch' = <<>>
+  /\ UNCHANGED <<epoch, latched, armed, queue, failed, produced, admittedAfter>>
+
+Terminal == produced = 3 \/ writer = "dead" \/ (latched /\ writer = "idle" /\ queue = <<>>)
+
+Quiescent == Terminal /\ UNCHANGED vars
 
 Next ==
-  \/ CommitQoS
-  \/ EagerFailRc15
-  \/ EagerFailCandidate
-  \/ AdmitAfterFailedEager
-  \/ WriterRetireMarker
-  \/ SettleFailure
+  \/ EagerSuccess \/ EagerRaises \/ Enqueue
+  \/ WriterRearm \/ WriterTake \/ WriterWrite
+  \/ Quiescent
 
 Spec == Init /\ [][Next]_vars
 
-EagerFailureRetiresGeneration ==
-  ~(producerFailed /\ (generationValid \/ eagerBound \/ wireRetry))
+TypeOK ==
+  /\ epoch \in 0..1
+  /\ writer \in {"idle", "writing", "dead"}
+  /\ produced \in 0..3
 
-OwnershipMarkerNeverRetries ==
-  ~(markerOwned /\ wireRetry)
+NothingAdmittedAfterFailure == ~admittedAfter
+
+MarkerNeverWritten == ~markerWritten
 
 =============================================================================

@@ -11,7 +11,8 @@ import pytest
 import mqttium
 import mqttium.api as api
 import mqttium.protocol as protocol
-from mqttium.api.async_client import AsyncClient, MessageDelivery
+from mqttium.api.async_client import AsyncClient
+from mqttium.api.models import MessageDelivery
 from mqttium.api.models import (
     PublishBatchReceipt,
     PublishMessage,
@@ -96,9 +97,18 @@ def test_root_exports_operational_errors_and_connection_state() -> None:
 
 
 def test_api_exports_every_type_used_by_supported_signatures() -> None:
+    # ClientStats and its nested snapshots are Provisional, importable from the
+    # supported entry point so applications can annotate them.
     expected = {
         **STABLE_API_EXPORTS,
         "ClientStats": ClientStats,
+        "DecoderStats": DecoderStats,
+        "DeliveryStats": DeliveryStats,
+        "InboundStats": InboundStats,
+        "OutboundStats": OutboundStats,
+        "ReceiptStats": ReceiptStats,
+        "TransportStats": TransportStats,
+        "WriterStats": WriterStats,
     }
 
     assert set(api.__all__) == set(expected)
@@ -116,7 +126,6 @@ def test_async_client_constructor_keywords_and_defaults() -> None:
         "password": None,
         "connect_properties": None,
         "will": None,
-        "will_properties": None,
         "maximum_packet_size": None,
         "topic_alias_maximum": 0,
         "max_inbound_inflight": 100,
@@ -245,7 +254,7 @@ def test_constructor_refuses_configuration_without_effect() -> None:
     AsyncClient("c", manual_ack=True)
     for option in (
         {"connect_properties": Properties({"session_expiry_interval": 10})},
-        {"will_properties": Properties({"message_expiry_interval": 10}), "will": Message("w", b"")},
+        {"will": PublishMessage("w", b"", properties=Properties({"message_expiry_interval": 10}))},
         {"topic_alias_maximum": 5},
         {"auth_handler": lambda packet: None},
     ):
@@ -298,8 +307,10 @@ def test_internal_pumps_are_not_promoted_to_supported_entry_points() -> None:
 
 
 def test_protocol_lazy_exports_are_complete_and_discoverable() -> None:
-    assert set(protocol.__all__) <= set(dir(protocol))
-    for name in protocol.__all__:
+    assert not hasattr(protocol, "__all__")
+    lazy = set(protocol._EXPORT_MODULES)
+    assert lazy <= set(dir(protocol))
+    for name in lazy:
         value = getattr(protocol, name)
         assert value.__module__.startswith("mqttium.protocol")
 
@@ -336,6 +347,19 @@ def test_retired_entry_points_are_absent() -> None:
     assert not hasattr(AsyncClient(), "on_publish")
 
 
+def test_client_timeouts_are_builtin_timeouts() -> None:
+    assert issubclass(MQTTTimeoutError, MQTTError)
+    assert issubclass(MQTTTimeoutError, TimeoutError)
+
+
+def test_batch_error_carries_only_its_receipt() -> None:
+    receipt = PublishBatchReceipt()
+    error = PublishBatchError(receipt)
+    assert error.receipt is receipt
+    assert not hasattr(error, "failures") and not hasattr(error, "cause")
+    assert not hasattr(receipt, "completed")
+
+
 def test_stable_enumerations_have_no_unused_members() -> None:
     # MQTT 3.1 is unsupported and no state is reported while reconnecting.
     assert [level.name for level in MQTTProtocolVersion] == ["MQTTv311", "MQTTv5"]
@@ -351,3 +375,44 @@ def test_stable_enumerations_have_no_unused_members() -> None:
 def test_negotiated_settings_expose_fields_only() -> None:
     public = {name for name in dir(NegotiatedSettings) if not name.startswith("_")}
     assert public == {field.name for field in dataclasses.fields(NegotiatedSettings)}
+
+
+def test_result_models_are_read_only() -> None:
+    receipt = PublishReceipt(mid=3, qos=QoS.AT_LEAST_ONCE)
+    assert (receipt.mid, receipt.qos) == (3, QoS.AT_LEAST_ONCE)
+    with pytest.raises(AttributeError):
+        receipt.mid = 4  # type: ignore[misc]
+    assert receipt != PublishReceipt(mid=3, qos=QoS.AT_LEAST_ONCE)  # identity
+    assert list(inspect.signature(PublishReceipt).parameters) == ["mid", "qos"]
+    for result_type in (SubscribeResult, UnsubscribeResult):
+        result = result_type(mid=1, reason_codes=(0,))
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            result.mid = 2  # type: ignore[misc]
+
+
+def test_store_classes_keep_only_their_lifecycle_supported(tmp_path: Path) -> None:
+    from mqttium.persistence import MemoryInflightStore, SqliteInflightStore
+
+    assert list(inspect.signature(MemoryInflightStore).parameters) == []
+    assert list(inspect.signature(SqliteInflightStore).parameters) == ["path"]
+    with SqliteInflightStore(tmp_path / "s.db") as store:
+        assert callable(store.close)
+    # The protocol methods exist but are Internal; the contract says so.
+    doc = (Path(__file__).resolve().parents[2] / "docs" / "api-stability.md").read_text()
+    assert "Their protocol methods" in doc and "are Internal" in doc
+
+
+def test_will_is_a_publish_message() -> None:
+    will = PublishMessage("w/t", "bye", qos=1, properties=Properties({"will_delay_interval": 5}))
+    client = AsyncClient("c", protocol=MQTTProtocolVersion.MQTTv5, will=will)
+    config = client._engine.config
+    assert config.will is not None and config.will.payload == b"bye"
+    assert config.will_properties is will.properties
+    with pytest.raises(TypeError, match="PublishMessage"):
+        AsyncClient("c", will=Message("w/t", b"bye"))  # type: ignore[arg-type]
+
+
+def test_will_properties_a_will_cannot_carry_are_refused_at_construction() -> None:
+    will = PublishMessage("w/t", b"", properties=Properties({"topic_alias": 3}))
+    with pytest.raises(ProtocolError, match="not allowed on WILL"):
+        AsyncClient("c", protocol=MQTTProtocolVersion.MQTTv5, will=will)

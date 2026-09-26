@@ -217,7 +217,7 @@ async def _phase(scenario: str, count: int) -> dict[str, Any]:  # noqa: C901 - s
                 batch_receipt is None
                 or not batch_receipt.is_done()
                 or batch_receipt.submitted != count
-                or batch_receipt.completed != count
+                or batch_receipt.submitted - batch_receipt.pending_count != count
                 or batch_receipt.pending_count
                 or batch_receipt.failure_count
             ):

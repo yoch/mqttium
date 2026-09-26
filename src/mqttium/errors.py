@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -72,8 +71,11 @@ class NotConnectedError(MQTTError):
     """Operation requires an active connection."""
 
 
-class MQTTTimeoutError(MQTTError):
-    """Operation exceeded its deadline."""
+class MQTTTimeoutError(MQTTError, TimeoutError):
+    """Operation exceeded its deadline.
+
+    Also a builtin :class:`TimeoutError`, so ``except TimeoutError`` catches it.
+    """
 
 
 class SessionDiscardedError(MQTTError):
@@ -83,28 +85,19 @@ class SessionDiscardedError(MQTTError):
 class PublishBatchError(MQTTError):
     """One or more publications in a batch failed.
 
+    The failure details and counts are those of :attr:`receipt`. When
+    submission itself stopped, the exception is raised ``from`` its cause.
+
     Attributes:
-        receipt (PublishBatchReceipt | None): Receipt for the committed prefix
-            when submission stopped early, or ``None``. Await
+        receipt (PublishBatchReceipt): Receipt of the batch. When submission
+            stopped early it covers the committed prefix; await
             ``receipt.wait()`` to settle that prefix.
     """
 
-    def __init__(
-        self,
-        failures: Mapping[int, BaseException] | None = None,
-        *,
-        failure_count: int | None = None,
-        failure_counts: dict[str, int] | None = None,
-        cause: BaseException | None = None,
-        receipt: PublishBatchReceipt | None = None,
-    ) -> None:
-        self.failures = dict(failures or {})
-        self.failure_count = len(self.failures) if failure_count is None else failure_count
-        self.failure_counts = dict(failure_counts or {})
-        self.cause = cause
+    def __init__(self, receipt: PublishBatchReceipt, *, cause: BaseException | None = None) -> None:
         self.receipt = receipt
         if cause is not None:
             message = f"Batch submission failed: {cause}"
         else:
-            message = f"{self.failure_count} publication(s) failed in batch"
+            message = f"{receipt.failure_count} publication(s) failed in batch"
         super().__init__(message)

@@ -53,6 +53,11 @@ class EngineConfig:
         self._validate_bounds()
         if self.protocol is not MQTTProtocolVersion.MQTTv5:
             self._refuse_mqtt5_options()
+        elif self.will_properties is not None and self.will_properties.values:
+            # Refuse a property a Will cannot carry now, not at the first CONNECT.
+            from mqttium.codec.properties import WILL, encode_properties
+
+            encode_properties(self.will_properties, WILL)
         if self.connect_properties is not None:
             reserved = {"receive_maximum", "maximum_packet_size", "topic_alias_maximum"}
             if reserved.intersection(self.connect_properties.values):
