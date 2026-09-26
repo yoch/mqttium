@@ -40,7 +40,7 @@ fixes. `InboundSession` holds 25 state slots instead of 27, `OutboundSession`
 | --- | --- |
 | [CI 36266676868](https://github.com/yoch/mqttium/actions/runs/36266676868) and [ARM64 CI 36266676903](https://github.com/yoch/mqttium/actions/runs/36266676903) | Passed |
 | [Soak and broker interoperability 36267800944](https://github.com/yoch/mqttium/actions/runs/36267800944) | Passed: Linux and macOS soaks for MQTT 3.1.1 and 5, EMQX 5.8.9 and HiveMQ CE 2026.5 |
-| NETWORK_GATE_PENDING |
+| Strict ARM64 network gate vs RC16, [36270053544](https://github.com/yoch/mqttium/actions/runs/36270053544) | Passed: QoS 1 receipt ACK throughput at windows 1, 20 and 64 within 0.94–1.06 of RC16 per ABBA cycle; window 1 at 1.01–1.02 in 11 of 12 cycles |
 | Strict ARM64 open-loop gate vs RC16, [36267803906](https://github.com/yoch/mqttium/actions/runs/36267803906) | Passed; see below |
 | ARM64 paired regression vs RC16, [36267722844](https://github.com/yoch/mqttium/actions/runs/36267722844) | Passed: strict writer-capacity A/B 0.999 (QoS 0) and 0.987 (QoS 1), A/A 0.998 and 1.000; strict paced writer-latency A/B lag 1.002 at 2,500 and 1.000 at 10,000 msgs/s |
 
