@@ -538,13 +538,17 @@ class ProtocolEngine:
                 self.outbound.packet_ids.release(mid)
         self._pending_sub_requests.clear()
 
-    def notify_transport_closed(self) -> None:
-        was = self.state
-        self.state = ConnectionState.DISCONNECTED
-        self.outbound.transport_closed()
-        self.inbound.transport_closed()
+    def _enter_disconnected(self) -> None:
+        """End the connection's state machine and any AUTH exchange on it."""
         self._reauth_in_progress = False
         self._auth_response_due = None
+        self.state = ConnectionState.DISCONNECTED
+
+    def notify_transport_closed(self) -> None:
+        was = self.state
+        self._enter_disconnected()
+        self.outbound.transport_closed()
+        self.inbound.transport_closed()
         # Release sub/unsub MIDs still in flight — no ACK will arrive now.
         self._release_pending_subscription_requests()
         if was != ConnectionState.DISCONNECTED:
@@ -682,9 +686,7 @@ class ProtocolEngine:
         if self.codec.is_mqtt5:
             self._validate_connack_v5(connack)
         if connack.reason_code != 0:
-            self._reauth_in_progress = False
-            self._auth_response_due = None
-            self.state = ConnectionState.DISCONNECTED
+            self._enter_disconnected()
             self._emit(EffectKind.CONNACK, connack)
             self._emit(
                 EffectKind.DISCONNECTED,
@@ -715,9 +717,7 @@ class ProtocolEngine:
             and peer_maximum_packet_size is not None
             and peer_maximum_packet_size < 4
         ):
-            self._reauth_in_progress = False
-            self._auth_response_due = None
-            self.state = ConnectionState.DISCONNECTED
+            self._enter_disconnected()
             raise MandatoryResponseTooLargeError(
                 f"Broker maximum_packet_size {peer_maximum_packet_size} is below the "
                 "4-byte minimum required for mandatory QoS acknowledgements"
@@ -727,8 +727,7 @@ class ProtocolEngine:
             try:
                 self.outbound.check_session_replayable()
             except SessionReplayError:
-                self._reauth_in_progress = False
-                self.state = ConnectionState.DISCONNECTED
+                self._enter_disconnected()
                 raise
 
         self._reauth_in_progress = False
@@ -863,9 +862,7 @@ class ProtocolEngine:
 
     def _on_disconnect(self, raw: RawPacket) -> None:
         reason_code, properties = self.codec.decode_disconnect(raw.remaining)
-        self._reauth_in_progress = False
-        self._auth_response_due = None
-        self.state = ConnectionState.DISCONNECTED
+        self._enter_disconnected()
         self._release_pending_subscription_requests()
         self._emit(
             EffectKind.DISCONNECTED,
@@ -956,9 +953,7 @@ class ProtocolEngine:
                 pass
             else:
                 self._send(packet)
-        self._reauth_in_progress = False
-        self._auth_response_due = None
-        self.state = ConnectionState.DISCONNECTED
+        self._enter_disconnected()
         self._release_pending_subscription_requests()
         self._emit(
             EffectKind.DISCONNECTED,
