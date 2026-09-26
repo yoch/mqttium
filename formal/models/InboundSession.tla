@@ -2,247 +2,266 @@
 EXTENDS Naturals, FiniteSets, Sequences
 
 (***************************************************************************
-Inbound MQTT QoS/session ownership abstraction used for the MQTTium study.
+Inbound Receive Maximum ownership across resumed sessions, with manual
+acknowledgement (#498, #499).
 
-Four notions are deliberately independent:
-  1. durable protocol/application phase (\`phase\`),
-  2. Receive-Maximum ownership for the current Network Connection (\`slots\`),
-  3. manual QoS1 acknowledgement order/intent (\`q1Order\`, \`q1Ready\`),
-  4. connection liveness (\`connected\`).
+A broker with a durable session sends QoS 1 and QoS 2 PUBLISHes within the
+client's Receive Maximum [MQTT-3.3.4-9]: it counts a PUBLISH until it
+receives its PUBACK or PUBCOMP, and its quota restarts with each Network
+Connection [MQTT-4.9.0-1]. On reconnect it resends unacknowledged PUBLISHes
+and PUBRELs by phase [MQTT-4.4.0-1]. Acknowledgements are lost with the
+connection that carried them.
 
-Normative hooks:
-- MQTT-4.9.0-1/-2: send quota is initialized per Network Connection and a
-  QoS>0 PUBLISH consumes it when that PUBLISH is sent.
-- MQTT-4.3.3-6: a QoS2 sender MUST NOT re-send PUBLISH after sending PUBREL.
-- MQTT-4.3.3-10: duplicate QoS2 PUBLISH is acknowledged again only until the
-  receiver gets the corresponding PUBREL.
-- MQTT-4.6.0-2: PUBACKs follow PUBLISH receive order.
+The client is InboundSession with manual_ack=True:
+- rows: WAIT_PUBACK ("q1"), WAIT_PUBREL ("rel", with `user_acked`),
+  WAIT_USER_ACK ("user");
+- Receive Maximum owners: `_current_persisted_mids` (a PUBLISH observed on
+  this connection) and the PUBCOMPs still in the engine batch that owned a
+  slot (`_pending_pubcomp_slots`); the occupancy is their size;
+- manual QoS 1 PUBACKs leave in PUBLISH arrival order (`_manual_qos1_order`,
+  `_pending_manual_qos1_acks`) [MQTT-4.6.0-2];
+- a QoS 2 exchange completes when both its PUBREL and the application
+  acknowledgement arrived, in either order (`user_acked` before PUBREL,
+  WAIT_USER_ACK after);
+- take_effects() hands the batch to the wire and frees the PUBCOMP slots.
 
-\`DrainQ1\` is modeled as a separate internal action. MQTTium drains the ready
-prefix synchronously inside ack(); splitting it here is a conservative
-interleaving over-approximation for safety checking.
+Delivery marks and automatic acknowledgement are covered by
+InboundDeliveryCommit and InboundAckHandoff; every message counts as
+delivered here.
+
+Variant = "rc15": replay_session() pre-charges the replacement connection
+with every durable row (`_inflight = persisted`).
+Variant = "rc16": a row owns a slot only once its PUBLISH is observed on the
+current connection, but the application's acknowledgement of a replayed
+QoS 1 row sends its PUBACK at once, possibly before the broker's resend.
+Variant = "fixed": a QoS 1 PUBACK leaves only for a PUBLISH observed on the
+current connection (_drain_manual_qos1_acks stops at a row that is not yet).
+
+Invariants:
+- NoFalseRefusal: the client never refuses (DISCONNECT 0x93) a PUBLISH the
+  broker sent within Receive Maximum.
+- OwnersAreOutstanding: every slot owner is a PUBLISH the broker still counts
+  on this connection, so occupancy never exceeds the broker's own count.
+- NoSwallowedMessage: a new PUBLISH never lands on a stored row the broker
+  considers finished (the row would answer it with its old payload).
+- Q1OrderLive: the PUBACK order holds exactly the unacknowledged QoS 1 rows.
 ***************************************************************************)
 
-CONSTANTS Mids, ReceiveMaximum
+CONSTANTS Variant, Mids, ReceiveMaximum
+ASSUME Variant \in {"rc15", "rc16", "fixed"}
 
-None          == "None"
-Q1WaitAck     == "Q1WaitAck"
-Q2WaitRel     == "Q2WaitRel"
-Q2WaitRelAck  == "Q2WaitRelAck"
-Q2WaitUser    == "Q2WaitUser"
-Phases == {None, Q1WaitAck, Q2WaitRel, Q2WaitRelAck, Q2WaitUser}
+Kinds == {"puback", "pubrec", "pubcomp"}
+Ack(k, m) == [k |-> k, m |-> m]
 
-VARIABLES phase, slots, q1Order, q1Ready, connected
-vars == <<phase, slots, q1Order, q1Ready, connected>>
+VARIABLES
+  phase, userAcked, current, pubcompSlots, q1Order, q1Ready, batch,
+  wire, bph, bout, relOwed, connected, refused, swallowed
 
-OrderSet == {q1Order[i] : i \in 1..Len(q1Order)}
-OrderUnique ==
-  \A i, j \in 1..Len(q1Order): i # j => q1Order[i] # q1Order[j]
+vars == <<phase, userAcked, current, pubcompSlots, q1Order, q1Ready, batch,
+          wire, bph, bout, relOwed, connected, refused, swallowed>>
+
+clientVars == <<phase, userAcked, current, pubcompSlots, q1Order, q1Ready, batch>>
 
 TypeOK ==
-  /\ phase \in [Mids -> Phases]
-  /\ slots \subseteq Mids
+  /\ phase \in [Mids -> {"none", "q1", "rel", "user"}]
+  /\ userAcked \in [Mids -> BOOLEAN]
+  /\ current \subseteq Mids
+  /\ pubcompSlots \subseteq Mids
   /\ q1Order \in Seq(Mids)
   /\ q1Ready \subseteq Mids
+  /\ bph \in [Mids -> {"idle", "pub1", "pub2", "rel"}]
+  /\ bout \subseteq Mids
+  /\ relOwed \subseteq Mids
   /\ connected \in BOOLEAN
-
-OwnershipOK ==
-  /\ \A m \in slots: phase[m] # None
-  /\ \A m \in OrderSet: phase[m] = Q1WaitAck
-  /\ q1Ready \subseteq OrderSet
-  /\ OrderUnique
+  /\ refused \in BOOLEAN
+  /\ swallowed \in BOOLEAN
 
 Init ==
-  /\ phase = [m \in Mids |-> None]
-  /\ slots = {}
+  /\ phase = [m \in Mids |-> "none"]
+  /\ userAcked = [m \in Mids |-> FALSE]
+  /\ current = {}
+  /\ pubcompSlots = {}
   /\ q1Order = <<>>
   /\ q1Ready = {}
+  /\ batch = <<>>
+  /\ wire = <<>>
+  /\ bph = [m \in Mids |-> "idle"]
+  /\ bout = {}
+  /\ relOwed = {}
   /\ connected = TRUE
+  /\ refused = FALSE
+  /\ swallowed = FALSE
 
-Disconnect ==
+Used == Cardinality(current) + Cardinality(pubcompSlots)
+
+\* The client refuses the PUBLISH and the connection ends (0x93).
+Refuse ==
+  /\ refused' = TRUE
   /\ connected' = FALSE
-  /\ UNCHANGED <<phase, slots, q1Order, q1Ready>>
-
-Reconnect ==
-  /\ phase' = phase
-  /\ slots' = {}
-  /\ q1Order' = q1Order
+  /\ batch' = <<>>
+  /\ wire' = <<>>
   /\ q1Ready' = {}
-  /\ connected' = TRUE
+  /\ pubcompSlots' = {}
+  /\ relOwed' = {}
+  /\ UNCHANGED <<phase, userAcked, current, q1Order>>
 
-Q1New(m) ==
+\* Client handling of PUBLISH(m, qos): _on_qos1_manual / _on_qos2.
+ClientPublish(m, qos) ==
+  IF m \notin current /\ Used >= ReceiveMaximum
+  THEN Refuse
+  ELSE
+    /\ current' = current \cup {m}
+    /\ IF phase[m] = "none"
+       THEN /\ phase' = [phase EXCEPT ![m] = IF qos = 1 THEN "q1" ELSE "rel"]
+            /\ q1Order' = IF qos = 1 THEN Append(q1Order, m) ELSE q1Order
+       ELSE UNCHANGED <<phase, q1Order>>
+    /\ batch' = IF qos = 2 THEN Append(batch, Ack("pubrec", m)) ELSE batch
+    /\ UNCHANGED <<userAcked, pubcompSlots, q1Ready, wire, relOwed, connected, refused>>
+
+\* The broker sends a new PUBLISH within its quota.
+BrokerNew(m, qos) ==
   /\ connected
-  /\ phase[m] = None
-  /\ Cardinality(slots) < ReceiveMaximum
-  /\ phase' = [phase EXCEPT ![m] = Q1WaitAck]
-  /\ slots' = slots \cup {m}
-  /\ q1Order' = Append(q1Order, m)
-  /\ UNCHANGED <<q1Ready, connected>>
+  /\ bph[m] = "idle"
+  /\ Cardinality(bout) < ReceiveMaximum
+  /\ bph' = [bph EXCEPT ![m] = IF qos = 1 THEN "pub1" ELSE "pub2"]
+  /\ bout' = bout \cup {m}
+  \* A stored row under an identifier the broker reuses answers it as a
+  \* duplicate: the new message is lost.
+  /\ swallowed' = (swallowed \/ phase[m] # "none")
+  /\ ClientPublish(m, qos)
 
-Q1NewOverQuota(m) ==
+\* After reconnect the broker resends an unacknowledged PUBLISH.
+BrokerResend(m) ==
   /\ connected
-  /\ phase[m] = None
-  /\ Cardinality(slots) >= ReceiveMaximum
-  /\ Disconnect
+  /\ bph[m] \in {"pub1", "pub2"}
+  /\ m \notin bout
+  /\ Cardinality(bout) < ReceiveMaximum
+  /\ bout' = bout \cup {m}
+  /\ UNCHANGED <<bph, swallowed>>
+  /\ ClientPublish(m, IF bph[m] = "pub1" THEN 1 ELSE 2)
 
-Q1Retransmit(m) ==
+Complete2(m) ==
+  /\ phase' = [phase EXCEPT ![m] = "none"]
+  /\ userAcked' = [userAcked EXCEPT ![m] = FALSE]
+  /\ current' = current \ {m}
+  /\ pubcompSlots' = IF m \in current THEN pubcompSlots \cup {m} ELSE pubcompSlots
+  /\ batch' = Append(batch, Ack("pubcomp", m))
+
+\* The broker sends PUBREL; the client answers (on_pubrel, manual_ack).
+BrokerPubrel(m) ==
   /\ connected
-  /\ phase[m] = Q1WaitAck
-  /\ m \notin slots
-  /\ Cardinality(slots) < ReceiveMaximum
-  /\ slots' = slots \cup {m}
-  /\ UNCHANGED <<phase, q1Order, q1Ready, connected>>
+  /\ m \in relOwed
+  /\ relOwed' = relOwed \ {m}
+  /\ CASE phase[m] = "rel" /\ userAcked[m] ->
+            /\ Complete2(m)
+            /\ UNCHANGED <<q1Order, q1Ready>>
+       [] phase[m] = "rel" ->
+            /\ phase' = [phase EXCEPT ![m] = "user"]
+            /\ UNCHANGED <<userAcked, current, pubcompSlots, q1Order, q1Ready, batch>>
+       [] phase[m] = "none" ->
+            /\ batch' = Append(batch, Ack("pubcomp", m))
+            /\ UNCHANGED <<phase, userAcked, current, pubcompSlots, q1Order, q1Ready>>
+       [] OTHER -> UNCHANGED clientVars
+  /\ UNCHANGED <<wire, bph, bout, connected, refused, swallowed>>
 
-Q1RetransmitSameConnection(m) ==
+\* The application acknowledges a delivered message (ack()).
+AppAck(m) ==
   /\ connected
-  /\ phase[m] = Q1WaitAck
-  /\ m \in slots
-  /\ UNCHANGED vars
+  /\ CASE phase[m] = "q1" /\ m \notin q1Ready ->
+            /\ q1Ready' = q1Ready \cup {m}
+            /\ UNCHANGED <<phase, userAcked, current, pubcompSlots, q1Order, batch>>
+       [] phase[m] = "rel" /\ ~userAcked[m] ->
+            /\ userAcked' = [userAcked EXCEPT ![m] = TRUE]
+            /\ UNCHANGED <<phase, current, pubcompSlots, q1Order, q1Ready, batch>>
+       [] phase[m] = "user" ->
+            /\ Complete2(m)
+            /\ UNCHANGED <<q1Order, q1Ready>>
+       [] OTHER -> FALSE
+  /\ UNCHANGED <<wire, bph, bout, relOwed, connected, refused, swallowed>>
 
-Q1RetransmitOverQuota(m) ==
-  /\ connected
-  /\ phase[m] = Q1WaitAck
-  /\ m \notin slots
-  /\ Cardinality(slots) >= ReceiveMaximum
-  /\ Disconnect
-
-Q1Collision(m) ==
-  /\ connected
-  /\ phase[m] \in {Q2WaitRel, Q2WaitRelAck, Q2WaitUser}
-  /\ Disconnect
-
-Q2New(m) ==
-  /\ connected
-  /\ phase[m] = None
-  /\ Cardinality(slots) < ReceiveMaximum
-  /\ phase' = [phase EXCEPT ![m] = Q2WaitRel]
-  /\ slots' = slots \cup {m}
-  /\ UNCHANGED <<q1Order, q1Ready, connected>>
-
-Q2NewOverQuota(m) ==
-  /\ connected
-  /\ phase[m] = None
-  /\ Cardinality(slots) >= ReceiveMaximum
-  /\ Disconnect
-
-Q2DuplicateBeforePubrel(m) ==
-  /\ connected
-  /\ phase[m] \in {Q2WaitRel, Q2WaitRelAck}
-  /\ m \in slots
-  /\ UNCHANGED vars
-
-Q2RetransmitAfterReconnect(m) ==
-  /\ connected
-  /\ phase[m] \in {Q2WaitRel, Q2WaitRelAck}
-  /\ m \notin slots
-  /\ Cardinality(slots) < ReceiveMaximum
-  /\ slots' = slots \cup {m}
-  /\ UNCHANGED <<phase, q1Order, q1Ready, connected>>
-
-Q2RetransmitOverQuota(m) ==
-  /\ connected
-  /\ phase[m] \in {Q2WaitRel, Q2WaitRelAck}
-  /\ m \notin slots
-  /\ Cardinality(slots) >= ReceiveMaximum
-  /\ Disconnect
-
-Q2PublishAfterPubrel(m) ==
-  /\ connected
-  /\ phase[m] = Q2WaitUser
-  /\ Disconnect
-
-Q2Collision(m) ==
-  /\ connected
-  /\ phase[m] = Q1WaitAck
-  /\ Disconnect
-
-Pubrel(m) ==
-  /\ connected
-  /\ phase[m] = Q2WaitRel
-  /\ phase' = [phase EXCEPT ![m] = Q2WaitUser]
-  /\ UNCHANGED <<slots, q1Order, q1Ready, connected>>
-
-PubrelAfterEarlyAck(m) ==
-  /\ connected
-  /\ phase[m] = Q2WaitRelAck
-  /\ phase' = [phase EXCEPT ![m] = None]
-  /\ slots' = slots \ {m}
-  /\ UNCHANGED <<q1Order, q1Ready, connected>>
-
-DuplicatePubrel(m) ==
-  /\ connected
-  /\ phase[m] = Q2WaitUser
-  /\ UNCHANGED vars
-
-OrphanPubrel(m) ==
-  /\ connected
-  /\ phase[m] = None
-  /\ UNCHANGED vars
-
-BadPubrelOnQ1(m) ==
-  /\ connected
-  /\ phase[m] = Q1WaitAck
-  /\ Disconnect
-
-AckQ1Mark(m) ==
-  /\ connected
-  /\ phase[m] = Q1WaitAck
-  /\ q1Ready' = q1Ready \cup {m}
-  /\ UNCHANGED <<phase, slots, q1Order, connected>>
-
+\* _drain_manual_qos1_acks: the ready prefix leaves in arrival order.
 DrainQ1 ==
   /\ connected
-  /\ Len(q1Order) > 0
+  /\ q1Order # <<>>
   /\ Head(q1Order) \in q1Ready
+  /\ Variant = "fixed" => Head(q1Order) \in current
   /\ LET m == Head(q1Order) IN
-       /\ phase' = [phase EXCEPT ![m] = None]
-       /\ slots' = slots \ {m}
+       /\ phase' = [phase EXCEPT ![m] = "none"]
+       /\ current' = current \ {m}
        /\ q1Order' = Tail(q1Order)
        /\ q1Ready' = q1Ready \ {m}
-       /\ UNCHANGED connected
+       /\ batch' = Append(batch, Ack("puback", m))
+  /\ UNCHANGED <<userAcked, pubcompSlots, wire, bph, bout, relOwed, connected, refused,
+                 swallowed>>
 
-EarlyAckQ2(m) ==
+\* take_effects(): the batch reaches the wire; PUBCOMP slots are freed.
+Handoff ==
   /\ connected
-  /\ phase[m] = Q2WaitRel
-  /\ phase' = [phase EXCEPT ![m] = Q2WaitRelAck]
-  /\ UNCHANGED <<slots, q1Order, q1Ready, connected>>
+  /\ batch # <<>>
+  /\ wire' = wire \o batch
+  /\ batch' = <<>>
+  /\ pubcompSlots' = {}
+  /\ UNCHANGED <<phase, userAcked, current, q1Order, q1Ready, bph, bout, relOwed,
+                 connected, refused, swallowed>>
 
-RepeatEarlyAckQ2(m) ==
+\* The broker receives the next acknowledgement, in wire order.
+BrokerReceive ==
   /\ connected
-  /\ phase[m] = Q2WaitRelAck
-  /\ UNCHANGED vars
+  /\ wire # <<>>
+  /\ LET a == Head(wire) IN
+       CASE a.k = "puback" /\ bph[a.m] = "pub1" ->
+              /\ bph' = [bph EXCEPT ![a.m] = "idle"]
+              /\ bout' = bout \ {a.m}
+              /\ UNCHANGED relOwed
+         [] a.k = "pubrec" /\ bph[a.m] = "pub2" ->
+              /\ bph' = [bph EXCEPT ![a.m] = "rel"]
+              /\ relOwed' = relOwed \cup {a.m}
+              /\ UNCHANGED bout
+         [] a.k = "pubcomp" /\ bph[a.m] = "rel" ->
+              /\ bph' = [bph EXCEPT ![a.m] = "idle"]
+              /\ bout' = bout \ {a.m}
+              /\ UNCHANGED relOwed
+         [] OTHER -> UNCHANGED <<bph, bout, relOwed>>
+  /\ wire' = Tail(wire)
+  /\ UNCHANGED <<clientVars, connected, refused, swallowed>>
 
-AckQ2(m) ==
+\* The connection is lost, with every acknowledgement it still carried.
+Disconnect ==
   /\ connected
-  /\ phase[m] = Q2WaitUser
-  /\ phase' = [phase EXCEPT ![m] = None]
-  /\ slots' = slots \ {m}
-  /\ UNCHANGED <<q1Order, q1Ready, connected>>
+  /\ connected' = FALSE
+  /\ batch' = <<>>
+  /\ wire' = <<>>
+  /\ q1Ready' = {}
+  /\ pubcompSlots' = {}
+  /\ relOwed' = {}
+  /\ UNCHANGED <<phase, userAcked, current, q1Order, bph, bout, refused, swallowed>>
 
-Q1Publish(m) ==
-  Q1New(m) \/ Q1NewOverQuota(m) \/ Q1Retransmit(m) \/
-  Q1RetransmitSameConnection(m) \/ Q1RetransmitOverQuota(m) \/ Q1Collision(m)
-
-Q2Publish(m) ==
-  Q2New(m) \/ Q2NewOverQuota(m) \/ Q2DuplicateBeforePubrel(m) \/
-  Q2RetransmitAfterReconnect(m) \/ Q2RetransmitOverQuota(m) \/
-  Q2PublishAfterPubrel(m) \/ Q2Collision(m)
-
-RecvPubrel(m) ==
-  Pubrel(m) \/ PubrelAfterEarlyAck(m) \/ DuplicatePubrel(m) \/
-  OrphanPubrel(m) \/ BadPubrelOnQ1(m)
-
-AppAck(m) == AckQ1Mark(m) \/ EarlyAckQ2(m) \/ RepeatEarlyAckQ2(m) \/ AckQ2(m)
+\* Session resumed (Session Present = 1) on a new Network Connection.
+Reconnect ==
+  /\ ~connected
+  /\ connected' = TRUE
+  /\ bout' = {}
+  /\ relOwed' = {m \in Mids : bph[m] = "rel"}
+  /\ current' = IF Variant = "rc15" THEN {m \in Mids : phase[m] # "none"} ELSE {}
+  /\ UNCHANGED <<phase, userAcked, pubcompSlots, q1Order, q1Ready, batch, wire, bph, refused,
+                 swallowed>>
 
 Next ==
-  Reconnect \/ DrainQ1 \/
-  \E m \in Mids: Q1Publish(m) \/ Q2Publish(m) \/ RecvPubrel(m) \/ AppAck(m)
+  \/ \E m \in Mids : \E q \in {1, 2} : BrokerNew(m, q)
+  \/ \E m \in Mids : BrokerResend(m) \/ BrokerPubrel(m) \/ AppAck(m)
+  \/ DrainQ1 \/ Handoff \/ BrokerReceive \/ Disconnect \/ Reconnect
 
 Spec == Init /\ [][Next]_vars
 
-ReceiveMaximumInv == Cardinality(slots) <= ReceiveMaximum
-SlotOwnsLiveExchange == \A m \in slots: phase[m] # None
-Q1OrderLive == \A m \in OrderSet: phase[m] = Q1WaitAck
-Q1ReadyOrdered == q1Ready \subseteq OrderSet
+NoFalseRefusal == ~refused
+
+OwnersAreOutstanding == connected => (current \cup pubcompSlots) \subseteq bout
+
+NoSwallowedMessage == ~swallowed
+
+Q1OrderLive ==
+  /\ {q1Order[i] : i \in 1..Len(q1Order)} = {m \in Mids : phase[m] = "q1"}
+  /\ Len(q1Order) = Cardinality({m \in Mids : phase[m] = "q1"})
+  /\ q1Ready \subseteq {m \in Mids : phase[m] = "q1"}
 
 =============================================================================

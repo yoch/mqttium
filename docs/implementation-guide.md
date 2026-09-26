@@ -198,6 +198,13 @@ through the ordinary acquire path. Packet-identifier reuse across unfinished
 QoS 1 and QoS 2 exchanges is a protocol error, including when the QoS 1
 PUBACK has been emitted but not yet handed off.
 
+A manual QoS 1 PUBACK leaves in PUBLISH arrival order and only for a PUBLISH
+observed on the current connection. A row replayed from an earlier connection
+keeps the application's acknowledgement until the broker's resend arrives
+[MQTT-4.4.0-1]; a PUBACK sent before it would make the resend a new exchange
+[MQTT-4.3.2-5] that the broker no longer counts, holding a Receive Maximum
+slot and answering a later reuse of the identifier with the old payload.
+
 A completed QoS 2 exchange keeps its Receive Maximum slot and its packet
 identifier the same way, until `take_effects()` hands its PUBCOMP to the
 runtime: the broker cannot have received it before. A PUBLISH decoded earlier

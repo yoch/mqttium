@@ -286,6 +286,13 @@ recovery creates fresh handles on redelivery; the identities are not persisted.
 Only active manual exchanges occupy the identity index, and auto acknowledgement
 does not allocate that index. QoS 0 acknowledgement remains a no-op.
 
+A QoS 1 PUBACK only answers a PUBLISH received on the current connection. When
+the application acknowledges a message replayed from an earlier connection,
+the PUBACK waits for the broker's resend of that PUBLISH, which a resumed
+session delivers first; the resend is then not delivered again. Sent earlier,
+the PUBACK would precede the resend, which MQTT then requires the client to
+treat as a new message the broker no longer counts.
+
 It does not create exactly-once business processing. A crash can occur after
 the business transaction commits but before the acknowledgement reaches the
 broker. The broker may then redeliver. Use an application key, transaction or
