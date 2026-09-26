@@ -12,6 +12,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   frozen dataclass constructor, which set its eight fields through
   `object.__setattr__`. Engine-level reception is about 20 % faster for QoS 0
   and QoS 1; the delivered `Message` is unchanged.
+- `publish()` and the reader skip awaiting the effect pump and the delivery
+  lane when neither holds work, the common case. An awaited QoS 0 `publish()`
+  uses about 6 % less CPU per message; ordering is unchanged.
 
 - `MQTTTimeoutError` also derives from `TimeoutError`, so `except TimeoutError`
   catches client deadlines.

@@ -359,6 +359,14 @@ class EffectPump:
         if owned and self.flush_requested and self.pending:
             self.schedule()
 
+    def settled(self, target: int | None = None) -> bool:
+        """Whether `drain(target=target)` would return without doing anything.
+
+        Hot paths test this first: a settled pump is the common case and the
+        test avoids creating and awaiting a coroutine.
+        """
+        return not self.pending and self.applied >= (self.enqueued if target is None else target)
+
     async def drain(self, *, nowait: bool = False, target: int | None = None) -> None:
         self.drain_inline(target=target)
         if nowait:

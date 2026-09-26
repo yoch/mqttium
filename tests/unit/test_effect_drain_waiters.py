@@ -109,3 +109,21 @@ async def test_cancelled_drain_cancels_its_progress_wait_without_orphan() -> Non
         task = pump.task
         if task is not None:
             await task
+
+
+async def test_settled_is_exactly_the_no_op_drain() -> None:
+    release = asyncio.Event()
+    owner = _Owner(release)
+    pump = EffectPump(owner)  # type: ignore[arg-type]
+    assert pump.settled()
+    pump.collect_from_engine()
+    assert not pump.settled()
+    assert not pump.settled(pump.enqueued)
+    # A reached fence is not enough: drain() would still schedule the pending work.
+    assert not pump.settled(pump.applied)
+    # Hot paths skip drain() only when settled(); unsettled work still drains.
+    release.set()
+    await pump.drain()
+    assert pump.settled()
+    assert pump.settled(pump.enqueued)
+    assert not pump.settled(pump.enqueued + 1)
