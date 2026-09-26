@@ -24,19 +24,18 @@ class WriterStats:
     queued_bytes: int
     high_water_messages: int
     high_water_bytes: int
-    max_messages: int
-    max_bytes: int
+    message_limit: int
+    byte_limit: int
     waiters: int
     last_outbound: float
 
 
 @dataclass(slots=True, frozen=True)
 class DecoderStats:
-    """Received bytes not yet decoded, against the packet-size bound."""
+    """Received bytes not yet decoded."""
 
     buffered_bytes: int
     high_water_bytes: int
-    max_packet_size: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -82,7 +81,7 @@ class ClientStats:
     """
 
     state: ConnectionState
-    connection_epoch: int
+    connections: int
     reconnect_attempt: int
     outbound: OutboundStats
     inbound: InboundStats

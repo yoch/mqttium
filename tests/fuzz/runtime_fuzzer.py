@@ -1156,7 +1156,7 @@ class _RuntimeHarness:
             )
         assert 0 <= stats.inbound.inflight <= stats.inbound.inflight_limit
         assert stats.delivery.iterator_bytes >= 0
-        if self.callback_epoch == stats.connection_epoch and self.client.is_connected:
+        if self.callback_epoch == self.client._connection_epoch and self.client.is_connected:
             reader = self.client._reader_task
             assert reader is not None and not reader.done(), (
                 "callback self-cancellation terminated the delivering reader"
@@ -1173,7 +1173,7 @@ class _RuntimeHarness:
                 newer > older
                 for older, newer in zip(transport_epochs, transport_epochs[1:], strict=False)
             ), "replacement transports reused a connection epoch"
-            assert stats.connection_epoch >= self.transport.owner_epoch, (
+            assert self.client._connection_epoch >= self.transport.owner_epoch, (
                 "connection epoch was not invalidated before transport ownership changed"
             )
         if terminal:
@@ -1205,7 +1205,7 @@ class _RuntimeHarness:
                 "lifecycle hook survived terminal teardown"
             )
             if self.transports:
-                assert stats.connection_epoch > self.transport.owner_epoch, (
+                assert self.client._connection_epoch > self.transport.owner_epoch, (
                     "terminal teardown did not retire its connection epoch"
                 )
 

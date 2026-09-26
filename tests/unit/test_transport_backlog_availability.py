@@ -38,8 +38,8 @@ async def test_reader_backlog_is_unknown_not_zero(transport_type):
 
 
 def test_no_transport_and_unknown_transport_are_distinct():
-    assert TransportStats.unavailable(None).buffered_read_bytes == 0
-    assert TransportStats.unavailable(object()).buffered_read_bytes is None
+    assert TransportStats._unavailable(None).buffered_read_bytes == 0
+    assert TransportStats._unavailable(object()).buffered_read_bytes is None
 
 
 class _ClosingWriter(_Writer):
@@ -87,11 +87,10 @@ async def test_client_snapshot_composes_transport_availability():
     try:
         # A live transport without a statistics method cannot measure.
         live = client.stats().transport
-        assert live.kind == "ScriptedBrokerTransport"
         assert live.buffered_read_bytes is None
     finally:
         await client.disconnect()
-    assert client.stats().transport == TransportStats.unavailable(None)
+    assert client.stats().transport == TransportStats._unavailable(None)
     assert client.stats().transport.buffered_read_bytes == 0
 
     # A present but closing pull transport is still present, not absent.
@@ -99,8 +98,7 @@ async def test_client_snapshot_composes_transport_availability():
     reader.feed_data(b"x")
     client._transport = StreamTransport(reader, _ClosingWriter())
     closing = client.stats().transport
-    assert (closing.kind, closing.closing, closing.buffered_read_bytes) == (
-        "StreamTransport",
+    assert (closing.closing, closing.buffered_read_bytes) == (
         True,
         None,
     )

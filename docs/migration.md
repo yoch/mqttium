@@ -60,6 +60,12 @@ removes contracts that had no effect, no use, or duplicated another.
 | Nested statistics types imported from `mqttium.api.stats` or other modules | Import them from `mqttium.api` |
 | `will=Message(...)` plus `will_properties=Properties(...)` | `will=PublishMessage(topic, payload, qos=..., retain=..., properties=...)`; a `Message` is refused with `TypeError` |
 | Store methods (`put_out`, `get_out`, `complete_out`, `in_replay_pages`, `batch`, ...) called by applications | Internal; use `client.stats()` for a running client. Construction, `store=`, `close()` and `with` stay supported |
+| `ClientStats.connection_epoch` (an internal epoch, advanced about twice per connection) | `ClientStats.connections`: connections established since construction |
+| `WriterStats.max_messages`, `max_bytes` | `WriterStats.message_limit`, `byte_limit` |
+| `DecoderStats.max_packet_size` | The `maximum_packet_size` you configured |
+| `TransportStats.kind` | None; the application knows which transport it opened |
+| `ProtocolError` for a `Properties` value or name of the wrong type | `TypeError` |
+| `ProtocolError` for a `SubscribeOptions` QoS or `retain_handling` out of range | `ValueError`, like an invalid QoS given to `publish()` |
 | `__all__` lists of Internal packages (`mqttium.packets`, `codec`, `transport`, `dispatch`, `protocol`, `api.models`, `api.stats`) | None; these packages are Internal |
 
 `MQTTTimeoutError` now also derives from `TimeoutError`; existing

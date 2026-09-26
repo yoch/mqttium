@@ -56,6 +56,13 @@ All MQTTium-specific public errors derive from `MQTTError`.
     options:
       heading_level: 3
 
+Invalid arguments raise builtin exceptions, not `MQTTError`: a value of the
+wrong Python type raises `TypeError` (for example a `Properties` value of an
+unsupported type), and a value out of range raises `ValueError` (for example a
+QoS outside 0–2 or `retain_handling` outside 0–2). `ProtocolError` is kept for
+MQTT rules: wildcards where a topic name is required, properties a packet cannot
+carry, MQTT 5 options on an MQTT 3.1.1 client, and peer violations.
+
 Catch the narrowest useful error. In particular, backpressure, a terminal
 connection rejection, and a discarded durable session require different
 application responses.

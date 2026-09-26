@@ -124,7 +124,8 @@ def test_outbound_packet_identifiers_are_validated() -> None:
 
 
 def test_subscribe_options_reject_qos3() -> None:
-    with pytest.raises(ProtocolError, match="QoS"):
+    # An out-of-range argument is a ValueError, not a protocol violation.
+    with pytest.raises(ValueError, match="QoS"):
         SubscribeOptions(qos=3).encode_byte(V5)  # type: ignore[arg-type]
 
 
