@@ -2,8 +2,10 @@ name: ARM64 receive-candidate comparison
 run-name: "Receive comparison: ${{ inputs.candidate_a_ref }} vs ${{ inputs.candidate_b_ref }}"
 
 # Neutral head-to-head for competing receive-path candidates. Tooling only.
-# Measures the saturated 64 KiB receive ceiling, storage/feed diagnostics, and
-# the historic fixed-rate RTT regime under one pinned protocol.
+# Measures the saturated receive ceiling (64 KiB messages by default;
+# payload_size 64 with a higher offer_msgs_s measures the small-message path),
+# storage/feed diagnostics, and the historic fixed-rate RTT regime under one
+# pinned protocol.
 
 on:
   workflow_dispatch:
@@ -15,6 +17,16 @@ on:
       candidate_b_ref:
         description: Exact 40-character commit SHA for arm B
         required: true
+        type: string
+      payload_size:
+        description: Payload bytes per message (64 measures the small-message receive path)
+        required: false
+        default: "65536"
+        type: string
+      offer_msgs_s:
+        description: Publisher offer in messages/s; it must exceed the receive ceiling
+        required: false
+        default: "14000"
         type: string
       confirm_trusted_code:
         description: I confirm that both input commits were reviewed and are trusted on the persistent runner
@@ -32,8 +44,8 @@ concurrency:
 env:
   BENCH_SHA: 37160eed99b50d1f384e1565a16d0346eb01ca56
   BENCHTOOLS_SHA: 3369317e64bb164b672bdc4b634952fb904bdbf4
-  PAYLOAD_SIZE: "65536"
-  OFFER_MSGS_S: "14000"
+  PAYLOAD_SIZE: ${{ inputs.payload_size }}
+  OFFER_MSGS_S: ${{ inputs.offer_msgs_s }}
   RTT_TARGET_RATE: "3942"
 
 jobs:
@@ -53,6 +65,8 @@ jobs:
             [[ "$value" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "arm refs must be exact commit SHAs" >&2; exit 2; }
           done
           [ "$A_REF" != "$B_REF" ] || { echo "the two arms must differ" >&2; exit 2; }
+          [[ "$PAYLOAD_SIZE" =~ ^[1-9][0-9]{0,6}$ ]] || { echo "payload_size must be a positive integer" >&2; exit 2; }
+          [[ "$OFFER_MSGS_S" =~ ^[1-9][0-9]{0,7}$ ]] || { echo "offer_msgs_s must be a positive integer" >&2; exit 2; }
 
       - name: Check out arm A
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
