@@ -36,7 +36,7 @@ async def test_source_reentry_preserves_writer_order_and_separate_receipts(qos, 
         await receipt.wait()
         await external[0].wait()
         await client._write_pump.join()
-        assert receipt.submitted == receipt.completed == 2
+        assert receipt.pending_count == 0 and receipt.submitted == 2
         assert [packet.payload for packet in broker.publishes] == [b"first", b"middle", b"last"]
         assert not client._receipts
         assert not client._batch_receipts
@@ -60,10 +60,10 @@ async def test_iterator_failure_seals_only_committed_prefix_at_driver_boundaries
     try:
         with pytest.raises(PublishBatchError) as caught:
             await client.publish_many(messages())
-        assert caught.value.cause is failure
+        assert caught.value.__cause__ is failure
         receipt = caught.value.receipt
         assert receipt._sealed
-        assert receipt.submitted == receipt.completed == failure_index
+        assert receipt.pending_count == 0 and receipt.submitted == failure_index
         await receipt.wait()
         await client._write_pump.join()
         assert [packet.payload for packet in broker.publishes] == [
@@ -101,14 +101,14 @@ async def test_qos1_effect_handoff_exception_keeps_prefix_without_retry(monkeypa
             patch.setattr(client._write_pump, "try_enqueue", accepted_then_raise)
             with pytest.raises(PublishBatchError) as caught:
                 await client.publish_many(messages())
-        assert caught.value.cause is failure
+        assert caught.value.__cause__ is failure
         receipt = caught.value.receipt
         assert receipt.submitted == 2
         assert consumed == [0, 1]
         assert len(attempts) == 2
         await client._write_pump.join()
         await asyncio.wait_for(receipt.wait(), 2)
-        assert receipt.completed == 2
+        assert receipt.submitted - receipt.pending_count == 2
         assert [packet.payload for packet in broker.publishes] == [b"\x00", b"\x01"]
     finally:
         await client.disconnect()
@@ -139,7 +139,7 @@ async def test_mixed_qos_keeps_wire_order_and_yields_within_a_long_source():
         await asyncio.wait_for(receipt.wait(), 2)
         await client._write_pump.join()
         assert heartbeat == [256]
-        assert receipt.submitted == receipt.completed == len(levels)
+        assert receipt.pending_count == 0 and receipt.submitted == len(levels)
         assert [packet.payload for packet in broker.publishes] == [
             str(index).encode() for index in range(len(levels))
         ]
@@ -170,10 +170,10 @@ async def test_validation_failure_does_not_advance_beyond_committed_prefix(failu
     try:
         with pytest.raises(PublishBatchError) as caught:
             await client.publish_many(messages())
-        assert isinstance(caught.value.cause, TypeError if invalid is None else ValueError)
+        assert isinstance(caught.value.__cause__, TypeError if invalid is None else ValueError)
         receipt = caught.value.receipt
         assert receipt._sealed
-        assert receipt.submitted == receipt.completed == failure_index
+        assert receipt.pending_count == 0 and receipt.submitted == failure_index
         await receipt.wait()
         await client._write_pump.join()
         assert consumed == [*range(failure_index), "invalid"]
@@ -208,6 +208,6 @@ async def test_source_is_not_called_again_after_its_first_exhaustion():
         await receipt.wait()
         await client._write_pump.join()
         assert source.calls == 66
-        assert receipt.submitted == receipt.completed == len(broker.publishes) == 65
+        assert receipt.pending_count == 0 and receipt.submitted == len(broker.publishes) == 65
     finally:
         await client.disconnect()

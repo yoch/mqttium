@@ -5,10 +5,9 @@ from __future__ import annotations
 import pytest
 
 from mqttium.codec.properties import PUBLISH, WILL, decode_properties, encode_properties
-from mqttium.enums import ConnectionState, MQTTProtocolVersion
+from mqttium.enums import MQTTProtocolVersion
 from mqttium.errors import MalformedPacketError, ProtocolError
 from mqttium.protocol.config import EngineConfig
-from mqttium.protocol.engine import ProtocolEngine
 from mqttium.types import Message, Properties
 
 
@@ -33,20 +32,15 @@ def test_response_topic_decode_requires_a_topic_name(response_topic: str) -> Non
 
 
 @pytest.mark.parametrize("response_topic", ["", "reply/#", "reply/+"])
-def test_invalid_will_response_topic_fails_before_connect_state_mutation(
+def test_invalid_will_response_topic_is_refused_at_configuration(
     response_topic: str,
 ) -> None:
-    engine = ProtocolEngine(
+    # Will Properties are validated when the configuration is built, before
+    # any engine or connection state exists.
+    with pytest.raises(ProtocolError, match="response_topic"):
         EngineConfig(
             client_id="response-topic",
             protocol=MQTTProtocolVersion.MQTTv5,
             will=Message(topic="will/topic", payload=b"bye"),
             will_properties=Properties({"response_topic": response_topic}),
         )
-    )
-
-    with pytest.raises(ProtocolError, match="response_topic"):
-        engine.begin_connect()
-
-    assert engine.state is ConnectionState.NEW
-    assert engine.take_effects() == []

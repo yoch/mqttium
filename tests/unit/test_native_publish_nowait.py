@@ -198,7 +198,7 @@ async def test_publish_many_qos0_uses_engine_admission() -> None:
     )
 
     assert receipt.submitted == 2
-    assert receipt.completed == 2
+    assert receipt.submitted - receipt.pending_count == 2
     assert not client._engine.has_pending_effects
     assert isinstance(client._write_pump.queue.get_nowait(), bytes)
     assert isinstance(client._write_pump.queue.get_nowait(), bytes)
@@ -212,7 +212,7 @@ async def test_publish_many_completion_invokes_no_message_callbacks() -> None:
     )
 
     await receipt.wait()
-    assert receipt.submitted == receipt.completed == 2
+    assert receipt.pending_count == 0 and receipt.submitted == 2
     assert client.stats().writer.queued_messages == 2
     assert client._delivery.callback_invocations == 0
 

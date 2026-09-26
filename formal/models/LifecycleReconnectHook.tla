@@ -2,138 +2,193 @@
 EXTENDS Naturals
 
 (***************************************************************************
-LifecycleHooks / automatic reconnect ownership model for mqttium issue #508.
+Automatic reconnect while an on_disconnect hook runs (#508).
 
-A disconnect notification is serialized by LifecycleHooks, but transport
-recovery must not depend on completion of arbitrary user code when that code
-may itself wait for MQTT work whose completion requires the replacement
-connection.
+Refines api/_lifecycle.py (LifecycleHooks) and the reconnect loop:
+- reader teardown calls retiring(token) (pending cleared, readiness closed),
+  then disconnected(error, token) (pending on_disconnect, readiness closed)
+  and starts the reconnect task, which awaits wait_reconnect();
+- the worker (_run) takes the pending notification, drops it if its token is
+  stale, and runs it in a hook task (_invoke), which checks the token again;
+- the reconnect task calls begin_operation(preserve_hook=True): the token
+  advances, pending is cleared and readiness reopens; on CONNACK,
+  connected(token) reopens readiness and queues on_connect behind the
+  running hook, since one worker runs hooks one at a time.
 
-AllowReconnectDuringHook=FALSE models rc15:
-  _reconnect_ready stays clear until on_disconnect returns.
+The on_disconnect hook here awaits the receipt of a publication left
+unacknowledged by the lost connection: only the replacement connection
+settles it (session replay), or reconnect exhaustion fails it.
 
-TRUE models the candidate:
-  reconnect readiness opens only after the running disconnect notification has
-  passed its token check. Automatic reconnect preserves that hook; a later
-  on_connect notification remains pending until the disconnect hook finishes.
+Variant = "rc15": readiness reopens only after the hook returns (the end of
+  _run's iteration), so the hook and the reconnect wait for each other.
+Variant = "fixed": _invoke reopens readiness once the disconnect hook owns
+  the lifecycle (after its token check), before it runs user code.
+
+TLC reports the rc15 wait cycle as a deadlock; the fixed configuration has
+no deadlock and keeps on_connect behind on_disconnect.
 ***************************************************************************)
 
-CONSTANT AllowReconnectDuringHook
-ASSUME AllowReconnectDuringHook \in BOOLEAN
-
-Idle == "idle"
-Running == "running"
-WaitingReceipt == "waiting-receipt"
-Done == "done"
-
-ReconnectWaiting == "reconnect-waiting"
-ReconnectRunning == "reconnect-running"
-ReconnectConnected == "reconnect-connected"
-ReconnectTerminal == "reconnect-terminal"
-
-None == "none"
-Pending == "pending"
-Settled == "settled"
-Failed == "failed"
+CONSTANT Variant
+ASSUME Variant \in {"rc15", "fixed"}
 
 VARIABLES
-  hook,
-  reconnectReady,
-  reconnect,
-  receipt,
-  onConnect
+  token,        \* LifecycleHooks.token
+  ready,        \* LifecycleHooks._reconnect_ready
+  pending,      \* kind of LifecycleHooks.pending: "none", "disc", "conn"
+  pendingToken,
+  hook,         \* hook task: "none", "scheduled", "running", "waiting", "done"
+  hookKind,     \* "disc" or "conn" while a hook task exists
+  hookToken,
+  phase,        \* connection: "connected", "retiring", "lost"
+  reconnect,    \* "none", "waiting", "running", "connected", "terminal"
+  receipt,      \* "none", "pending", "settled", "failed"
+  discRan,      \* the on_disconnect callback started
+  discReturned, \* the on_disconnect callback returned
+  connRan       \* the on_connect callback started
 
-vars == <<hook, reconnectReady, reconnect, receipt, onConnect>>
+vars == <<token, ready, pending, pendingToken, hook, hookKind, hookToken,
+          phase, reconnect, receipt, discRan, discReturned, connRan>>
 
 Init ==
-  /\ hook = Idle
-  /\ reconnectReady = TRUE
-  /\ reconnect = Idle
-  /\ receipt = None
-  /\ onConnect = None
+  /\ token = 0
+  /\ ready = TRUE
+  /\ pending = "none"
+  /\ pendingToken = 0
+  /\ hook = "none"
+  /\ hookKind = "none"
+  /\ hookToken = 0
+  /\ phase = "connected"
+  /\ reconnect = "none"
+  /\ receipt = "pending"
+  /\ discRan = FALSE
+  /\ discReturned = FALSE
+  /\ connRan = FALSE
 
-TypeOK ==
-  /\ hook \in {Idle, Running, WaitingReceipt, Done}
-  /\ reconnectReady \in BOOLEAN
-  /\ reconnect \in {
-       Idle, ReconnectWaiting, ReconnectRunning,
-       ReconnectConnected, ReconnectTerminal
-     }
-  /\ receipt \in {None, Pending, Settled, Failed}
-  /\ onConnect \in {None, Pending, Done}
+\* _read_loop teardown: retiring(token) before cleanup can suspend.
+Retiring ==
+  /\ phase = "connected"
+  /\ phase' = "retiring"
+  /\ pending' = "none"
+  /\ ready' = FALSE
+  /\ UNCHANGED <<token, pendingToken, hook, hookKind, hookToken, reconnect,
+                 receipt, discRan, discReturned, connRan>>
 
-Loss ==
-  /\ hook = Idle
-  /\ reconnect = Idle
-  /\ hook' = Running
-  /\ reconnectReady' = FALSE
-  /\ reconnect' = ReconnectWaiting
-  /\ UNCHANGED <<receipt, onConnect>>
+\* After cleanup: disconnected(error, token), then the reconnect task.
+Disconnected ==
+  /\ phase = "retiring"
+  /\ phase' = "lost"
+  /\ ready' = FALSE
+  /\ pending' = "disc"
+  /\ pendingToken' = token
+  /\ reconnect' = "waiting"
+  /\ UNCHANGED <<token, hook, hookKind, hookToken, receipt, discRan, discReturned, connRan>>
 
-HookWaitReceipt ==
-  /\ hook = Running
-  /\ hook' = WaitingReceipt
-  /\ receipt' = Pending
-  /\ reconnectReady' =
-       IF AllowReconnectDuringHook THEN TRUE ELSE reconnectReady
-  /\ UNCHANGED <<reconnect, onConnect>>
+\* _run: take the pending notification; a stale one is dropped.
+WorkerTake ==
+  /\ pending # "none"
+  /\ hook = "none"
+  /\ pending' = "none"
+  /\ IF pendingToken = token
+     THEN /\ hook' = "scheduled"
+          /\ hookKind' = pending
+          /\ hookToken' = pendingToken
+     ELSE UNCHANGED <<hook, hookKind, hookToken>>
+  /\ UNCHANGED <<token, ready, pendingToken, phase, reconnect, receipt,
+                 discRan, discReturned, connRan>>
 
+\* _invoke: token check, then (fixed) reopen readiness for a disconnect hook.
+Invoke ==
+  /\ hook = "scheduled"
+  /\ IF hookToken # token
+     THEN /\ hook' = "done"
+          /\ UNCHANGED <<ready, discRan, connRan>>
+     ELSE /\ hook' = "running"
+          /\ ready' = IF Variant = "fixed" /\ hookKind = "disc" THEN TRUE ELSE ready
+          /\ discRan' = (discRan \/ hookKind = "disc")
+          /\ connRan' = (connRan \/ hookKind = "conn")
+  /\ UNCHANGED <<token, pending, pendingToken, hookKind, hookToken, phase,
+                 reconnect, receipt, discReturned>>
+
+\* The disconnect hook awaits the receipt of the lost connection.
+HookAwaitsReceipt ==
+  /\ hook = "running"
+  /\ hookKind = "disc"
+  /\ hook' = "waiting"
+  /\ UNCHANGED <<token, ready, pending, pendingToken, hookKind, hookToken,
+                 phase, reconnect, receipt, discRan, discReturned, connRan>>
+
+HookReturns ==
+  /\ \/ hook = "running" /\ hookKind = "conn"
+     \/ hook = "waiting" /\ receipt \in {"settled", "failed"}
+  /\ hook' = "done"
+  /\ discReturned' = (discReturned \/ hookKind = "disc")
+  /\ UNCHANGED <<token, ready, pending, pendingToken, hookKind, hookToken,
+                 phase, reconnect, receipt, discRan, connRan>>
+
+\* The end of one _run iteration.
+WorkerDone ==
+  /\ hook = "done"
+  /\ hook' = "none"
+  /\ hookKind' = "none"
+  /\ ready' = IF hookKind = "disc" /\ hookToken = token /\ pending = "none"
+              THEN TRUE ELSE ready
+  /\ UNCHANGED <<token, pending, pendingToken, hookToken, phase, reconnect,
+                 receipt, discRan, discReturned, connRan>>
+
+\* _reconnect_loop: wait_reconnect(), then begin_operation(preserve_hook=True).
 ReconnectStart ==
-  /\ reconnect = ReconnectWaiting
-  /\ reconnectReady
-  /\ reconnect' = ReconnectRunning
-  /\ UNCHANGED <<hook, reconnectReady, receipt, onConnect>>
+  /\ reconnect = "waiting"
+  /\ ready
+  /\ reconnect' = "running"
+  /\ token' = token + 1
+  /\ pending' = "none"
+  /\ ready' = TRUE
+  /\ UNCHANGED <<pendingToken, hook, hookKind, hookToken, phase, receipt,
+                 discRan, discReturned, connRan>>
 
+\* CONNACK on the replacement: the receipt settles, connected(token).
 ReconnectSuccess ==
-  /\ reconnect = ReconnectRunning
-  /\ reconnect' = ReconnectConnected
-  /\ receipt' = Settled
-  /\ onConnect' = Pending
-  /\ UNCHANGED <<hook, reconnectReady>>
+  /\ reconnect = "running"
+  /\ reconnect' = "connected"
+  /\ receipt' = IF receipt = "pending" THEN "settled" ELSE receipt
+  /\ ready' = TRUE
+  /\ pending' = "conn"
+  /\ pendingToken' = token
+  /\ UNCHANGED <<token, hook, hookKind, hookToken, phase, discRan, discReturned, connRan>>
 
 ReconnectExhausted ==
-  /\ reconnect = ReconnectRunning
-  /\ reconnect' = ReconnectTerminal
-  /\ receipt' = Failed
-  /\ UNCHANGED <<hook, reconnectReady, onConnect>>
+  /\ reconnect = "running"
+  /\ reconnect' = "terminal"
+  /\ receipt' = IF receipt = "pending" THEN "failed" ELSE receipt
+  /\ UNCHANGED <<token, ready, pending, pendingToken, hook, hookKind, hookToken,
+                 phase, discRan, discReturned, connRan>>
 
-HookFinish ==
-  /\ hook = WaitingReceipt
-  /\ receipt \in {Settled, Failed}
-  /\ hook' = Done
-  /\ UNCHANGED <<reconnectReady, reconnect, receipt, onConnect>>
-
-RunOnConnect ==
-  /\ onConnect = Pending
-  /\ hook = Done
-  /\ onConnect' = Done
-  /\ UNCHANGED <<hook, reconnectReady, reconnect, receipt>>
-
-(* Completed runs are explicit, so TLC still reports any other deadlock. *)
 Terminal ==
-  /\ hook = Done
-  /\ reconnect \in {ReconnectConnected, ReconnectTerminal}
-  /\ onConnect # Pending
+  /\ reconnect \in {"connected", "terminal"}
+  /\ pending = "none"
+  /\ hook = "none"
 
 Quiescent == Terminal /\ UNCHANGED vars
 
 Next ==
-  \/ Loss
-  \/ HookWaitReceipt
-  \/ ReconnectStart
-  \/ ReconnectSuccess
-  \/ ReconnectExhausted
-  \/ HookFinish
-  \/ RunOnConnect
-  \/ Quiescent
+  \/ Retiring \/ Disconnected \/ WorkerTake \/ Invoke \/ HookAwaitsReceipt
+  \/ HookReturns \/ WorkerDone \/ ReconnectStart \/ ReconnectSuccess
+  \/ ReconnectExhausted \/ Quiescent
 
 Spec == Init /\ [][Next]_vars
 
-NoHookReceiptReconnectCycle ==
-  ~(hook = WaitingReceipt /\ receipt = Pending /\
-    reconnect = ReconnectWaiting /\ ~reconnectReady)
+TypeOK ==
+  /\ token \in 0..1
+  /\ ready \in BOOLEAN
+  /\ pending \in {"none", "disc", "conn"}
+  /\ hook \in {"none", "scheduled", "running", "waiting", "done"}
+  /\ reconnect \in {"none", "waiting", "running", "connected", "terminal"}
+  /\ receipt \in {"pending", "settled", "failed"}
 
-OnConnectSerializedBehindDisconnect ==
-  ~(onConnect = Done /\ hook # Done)
+\* on_connect never starts before the disconnect hook it follows returned.
+OnConnectSerializedBehindDisconnect == connRan => discReturned
+
+\* A successful reconnect runs on_connect, and the disconnect hook ran.
+HooksRun == Terminal /\ reconnect = "connected" => (discRan /\ connRan)
 
 =============================================================================
