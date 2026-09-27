@@ -297,6 +297,30 @@ collapsed one and reports a large regression for what is in fact an
 improvement. Baseline CV inflates in the same band, because the slower arm
 flips between modes from sample to sample.
 
+Close to saturation the collapsed value is queueing delay: the publisher never
+sleeps and waits only while the loop runs acknowledgement, receipt and writer
+work. That delay grows like `ρ/(1 − ρ)` in the utilisation `ρ`, so near
+`ρ ≈ 0.9` a lag ratio amplifies a per-message cost difference about tenfold: a
+2% cost gap reads as a lag ratio near 1.2. The same code then reports very
+different absolute lag depending on how close its target sits to the true
+capacity; on the Pi 5 the calibrated capacity settles on distinct levels
+(about 20.5k, 22.3k and 26k msgs/s for 64 B QoS 1) at a constant 2.4 GHz, and
+the load-1.00 lag of one commit moves between about 0.2 and 0.8 ms with it.
+Compare lag ratios only between runs whose targets sit on the same level, and
+read per-message cost from a rate where both arms still sleep: above about 75%
+load the publisher is busy for its whole sample, its CPU time equals its wall
+time, and CPU per message stops measuring cost.
+
+A publisher that cannot keep its offered rate at all enters a backlog: each
+late publication delays the later ones, and `loop_lag_p95` approaches
+`0.95·count·(1/offered − 1/target)`, a throughput measure that grows with the
+sample length. `open_loop_lag_analysis.py` re-reads retained evidence,
+classifies each sample as paced or backlog (offered/target below 0.99), checks
+backlog samples against that prediction, reports absolute lag and the target
+next to the lag ratio, and reports the CPU-per-message ratio only for samples
+that were not busy. The `Loop-lag diagnosis` workflow runs it on retained gate
+artifacts and, manually, sweeps fixed absolute rates on the ARM64 runner.
+
 Before trusting a lag verdict, compare the two arms' **absolute**
 `loop_lag_p95`: values near the plateau mean the publisher is still sleeping and
 the number is a timer artifact, not congestion. Choose load points where both
