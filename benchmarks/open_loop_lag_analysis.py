@@ -38,6 +38,9 @@ DEFAULT_BACKLOG_PACE = 0.99
 # Share of the backlog prediction a measured value may deviate by and still be
 # called explained by backlog.
 DEFAULT_FIT_TOLERANCE = 0.35
+# A publisher busy for this share of its sample never slept: its CPU time is
+# its wall time, so CPU per message no longer measures per-message cost.
+BUSY_SHARE = 0.95
 SAMPLE_FIELDS = ("loop_lag_p95_ms", "offered_rate", "target_rate", "count")
 
 
@@ -48,6 +51,7 @@ class SampleView:
     loop_lag_p95_ms: float
     predicted_backlog_ms: float
     cpu_us_per_msg: float | None
+    busy_share: float | None
     completed_rate: float | None
 
 
@@ -66,6 +70,7 @@ class CellReport:
     base_pace: float
     candidate_pace: float
     cpu_ratio: float | None
+    busy_samples: int
     completed_ratio: float | None
     backlog_samples: int
     backlog_explained: int
@@ -100,12 +105,15 @@ def view(sample: dict[str, Any], *, backlog_pace: float) -> SampleView:
     pace = float(sample["offered_rate"]) / target if target > 0 else math.inf
     cpu = _finite(sample.get("cpu_seconds"))
     count = float(sample["count"])
+    offered = float(sample["offered_rate"])
+    elapsed = count / offered if offered > 0 else None
     return SampleView(
         regime="backlog" if pace < backlog_pace else "paced",
         pace=pace,
         loop_lag_p95_ms=float(sample["loop_lag_p95_ms"]),
         predicted_backlog_ms=predicted_backlog_ms(sample),
         cpu_us_per_msg=(cpu * 1_000_000 / count) if cpu is not None and count > 0 else None,
+        busy_share=(cpu / elapsed) if cpu is not None and elapsed else None,
         completed_rate=_finite(sample.get("completed_rate")),
     )
 
@@ -117,6 +125,10 @@ def explained_by_backlog(sample: SampleView, *, tolerance: float) -> bool:
         return False
     error = abs(sample.loop_lag_p95_ms - sample.predicted_backlog_ms)
     return error <= tolerance * sample.predicted_backlog_ms
+
+
+def _busy(sample: SampleView) -> bool:
+    return sample.busy_share is not None and sample.busy_share >= BUSY_SHARE
 
 
 def _ratio(values: list[float | None]) -> float | None:
@@ -142,9 +154,10 @@ def cell_report(
     cpu_ratios: list[float | None] = []
     completed_ratios: list[float | None] = []
     for b, c in zip(base, candidate, strict=True):
+        # A busy arm's CPU time is its wall time: no per-message cost signal.
         cpu_ratios.append(
             c.cpu_us_per_msg / b.cpu_us_per_msg
-            if b.cpu_us_per_msg and c.cpu_us_per_msg is not None
+            if b.cpu_us_per_msg and c.cpu_us_per_msg is not None and not (_busy(b) or _busy(c))
             else None
         )
         completed_ratios.append(
@@ -180,6 +193,7 @@ def cell_report(
         base_pace=statistics.median(s.pace for s in base),
         candidate_pace=statistics.median(s.pace for s in candidate),
         cpu_ratio=_ratio(cpu_ratios),
+        busy_samples=sum(_busy(sample) for sample in samples),
         completed_ratio=_ratio(completed_ratios),
         backlog_samples=len(backlog),
         backlog_explained=len(explained),
@@ -328,6 +342,7 @@ def summarise(cells: list[CellReport]) -> dict[str, Any]:
         "backlog_samples": sum(cell.backlog_samples for cell in cells),
         "backlog_samples_explained": sum(cell.backlog_explained for cell in cells),
         "paced_cpu_ratio_median": statistics.median(paced_cpu) if paced_cpu else None,
+        "busy_samples": sum(cell.busy_samples for cell in cells),
     }
 
 
@@ -347,12 +362,13 @@ def markdown(result: dict[str, Any]) -> str:
         f"(by regime: {summary['lag_ratio_above_1_05_by_regime']}).",
         f"- Backlog samples: {summary['backlog_samples']}, explained by the backlog "
         f"prediction: {summary['backlog_samples_explained']}.",
-        f"- Median CPU/message ratio in paced cells: {_fmt(summary['paced_cpu_ratio_median'])}.",
+        f"- Median CPU/message ratio in paced cells: {_fmt(summary['paced_cpu_ratio_median'])} "
+        f"(samples busy ≥ {BUSY_SHARE:.0%} of their wall time excluded: {summary['busy_samples']}).",
         "",
         "| Source | Cell | Phase | Pairs | Target msg/s | Regime B / C (backlog) | "
-        "Lag p95 B / C ms | Lag ratio | Pace B / C | CPU/msg ratio | Completed ratio | "
+        "Lag p95 B / C ms | Lag ratio | Pace B / C | CPU/msg ratio | Busy samples | Completed ratio | "
         "Backlog explained | Verdict |",
-        "| --- | --- | --- | ---: | ---: | --- | --- | ---: | --- | ---: | ---: | --- | --- |",
+        "| --- | --- | --- | ---: | ---: | --- | --- | ---: | --- | ---: | ---: | ---: | --- | --- |",
     ]
     for cell in result["cells"]:
         lines.append(
@@ -362,7 +378,8 @@ def markdown(result: dict[str, Any]) -> str:
             f"| {cell['base_lag_p95_ms']:.3f} / {cell['candidate_lag_p95_ms']:.3f} "
             f"| {cell['lag_ratio']:.3f} "
             f"| {cell['base_pace']:.3f} / {cell['candidate_pace']:.3f} "
-            f"| {_fmt(cell['cpu_ratio'])} | {_fmt(cell['completed_ratio'])} "
+            f"| {_fmt(cell['cpu_ratio'])} | {cell['busy_samples']}/{2 * cell['pairs']} "
+            f"| {_fmt(cell['completed_ratio'])} "
             f"| {cell['backlog_explained']}/{cell['backlog_samples']} | {cell['verdict']} |"
         )
     if result["calibrations"]:

@@ -76,6 +76,18 @@ def test_paced_cells_compare_timer_lag(analysis) -> None:
     assert cell.lag_ratio == pytest.approx(1.2)
 
 
+def test_a_publisher_that_never_sleeps_reports_no_cpu_ratio(analysis) -> None:
+    # At 20k msgs/s, 50 us of CPU per message is the whole wall time.
+    base = _sample(capacity=30_000, target=20_000, cpu_us=50.0)
+    candidate = _sample(capacity=30_000, target=20_000, cpu_us=50.0)
+    cell = analysis.cell_report(
+        _pairs(base, candidate), source="s", label="c", phase="p", backlog_pace=0.99, tolerance=0.35
+    )
+
+    assert cell.busy_samples == 8
+    assert cell.cpu_ratio is None
+
+
 def test_one_arm_falling_behind_is_mixed(analysis) -> None:
     base = _sample(capacity=27_000, target=26_000)
     candidate = _sample(capacity=25_000, target=26_000)
