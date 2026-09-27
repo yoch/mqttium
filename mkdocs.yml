@@ -19,6 +19,8 @@ exclude_docs: |
   experiments/
   reports/*.md
   !reports/README.md
+  !reports/API-SURFACE-REVIEW-2026-09-24.md
+  !reports/LOOP-LAG-493-DIAGNOSIS-2026-09-27.md
   !reports/RELEASE-CANDIDATE-1.0.0rc17.md
   !reports/RELEASE-CANDIDATE-1.0.0rc16.md
   !reports/RELEASE-CANDIDATE-1.0.0rc15.md

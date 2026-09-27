@@ -506,3 +506,29 @@ def test_confirmation_cannot_promote_a_changed_pacing_regime(gate, monkeypatch, 
     assert not failures
     assert "confirmation changed pacing regime" in invalidations[0]
     assert record["confirmation"]["status"] == "invalid_control"
+
+
+def test_completed_cells_survive_later_ineligible_preflight(gate, monkeypatch, tmp_path):
+    from argparse import Namespace
+
+    def preflight(*_a, **kwargs):
+        if kwargs["label"] == "ab-5":
+            raise RuntimeError("runner preflight is not eligible")
+        return tmp_path
+
+    monkeypatch.setattr(gate, "_fresh_preflight", preflight)
+    monkeypatch.setattr(gate, "_initial_record", lambda *_a, **_kw: {"retained": True})
+    specs = [gate.ScenarioSpec(protocol, 64, "receipt", 100) for protocol in ("311", "5")]
+    retained = []
+    with pytest.raises(RuntimeError, match="not eligible"):
+        gate._run_initial_matrix(
+            Namespace(protocols="311,5"),
+            specs=specs,
+            load_points=[gate.LoadPoint("absolute_rate", 5_000)],
+            calibrations=dict.fromkeys(specs),
+            base_root=tmp_path,
+            candidate_root=tmp_path,
+            raw_dir=tmp_path,
+            records=retained,
+        )
+    assert retained == [{"retained": True}]
