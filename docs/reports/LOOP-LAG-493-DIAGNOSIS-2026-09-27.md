@@ -143,3 +143,56 @@ Both, in different proportions.
    - absolute target rates, or reject a calibration that changes level;
    - no lag ratio at load ≥ 0.90 as a release criterion;
    - a per-message cost measurement at a rate where the publisher sleeps.
+
+## Addendum: fixed-rate sweep, RC14 against RC17 (2026-09-27)
+
+Run [36351522154](https://github.com/yoch/mqttium/actions/runs/36351522154)
+of the `Loop-lag diagnosis` sweep, on the dedicated Pi 5 runner:
+
+- RC14 `c194597b` as base, RC17 `c9bab1ad` as candidate;
+- `rate_regime_probe.py`, 64 B QoS 1, window 100, receipt completion;
+- two ABBA blocks per protocol (four samples per arm and rate), each block
+  preceded by an eligible runner probe.
+
+Medians per arm; ratios are RC17 over RC14.
+
+| Protocol | Rate (msgs/s) | CPU/message RC14 / RC17 (µs) | Ratio | Schedule lag p95 RC14 / RC17 (ms) | Ratio | ACK p50 RC14 / RC17 (ms) |
+| --- | ---: | --- | ---: | --- | ---: | --- |
+| 3.1.1 | 5,000 | 59.9 / 60.2 | 1.004 | 1.028 / 1.023 | 0.99 | 0.291 / 0.296 |
+| 3.1.1 | 10,000 | 55.8 / 55.5 | 0.996 | 1.010 / 1.012 | 1.00 | 0.453 / 0.444 |
+| 3.1.1 | 15,000 | busy | — | 0.087 / 0.086 | 0.98 | 0.272 / 0.274 |
+| 3.1.1 | 20,000 | busy | — | 0.127 / 0.126 | 0.99 | 0.405 / 0.411 |
+| 3.1.1 | 22,000 | busy | — | 0.155 / 0.160 | 1.03 | 0.461 / 0.473 |
+| 3.1.1 | 24,000 | busy | — | 0.238 / 0.233 | 0.98 | 0.585 / 0.592 |
+| 3.1.1 | 26,000 | busy | — | 1.984 / 1.656 | 0.83 | 0.752 / 0.777 |
+| 5 | 5,000 | 60.8 / 61.7 | 1.015 | 1.026 / 1.030 | 1.00 | 0.297 / 0.301 |
+| 5 | 10,000 | 56.5 / 56.8 | 1.004 | 1.011 / 1.012 | 1.00 | 0.449 / 0.443 |
+| 5 | 15,000 | busy | — | 0.088 / 0.087 | 0.99 | 0.286 / 0.294 |
+| 5 | 20,000 | busy | — | 0.129 / 0.128 | 0.99 | 0.417 / 0.420 |
+| 5 | 22,000 | busy | — | 0.173 / 0.170 | 0.98 | 0.493 / 0.534 |
+| 5 | 24,000 | busy | — | 0.285 / 0.265 | 0.93 | 0.593 / 0.655 |
+| 5 | 26,000 | busy | — | 2.094 / 1.757 | 0.84 | 0.842 / 0.888 |
+
+"Busy" marks rates where CPU per message times the rate is at least 1.0 for
+both arms: the publisher never slept, so its CPU time is its wall time and the
+per-message cost is not measured there (18,000 msgs/s behaves the same and is
+omitted). Every rate kept its offered rate within 0.05 %.
+
+Results:
+
+- **Per-message cost.** At the rates where both arms still sleep, RC17 costs
+  0.996–1.015 times RC14 per message. That is within 1.5 %, below the 3 %
+  decision threshold of this report.
+- **Schedule lag.** At fixed absolute rates the curves match: 0.98–1.03 up to
+  24,000 msgs/s on MQTT 3.1.1 and up to 22,000 on MQTT 5. RC17 is lower near
+  saturation: 0.93 at 24,000 on MQTT 5, and 0.83–0.84 at 26,000 on both
+  protocols.
+- **Residual.** RC17's median acknowledgement latency is within −2 % to +4 % of
+  RC14's at most rates, and 5–10 % higher at 22,000–26,000 msgs/s on MQTT 5
+  (up to 0.06 ms). Subscriber delivery p50 is 2–8 % higher. Both are small,
+  near-saturation differences with no throughput or schedule-lag cost.
+
+The sweep ran no same-code control; the ABBA spread of each cell is its only
+noise estimate. Against the decision rule above, RC17 shows no loop-lag
+regression against RC14 at fixed rates. Its per-message cost is within 1.5 %
+of RC14. The "+15–20 %" of #493 does not reproduce once rates are fixed.
