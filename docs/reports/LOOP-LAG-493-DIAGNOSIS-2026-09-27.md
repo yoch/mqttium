@@ -206,3 +206,73 @@ of RC14. This supports the report's decision rule for the observed workload,
 not a general equivalence claim. Strict MQTT 5 qualification still needs an
 eligible rerun; the follow-up gate must enforce preflight eligibility and
 retain same-code controls.
+
+
+## Addendum: corrected gate qualification (2026-09-28)
+
+The corrected gate was tested on the dedicated Pi 5 with Python 3.14.7,
+publisher CPU 2, MQTT 3.1.1 and 5, 64-byte and 4096-byte payloads, QoS 1
+receipt completion, window 100, and fixed rates of 5k, 10k, 15k, 20k, 22k,
+24k and 26k messages/s. The harness commit is
+`d29a8462bf971198a477925c8f4cf36123530cf7`; its entire `src/` tree is identical
+to RC17 `c9bab1ad93dd2e875c07706aecdeaa69eb8dce89`.
+
+- [Same-code control 36353058646](https://github.com/yoch/mqttium/actions/runs/36353058646):
+  **passed**, 28 cells, 224 initial worker samples and 5,856,000 publications,
+  all completed. All three final preflights were eligible; MQTT 5 needed five
+  attempts before eligibility was stable. CPU/message ratios at 5k/10k were
+  0.9852–1.0028 across both payload sizes. Saturation lag ratios reached 1.3984
+  for identical code; those cells correctly remained diagnostic.
+- [RC14 → RC17 comparison 36353060011](https://github.com/yoch/mqttium/actions/runs/36353060011):
+  **failed**, with all five final preflights eligible, including both
+  confirmation preflights. The confirmed failure is MQTT 5, 4096 bytes,
+  24k messages/s: completed-rate ratio **0.9326**, below the unchanged 0.97
+  threshold. The 26k cell also required confirmation and recovered above the
+  threshold. No publication was lost.
+
+The gate uses `paired_open_loop.py`, whereas the preceding diagnostic sweep
+used `rate_regime_probe.py`. Compare the arms within each acquisition; do not
+interpret differences between the two harnesses as runtime changes.
+
+Only 5k and 10k provided eligible sleeping, unsaturated comparisons in every
+scenario. The following CPU figures are ratios of per-arm medians; lag figures
+are the gate's median paired ratios, candidate over RC14:
+
+| Protocol | Payload | CPU/message at 5k / 10k | Schedule lag at 5k / 10k |
+| --- | ---: | --- | --- |
+| 3.1.1 | 64 B | 1.0013 / 1.0110 | 0.9979 / 1.0009 |
+| 5 | 64 B | 0.9953 / 1.0239 | 1.0000 / 1.0015 |
+| 3.1.1 | 4096 B | 0.9949 / 1.0167 | 1.0006 / 1.0019 |
+| 5 | 4096 B | 0.9620 / 1.0386 | 1.0071 / 1.0018 |
+
+For the original 64-byte scope of #493, no +15–20% lag increase reproduces at
+fixed rates, and the measured CPU cost remains within the report's 3% decision
+threshold. That result does **not** establish general RC14/RC17 equivalence.
+The extended 4096-byte scope exposes a separate outstanding qualification
+failure, and its MQTT 5 CPU/message ratio at 10k is also above 1.03 (diagnostic,
+not an automatically confirmed CPU regression).
+
+At the failing 24k point, eight paired samples were retained after confirmation.
+Seven candidate samples have lower completed throughput than their paired
+baseline by more than 3%; one initial pair is effectively equal. The offered
+rate remains near 24k in both arms, but the candidate takes longer to finish
+all receipts. Median ACK latency across the eight per-arm sample medians is
+about 1.25 ms for RC14 and 99 ms for RC17. This is a completion/drain-time
+finding, not a missing-message finding. Its implementation cause has not been
+established, and it has not been accepted as a release trade-off.
+
+PR [#588](https://github.com/yoch/mqttium/pull/588) retains the report and gate
+changes together. Qualification remains open until this completed-throughput
+finding is explained and resolved or explicitly accepted. The correction keeps
+the failure visible; neither its rate nor its threshold was removed to obtain
+a passing result.
+
+Limits: this is one same-code campaign and one RC14/RC17 campaign, with targeted
+confirmation inside the latter, not a cross-run equivalence study. Firmware
+throttling telemetry was unavailable (`null`); the recorded CPU frequencies
+were 2.4 GHz, and eligibility follows the existing probe's enforced criteria.
+
+Retained `open-loop.json` SHA256 digests:
+
+- same-code: `eb6015c7adc7994d6118b80366c0eea4ba9a68b2cfbc59ec2fdef2880ce49b81`;
+- RC14/RC17: `d741331e148d0c0ed5f8515f13de41db61cf352ecf264157616defb4f82ac407`.
