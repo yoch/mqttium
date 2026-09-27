@@ -152,31 +152,38 @@ of the `Loop-lag diagnosis` sweep, on the dedicated Pi 5 runner:
 - RC14 `c194597b` as base, RC17 `c9bab1ad` as candidate;
 - `rate_regime_probe.py`, 64 B QoS 1, window 100, receipt completion;
 - two ABBA blocks per protocol (four samples per arm and rate), each block
-  preceded by an eligible runner probe.
+  preceded by a recorded runner probe. Both MQTT 3.1.1 probes were eligible;
+  both MQTT 5 probes were **ineligible** (one-minute load per CPU 0.303 and
+  0.257 against a 0.250 limit). Instantaneous CPU use was 0.3 % and 0.0 %.
+  The workflow recorded eligibility without enforcing it. Residual load from
+  the preceding sweep is a possible explanation, not an established cause;
+  the MQTT 5 measurements remain diagnostic, not strict qualification.
 
 Medians per arm; ratios are RC17 over RC14.
 
 | Protocol | Rate (msgs/s) | CPU/message RC14 / RC17 (µs) | Ratio | Schedule lag p95 RC14 / RC17 (ms) | Ratio | ACK p50 RC14 / RC17 (ms) |
 | --- | ---: | --- | ---: | --- | ---: | --- |
-| 3.1.1 | 5,000 | 59.9 / 60.2 | 1.004 | 1.028 / 1.023 | 0.99 | 0.291 / 0.296 |
+| 3.1.1 | 5,000 | 59.9 / 60.1 | 1.004 | 1.029 / 1.023 | 1.00 | 0.291 / 0.296 |
 | 3.1.1 | 10,000 | 55.8 / 55.5 | 0.996 | 1.010 / 1.012 | 1.00 | 0.453 / 0.444 |
-| 3.1.1 | 15,000 | busy | — | 0.087 / 0.086 | 0.98 | 0.272 / 0.274 |
-| 3.1.1 | 20,000 | busy | — | 0.127 / 0.126 | 0.99 | 0.405 / 0.411 |
-| 3.1.1 | 22,000 | busy | — | 0.155 / 0.160 | 1.03 | 0.461 / 0.473 |
+| 3.1.1 | 15,000 | busy | — | 0.087 / 0.086 | 0.98 | 0.272 / 0.273 |
+| 3.1.1 | 20,000 | busy | — | 0.127 / 0.126 | 0.99 | 0.405 / 0.412 |
+| 3.1.1 | 22,000 | busy | — | 0.155 / 0.160 | 1.03 | 0.460 / 0.473 |
 | 3.1.1 | 24,000 | busy | — | 0.238 / 0.233 | 0.98 | 0.585 / 0.592 |
 | 3.1.1 | 26,000 | busy | — | 1.984 / 1.656 | 0.83 | 0.752 / 0.777 |
-| 5 | 5,000 | 60.8 / 61.7 | 1.015 | 1.026 / 1.030 | 1.00 | 0.297 / 0.301 |
-| 5 | 10,000 | 56.5 / 56.8 | 1.004 | 1.011 / 1.012 | 1.00 | 0.449 / 0.443 |
+| 5 | 5,000 | 60.8 / 61.7 | 1.015 | 1.026 / 1.030 | 1.00 | 0.297 / 0.302 |
+| 5 | 10,000 | 56.5 / 56.7 | 1.004 | 1.011 / 1.012 | 1.00 | 0.449 / 0.443 |
 | 5 | 15,000 | busy | — | 0.088 / 0.087 | 0.99 | 0.286 / 0.294 |
 | 5 | 20,000 | busy | — | 0.129 / 0.128 | 0.99 | 0.417 / 0.420 |
-| 5 | 22,000 | busy | — | 0.173 / 0.170 | 0.98 | 0.493 / 0.534 |
+| 5 | 22,000 | busy | — | 0.173 / 0.170 | 0.98 | 0.493 / 0.535 |
 | 5 | 24,000 | busy | — | 0.285 / 0.265 | 0.93 | 0.593 / 0.655 |
 | 5 | 26,000 | busy | — | 2.094 / 1.757 | 0.84 | 0.842 / 0.888 |
 
 "Busy" marks rates where CPU per message times the rate is at least 1.0 for
 both arms: the publisher never slept, so its CPU time is its wall time and the
 per-message cost is not measured there (18,000 msgs/s behaves the same and is
-omitted). Every rate kept its offered rate within 0.05 %.
+omitted). Every sample kept its offered rate within 0.06 % of target, and all
+publications completed. Values above are recomputed medians from the retained
+JSON samples (four per arm and rate), rounded only for display.
 
 Results:
 
@@ -193,6 +200,9 @@ Results:
   near-saturation differences with no throughput or schedule-lag cost.
 
 The sweep ran no same-code control; the ABBA spread of each cell is its only
-noise estimate. Against the decision rule above, RC17 shows no loop-lag
-regression against RC14 at fixed rates. Its per-message cost is within 1.5 %
-of RC14. The "+15–20 %" of #493 does not reproduce once rates are fixed.
+noise estimate. In this sweep, the "+15–20 %" loop-lag increase of #493
+does not reproduce at fixed rates; measured per-message cost is within 1.5 %
+of RC14. This supports the report's decision rule for the observed workload,
+not a general equivalence claim. Strict MQTT 5 qualification still needs an
+eligible rerun; the follow-up gate must enforce preflight eligibility and
+retain same-code controls.
