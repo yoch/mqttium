@@ -1,0 +1,255 @@
+name: Loop-lag diagnosis (#493)
+run-name: "Loop-lag diagnosis: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'archived' }}"
+
+# Diagnostic only; never a gate. Two questions from issue #493:
+# - archived: does the retained open-loop evidence show loop congestion, or a
+#   publisher that fell behind its own schedule (backlog)? Runs on a hosted
+#   runner and re-reads the raw artifacts of earlier gate runs.
+# - sweep: at fixed absolute rates, below and through saturation, do two
+#   trusted commits differ in schedule lag while both keep pace, or only once
+#   one of them falls behind? Runs on the dedicated ARM64 runner.
+
+on:
+  pull_request:
+    paths:
+      - benchmarks/open_loop_lag_analysis.py
+      - .github/workflows/loop-lag-diagnosis.yml
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Diagnosis to run
+        required: true
+        default: archived
+        type: choice
+        options: [archived, sweep]
+      run_ids:
+        description: "archived: space-separated open-loop gate run IDs (default: the #493 campaign and the RC16/RC17 gates)"
+        required: false
+        default: ""
+        type: string
+      base_ref:
+        description: "sweep: exact reviewed baseline commit SHA (for example RC14)"
+        required: false
+        default: ""
+        type: string
+      candidate_ref:
+        description: "sweep: exact reviewed candidate commit SHA"
+        required: false
+        default: ""
+        type: string
+      rates:
+        description: "sweep: fixed absolute rates in msgs/s"
+        required: false
+        default: "10000,15000,18000,20000,22000,24000,26000,28000"
+        type: string
+      blocks:
+        description: "sweep: ABBA blocks per protocol (each block runs both arms twice)"
+        required: false
+        default: "2"
+        type: string
+      confirm_trusted_code:
+        description: I confirm that both commits were reviewed and are trusted on the persistent runner
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  # The 2026-09-23 #493 campaign (RC14 and #457 bisection against ed52965,
+  # same-code controls), then the RC16 and RC17 open-loop gates.
+  DEFAULT_RUN_IDS: >-
+    35843620810 35848449531 35850177883 35846178400 35849329125 35846972388
+    35847538941 35846212211 35845226479 35848620365 35850729484
+    36025710297 36267803906
+
+jobs:
+  archived:
+    if: github.event_name == 'pull_request' || inputs.mode == 'archived'
+    name: Re-read retained open-loop evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+      - name: Download retained evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_IDS: ${{ inputs.run_ids }}
+        run: |
+          set -euo pipefail
+          ids="${RUN_IDS:-$DEFAULT_RUN_IDS}"
+          mkdir -p evidence
+          for id in $ids; do
+            [[ "$id" =~ ^[0-9]+$ ]] || { echo "run IDs must be numeric: $id" >&2; exit 2; }
+            if ! gh run download "$id" --repo "$GITHUB_REPOSITORY" --dir "evidence/$id"; then
+              echo "::warning::no retained artifact for run $id"
+            fi
+          done
+      - name: Classify samples as paced or backlog
+        run: |
+          set -euo pipefail
+          python benchmarks/open_loop_lag_analysis.py evidence \
+            --output lag-analysis.json \
+            --summary-output lag-analysis.md
+          cat lag-analysis.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: loop-lag-archived-${{ github.run_id }}
+          path: |
+            lag-analysis.json
+            lag-analysis.md
+          retention-days: 90
+
+  sweep:
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.mode == 'sweep'
+      && inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
+    name: Fixed-rate schedule-lag sweep (manual only)
+    runs-on: [self-hosted, linux, ARM64]
+    timeout-minutes: 240
+    concurrency:
+      group: mqttium-arm64-runner
+      cancel-in-progress: false
+    env:
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Check out benchmark harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: harness
+          persist-credentials: false
+      - name: Set run-specific workspace
+        run: echo "JOB_ROOT=$RUNNER_TEMP/mqttium-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - name: Validate inputs
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref }}
+          RATES: ${{ inputs.rates }}
+          BLOCKS: ${{ inputs.blocks }}
+        run: |
+          set -euo pipefail
+          for value in "$BASE_REF" "$CANDIDATE_REF"; do
+            [[ "$value" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "all refs must be exact commit SHAs" >&2; exit 2; }
+          done
+          [[ "$RATES" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "rates must be comma-separated integers" >&2; exit 2; }
+          [[ "$BLOCKS" =~ ^[1-8]$ ]] || { echo "blocks must be 1 to 8" >&2; exit 2; }
+      - name: Check out baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.base_ref }}
+          path: base
+          persist-credentials: false
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.candidate_ref }}
+          path: candidate
+          persist-credentials: false
+      - name: Verify dedicated runner
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          command -v python3
+          command -v mosquitto
+          command -v mosquitto_sub
+          command -v taskset
+          test "$(nproc)" -ge 4
+          if pgrep -a mosquitto; then
+            echo "pre-existing Mosquitto would contaminate the diagnosis" >&2
+            exit 1
+          fi
+          for cpu in 0 1 2 3; do
+            test "$(cat "/sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_governor")" = performance
+          done
+      - name: Create isolated virtual environment
+        run: |
+          set -euo pipefail
+          rm -rf "$JOB_ROOT"
+          mkdir -p "$JOB_ROOT"
+          python3 -m venv "$JOB_ROOT/venv"
+          echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
+      - name: Install probe dependency
+        run: python -m pip install "psutil>=6,<8"
+      - name: Start isolated broker on CPU 0
+        run: |
+          set -euo pipefail
+          root="$JOB_ROOT"
+          cat > "$root/mosquitto.conf" <<'EOF'
+          persistence false
+          allow_anonymous true
+          max_inflight_messages 1000
+          max_queued_messages 100000
+          max_queued_bytes 0
+          connection_messages false
+          log_type error
+          listener 11883 127.0.0.1
+          EOF
+          taskset -c 0 mosquitto -c "$root/mosquitto.conf" > "$root/mosquitto.log" 2>&1 &
+          echo "$!" > "$root/mosquitto.pid"
+          for _ in $(seq 1 50); do
+            if (echo > /dev/tcp/127.0.0.1/11883) >/dev/null 2>&1; then
+              exit 0
+            fi
+            if ! kill -0 "$(cat "$root/mosquitto.pid")" 2>/dev/null; then
+              cat "$root/mosquitto.log"
+              exit 1
+            fi
+            sleep 0.2
+          done
+          cat "$root/mosquitto.log"
+          exit 1
+      - name: Sweep fixed rates in ABBA order
+        env:
+          RATES: ${{ inputs.rates }}
+          BLOCKS: ${{ inputs.blocks }}
+          PYTHONPATH: harness/benchmarks
+        run: |
+          set -euo pipefail
+          out="$JOB_ROOT/sweep"
+          mkdir -p "$out"
+          for protocol in 311 5; do
+            for block in $(seq 1 "$BLOCKS"); do
+              python harness/benchmarks/runner_probe.py \
+                --output "$out/preflight-$protocol-$block.json" --require-temperature
+              step=0
+              for arm in base candidate candidate base; do
+                step=$((step + 1))
+                python harness/benchmarks/rate_regime_probe.py \
+                  --root "$arm" --port 11883 --protocol "$protocol" \
+                  --payload-bytes 64 --window 100 --completion receipt \
+                  --rates "$RATES" --repeat 1 --sample-seconds 3 --cpu 2 \
+                  --output "$out/$protocol-block$block-$step-$arm.json"
+              done
+            done
+          done
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: loop-lag-sweep-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/sweep/*.json
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/mosquitto.log
+          if-no-files-found: warn
+          retention-days: 90
+      - name: Stop isolated broker
+        if: always()
+        run: |
+          pidfile="$JOB_ROOT/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
+          rm -rf "$JOB_ROOT"

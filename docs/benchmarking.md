@@ -297,6 +297,18 @@ collapsed one and reports a large regression for what is in fact an
 improvement. Baseline CV inflates in the same band, because the slower arm
 flips between modes from sample to sample.
 
+A third regime starts where the publisher can no longer keep its offered rate.
+Each late publication then delays all later ones: publication `k` starts about
+`k·(1/offered − 1/target)` late, so `loop_lag_p95` approaches
+`0.95·count·(1/offered − 1/target)`. That backlog grows with the sample length
+and turns a few percent of capacity difference into a large lag ratio; it
+measures throughput, not loop latency. `open_loop_lag_analysis.py` re-reads
+retained evidence, classifies each sample as paced or backlog (offered/target
+below 0.99), checks backlog samples against that prediction and reports the
+per-message CPU ratio next to the lag ratio. The `Loop-lag diagnosis` workflow
+runs it on retained gate artifacts and, manually, sweeps fixed absolute rates on
+the ARM64 runner.
+
 Before trusting a lag verdict, compare the two arms' **absolute**
 `loop_lag_p95`: values near the plateau mean the publisher is still sleeping and
 the number is a timer artifact, not congestion. Choose load points where both
