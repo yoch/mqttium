@@ -6,6 +6,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Use fixed absolute rates in the open-loop release gate. Keep saturation lag
+  diagnostic, require an eligible lower-rate comparison, and report CPU cost
+  only with measured headroom. Enforce runner eligibility before each block of
+  the diagnostic sweep; an ineligible probe can no longer appear as a
+  successful qualification.
+
 ## [1.0.0rc17] - 2026-09-26
 
 ### Changed

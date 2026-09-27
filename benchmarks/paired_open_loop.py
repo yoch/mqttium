@@ -57,6 +57,8 @@ class OpenLoopResult:
     loop_lag_p95_ms: float
     loop_lag_p99_ms: float
     cpu_seconds: float
+    measurement_seconds: float
+    pacing_sleeps: int
     effect_inline: int
     effect_enqueued: int
     effect_suspensions: int
@@ -115,16 +117,20 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
     cpu_started = time.process_time()
     started = loop.time() + (0.05 if paced else 0.0)
     offered_started = 0.0
+    pacing_sleeps = 0
     try:
         for sequence in range(args.count):
             deadline = started + sequence * interval if paced else loop.time()
             if paced:
                 delay = deadline - loop.time()
                 if delay > 0:
+                    if sequence > 0:
+                        pacing_sleeps += 1
                     await asyncio.sleep(delay)
             actual = loop.time()
             if sequence == 0:
                 offered_started = actual
+                cpu_started = time.process_time()
             schedule_lag.append(max(0.0, actual - deadline) * 1000)
             sent_ns = time.monotonic_ns()
             receipt = await client.publish(topic, _payload(sequence, args.payload_bytes), qos=1)
@@ -133,6 +139,7 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
         offered_elapsed = max(loop.time() - offered_started, 1e-9)
         await asyncio.gather(*receipt_tasks)
         completed_elapsed = max(loop.time() - offered_started, 1e-9)
+        cpu_elapsed = time.process_time() - cpu_started
         effects = runtime_counters(client, "effects")
         writer = runtime_counters(client, "writer")
         return OpenLoopResult(
@@ -154,7 +161,9 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
             delivery_latency_p99_ms=0.0,
             loop_lag_p95_ms=percentile(schedule_lag, 0.95),
             loop_lag_p99_ms=percentile(schedule_lag, 0.99),
-            cpu_seconds=time.process_time() - cpu_started,
+            cpu_seconds=cpu_elapsed,
+            measurement_seconds=completed_elapsed,
+            pacing_sleeps=pacing_sleeps,
             effect_inline=effects["inline_effects"],
             effect_enqueued=effects["enqueued"],
             effect_suspensions=effects["apply_suspensions"],

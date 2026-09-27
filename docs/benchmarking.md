@@ -75,20 +75,41 @@ predecessor and the measured same-code noise.
 - `paired_open_loop.py` measures completion and loop lag at calibrated or fixed
   absolute load. It can sweep outbound windows while calling `AsyncClient`
   directly; no cross-client adapter participates in the measurement.
-- `open_loop_release_gate.py` anchors fractional load to baseline capacity and
-  uses a two-stage loop-lag decision. The initial ABBA screen must exceed the
-  relative threshold with relative and additive 95% lower bounds above the
-  no-effect boundary before it consumes one of the bounded same-code A/A
-  confirmation slots. Final rejection still requires the additive increase to
-  exceed the measured same-code noise envelope.
+- `open_loop_release_gate.py` defaults to fixed absolute rates of 5k, 10k,
+  15k, 20k, 22k, 24k and 26k messages/s, identical for both arms. Calibration
+  records capacity but does not move those targets. Explicit fractional loads
+  remain available; a baseline calibration with max/min above 1.05 invalidates
+  fractional acquisition rather than choosing one of its levels.
 
-The open-loop loop-lag rule is a targeted regression detector, not an
-equivalence proof. Its initial screen uses necessary conditions from the final
-pre-existing verdict: a point estimate above 1.05 whose relative or additive
-95% interval still crosses the no-effect boundary remains diagnostic. It cannot
-fail the release or consume scarce same-code controls by itself. Throughput,
-runner eligibility, exact completion, and the deeper controlled network gate
-remain separate evidence.
+The open-loop lag rule is a targeted regression detector, not an equivalence
+proof. Lag is eligible for a release decision only below 90% of the lowest
+observed capacity (all baseline calibration samples and the candidate sample),
+with both arms sleeping between publications, below 95% CPU busy in every
+sample, and offered rates within 0.5% of target. Other lag ratios remain in the
+artifact as diagnostics, with reasons. A matrix without an eligible comparison
+for every protocol/payload/window is invalid: add lower fixed rates.
+
+For eligible cells, the initial ABBA screen must exceed the relative threshold
+with relative and additive 95% lower bounds above the no-effect boundary
+before it consumes a bounded confirmation slot. Final rejection also requires
+the additive increase to exceed same-code A/A noise. Confirmation and controls
+must remain in an eligible pacing regime; otherwise the result is invalid.
+Throughput checks still apply at saturation, and every publication must complete.
+
+The worker measures CPU and wall time over the same interval, from the first
+publication to completion of all receipts, excluding the initial pacing sleep.
+The report shows per-arm CPU microseconds per message only when both arms sleep
+and stay below 95% busy in every sample; otherwise the summary value is `null`.
+These costs are diagnostic measurements, not a CPU-equivalence verdict. ACK
+and delivery latency remain recorded independently. The deeper controlled
+network gate remains separate evidence.
+
+The diagnostic `Loop-lag diagnosis` sweep also enforces runner eligibility:
+it waits up to 120 seconds for two consecutive eligible probes before each
+ABBA block, aborting on failure while retaining probe artifacts. A successful
+workflow from before this enforcement does not prove eligible acquisition;
+inspect its retained preflight reports.
+
 - `paired_writer_capacity.py` protects the native `publish_nowait` closed-loop
   writer regime for QoS 0/1. It yields once per application outstanding window
   and yields/retries on synchronous backpressure, matching the scheduling shape

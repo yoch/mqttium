@@ -200,3 +200,60 @@ def test_parent_invalidates_candidate_only_variability(
     assert result["status"] == "invalid"
     assert any("candidate completed-rate CV" in item for item in result["invalidations"])
     assert any("candidate p50-latency CV" in item for item in result["invalidations"])
+
+
+async def test_cpu_interval_excludes_initial_pacing_sleep(open_loop, monkeypatch):
+    from collections import defaultdict
+
+    clock = {"wall": 0.0, "cpu": 0.0}
+
+    class Loop:
+        def time(self):
+            return clock["wall"]
+
+    class Receipt:
+        mid = 1
+
+        async def wait(self):
+            pass
+
+    class Client:
+        async def connect(self, *_a, **_kw):
+            pass
+
+        async def publish(self, *_a, **_kw):
+            clock["wall"] += 0.001
+            clock["cpu"] += 0.0005
+            return Receipt()
+
+        async def disconnect(self):
+            pass
+
+    async def connected(*_a):
+        return Client()
+
+    async def sleep(delay):
+        clock["wall"] += delay
+        clock["cpu"] += 0.0001
+
+    monkeypatch.setattr(open_loop, "_connected_client", connected)
+    monkeypatch.setattr(open_loop.asyncio, "get_running_loop", lambda: Loop())
+    monkeypatch.setattr(open_loop.asyncio, "sleep", sleep)
+    monkeypatch.setattr(open_loop.time, "process_time", lambda: clock["cpu"])
+    monkeypatch.setattr(open_loop, "runtime_counters", lambda *_a: defaultdict(int))
+    args = Namespace(
+        protocol="311",
+        window=100,
+        completion="receipt",
+        host="unused",
+        port=0,
+        timeout=1,
+        target_rate=10,
+        count=3,
+        payload_bytes=64,
+    )
+    result = await open_loop.sample(args, "test/timing")
+    assert result.cpu_seconds == pytest.approx(0.0017)
+    assert result.measurement_seconds == pytest.approx(0.201)
+    assert result.pacing_sleeps == 2
+    assert result.completion_ratio == 1.0

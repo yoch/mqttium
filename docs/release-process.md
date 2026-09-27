@@ -66,8 +66,13 @@ be the maintainer's workstation. The manual `ARM64 Network Release Gate`
 workflow accepts `gate=network` or `gate=open-loop`, exact reviewed baseline
 and candidate SHAs, and explicit trusted-code confirmation from `main`. Both
 selections use the existing strict harness and serialize with other ARM64 work.
-The open-loop selection keeps its full default protocol/payload/load matrix;
-it is distinct from the paired workflow's fixed-rate writer checks.
+The open-loop selection keeps both protocols and payload sizes at fixed
+absolute rates from 5k to 26k messages/s. Lag at or above 90% of the lowest
+observed capacity, or without sleeping CPU headroom, is diagnostic only.
+Every scenario must include an eligible lower-rate comparison; all rates retain
+throughput and exact-completion checks. See the
+[benchmarking contract](benchmarking.md) for the regime and confirmation rules.
+This is distinct from the paired workflow's fixed-rate writer checks.
 
 An open-loop run invalidated **only** because the old point-ratio screen
 overflowed its bounded confirmation budget may be reevaluated without new
