@@ -13,6 +13,9 @@ class _BufferTransport:
     def get_write_buffer_size(self) -> int:
         return self.size
 
+    def is_closing(self) -> bool:
+        return False
+
 
 class _Writer:
     def __init__(self, transport: _BufferTransport) -> None:

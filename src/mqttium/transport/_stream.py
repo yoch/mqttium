@@ -16,6 +16,17 @@ def write_buffer_needs_drain(writer: asyncio.StreamWriter) -> bool:
     return transport is not None and transport.get_write_buffer_size() > _WRITE_BUFFER_HIGH_WATER
 
 
+def ensure_writable(writer: asyncio.StreamWriter) -> None:
+    """Refuse a write into a closing or lost stream instead of dropping it.
+
+    After a connection loss asyncio silently discards every further write and
+    logs ``socket.send() raised exception`` once the count passes a threshold.
+    Raising here turns that silent drop into the writer's ordinary failure path.
+    """
+    if writer.is_closing():
+        raise ConnectionResetError("transport is closed")
+
+
 async def close_stream_writer(writer: asyncio.StreamWriter) -> None:
     """Flush a closing stream for a bounded time, then abort stalled output."""
     writer.close()
@@ -88,6 +99,7 @@ class StreamTransportBase:
         self._writer = writer
 
     async def write(self, data: bytes) -> None:
+        ensure_writable(self._writer)
         self._writer.write(data)
         await self._drain_if_needed()
 
@@ -110,9 +122,12 @@ class StreamTransportBase:
         """
         transport = self._writer.transport
         if (
-            transport is not None
-            and transport.get_write_buffer_size() + len(data) > _WRITE_BUFFER_HIGH_WATER
+            transport is None
+            or transport.is_closing()
+            or transport.get_write_buffer_size() + len(data) > _WRITE_BUFFER_HIGH_WATER
         ):
+            # A closing transport falls back to the writer task, whose write
+            # raises and retires the connection instead of dropping the frame.
             return False
         self._writer.write(data)
         return True
@@ -123,6 +138,7 @@ class StreamTransportBase:
         if len(parts) == 1:
             await self.write(parts[0])
             return
+        ensure_writable(self._writer)
         self._writer.writelines(parts)
         await self._drain_if_needed()
 

@@ -6,6 +6,17 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Stop writing into a closed or lost transport. After a connection loss the
+  writer now fails on its next write instead of handing frames to a dead
+  socket, so asyncio no longer logs bursts of `socket.send() raised
+  exception`, and a terminal DISCONNECT is skipped for a transport that is
+  already closing.
+- Never surface the internal stale-connection fence from `publish()`: a send
+  for a connection the writer has already retired is dropped for teardown to
+  settle, like a deferred send.
+
 ## [1.0.0] - 2026-09-28
 
 ### Changed
