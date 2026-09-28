@@ -134,7 +134,7 @@ jobs:
       github.event_name == 'workflow_dispatch'
       && (inputs.mode == 'sweep' || inputs.mode == 'regimes')
       && inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
-    name: ${{ inputs.mode == 'regimes' && 'Saturation regime probe' || 'Fixed-rate schedule-lag sweep' }} (manual only)
+    name: ARM64 sweep or regime probe (manual only)
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 300
     concurrency:
