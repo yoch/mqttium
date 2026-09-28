@@ -70,7 +70,9 @@ The open-loop selection keeps both protocols and payload sizes at fixed
 absolute rates from 5k to 26k messages/s. Lag at or above 90% of the lowest
 observed capacity, or without sleeping CPU headroom, is diagnostic only.
 Every scenario must include an eligible lower-rate comparison; all rates retain
-throughput and exact-completion checks. See the
+throughput and exact-completion checks. A throughput suspect requires controls
+for both source trees and confidence bounds; inconclusive evidence remains
+release-blocking. See the
 [benchmarking contract](benchmarking.md) for the regime and confirmation rules.
 This is distinct from the paired workflow's fixed-rate writer checks.
 
