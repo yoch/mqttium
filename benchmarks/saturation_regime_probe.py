@@ -27,7 +27,6 @@ import argparse
 import json
 import math
 import re
-import resource
 import statistics
 import subprocess
 import sys
@@ -171,6 +170,8 @@ def _broker_counters(process: Any) -> dict[str, float]:
 
 
 def _children() -> dict[str, float]:
+    import resource  # POSIX only: the probe runs on the Linux runner
+
     usage = resource.getrusage(resource.RUSAGE_CHILDREN)
     return {
         "user": usage.ru_utime,
