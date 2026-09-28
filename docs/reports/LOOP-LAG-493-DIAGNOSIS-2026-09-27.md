@@ -347,3 +347,40 @@ runtime and throughput threshold remain unchanged.
 
 Retained `open-loop.json` SHA256:
 `25d4fadabeaad0587dec5de9adb4008800f09cc0b031fb44fb798297efe5d564`.
+
+## Addendum: strengthened confirmation remains inconclusive (2026-09-28)
+
+[Comparison 36401521973](https://github.com/yoch/mqttium/actions/runs/36401521973)
+used harness `bca1b0aa4e933718f6ded5572e5cf665ec3eaeba`, before the observer
+retention change. Its runtime is still RC17, compared with RC14. All six final
+preflights were eligible. The 512 worker samples cover 16,512,000 publications;
+all completed. The artifact verdict is **invalid**, not a confirmed regression
+or a qualification pass.
+
+Three 4096-byte cells required confirmation. Each has ten A/B ABBA cycles
+(including the two initial cycles) and eight A/A cycles per source tree:
+
+| Protocol / rate | A/B geometric completed-rate ratio | A/B 95% interval | RC14 A/A 95% interval | RC17 A/A 95% interval |
+| --- | ---: | --- | --- | --- |
+| 3.1.1 / 24k | 0.98162 | [0.96539, 0.99812] | [0.99817, 1.00812] | [0.96945, 1.02839] |
+| 5 / 24k | 0.98072 | [0.95203, 1.01028] | [0.94396, 1.02674] | [0.99445, 1.02644] |
+| 5 / 26k | 0.98032 | [0.96050, 1.00055] | [0.98436, 1.02395] | [0.97322, 1.01603] |
+
+Every A/B interval crosses the 0.97 throughput threshold, and at least one
+same-code interval in each cell exceeds the ±2% equivalence budget. The
+strengthened rule correctly refuses a product verdict from these measurements.
+The absence of an entry in the artifact's `failures` list is not a pass when
+`invalidations` is nonempty.
+
+Low-rate CPU/message ratios are diagnostic, without dedicated CPU controls:
+0.94842–1.06310 across the eight 5k/10k cells. The largest ratio is MQTT 5 /
+4096 B / 10k; the 3.1.1 / 64 B / 10k ratio is 1.03498. These values do not
+support extending the original sweep's within-1.5% observation to all later
+campaigns. No runtime optimization or threshold relaxation follows from them.
+
+The next controlled acquisition uses the observer-retention correction. It
+must be judged on its own same-code and A/B evidence; this invalid acquisition
+remains part of the record.
+
+Retained `open-loop.json` SHA256:
+`71014d0315df35d12d0a7c8b22086d24848cf8c4cee02119a7807c998e4f2733`.
