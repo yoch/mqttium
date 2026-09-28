@@ -8,11 +8,15 @@ run-name: "Loop-lag diagnosis: ${{ github.event_name == 'workflow_dispatch' && i
 # - sweep: at fixed absolute rates, below and through saturation, do two
 #   trusted commits differ in schedule lag while both keep pace, or only once
 #   one of them falls behind? Runs on the dedicated ARM64 runner.
+# - regimes: why does one commit's saturated throughput settle on distinct
+#   levels? Repeats one runtime per cell and records client, broker, softirq
+#   and TCP indicators around each sample. Runs on the dedicated ARM64 runner.
 
 on:
   pull_request:
     paths:
       - benchmarks/open_loop_lag_analysis.py
+      - benchmarks/saturation_regime_probe.py
       - .github/workflows/loop-lag-diagnosis.yml
   workflow_dispatch:
     inputs:
@@ -21,7 +25,7 @@ on:
         required: true
         default: archived
         type: choice
-        options: [archived, sweep]
+        options: [archived, sweep, regimes]
       run_ids:
         description: "archived: space-separated open-loop gate run IDs (default: the #493 campaign and the RC16/RC17 gates)"
         required: false
@@ -33,9 +37,24 @@ on:
         default: ""
         type: string
       candidate_ref:
-        description: "sweep: exact reviewed candidate commit SHA"
+        description: "sweep: exact reviewed candidate commit SHA; regimes: the runtime to measure"
         required: false
         default: ""
+        type: string
+      harness_ref:
+        description: "sweep, regimes: exact reviewed commit SHA of the benchmark harness (default: this workflow's commit)"
+        required: false
+        default: ""
+        type: string
+      regime_cells:
+        description: "regimes: protocols;payloads;rates (0 = unpaced), each comma-separated"
+        required: false
+        default: "311,5;64,4096;0,20000,24000,26000"
+        type: string
+      samples:
+        description: "regimes: samples per cell, interleaved across cells"
+        required: false
+        default: "12"
         type: string
       rates:
         description: "sweep: fixed absolute rates in msgs/s"
@@ -112,11 +131,12 @@ jobs:
 
   sweep:
     if: >-
-      github.event_name == 'workflow_dispatch' && inputs.mode == 'sweep'
+      github.event_name == 'workflow_dispatch'
+      && (inputs.mode == 'sweep' || inputs.mode == 'regimes')
       && inputs.confirm_trusted_code && github.ref == 'refs/heads/main'
-    name: Fixed-rate schedule-lag sweep (manual only)
+    name: ${{ inputs.mode == 'regimes' && 'Saturation regime probe' || 'Fixed-rate schedule-lag sweep' }} (manual only)
     runs-on: [self-hosted, linux, ARM64]
-    timeout-minutes: 240
+    timeout-minutes: 300
     concurrency:
       group: mqttium-arm64-runner
       cancel-in-progress: false
@@ -124,27 +144,48 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
     steps:
+      - name: Validate harness ref
+        env:
+          HARNESS_REF: ${{ inputs.harness_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$HARNESS_REF" ]; then
+            [[ "$HARNESS_REF" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "harness_ref must be an exact commit SHA" >&2; exit 2; }
+          fi
       - name: Check out benchmark harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ inputs.harness_ref || github.sha }}
           path: harness
           persist-credentials: false
       - name: Set run-specific workspace
         run: echo "JOB_ROOT=$RUNNER_TEMP/mqttium-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
       - name: Validate inputs
         env:
+          MODE: ${{ inputs.mode }}
           BASE_REF: ${{ inputs.base_ref }}
           CANDIDATE_REF: ${{ inputs.candidate_ref }}
           RATES: ${{ inputs.rates }}
           BLOCKS: ${{ inputs.blocks }}
+          CELLS: ${{ inputs.regime_cells }}
+          SAMPLES: ${{ inputs.samples }}
         run: |
           set -euo pipefail
-          for value in "$BASE_REF" "$CANDIDATE_REF"; do
+          refs=("$CANDIDATE_REF")
+          [ "$MODE" = sweep ] && refs+=("$BASE_REF")
+          for value in "${refs[@]}"; do
             [[ "$value" =~ ^[0-9a-fA-F]{40}$ ]] || { echo "all refs must be exact commit SHAs" >&2; exit 2; }
           done
-          [[ "$RATES" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "rates must be comma-separated integers" >&2; exit 2; }
-          [[ "$BLOCKS" =~ ^[1-8]$ ]] || { echo "blocks must be 1 to 8" >&2; exit 2; }
+          if [ "$MODE" = sweep ]; then
+            [[ "$RATES" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "rates must be comma-separated integers" >&2; exit 2; }
+            [[ "$BLOCKS" =~ ^[1-8]$ ]] || { echo "blocks must be 1 to 8" >&2; exit 2; }
+          else
+            [[ "$CELLS" =~ ^(311|5)(,(311|5))*\;[0-9]+(,[0-9]+)*\;[0-9]+(,[0-9]+)*$ ]] \
+              || { echo "regime_cells must be protocols;payloads;rates" >&2; exit 2; }
+            [[ "$SAMPLES" =~ ^([2-9]|[1-3][0-9]|40)$ ]] || { echo "samples must be 2 to 40" >&2; exit 2; }
+          fi
       - name: Check out baseline
+        if: inputs.mode == 'sweep'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.base_ref }}
@@ -210,6 +251,7 @@ jobs:
           cat "$root/mosquitto.log"
           exit 1
       - name: Sweep fixed rates in ABBA order
+        if: inputs.mode == 'sweep'
         env:
           RATES: ${{ inputs.rates }}
           BLOCKS: ${{ inputs.blocks }}
@@ -234,13 +276,36 @@ jobs:
               done
             done
           done
+      - name: Probe saturation regimes
+        if: inputs.mode == 'regimes'
+        env:
+          CELLS: ${{ inputs.regime_cells }}
+          SAMPLES: ${{ inputs.samples }}
+          PYTHONPATH: harness/benchmarks
+        run: |
+          set -euo pipefail
+          out="$JOB_ROOT/sweep"
+          mkdir -p "$out"
+          IFS=';' read -r protocols payloads rates <<< "$CELLS"
+          python harness/benchmarks/runner_probe.py \
+            --output "$out/preflight-before.json" --require-temperature \
+            --wait-seconds 120 --poll-seconds 5 --consecutive-eligible 2 --enforce
+          python harness/benchmarks/saturation_regime_probe.py \
+            --root candidate --port 11883 --cpu 2 \
+            --protocols "$protocols" --payloads "$payloads" --rates "$rates" \
+            --samples "$SAMPLES" --broker-pid-file "$JOB_ROOT/mosquitto.pid" \
+            --output "$out/regimes.json" --summary-output "$out/regimes.md"
+          python harness/benchmarks/runner_probe.py \
+            --output "$out/preflight-after.json" --require-temperature
+          cat "$out/regimes.md" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: loop-lag-sweep-${{ github.run_id }}
+          name: loop-lag-${{ inputs.mode }}-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/sweep/*.json
+            ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/sweep/*.md
             ${{ runner.temp }}/mqttium-${{ github.run_id }}-${{ github.run_attempt }}/mosquitto.log
           if-no-files-found: warn
           retention-days: 90
