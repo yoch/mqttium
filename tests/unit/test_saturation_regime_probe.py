@@ -144,3 +144,33 @@ def test_paced_cells_size_samples_by_rate(probe) -> None:
     assert probe.sample_count(probe.Cell("5", 4096, 26_000), args) == 52_000
     assert probe.sample_count(probe.Cell("5", 4096, 0), args) == args.count_large
     assert probe.sample_count(probe.Cell("5", 64, 0), args) == args.count_small
+
+
+def test_rank_correlation_handles_ties_and_constants(probe) -> None:
+    assert probe.rank_correlation([1, 2, 3, 4], [10, 20, 30, 40]) == pytest.approx(1.0)
+    assert probe.rank_correlation([1, 2, 3, 4], [4, 3, 3, 1]) == pytest.approx(-0.9486833)
+    assert probe.rank_correlation([1, 2, 3], [5, 5, 5]) is None
+
+
+def test_dispersed_cell_reports_profile_and_correlations(probe) -> None:
+    # One continuous spread without a 2 % gap: broker cost rises as throughput falls.
+    samples = []
+    for i in range(8):
+        sample = _sample(21_000 + i * 250, 1.0 - i * 0.02, seed=i)
+        sample["result"]["offered_seconds"] = 2.0
+        sample["result"]["measurement_seconds"] = 2.0 + 0.001 * (8 - i)
+        samples.append(sample)
+
+    summary = probe.summarise(samples)
+    cell = summary["cells"][0]
+
+    assert len(cell["levels"]) == 1
+    assert cell["completed_cv"] > probe.DISPERSED_CV
+    correlations = {item["indicator"]: item["rho"] for item in cell["rate_correlations"]}
+    assert correlations["broker_cpu_us_per_msg"] == pytest.approx(-1.0)
+    assert correlations["completion_tail_ms"] == pytest.approx(-1.0)
+    assert cell["profile"]["completion_tail_ms"] == pytest.approx(4.5)
+    assert cell["profile"]["completed_over_target"] == pytest.approx(21_875 / 26_000)
+    text = probe.markdown(summary)
+    assert "## Cell profiles (medians)" in text
+    assert "| broker_cpu_us_per_msg | -1.00 |" in text

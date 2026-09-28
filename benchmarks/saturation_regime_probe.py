@@ -42,6 +42,23 @@ ENGINE = SCRIPT_DIR / "paired_open_loop.py"
 # median starts a new level.
 DEFAULT_LEVEL_GAP = 0.02
 SEPARATION_FLOOR = 0.01
+# A cell whose completed throughput varies by more than this coefficient of
+# variation is dispersed even without a level gap; rank-correlate its indicators.
+DISPERSED_CV = 0.01
+MIN_CORRELATION_SAMPLES = 6
+# Cross-cell profile: where each cost goes as the offered rate approaches and
+# passes capacity.
+PROFILE = (
+    "completed_over_target",
+    "completion_tail_ms",
+    "ack_latency_p95_ms",
+    "worker_cpu_us_per_msg",
+    "broker_cpu_us_per_msg",
+    "broker_busy_share",
+    "writer_items_per_batch",
+    "net_rx_per_msg",
+    "tcp_max_rwnd_limited_ms",
+)
 _UNIT = {"": 1.0, "K": 1e3, "M": 1e6, "G": 1e9}
 
 
@@ -258,6 +275,19 @@ def _delta(before: dict[str, float], after: dict[str, float]) -> dict[str, float
 # --- analysis ---------------------------------------------------------------
 
 
+def _schedule(result: dict[str, Any]) -> dict[str, float]:
+    """How the paced schedule and the completion tail compare with the target."""
+    out: dict[str, float] = {}
+    target = result.get("target_rate") or 0.0
+    if target:
+        out["offered_over_target"] = result.get("offered_rate", 0.0) / target
+        out["completed_over_target"] = result.get("completed_rate", 0.0) / target
+    offered, measured = result.get("offered_seconds"), result.get("measurement_seconds")
+    if isinstance(offered, (int, float)) and isinstance(measured, (int, float)) and offered:
+        out["completion_tail_ms"] = (measured - offered) * 1000
+    return out
+
+
 def features(sample: dict[str, Any]) -> dict[str, float]:
     """Flatten one sample into per-message indicators."""
     result = sample["result"]
@@ -270,12 +300,12 @@ def features(sample: dict[str, Any]) -> dict[str, float]:
             out[name] = float(value)
 
     put("completed_rate", result.get("completed_rate"))
-    target = result.get("target_rate") or 0.0
-    if target:
-        put("offered_over_target", result.get("offered_rate", 0.0) / target)
+    for name, value in _schedule(result).items():
+        put(name, value)
     for name in (
         "loop_lag_p95_ms",
         "ack_latency_p50_ms",
+        "ack_latency_p95_ms",
         "delivery_latency_p50_ms",
         "observer_join_tail_seconds",
         "pending_receipts_high_water",
@@ -373,6 +403,49 @@ def separation(levels: list[list[dict[str, float]]], name: str) -> float | None:
     return abs(high_median - low_median) / spread
 
 
+def _ranks(values: list[float]) -> list[float]:
+    order = sorted(range(len(values)), key=values.__getitem__)
+    ranks = [0.0] * len(values)
+    start = 0
+    while start < len(order):
+        end = start
+        while end + 1 < len(order) and values[order[end + 1]] == values[order[start]]:
+            end += 1
+        for position in range(start, end + 1):
+            ranks[order[position]] = (start + end) / 2
+        start = end + 1
+    return ranks
+
+
+def rank_correlation(xs: list[float], ys: list[float]) -> float | None:
+    """Spearman correlation, or None when either side does not vary."""
+    if len(xs) != len(ys) or len(xs) < 3:
+        return None
+    rx, ry = _ranks(xs), _ranks(ys)
+    mx, my = statistics.fmean(rx), statistics.fmean(ry)
+    sxy = sum((a - mx) * (b - my) for a, b in zip(rx, ry, strict=True))
+    sxx = sum((a - mx) ** 2 for a in rx)
+    syy = sum((b - my) ** 2 for b in ry)
+    if not sxx or not syy:
+        return None
+    return sxy / math.sqrt(sxx * syy)
+
+
+def _correlations(rows: list[dict[str, float]], names: list[str]) -> list[dict[str, Any]]:
+    if len(rows) < MIN_CORRELATION_SAMPLES:
+        return []
+    found = []
+    for name in names:
+        paired = [(row["completed_rate"], row[name]) for row in rows if name in row]
+        if len(paired) < MIN_CORRELATION_SAMPLES:
+            continue
+        rho = rank_correlation([a for a, _ in paired], [b for _, b in paired])
+        if rho is not None:
+            found.append({"indicator": name, "rho": rho})
+    found.sort(key=lambda item: abs(item["rho"]), reverse=True)
+    return found[:12]
+
+
 def summarise(samples: list[dict[str, Any]], *, gap: float = DEFAULT_LEVEL_GAP) -> dict[str, Any]:
     by_cell: dict[str, list[dict[str, float]]] = {}
     for sample in samples:
@@ -409,6 +482,15 @@ def summarise(samples: list[dict[str, Any]], *, gap: float = DEFAULT_LEVEL_GAP) 
                 "separating_indicators": [
                     {"indicator": name, "separation": score} for name, score in ranked[:12]
                 ],
+                "completed_cv": (
+                    statistics.stdev(rates) / statistics.fmean(rates) if len(rates) > 1 else 0.0
+                ),
+                "profile": {
+                    name: statistics.median(row[name] for row in rows if name in row)
+                    for name in ("completed_rate", *PROFILE)
+                    if any(name in row for row in rows)
+                },
+                "rate_correlations": _correlations(rows, names),
             }
         )
     return {"level_gap": gap, "cells": cells}
@@ -422,7 +504,19 @@ def markdown(summary: dict[str, Any]) -> str:
         f"{summary['level_gap']:.0%} of the cell median. Separation is the distance "
         "between the lowest and highest levels' medians over their larger median "
         "absolute deviation.",
+        "",
+        "## Cell profiles (medians)",
+        "",
+        "| Cell | CV | " + " | ".join(("completed_rate", *PROFILE)) + " |",
+        "| --- | ---: | " + " | ".join("---:" for _ in range(len(PROFILE) + 1)) + " |",
     ]
+    for cell in summary["cells"]:
+        profile = cell.get("profile", {})
+        values = " | ".join(
+            f"{profile[name]:.4g}" if name in profile else "-"
+            for name in ("completed_rate", *PROFILE)
+        )
+        lines.append(f"| {cell['cell']} | {cell.get('completed_cv', 0.0):.2%} | {values} |")
     for cell in summary["cells"]:
         lines += [
             "",
@@ -446,6 +540,16 @@ def markdown(summary: dict[str, Any]) -> str:
                     f"| {name} | {item['separation']:.1f} | {low.get(name, math.nan):.4g} "
                     f"| {high.get(name, math.nan):.4g} |"
                 )
+        if cell.get("completed_cv", 0.0) > DISPERSED_CV and cell.get("rate_correlations"):
+            lines += [
+                "",
+                "| Indicator | Rank correlation with completed rate |",
+                "| --- | ---: |",
+            ]
+            lines += [
+                f"| {item['indicator']} | {item['rho']:+.2f} |"
+                for item in cell["rate_correlations"]
+            ]
     return "\n".join(lines) + "\n"
 
 
