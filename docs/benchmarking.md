@@ -366,6 +366,16 @@ next to the lag ratio, and reports the CPU-per-message ratio only for samples
 that were not busy. The `Loop-lag diagnosis` workflow runs it on retained gate
 artifacts and, manually, sweeps fixed absolute rates on the ARM64 runner.
 
+When one commit's saturated throughput settles on distinct levels, its
+same-code controls fail their equivalence budget whatever the candidate. The
+workflow's manual `regimes` mode runs `saturation_regime_probe.py`: one trusted
+runtime, many interleaved samples per cell, and around each unchanged
+`paired_open_loop.py` sample the worker's and the broker's CPU and context
+switches, per-CPU network softirqs, a TCP snapshot of the broker connections
+and the CPU frequencies. Its summary groups each cell's samples into throughput
+levels and ranks the indicators that separate them. Its `harness_ref` input
+runs a reviewed harness commit other than the workflow's own.
+
 Before trusting a lag verdict, compare the two arms' **absolute**
 `loop_lag_p95`: values near the plateau mean the publisher is still sleeping and
 the number is a timer artifact, not congestion. Choose load points where both
