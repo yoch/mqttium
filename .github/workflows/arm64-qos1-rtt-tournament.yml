@@ -203,6 +203,7 @@ jobs:
           cat > "$JOB_ROOT/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
+          set_tcp_nodelay true
           max_inflight_messages 1000
           max_queued_messages 100000
           max_queued_bytes 0

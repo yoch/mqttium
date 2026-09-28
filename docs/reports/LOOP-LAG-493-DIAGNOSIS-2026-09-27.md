@@ -458,3 +458,146 @@ at 3.1.1 / 64 B / 10k and 1.03246 at 3.1.1 / 4096 B / 10k.
 
 Retained `open-loop.json` SHA256:
 `55ebbea129a448e23f387416975c7167ae816e77631ecb79353a2b877aa162d8`.
+
+## Addendum: saturation regimes isolated (2026-09-28)
+
+Three single-arm runs of `benchmarks/saturation_regime_probe.py` on the Pi 5
+measured RC17 (`c9bab1ad`) with the broker on CPU 0, the publisher on CPU 2 and
+an eligible preflight before each run. Cells are interleaved round by round.
+The runs record per-sample worker, broker, softirq, TCP and collector
+indicators; the step summaries hold the per-cell medians quoted here.
+
+| Run | Harness | Cells | Samples per cell |
+| --- | --- | --- | ---: |
+| [36419657087](https://github.com/yoch/mqttium/actions/runs/36419657087) | `78b0704e` | 3.1.1, 5 × 64, 4096 B × unpaced, 20k, 24k, 26k | 12 |
+| [36421145616](https://github.com/yoch/mqttium/actions/runs/36421145616) | `bb5f7a35` | 3.1.1, 5 × 64, 4096 B × unpaced, 24k–30k | 10 |
+| [36423070317](https://github.com/yoch/mqttium/actions/runs/36423070317) | `48872103` | 5 × 64, 4096 B × unpaced, 24k, 26k, 28k × three publisher variants | 8 |
+
+### Below capacity the code is stable
+
+Every paced cell that the Pi sustains has one throughput level and a
+coefficient of variation of at most 0.11 %: 64 B from 20k to 30k msgs/s under
+both protocols, and 4096 B up to 24k. The earlier widely separated calibration
+levels did not reproduce with the strict preflight: every unpaced cell stayed
+within a 1.5 % coefficient of variation. The same-code dispersion
+that invalidated the RC17/RC17 controls appears only where the offered rate
+exceeds capacity.
+
+### Finding 1: a fixed 42 ms completion tail from broker Nagle
+
+In every sustained paced cell, completed throughput is 0.979 of the target and
+the completion tail (last offer to last receipt) is 41–44 ms, independent of
+rate, payload and protocol, while the PUBACK p95 is 1–2 ms. Mosquitto leaves
+Nagle's algorithm enabled unless `set_tcp_nodelay true` is configured; the
+final PUBACK then waits for the delayed ACK of the publisher's last segment.
+MQTTium already sets `TCP_NODELAY` on its own sockets.
+
+A local reproduction with Mosquitto 2.0.18 and 3 samples per cell:
+
+| Broker | Completion tail | Completed / target | PUBACK p95 |
+| --- | ---: | ---: | ---: |
+| default | 40.5–44.3 ms | 0.978–0.980 (one 0.993) | 0.9–4.9 ms (one 33.7) |
+| `set_tcp_nodelay true` | 0.10–0.53 ms | 1.000 | 0.7–2.1 ms (one 16.5) |
+
+With 2-second samples this is a 2.1 % bias in every completed rate. It leaves
+only 0.9 points of margin above the gate's 0.97 floor before any code
+difference is measured, and it adds broker delay to acknowledgement
+latencies. It cancels in same-condition ratios, but not in absolute floors.
+The benchmark workflows now configure `set_tcp_nodelay true`; their earlier
+artifacts keep the Nagle broker.
+
+### Finding 2: over capacity, an unbounded backlog collapses throughput
+
+The 4096 B capacity on this runner lies between 24k and 25k msgs/s. MQTT 3.1.1
+sustains 25k in most samples; MQTT 5 at 25k tips into backlog in 9 of 10. Above
+capacity the harness keeps publishing without a bound
+(`max_unacknowledged_messages=None`), so pending receipts grow from about 200
+at 24k to 10⁴–6·10⁴.
+Worker CPU per message then rises and completed throughput falls **below**
+what a paced run sustains. The fall is random per sample:
+
+| MQTT 5 / 4096 B, run 36421145616 | 24k | 25k | 26k | 28k | 30k |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Completed msgs/s (median) | 23,510 | 22,490 | 22,130 | 20,620 | 20,820 |
+| CV | 0.07 % | 3.25 % | 5.55 % | 12.82 % | 0.96 % |
+| Worker CPU µs/msg | 41.7 | 44.4 | 44.6 | 48.0 | 47.5 |
+
+In the dispersed cells, the rank correlation of completed throughput with
+worker CPU per message is between −0.78 and −0.93. Its correlation with
+pending receipts or completion tail is between −0.71 and −0.99. Broker busy
+share correlates positively (+0.59 to +0.94): the broker is starved, not
+saturated, at about 17–19 % busy. Under overload the publisher, not the
+broker or the network, sets throughput, and its per-message cost grows with
+its own backlog. The feedback has two stable outcomes: a sample either keeps
+up or falls into backlog. This is the multi-level saturated throughput.
+
+The third run separates the causes with the same cells and three publisher
+variants:
+
+| MQTT 5 | unbounded (gate) | bounded to 1,024 | collector off |
+| --- | ---: | ---: | ---: |
+| 64 B unpaced | 23,410 (CV 0.53 %) | 27,370 (0.65 %) | 26,740 (0.46 %) |
+| 4096 B unpaced | 21,770 (0.20 %) | 22,630 (1.15 %) | 23,810 (0.86 %) |
+| 4096 B / 26k | 22,150 (3.45 %) | 23,070 (1.97 %) | 23,480 (1.45 %) |
+| 4096 B / 28k | 20,820 (13.99 %) | 22,670 (0.91 %) | 21,950 (7.45 %) |
+
+At 24k, 26k and 28k with 64 B, and at 24k with 4096 B, the three variants
+agree within 0.1 %. Disabling the cyclic collector recovers most of the lost
+throughput, although full collections stay rare (at most one per 40,000
+messages). The younger collections traverse every object that survived since
+the previous one, and a growing backlog consists of exactly such survivors. Bounding the backlog removes the collapse and most of the spread,
+because an awaiting `publish()` parks instead of accumulating state.
+
+A local object count shows which state is live during a backlog. RC17 keeps
+two collector-tracked objects per unacknowledged publication
+(`OutboundMessage` and `PublishReceipt`). The harness's per-publication
+observer task adds six more: `Task`, coroutine, `Handle`, `Context`, step
+wrapper and weak reference. Three quarters of the traversed backlog belongs to
+the measurement harness.
+
+### Finding 3: unpaced calibration measures the collapse
+
+The closed-loop calibration publishes the whole sample at once with the same
+unbounded backlog, so it reports the collapsed rate: 23.4k msgs/s at 64 B,
+while paced 28k sustains 27.4k and a bounded unpaced run completes 27.4k. A
+calibration therefore under-reports capacity by up to 15 %. Any load expressed
+as a fraction of it lands in a different regime from run to run.
+
+### Verdict for #493
+
+The saturated same-code variance is a **measurement defect** with three
+parts:
+
+1. The broker's Nagle tail biases every completed rate by 2.1 % and inflates
+   latencies.
+2. The fixed 26k point at 4096 B lies above this runner's capacity. There the
+   harness's unbounded backlog, with one observer task per publication, makes
+   throughput depend on the random depth of that backlog.
+3. Unpaced calibrations measure the same collapse.
+
+No software defect was found in RC17. It is stable to within 0.11 % wherever the
+offered rate is sustainable, and its own live state per pending publication is
+two objects. Throughput under an unbounded backlog does degrade with backlog
+depth. That is a property of Python's collector over any large live set;
+applications keep MQTTium's default bound of 10,000 unacknowledged messages
+unless they disable it.
+
+### Gate changes for the maintainer's decision
+
+- **Applied here:** `set_tcp_nodelay true` in every benchmark broker
+  configuration. Qualify it with one RC17/RC17 open-loop control before
+  interpreting new absolute floors.
+- **Proposed:**
+  - Measure throughput and schedule lag only at rates the runner sustains:
+    4096 B up to 24k on the Pi 5. Classify a cell with `completed_over_target`
+    below 0.97, after the Nagle fix, as overload rather than as a regression.
+  - Qualify overload separately with a bounded publisher
+    (`--max-unacknowledged-messages 1024`) and compare completed throughput
+    only.
+  - Calibrate with the bounded publisher.
+- **Optional:** replace the per-publication observer task with a FIFO
+  observer to reduce the harness's own backlog state. That changes how
+  out-of-order completions are timed, so it needs its own A/A qualification.
+
+After these changes, the closing campaign is the one already planned: two RC17
+A/A open-loop controls, then RC14 → RC17.

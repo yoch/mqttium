@@ -178,7 +178,18 @@ def test_dispersed_cell_reports_profile_and_correlations(probe) -> None:
 
 def test_variants_expand_cells_and_worker_options(probe) -> None:
     args = probe.parse_args(
-        ["--root", "x", "--protocols", "5", "--payloads", "4096", "--rates", "0,26000"]
+        [
+            "--root",
+            "x",
+            "--protocols",
+            "5",
+            "--payloads",
+            "4096",
+            "--rates",
+            "0,26000",
+            "--variants",
+            ",".join(probe.VARIANTS),
+        ]
     )
 
     cells = probe._cells(args)

@@ -626,7 +626,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--observer-retention", choices=("pending", "all"), default="pending")
     parser.add_argument(
         "--variants",
-        default=",".join(VARIANTS),
+        default="unbounded",
         help="comma-separated publisher variants: " + ", ".join(VARIANTS),
     )
     parser.add_argument(
