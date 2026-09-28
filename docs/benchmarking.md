@@ -111,6 +111,14 @@ fields record the offering phase, the last observed receipt, synchronous join
 setup, and the remaining join tail. Pending-observer high water and garbage
 collection counts help investigate changes of regime; they do not by themselves
 identify a runtime cause or change the gate's completed-rate definition.
+Completed observer tasks are retired in order after pacing sleeps and every
+256 admissions. Pending observers remain owned until completion, and retiring
+a failed observer raises its error. The worker no longer retains a full sample's
+completed task graphs merely to join them again. `--observer-retention all`
+retains that older behavior for diagnostic comparisons; the selected mode and
+retained-observer high water are recorded in the artifact. Compare both source
+trees with the same harness and observer mode, and rerun same-code controls
+after changing the measurement implementation.
 The report shows per-arm CPU microseconds per message only when both arms sleep
 and stay below 95% busy in every sample; otherwise the summary value is `null`.
 These costs are diagnostic measurements, not a CPU-equivalence verdict. ACK

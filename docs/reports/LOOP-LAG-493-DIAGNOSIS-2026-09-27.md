@@ -321,3 +321,29 @@ not rewritten or relabelled as passed.
 
 Retained `open-loop.json` SHA256:
 `22c944a9eac0ea01f2335328f4f00e12b788e11a48d11a7d68c97d31da9cc53e`.
+
+## Addendum: identical-code false failure (2026-09-28)
+
+[Instrumented A/A 36400414652](https://github.com/yoch/mqttium/actions/runs/36400414652)
+compared `18432349483b828e185cf41ec899d79a4fdef298` against itself. The old
+median-only rule returned **failed** at MQTT 5 / 4096 B / 26k msgs/s:
+median ratio **0.9624**, despite identical source code. Its geometric mean
+was 0.96376 with 95% interval [0.93554, 0.99283]. This demonstrates a false
+release-regression verdict from that rule; the earlier passing A/A campaign
+does not establish reliable saturation qualification.
+
+For this cell, median join setup took 57.12 ms in the baseline-labelled arm
+and 126.75 ms in the candidate-labelled arm. The last-receipt ratio was still
+0.96220. The measurement is sensitive to work done by the observer machinery
+and to backlog before joining; these diagnostics do not establish the sole
+cause of that sensitivity.
+
+The next harness revision retires completed observers during acquisition,
+while keeping pending observers owned and propagating their exceptions. It
+records retention mode and peak retained tasks; an explicit `all` mode keeps
+the older retention behavior available. Fresh paired and same-code campaigns
+are required before interpreting results from that changed harness. The MQTTium
+runtime and throughput threshold remain unchanged.
+
+Retained `open-loop.json` SHA256:
+`25d4fadabeaad0587dec5de9adb4008800f09cc0b031fb44fb798297efe5d564`.

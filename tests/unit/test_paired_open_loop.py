@@ -283,3 +283,67 @@ async def test_cpu_interval_excludes_initial_pacing_sleep(
     assert result.pending_receipts_after_offer == 3
     assert result.pending_receipts_high_water == 3
     assert len(result.gc_collections) == 3
+
+
+@pytest.mark.parametrize("retention,expected_peak", [("pending", 256), ("all", 1_024)])
+async def test_completed_observers_do_not_accumulate_with_sample_length(
+    open_loop, monkeypatch, retention, expected_peak
+):
+    from collections import defaultdict
+
+    class Receipt:
+        mid = 1
+
+        async def wait(self):
+            pass
+
+    class Client:
+        async def connect(self, *_a, **_kw):
+            pass
+
+        async def publish(self, *_a, **_kw):
+            await open_loop.asyncio.sleep(0)
+            return Receipt()
+
+        async def disconnect(self):
+            pass
+
+    async def connected(*_a):
+        return Client()
+
+    monkeypatch.setattr(open_loop, "_connected_client", connected)
+    monkeypatch.setattr(open_loop, "runtime_counters", lambda *_a: defaultdict(int))
+    args = Namespace(
+        protocol="311",
+        window=100,
+        completion="receipt",
+        host="unused",
+        port=0,
+        timeout=1,
+        target_rate=0,
+        count=1_024,
+        payload_bytes=64,
+        observer_retention=retention,
+    )
+    result = await open_loop.sample(args, "test/observers")
+    assert result.observer_retention == retention
+    assert result.retained_observers_high_water <= expected_peak + 1
+    assert result.retained_observers_high_water >= expected_peak
+    assert result.pending_receipts_high_water <= 2
+    assert result.completion_ratio == 1.0
+
+
+async def test_observer_retirement_preserves_pending_tasks_and_surfaces_failure(open_loop):
+    from collections import deque
+
+    loop = open_loop.asyncio.get_running_loop()
+    first, pending, failed = (loop.create_future() for _ in range(3))
+    first.set_result(None)
+    failed.set_exception(RuntimeError("receipt failed"))
+    tasks = deque([first, pending, failed])
+    open_loop._retire_completed_observers(tasks)
+    assert list(tasks) == [pending, failed]
+    pending.set_result(None)
+    with pytest.raises(RuntimeError, match="receipt failed"):
+        open_loop._retire_completed_observers(tasks)
+    assert not tasks

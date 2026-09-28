@@ -264,6 +264,8 @@ def _worker_command(
         str(target),
         "--timeout",
         str(args.timeout),
+        "--observer-retention",
+        getattr(args, "observer_retention", "pending"),
     ]
     if args.cpu is not None:
         command.extend(("--cpu", str(args.cpu)))
@@ -1086,6 +1088,7 @@ def _result_template(
         "harness": {
             "engine": str(args.engine),
             "publisher_cpu": args.cpu,
+            "observer_retention": getattr(args, "observer_retention", "pending"),
             "calibration_source": "baseline_only",
             "calibration_seconds": args.calibration_seconds,
             "calibration_repeats": args.calibration_repeats,
@@ -1100,6 +1103,8 @@ def _result_template(
             "min_completed_ratio": args.min_completed_ratio,
             "max_loop_lag_ratio": args.max_loop_lag_ratio,
             "control_max_throughput_deviation": args.control_max_throughput_deviation,
+            "throughput_confirmation": "95% interval below or above min_completed_ratio; overlap invalidates",
+            "throughput_control": "each source tree's 95% interval must fit the equivalence budget",
             "loop_confirmation_screen": (
                 "geometric mean above ratio threshold with relative and additive "
                 "95% lower bounds above zero effect"
@@ -1236,6 +1241,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocols", default="311,5")
     parser.add_argument("--payloads", default="64,4096")
     parser.add_argument("--completions", choices=("receipt",), default="receipt")
+    parser.add_argument("--observer-retention", choices=("pending", "all"), default="pending")
     parser.add_argument("--windows", default="100")
     parser.add_argument("--fractions")
     parser.add_argument("--target-rates")

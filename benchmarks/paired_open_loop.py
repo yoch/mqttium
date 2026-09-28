@@ -12,6 +12,7 @@ import statistics
 import subprocess
 import sys
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
@@ -68,6 +69,8 @@ class OpenLoopResult:
     pending_receipts_after_offer: int
     pending_receipts_high_water: int
     gc_collections: list[int]
+    observer_retention: str
+    retained_observers_high_water: int
     effect_inline: int
     effect_enqueued: int
     effect_suspensions: int
@@ -106,10 +109,17 @@ async def _connected_client(protocol: str, window: int):
     return client
 
 
+def _retire_completed_observers(tasks: deque[asyncio.Task[None]]) -> None:
+    """Release completed observers in order, propagating their failures."""
+    while tasks and tasks[0].done():
+        tasks.popleft().result()
+
+
 async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
     client = await _connected_client(args.protocol, args.window)
     latencies: list[float] = []
-    receipt_tasks: list[asyncio.Task[None]] = []
+    receipt_tasks: deque[asyncio.Task[None]] = deque()
+    observer_retention = getattr(args, "observer_retention", "pending")
     receipt_completed = 0.0
 
     async def observe_receipt(receipt, sent_ns: int) -> None:
@@ -132,16 +142,21 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
     offered_started = 0.0
     pacing_sleeps = 0
     pending_high_water = 0
+    retained_high_water = 0
     gc_before = gc.get_stats()
     try:
         for sequence in range(args.count):
             deadline = started + sequence * interval if paced else loop.time()
+            slept = False
             if paced:
                 delay = deadline - loop.time()
                 if delay > 0:
                     if sequence > 0:
                         pacing_sleeps += 1
                     await asyncio.sleep(delay)
+                    slept = True
+            if observer_retention == "pending" and (slept or sequence % 256 == 0):
+                _retire_completed_observers(receipt_tasks)
             actual = loop.time()
             if sequence == 0:
                 offered_started = actual
@@ -151,10 +166,11 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
             receipt = await client.publish(topic, _payload(sequence, args.payload_bytes), qos=1)
             assert receipt.mid is not None
             receipt_tasks.append(asyncio.create_task(observe_receipt(receipt, sent_ns)))
-            pending_high_water = max(pending_high_water, len(receipt_tasks) - len(latencies))
+            pending_high_water = max(pending_high_water, sequence + 1 - len(latencies))
+            retained_high_water = max(retained_high_water, len(receipt_tasks))
         offered_elapsed = max(loop.time() - offered_started, 1e-9)
         offered_cpu_elapsed = time.process_time() - cpu_started
-        pending_after_offer = len(receipt_tasks) - len(latencies)
+        pending_after_offer = args.count - len(latencies)
         join_started = loop.time()
         joined = asyncio.gather(*receipt_tasks)
         join_setup_elapsed = loop.time() - join_started
@@ -199,6 +215,8 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
                 after["collections"] - before["collections"]
                 for before, after in zip(gc_before, gc_after, strict=True)
             ],
+            observer_retention=observer_retention,
+            retained_observers_high_water=retained_high_water,
             effect_inline=effects["inline_effects"],
             effect_enqueued=effects["enqueued"],
             effect_suspensions=effects["apply_suspensions"],
@@ -282,6 +300,8 @@ def _run_worker(
         str(target_rate),
         "--timeout",
         str(args.timeout),
+        "--observer-retention",
+        getattr(args, "observer_retention", "pending"),
     ]
     if args.cpu is not None:
         command.extend(("--cpu", str(args.cpu)))
@@ -592,6 +612,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--payload-bytes", type=int, default=64)
     parser.add_argument("--payloads", default="64,4096")
     parser.add_argument("--completion", choices=("receipt",), default="receipt")
+    parser.add_argument(
+        "--observer-retention",
+        choices=("pending", "all"),
+        default="pending",
+        help="retire completed observers during acquisition; all retains the legacy task history",
+    )
     parser.add_argument("--completions", default="receipt")
     parser.add_argument("--fractions")
     parser.add_argument("--target-rates")
