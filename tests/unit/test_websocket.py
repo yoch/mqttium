@@ -244,6 +244,9 @@ class _BatchWriter:
     def writelines(self, frames: list[bytes]) -> None:
         self.batches.append(list(frames))
 
+    def is_closing(self) -> bool:
+        return False
+
     async def drain(self) -> None:
         return None
 

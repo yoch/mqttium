@@ -12,7 +12,11 @@ from ssl import SSLContext
 from typing import Any
 from urllib.parse import urlparse
 
-from mqttium.transport._stream import close_stream_writer, write_buffer_needs_drain
+from mqttium.transport._stream import (
+    close_stream_writer,
+    ensure_writable,
+    write_buffer_needs_drain,
+)
 from mqttium.transport.stats import TransportStats
 
 _MAX_HANDSHAKE_BYTES = 64 * 1024
@@ -94,6 +98,7 @@ class WebSocketTransport:
         return transport
 
     async def write(self, data: bytes) -> None:
+        ensure_writable(self._writer)
         await self._flush_control()
         frame = _mask_client_frame(0x2, data)  # binary
         self._writer.write(frame)
@@ -103,6 +108,7 @@ class WebSocketTransport:
     async def write_many(self, parts: list[bytes]) -> None:
         if not parts:
             return
+        ensure_writable(self._writer)
         await self._flush_control()
         # A WebSocket binary message may contain several consecutive MQTT
         # Control Packets. Coalesce them before framing so one batch pays for
@@ -135,6 +141,7 @@ class WebSocketTransport:
             await self._write_payload_batch(batch, payload_bytes)
 
     async def _write_payload_batch(self, parts: list[bytes], payload_bytes: int) -> None:
+        ensure_writable(self._writer)
         payload = parts[0] if len(parts) == 1 else b"".join(parts)
         mask = os.urandom(4)
         # Header and masked payload are separate TCP write segments but together
@@ -206,6 +213,7 @@ class WebSocketTransport:
     async def _flush_control(self) -> None:
         if not self._pending_control:
             return
+        ensure_writable(self._writer)
         self._writer.writelines(self._pending_control)
         self._pending_control.clear()
         if write_buffer_needs_drain(self._writer):
