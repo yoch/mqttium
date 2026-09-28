@@ -866,6 +866,7 @@ class AsyncClient:
         # CONNACK; no old effect may cross into the new connection.
         await self._invalidate_connection_epoch()
         self._effect_pump.discard_connection_effects()
+        self._flush_delivery_carryover()
         deadline = loop.time() + timeout
         try:
             try:
@@ -1816,6 +1817,7 @@ class AsyncClient:
         self._effect_pump.collect_from_engine()
         self._auth_exchange.retire()
         await self._write_pump.wake_waiters()
+        self._flush_delivery_carryover()
         # The keepalive loop belongs to this reader's transport epoch. An
         # EOF or reader-side failure can end the reader without entering
         # _force_close(), so retire the task here before a reconnect can
@@ -2367,7 +2369,9 @@ class AsyncClient:
                 message, self._message_callback, effect.decoded_property_wire_size
             )
             if not effect.requires_delivery_mark or message.mid is None:
-                return pending
+                if pending is None or self._delivery.mode == "callback":
+                    return pending
+                return self._admit_acknowledged(message, effect.decoded_property_wire_size, pending)
             if pending is None or self._delivery.mode == "callback":
                 # The application owns the message now: a callback already ran,
                 # or the iterator queue accepted it. Mark before any await, so
@@ -2378,6 +2382,34 @@ class AsyncClient:
         if kind is EffectKind.CONTINUE_INBOUND_REPLAY:
             return self._continue_inbound_replay(epoch)
         raise MQTTError(f"Non-delivery effect in reader lane: {kind!r}")
+
+    async def _admit_acknowledged(
+        self,
+        message: Message,
+        property_wire_size: int | None,
+        pending: Awaitable[bool | None],
+    ) -> None:
+        """Finish a waiting admission for a message the client already acknowledged.
+
+        A replaced connection or stream retires the waiting admission, but
+        nothing else will ever deliver this message: commit it anyway.
+        """
+        if await pending is False:
+            self._delivery.deliver_acknowledged(message, None, property_wire_size)
+
+    def _flush_delivery_carryover(self) -> None:
+        """Hand retired connections' acknowledged messages to the application.
+
+        Called once the old reader has stopped, outside every protocol lock,
+        so callback mode may run application code here.
+        """
+        lane = self._delivery_lane
+        if not lane.carryover:
+            return
+        for effect in lane.take_carryover():
+            self._delivery.deliver_acknowledged(
+                effect.data, self._message_callback, effect.decoded_property_wire_size
+            )
 
     def _mark_delivered_locked(self, mid: int, token: object | None = None) -> None:
         """Record delivery of ``mid`` and apply the completion it releases.
@@ -2712,6 +2744,8 @@ class AsyncClient:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+        # The joined reader may have left an interrupted lot behind.
+        self._flush_delivery_carryover()
         if (
             old_reader is not None
             and old_reader is not current

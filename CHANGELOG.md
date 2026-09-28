@@ -24,6 +24,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Never surface the internal stale-connection fence from `publish()`: a send
   for a connection the writer has already retired is dropped for teardown to
   settle, like a deferred send.
+- Never discard a message the client has already acknowledged. QoS 0 and
+  automatically acknowledged QoS 1 messages decoded before a connection loss,
+  `disconnect()` or an explicit reconnect were dropped when the reader's lot or
+  a waiting iterator admission was retired, and an explicit reconnect emptied
+  the unread iterator queue. They are now delivered in order: unread messages
+  move to the new iterator generation, and interrupted lots are handed over
+  once the old reader stops, past the iterator bound by at most one lot.
 
 ## [1.0.0] - 2026-09-28
 

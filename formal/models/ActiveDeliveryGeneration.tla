@@ -15,8 +15,14 @@ captures the admission generation, then loops:
 
 _wake_waiters() sets `space` only while a waiter exists; it runs when the
 application consumes (release), on invalidate_waiting_admissions() (a new
-connection epoch) and on reset_stream() (a new application stream, whose
-queue is emptied). The queue holds one message.
+connection epoch) and on reset_stream() (a new application stream, which
+carries the unread queue into the new generation). The queue holds one
+message.
+
+A retired admission returns False and commits nothing. For an already
+acknowledged message (no delivery mark) the client then commits it explicitly
+through deliver_acknowledged(), outside this loop; a marked delivery is left
+to session state. Neither changes what this loop may commit.
 
 Variant = "rc15": the loop waits for capacity only and always commits; a new
   connection epoch does not wake it (reset_stream() did).
@@ -112,14 +118,13 @@ NewEpoch ==
   /\ UNCHANGED <<stream, queued, waiter, waiterAdmission, waiterOwner,
                  arrivals, stale>>
 
-\* A new application stream: reset_stream() empties the queue.
+\* A new application stream: reset_stream() carries the unread queue over.
 NewStream ==
   /\ stream < 2
   /\ stream' = stream + 1
-  /\ queued' = 0
   /\ space' = Wake(space)
   /\ admission' = IF Variant = "fixed" THEN admission + 1 ELSE admission
-  /\ UNCHANGED <<epoch, waiter, waiterAdmission, waiterOwner, arrivals, stale>>
+  /\ UNCHANGED <<epoch, queued, waiter, waiterAdmission, waiterOwner, arrivals, stale>>
 
 \* The application reads the next stream's queue until it fills again.
 Refill ==
