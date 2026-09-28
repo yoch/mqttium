@@ -42,7 +42,29 @@ ENGINE = SCRIPT_DIR / "paired_open_loop.py"
 # median starts a new level.
 DEFAULT_LEVEL_GAP = 0.02
 SEPARATION_FLOOR = 0.01
+# A cell whose completed throughput varies by more than this coefficient of
+# variation is dispersed even without a level gap; rank-correlate its indicators.
+DISPERSED_CV = 0.01
+MIN_CORRELATION_SAMPLES = 6
+# Cross-cell profile: where each cost goes as the offered rate approaches and
+# passes capacity.
+PROFILE = (
+    "completed_over_target",
+    "completion_tail_ms",
+    "ack_latency_p95_ms",
+    "worker_cpu_us_per_msg",
+    "broker_cpu_us_per_msg",
+    "broker_busy_share",
+    "writer_items_per_batch",
+    "pending_receipts_high_water",
+    "gc_gen2_per_kmsg",
+    "tcp_max_rwnd_limited_ms",
+)
 _UNIT = {"": 1.0, "K": 1e3, "M": 1e6, "G": 1e9}
+# Publisher variants: the gate's unbounded backlog, a bounded backlog where an
+# awaiting publish() parks, and the unbounded backlog without the cyclic
+# collector (diagnostic attribution of backlog cost).
+VARIANTS = ("unbounded", "bounded", "gc-off")
 
 
 @dataclass(frozen=True)
@@ -50,11 +72,21 @@ class Cell:
     protocol: str
     payload_bytes: int
     rate: float
+    variant: str = "unbounded"
 
     @property
     def key(self) -> str:
         rate = "unpaced" if self.rate <= 0 else f"{self.rate:.0f}"
-        return f"protocol={self.protocol} payload={self.payload_bytes} rate={rate}"
+        key = f"protocol={self.protocol} payload={self.payload_bytes} rate={rate}"
+        return key if self.variant == "unbounded" else f"{key} variant={self.variant}"
+
+
+def worker_options(cell: Cell, args: argparse.Namespace) -> argparse.Namespace:
+    """The worker arguments for one cell's publisher variant."""
+    options = argparse.Namespace(**vars(args))
+    options.max_unacknowledged_messages = args.bounded_backlog if cell.variant == "bounded" else 0
+    options.gc_disable = cell.variant == "gc-off"
+    return options
 
 
 # --- system readers ---------------------------------------------------------
@@ -213,7 +245,7 @@ def acquire(cell: Cell, args: argparse.Namespace, broker: Any) -> dict[str, Any]
     result = _run_worker(
         ENGINE,
         args.root,
-        args,
+        worker_options(cell, args),
         mode="calibrate" if cell.rate <= 0 else "sample",
         protocol=cell.protocol,
         payload_bytes=cell.payload_bytes,
@@ -233,6 +265,7 @@ def acquire(cell: Cell, args: argparse.Namespace, broker: Any) -> dict[str, Any]
         "protocol": cell.protocol,
         "payload_bytes": cell.payload_bytes,
         "rate": cell.rate,
+        "variant": cell.variant,
         "count": count,
         "result": result,
         "system": {
@@ -258,6 +291,21 @@ def _delta(before: dict[str, float], after: dict[str, float]) -> dict[str, float
 # --- analysis ---------------------------------------------------------------
 
 
+def _derived(result: dict[str, Any], count: float) -> dict[str, float]:
+    """Schedule, completion tail and collector activity relative to the target."""
+    out: dict[str, float] = {}
+    for generation, collections in enumerate(result.get("gc_collections") or []):
+        out[f"gc_gen{generation}_per_kmsg"] = collections / count * 1000
+    target = result.get("target_rate") or 0.0
+    if target:
+        out["offered_over_target"] = result.get("offered_rate", 0.0) / target
+        out["completed_over_target"] = result.get("completed_rate", 0.0) / target
+    offered, measured = result.get("offered_seconds"), result.get("measurement_seconds")
+    if isinstance(offered, (int, float)) and isinstance(measured, (int, float)) and offered:
+        out["completion_tail_ms"] = (measured - offered) * 1000
+    return out
+
+
 def features(sample: dict[str, Any]) -> dict[str, float]:
     """Flatten one sample into per-message indicators."""
     result = sample["result"]
@@ -270,12 +318,12 @@ def features(sample: dict[str, Any]) -> dict[str, float]:
             out[name] = float(value)
 
     put("completed_rate", result.get("completed_rate"))
-    target = result.get("target_rate") or 0.0
-    if target:
-        put("offered_over_target", result.get("offered_rate", 0.0) / target)
+    for name, value in _derived(result, count).items():
+        put(name, value)
     for name in (
         "loop_lag_p95_ms",
         "ack_latency_p50_ms",
+        "ack_latency_p95_ms",
         "delivery_latency_p50_ms",
         "observer_join_tail_seconds",
         "pending_receipts_high_water",
@@ -373,6 +421,49 @@ def separation(levels: list[list[dict[str, float]]], name: str) -> float | None:
     return abs(high_median - low_median) / spread
 
 
+def _ranks(values: list[float]) -> list[float]:
+    order = sorted(range(len(values)), key=values.__getitem__)
+    ranks = [0.0] * len(values)
+    start = 0
+    while start < len(order):
+        end = start
+        while end + 1 < len(order) and values[order[end + 1]] == values[order[start]]:
+            end += 1
+        for position in range(start, end + 1):
+            ranks[order[position]] = (start + end) / 2
+        start = end + 1
+    return ranks
+
+
+def rank_correlation(xs: list[float], ys: list[float]) -> float | None:
+    """Spearman correlation, or None when either side does not vary."""
+    if len(xs) != len(ys) or len(xs) < 3:
+        return None
+    rx, ry = _ranks(xs), _ranks(ys)
+    mx, my = statistics.fmean(rx), statistics.fmean(ry)
+    sxy = sum((a - mx) * (b - my) for a, b in zip(rx, ry, strict=True))
+    sxx = sum((a - mx) ** 2 for a in rx)
+    syy = sum((b - my) ** 2 for b in ry)
+    if not sxx or not syy:
+        return None
+    return sxy / math.sqrt(sxx * syy)
+
+
+def _correlations(rows: list[dict[str, float]], names: list[str]) -> list[dict[str, Any]]:
+    if len(rows) < MIN_CORRELATION_SAMPLES:
+        return []
+    found = []
+    for name in names:
+        paired = [(row["completed_rate"], row[name]) for row in rows if name in row]
+        if len(paired) < MIN_CORRELATION_SAMPLES:
+            continue
+        rho = rank_correlation([a for a, _ in paired], [b for _, b in paired])
+        if rho is not None:
+            found.append({"indicator": name, "rho": rho})
+    found.sort(key=lambda item: abs(item["rho"]), reverse=True)
+    return found[:12]
+
+
 def summarise(samples: list[dict[str, Any]], *, gap: float = DEFAULT_LEVEL_GAP) -> dict[str, Any]:
     by_cell: dict[str, list[dict[str, float]]] = {}
     for sample in samples:
@@ -409,6 +500,15 @@ def summarise(samples: list[dict[str, Any]], *, gap: float = DEFAULT_LEVEL_GAP) 
                 "separating_indicators": [
                     {"indicator": name, "separation": score} for name, score in ranked[:12]
                 ],
+                "completed_cv": (
+                    statistics.stdev(rates) / statistics.fmean(rates) if len(rates) > 1 else 0.0
+                ),
+                "profile": {
+                    name: statistics.median(row[name] for row in rows if name in row)
+                    for name in ("completed_rate", *PROFILE)
+                    if any(name in row for row in rows)
+                },
+                "rate_correlations": _correlations(rows, names),
             }
         )
     return {"level_gap": gap, "cells": cells}
@@ -422,7 +522,19 @@ def markdown(summary: dict[str, Any]) -> str:
         f"{summary['level_gap']:.0%} of the cell median. Separation is the distance "
         "between the lowest and highest levels' medians over their larger median "
         "absolute deviation.",
+        "",
+        "## Cell profiles (medians)",
+        "",
+        "| Cell | CV | " + " | ".join(("completed_rate", *PROFILE)) + " |",
+        "| --- | ---: | " + " | ".join("---:" for _ in range(len(PROFILE) + 1)) + " |",
     ]
+    for cell in summary["cells"]:
+        profile = cell.get("profile", {})
+        values = " | ".join(
+            f"{profile[name]:.4g}" if name in profile else "-"
+            for name in ("completed_rate", *PROFILE)
+        )
+        lines.append(f"| {cell['cell']} | {cell.get('completed_cv', 0.0):.2%} | {values} |")
     for cell in summary["cells"]:
         lines += [
             "",
@@ -446,6 +558,16 @@ def markdown(summary: dict[str, Any]) -> str:
                     f"| {name} | {item['separation']:.1f} | {low.get(name, math.nan):.4g} "
                     f"| {high.get(name, math.nan):.4g} |"
                 )
+        if cell.get("completed_cv", 0.0) > DISPERSED_CV and cell.get("rate_correlations"):
+            lines += [
+                "",
+                "| Indicator | Rank correlation with completed rate |",
+                "| --- | ---: |",
+            ]
+            lines += [
+                f"| {item['indicator']} | {item['rho']:+.2f} |"
+                for item in cell["rate_correlations"]
+            ]
     return "\n".join(lines) + "\n"
 
 
@@ -454,10 +576,11 @@ def markdown(summary: dict[str, Any]) -> str:
 
 def _cells(args: argparse.Namespace) -> list[Cell]:
     return [
-        Cell(protocol, int(payload), float(rate))
+        Cell(protocol, int(payload), float(rate), variant)
         for protocol in args.protocols.split(",")
         for payload in args.payloads.split(",")
         for rate in args.rates.split(",")
+        for variant in args.variants.split(",")
     ]
 
 
@@ -501,6 +624,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--cpu", type=int)
     parser.add_argument("--observer-retention", choices=("pending", "all"), default="pending")
+    parser.add_argument(
+        "--variants",
+        default="unbounded",
+        help="comma-separated publisher variants: " + ", ".join(VARIANTS),
+    )
+    parser.add_argument(
+        "--bounded-backlog",
+        type=int,
+        default=1_024,
+        help="max_unacknowledged_messages for the bounded variant",
+    )
     parser.add_argument("--broker-pid-file", type=Path)
     parser.add_argument("--level-gap", type=float, default=DEFAULT_LEVEL_GAP)
     parser.add_argument("--output", type=Path, default=Path("/tmp/saturation-regimes.json"))
@@ -508,6 +642,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.summarise is None and args.root is None:
         parser.error("--root is required unless --summarise is given")
+    unknown = set(args.variants.split(",")) - set(VARIANTS)
+    if unknown:
+        parser.error(f"unknown variants: {', '.join(sorted(unknown))}")
     return args
 
 

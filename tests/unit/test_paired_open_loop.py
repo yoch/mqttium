@@ -347,3 +347,39 @@ async def test_observer_retirement_preserves_pending_tasks_and_surfaces_failure(
     with pytest.raises(RuntimeError, match="receipt failed"):
         open_loop._retire_completed_observers(tasks)
     assert not tasks
+
+
+def test_run_worker_forwards_backlog_bound_and_collector_diagnostic(
+    open_loop, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        seen.append(command)
+        return subprocess.CompletedProcess(command, 0, '{"completed_rate": 1.0}\n', "")
+
+    monkeypatch.setattr(open_loop.subprocess, "run", fake_run)
+    common = {"host": "127.0.0.1", "port": 11883, "timeout": 1.0, "cpu": None}
+    for args in (
+        Namespace(**common),
+        Namespace(**common, max_unacknowledged_messages=1024, gc_disable=True),
+    ):
+        open_loop._run_worker(
+            tmp_path / "benchmark.py",
+            tmp_path,
+            args,
+            mode="sample",
+            protocol="5",
+            payload_bytes=4096,
+            completion="receipt",
+            window=100,
+            count=10,
+            target_rate=26_000.0,
+        )
+
+    unchanged, variant = seen
+    assert "--max-unacknowledged-messages" not in unchanged
+    assert "--gc-disable" not in unchanged
+    bound = variant.index("--max-unacknowledged-messages")
+    assert variant[bound + 1] == "1024"
+    assert "--gc-disable" in variant

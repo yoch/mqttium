@@ -28,10 +28,14 @@ cross-client evidence.
 Record the broker's TCP settings. Small QoS 0 bursts can alternate between fast
 delivery and roughly 40-ms TCP stalls, including with identical client source;
 a short pilot may then choose an unsuitable message count. Inspect raw A/A
-durations as well as aggregate ratios. A separate broker with Mosquitto's
-`set_tcp_nodelay true` is a useful controlled condition, but it changes the
-stimulus. Preserve the original attempt and report the two conditions separately
-instead of presenting the new result as an unchanged-workload rerun.
+durations as well as aggregate ratios. Mosquitto leaves Nagle's algorithm on
+unless `set_tcp_nodelay true` is set; its last PUBACK of a burst then waits for
+the delayed ACK of the publisher's last segment, adding a fixed ~40 ms tail to
+every completion time (2.1 % of a 2-second open-loop sample). The benchmark
+workflows configure `set_tcp_nodelay true` since 2026-09-28. Artifacts from
+before that date used the Nagle broker: compare them only with each other, and
+never present a result under one condition as an unchanged-workload rerun of the
+other.
 
 `lean_native_paced.py` supplements those saturated lots with fixed offered load.
 It freezes rates at 50/75/90% of the reference long-lot A/A median before comparing
@@ -373,8 +377,23 @@ runtime, many interleaved samples per cell, and around each unchanged
 `paired_open_loop.py` sample the worker's and the broker's CPU and context
 switches, per-CPU network softirqs, a TCP snapshot of the broker connections
 and the CPU frequencies. Its summary groups each cell's samples into throughput
-levels and ranks the indicators that separate them. Its `harness_ref` input
-runs a reviewed harness commit other than the workflow's own.
+levels and ranks the indicators that separate them. It also tabulates each
+cell's medians across cells and, in cells that spread without a level gap,
+the rank correlation of every indicator with completed throughput. Its
+`regime_variants` input selects publisher variants: `unbounded` (the gate's
+publisher), `bounded` (`max_unacknowledged_messages`, 1,024 by default, where an
+awaiting `publish()` parks) and the diagnostic `gc-off`, which disables the
+cyclic collector during the sample. Its `harness_ref` input runs a reviewed
+harness commit other than the workflow's own; that commit must include the
+variant option.
+
+Above the runner's capacity, an unbounded publisher accumulates tens of
+thousands of pending receipts, each with one observer task. Its CPU per message
+grows with that backlog, so completed throughput falls below the paced
+capacity and the sample ends in a random state. Such cells, and unpaced
+calibrations with the same publisher, measure that collapse rather than the
+code's throughput. Compare throughput and schedule lag only at sustained rates,
+and use a bounded publisher to qualify overload.
 
 Before trusting a lag verdict, compare the two arms' **absolute**
 `loop_lag_p95`: values near the plateau mean the publisher is still sleeping and

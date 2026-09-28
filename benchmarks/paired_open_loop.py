@@ -91,7 +91,7 @@ def _payload(sequence: int, size: int) -> bytes:
     return header + b"x" * max(0, size - len(header))
 
 
-async def _connected_client(protocol: str, window: int):
+async def _connected_client(protocol: str, window: int, max_unacknowledged: int | None = None):
     from mqttium.api import AsyncClient
     from mqttium.enums import MQTTProtocolVersion
 
@@ -102,7 +102,7 @@ async def _connected_client(protocol: str, window: int):
         reconnect=None,
         **client_options(
             AsyncClient,
-            max_unacknowledged_messages=None,
+            max_unacknowledged_messages=max_unacknowledged,
             max_unacknowledged_bytes=None,
         ),
     )
@@ -116,7 +116,12 @@ def _retire_completed_observers(tasks: deque[asyncio.Task[None]]) -> None:
 
 
 async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
-    client = await _connected_client(args.protocol, args.window)
+    client = await _connected_client(
+        args.protocol, args.window, getattr(args, "max_unacknowledged_messages", 0) or None
+    )
+    # Diagnostic only: separates collector traversal of a large live backlog
+    # from the per-message cost of the client itself.
+    gc_disabled = getattr(args, "gc_disable", False)
     latencies: list[float] = []
     receipt_tasks: deque[asyncio.Task[None]] = deque()
     observer_retention = getattr(args, "observer_retention", "pending")
@@ -144,6 +149,8 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
     pending_high_water = 0
     retained_high_water = 0
     gc_before = gc.get_stats()
+    if gc_disabled:
+        gc.disable()
     try:
         for sequence in range(args.count):
             deadline = started + sequence * interval if paced else loop.time()
@@ -232,6 +239,8 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
             effect_applied=effects["applied"],
         )
     finally:
+        if gc_disabled:
+            gc.enable()
         await client.disconnect()
 
 
@@ -303,6 +312,10 @@ def _run_worker(
         "--observer-retention",
         getattr(args, "observer_retention", "pending"),
     ]
+    if getattr(args, "max_unacknowledged_messages", 0):
+        command.extend(("--max-unacknowledged-messages", str(args.max_unacknowledged_messages)))
+    if getattr(args, "gc_disable", False):
+        command.append("--gc-disable")
     if args.cpu is not None:
         command.extend(("--cpu", str(args.cpu)))
     timeout = args.timeout + max(30, count / max(target_rate, 1.0) * 2)
@@ -617,6 +630,17 @@ def parse_args() -> argparse.Namespace:
         choices=("pending", "all"),
         default="pending",
         help="retire completed observers during acquisition; all retains the legacy task history",
+    )
+    parser.add_argument(
+        "--max-unacknowledged-messages",
+        type=int,
+        default=0,
+        help="bound the publisher's unacknowledged backlog (0 keeps it unbounded)",
+    )
+    parser.add_argument(
+        "--gc-disable",
+        action="store_true",
+        help="diagnostic: disable the cyclic collector while a worker samples",
     )
     parser.add_argument("--completions", default="receipt")
     parser.add_argument("--fractions")

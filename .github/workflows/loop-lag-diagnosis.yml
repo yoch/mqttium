@@ -56,6 +56,11 @@ on:
         required: false
         default: "12"
         type: string
+      regime_variants:
+        description: "regimes: publisher variants, comma-separated (unbounded, bounded, gc-off)"
+        required: false
+        default: "unbounded,bounded"
+        type: string
       rates:
         description: "sweep: fixed absolute rates in msgs/s"
         required: false
@@ -169,6 +174,7 @@ jobs:
           BLOCKS: ${{ inputs.blocks }}
           CELLS: ${{ inputs.regime_cells }}
           SAMPLES: ${{ inputs.samples }}
+          VARIANTS: ${{ inputs.regime_variants }}
         run: |
           set -euo pipefail
           refs=("$CANDIDATE_REF")
@@ -183,6 +189,8 @@ jobs:
             [[ "$CELLS" =~ ^(311|5)(,(311|5))*\;[0-9]+(,[0-9]+)*\;[0-9]+(,[0-9]+)*$ ]] \
               || { echo "regime_cells must be protocols;payloads;rates" >&2; exit 2; }
             [[ "$SAMPLES" =~ ^([2-9]|[1-3][0-9]|40)$ ]] || { echo "samples must be 2 to 40" >&2; exit 2; }
+            [[ "$VARIANTS" =~ ^(unbounded|bounded|gc-off)(,(unbounded|bounded|gc-off))*$ ]] \
+              || { echo "regime_variants must name unbounded, bounded or gc-off" >&2; exit 2; }
           fi
       - name: Check out baseline
         if: inputs.mode == 'sweep'
@@ -229,6 +237,7 @@ jobs:
           cat > "$root/mosquitto.conf" <<'EOF'
           persistence false
           allow_anonymous true
+          set_tcp_nodelay true
           max_inflight_messages 1000
           max_queued_messages 100000
           max_queued_bytes 0
@@ -281,6 +290,7 @@ jobs:
         env:
           CELLS: ${{ inputs.regime_cells }}
           SAMPLES: ${{ inputs.samples }}
+          VARIANTS: ${{ inputs.regime_variants }}
           PYTHONPATH: harness/benchmarks
         run: |
           set -euo pipefail
@@ -293,7 +303,7 @@ jobs:
           python harness/benchmarks/saturation_regime_probe.py \
             --root candidate --port 11883 --cpu 2 \
             --protocols "$protocols" --payloads "$payloads" --rates "$rates" \
-            --samples "$SAMPLES" --broker-pid-file "$JOB_ROOT/mosquitto.pid" \
+            --samples "$SAMPLES" --variants "$VARIANTS" --broker-pid-file "$JOB_ROOT/mosquitto.pid" \
             --output "$out/regimes.json" --summary-output "$out/regimes.md"
           python harness/benchmarks/runner_probe.py \
             --output "$out/preflight-after.json" --require-temperature

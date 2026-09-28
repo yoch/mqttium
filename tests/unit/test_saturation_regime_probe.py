@@ -144,3 +144,79 @@ def test_paced_cells_size_samples_by_rate(probe) -> None:
     assert probe.sample_count(probe.Cell("5", 4096, 26_000), args) == 52_000
     assert probe.sample_count(probe.Cell("5", 4096, 0), args) == args.count_large
     assert probe.sample_count(probe.Cell("5", 64, 0), args) == args.count_small
+
+
+def test_rank_correlation_handles_ties_and_constants(probe) -> None:
+    assert probe.rank_correlation([1, 2, 3, 4], [10, 20, 30, 40]) == pytest.approx(1.0)
+    assert probe.rank_correlation([1, 2, 3, 4], [4, 3, 3, 1]) == pytest.approx(-0.9486833)
+    assert probe.rank_correlation([1, 2, 3], [5, 5, 5]) is None
+
+
+def test_dispersed_cell_reports_profile_and_correlations(probe) -> None:
+    # One continuous spread without a 2 % gap: broker cost rises as throughput falls.
+    samples = []
+    for i in range(8):
+        sample = _sample(21_000 + i * 250, 1.0 - i * 0.02, seed=i)
+        sample["result"]["offered_seconds"] = 2.0
+        sample["result"]["measurement_seconds"] = 2.0 + 0.001 * (8 - i)
+        samples.append(sample)
+
+    summary = probe.summarise(samples)
+    cell = summary["cells"][0]
+
+    assert len(cell["levels"]) == 1
+    assert cell["completed_cv"] > probe.DISPERSED_CV
+    correlations = {item["indicator"]: item["rho"] for item in cell["rate_correlations"]}
+    assert correlations["broker_cpu_us_per_msg"] == pytest.approx(-1.0)
+    assert correlations["completion_tail_ms"] == pytest.approx(-1.0)
+    assert cell["profile"]["completion_tail_ms"] == pytest.approx(4.5)
+    assert cell["profile"]["completed_over_target"] == pytest.approx(21_875 / 26_000)
+    text = probe.markdown(summary)
+    assert "## Cell profiles (medians)" in text
+    assert "| broker_cpu_us_per_msg | -1.00 |" in text
+
+
+def test_variants_expand_cells_and_worker_options(probe) -> None:
+    args = probe.parse_args(
+        [
+            "--root",
+            "x",
+            "--protocols",
+            "5",
+            "--payloads",
+            "4096",
+            "--rates",
+            "0,26000",
+            "--variants",
+            ",".join(probe.VARIANTS),
+        ]
+    )
+
+    cells = probe._cells(args)
+
+    assert [cell.key for cell in cells[:3]] == [
+        "protocol=5 payload=4096 rate=unpaced",
+        "protocol=5 payload=4096 rate=unpaced variant=bounded",
+        "protocol=5 payload=4096 rate=unpaced variant=gc-off",
+    ]
+    options = {cell.variant: probe.worker_options(cell, args) for cell in cells[:3]}
+    assert options["unbounded"].max_unacknowledged_messages == 0
+    assert not options["unbounded"].gc_disable
+    assert options["bounded"].max_unacknowledged_messages == args.bounded_backlog
+    assert options["gc-off"].gc_disable
+    assert not hasattr(args, "gc_disable")
+
+
+def test_unknown_variant_is_refused(probe) -> None:
+    with pytest.raises(SystemExit):
+        probe.parse_args(["--root", "x", "--variants", "unbounded,tuned"])
+
+
+def test_collector_activity_is_reported_per_thousand_messages(probe) -> None:
+    sample = _sample(26_000, 0.8, seed=0)
+    sample["result"]["gc_collections"] = [400, 40, 4]
+
+    row = probe.features(sample)
+
+    assert row["gc_gen0_per_kmsg"] == pytest.approx(10.0)
+    assert row["gc_gen2_per_kmsg"] == pytest.approx(0.1)
