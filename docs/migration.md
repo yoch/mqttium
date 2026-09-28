@@ -1,14 +1,13 @@
-# Migrating from 1.0.0rc14
+# Migrating to 1.0.0rc17
 
-The current native API deliberately breaks the pre-v1 contract published as
-**1.0.0rc14** (`c194597`, 2026-09-11), the last released predecessor. It keeps
+RC17 revises the RC16 API before 1.0. If you are upgrading from **1.0.0rc16**,
+start with [Changes since 1.0.0rc16](#changes-since-100rc16). If you are
+upgrading from **1.0.0rc14** (`c194597`, 2026-09-11), review the broader
+native-API changes throughout this guide as well.
+
 MQTT 3.1.1/5, all QoS levels, TCP/TLS, WebSocket, Unix, manual acknowledgement
-and the memory/SQLite backends. There is no automatic upgrade of applications
-or historical databases.
-
-The breaking work began earlier, against `main@9ad1f018`; that commit remains
-the baseline of the historical reports under `docs/reports/`, but `1.0.0rc14`
-is the version an application actually upgrades from.
+and the memory/SQLite backends remain supported. Applications must adapt to
+the changes below; historical database formats are not upgraded automatically.
 
 ## Removed surfaces and replacements
 
@@ -39,8 +38,8 @@ is the version an application actually upgrades from.
 
 ## Changes since 1.0.0rc16
 
-The pre-1.0 surface review (`docs/reports/API-SURFACE-REVIEW-2026-09-24.md`)
-removes contracts that had no effect, no use, or duplicated another.
+The [pre-1.0 surface review](reports/API-SURFACE-REVIEW-2026-09-24.md) led to
+removing unused and duplicate contracts and making internal state private.
 
 | 1.0.0rc16 contract | Replacement |
 | --- | --- |
@@ -54,7 +53,6 @@ removes contracts that had no effect, no use, or duplicated another.
 | `PublishBatchError.cause` | `PublishBatchError.__cause__` (the error is raised `from` its cause) |
 | `PublishBatchError.receipt` could be `None` | Always the batch receipt; no narrowing needed |
 | `PublishBatchReceipt.completed` | `receipt.submitted - receipt.pending_count` |
-
 | Mutable `PublishReceipt.mid` / `.qos`; value equality; constructor fields `_waiters`, `_error`, `_settled` | Read-only `mid` and `qos`; identity equality; `PublishReceipt(mid, qos)` |
 | Mutable `SubscribeResult` / `UnsubscribeResult` | Frozen; construct a new value instead of assigning fields |
 | Nested statistics types imported from `mqttium.api.stats` or other modules | Import them from `mqttium.api` |
@@ -88,18 +86,18 @@ recorded in `tests/project/test_public_api_surface.py`.
 | `ReconnectPolicy.connect_timeout` | `AsyncClient(connect_timeout=...)` | One deadline for explicit `connect*()` calls without `timeout` and for automatic attempts |
 | `ReconnectPolicy(enabled=False)` | `reconnect=None` | Passing a policy enables reconnection |
 | `max_ingress_batch_bytes` | removed | The 1 MiB / 256-packet decode quantum is a fairness constant |
-| MQTT 5 options accepted by an MQTT 3.1.1 client until `connect()` | `ProtocolError` from the constructor | `connect_properties`, `will_properties`, `topic_alias_maximum`, `auth_handler` |
+| MQTT 5 options accepted by an MQTT 3.1.1 client until `connect()` | `ProtocolError` from the constructor | `connect_properties`, properties on `will=PublishMessage(...)`, `topic_alias_maximum`, `auth_handler` |
 | `MandatoryResponseTooLargeError` importable from `mqttium.errors` only | Exported from `mqttium` | Local terminal failure; never retried |
 
-`ClientStats` keeps the same shape (state, epoch, reconnect attempt, one
-section per queue or window) with renamed fields and without runtime
-scheduling detail:
+`ClientStats` reports connection state, the lifetime `connections` count,
+the current reconnect attempt, and one section per queue or window. It no
+longer exposes the internal connection epoch or runtime scheduling details:
 
 | Previous field | Frozen field |
 | --- | --- |
 | `stats().tasks` (`TaskStats`) | removed; `state` and `reconnect_attempt` describe recovery |
 | `stats().effects` (`EffectStats`) | removed |
-| `writer.batches`, `batched_items`, `batched_bytes`, `segmented_writes`, `enqueue_suspensions`, `eager_writes`, `eager_bytes` | removed; `queued_*`, `high_water_*`, `max_*`, `waiters`, `last_outbound` remain |
+| `writer.batches`, `batched_items`, `batched_bytes`, `segmented_writes`, `enqueue_suspensions`, `eager_writes`, `eager_bytes` | removed; `queued_*`, `high_water_*`, `message_limit`, `byte_limit`, `waiters`, `last_outbound` remain |
 | `decoder.ingress_batch_limit_bytes` | removed |
 | `outbound.pending_messages` / `pending_bytes` / `pending_high_water_*` | `outbound.unacknowledged_messages` / `unacknowledged_bytes` / `unacknowledged_high_water_*` |
 | `outbound.queued_messages`, `flow_inflight`, `flow_limit` | `outbound.awaiting_slot`, `inflight`, `inflight_limit` |
@@ -145,9 +143,9 @@ await receipt.wait()
 receipt = client.publish_nowait("telemetry", b"sample", qos=1)
 ```
 
-The nonblocking method can raise `FlowControlError` for protocol/writer pressure,
-a pending protocol-effect transfer. A full application-delivery queue alone is
-not a publication refusal.
+The nonblocking method can raise `FlowControlError` for protocol/writer pressure
+or a pending protocol-effect transfer. A full application-delivery queue alone
+is not a publication refusal.
 Choose an application retry, rejection or spill policy; never busy-spin.
 
 A cancelled `publish()` may already be committed. Cancellation stops the Python
@@ -155,8 +153,11 @@ wait; it does not undo MQTT admission. Its effect transfer remains owned by the
 client. Receipt waits are independent of each other.
 
 For batches, each successful admission remains committed if a later element or
-the input iterator fails. Catch `PublishBatchError` and inspect `receipt`,
-`cause`, `submitted` and failure counts. A cancellation propagates unchanged;
+the input iterator fails. Catch `PublishBatchError` as `exc` and inspect
+`exc.receipt.submitted`, `exc.receipt.failure_count` and
+`exc.receipt.failure_counts`. The original admission failure, if any, is
+`exc.__cause__`; `exc.receipt.failures` contains the bounded failure details.
+A cancellation propagates unchanged;
 the internally registered aggregate is sealed and its admitted exchanges remain
 owned by the client. There is no rollback of a committed prefix.
 
@@ -218,18 +219,23 @@ not after the hook; incoming messages do not wait for `on_connect` to finish.
 Use an application readiness signal when necessary. Hooks describe the latest
 state: obsolete pending notifications are coalesced, and external lifecycle
 operations cancel obsolete active hooks. A lifecycle operation awaited directly
-by the hook itself preserves that caller. Automatic retry waits for the current
-`on_disconnect` hook, then rechecks user intent. See the full
+by the hook itself preserves that caller. Automatic retry waits until the current
+`on_disconnect` hook starts, then rechecks user intent and may reconnect while
+the hook is still running. The replacement connection's `on_connect` waits for
+that hook to finish. Use application-owned synchronization if reconnect must
+depend on asynchronous cleanup. See the full
 [hook contract](reference/async-client.md#lifecycle-hooks).
 
 `auth_handler` retains its timeout and protocol-specific async behavior.
 
 ## SQLite format
 
-Use a new database path. The current implementation writes **schema 5** and
-can reopen its own databases. Historical schemas 0–4 containing data, future
-versions and inconsistent schemas are explicitly refused. Validation precedes write-affecting
-pragmas. Refusal preserves committed schema and data; SQLite may still recover,
+The current implementation writes **schema 5** and can reopen a valid schema-5
+database. A version upgrade alone does not require a new database path.
+Historical schemas 0–4 containing data, future versions and inconsistent
+schemas are explicitly refused; use a new database path for an incompatible
+format and plan recovery of outstanding work separately. Validation precedes
+write-affecting pragmas. Refusal preserves committed schema and data; SQLite may still recover,
 checkpoint, or coordinate its main database and journal files. File-byte identity
 is not promised. There is no migration or silent reset.
 

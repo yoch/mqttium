@@ -143,3 +143,318 @@ Both, in different proportions.
    - absolute target rates, or reject a calibration that changes level;
    - no lag ratio at load ≥ 0.90 as a release criterion;
    - a per-message cost measurement at a rate where the publisher sleeps.
+
+## Addendum: fixed-rate sweep, RC14 against RC17 (2026-09-27)
+
+Run [36351522154](https://github.com/yoch/mqttium/actions/runs/36351522154)
+of the `Loop-lag diagnosis` sweep, on the dedicated Pi 5 runner:
+
+- RC14 `c194597b` as base, RC17 `c9bab1ad` as candidate;
+- `rate_regime_probe.py`, 64 B QoS 1, window 100, receipt completion;
+- two ABBA blocks per protocol (four samples per arm and rate), each block
+  preceded by a recorded runner probe. Both MQTT 3.1.1 probes were eligible;
+  both MQTT 5 probes were **ineligible** (one-minute load per CPU 0.303 and
+  0.257 against a 0.250 limit). Instantaneous CPU use was 0.3 % and 0.0 %.
+  The workflow recorded eligibility without enforcing it. Residual load from
+  the preceding sweep is a possible explanation, not an established cause;
+  the MQTT 5 measurements remain diagnostic, not strict qualification.
+
+Medians per arm; ratios are RC17 over RC14.
+
+| Protocol | Rate (msgs/s) | CPU/message RC14 / RC17 (µs) | Ratio | Schedule lag p95 RC14 / RC17 (ms) | Ratio | ACK p50 RC14 / RC17 (ms) |
+| --- | ---: | --- | ---: | --- | ---: | --- |
+| 3.1.1 | 5,000 | 59.9 / 60.1 | 1.004 | 1.029 / 1.023 | 1.00 | 0.291 / 0.296 |
+| 3.1.1 | 10,000 | 55.8 / 55.5 | 0.996 | 1.010 / 1.012 | 1.00 | 0.453 / 0.444 |
+| 3.1.1 | 15,000 | busy | — | 0.087 / 0.086 | 0.98 | 0.272 / 0.273 |
+| 3.1.1 | 20,000 | busy | — | 0.127 / 0.126 | 0.99 | 0.405 / 0.412 |
+| 3.1.1 | 22,000 | busy | — | 0.155 / 0.160 | 1.03 | 0.460 / 0.473 |
+| 3.1.1 | 24,000 | busy | — | 0.238 / 0.233 | 0.98 | 0.585 / 0.592 |
+| 3.1.1 | 26,000 | busy | — | 1.984 / 1.656 | 0.83 | 0.752 / 0.777 |
+| 5 | 5,000 | 60.8 / 61.7 | 1.015 | 1.026 / 1.030 | 1.00 | 0.297 / 0.302 |
+| 5 | 10,000 | 56.5 / 56.7 | 1.004 | 1.011 / 1.012 | 1.00 | 0.449 / 0.443 |
+| 5 | 15,000 | busy | — | 0.088 / 0.087 | 0.99 | 0.286 / 0.294 |
+| 5 | 20,000 | busy | — | 0.129 / 0.128 | 0.99 | 0.417 / 0.420 |
+| 5 | 22,000 | busy | — | 0.173 / 0.170 | 0.98 | 0.493 / 0.535 |
+| 5 | 24,000 | busy | — | 0.285 / 0.265 | 0.93 | 0.593 / 0.655 |
+| 5 | 26,000 | busy | — | 2.094 / 1.757 | 0.84 | 0.842 / 0.888 |
+
+"Busy" marks rates where CPU per message times the rate is at least 1.0 for
+both arms: the publisher never slept, so its CPU time is its wall time and the
+per-message cost is not measured there (18,000 msgs/s behaves the same and is
+omitted). Every sample kept its offered rate within 0.06 % of target, and all
+publications completed. Values above are recomputed medians from the retained
+JSON samples (four per arm and rate), rounded only for display.
+
+Results:
+
+- **Per-message cost.** At the rates where both arms still sleep, RC17 costs
+  0.996–1.015 times RC14 per message. That is within 1.5 %, below the 3 %
+  decision threshold of this report.
+- **Schedule lag.** At fixed absolute rates the curves match: 0.98–1.03 up to
+  24,000 msgs/s on MQTT 3.1.1 and up to 22,000 on MQTT 5. RC17 is lower near
+  saturation: 0.93 at 24,000 on MQTT 5, and 0.83–0.84 at 26,000 on both
+  protocols.
+- **Residual.** RC17's median acknowledgement latency is within −2 % to +4 % of
+  RC14's at most rates, and 5–10 % higher at 22,000–26,000 msgs/s on MQTT 5
+  (up to 0.06 ms). Subscriber delivery p50 is 2–8 % higher. Both are small,
+  near-saturation differences with no throughput or schedule-lag cost.
+
+The sweep ran no same-code control; the ABBA spread of each cell is its only
+noise estimate. In this sweep, the "+15–20 %" loop-lag increase of #493
+does not reproduce at fixed rates; measured per-message cost is within 1.5 %
+of RC14. This supports the report's decision rule for the observed workload,
+not a general equivalence claim. Strict MQTT 5 qualification still needs an
+eligible rerun; the follow-up gate must enforce preflight eligibility and
+retain same-code controls.
+
+
+## Addendum: corrected gate qualification (2026-09-28)
+
+The corrected gate was tested on the dedicated Pi 5 with Python 3.14.7,
+publisher CPU 2, MQTT 3.1.1 and 5, 64-byte and 4096-byte payloads, QoS 1
+receipt completion, window 100, and fixed rates of 5k, 10k, 15k, 20k, 22k,
+24k and 26k messages/s. The harness commit is
+`d29a8462bf971198a477925c8f4cf36123530cf7`; its entire `src/` tree is identical
+to RC17 `c9bab1ad93dd2e875c07706aecdeaa69eb8dce89`.
+
+- [Same-code control 36353058646](https://github.com/yoch/mqttium/actions/runs/36353058646):
+  **passed**, 28 cells, 224 initial worker samples and 5,856,000 publications,
+  all completed. All three final preflights were eligible; MQTT 5 needed five
+  attempts before eligibility was stable. CPU/message ratios at 5k/10k were
+  0.9852–1.0028 across both payload sizes. Saturation lag ratios reached 1.3984
+  for identical code; those cells correctly remained diagnostic.
+- [RC14 → RC17 comparison 36353060011](https://github.com/yoch/mqttium/actions/runs/36353060011):
+  **failed**, with all five final preflights eligible, including both
+  confirmation preflights. The confirmed failure is MQTT 5, 4096 bytes,
+  24k messages/s: completed-rate ratio **0.9326**, below the unchanged 0.97
+  threshold. The 26k cell also required confirmation and recovered above the
+  threshold. No publication was lost.
+
+The gate uses `paired_open_loop.py`, whereas the preceding diagnostic sweep
+used `rate_regime_probe.py`. Compare the arms within each acquisition; do not
+interpret differences between the two harnesses as runtime changes.
+
+Only 5k and 10k provided eligible sleeping, unsaturated comparisons in every
+scenario. The following CPU figures are ratios of per-arm medians; lag figures
+are the gate's median paired ratios, candidate over RC14:
+
+| Protocol | Payload | CPU/message at 5k / 10k | Schedule lag at 5k / 10k |
+| --- | ---: | --- | --- |
+| 3.1.1 | 64 B | 1.0013 / 1.0110 | 0.9979 / 1.0009 |
+| 5 | 64 B | 0.9953 / 1.0239 | 1.0000 / 1.0015 |
+| 3.1.1 | 4096 B | 0.9949 / 1.0167 | 1.0006 / 1.0019 |
+| 5 | 4096 B | 0.9620 / 1.0386 | 1.0071 / 1.0018 |
+
+For the original 64-byte scope of #493, no +15–20% lag increase reproduces at
+fixed rates, and the measured CPU cost remains within the report's 3% decision
+threshold. That result does **not** establish general RC14/RC17 equivalence.
+The extended 4096-byte scope exposes a separate outstanding qualification
+failure, and its MQTT 5 CPU/message ratio at 10k is also above 1.03 (diagnostic,
+not an automatically confirmed CPU regression).
+
+At the failing 24k point, eight paired samples were retained after confirmation.
+Seven candidate samples have lower completed throughput than their paired
+baseline by more than 3%; one initial pair is effectively equal. The offered
+rate remains near 24k in both arms, but the candidate takes longer to finish
+all receipts. Median ACK latency across the eight per-arm sample medians is
+about 1.25 ms for RC14 and 99 ms for RC17. This is a completion/drain-time
+finding, not a missing-message finding. Its implementation cause has not been
+established, and it has not been accepted as a release trade-off.
+
+PR [#588](https://github.com/yoch/mqttium/pull/588) retains the report and gate
+changes together. Qualification remains open until this completed-throughput
+finding is explained and resolved or explicitly accepted. The correction keeps
+the failure visible; neither its rate nor its threshold was removed to obtain
+a passing result.
+
+Limits: this is one same-code campaign and one RC14/RC17 campaign, with targeted
+confirmation inside the latter, not a cross-run equivalence study. Firmware
+throttling telemetry was unavailable (`null`); the recorded CPU frequencies
+were 2.4 GHz, and eligibility follows the existing probe's enforced criteria.
+
+Retained `open-loop.json` SHA256 digests:
+
+- same-code: `eb6015c7adc7994d6118b80366c0eea4ba9a68b2cfbc59ec2fdef2880ce49b81`;
+- RC14/RC17: `d741331e148d0c0ed5f8515f13de41db61cf352ecf264157616defb4f82ac407`.
+
+## Addendum: completion phases and confirmation limits (2026-09-28)
+
+[Instrumented comparison 36399866881](https://github.com/yoch/mqttium/actions/runs/36399866881)
+used harness `18432349483b828e185cf41ec899d79a4fdef298`, with the unchanged RC17
+runtime against RC14. All four final preflights were eligible. The existing
+rule again returned `failed` for MQTT 5 / 4096 B / 24k msgs/s, with median
+paired completed-rate ratio **0.94346** across eight pairs. All publications
+completed. This campaign added phase clocks, pending receipt-observer counts
+and garbage-collection counts without changing the gate's metric.
+
+The worker retains every receipt-observer task, including completed ones, and
+calls `asyncio.gather` over the full list at the end. At the failing point,
+median synchronous join setup took 42.24 ms for RC14 and 44.08 ms for RC17;
+the tail after observing the last receipt took 7.40 and 7.65 ms respectively.
+The paired ratio measured at the last observed receipt was still **0.94325**.
+The discrepancy is therefore not explained by the final join tail alone.
+These clocks still include observer scheduling and are not wire-level ACK
+timestamps.
+
+The initial RC14 samples finished offering with 7–32 outstanding observers;
+RC17 had 5,400–6,554. In confirmation, RC14 also entered the slower regime
+(3,268–7,225 outstanding). The candidate had 4,140–6,904. These are receipt
+observers, not writer-queue entries or send-quota occupancy. Garbage-collection
+counts also increase in this regime, but neither this correlation nor the
+end-of-offer backlog identifies the implementation cause.
+
+Inspection of confirmation exposed a second methodological limitation: a
+throughput-only suspect received extra A/B pairs, but **no same-code controls**,
+and the failure decision used its median alone. For this acquisition, the
+four-cycle geometric mean is 0.96023 and the 95% interval is **[0.89019,
+1.03579]**. Calling that a statistically established regression, or a
+demonstrated recovery, would overstate the evidence. The earlier addendum's
+word “confirmed” describes the then-implemented gate verdict, not such a proof.
+
+The follow-up policy keeps the 0.97 threshold and failing workload. Every
+throughput suspect receives A/A controls for each source tree; their 95%
+intervals must fit the existing ±2% equivalence budget. A/B confidence bounds
+must establish a drop or clear the threshold; an interval crossing it produces
+`invalid`, which still blocks qualification. Confirmation and control default
+to eight ABBA cycles each. This is a prospective rule: the retained runs are
+not rewritten or relabelled as passed.
+
+Retained `open-loop.json` SHA256:
+`22c944a9eac0ea01f2335328f4f00e12b788e11a48d11a7d68c97d31da9cc53e`.
+
+## Addendum: identical-code false failure (2026-09-28)
+
+[Instrumented A/A 36400414652](https://github.com/yoch/mqttium/actions/runs/36400414652)
+compared `18432349483b828e185cf41ec899d79a4fdef298` against itself. The old
+median-only rule returned **failed** at MQTT 5 / 4096 B / 26k msgs/s:
+median ratio **0.9624**, despite identical source code. Its geometric mean
+was 0.96376 with 95% interval [0.93554, 0.99283]. This demonstrates a false
+release-regression verdict from that rule; the earlier passing A/A campaign
+does not establish reliable saturation qualification.
+
+For this cell, median join setup took 57.12 ms in the baseline-labelled arm
+and 126.75 ms in the candidate-labelled arm. The last-receipt ratio was still
+0.96220. The measurement is sensitive to work done by the observer machinery
+and to backlog before joining; these diagnostics do not establish the sole
+cause of that sensitivity.
+
+The next harness revision retires completed observers during acquisition,
+while keeping pending observers owned and propagating their exceptions. It
+records retention mode and peak retained tasks; an explicit `all` mode keeps
+the older retention behavior available. Fresh paired and same-code campaigns
+are required before interpreting results from that changed harness. The MQTTium
+runtime and throughput threshold remain unchanged.
+
+Retained `open-loop.json` SHA256:
+`25d4fadabeaad0587dec5de9adb4008800f09cc0b031fb44fb798297efe5d564`.
+
+## Addendum: strengthened confirmation remains inconclusive (2026-09-28)
+
+[Comparison 36401521973](https://github.com/yoch/mqttium/actions/runs/36401521973)
+used harness `bca1b0aa4e933718f6ded5572e5cf665ec3eaeba`, before the observer
+retention change. Its runtime is still RC17, compared with RC14. All six final
+preflights were eligible. The 512 worker samples cover 16,512,000 publications;
+all completed. The artifact verdict is **invalid**, not a confirmed regression
+or a qualification pass.
+
+Three 4096-byte cells required confirmation. Each has ten A/B ABBA cycles
+(including the two initial cycles) and eight A/A cycles per source tree:
+
+| Protocol / rate | A/B geometric completed-rate ratio | A/B 95% interval | RC14 A/A 95% interval | RC17 A/A 95% interval |
+| --- | ---: | --- | --- | --- |
+| 3.1.1 / 24k | 0.98162 | [0.96539, 0.99812] | [0.99817, 1.00812] | [0.96945, 1.02839] |
+| 5 / 24k | 0.98072 | [0.95203, 1.01028] | [0.94396, 1.02674] | [0.99445, 1.02644] |
+| 5 / 26k | 0.98032 | [0.96050, 1.00055] | [0.98436, 1.02395] | [0.97322, 1.01603] |
+
+Every A/B interval crosses the 0.97 throughput threshold, and at least one
+same-code interval in each cell exceeds the ±2% equivalence budget. The
+strengthened rule correctly refuses a product verdict from these measurements.
+The absence of an entry in the artifact's `failures` list is not a pass when
+`invalidations` is nonempty.
+
+Low-rate CPU/message ratios are diagnostic, without dedicated CPU controls:
+0.94842–1.06310 across the eight 5k/10k cells. The largest ratio is MQTT 5 /
+4096 B / 10k; the 3.1.1 / 64 B / 10k ratio is 1.03498. These values do not
+support extending the original sweep's within-1.5% observation to all later
+campaigns. No runtime optimization or threshold relaxation follows from them.
+
+The next controlled acquisition uses the observer-retention correction. It
+must be judged on its own same-code and A/B evidence; this invalid acquisition
+remains part of the record.
+
+Retained `open-loop.json` SHA256:
+`71014d0315df35d12d0a7c8b22086d24848cf8c4cee02119a7807c998e4f2733`.
+
+## Addendum: observer-retention same-code validation (2026-09-28)
+
+[A/A 36402364148](https://github.com/yoch/mqttium/actions/runs/36402364148)
+compared `79268e55dec1984316eb27893f5fa7488815ab27` against itself with
+`observer_retention=pending`. All four final preflights were eligible and
+all 9,600,000 publications completed across 320 worker samples. The verdict
+is **invalid** at MQTT 5 / 4096 B / 26k msgs/s, with no confirmed product
+regression. The other 27 initial cells did not require confirmation.
+
+The suspect's ten-cycle completed-rate geometric ratio is 0.99143 with 95%
+interval **[0.94433, 1.04088]**. Its two same-code controls have intervals
+[0.92452, 1.04656] and [0.93304, 1.07093], both wider than the ±2% budget.
+The corrected decision thus blocks qualification instead of falsely certifying
+a regression between identical sources.
+
+Observer retirement removes the full history of completed tasks in ordinary
+samples: the campaign-wide median peak retention is 54 tasks, with median
+join setup 0.0473 ms. It does not bound genuinely outstanding observers under
+overload; the maximum peak is 28,802 tasks. At the suspect cell, median
+end-of-offer backlogs are 4,309 and 6,632 in the two labels of the same source.
+Some samples keep up at about 25.3k completed messages/s; others accumulate
+backlog and finish more slowly. This remains a change of operating regime,
+not evidence of a difference between the two identical implementations.
+
+These results validate task retirement's bookkeeping effect, but do not show
+that it resolves saturation measurement variance. They also do not identify
+the implementation or environmental cause of the remaining regime changes.
+The matching RC14/RC17 acquisition is required separately.
+
+Retained `open-loop.json` SHA256:
+`34b09654e868d83906628c2f55ea325d43753669e3f7e667c493fc58c4af2270`.
+
+## Addendum: a passing median can bypass confirmation (2026-09-28)
+
+[RC14/RC17 36404229046](https://github.com/yoch/mqttium/actions/runs/36404229046)
+used the same `79268e55` harness and pending-observer retention. All three
+final preflights were eligible; all 5,856,000 publications completed in 224
+worker samples. The artifact says **passed**, with no confirmation acquired.
+Review of its raw intervals shows that this is insufficient qualification.
+
+The MQTT 5 / 4096 B / 24k point has geometric completed-rate ratio 0.99995
+and interval [0.99899, 1.00091]. The earlier failure at that point does not
+reproduce in this acquisition. At 26k, however, two cells have wide initial
+intervals despite passing medians:
+
+| Protocol / 4096 B / 26k | Median ratio | Geometric ratio | 95% interval |
+| --- | ---: | ---: | --- |
+| 3.1.1 | 1.00458 | 1.07886 | [0.41159, 2.82789] |
+| 5 | 0.97420 | 0.94705 | [0.66425, 1.35025] |
+
+The initial throughput screen still used the median alone. Consequently, the
+stronger confirmation rule never examined these cells. The follow-up corrects
+both live acquisition and the existing retained-evidence screening path:
+confirmation is required when **either the median or the lower 95% bound**
+is below 0.97. Thresholds, workload and the bounded confirmation budget remain
+unchanged; exceeding that budget remains invalid.
+
+A deterministic replay of the retained initial samples selects both 26k cells
+under the corrected screen. It also selects the previously unconfirmed 3.1.1
+26k cell in the preceding A/A campaign. This replay acquires no new samples
+and does not change either historical artifact's status. A regression test
+uses the rounded four MQTT 5 pair ratios from this acquisition to prevent the
+passing-median bypass from returning.
+
+The final screen correction has local regression coverage, but no fresh
+dedicated A/A and A/B campaign yet. This acquisition therefore cannot close
+#493 or establish general RC14/RC17 parity. The paired same-code campaign
+also remains invalid independently of this screening defect. Low-rate CPU
+ratios are diagnostic: 0.96911–1.03637 in this acquisition, including 1.03637
+at 3.1.1 / 64 B / 10k and 1.03246 at 3.1.1 / 4096 B / 10k.
+
+Retained `open-loop.json` SHA256:
+`55ebbea129a448e23f387416975c7167ae816e77631ecb79353a2b877aa162d8`.

@@ -25,10 +25,12 @@ cd mqttium
 python -m pip install .
 ```
 
-Applications on `1.0.0rc14` should keep its
-[RC14 documentation](https://mqttium.readthedocs.io/en/v1.0.0rc14/) and read the
-[migration guide](migration.md) before changing an existing application or
-SQLite database.
+When upgrading an existing application, read the [migration guide](migration.md)
+first. It covers both the RC16-to-RC17 changes and the broader changes since
+RC14, including persistence compatibility. Use the documentation for your
+installed version until you upgrade:
+[RC16](https://mqttium.readthedocs.io/en/v1.0.0rc16/) or
+[RC14](https://mqttium.readthedocs.io/en/v1.0.0rc14/).
 
 The examples assume a broker on `127.0.0.1:1883`. If Mosquitto is already
 installed, a development listener can be started with an explicit configuration
@@ -111,8 +113,10 @@ receipt = await client.publish_many(
 await receipt.wait()
 ```
 
-The iterable is consumed progressively, with at most one element read ahead. The aggregate receipt retains exact
-completion and failure counts without creating one task per publication.
+The iterable is consumed progressively, with at most one element read ahead.
+The aggregate receipt retains exact completion and failure counts without
+creating one task per publication. See [batch publication](cookbook.md#bounded-batch-publication)
+for partial-admission and cancellation behavior.
 
 ## Choosing inbound delivery
 
@@ -158,10 +162,14 @@ for the application:
 
 ```python
 client = AsyncClient("worker", manual_ack=True)
-
-async for message in client.messages():
-    await persist_business_result(message)
-    await client.ack(message)
+try:
+    await client.connect("127.0.0.1", 1883)
+    await client.subscribe("jobs/#", qos=1)
+    async for message in client.messages():
+        await persist_business_result(message)
+        await client.ack(message)
+finally:
+    await client.disconnect()
 ```
 
 Manual MQTT acknowledgement does not replace application-level idempotency. A
@@ -183,13 +191,19 @@ client = AsyncClient(
 )
 
 try:
-    receipt = client.publish_nowait("telemetry", payload, qos=1)
-except FlowControlError:
-    await shed_or_retry(payload)
+    await client.connect("127.0.0.1", 1883)
+    try:
+        receipt = client.publish_nowait("telemetry", payload, qos=1)
+    except FlowControlError:
+        await shed_or_retry(payload)
+    else:
+        await receipt.wait()
+finally:
+    await client.disconnect()
 ```
 
-`publish_nowait()` provides the same immediate-refusal behaviour without a
-coroutine suspension, but it must run on the client's owning event-loop thread.
+`publish_nowait()` either admits the publication or raises immediately, without
+a coroutine suspension. It must run on the client's owning event-loop thread.
 Cross-thread applications must arrange their own bounded handoff to that loop.
 
 ## MQTT versions and transports
@@ -203,7 +217,8 @@ client = AsyncClient("mqtt5-client", protocol=MQTTProtocolVersion.MQTTv5)
 ```
 
 Connect over TCP or TLS with `connect()`, over WebSocket with `connect_ws()`, or
-over a Unix-domain socket with `connect_unix()`:
+over a Unix-domain socket with `connect_unix()`. Choose one of these alternatives
+for a disconnected client:
 
 ```python
 await client.connect("broker.example", 8883, ssl=tls_context)
@@ -217,7 +232,8 @@ silently sending unsupported QoS, retain or packet sizes.
 
 ## One-shot operations
 
-Use the same explicit connect, operation and disconnect lifecycle for short programs. MQTTium does not ship one-shot helpers.
+Use the same explicit connect, operation and disconnect lifecycle for short
+programs. MQTTium does not ship one-shot helpers.
 
 ## Errors and shutdown
 
@@ -236,5 +252,5 @@ Next steps:
 - [Sessions and Persistence](sessions-and-persistence.md) for reconnect and
   restart recovery;
 - [Operations](operations.md) for sizing and diagnostics;
-- [Migrating to MQTTium](migration.md) for the breaking changes since `1.0.0rc14`;
+- [Migrating to MQTTium](migration.md) for the changes from RC16 or RC14;
 - [API Stability](api-stability.md) for the supported public contract.

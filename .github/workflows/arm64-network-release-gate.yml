@@ -164,7 +164,7 @@ jobs:
             --policy strict \
             --output "$JOB_ROOT/result.json"
 
-      - name: Run strict baseline-anchored open-loop release gate
+      - name: Run strict fixed-rate open-loop release gate
         if: inputs.gate == 'open-loop'
         shell: bash
         run: |
@@ -174,6 +174,7 @@ jobs:
             --base-root base \
             --candidate-root candidate \
             --engine harness/benchmarks/paired_open_loop.py \
+            --target-rates 5000,10000,15000,20000,22000,24000,26000 \
             --runner-probe harness/benchmarks/runner_probe.py \
             --cpu 2 \
             --require-temperature \

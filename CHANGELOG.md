@@ -6,6 +6,26 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Correct RC17 migration-table rendering, reconnect-hook ordering and renamed
+  API fields in the maintained guides. Restore the published surface-review
+  link, clarify the Read the Docs fallback and PyPI approval steps, and update
+  examples for manual acknowledgement, publication deadlines and MQTT 5 Wills.
+- Use fixed absolute rates in the open-loop release gate. Keep saturation lag
+  diagnostic, require an eligible lower-rate comparison, and report CPU cost
+  only with measured headroom. Enforce runner eligibility before each block of
+  the diagnostic sweep; an ineligible probe can no longer appear as a
+  successful qualification.
+- Require same-code controls and confidence bounds when confirming an open-loop
+  throughput suspect. A noisy median can no longer certify either a regression
+  or recovery; inconclusive evidence blocks qualification.
+- Confirm throughput cells whose initial confidence interval still permits a
+  regression, even when their median passes the threshold.
+- Retire completed receipt-observer tasks during open-loop acquisition instead
+  of retaining their entire history through the timed final join. Preserve
+  pending observers, completion errors and an explicit legacy diagnostic mode.
+
 ## [1.0.0rc17] - 2026-09-26
 
 ### Changed

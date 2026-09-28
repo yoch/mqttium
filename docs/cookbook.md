@@ -55,13 +55,15 @@ import asyncio
 
 
 async def publish_confirmed(client, topic: str, payload: bytes) -> None:
-    receipt = await client.publish(topic, payload, qos=1)
     async with asyncio.timeout(10):
+        receipt = await client.publish(topic, payload, qos=1)
         await receipt.wait()
 ```
 
-The deadline limits this caller's wait. It does not undo an MQTT publication
-already admitted to protocol state.
+The deadline covers admission and broker acknowledgement together. It limits
+this caller's wait and does not undo a publication already admitted to protocol
+state. To limit only the acknowledgement wait, call `publish()` before entering
+the timeout context.
 
 ## Bounded telemetry stream
 
@@ -133,6 +135,10 @@ async def publish_batch(client, samples) -> None:
 zero). Failure counts remain exact. An ordinary admission or generator error
 raises `PublishBatchError` carrying the committed prefix receipt. Cancellation
 propagates and seals the aggregate; committed publications remain active.
+For `except PublishBatchError as exc`, read aggregate counts from
+`exc.receipt` and the original admission exception from `exc.__cause__`.
+Do not resubmit the whole batch after partial admission unless the application
+can tolerate duplicate processing.
 
 ## Manual acknowledgement after durable work
 
@@ -140,10 +146,14 @@ propagates and seals the aggregate; committed publications remain active.
 from mqttium.api import AsyncClient
 
 client = AsyncClient("worker", manual_ack=True)
-
-async for message in client.messages():
-    await save_idempotently(message)
-    await client.ack(message)
+try:
+    await client.connect("broker.example", 8883, ssl=True)
+    await client.subscribe("jobs/#", qos=1)
+    async for message in client.messages():
+        await save_idempotently(message)
+        await client.ack(message)
+finally:
+    await client.disconnect()
 ```
 
 Application storage and MQTT acknowledgement are not one atomic transaction.
@@ -159,6 +169,7 @@ def health_fields(client) -> dict[str, object]:
     snapshot = client.stats()
     return {
         "state": snapshot.state.name,
+        "connections": snapshot.connections,
         "reconnect_attempt": snapshot.reconnect_attempt,
         "outbound": asdict(snapshot.outbound),
         "writer": asdict(snapshot.writer),

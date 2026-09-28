@@ -221,7 +221,8 @@ jobs:
           for protocol in 311 5; do
             for block in $(seq 1 "$BLOCKS"); do
               python harness/benchmarks/runner_probe.py \
-                --output "$out/preflight-$protocol-$block.json" --require-temperature
+                --output "$out/preflight-$protocol-$block.json" --require-temperature \
+                --wait-seconds 120 --poll-seconds 5 --consecutive-eligible 2 --enforce
               step=0
               for arm in base candidate candidate base; do
                 step=$((step + 1))

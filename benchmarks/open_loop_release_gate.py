@@ -1,13 +1,13 @@
-"""Release-grade open-loop gate with baseline-anchored load and targeted confirmation.
+"""Release-grade open-loop gate with fixed rates and targeted confirmation.
 
 ``paired_open_loop.py`` remains the low-level worker. This module owns release
-policy: baseline-only capacity calibration, identical absolute A/B load,
+policy: fixed absolute A/B load, conservative saturation diagnostics,
 balanced ABBA acquisition, and bounded confirmation of suspicious cells.
 
 Raw per-arm latency variability is retained as diagnostic evidence. Loop-lag
 regressions are only release-blocking when a relative signal survives extra
 A/B samples and its additive increase exceeds same-code A/A noise measured at
-the same target rate.
+the same target rate, below 90% of observed capacity and with both arms sleeping.
 """
 
 from __future__ import annotations
@@ -30,7 +30,10 @@ from network_release_gate import PairEstimate, _t_critical_95, paired_ratio_esti
 from paired_network import calibrated_sample_count
 
 
-DEFAULT_FRACTIONS = (0.50, 0.75, 0.90, 1.00)
+DEFAULT_TARGET_RATES = (5_000, 10_000, 15_000, 20_000, 22_000, 24_000, 26_000)
+LAG_LOAD_LIMIT = 0.90
+CPU_BUSY_LIMIT = 0.95
+CALIBRATION_SPREAD_LIMIT = 1.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,10 +130,9 @@ def _csv_floats(raw: str | None, *, option: str) -> list[float]:
 
 def _load_points(fractions: str | None, target_rates: str | None) -> list[LoadPoint]:
     rates = _csv_floats(target_rates, option="--target-rates")
-    if fractions is None:
-        fraction_values = [] if rates else list(DEFAULT_FRACTIONS)
-    else:
-        fraction_values = _csv_floats(fractions, option="--fractions")
+    if fractions is None and target_rates is None:
+        rates = list(DEFAULT_TARGET_RATES)
+    fraction_values = _csv_floats(fractions, option="--fractions")
     points = [LoadPoint("baseline_capacity_fraction", value) for value in fraction_values]
     points.extend(LoadPoint("absolute_rate", value) for value in rates)
     if not points:
@@ -262,6 +264,8 @@ def _worker_command(
         str(target),
         "--timeout",
         str(args.timeout),
+        "--observer-retention",
+        getattr(args, "observer_retention", "pending"),
     ]
     if args.cpu is not None:
         command.extend(("--cpu", str(args.cpu)))
@@ -315,6 +319,8 @@ def _run_worker(
         ) from exc
     if not isinstance(payload, dict):
         raise RuntimeError(f"{spec.key}: worker result is not an object")
+    if mode == "sample" and _number(payload, "completion_ratio") != 1.0:
+        raise RuntimeError(f"{spec.key}: not every publication completed")
     return payload
 
 
@@ -585,6 +591,14 @@ def loop_requires_confirmation(
     )
 
 
+def throughput_requires_confirmation(estimate: Metrics, *, min_completed_ratio: float) -> bool:
+    """Do not let a passing median hide an unresolved throughput loss."""
+    return (
+        estimate.throughput_median < min_completed_ratio
+        or estimate.throughput.lower_95 < min_completed_ratio
+    )
+
+
 def reevaluate_confirmation_overflow(payload: dict[str, Any]) -> dict[str, Any]:
     """Reapply the corrected screen to retained initial ABBA evidence only."""
     invalidations = payload.get("invalidations")
@@ -619,7 +633,9 @@ def reevaluate_confirmation_overflow(payload: dict[str, Any]) -> dict[str, Any]:
         estimate = metrics(pairs)
         record["initial_metrics"] = _metrics_dict(estimate)
         record["final_metrics"] = _metrics_dict(estimate)
-        record["throughput_suspect"] = estimate.throughput_median < min_completed_ratio
+        record["throughput_suspect"] = throughput_requires_confirmation(
+            estimate, min_completed_ratio=min_completed_ratio
+        )
         record["loop_suspect"] = loop_requires_confirmation(
             pairs, max_loop_lag_ratio=max_loop_lag_ratio
         )
@@ -632,7 +648,8 @@ def reevaluate_confirmation_overflow(payload: dict[str, Any]) -> dict[str, Any]:
         "acquisition": "none; retained initial ABBA pairs only",
         "policy_change": (
             "loop confirmation screening now requires the relative threshold "
-            "and positive relative/additive 95% lower bounds"
+            "and positive relative/additive 95% lower bounds; throughput screening "
+            "requires confirmation when its median or lower 95% bound is below threshold"
         ),
     }
     result["failures"] = []
@@ -661,6 +678,51 @@ def _metrics_dict(value: Metrics) -> dict[str, Any]:
     return asdict(value)
 
 
+def measurement_regime(
+    pairs: list[dict[str, Any]], *, target: float, capacity_floor: float
+) -> dict[str, Any]:
+    """Keep busy or near-saturation samples descriptive, never lag verdicts."""
+    busy: dict[str, list[float]] = {"base": [], "candidate": []}
+    costs: dict[str, list[float]] = {"base": [], "candidate": []}
+    sleeping = True
+    paced = True
+    for pair in pairs:
+        for arm in busy:
+            sample = pair[arm]
+            cpu = _number(sample, "cpu_seconds")
+            elapsed = _number(sample, "measurement_seconds")
+            count = _number(sample, "count")
+            if cpu < 0 or elapsed <= 0 or count <= 0:
+                raise RuntimeError("invalid CPU measurement interval or count")
+            busy[arm].append(cpu / elapsed)
+            costs[arm].append(cpu * 1_000_000 / count)
+            sleeping = sleeping and _number(sample, "pacing_sleeps") > 0
+            paced = paced and abs(_number(sample, "offered_rate") / target - 1) <= 0.005
+    cost_eligible = sleeping and all(
+        values and max(values) < CPU_BUSY_LIMIT for values in busy.values()
+    )
+    near_saturation = target >= LAG_LOAD_LIMIT * capacity_floor
+    reasons = []
+    if near_saturation:
+        reasons.append("target at or above 90% of the lowest observed capacity")
+    if not cost_eligible:
+        reasons.append("both arms must sleep and stay below 95% CPU busy in every sample")
+    if not paced:
+        reasons.append("offered rate differs from target by more than 0.5%")
+    return {
+        "capacity_floor": capacity_floor,
+        "load_against_capacity_floor": target / capacity_floor,
+        "cpu_busy_max": {arm: max(values) for arm, values in busy.items()},
+        "cpu_cost_eligible": cost_eligible,
+        "cpu_us_per_message": {
+            arm: statistics.median(values) if cost_eligible else None
+            for arm, values in costs.items()
+        },
+        "loop_lag_eligible": not reasons,
+        "diagnostic_reasons": reasons,
+    }
+
+
 def _initial_record(
     args: argparse.Namespace,
     *,
@@ -670,6 +732,12 @@ def _initial_record(
     base_root: Path,
     candidate_root: Path,
 ) -> dict[str, Any]:
+    if (
+        point.mode == "baseline_capacity_fraction"
+        and max(calibration.baseline_samples) / min(calibration.baseline_samples)
+        > CALIBRATION_SPREAD_LIMIT
+    ):
+        raise RuntimeError("fractional load calibration changes level; use fixed --target-rates")
     target = target_rate(calibration, point)
     requested_count = args.count_small if spec.payload_bytes <= 256 else args.count_large
     count = calibrated_sample_count(
@@ -688,6 +756,11 @@ def _initial_record(
         seeds=args.initial_cycle_seeds,
     )
     initial = metrics(pairs)
+    regime = measurement_regime(
+        pairs,
+        target=target,
+        capacity_floor=min(*calibration.baseline_samples, calibration.candidate_capacity),
+    )
     record: dict[str, Any] = {
         "label": _scenario_label(spec, point),
         "protocol": spec.protocol,
@@ -701,14 +774,16 @@ def _initial_record(
         "candidate_capacity_diagnostic": calibration.candidate_capacity,
         "target_rate": target,
         "count": count,
+        "measurement": regime,
         "initial_metrics": _metrics_dict(initial),
         "initial_pairs": pairs,
         "confirmation": None,
         "final_metrics": _metrics_dict(initial),
-        "throughput_suspect": initial.throughput_median < args.min_completed_ratio,
-        "loop_suspect": loop_requires_confirmation(
-            pairs, max_loop_lag_ratio=args.max_loop_lag_ratio
+        "throughput_suspect": throughput_requires_confirmation(
+            initial, min_completed_ratio=args.min_completed_ratio
         ),
+        "loop_suspect": regime["loop_lag_eligible"]
+        and loop_requires_confirmation(pairs, max_loop_lag_ratio=args.max_loop_lag_ratio),
     }
     print(
         f"{record['label']}: throughput={initial.throughput_median:.4f} "
@@ -727,8 +802,8 @@ def _run_initial_matrix(
     base_root: Path,
     candidate_root: Path,
     raw_dir: Path,
+    records: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
     for protocol in _csv_strings(args.protocols):
         _fresh_preflight(args, label=f"ab-{protocol}", raw_dir=raw_dir)
         protocol_specs = (item for item in specs if item.protocol == protocol)
@@ -843,16 +918,20 @@ def _confirm_record(
         "same_code_noise_floor_ms": None,
     }
 
-    if record["throughput_suspect"] and final.throughput_median < args.min_completed_ratio:
-        failures.append(
-            f"{record['label']}: completed ratio {final.throughput_median:.4f} "
-            f"< {args.min_completed_ratio:.4f} after confirmation"
-        )
-
-    persistent_loop_signal = (
-        record["loop_suspect"] and final.loop_lag_median_ratio > args.max_loop_lag_ratio
+    regime = measurement_regime(
+        ab_pairs,
+        target=record["target_rate"],
+        capacity_floor=record["measurement"]["capacity_floor"],
     )
-    if persistent_loop_signal:
+    record["measurement"] = regime
+    if record["loop_suspect"] and not regime["loop_lag_eligible"]:
+        invalidations.append(f"{record['label']}: confirmation changed pacing regime")
+    persistent_loop_signal = (
+        record["loop_suspect"]
+        and regime["loop_lag_eligible"]
+        and final.loop_lag_median_ratio > args.max_loop_lag_ratio
+    )
+    if persistent_loop_signal or record["throughput_suspect"]:
         base_control, candidate_control = _same_code_controls(
             args,
             spec=spec,
@@ -869,6 +948,15 @@ def _confirm_record(
             "pairs": candidate_control,
             "metrics": _metrics_dict(metrics(candidate_control)),
         }
+        for arm, controls in (("base", base_control), ("candidate", candidate_control)):
+            control_regime = measurement_regime(
+                controls,
+                target=record["target_rate"],
+                capacity_floor=regime["capacity_floor"],
+            )
+            confirmation[f"{arm}_control"]["measurement"] = control_regime
+            if persistent_loop_signal and not control_regime["loop_lag_eligible"]:
+                invalidations.append(f"{record['label']}: {arm} A/A changed pacing regime")
         _record_control_validity(
             args,
             label=record["label"],
@@ -876,21 +964,48 @@ def _confirm_record(
             candidate_control=candidate_control,
             invalidations=invalidations,
         )
-        confirmed, noise_floor = confirmed_loop_regression(
-            ab_pairs,
-            base_control_pairs=base_control,
-            candidate_control_pairs=candidate_control,
-            max_loop_lag_ratio=args.max_loop_lag_ratio,
-        )
-        confirmation["same_code_noise_floor_ms"] = noise_floor
-        confirmation["loop_confirmed"] = confirmed
-        if confirmed:
-            failures.append(
-                f"{record['label']}: loop-lag ratio "
-                f"{final.loop_lag_ratio.geometric_mean:.4f} with additive lower 95% "
-                f"bound {final.loop_lag_delta.lower_95_ms:.6f}ms above same-code "
-                f"noise floor {noise_floor:.6f}ms"
+        if record["throughput_suspect"]:
+            for arm, controls in (("base", base_control), ("candidate", candidate_control)):
+                estimate = metrics(controls).throughput
+                budget = args.control_max_throughput_deviation
+                if estimate.lower_95 < 1 - budget or estimate.upper_95 > 1 + budget:
+                    invalidations.append(
+                        f"{record['label']}: {arm} A/A throughput confidence interval "
+                        f"[{estimate.lower_95:.4f}, {estimate.upper_95:.4f}] "
+                        f"does not fit the {budget:.2%} equivalence budget"
+                    )
+            estimate = final.throughput
+            if estimate.upper_95 < args.min_completed_ratio:
+                confirmation["throughput_decision"] = "regression"
+                failures.append(
+                    f"{record['label']}: completed-rate upper 95% bound "
+                    f"{estimate.upper_95:.4f} < {args.min_completed_ratio:.4f}"
+                )
+            elif estimate.lower_95 >= args.min_completed_ratio:
+                confirmation["throughput_decision"] = "cleared"
+            else:
+                confirmation["throughput_decision"] = "inconclusive"
+                invalidations.append(
+                    f"{record['label']}: completed-rate confidence interval "
+                    f"[{estimate.lower_95:.4f}, {estimate.upper_95:.4f}] crosses "
+                    f"the {args.min_completed_ratio:.4f} threshold; more evidence required"
+                )
+        if persistent_loop_signal:
+            confirmed, noise_floor = confirmed_loop_regression(
+                ab_pairs,
+                base_control_pairs=base_control,
+                candidate_control_pairs=candidate_control,
+                max_loop_lag_ratio=args.max_loop_lag_ratio,
             )
+            confirmation["same_code_noise_floor_ms"] = noise_floor
+            confirmation["loop_confirmed"] = confirmed
+            if confirmed:
+                failures.append(
+                    f"{record['label']}: loop-lag ratio "
+                    f"{final.loop_lag_ratio.geometric_mean:.4f} with additive lower 95% "
+                    f"bound {final.loop_lag_delta.lower_95_ms:.6f}ms above same-code "
+                    f"noise floor {noise_floor:.6f}ms"
+                )
 
     confirmation["status"] = "invalid_control" if invalidations else "completed"
     record["confirmation"] = confirmation
@@ -935,7 +1050,7 @@ def _write_result(output: Path, payload: dict[str, Any]) -> None:
         f"- Status: **{payload['status']}**",
         f"- Base: `{payload['base_sha']}`",
         f"- Candidate: `{payload['candidate_sha']}`",
-        "- Fractional loads: anchored to baseline capacity only",
+        "- Default loads: fixed absolute rates; saturation lag is diagnostic only",
         "- Raw ACK p50 CV: diagnostic only",
         "",
     ]
@@ -957,6 +1072,7 @@ def _write_result(output: Path, payload: dict[str, Any]) -> None:
             f"loop delta CI=[{final['loop_lag_delta']['lower_95_ms']:.6f}, "
             f"{final['loop_lag_delta']['upper_95_ms']:.6f}] ms; "
             f"confirmation={scenario['confirmation']['status'] if scenario['confirmation'] else 'none'}"
+            f"; measurement={scenario.get('measurement', 'legacy policy')}"
         )
     output.with_suffix(".md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -985,6 +1101,7 @@ def _result_template(
         "harness": {
             "engine": str(args.engine),
             "publisher_cpu": args.cpu,
+            "observer_retention": getattr(args, "observer_retention", "pending"),
             "calibration_source": "baseline_only",
             "calibration_seconds": args.calibration_seconds,
             "calibration_repeats": args.calibration_repeats,
@@ -992,17 +1109,25 @@ def _result_template(
             "confirmation_pairs_per_scenario": 2 * len(args.confirmation_cycle_seeds),
             "max_confirmation_scenarios": args.max_confirmation_scenarios,
             "raw_ack_p50_cv": "diagnostic_only",
+            "default_target_rates": list(DEFAULT_TARGET_RATES),
+            "cpu_cost": "diagnostic; only when both arms sleep below 95% CPU busy",
         },
         "thresholds": {
             "min_completed_ratio": args.min_completed_ratio,
             "max_loop_lag_ratio": args.max_loop_lag_ratio,
             "control_max_throughput_deviation": args.control_max_throughput_deviation,
+            "throughput_confirmation_screen": "median or lower 95% bound below min_completed_ratio",
+            "throughput_confirmation": "95% interval below or above min_completed_ratio; overlap invalidates",
+            "throughput_control": "each source tree's 95% interval must fit the equivalence budget",
             "loop_confirmation_screen": (
                 "geometric mean above ratio threshold with relative and additive "
                 "95% lower bounds above zero effect"
             ),
             "loop_absolute_materiality": "same-code A/A additive noise envelope",
             "loop_confidence": 0.95,
+            "loop_load_limit_exclusive": LAG_LOAD_LIMIT,
+            "cpu_busy_limit_exclusive": CPU_BUSY_LIMIT,
+            "fractional_calibration_max_ratio": CALIBRATION_SPREAD_LIMIT,
         },
         "calibration": {},
         "scenarios": [],
@@ -1020,6 +1145,19 @@ def _evaluate_records(
     candidate_root: Path,
     raw_dir: Path,
 ) -> int:
+    coverage: dict[tuple[Any, ...], bool] = {}
+    for record in records:
+        key = tuple(
+            record[field] for field in ("protocol", "payload_bytes", "completion", "window")
+        )
+        coverage[key] = coverage.get(key, False) or record["measurement"]["loop_lag_eligible"]
+    missing = [str(key) for key, eligible in coverage.items() if not eligible]
+    if missing:
+        result["status"] = "invalid"
+        result["invalidations"] = [
+            "no unsaturated, sleeping comparison; add lower fixed rates: " + "; ".join(missing)
+        ]
+        return 2
     suspects = [
         record for record in records if record["throughput_suspect"] or record["loop_suspect"]
     ]
@@ -1081,6 +1219,7 @@ def parent(args: argparse.Namespace) -> int:
             specs=specs,
             load_points=load_points,
             calibrations=calibrations,
+            records=result["scenarios"],
             base_root=base_root,
             candidate_root=candidate_root,
             raw_dir=raw_dir,
@@ -1116,6 +1255,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocols", default="311,5")
     parser.add_argument("--payloads", default="64,4096")
     parser.add_argument("--completions", choices=("receipt",), default="receipt")
+    parser.add_argument("--observer-retention", choices=("pending", "all"), default="pending")
     parser.add_argument("--windows", default="100")
     parser.add_argument("--fractions")
     parser.add_argument("--target-rates")
@@ -1137,12 +1277,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--confirmation-cycle-seeds",
         type=lambda value: _parse_seed_schedule(value, minimum=2),
-        default=_parse_seed_schedule("12,13", minimum=2),
+        default=_parse_seed_schedule("12,13,14,15,16,17,18,19", minimum=2),
     )
     parser.add_argument(
         "--control-cycle-seeds",
         type=lambda value: _parse_seed_schedule(value, minimum=2),
-        default=_parse_seed_schedule("20,21", minimum=2),
+        default=_parse_seed_schedule("20,21,22,23,24,25,26,27", minimum=2),
     )
     parser.add_argument("--max-count", type=int, default=50_000)
     parser.add_argument("--timeout", type=float, default=120.0)

@@ -200,3 +200,150 @@ def test_parent_invalidates_candidate_only_variability(
     assert result["status"] == "invalid"
     assert any("candidate completed-rate CV" in item for item in result["invalidations"])
     assert any("candidate p50-latency CV" in item for item in result["invalidations"])
+
+
+@pytest.mark.parametrize("join_setup,join_tail", [(0.0, 0.0), (0.07, 0.02)])
+async def test_cpu_interval_excludes_initial_pacing_sleep(
+    open_loop, monkeypatch, join_setup, join_tail
+):
+    from collections import defaultdict
+
+    clock = {"wall": 0.0, "cpu": 0.0}
+
+    class Loop:
+        def time(self):
+            return clock["wall"]
+
+    class Receipt:
+        mid = 1
+
+        async def wait(self):
+            pass
+
+    class Client:
+        async def connect(self, *_a, **_kw):
+            pass
+
+        async def publish(self, *_a, **_kw):
+            clock["wall"] += 0.001
+            clock["cpu"] += 0.0005
+            return Receipt()
+
+        async def disconnect(self):
+            pass
+
+    async def connected(*_a):
+        return Client()
+
+    async def sleep(delay):
+        clock["wall"] += delay
+        clock["cpu"] += 0.0001
+
+    real_gather = open_loop.asyncio.gather
+
+    def gather(*tasks):
+        joined = real_gather(*tasks)
+        clock["wall"] += join_setup
+        clock["cpu"] += join_setup
+
+        async def finish():
+            await joined
+            clock["wall"] += join_tail
+            clock["cpu"] += join_tail
+
+        return finish()
+
+    monkeypatch.setattr(open_loop, "_connected_client", connected)
+    monkeypatch.setattr(open_loop.asyncio, "get_running_loop", lambda: Loop())
+    monkeypatch.setattr(open_loop.asyncio, "sleep", sleep)
+    monkeypatch.setattr(open_loop.asyncio, "gather", gather)
+    monkeypatch.setattr(open_loop.time, "process_time", lambda: clock["cpu"])
+    monkeypatch.setattr(open_loop, "runtime_counters", lambda *_a: defaultdict(int))
+    args = Namespace(
+        protocol="311",
+        window=100,
+        completion="receipt",
+        host="unused",
+        port=0,
+        timeout=1,
+        target_rate=10,
+        count=3,
+        payload_bytes=64,
+    )
+    result = await open_loop.sample(args, "test/timing")
+    assert result.cpu_seconds == pytest.approx(0.0017 + join_setup + join_tail)
+    assert result.measurement_seconds == pytest.approx(0.201 + join_setup + join_tail)
+    assert result.pacing_sleeps == 2
+    assert result.completion_ratio == 1.0
+    assert result.offered_seconds == pytest.approx(0.201)
+    assert result.offered_cpu_seconds == pytest.approx(0.0017)
+    assert result.receipt_completed_seconds == pytest.approx(0.201 + join_setup)
+    assert result.observer_join_setup_seconds == pytest.approx(join_setup)
+    assert result.observer_join_tail_seconds == pytest.approx(join_tail)
+    assert result.pending_receipts_after_offer == 3
+    assert result.pending_receipts_high_water == 3
+    assert len(result.gc_collections) == 3
+
+
+@pytest.mark.parametrize("retention,expected_peak", [("pending", 256), ("all", 1_024)])
+async def test_completed_observers_do_not_accumulate_with_sample_length(
+    open_loop, monkeypatch, retention, expected_peak
+):
+    from collections import defaultdict
+
+    class Receipt:
+        mid = 1
+
+        async def wait(self):
+            pass
+
+    class Client:
+        async def connect(self, *_a, **_kw):
+            pass
+
+        async def publish(self, *_a, **_kw):
+            await open_loop.asyncio.sleep(0)
+            return Receipt()
+
+        async def disconnect(self):
+            pass
+
+    async def connected(*_a):
+        return Client()
+
+    monkeypatch.setattr(open_loop, "_connected_client", connected)
+    monkeypatch.setattr(open_loop, "runtime_counters", lambda *_a: defaultdict(int))
+    args = Namespace(
+        protocol="311",
+        window=100,
+        completion="receipt",
+        host="unused",
+        port=0,
+        timeout=1,
+        target_rate=0,
+        count=1_024,
+        payload_bytes=64,
+        observer_retention=retention,
+    )
+    result = await open_loop.sample(args, "test/observers")
+    assert result.observer_retention == retention
+    assert result.retained_observers_high_water <= expected_peak + 1
+    assert result.retained_observers_high_water >= expected_peak
+    assert result.pending_receipts_high_water <= 2
+    assert result.completion_ratio == 1.0
+
+
+async def test_observer_retirement_preserves_pending_tasks_and_surfaces_failure(open_loop):
+    from collections import deque
+
+    loop = open_loop.asyncio.get_running_loop()
+    first, pending, failed = (loop.create_future() for _ in range(3))
+    first.set_result(None)
+    failed.set_exception(RuntimeError("receipt failed"))
+    tasks = deque([first, pending, failed])
+    open_loop._retire_completed_observers(tasks)
+    assert list(tasks) == [pending, failed]
+    pending.set_result(None)
+    with pytest.raises(RuntimeError, match="receipt failed"):
+        open_loop._retire_completed_observers(tasks)
+    assert not tasks
