@@ -43,6 +43,15 @@ class _DeliveryQueue(asyncio.Queue[IteratorQueueItem]):
         self._put(item)
         self._wakeup_next(self._getters)  # type: ignore[attr-defined]
 
+    def put_over_bound(self, item: IteratorQueueItem) -> None:
+        """Commit an item the client already acknowledged, even when full.
+
+        Only a retired connection's already-acknowledged messages use this, so
+        the overshoot is bounded by one ingress lot.
+        """
+        self._put(item)
+        self._wakeup_next(self._getters)  # type: ignore[attr-defined]
+
 
 class ApplicationDelivery:
     """Own the message destination: a bounded iterator queue or direct callbacks.
@@ -295,23 +304,60 @@ class ApplicationDelivery:
                 yield message
 
     def reset_stream(self) -> None:
+        """Start a new iterator generation, carrying unread messages into it.
+
+        Iterators of the retired generation end. Messages they did not read
+        are already committed to the application -- acknowledged to the broker
+        or marked delivered -- so they move to the new generation, in order,
+        instead of being discarded with the old stream.
+        """
         if not self.closed.is_set():
             return
         self.invalidate_waiting_admissions()
         self._stream_generation += 1
-        if self.max_iterator_bytes is None:
-            while not self.messages_queue.empty():
-                self.messages_queue.get_nowait()
-            self._wake_waiters()
-        else:
-            while not self.messages_queue.empty():
-                _message, size = cast(tuple[Message, int], self.messages_queue.get_nowait())
-                self.release(size)
+        old_queue = self.messages_queue
+        replacement = _DeliveryQueue(self.max_iterator_messages)
+        while not old_queue.empty():
+            replacement.put_over_bound(old_queue.get_nowait())
         # Wake iterators that belong to the retired stream before replacing it.
         self.message_ready.set()
-        self.messages_queue = _DeliveryQueue(self.max_iterator_messages)
+        self.messages_queue = replacement
         self.message_ready = asyncio.Event()
+        if not replacement.empty():
+            self.message_ready.set()
         self.closed.clear()
+
+    def deliver_acknowledged(
+        self,
+        message: Message,
+        callback: CallbackTarget | None,
+        property_wire_size: int | None = None,
+    ) -> None:
+        """Hand over a message from a retired connection without waiting.
+
+        The client already acknowledged it, so nothing else will ever deliver
+        it. Callback mode runs its callbacks now; iterator mode commits it past
+        the queue bounds, an overshoot bounded by one ingress lot.
+        """
+        if self.mode == "callback":
+            if callback is None:
+                return
+            if isinstance(callback, MessageRoute):
+                for selected in callback.select(message):
+                    self.invoke_sync_isolated(selected, message)
+            else:
+                self.invoke_sync_isolated(callback, message)
+            return
+        queue = cast(_DeliveryQueue, self.messages_queue)
+        if self.max_iterator_bytes is None:
+            queue.put_over_bound(message)
+        else:
+            size = self.logical_size(message, property_wire_size)
+            self.pending_bytes += size
+            if self.pending_bytes > self.pending_high_water_bytes:
+                self.pending_high_water_bytes = self.pending_bytes
+            queue.put_over_bound((message, size))
+        self.message_ready.set()
 
     @staticmethod
     def _is_async_callback(callback: Callable[..., Any]) -> bool:

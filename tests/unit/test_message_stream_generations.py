@@ -59,14 +59,18 @@ async def test_reopen_without_reset_keeps_the_same_stream_generation() -> None:
     assert await asyncio.wait_for(pending, timeout=1.0) == message
 
 
-async def test_reset_releases_discarded_accounting_exactly_once() -> None:
+async def test_reset_carries_unread_messages_and_their_accounting() -> None:
     delivery = _delivery(max_iterator_bytes=4096)
-    await accept_message(delivery, Message(topic="old", payload=b"x"))
+    message = Message(topic="old", payload=b"x")
+    await accept_message(delivery, message)
     assert delivery.pending_bytes == 4
 
     delivery.close()
     delivery.reset_stream()
 
+    # Committed to the application already: it moves to the new generation.
+    assert delivery.pending_bytes == 4
+    assert await asyncio.wait_for(anext(delivery.messages()), 1) is message
     assert delivery.pending_bytes == 0
     assert delivery.messages_queue.empty()
 

@@ -162,4 +162,14 @@ A terminal disconnect ends the current generation. A later explicit `connect()`,
 `connect_unix()`, or `connect_ws()` starts a new generation. Iterators created for
 the previous generation stay terminal and cannot consume messages delivered by
 the new connection; call `messages()` again after the explicit connect to consume
-the replacement generation.
+the replacement generation. Messages the previous generation queued but did not
+yield move to the new generation first, in order: they are already committed to
+the application and are never discarded.
+
+A message the client has already acknowledged -- any QoS 0 message, and QoS 1
+with automatic acknowledgement -- has no other owner once its acknowledgement
+has left: the broker will not resend it. Connection loss, `disconnect()` or an
+explicit reconnect therefore still delivers it, in order, even when the
+iterator queue is full; this overshoot is bounded by one ingress lot. A QoS 2 or
+manually acknowledged delivery that was not handed over stays with session
+state, which redelivers it on a resumed session.
