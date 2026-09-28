@@ -1,6 +1,16 @@
-# Migrating to 1.0.0rc17
+# Migrating to 1.0.0
 
-RC17 revises the RC16 API before 1.0. If you are upgrading from **1.0.0rc16**,
+## Changes since 1.0.0rc17
+
+The stable 1.0.0 release preserves RC17's client behavior, public API and SQLite
+schema 5. RC17 applications need no API or database migration for this release.
+The support tiers in the [API contract](api-stability.md) remain distinct:
+Stable interfaces follow SemVer, while statistics and the supplied stores stay
+Provisional.
+
+## Upgrading from earlier candidates
+
+RC17 revised the RC16 API before 1.0. If you are upgrading from **1.0.0rc16**,
 start with [Changes since 1.0.0rc16](#changes-since-100rc16). If you are
 upgrading from **1.0.0rc14** (`c194597`, 2026-09-11), review the broader
 native-API changes throughout this guide as well.

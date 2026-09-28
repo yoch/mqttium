@@ -170,7 +170,7 @@ finally:
 structure makes that convenient. `close()` is idempotent, but closing inside an
 active store batch is rejected.
 
-The database uses WAL mode and pre-v1 schema 5, recorded by
+The database uses WAL mode and schema 5, recorded by
 `PRAGMA user_version`. Only new databases and schema 5 are accepted. Historical,
 future and inconsistent schemas are refused without migrating, resetting, or
 changing their committed schema and data. No historical size backfill is performed.

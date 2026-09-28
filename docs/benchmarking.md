@@ -395,6 +395,12 @@ calibrations with the same publisher, measure that collapse rather than the
 code's throughput. Compare throughput and schedule lag only at sustained rates,
 and use a bounded publisher to qualify overload.
 
+That diagnostic recommendation is not an implemented replacement for the
+open-loop release gate above: it still checks completed throughput at every
+fixed rate. Changing the overload workload requires a reviewed gate change and
+fresh same-code qualification; a backlog classification alone does not convert
+an invalid gate result into a pass.
+
 Before trusting a lag verdict, compare the two arms' **absolute**
 `loop_lag_p95`: values near the plateau mean the publisher is still sleeping and
 the number is a timer artifact, not congestion. Choose load points where both

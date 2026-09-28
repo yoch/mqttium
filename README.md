@@ -22,7 +22,7 @@ connection or process fails.
 
 The package has no runtime dependencies and is fully typed.
 
-The current pre-v1 native API deliberately differs from `1.0.0rc14`, including
+The 1.0 native API deliberately differs from `1.0.0rc14`, including
 message delivery, publication completion, configuration names, and the SQLite
 format. If you are upgrading an existing application or database, read the
 [migration guide](https://github.com/yoch/mqttium/blob/main/docs/migration.md)
@@ -48,10 +48,10 @@ native client free of background threads.
 
 ## Install
 
-The native API below is published as the pre-release `1.0.0rc17`:
+Install the stable native release:
 
 ```bash
-python -m pip install mqttium==1.0.0rc17
+python -m pip install mqttium==1.0.0
 ```
 
 To try unreleased changes, install a checkout instead and record the Git commit
@@ -63,7 +63,7 @@ cd mqttium
 python -m pip install .
 ```
 
-`1.0.0rc17` revises the `1.0.0rc16` API before 1.0; see the
+`1.0.0` preserves the RC17 API. For upgrades from RC16, see the
 [changes since 1.0.0rc16](https://mqttium.readthedocs.io/en/latest/migration/#changes-since-100rc16).
 Applications still on `1.0.0rc14` should use its
 [RC14 documentation](https://mqttium.readthedocs.io/en/v1.0.0rc14/) and read the
@@ -231,10 +231,10 @@ statistics vocabulary, progressive batch publication, synchronous message
 callbacks, receipt-based publication completion, and the new SQLite schema.
 Historical databases are not upgraded automatically.
 
-Use the Read the Docs version matching your installed release: `v1.0.0rc17`
-for this API, `v1.0.0rc16`, `v1.0.0rc15` or `v1.0.0rc14` for earlier candidates, and `latest`
-for the current source. The legacy `stable` URL redirects to the latest published
-candidate until a final release provides Read the Docs' automatic stable version.
+Use the Read the Docs version matching your installed release: `v1.0.0`
+for the stable release, the corresponding RC tag for an earlier candidate,
+and `latest` for the current source. The `stable` version follows the latest
+stable release.
 
 ## Documentation
 

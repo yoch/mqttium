@@ -6,12 +6,26 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-09-28
+
+### Changed
+
+- Publish the first stable native release. The client implementation and public
+  API are unchanged from RC17; the Stable surface now follows the 1.x SemVer
+  and deprecation contract. Statistics and the two supplied inflight stores
+  remain Provisional.
+- Align installation instructions, migration guidance, support policy and
+  package metadata with the stable 1.0 release line.
+
 ### Fixed
 
 - Correct RC17 migration-table rendering, reconnect-hook ordering and renamed
   API fields in the maintained guides. Restore the published surface-review
   link, clarify the Read the Docs fallback and PyPI approval steps, and update
   examples for manual acknowledgement, publication deadlines and MQTT 5 Wills.
+- Disable broker Nagle in benchmark workloads to remove the delayed final-ACK
+  measurement tail. Keep overload behavior and collector costs documented
+  separately from sustained-rate comparisons.
 - Use fixed absolute rates in the open-loop release gate. Keep saturation lag
   diagnostic, require an eligible lower-rate comparison, and report CPU cost
   only with measured headroom. Enforce runner eligibility before each block of
@@ -1574,7 +1588,8 @@ See the [migration guide](docs/migration.md) for the breaking changes since
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc17...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/yoch/mqttium/compare/v1.0.0rc17...v1.0.0
 [1.0.0rc17]: https://github.com/yoch/mqttium/compare/v1.0.0rc16...v1.0.0rc17
 [1.0.0rc16]: https://github.com/yoch/mqttium/compare/v1.0.0rc15...v1.0.0rc16
 [1.0.0rc15]: https://github.com/yoch/mqttium/compare/v1.0.0rc14...v1.0.0rc15

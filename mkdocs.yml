@@ -19,6 +19,7 @@ exclude_docs: |
   experiments/
   reports/*.md
   !reports/README.md
+  !reports/FINAL-1.0.0-PUBLICATION-CHECKPOINT-2026-09-28.md
   !reports/RC17-AUDIT-CLOSURE-2026-09-28.md
   !reports/RC17-STABLE-PROMOTION-AUDIT-2026-09-27.md
   !reports/RC17-LONG-CAMPAIGN-CLOSURE-2026-09-27.md
