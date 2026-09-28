@@ -56,10 +56,15 @@ PROFILE = (
     "broker_cpu_us_per_msg",
     "broker_busy_share",
     "writer_items_per_batch",
-    "net_rx_per_msg",
+    "pending_receipts_high_water",
+    "gc_gen2_per_kmsg",
     "tcp_max_rwnd_limited_ms",
 )
 _UNIT = {"": 1.0, "K": 1e3, "M": 1e6, "G": 1e9}
+# Publisher variants: the gate's unbounded backlog, a bounded backlog where an
+# awaiting publish() parks, and the unbounded backlog without the cyclic
+# collector (diagnostic attribution of backlog cost).
+VARIANTS = ("unbounded", "bounded", "gc-off")
 
 
 @dataclass(frozen=True)
@@ -67,11 +72,21 @@ class Cell:
     protocol: str
     payload_bytes: int
     rate: float
+    variant: str = "unbounded"
 
     @property
     def key(self) -> str:
         rate = "unpaced" if self.rate <= 0 else f"{self.rate:.0f}"
-        return f"protocol={self.protocol} payload={self.payload_bytes} rate={rate}"
+        key = f"protocol={self.protocol} payload={self.payload_bytes} rate={rate}"
+        return key if self.variant == "unbounded" else f"{key} variant={self.variant}"
+
+
+def worker_options(cell: Cell, args: argparse.Namespace) -> argparse.Namespace:
+    """The worker arguments for one cell's publisher variant."""
+    options = argparse.Namespace(**vars(args))
+    options.max_unacknowledged_messages = args.bounded_backlog if cell.variant == "bounded" else 0
+    options.gc_disable = cell.variant == "gc-off"
+    return options
 
 
 # --- system readers ---------------------------------------------------------
@@ -230,7 +245,7 @@ def acquire(cell: Cell, args: argparse.Namespace, broker: Any) -> dict[str, Any]
     result = _run_worker(
         ENGINE,
         args.root,
-        args,
+        worker_options(cell, args),
         mode="calibrate" if cell.rate <= 0 else "sample",
         protocol=cell.protocol,
         payload_bytes=cell.payload_bytes,
@@ -250,6 +265,7 @@ def acquire(cell: Cell, args: argparse.Namespace, broker: Any) -> dict[str, Any]
         "protocol": cell.protocol,
         "payload_bytes": cell.payload_bytes,
         "rate": cell.rate,
+        "variant": cell.variant,
         "count": count,
         "result": result,
         "system": {
@@ -275,9 +291,11 @@ def _delta(before: dict[str, float], after: dict[str, float]) -> dict[str, float
 # --- analysis ---------------------------------------------------------------
 
 
-def _schedule(result: dict[str, Any]) -> dict[str, float]:
-    """How the paced schedule and the completion tail compare with the target."""
+def _derived(result: dict[str, Any], count: float) -> dict[str, float]:
+    """Schedule, completion tail and collector activity relative to the target."""
     out: dict[str, float] = {}
+    for generation, collections in enumerate(result.get("gc_collections") or []):
+        out[f"gc_gen{generation}_per_kmsg"] = collections / count * 1000
     target = result.get("target_rate") or 0.0
     if target:
         out["offered_over_target"] = result.get("offered_rate", 0.0) / target
@@ -300,7 +318,7 @@ def features(sample: dict[str, Any]) -> dict[str, float]:
             out[name] = float(value)
 
     put("completed_rate", result.get("completed_rate"))
-    for name, value in _schedule(result).items():
+    for name, value in _derived(result, count).items():
         put(name, value)
     for name in (
         "loop_lag_p95_ms",
@@ -558,10 +576,11 @@ def markdown(summary: dict[str, Any]) -> str:
 
 def _cells(args: argparse.Namespace) -> list[Cell]:
     return [
-        Cell(protocol, int(payload), float(rate))
+        Cell(protocol, int(payload), float(rate), variant)
         for protocol in args.protocols.split(",")
         for payload in args.payloads.split(",")
         for rate in args.rates.split(",")
+        for variant in args.variants.split(",")
     ]
 
 
@@ -605,6 +624,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--cpu", type=int)
     parser.add_argument("--observer-retention", choices=("pending", "all"), default="pending")
+    parser.add_argument(
+        "--variants",
+        default=",".join(VARIANTS),
+        help="comma-separated publisher variants: " + ", ".join(VARIANTS),
+    )
+    parser.add_argument(
+        "--bounded-backlog",
+        type=int,
+        default=1_024,
+        help="max_unacknowledged_messages for the bounded variant",
+    )
     parser.add_argument("--broker-pid-file", type=Path)
     parser.add_argument("--level-gap", type=float, default=DEFAULT_LEVEL_GAP)
     parser.add_argument("--output", type=Path, default=Path("/tmp/saturation-regimes.json"))
@@ -612,6 +642,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.summarise is None and args.root is None:
         parser.error("--root is required unless --summarise is given")
+    unknown = set(args.variants.split(",")) - set(VARIANTS)
+    if unknown:
+        parser.error(f"unknown variants: {', '.join(sorted(unknown))}")
     return args
 
 

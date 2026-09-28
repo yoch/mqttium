@@ -174,3 +174,38 @@ def test_dispersed_cell_reports_profile_and_correlations(probe) -> None:
     text = probe.markdown(summary)
     assert "## Cell profiles (medians)" in text
     assert "| broker_cpu_us_per_msg | -1.00 |" in text
+
+
+def test_variants_expand_cells_and_worker_options(probe) -> None:
+    args = probe.parse_args(
+        ["--root", "x", "--protocols", "5", "--payloads", "4096", "--rates", "0,26000"]
+    )
+
+    cells = probe._cells(args)
+
+    assert [cell.key for cell in cells[:3]] == [
+        "protocol=5 payload=4096 rate=unpaced",
+        "protocol=5 payload=4096 rate=unpaced variant=bounded",
+        "protocol=5 payload=4096 rate=unpaced variant=gc-off",
+    ]
+    options = {cell.variant: probe.worker_options(cell, args) for cell in cells[:3]}
+    assert options["unbounded"].max_unacknowledged_messages == 0
+    assert not options["unbounded"].gc_disable
+    assert options["bounded"].max_unacknowledged_messages == args.bounded_backlog
+    assert options["gc-off"].gc_disable
+    assert not hasattr(args, "gc_disable")
+
+
+def test_unknown_variant_is_refused(probe) -> None:
+    with pytest.raises(SystemExit):
+        probe.parse_args(["--root", "x", "--variants", "unbounded,tuned"])
+
+
+def test_collector_activity_is_reported_per_thousand_messages(probe) -> None:
+    sample = _sample(26_000, 0.8, seed=0)
+    sample["result"]["gc_collections"] = [400, 40, 4]
+
+    row = probe.features(sample)
+
+    assert row["gc_gen0_per_kmsg"] == pytest.approx(10.0)
+    assert row["gc_gen2_per_kmsg"] == pytest.approx(0.1)
