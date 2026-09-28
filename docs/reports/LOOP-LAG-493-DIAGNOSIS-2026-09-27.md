@@ -618,7 +618,7 @@ bounded publishers, 8 samples per cell.
 - The broker's CPU per message rose by 25–65 %, because it no longer coalesces
   writes. It stays far from saturation.
 - Above capacity (4096 B at 26k and 28k), the unbounded publisher still
-  collapses, with CV 2.1–10.7 %. The bounded publisher holds CV 0.6–2.5 %.
+  collapses, with CV 0.5–10.7 %. The bounded publisher holds CV 0.6–2.5 %.
 
 **RC17/RC17 open-loop control** ([36428349624](https://github.com/yoch/mqttium/actions/runs/36428349624)):
 **passed**, all preflights eligible, no confirmation acquired.
