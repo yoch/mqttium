@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import json
 import math
 import os
@@ -59,6 +60,14 @@ class OpenLoopResult:
     cpu_seconds: float
     measurement_seconds: float
     pacing_sleeps: int
+    offered_seconds: float
+    offered_cpu_seconds: float
+    receipt_completed_seconds: float
+    observer_join_setup_seconds: float
+    observer_join_tail_seconds: float
+    pending_receipts_after_offer: int
+    pending_receipts_high_water: int
+    gc_collections: list[int]
     effect_inline: int
     effect_enqueued: int
     effect_suspensions: int
@@ -101,10 +110,14 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
     client = await _connected_client(args.protocol, args.window)
     latencies: list[float] = []
     receipt_tasks: list[asyncio.Task[None]] = []
+    receipt_completed = 0.0
 
     async def observe_receipt(receipt, sent_ns: int) -> None:
+        nonlocal receipt_completed
         await receipt.wait()
         latencies.append((time.monotonic_ns() - sent_ns) / 1_000_000)
+        if len(latencies) == args.count:
+            receipt_completed = loop.time()
 
     if args.completion != "receipt":
         raise ValueError("publication completion requires receipts")
@@ -118,6 +131,8 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
     started = loop.time() + (0.05 if paced else 0.0)
     offered_started = 0.0
     pacing_sleeps = 0
+    pending_high_water = 0
+    gc_before = gc.get_stats()
     try:
         for sequence in range(args.count):
             deadline = started + sequence * interval if paced else loop.time()
@@ -136,10 +151,17 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
             receipt = await client.publish(topic, _payload(sequence, args.payload_bytes), qos=1)
             assert receipt.mid is not None
             receipt_tasks.append(asyncio.create_task(observe_receipt(receipt, sent_ns)))
+            pending_high_water = max(pending_high_water, len(receipt_tasks) - len(latencies))
         offered_elapsed = max(loop.time() - offered_started, 1e-9)
-        await asyncio.gather(*receipt_tasks)
+        offered_cpu_elapsed = time.process_time() - cpu_started
+        pending_after_offer = len(receipt_tasks) - len(latencies)
+        join_started = loop.time()
+        joined = asyncio.gather(*receipt_tasks)
+        join_setup_elapsed = loop.time() - join_started
+        await joined
         completed_elapsed = max(loop.time() - offered_started, 1e-9)
         cpu_elapsed = time.process_time() - cpu_started
+        gc_after = gc.get_stats()
         effects = runtime_counters(client, "effects")
         writer = runtime_counters(client, "writer")
         return OpenLoopResult(
@@ -164,6 +186,19 @@ async def sample(args: argparse.Namespace, topic: str) -> OpenLoopResult:
             cpu_seconds=cpu_elapsed,
             measurement_seconds=completed_elapsed,
             pacing_sleeps=pacing_sleeps,
+            offered_seconds=offered_elapsed,
+            offered_cpu_seconds=offered_cpu_elapsed,
+            receipt_completed_seconds=max(receipt_completed - offered_started, 1e-9),
+            observer_join_setup_seconds=join_setup_elapsed,
+            observer_join_tail_seconds=max(
+                0.0, completed_elapsed - (receipt_completed - offered_started)
+            ),
+            pending_receipts_after_offer=pending_after_offer,
+            pending_receipts_high_water=pending_high_water,
+            gc_collections=[
+                after["collections"] - before["collections"]
+                for before, after in zip(gc_before, gc_after, strict=True)
+            ],
             effect_inline=effects["inline_effects"],
             effect_enqueued=effects["enqueued"],
             effect_suspensions=effects["apply_suspensions"],

@@ -257,3 +257,11 @@ async def test_cpu_interval_excludes_initial_pacing_sleep(open_loop, monkeypatch
     assert result.measurement_seconds == pytest.approx(0.201)
     assert result.pacing_sleeps == 2
     assert result.completion_ratio == 1.0
+    assert result.offered_seconds == pytest.approx(0.201)
+    assert result.offered_cpu_seconds == pytest.approx(0.0017)
+    assert result.receipt_completed_seconds == pytest.approx(0.201)
+    assert result.observer_join_setup_seconds == 0.0
+    assert result.observer_join_tail_seconds == 0.0
+    assert result.pending_receipts_after_offer == 3
+    assert result.pending_receipts_high_water == 3
+    assert len(result.gc_collections) == 3
