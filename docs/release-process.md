@@ -8,7 +8,7 @@ published release, from that same tag. Validation mode never publishes.
 ## Preparing the next release
 
 Between releases, `main` keeps the version of the last published release
-(currently `1.0.0rc17`); never upload a tree under an already-used version.
+(currently `1.0.0`); never upload a tree under an already-used version.
 Keep changes in `[Unreleased]`, record the candidate commit and source
 fingerprint, and validate the current installation and migration instructions
 before deciding the next version.
@@ -16,8 +16,8 @@ before deciding the next version.
 For the release cut, update `src/mqttium/__init__.py`, freeze the changelog
 section and comparison links, and align README installation commands, security
 and support status, documentation version notices and the development-status
-classifier. RC17 remains a pre-release/Beta; a final 1.0 release uses the
-Production/Stable classifier. Validate that exact reviewed release commit
+classifier. Stable 1.x releases use the Production/Stable classifier;
+alpha, beta and release-candidate versions remain pre-releases. Validate that exact reviewed release commit
 before tagging. Preparation alone does not authorize publication.
 
 ## Local candidate gate
@@ -128,13 +128,13 @@ Read the Docs `latest` after integration. Keep `stable` on the published line
 until an appropriate release is available. A successful CI status is not a
 substitute for inspecting the deployed documentation.
 
-During the pre-release period, Read the Docs does not create its automatic
-`stable` version. Use a non-forced HTTP 302 exact redirect from
-`/en/stable/*` to `/en/<published-rc-tag>/:splat`; the published RC17 target is
-`/en/v1.0.0rc17/:splat`. Activate and successfully build the new RC tag before
-updating this fallback. Verify both the landing page and a nested page through
-`stable`. For a final release, verify the automatic `stable` version and remove
-the fallback. Never direct published-version links to unpublished `main` content.
+For stable 1.x releases, activate and successfully build the exact release
+tag, verify Read the Docs' automatic `stable` version, and remove any legacy
+RC fallback redirect. Verify both the landing page and a nested page through
+`stable`. During an RC-only period without an automatic stable version, a
+non-forced HTTP 302 exact redirect from `/en/stable/*` to
+`/en/<published-rc-tag>/:splat` can provide the fallback. Never direct
+published-version links to unpublished `main` content.
 
 ## Publish
 

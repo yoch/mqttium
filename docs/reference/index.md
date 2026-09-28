@@ -43,6 +43,6 @@ See [Core Concepts](../core-concepts.md) before choosing timeouts or retry logic
 
 ## Stability rules
 
-The current pre-v1 API intentionally revises the earlier one. See the
+The 1.0 native API preserves RC17 and supersedes earlier candidates. See the
 [API contract](../api-stability.md) and [migration guide](../migration.md)
 for supported interfaces and incompatible changes.

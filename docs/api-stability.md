@@ -1,16 +1,15 @@
 # Native API contract
 
-This is the current pre-v1 native contract. It intentionally revises the
-earlier pre-v1 Stable contract and is breaking, not a deprecation bridge. The
-[migration guide](migration.md) records the changes from RC16 to RC17 and the
-broader differences from `1.0.0rc14` (`c194597`). There are no compatibility
-wrappers for removed APIs.
+This is the 1.0 native API contract, unchanged from RC17. The
+[migration guide](migration.md) records the pre-release changes from RC16 to
+RC17 and the broader differences from `1.0.0rc14` (`c194597`). Those changes
+preceded the stable 1.0 boundary; removed APIs have no compatibility wrappers.
 
 ## Support tiers
 
 **Stable** covers the root operational errors and enums, the native client,
 its constructor and operations, and the models, receipts, results and settings
-listed below, except `ClientStats`. After 1.0, incompatible Stable changes
+listed below, except `ClientStats`. In the 1.x line, incompatible Stable changes
 require a major version; a deprecated API remains available throughout its
 major release line, with a documented replacement and migration guidance.
 The deliberate pre-v1 changes are recorded in the migration guide.
