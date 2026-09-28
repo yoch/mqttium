@@ -8,6 +8,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Detect a dead connection from a steady publisher. Keepalive now sends
+  PINGREQ after `keepalive` seconds without receiving as well as without
+  sending; a QoS 0 publisher to a half-open connection previously never pinged
+  and kept completing receipts into the void.
+- Stop reporting application backpressure as `PINGRESP timed out`. While the
+  reader waits for iterator capacity or runs a callback batch it cannot read
+  the PINGRESP, so the deadline now restarts instead of tearing down a live
+  connection (and, with a clean session, losing its unacknowledged work).
 - Stop writing into a closed or lost transport. After a connection loss the
   writer now fails on its next write instead of handing frames to a dead
   socket, so asyncio no longer logs bursts of `socket.send() raised
