@@ -591,6 +591,14 @@ def loop_requires_confirmation(
     )
 
 
+def throughput_requires_confirmation(estimate: Metrics, *, min_completed_ratio: float) -> bool:
+    """Do not let a passing median hide an unresolved throughput loss."""
+    return (
+        estimate.throughput_median < min_completed_ratio
+        or estimate.throughput.lower_95 < min_completed_ratio
+    )
+
+
 def reevaluate_confirmation_overflow(payload: dict[str, Any]) -> dict[str, Any]:
     """Reapply the corrected screen to retained initial ABBA evidence only."""
     invalidations = payload.get("invalidations")
@@ -625,7 +633,9 @@ def reevaluate_confirmation_overflow(payload: dict[str, Any]) -> dict[str, Any]:
         estimate = metrics(pairs)
         record["initial_metrics"] = _metrics_dict(estimate)
         record["final_metrics"] = _metrics_dict(estimate)
-        record["throughput_suspect"] = estimate.throughput_median < min_completed_ratio
+        record["throughput_suspect"] = throughput_requires_confirmation(
+            estimate, min_completed_ratio=min_completed_ratio
+        )
         record["loop_suspect"] = loop_requires_confirmation(
             pairs, max_loop_lag_ratio=max_loop_lag_ratio
         )
@@ -638,7 +648,8 @@ def reevaluate_confirmation_overflow(payload: dict[str, Any]) -> dict[str, Any]:
         "acquisition": "none; retained initial ABBA pairs only",
         "policy_change": (
             "loop confirmation screening now requires the relative threshold "
-            "and positive relative/additive 95% lower bounds"
+            "and positive relative/additive 95% lower bounds; throughput screening "
+            "requires confirmation when its median or lower 95% bound is below threshold"
         ),
     }
     result["failures"] = []
@@ -768,7 +779,9 @@ def _initial_record(
         "initial_pairs": pairs,
         "confirmation": None,
         "final_metrics": _metrics_dict(initial),
-        "throughput_suspect": initial.throughput_median < args.min_completed_ratio,
+        "throughput_suspect": throughput_requires_confirmation(
+            initial, min_completed_ratio=args.min_completed_ratio
+        ),
         "loop_suspect": regime["loop_lag_eligible"]
         and loop_requires_confirmation(pairs, max_loop_lag_ratio=args.max_loop_lag_ratio),
     }
@@ -1103,6 +1116,7 @@ def _result_template(
             "min_completed_ratio": args.min_completed_ratio,
             "max_loop_lag_ratio": args.max_loop_lag_ratio,
             "control_max_throughput_deviation": args.control_max_throughput_deviation,
+            "throughput_confirmation_screen": "median or lower 95% bound below min_completed_ratio",
             "throughput_confirmation": "95% interval below or above min_completed_ratio; overlap invalidates",
             "throughput_control": "each source tree's 95% interval must fit the equivalence budget",
             "loop_confirmation_screen": (

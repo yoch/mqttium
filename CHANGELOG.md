@@ -20,6 +20,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Require same-code controls and confidence bounds when confirming an open-loop
   throughput suspect. A noisy median can no longer certify either a regression
   or recovery; inconclusive evidence blocks qualification.
+- Confirm throughput cells whose initial confidence interval still permits a
+  regression, even when their median passes the threshold.
 - Retire completed receipt-observer tasks during open-loop acquisition instead
   of retaining their entire history through the timed final join. Preserve
   pending observers, completion errors and an explicit legacy diagnostic mode.

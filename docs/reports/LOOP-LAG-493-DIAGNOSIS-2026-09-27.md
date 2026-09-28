@@ -384,3 +384,77 @@ remains part of the record.
 
 Retained `open-loop.json` SHA256:
 `71014d0315df35d12d0a7c8b22086d24848cf8c4cee02119a7807c998e4f2733`.
+
+## Addendum: observer-retention same-code validation (2026-09-28)
+
+[A/A 36402364148](https://github.com/yoch/mqttium/actions/runs/36402364148)
+compared `79268e55dec1984316eb27893f5fa7488815ab27` against itself with
+`observer_retention=pending`. All four final preflights were eligible and
+all 9,600,000 publications completed across 320 worker samples. The verdict
+is **invalid** at MQTT 5 / 4096 B / 26k msgs/s, with no confirmed product
+regression. The other 27 initial cells did not require confirmation.
+
+The suspect's ten-cycle completed-rate geometric ratio is 0.99143 with 95%
+interval **[0.94433, 1.04088]**. Its two same-code controls have intervals
+[0.92452, 1.04656] and [0.93304, 1.07093], both wider than the ±2% budget.
+The corrected decision thus blocks qualification instead of falsely certifying
+a regression between identical sources.
+
+Observer retirement removes the full history of completed tasks in ordinary
+samples: the campaign-wide median peak retention is 54 tasks, with median
+join setup 0.0473 ms. It does not bound genuinely outstanding observers under
+overload; the maximum peak is 28,802 tasks. At the suspect cell, median
+end-of-offer backlogs are 4,309 and 6,632 in the two labels of the same source.
+Some samples keep up at about 25.3k completed messages/s; others accumulate
+backlog and finish more slowly. This remains a change of operating regime,
+not evidence of a difference between the two identical implementations.
+
+These results validate task retirement's bookkeeping effect, but do not show
+that it resolves saturation measurement variance. They also do not identify
+the implementation or environmental cause of the remaining regime changes.
+The matching RC14/RC17 acquisition is required separately.
+
+Retained `open-loop.json` SHA256:
+`34b09654e868d83906628c2f55ea325d43753669e3f7e667c493fc58c4af2270`.
+
+## Addendum: a passing median can bypass confirmation (2026-09-28)
+
+[RC14/RC17 36404229046](https://github.com/yoch/mqttium/actions/runs/36404229046)
+used the same `79268e55` harness and pending-observer retention. All three
+final preflights were eligible; all 5,856,000 publications completed in 224
+worker samples. The artifact says **passed**, with no confirmation acquired.
+Review of its raw intervals shows that this is insufficient qualification.
+
+The MQTT 5 / 4096 B / 24k point has geometric completed-rate ratio 0.99995
+and interval [0.99899, 1.00091]. The earlier failure at that point does not
+reproduce in this acquisition. At 26k, however, two cells have wide initial
+intervals despite passing medians:
+
+| Protocol / 4096 B / 26k | Median ratio | Geometric ratio | 95% interval |
+| --- | ---: | ---: | --- |
+| 3.1.1 | 1.00458 | 1.07886 | [0.41159, 2.82789] |
+| 5 | 0.97420 | 0.94705 | [0.66425, 1.35025] |
+
+The initial throughput screen still used the median alone. Consequently, the
+stronger confirmation rule never examined these cells. The follow-up corrects
+both live acquisition and the existing retained-evidence screening path:
+confirmation is required when **either the median or the lower 95% bound**
+is below 0.97. Thresholds, workload and the bounded confirmation budget remain
+unchanged; exceeding that budget remains invalid.
+
+A deterministic replay of the retained initial samples selects both 26k cells
+under the corrected screen. It also selects the previously unconfirmed 3.1.1
+26k cell in the preceding A/A campaign. This replay acquires no new samples
+and does not change either historical artifact's status. A regression test
+uses the rounded four MQTT 5 pair ratios from this acquisition to prevent the
+passing-median bypass from returning.
+
+The final screen correction has local regression coverage, but no fresh
+dedicated A/A and A/B campaign yet. This acquisition therefore cannot close
+#493 or establish general RC14/RC17 parity. The paired same-code campaign
+also remains invalid independently of this screening defect. Low-rate CPU
+ratios are diagnostic: 0.96911–1.03637 in this acquisition, including 1.03637
+at 3.1.1 / 64 B / 10k and 1.03246 at 3.1.1 / 4096 B / 10k.
+
+Retained `open-loop.json` SHA256:
+`55ebbea129a448e23f387416975c7167ae816e77631ecb79353a2b877aa162d8`.

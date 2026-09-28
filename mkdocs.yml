@@ -19,6 +19,9 @@ exclude_docs: |
   experiments/
   reports/*.md
   !reports/README.md
+  !reports/RC17-AUDIT-CLOSURE-2026-09-28.md
+  !reports/RC17-STABLE-PROMOTION-AUDIT-2026-09-27.md
+  !reports/RC17-LONG-CAMPAIGN-CLOSURE-2026-09-27.md
   !reports/API-SURFACE-REVIEW-2026-09-24.md
   !reports/LOOP-LAG-493-DIAGNOSIS-2026-09-27.md
   !reports/RELEASE-CANDIDATE-1.0.0rc17.md

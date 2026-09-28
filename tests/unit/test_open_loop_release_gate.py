@@ -396,10 +396,12 @@ def _record_args():
     )
 
 
-def _initial(gate, monkeypatch, tmp_path, *, target, candidate_rate=100.0):
+def _initial(gate, monkeypatch, tmp_path, *, target, candidate_rate=100.0, candidate_rates=None):
     pairs = _measured_cycles(target=target)
-    for pair in pairs:
-        pair["candidate"]["completed_rate"] = candidate_rate
+    for index, pair in enumerate(pairs):
+        pair["candidate"]["completed_rate"] = (
+            candidate_rates[index] if candidate_rates is not None else candidate_rate
+        )
     monkeypatch.setattr(gate, "_acquire_cycles", lambda *_a, **_kw: pairs)
     return gate._initial_record(
         _record_args(),
@@ -409,6 +411,48 @@ def _initial(gate, monkeypatch, tmp_path, *, target, candidate_rate=100.0):
         base_root=tmp_path,
         candidate_root=tmp_path,
     )
+
+
+def test_passing_throughput_median_does_not_hide_saturation_uncertainty(
+    gate, monkeypatch, tmp_path
+) -> None:
+    # Rounded ratios from MQTT 5 / 4096 B / 26k in run 36404229046.
+    record = _initial(
+        gate,
+        monkeypatch,
+        tmp_path,
+        target=26_000,
+        candidate_rates=[84.8023, 100.0214, 94.8331, 100.0079],
+    )
+    assert record["initial_metrics"]["throughput_median"] > 0.97
+    assert record["initial_metrics"]["throughput"]["geometric_mean"] < 0.97
+    assert record["loop_suspect"] is False
+    assert record["throughput_suspect"] is True
+
+
+def test_tight_throughput_interval_can_clear_initial_screen(gate, monkeypatch, tmp_path) -> None:
+    record = _initial(gate, monkeypatch, tmp_path, target=26_000, candidate_rate=99.0)
+    assert record["throughput_suspect"] is False
+
+
+def test_retained_evidence_reevaluation_keeps_uncertain_throughput_invalid(gate) -> None:
+    pairs = _cycles(2, base_loop=0.1, candidate_loop=0.1)
+    for pair, rate in zip(pairs, [84.8023, 100.0214, 94.8331, 100.0079], strict=True):
+        pair["candidate"]["completed_rate"] = rate
+    payload = {
+        "status": "invalid",
+        "policy": "strict",
+        "thresholds": {"min_completed_ratio": 0.97, "max_loop_lag_ratio": 1.05},
+        "scenarios": [{"initial_pairs": pairs, "confirmation": None}],
+        "failures": [],
+        "invalidations": ["5 cells require confirmation; bounded maximum is 4"],
+    }
+
+    result = gate.reevaluate_confirmation_overflow(payload)
+
+    assert result["status"] == "invalid"
+    assert result["scenarios"][0]["throughput_suspect"] is True
+    assert "still require fresh confirmation" in result["invalidations"][0]
 
 
 def test_saturation_lag_does_not_consume_confirmation_but_throughput_still_does(
