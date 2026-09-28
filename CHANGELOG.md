@@ -8,6 +8,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Stop writing into a closed or lost transport. After a connection loss the
+  writer now fails on its next write instead of handing frames to a dead
+  socket, so asyncio no longer logs bursts of `socket.send() raised
+  exception`, and a terminal DISCONNECT is skipped for a transport that is
+  already closing.
+- Never surface the internal stale-connection fence from `publish()`: a send
+  for a connection the writer has already retired is dropped for teardown to
+  settle, like a deferred send.
 - Never discard a message the client has already acknowledged. QoS 0 and
   automatically acknowledged QoS 1 messages decoded before a connection loss,
   `disconnect()` or an explicit reconnect were dropped when the reader's lot or

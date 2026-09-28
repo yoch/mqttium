@@ -966,8 +966,12 @@ class AsyncClient:
         Shutdown must not wait for application traffic to free a bounded queue,
         so a packet that cannot be admitted immediately is dropped rather than
         parked. StaleConnectionEffect is deliberately not caught here: whether a
-        dead epoch is an error depends on the caller.
+        dead epoch is an error depends on the caller. A packet for a transport
+        that is already closing has nowhere to go and is dropped.
         """
+        transport = self._transport
+        if transport is not None and transport.is_closing():
+            return
         if not self._write_pump.try_enqueue_terminal(packet, epoch=self._connection_epoch):
             return
         writer_task = self._write_pump.task
@@ -2180,10 +2184,17 @@ class AsyncClient:
         if epoch != self._connection_epoch:
             return True
         kind = effect.kind
-        if kind is EffectKind.SEND:
-            return self._write_pump.try_enqueue(effect.data, epoch=epoch)
-        if kind is EffectKind.SEND_ACK:
-            return self._write_pump.try_enqueue_ack(effect.data, epoch=epoch)
+        if kind is EffectKind.SEND or kind is EffectKind.SEND_ACK:
+            try:
+                if kind is EffectKind.SEND:
+                    return self._write_pump.try_enqueue(effect.data, epoch=epoch)
+                return self._write_pump.try_enqueue_ack(effect.data, epoch=epoch)
+            except StaleConnectionEffect:
+                # The writer retired this connection before the reader did.
+                # Like the deferred lane, drop the send: teardown owns the
+                # publication from here, and the caller must not see an
+                # internal fence as an error.
+                return True
         if kind is EffectKind.CONNACK:
             connack: ConnAckPacket = effect.data
             self._resolve_connack(connack)
