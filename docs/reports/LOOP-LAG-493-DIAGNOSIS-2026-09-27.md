@@ -601,3 +601,53 @@ unless they disable it.
 
 After these changes, the closing campaign is the one already planned: two RC17
 A/A open-loop controls, then RC14 → RC17.
+
+## Addendum: closing controls with the Nagle-free broker (2026-09-28)
+
+After #591 enabled `set_tcp_nodelay true`, three runs on `01624ab4` qualify
+the fix and close the performance reservation.
+
+**Regime probe** ([36427980193](https://github.com/yoch/mqttium/actions/runs/36427980193)):
+RC17, 3.1.1 and 5 × 64 and 4096 B × unpaced, 24k, 26k and 28k, with unbounded and
+bounded publishers, 8 samples per cell.
+
+- In every sustained paced cell, the completion tail fell from 41–44 ms to
+  0.25–0.45 ms. Completed throughput is 0.9998–0.9999 of target, and the median
+  CV is 0.00 %. Two isolated samples out of 128 dipped, by 1.4 % and 7.7 %.
+- The PUBACK p95 fell to 0.6–1.5 ms.
+- The broker's CPU per message rose by 25–65 %, because it no longer coalesces
+  writes. It stays far from saturation.
+- Above capacity (4096 B at 26k and 28k), the unbounded publisher still
+  collapses, with CV 2.1–10.7 %. The bounded publisher holds CV 0.6–2.5 %.
+
+**RC17/RC17 open-loop control** ([36428349624](https://github.com/yoch/mqttium/actions/runs/36428349624)):
+**passed**, all preflights eligible, no confirmation acquired.
+
+- Throughput ratios are 0.9993–1.0004 in 26 of 28 cells, and 0.9906 and 1.0115
+  at MQTT 5 / 4096 B / 24k and 26k.
+- CPU per message is within ±1.1 % at the non-busy rates (5k and 10k).
+- The retained-evidence classifier
+  ([36432539037](https://github.com/yoch/mqttium/actions/runs/36432539037))
+  finds backlog samples only at 4096 B / 26k, in both arms, as the capacity
+  finding predicts.
+- Schedule-lag ratios at 4096 B from 20k upwards remain 0.89–1.38 with the
+  publisher busy in every sample. They are not a code comparison (finding 4).
+
+**RC14 → RC17 open-loop gate** ([36432884735](https://github.com/yoch/mqttium/actions/runs/36432884735)):
+**passed**, all preflights eligible.
+
+- Throughput ratios are 0.9994–1.0080 in 26 of 28 cells, and 0.9729 and 0.9907
+  at MQTT 5 / 4096 B / 24k and 26k, at the edge of capacity.
+- Schedule-lag ratios are 0.90–1.23, inside the same-code spread measured
+  above.
+
+### Closure
+
+#493 is closed as a measurement defect: the broker's Nagle tail, and gate
+points above the runner's capacity with an unbounded publisher. RC17 shows no
+throughput or CPU regression against RC14 at sustained rates.
+
+- The gate keeps its fixed rates. Cells above capacity are recognisable by
+  their backlog classification and must not be read as code comparisons.
+- The collector cost of a large outbound backlog is tracked for after 1.0 in
+  [yoch/mqttium#592](https://github.com/yoch/mqttium/issues/592).
