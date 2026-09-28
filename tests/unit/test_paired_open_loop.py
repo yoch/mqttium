@@ -202,7 +202,10 @@ def test_parent_invalidates_candidate_only_variability(
     assert any("candidate p50-latency CV" in item for item in result["invalidations"])
 
 
-async def test_cpu_interval_excludes_initial_pacing_sleep(open_loop, monkeypatch):
+@pytest.mark.parametrize("join_setup,join_tail", [(0.0, 0.0), (0.07, 0.02)])
+async def test_cpu_interval_excludes_initial_pacing_sleep(
+    open_loop, monkeypatch, join_setup, join_tail
+):
     from collections import defaultdict
 
     clock = {"wall": 0.0, "cpu": 0.0}
@@ -236,9 +239,24 @@ async def test_cpu_interval_excludes_initial_pacing_sleep(open_loop, monkeypatch
         clock["wall"] += delay
         clock["cpu"] += 0.0001
 
+    real_gather = open_loop.asyncio.gather
+
+    def gather(*tasks):
+        joined = real_gather(*tasks)
+        clock["wall"] += join_setup
+        clock["cpu"] += join_setup
+
+        async def finish():
+            await joined
+            clock["wall"] += join_tail
+            clock["cpu"] += join_tail
+
+        return finish()
+
     monkeypatch.setattr(open_loop, "_connected_client", connected)
     monkeypatch.setattr(open_loop.asyncio, "get_running_loop", lambda: Loop())
     monkeypatch.setattr(open_loop.asyncio, "sleep", sleep)
+    monkeypatch.setattr(open_loop.asyncio, "gather", gather)
     monkeypatch.setattr(open_loop.time, "process_time", lambda: clock["cpu"])
     monkeypatch.setattr(open_loop, "runtime_counters", lambda *_a: defaultdict(int))
     args = Namespace(
@@ -253,15 +271,15 @@ async def test_cpu_interval_excludes_initial_pacing_sleep(open_loop, monkeypatch
         payload_bytes=64,
     )
     result = await open_loop.sample(args, "test/timing")
-    assert result.cpu_seconds == pytest.approx(0.0017)
-    assert result.measurement_seconds == pytest.approx(0.201)
+    assert result.cpu_seconds == pytest.approx(0.0017 + join_setup + join_tail)
+    assert result.measurement_seconds == pytest.approx(0.201 + join_setup + join_tail)
     assert result.pacing_sleeps == 2
     assert result.completion_ratio == 1.0
     assert result.offered_seconds == pytest.approx(0.201)
     assert result.offered_cpu_seconds == pytest.approx(0.0017)
-    assert result.receipt_completed_seconds == pytest.approx(0.201)
-    assert result.observer_join_setup_seconds == 0.0
-    assert result.observer_join_tail_seconds == 0.0
+    assert result.receipt_completed_seconds == pytest.approx(0.201 + join_setup)
+    assert result.observer_join_setup_seconds == pytest.approx(join_setup)
+    assert result.observer_join_tail_seconds == pytest.approx(join_tail)
     assert result.pending_receipts_after_offer == 3
     assert result.pending_receipts_high_water == 3
     assert len(result.gc_collections) == 3

@@ -97,7 +97,12 @@ must remain in an eligible pacing regime; otherwise the result is invalid.
 Throughput checks still apply at saturation, and every publication must complete.
 
 The worker measures CPU and wall time over the same interval, from the first
-publication to completion of all receipts, excluding the initial pacing sleep.
+publication through joining all receipt-observer tasks, excluding the initial
+pacing sleep. This interval includes benchmark bookkeeping. Separate diagnostic
+fields record the offering phase, the last observed receipt, synchronous join
+setup, and the remaining join tail. Pending-observer high water and garbage
+collection counts help investigate changes of regime; they do not by themselves
+identify a runtime cause or change the gate's completed-rate definition.
 The report shows per-arm CPU microseconds per message only when both arms sleep
 and stay below 95% busy in every sample; otherwise the summary value is `null`.
 These costs are diagnostic measurements, not a CPU-equivalence verdict. ACK
