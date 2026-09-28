@@ -6,33 +6,20 @@ delivery and shutdown.
 
 ## Requirements
 
-MQTTium supports Python 3.11 through 3.14 and has no runtime dependencies. You
-also need an MQTT 3.1.1 or MQTT 5 broker that the application can reach.
+MQTTium supports Python 3.11 through 3.14 and has no runtime dependencies.
 
-The stable native release is `1.1.0`. It keeps the 1.0 API and SQLite schema 5
-and corrects 1.0 behaviour found in real deployments (see the
-[1.1 migration notes](migration.md#changes-in-11)); earlier candidates may
-require migration:
+Install MQTTium from PyPI:
 
 ```bash
 python -m pip install mqttium==1.1.0
 ```
 
-To run a newer revision than the published release, install a checkout of the
-revision you are reading and record `git rev-parse HEAD` alongside the version:
-
-```bash
-git clone https://github.com/yoch/mqttium.git
-cd mqttium
-python -m pip install .
-```
-
-When upgrading an existing application, read the [migration guide](migration.md)
-first. It covers both the RC16-to-RC17 changes and the broader changes since
-RC14, including persistence compatibility. Use the documentation for your
-installed version until you upgrade:
-[RC16](https://mqttium.readthedocs.io/en/v1.0.0rc16/) or
-[RC14](https://mqttium.readthedocs.io/en/v1.0.0rc14/).
+When upgrading from 1.0, read the
+[1.1 migration notes](migration.md#changes-in-11). The client API and SQLite
+schema stay on the 1.0 contract, while several connection, subscription, limit,
+and session behaviours are corrected. For earlier versions, use the complete
+[migration guide](migration.md) and the documentation matching the installed
+package.
 
 The examples assume a broker on `127.0.0.1:1883`. If Mosquitto is already
 installed, a development listener can be started with an explicit configuration
@@ -44,7 +31,14 @@ allow_anonymous true
 persistence false
 ```
 
-Do not use an anonymous development listener on an untrusted network.
+Save this configuration as `mqttium-demo.conf`, then start Mosquitto in a
+separate terminal:
+
+```bash
+mosquitto -c mqttium-demo.conf
+```
+
+Keep this anonymous development listener bound to localhost.
 
 ## A complete native client
 
@@ -68,9 +62,7 @@ async def main() -> None:
     client.on_message = on_message
     try:
         await client.connect("127.0.0.1", 1883, timeout=5)
-        result = await client.subscribe("mqttium/demo", qos=1)
-        if any(code >= 0x80 for code in result.reason_codes):
-            raise RuntimeError(f"subscription rejected: {result.reason_codes}")
+        await client.subscribe("mqttium/demo", qos=1)
 
         receipt = await client.publish("mqttium/demo", b"hello", qos=1)
         await receipt.wait()
