@@ -108,8 +108,33 @@ not carry the previous connection's alias onto the replacement connection.
 
 Pass a `PublishMessage` as `will`. Its `properties` are the MQTT 5 Will
 Properties (for example `will_delay_interval` or `message_expiry_interval`);
-properties that a Will cannot carry are refused. Broker publication of a Will is controlled by MQTT session
-and disconnect semantics; an orderly DISCONNECT normally suppresses it.
+properties that a Will cannot carry are refused:
+
+```python
+from mqttium import MQTTProtocolVersion
+from mqttium.api import AsyncClient, Properties, PublishMessage
+
+client = AsyncClient(
+    "sensor-a",
+    protocol=MQTTProtocolVersion.MQTTv5,
+    clean_start=False,
+    connect_properties=Properties({"session_expiry_interval": 60}),
+    will=PublishMessage(
+        "status/sensor-a",
+        b"offline",
+        qos=1,
+        retain=True,
+        properties=Properties({"will_delay_interval": 10}),
+    ),
+)
+```
+
+Broker publication of a Will is controlled by MQTT session and disconnect
+semantics; an orderly DISCONNECT normally suppresses it. The example requests
+a 60-second session lifetime so the 10-second Will delay can take effect after
+connection loss. The broker publishes the Will when the delay expires or the
+session ends, whichever comes first; resuming the session before then cancels
+the pending Will. See [session lifetime](sessions-and-persistence.md).
 
 ## Enhanced authentication
 

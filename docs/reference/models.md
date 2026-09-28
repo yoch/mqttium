@@ -51,8 +51,9 @@ a submission error carries a receipt for the committed prefix.
       heading_level: 3
       members: [mid, reason_codes]
 
-These result types support value construction with `mid` and `reason_codes`,
-and inspection of those two fields. Conversion from Internal decoded packets
+These result types are frozen. They support value construction with `mid` and
+`reason_codes`, and inspection of those two fields; construct a new result to
+change a value. Conversion from Internal decoded packets
 belongs to the client adapter and is not a public model operation.
 
 Reason codes at or above `0x80` represent failure for the corresponding topic

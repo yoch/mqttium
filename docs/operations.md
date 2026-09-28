@@ -99,6 +99,7 @@ Call `client.stats()` on the client's owning event-loop thread:
 snapshot = client.stats()
 
 print("state", snapshot.state)
+print("connections established", snapshot.connections)
 print("reconnect attempt", snapshot.reconnect_attempt)
 print(
     "outbound",
@@ -154,7 +155,7 @@ limits = client.negotiated
 print("receive maximum", limits.receive_maximum)
 print("maximum packet size", limits.maximum_packet_size)
 print("maximum QoS", limits.maximum_qos)
-print("effective keepalive", limits.server_keep_alive)
+print("broker keepalive override", limits.server_keep_alive)
 print("client id", client.effective_client_id)
 ```
 
@@ -162,6 +163,10 @@ The snapshot also reports retain, wildcard, shared-subscription and
 subscription-identifier availability, topic alias maximum, session expiry and
 server references. MQTTium validates operations against these settings and
 raises rather than silently downgrading unsupported work.
+
+`server_keep_alive=None` means the broker did not override the configured
+`keepalive`; it does not mean keepalive is disabled. An override of `0`
+disables it.
 
 ### Inbound concurrency is capped below the protocol maximum
 
@@ -199,9 +204,11 @@ Timeouts protect different boundaries:
   no queue: synchronous callbacks run on the reader and are never timed out or
   preempted.
 
-Lifecycle hooks have no implicit deadline. Automatic retry waits for the current
-`on_disconnect` hook; give the hook an application deadline when needed and
-cooperate with cancellation. See the
+Lifecycle hooks have no implicit deadline. Automatic retry can proceed once
+`on_disconnect` starts, while the hook is still running. An unfinished hook
+delays the replacement connection's `on_connect`, not the reconnect itself.
+Give the hook an application deadline when needed and cooperate with
+cancellation. See the
 [lifecycle contract](reference/async-client.md#lifecycle-hooks).
 
 Publication receipts intentionally follow reconnect policy and session outcome
@@ -219,12 +226,11 @@ Use several fields together:
 - a growing writer queue points to transport or socket progress;
 - delivery queues or delivery bytes at their limit point to slow application
   consumers;
-- pending effects with an active effect task may be transient batching, while
-  a stable non-zero count after disconnect needs investigation;
-- a reconnect task and increasing attempt count show active recovery rather
-  than a silent stop;
-- packet IDs in use without corresponding pending QoS state indicate an
-  invariant failure and should be reported.
+- an increasing `reconnect_attempt` count shows retries, while an increase in
+  `connections` shows an accepted connection;
+- `outbound.packet_ids_in_use` also includes subscription requests and sealed
+  publications retained for recovery. A difference from
+  `outbound.unacknowledged_messages` alone is not evidence of a leak.
 
 Capture two or more snapshots over time. One high-water mark proves that a burst
 happened; it does not prove that the queue is still stuck.

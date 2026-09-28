@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Correct RC17 migration-table rendering, reconnect-hook ordering and renamed
+  API fields in the maintained guides. Restore the published surface-review
+  link, clarify the Read the Docs fallback and PyPI approval steps, and update
+  examples for manual acknowledgement, publication deadlines and MQTT 5 Wills.
 - Use fixed absolute rates in the open-loop release gate. Keep saturation lag
   diagnostic, require an eligible lower-rate comparison, and report CPU cost
   only with measured headroom. Enforce runner eligibility before each block of

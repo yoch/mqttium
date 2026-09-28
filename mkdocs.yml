@@ -115,7 +115,8 @@ plugins:
         MQTTium is a dependency-free, async-native MQTT 3.1.1 and MQTT 5.0
         client for production Python services, gateways, and IoT systems.
         The pre-v1 native AsyncClient API, published as 1.0.0rc17, revises
-        1.0.0rc16 before 1.0 and deliberately differs from 1.0.0rc14. Paho and one-shot helpers are removed. Follow the installation
+        1.0.0rc16 before 1.0 and deliberately differs from 1.0.0rc14.
+        Paho and one-shot helpers are removed. Follow the installation
         and migration guides for the version described by this documentation.
       sections:
         Get started:

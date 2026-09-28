@@ -127,11 +127,12 @@ until an appropriate release is available. A successful CI status is not a
 substitute for inspecting the deployed documentation.
 
 During the pre-release period, Read the Docs does not create its automatic
-`stable` version. The project has a non-forced HTTP 302 exact redirect from
-`/en/stable/*` to `/en/v1.0.0rc14/:splat`. Activate and build a newly published
-RC tag before updating this fallback. For a final release, verify the automatic
-`stable` version and remove the fallback. Never direct published-version links
-to unpublished `main` content.
+`stable` version. Use a non-forced HTTP 302 exact redirect from
+`/en/stable/*` to `/en/<published-rc-tag>/:splat`; the published RC17 target is
+`/en/v1.0.0rc17/:splat`. Activate and successfully build the new RC tag before
+updating this fallback. Verify both the landing page and a nested page through
+`stable`. For a final release, verify the automatic `stable` version and remove
+the fallback. Never direct published-version links to unpublished `main` content.
 
 ## Publish
 
@@ -139,6 +140,10 @@ to unpublished `main` content.
 2. Create a GitHub release for that tag. Mark alpha, beta, and release-candidate
    versions as pre-releases.
 3. Review the release notes, then publish the GitHub release.
+4. Wait for artifact validation and installed-distribution smokes, then approve
+   the protected `pypi` environment when GitHub requests it.
+5. Confirm that both `publish` and `verify-pypi` succeed. A public GitHub release
+   alone does not confirm that the package is available on PyPI.
 
 The publication workflow verifies that the tag belongs to `main` and matches the
 package version, rebuilds and validates the distributions, installs the wheel in

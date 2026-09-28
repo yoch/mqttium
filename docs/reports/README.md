@@ -20,6 +20,8 @@ Status meanings:
 
 | Report | Status | Use instead or interpretation |
 | --- | --- | --- |
+| [RC17-LONG-CAMPAIGN-CLOSURE-2026-09-27](https://github.com/yoch/mqttium/blob/main/docs/reports/RC17-LONG-CAMPAIGN-CLOSURE-2026-09-27.md) | Current evidence | RC17 long fuzz and two-hour protocol soaks passed; closes G01 of the initial promotion checkpoint; remaining promotion conditions unchanged |
+| [RC17-STABLE-PROMOTION-AUDIT-2026-09-27](https://github.com/yoch/mqttium/blob/main/docs/reports/RC17-STABLE-PROMOTION-AUDIT-2026-09-27.md) | Current evidence | Initial RC17 stable-promotion checkpoint: exact-source checks and retained artifacts; campaign status superseded by the closure report above; #493, real-application migration and final release qualification remain open |
 | [API-SURFACE-REVIEW-2026-09-24](API-SURFACE-REVIEW-2026-09-24.md) | Current evidence | Pre-1.0 inventory of the supported surface with remove, privatise or reshape proposals; store decision recorded (classes public, protocol methods Internal) |
 | [LOOP-LAG-493-DIAGNOSIS-2026-09-27](LOOP-LAG-493-DIAGNOSIS-2026-09-27.md) | Current evidence | Original 64-byte lag finding not reproduced at fixed rates. Corrected-gate A/A passed; eligible RC14 → RC17 comparison confirmed a 0.9326 completed-rate ratio for MQTT 5 / 4096 B / 24k msgs/s. Qualification remains open in #588; earlier MQTT 5 sweep probes were ineligible. |
 | [RELEASE-CANDIDATE-1.0.0rc17](RELEASE-CANDIDATE-1.0.0rc17.md) | Current evidence | RC17 content (pre-1.0 surface decisions, four bug fixes, refinement-only models, reception and publish CPU gains), CI/soak/interoperability and ARM64 gates against RC16; issue #493 against RC14 remains open for 1.0 |

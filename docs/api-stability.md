@@ -2,8 +2,9 @@
 
 This is the current pre-v1 native contract. It intentionally revises the
 earlier pre-v1 Stable contract and is breaking, not a deprecation bridge. The
-migration guide records the differences from `1.0.0rc14` (`c194597`); there are
-no compatibility wrappers for removed APIs.
+[migration guide](migration.md) records the changes from RC16 to RC17 and the
+broader differences from `1.0.0rc14` (`c194597`). There are no compatibility
+wrappers for removed APIs.
 
 ## Support tiers
 
@@ -12,7 +13,7 @@ its constructor and operations, and the models, receipts, results and settings
 listed below, except `ClientStats`. After 1.0, incompatible Stable changes
 require a major version; a deprecated API remains available throughout its
 major release line, with a documented replacement and migration guidance.
-The deliberate pre-v1 break from RC14 is recorded in the migration guide.
+The deliberate pre-v1 changes are recorded in the migration guide.
 
 **Provisional** covers `ClientStats`, its nested immutable snapshots,
 `MemoryInflightStore` and `SqliteInflightStore`. These remain supported and
@@ -160,7 +161,8 @@ deadline; a positive value covers the entire byte-and-queue admission with one
 deadline. A message that cannot ever fit fails immediately.
 
 `ClientStats` is an immutable snapshot of what the client is doing for the
-application without a logger: connection state and epoch, and for each
+application without a logger: connection state, lifetime connection count,
+current reconnect attempt, and for each
 sizeable queue or window its occupancy, high-water mark, limit and parked
 waiters, in the constructor's vocabulary. Runtime scheduling (task liveness,
 effect and writer batching decisions) is not part of the snapshot.
