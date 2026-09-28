@@ -903,12 +903,6 @@ def _confirm_record(
         "same_code_noise_floor_ms": None,
     }
 
-    if record["throughput_suspect"] and final.throughput_median < args.min_completed_ratio:
-        failures.append(
-            f"{record['label']}: completed ratio {final.throughput_median:.4f} "
-            f"< {args.min_completed_ratio:.4f} after confirmation"
-        )
-
     regime = measurement_regime(
         ab_pairs,
         target=record["target_rate"],
@@ -922,7 +916,7 @@ def _confirm_record(
         and regime["loop_lag_eligible"]
         and final.loop_lag_median_ratio > args.max_loop_lag_ratio
     )
-    if persistent_loop_signal:
+    if persistent_loop_signal or record["throughput_suspect"]:
         base_control, candidate_control = _same_code_controls(
             args,
             spec=spec,
@@ -946,7 +940,7 @@ def _confirm_record(
                 capacity_floor=regime["capacity_floor"],
             )
             confirmation[f"{arm}_control"]["measurement"] = control_regime
-            if not control_regime["loop_lag_eligible"]:
+            if persistent_loop_signal and not control_regime["loop_lag_eligible"]:
                 invalidations.append(f"{record['label']}: {arm} A/A changed pacing regime")
         _record_control_validity(
             args,
@@ -955,21 +949,48 @@ def _confirm_record(
             candidate_control=candidate_control,
             invalidations=invalidations,
         )
-        confirmed, noise_floor = confirmed_loop_regression(
-            ab_pairs,
-            base_control_pairs=base_control,
-            candidate_control_pairs=candidate_control,
-            max_loop_lag_ratio=args.max_loop_lag_ratio,
-        )
-        confirmation["same_code_noise_floor_ms"] = noise_floor
-        confirmation["loop_confirmed"] = confirmed
-        if confirmed:
-            failures.append(
-                f"{record['label']}: loop-lag ratio "
-                f"{final.loop_lag_ratio.geometric_mean:.4f} with additive lower 95% "
-                f"bound {final.loop_lag_delta.lower_95_ms:.6f}ms above same-code "
-                f"noise floor {noise_floor:.6f}ms"
+        if record["throughput_suspect"]:
+            for arm, controls in (("base", base_control), ("candidate", candidate_control)):
+                estimate = metrics(controls).throughput
+                budget = args.control_max_throughput_deviation
+                if estimate.lower_95 < 1 - budget or estimate.upper_95 > 1 + budget:
+                    invalidations.append(
+                        f"{record['label']}: {arm} A/A throughput confidence interval "
+                        f"[{estimate.lower_95:.4f}, {estimate.upper_95:.4f}] "
+                        f"does not fit the {budget:.2%} equivalence budget"
+                    )
+            estimate = final.throughput
+            if estimate.upper_95 < args.min_completed_ratio:
+                confirmation["throughput_decision"] = "regression"
+                failures.append(
+                    f"{record['label']}: completed-rate upper 95% bound "
+                    f"{estimate.upper_95:.4f} < {args.min_completed_ratio:.4f}"
+                )
+            elif estimate.lower_95 >= args.min_completed_ratio:
+                confirmation["throughput_decision"] = "cleared"
+            else:
+                confirmation["throughput_decision"] = "inconclusive"
+                invalidations.append(
+                    f"{record['label']}: completed-rate confidence interval "
+                    f"[{estimate.lower_95:.4f}, {estimate.upper_95:.4f}] crosses "
+                    f"the {args.min_completed_ratio:.4f} threshold; more evidence required"
+                )
+        if persistent_loop_signal:
+            confirmed, noise_floor = confirmed_loop_regression(
+                ab_pairs,
+                base_control_pairs=base_control,
+                candidate_control_pairs=candidate_control,
+                max_loop_lag_ratio=args.max_loop_lag_ratio,
             )
+            confirmation["same_code_noise_floor_ms"] = noise_floor
+            confirmation["loop_confirmed"] = confirmed
+            if confirmed:
+                failures.append(
+                    f"{record['label']}: loop-lag ratio "
+                    f"{final.loop_lag_ratio.geometric_mean:.4f} with additive lower 95% "
+                    f"bound {final.loop_lag_delta.lower_95_ms:.6f}ms above same-code "
+                    f"noise floor {noise_floor:.6f}ms"
+                )
 
     confirmation["status"] = "invalid_control" if invalidations else "completed"
     record["confirmation"] = confirmation
@@ -1236,12 +1257,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--confirmation-cycle-seeds",
         type=lambda value: _parse_seed_schedule(value, minimum=2),
-        default=_parse_seed_schedule("12,13", minimum=2),
+        default=_parse_seed_schedule("12,13,14,15,16,17,18,19", minimum=2),
     )
     parser.add_argument(
         "--control-cycle-seeds",
         type=lambda value: _parse_seed_schedule(value, minimum=2),
-        default=_parse_seed_schedule("20,21", minimum=2),
+        default=_parse_seed_schedule("20,21,22,23,24,25,26,27", minimum=2),
     )
     parser.add_argument("--max-count", type=int, default=50_000)
     parser.add_argument("--timeout", type=float, default=120.0)

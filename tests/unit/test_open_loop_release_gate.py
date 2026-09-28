@@ -532,3 +532,61 @@ def test_completed_cells_survive_later_ineligible_preflight(gate, monkeypatch, t
             records=retained,
         )
     assert retained == [{"retained": True}]
+
+
+@pytest.mark.parametrize(
+    "initial_rate,extra_rate,extra_cycles,decision",
+    [(90, 90, 2, "regression"), (94, 102, 2, "inconclusive"), (96.9, 97.2, 8, "cleared")],
+)
+def test_throughput_confirmation_requires_controls_and_confidence(
+    gate, monkeypatch, tmp_path, initial_rate, extra_rate, extra_cycles, decision
+):
+    record = _initial(gate, monkeypatch, tmp_path, target=24_000, candidate_rate=initial_rate)
+    args = _record_args()
+    args.confirmation_cycle_seeds = [12, 13]
+    args.control_max_throughput_deviation = 0.02
+    extra = _measured_cycles(target=24_000, busy=1.0)
+    extra *= extra_cycles // 2
+    for pair in extra:
+        pair["candidate"]["completed_rate"] = extra_rate
+    controls = _measured_cycles(target=24_000, busy=1.0)
+    seen = []
+
+    def same_code(*_a, **kw):
+        seen.append(kw["target"])
+        return controls, controls
+
+    monkeypatch.setattr(gate, "_fresh_preflight", lambda *_a, **_kw: tmp_path)
+    monkeypatch.setattr(gate, "_acquire_cycles", lambda *_a, **_kw: extra)
+    monkeypatch.setattr(gate, "_same_code_controls", same_code)
+    failures, invalidations = gate._confirm_record(
+        args, record=record, index=1, base_root=tmp_path, candidate_root=tmp_path, raw_dir=tmp_path
+    )
+    assert seen == [24_000]
+    assert record["confirmation"]["throughput_decision"] == decision
+    assert bool(failures) is (decision == "regression")
+    assert bool(invalidations) is (decision == "inconclusive")
+    assert record["confirmation"]["base_control"] is not None
+    assert record["confirmation"]["candidate_control"] is not None
+
+
+def test_centered_but_noisy_throughput_controls_cannot_confirm_a_regression(
+    gate, monkeypatch, tmp_path
+):
+    record = _initial(gate, monkeypatch, tmp_path, target=24_000, candidate_rate=90)
+    args = _record_args()
+    args.confirmation_cycle_seeds = [12, 13]
+    args.control_max_throughput_deviation = 0.02
+    controls = _measured_cycles(target=24_000, busy=1.0)
+    for index, pair in enumerate(controls):
+        pair["candidate"]["completed_rate"] = 90 if index < 2 else 100 / 0.9
+    assert gate.control_is_valid(controls, max_throughput_deviation=0.02)
+    monkeypatch.setattr(gate, "_fresh_preflight", lambda *_a, **_kw: tmp_path)
+    monkeypatch.setattr(gate, "_same_code_controls", lambda *_a, **_kw: (controls, controls))
+    failures, invalidations = gate._confirm_record(
+        args, record=record, index=1, base_root=tmp_path, candidate_root=tmp_path, raw_dir=tmp_path
+    )
+    assert failures  # Retain the observed drop, without treating the noisy run as valid.
+    assert len(invalidations) == 2
+    assert all("equivalence budget" in reason for reason in invalidations)
+    assert record["confirmation"]["status"] == "invalid_control"

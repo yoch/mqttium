@@ -276,3 +276,48 @@ Retained `open-loop.json` SHA256 digests:
 
 - same-code: `eb6015c7adc7994d6118b80366c0eea4ba9a68b2cfbc59ec2fdef2880ce49b81`;
 - RC14/RC17: `d741331e148d0c0ed5f8515f13de41db61cf352ecf264157616defb4f82ac407`.
+
+## Addendum: completion phases and confirmation limits (2026-09-28)
+
+[Instrumented comparison 36399866881](https://github.com/yoch/mqttium/actions/runs/36399866881)
+used harness `18432349483b828e185cf41ec899d79a4fdef298`, with the unchanged RC17
+runtime against RC14. All four final preflights were eligible. The existing
+rule again returned `failed` for MQTT 5 / 4096 B / 24k msgs/s, with median
+paired completed-rate ratio **0.94346** across eight pairs. All publications
+completed. This campaign added phase clocks, pending receipt-observer counts
+and garbage-collection counts without changing the gate's metric.
+
+The worker retains every receipt-observer task, including completed ones, and
+calls `asyncio.gather` over the full list at the end. At the failing point,
+median synchronous join setup took 42.24 ms for RC14 and 44.08 ms for RC17;
+the tail after observing the last receipt took 7.40 and 7.65 ms respectively.
+The paired ratio measured at the last observed receipt was still **0.94325**.
+The discrepancy is therefore not explained by the final join tail alone.
+These clocks still include observer scheduling and are not wire-level ACK
+timestamps.
+
+The initial RC14 samples finished offering with 7–32 outstanding observers;
+RC17 had 5,400–6,554. In confirmation, RC14 also entered the slower regime
+(3,268–7,225 outstanding). The candidate had 4,140–6,904. These are receipt
+observers, not writer-queue entries or send-quota occupancy. Garbage-collection
+counts also increase in this regime, but neither this correlation nor the
+end-of-offer backlog identifies the implementation cause.
+
+Inspection of confirmation exposed a second methodological limitation: a
+throughput-only suspect received extra A/B pairs, but **no same-code controls**,
+and the failure decision used its median alone. For this acquisition, the
+four-cycle geometric mean is 0.96023 and the 95% interval is **[0.89019,
+1.03579]**. Calling that a statistically established regression, or a
+demonstrated recovery, would overstate the evidence. The earlier addendum's
+word “confirmed” describes the then-implemented gate verdict, not such a proof.
+
+The follow-up policy keeps the 0.97 threshold and failing workload. Every
+throughput suspect receives A/A controls for each source tree; their 95%
+intervals must fit the existing ±2% equivalence budget. A/B confidence bounds
+must establish a drop or clear the threshold; an interval crossing it produces
+`invalid`, which still blocks qualification. Confirmation and control default
+to eight ABBA cycles each. This is a prospective rule: the retained runs are
+not rewritten or relabelled as passed.
+
+Retained `open-loop.json` SHA256:
+`22c944a9eac0ea01f2335328f4f00e12b788e11a48d11a7d68c97d31da9cc53e`.

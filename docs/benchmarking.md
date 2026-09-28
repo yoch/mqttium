@@ -96,6 +96,14 @@ the additive increase to exceed same-code A/A noise. Confirmation and controls
 must remain in an eligible pacing regime; otherwise the result is invalid.
 Throughput checks still apply at saturation, and every publication must complete.
 
+A throughput suspect requires fresh same-code controls for both source trees,
+even when lag is diagnostic. Each control's 95% interval must fit the ±2%
+equivalence budget. The confirmed A/B interval must lie entirely below 0.97
+to establish a throughput regression, or entirely at/above 0.97 to clear the
+suspect. An interval crossing 0.97 invalidates qualification; a recovered
+median alone cannot turn it green. Confirmation and each same-code control
+default to eight additional ABBA cycles with distinct deterministic hash seeds.
+
 The worker measures CPU and wall time over the same interval, from the first
 publication through joining all receipt-observer tasks, excluding the initial
 pacing sleep. This interval includes benchmark bookkeeping. Separate diagnostic

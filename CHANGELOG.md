@@ -17,6 +17,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   only with measured headroom. Enforce runner eligibility before each block of
   the diagnostic sweep; an ineligible probe can no longer appear as a
   successful qualification.
+- Require same-code controls and confidence bounds when confirming an open-loop
+  throughput suspect. A noisy median can no longer certify either a regression
+  or recovery; inconclusive evidence blocks qualification.
 
 ## [1.0.0rc17] - 2026-09-26
 
