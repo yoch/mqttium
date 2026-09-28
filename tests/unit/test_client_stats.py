@@ -252,6 +252,9 @@ async def test_effect_high_water_retains_combined_protocol_and_delivery_peak() -
     with pytest.raises(asyncio.CancelledError):
         await delivery
     client._effect_pump.discard_connection_effects()
+    # The interrupted lot's unmarked messages stay outstanding until handed over.
+    assert client._effect_pump.counters()["pending"] == 2
+    client._flush_delivery_carryover()
     assert client._effect_pump.counters()["pending"] == 0
     assert client._effect_pump.counters()["pending_high_water"] == 3
     await client._force_close()

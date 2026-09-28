@@ -7,7 +7,7 @@ import asyncio
 import pytest
 
 from mqttium.api import AsyncClient, Message
-from mqttium.enums import MQTTProtocolVersion
+from mqttium.enums import MQTTProtocolVersion, QoS
 from mqttium.packets import PublishPacket
 from mqttium.protocol.effects import EffectKind
 from tests.support import (
@@ -83,9 +83,13 @@ async def test_failure_interrupts_reader_delivery_and_releases_its_reservation()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(reader, 1)
     assert client._disconnect_exc is error
-    assert client._delivery.pending_bytes == len("infirst")
+    # The interrupted QoS 0 message had no other owner: it is committed past
+    # the iterator bound instead of vanishing with the connection.
+    assert client._delivery.pending_bytes == len("infirst") + len("insecond")
     stream = client.messages()
     assert await anext(stream) is first
+    second = await anext(stream)
+    assert (second.topic, second.payload) == ("in", b"second")
     with pytest.raises(StopAsyncIteration):
         await anext(stream)
     assert client._delivery.pending_bytes == 0
@@ -110,13 +114,35 @@ async def test_delivery_fence_does_not_wait_for_later_protocol_work():
     await client._force_close()
 
 
-async def test_replaced_epoch_discards_unaccepted_delivery():
+async def test_replaced_epoch_carries_acknowledged_delivery():
     client = AsyncClient()
-    client._engine._emit(EffectKind.MESSAGE, Message("old", b"old"))
+    old = Message("old", b"old")
+    client._engine._emit(EffectKind.MESSAGE, old)
     client._effect_pump.collect_from_engine()
     assert client._delivery_lane.pending_count == 1
     await client._invalidate_connection_epoch()
     await client._delivery_lane.drain()
+    # Nothing else will ever deliver an unmarked message: it waits in the
+    # carryover until the old reader has stopped, then reaches the stream.
+    assert client._delivery.messages_queue.empty()
+    client._flush_delivery_carryover()
+    assert client._delivery_lane.pending_count == 0
+    assert client._delivery.messages_queue.get_nowait()[0] is old
+
+
+async def test_replaced_epoch_discards_marked_delivery():
+    client = AsyncClient()
+    client._engine._emit(
+        EffectKind.MESSAGE,
+        Message("old", b"old", qos=QoS.EXACTLY_ONCE, mid=7),
+        requires_delivery_mark=True,
+    )
+    client._effect_pump.collect_from_engine()
+    assert client._delivery_lane.pending_count == 1
+    await client._invalidate_connection_epoch()
+    await client._delivery_lane.drain()
+    client._flush_delivery_carryover()
+    # Session state owns an unmarked QoS 2 delivery; it is redelivered, not carried.
     assert client._delivery_lane.pending_count == 0
     assert client._delivery.messages_queue.empty()
     assert client._delivery.pending_bytes == 0
