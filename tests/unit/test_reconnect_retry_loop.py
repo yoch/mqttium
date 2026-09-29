@@ -9,7 +9,7 @@ import pytest
 from mqttium.api.async_client import AsyncClient
 from mqttium.api.models import PublishReceipt
 from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
-from mqttium.errors import ProtocolError
+from mqttium.errors import ConnectError, ProtocolError
 from mqttium.packets import encode_frame
 from mqttium.protocol.reconnect import ReconnectPolicy
 
@@ -94,8 +94,9 @@ async def test_reconnect_exhaustion_fails_pending_receipts() -> None:
 
     assert calls == 2
     assert receipt.is_done()
-    with pytest.raises(ConnectionRefusedError, match="broker unavailable"):
+    with pytest.raises(ConnectError, match="broker unavailable") as failed:
         await receipt.wait()
+    assert isinstance(failed.value.__cause__, ConnectionRefusedError)
 
 
 async def test_terminal_connack_reason_stops_reconnect_without_string_parsing() -> None:

@@ -8,7 +8,7 @@ import pytest
 
 from mqttium.api import AsyncClient
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
-from mqttium.errors import ConnectRefusedError, MQTTError, NotConnectedError
+from mqttium.errors import ConnectError, ConnectRefusedError, MQTTError, NotConnectedError
 from mqttium.packets import PublishPacket, encode_frame
 from mqttium.protocol.reconnect import ReconnectPolicy
 from tests.support import ScriptedBrokerTransport, wait_until
@@ -103,7 +103,7 @@ async def test_failed_connect_keeps_the_message_stream_for_a_later_connection() 
         raise ConnectionRefusedError("down")
 
     client._transport_factory = refused
-    with pytest.raises(ConnectionRefusedError):
+    with pytest.raises(ConnectError):
         await client.connect("broker")
     await asyncio.sleep(0)
     assert not consumer.done()
