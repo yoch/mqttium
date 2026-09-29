@@ -13,6 +13,7 @@ relative order of outbound and connection effects is observable by AsyncClient.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from collections import deque
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, TypeAlias
@@ -853,6 +854,11 @@ class OutboundSession:
             try:
                 msg = self.materialize(stored)
                 if msg.state is OutboundQoSState.QUEUED:
+                    if msg.dup:
+                        # Requeued after its session was discarded: the new
+                        # session never saw it, so it leaves as a first attempt.
+                        msg.dup = False
+                        msg.encoded_publish = None
                     self._launch(msg, persisted=True)
                 else:
                     self._retransmit(msg)
@@ -1179,53 +1185,71 @@ class OutboundSession:
         self.drain()
 
     def purge_after_clean_session(self, *, sub_mids_pending: bool) -> None:
-        """Fail every unacknowledged publication: the broker dropped the session.
+        """Settle every unacknowledged publication: the broker dropped the session.
+
+        An unacknowledged QoS 1 publication is sent again as a new one: at
+        least once allows the duplicate, and failing it would lose a message
+        the application handed over. It keeps its packet identifier, receipt
+        and budget, and goes back to the head of the queue, ahead of work that
+        was never sent. A QoS 2 exchange cannot be restarted without risking a
+        second delivery, so it fails with `SessionDiscardedError`.
 
         `_queued` mirrors every outbound record that must survive a missing
         broker session — including WAIT_* entries `replay_session()` left there
         when the Receive Maximum window could not admit their retransmission.
-        Those records are failed below, so their queue entries must go with
-        them: a stale entry made `drain()` re-materialise a deleted record,
-        double-release its byte reservation and retransmit a packet id the
-        pool no longer owns.
+        Those entries are rebuilt below from the store: a stale entry made
+        `drain()` re-materialise a deleted record, double-release its byte
+        reservation and retransmit a packet id the pool no longer owns.
 
-        With no queued work and no SUB/UNSUB in flight, every packet id belongs
-        to a record discarded here, so the pool is reset in constant time
-        rather than id by id — it reclaims its accumulated hashing capacity
-        only on a full clear.
+        With no surviving work and no SUB/UNSUB in flight, every packet id
+        belongs to a record discarded here, so the pool is reset in constant
+        time rather than id by id — it reclaims its accumulated hashing
+        capacity only on a full clear.
         """
         if any(m.state is not OutboundQoSState.QUEUED for m in self._queued):
             self._queued = deque(m for m in self._queued if m.state is OutboundQoSState.QUEUED)
         self._parked.clear()
         sealed = self._sealed
-        # A sealed, never-sent row survives like any queued one and keeps its
-        # identifier, so the pool cannot be reset wholesale around it.
-        clear_abandoned_packet_ids = (
-            not self._queued
-            and not sub_mids_pending
-            and not any(not sent for sent in sealed.values())
-        )
+        resent: list[OutboundMessage | OutboundMessageSummary] = []
+        released: list[int] = []
         for page in self.store_summary_pages():
             for msg in page:
                 if msg.state is OutboundQoSState.QUEUED:
                     continue
-                if msg.mid in sealed:
+                mid = msg.mid
+                if mid in sealed:
                     # The broker dropped it with its session; its receipt
                     # already failed and its reservation left with the seal.
-                    del sealed[msg.mid]
-                    self.store.delete_out(msg.mid)
-                    if not clear_abandoned_packet_ids:
-                        self.packet_ids.release(msg.mid)
+                    del sealed[mid]
+                    self.store.delete_out(mid)
+                    released.append(mid)
                     continue
-                self.complete_record(msg.mid, msg)
-                if not clear_abandoned_packet_ids:
-                    self.packet_ids.release(msg.mid)
+                if msg.state is OutboundQoSState.WAIT_PUBACK:
+                    changed = self.store.transition_out(
+                        mid, OutboundQoSState.WAIT_PUBACK, OutboundQoSState.QUEUED
+                    )
+                    if changed is None:
+                        raise RuntimeError(f"Outbound mid={mid} changed while being requeued")
+                    # The queue entry follows the durable transition, so a
+                    # later purge keeps it like any never-sent publication.
+                    resent.append(replace(msg, state=OutboundQoSState.QUEUED))
+                    continue
+                self.complete_record(mid, msg)
+                released.append(mid)
                 self._fail(
-                    msg.mid,
+                    mid,
                     SessionDiscardedError("Publish lost: clean session replaced the previous one"),
                 )
-        if clear_abandoned_packet_ids:
+        if resent:
+            resent.extend(self._queued)
+            self._queued = deque(resent)
+        # A sealed, never-sent row survives like any queued one and keeps its
+        # identifier, so the pool cannot be reset wholesale around it.
+        if not self._queued and not sub_mids_pending and all(sent for sent in sealed.values()):
             self.packet_ids.clear()
+        else:
+            for mid in released:
+                self.packet_ids.release(mid)
 
     # --- negotiation ----------------------------------------------------------
 

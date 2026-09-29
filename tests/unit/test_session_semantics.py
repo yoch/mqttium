@@ -67,8 +67,8 @@ def test_offline_queue_survives_clean_connect() -> None:
     assert any(e.kind is EffectKind.PUBLISH_COMPLETE and e.data == handle.mid for e in effects)
 
 
-def test_clean_reconnect_fails_inflight_keeps_queued() -> None:
-    """Inflight from the old session fail on clean CONNACK; queued survive."""
+def test_clean_reconnect_resends_inflight_qos1_before_queued() -> None:
+    """An unacknowledged QoS 1 publication is sent again, as new, ahead of the queue."""
     engine = ProtocolEngine(
         EngineConfig(client_id="c1", max_inbound_inflight=1, max_outbound_inflight=1)
     )
@@ -87,16 +87,10 @@ def test_clean_reconnect_fails_inflight_keeps_queued() -> None:
     _feed(engine, _connack(session_present=False))
     effects = engine.take_effects()
 
-    failed_mids = [
-        e.data.mid if hasattr(e.data, "mid") else e.data
-        for e in effects
-        if e.kind is EffectKind.PUBLISH_FAILED
-    ]
-    assert failed_mids == [inflight.mid]
-    assert engine.store.get_out(inflight.mid or 0) is None
-    assert not engine.packet_ids.in_use(inflight.mid or 0)
+    assert not any(e.kind is EffectKind.PUBLISH_FAILED for e in effects)
+    assert engine.packet_ids.in_use(inflight.mid or 0)
 
-    # The queued message must have been launched on the fresh session.
+    # The old publication takes the only slot again, as a first attempt.
     sends = [_as_bytes(e.data) for e in effects if e.kind is EffectKind.SEND]
     assert len(sends) == 1
     dec = IncrementalDecoder()
@@ -104,8 +98,53 @@ def test_clean_reconnect_fails_inflight_keeps_queued() -> None:
     raw = dec.next_packet()
     assert raw is not None
     pub = PublishPacket.decode(raw.flags, raw.remaining)
-    assert pub.mid == queued.mid
+    assert (pub.mid, pub.dup, pub.payload) == (inflight.mid, False, b"1")
+    assert engine.store.get_out(queued.mid or 0).state is OutboundQoSState.QUEUED
+
+    # Its PUBACK completes the original receipt and launches the queued one.
+    _feed(engine, PubAckPacket(mid=inflight.mid or 0).encode())
+    effects = engine.take_effects()
+    assert any(e.kind is EffectKind.PUBLISH_COMPLETE and e.data == inflight.mid for e in effects)
+    sends = [_as_bytes(e.data) for e in effects if e.kind is EffectKind.SEND]
+    assert len(sends) == 1
+    dec.feed(sends[0])
+    raw = dec.next_packet()
+    assert raw is not None
+    assert PublishPacket.decode(raw.flags, raw.remaining).mid == queued.mid
     assert engine.store.get_out(queued.mid or 0).state is OutboundQoSState.WAIT_PUBACK
+
+
+def test_clean_reconnect_fails_inflight_qos2_keeps_queued() -> None:
+    """A QoS 2 exchange cannot restart without a second delivery, so it fails."""
+    engine = ProtocolEngine(
+        EngineConfig(client_id="c1", max_inbound_inflight=1, max_outbound_inflight=1)
+    )
+    engine.begin_connect()
+    _feed(engine, _connack(session_present=False))
+    engine.take_effects()
+
+    inflight = engine.queue_publish("a", b"1", qos=2)
+    queued = engine.queue_publish("b", b"2", qos=1)
+    engine.take_effects()
+
+    engine.notify_transport_closed()
+    engine.take_effects()
+    engine.begin_connect()
+    _feed(engine, _connack(session_present=False))
+    effects = engine.take_effects()
+
+    failures = [e.data for e in effects if e.kind is EffectKind.PUBLISH_FAILED]
+    assert [f.mid for f in failures] == [inflight.mid]
+    assert isinstance(failures[0].reason, SessionDiscardedError)
+    assert engine.store.get_out(inflight.mid or 0) is None
+    assert not engine.packet_ids.in_use(inflight.mid or 0)
+    sends = [_as_bytes(e.data) for e in effects if e.kind is EffectKind.SEND]
+    assert len(sends) == 1
+    dec = IncrementalDecoder()
+    dec.feed(sends[0])
+    raw = dec.next_packet()
+    assert raw is not None
+    assert PublishPacket.decode(raw.flags, raw.remaining).mid == queued.mid
 
 
 def _connack_v5(session_present: bool, receive_maximum: int | None = None) -> bytes:
@@ -116,7 +155,8 @@ def _connack_v5(session_present: bool, receive_maximum: int | None = None) -> by
     return bytes((0x20, len(body))) + body
 
 
-def test_session_loss_with_blocked_replay_queue() -> None:
+@pytest.mark.parametrize("qos", [1, 2])
+def test_session_loss_with_blocked_replay_queue(qos: int) -> None:
     """A clean-session CONNACK must also purge flow-blocked WAIT_* queue entries.
 
     `replay_session()` leaves retransmissions the broker's Receive Maximum
@@ -139,11 +179,11 @@ def test_session_loss_with_blocked_replay_queue() -> None:
         )
     )
 
-    # Connection 1: launch three QoS 1 publications, never acknowledged.
+    # Connection 1: launch three publications, never acknowledged.
     engine.begin_connect()
     _feed(engine, _connack_v5(session_present=False))
     engine.take_effects()
-    handles = [engine.queue_publish(f"t/{i}", b"x" * 10, qos=1) for i in range(3)]
+    handles = [engine.queue_publish(f"t/{i}", b"x" * 10, qos=qos) for i in range(3)]
     engine.take_effects()
     engine.notify_transport_closed()
     engine.take_effects()
@@ -153,7 +193,7 @@ def test_session_loss_with_blocked_replay_queue() -> None:
     engine.begin_connect()
     _feed(engine, _connack_v5(session_present=True, receive_maximum=2))
     engine.take_effects()
-    blocked = [m for m in engine.outbound._queued if m.state is OutboundQoSState.WAIT_PUBACK]
+    blocked = [m for m in engine.outbound._queued if m.state is not OutboundQoSState.QUEUED]
     assert len(blocked) == 1
     assert blocked[0].mid == handles[2].mid
 
@@ -166,10 +206,29 @@ def test_session_loss_with_blocked_replay_queue() -> None:
 
     assert not any(e.kind is EffectKind.PROTOCOL_ERROR for e in effects)
     failures = [e.data for e in effects if e.kind is EffectKind.PUBLISH_FAILED]
+    outbound = engine.outbound
+    if qos == 1:
+        # Each is sent again once, as new: no stale parked entry survives.
+        assert failures == []
+        sends = [_as_bytes(e.data) for e in effects if e.kind is EffectKind.SEND]
+        decoder = IncrementalDecoder()
+        for send in sends:
+            decoder.feed(send)
+        published = [
+            PublishPacket.decode(raw.flags, raw.remaining) for raw in decoder.drain_packets()
+        ]
+        assert [(p.mid, p.dup) for p in published] == [(h.mid, False) for h in handles]
+        assert len(outbound._queued) == 0
+        assert outbound.unacknowledged_messages == 3
+        for handle in handles:
+            _feed(engine, PubAckPacket(mid=handle.mid or 0).encode(MQTTProtocolVersion.MQTTv5))
+        engine.take_effects()
+        assert outbound.unacknowledged_messages == 0
+        assert outbound.unacknowledged_bytes == 0
+        return
     assert sorted(f.mid for f in failures) == sorted(h.mid or 0 for h in handles)
     assert all(isinstance(f.reason, SessionDiscardedError) for f in failures)
-    assert len(engine.outbound._queued) == 0
-    outbound = engine.outbound
+    assert len(outbound._queued) == 0
     assert outbound.unacknowledged_messages == 0
     assert outbound.unacknowledged_bytes == 0
 
@@ -201,3 +260,31 @@ def test_begin_connect_rejected_while_disconnecting() -> None:
     engine.begin_connect()
     _feed(engine, _connack(session_present=False))
     assert any(e.kind is EffectKind.CONNACK for e in engine.take_effects())
+
+
+def test_second_discarded_session_keeps_a_requeued_qos1_waiting_for_a_slot() -> None:
+    """A requeued publication still waiting for a slot survives another purge."""
+    engine = ProtocolEngine(EngineConfig(client_id="c1", protocol=MQTTProtocolVersion.MQTTv5))
+    engine.begin_connect()
+    _feed(engine, _connack_v5(session_present=False))
+    engine.take_effects()
+    handles = [engine.queue_publish(f"t/{i}", b"x", qos=1) for i in range(2)]
+    engine.take_effects()
+
+    mids = [h.mid for h in handles]
+    for _ in range(2):
+        engine.notify_transport_closed()
+        engine.take_effects()
+        engine.begin_connect()
+        _feed(engine, _connack_v5(session_present=False, receive_maximum=1))
+        effects = engine.take_effects()
+        assert not any(e.kind is EffectKind.PUBLISH_FAILED for e in effects)
+        assert [m.mid for m in engine.outbound._queued] == mids[1:]
+        assert engine.outbound.unacknowledged_messages == 2
+
+    _feed(engine, PubAckPacket(mid=mids[0] or 0).encode(MQTTProtocolVersion.MQTTv5))
+    decoder = IncrementalDecoder()
+    for send in _take_sends(engine):
+        decoder.feed(send)
+    published = [PublishPacket.decode(raw.flags, raw.remaining) for raw in decoder.drain_packets()]
+    assert [(p.mid, p.dup) for p in published] == [(mids[1], False)]

@@ -36,6 +36,11 @@
 - A publication larger than `max_unacknowledged_bytes` is admitted alone
   instead of raising `FlowControlError`; set the bound above your largest
   message if other publications must not wait behind it.
+- After a reconnect without a broker session, unacknowledged QoS 1
+  publications are sent again as new ones and their receipts complete normally;
+  only QoS 2 receipts fail with `SessionDiscardedError`. Remove application
+  code that republished QoS 1 messages on that error. Consumers may see the
+  message twice, as QoS 1 always allowed.
 - An MQTT 5 client connecting with `clean_start=False` accepts Session Present
   even when it holds no incomplete QoS exchange, so a restarted durable
   subscriber resumes its broker session instead of failing with

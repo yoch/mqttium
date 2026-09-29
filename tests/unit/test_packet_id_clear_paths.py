@@ -38,7 +38,7 @@ def _outbound(mid: int, state: OutboundQoSState) -> OutboundMessage:
         mid=mid,
         topic="t",
         payload=b"x",
-        qos=QoS.AT_LEAST_ONCE,
+        qos=QoS.AT_LEAST_ONCE if state is OutboundQoSState.WAIT_PUBACK else QoS.EXACTLY_ONCE,
         retain=False,
         state=state,
         logical_size=2,
@@ -78,7 +78,7 @@ def test_transport_close_keeps_publish_ids_when_releasing_subscriptions() -> Non
 def test_missing_session_clears_all_abandoned_inflight_packet_ids_once() -> None:
     store = MemoryInflightStore()
     for mid in (7, 19):
-        store.put_out(_outbound(mid, OutboundQoSState.WAIT_PUBACK))
+        store.put_out(_outbound(mid, OutboundQoSState.WAIT_PUBREC))
     engine = ProtocolEngine(store=store)
     pool = TrackingPacketIdPool()
     for mid in (7, 19):

@@ -313,7 +313,9 @@ state survives only when the broker confirms the session. Durable outbound
 records always retain their canonical Topic Name, so replay never depends on a
 mapping from the dead connection.
 
-If `session_present` is false, stale persisted work is failed and released. If
+If `session_present` is false, unacknowledged QoS 1 records return to the head
+of the offline queue and are sent again as new; the remaining stale persisted
+work is failed and released. If
 it is true, outbound and inbound state is replayed in order and under the same
 flow-control limits as new traffic.
 

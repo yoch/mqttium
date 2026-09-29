@@ -338,6 +338,11 @@ def _family_operations(  # noqa: C901
             _op("checkpoint", "wire", "CONNECT"),
             _op("broker", "connack"),
             _op("checkpoint", "connected"),
+            # The new session never saw the two unfinished QoS 1 records, so
+            # both are sent again as new; the parked publisher follows once
+            # their PUBACKs free admission.
+            _op("checkpoint", "wire_bulk", "PUBLISH:2"),
+            _op("broker", "puback_pending"),
             _op("checkpoint", "wire", "PUBLISH"),
             _op("broker", "puback_pending"),
             _op("app", "disconnect"),

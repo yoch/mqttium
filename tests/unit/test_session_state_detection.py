@@ -212,9 +212,9 @@ def test_session_present_zero_still_discards_stale_state() -> None:
                 mid=1,
                 topic="out",
                 payload=b"x",
-                qos=QoS.AT_LEAST_ONCE,
+                qos=QoS.EXACTLY_ONCE,
                 retain=False,
-                state=OutboundQoSState.WAIT_PUBACK,
+                state=OutboundQoSState.WAIT_PUBREC,
             )
         )
     )

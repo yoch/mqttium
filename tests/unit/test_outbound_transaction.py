@@ -18,9 +18,10 @@ from typing import Any
 
 import pytest
 
-from mqttium.codec.buffer import RawPacket
+from mqttium.codec.buffer import IncrementalDecoder, RawPacket
 from mqttium.enums import ConnectionState, OutboundQoSState, PacketType, QoS
 from mqttium.errors import FlowControlError
+from mqttium.packets import PublishPacket
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
 from mqttium.protocol.effects import EffectKind
@@ -228,3 +229,76 @@ def test_an_oversized_publication_is_admitted_alone_into_an_empty_budget(
         # A second oversized publication waits for the budget to empty again.
         with pytest.raises(FlowControlError):
             engine.queue_publish("a/b", b"x" * 1000, qos=QoS.AT_LEAST_ONCE)
+
+
+# --- a discarded broker session requeues QoS 1 with everything it owns --------
+
+
+def _clean_connack(engine: ProtocolEngine) -> list[Any]:
+    engine.notify_transport_closed()
+    engine.take_effects()
+    engine.begin_connect()
+    engine.take_effects()
+    engine.handle_raw(RawPacket(PacketType.CONNACK, 0, b"\x00\x00"))
+    return engine.take_effects()
+
+
+def _published(effects: list[Any]) -> list[PublishPacket]:
+    decoder = IncrementalDecoder()
+    for effect in effects:
+        if effect.kind is EffectKind.SEND:
+            data = effect.data
+            decoder.feed(data if isinstance(data, bytes) else data[0] + data[1])
+    return [PublishPacket.decode(raw.flags, raw.remaining) for raw in decoder.drain_packets()]
+
+
+def test_requeued_qos1_keeps_its_id_budget_and_row(tmp_path: Path) -> None:
+    for engine in _stores(tmp_path):
+        sent = engine.queue_publish("a/b", b"1", qos=QoS.AT_LEAST_ONCE)
+        engine.take_effects()
+        before = _snapshot(engine)
+
+        effects = _clean_connack(engine)
+
+        assert [(p.mid, p.dup, p.payload) for p in _published(effects)] == [(sent.mid, False, b"1")]
+        assert not any(e.kind is EffectKind.PUBLISH_FAILED for e in effects)
+        after = _snapshot(engine)
+        assert {key: after[key] for key in ("pending_messages", "pending_bytes", "used_mids")} == {
+            key: before[key] for key in ("pending_messages", "pending_bytes", "used_mids")
+        }
+        assert engine.flow.inflight == 1
+        assert engine.store.get_out(sent.mid or 0).state is OutboundQoSState.WAIT_PUBACK
+
+
+def test_requeued_qos1_leaves_as_a_first_attempt_after_a_replay() -> None:
+    """A PUBLISH already resent with DUP on a resumed session is new again later."""
+    engine = _engine(client_id="c", clean_start=False)
+    sent = engine.queue_publish("a/b", b"1", qos=QoS.AT_LEAST_ONCE)
+    engine.take_effects()
+    engine.notify_transport_closed()
+    engine.take_effects()
+    engine.begin_connect()
+    engine.take_effects()
+    engine.handle_raw(RawPacket(PacketType.CONNACK, 0, b"\x01\x00"))
+    assert [(p.mid, p.dup) for p in _published(engine.take_effects())] == [(sent.mid, True)]
+
+    assert [(p.mid, p.dup) for p in _published(_clean_connack(engine))] == [(sent.mid, False)]
+
+
+def test_restarted_process_resends_a_stored_qos1_on_a_new_session(tmp_path: Path) -> None:
+    path = tmp_path / "restart.db"
+    with SqliteInflightStore(path) as store:
+        first = ProtocolEngine(EngineConfig(client_id="c", clean_start=False), store)
+        first.state = ConnectionState.CONNECTED
+        sent = first.queue_publish("a/b", b"kept", qos=QoS.AT_LEAST_ONCE)
+        first.take_effects()
+    with SqliteInflightStore(path) as store:
+        engine = ProtocolEngine(EngineConfig(client_id="c", clean_start=False), store)
+        engine.begin_connect()
+        engine.take_effects()
+        engine.handle_raw(RawPacket(PacketType.CONNACK, 0, b"\x00\x00"))
+        effects = engine.take_effects()
+        assert [(p.mid, p.dup, p.payload) for p in _published(effects)] == [
+            (sent.mid, False, b"kept")
+        ]
+        assert not any(e.kind is EffectKind.PUBLISH_FAILED for e in effects)
