@@ -37,7 +37,7 @@ def test_policy_rejects_nonfinite_timing(name, value):
     "operation", ["connect", "connect_unix", "connect_ws", "subscribe", "unsubscribe"]
 )
 async def test_invalid_override_does_not_mutate_client(operation, value):
-    client = AsyncClient("finite-timing")
+    client = AsyncClient("finite-timing", message_delivery="callback")
     with pytest.raises(ValueError, match="timeout"):
         await getattr(client, operation)("unused", timeout=value)
     assert client.state is ConnectionState.NEW
