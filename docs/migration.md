@@ -1,6 +1,13 @@
-# Migrating to 1.0.0
+# Migrating to 1.1
 
 ## Changes in 1.1
+
+1.1.0 keeps the 1.0 API and SQLite schema 5, and corrects behaviour that
+real deployments of 1.0 found unsafe: silent losses, clients that stall, and
+limits enforced without the broker knowing them. Some corrections change what
+Stable interfaces do; each one is listed here with what to change. See the
+[exception note](api-stability.md#the-11-exception) in the API contract.
+
 
 - `ConnectionState.DISCONNECTED` now means that no automatic reconnection is
   pending. While the reconnect policy will retry, `state` and

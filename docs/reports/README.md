@@ -20,6 +20,7 @@ Status meanings:
 
 | Report | Status | Use instead or interpretation |
 | --- | --- | --- |
+| [RELEASE-1.1.0](RELEASE-1.1.0.md) | Current evidence | 1.1.0 content (fixes from a real 1.0 deployment and three outside audits, with a documented SemVer exception), report point 8 reproduced against Mosquitto, CI/soak and ARM64 gates against 1.0.0 |
 | [FINAL-1.0.0-PUBLICATION-CHECKPOINT-2026-09-28](FINAL-1.0.0-PUBLICATION-CHECKPOINT-2026-09-28.md) | Current evidence | 1.0.0 metadata and distributions validated; maintainer authorized publication with the scoped performance reservation. Earlier closing runs selected the historical RC17 harness. Fresh current-harness A/A and RC14/A/B remain invalid at unbounded 4096 B / 26k overload, without a confirmed runtime regression. |
 | [RC17-AUDIT-CLOSURE-2026-09-28](RC17-AUDIT-CLOSURE-2026-09-28.md) | Superseded | Bounded RC17 audit checkpoint and functional evidence retained. Use the 1.0.0 publication checkpoint above for subsequent closing-run review and the remaining performance reservation. |
 | [RC17-LONG-CAMPAIGN-CLOSURE-2026-09-27](RC17-LONG-CAMPAIGN-CLOSURE-2026-09-27.md) | Current evidence | RC17 long fuzz and two-hour protocol soaks passed; closes G01 of the initial promotion checkpoint. Use the 1.0.0 publication checkpoint above for the latest release disposition. |

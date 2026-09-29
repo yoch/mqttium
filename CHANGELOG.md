@@ -6,6 +6,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-29
+
+Fixes from real deployments of 1.0. Some fixes change Stable behaviour as a
+documented exception to SemVer; see the 1.1 migration notes.
+
 ### Added
 
 - A "Coming from Paho or aiomqtt" guide covering the differences that surface
@@ -1709,7 +1714,8 @@ See the [migration guide](docs/migration.md) for the breaking changes since
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/yoch/mqttium/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/yoch/mqttium/compare/v1.0.0rc17...v1.0.0
 [1.0.0rc17]: https://github.com/yoch/mqttium/compare/v1.0.0rc16...v1.0.0rc17
 [1.0.0rc16]: https://github.com/yoch/mqttium/compare/v1.0.0rc15...v1.0.0rc16

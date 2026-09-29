@@ -14,6 +14,19 @@ require a major version; a deprecated API remains available throughout its
 major release line, with a documented replacement and migration guidance.
 The deliberate pre-v1 changes are recorded in the migration guide.
 
+### The 1.1 exception
+
+1.1.0 is a minor release that deliberately changes some Stable behaviour
+without a major version. A real deployment of 1.0 showed that several 1.0
+behaviours lost messages or stalled services silently, and keeping them for
+the rest of the 1.x line would have been worse than a documented break: a
+refused subscription reported as success, publications queued for a
+connection nothing would open, iterator messages discarded on reconnect,
+limits the broker was never told about, and connection failures outside
+`MQTTError`. Each change and the code to adapt are listed in the
+[1.1 migration notes](migration.md#changes-in-11). This exception is not a
+precedent: later 1.x releases follow the rule above.
+
 **Provisional** covers `ClientStats`, its nested immutable snapshots,
 `MemoryInflightStore` and `SqliteInflightStore`. These remain supported and
 tested, but may evolve in a minor release with a changelog entry and migration

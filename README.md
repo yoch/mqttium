@@ -51,7 +51,7 @@ native client free of background threads.
 Install the stable native release:
 
 ```bash
-python -m pip install mqttium==1.0.0
+python -m pip install mqttium==1.1.0
 ```
 
 To try unreleased changes, install a checkout instead and record the Git commit
@@ -63,7 +63,10 @@ cd mqttium
 python -m pip install .
 ```
 
-`1.0.0` preserves the RC17 API. For upgrades from RC16, see the
+`1.1.0` fixes behaviour found in real deployments of 1.0; some fixes change
+Stable behaviour, listed in the
+[1.1 migration notes](https://mqttium.readthedocs.io/en/latest/migration/#changes-in-11).
+`1.0.0` preserved the RC17 API. For upgrades from RC16, see the
 [changes since 1.0.0rc16](https://mqttium.readthedocs.io/en/latest/migration/#changes-since-100rc16).
 Applications still on `1.0.0rc14` should use its
 [RC14 documentation](https://mqttium.readthedocs.io/en/v1.0.0rc14/) and read the
@@ -231,8 +234,8 @@ statistics vocabulary, progressive batch publication, synchronous message
 callbacks, receipt-based publication completion, and the new SQLite schema.
 Historical databases are not upgraded automatically.
 
-Use the Read the Docs version matching your installed release: `v1.0.0`
-for the stable release, the corresponding RC tag for an earlier candidate,
+Use the Read the Docs version matching your installed release: `v1.1.0`
+for the current stable release, `v1.0.0` for 1.0, the corresponding RC tag for an earlier candidate,
 and `latest` for the current source. The `stable` version follows the latest
 stable release.
 

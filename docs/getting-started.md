@@ -9,11 +9,13 @@ delivery and shutdown.
 MQTTium supports Python 3.11 through 3.14 and has no runtime dependencies. You
 also need an MQTT 3.1.1 or MQTT 5 broker that the application can reach.
 
-The stable native release is `1.0.0`. Its API and SQLite schema are unchanged
-from RC17; earlier candidates may require migration:
+The stable native release is `1.1.0`. It keeps the 1.0 API and SQLite schema 5
+and corrects 1.0 behaviour found in real deployments (see the
+[1.1 migration notes](migration.md#changes-in-11)); earlier candidates may
+require migration:
 
 ```bash
-python -m pip install mqttium==1.0.0
+python -m pip install mqttium==1.1.0
 ```
 
 To run a newer revision than the published release, install a checkout of the
