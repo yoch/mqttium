@@ -58,6 +58,7 @@ from mqttium.errors import (
     FlowControlError,
     MQTTError,
     MQTTTimeoutError,
+    NotConnectedError,
     MalformedPacketError,
     MandatoryResponseTooLargeError,
     PublishBatchError,
@@ -475,6 +476,12 @@ class AsyncClient:
         # Decided before the disconnect notification, so on_disconnect can
         # read the final state.
         self._reconnect_pending = False
+        # Set while the client itself cancels its reader, to tell that apart
+        # from a cancellation imposed from outside (event-loop shutdown).
+        self._reader_cancel_requested = False
+        # Wakes a first connect() waiting between attempts when disconnect()
+        # abandons it.
+        self._connect_backoff_wake: asyncio.Future[None] | None = None
 
         self._on_message: _OnMessage | None = None
         self._message_callback: CallbackTarget | None = None
@@ -543,6 +550,17 @@ class AsyncClient:
             "auth": running(self._auth_exchange.task),
         }
 
+    async def __aenter__(self) -> AsyncClient:
+        """Scope the client: ``async with AsyncClient(...) as client``.
+
+        Entering does not connect; call ``connect()`` inside the block. Leaving
+        the block always calls ``disconnect()``, also on error or cancellation.
+        """
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.disconnect()
+
     @property
     def state(self) -> ConnectionState:
         """Current connection state.
@@ -552,6 +570,7 @@ class AsyncClient:
         """
         state = self._engine.state
         if self._reconnect_pending and state in (
+            ConnectionState.NEW,
             ConnectionState.DISCONNECTED,
             ConnectionState.CONNECTING,
         ):
@@ -631,10 +650,21 @@ class AsyncClient:
         prepared: _PreparedPublish | None = None,
     ) -> PublishReceipt | None:
         """Admit one operation and register its completion before collecting SEND."""
-        if qos != QoS.AT_MOST_ONCE and self._local_terminal_failure is not None:
-            raise MQTTError(
-                "Client is unusable after a local terminal failure; create a new AsyncClient"
-            )
+        if qos != QoS.AT_MOST_ONCE:
+            if self._local_terminal_failure is not None:
+                raise MQTTError(
+                    "Client is unusable after a local terminal failure; create a new AsyncClient"
+                )
+            if (
+                self._engine.state is ConnectionState.DISCONNECTED
+                and not self._connection_pending()
+            ):
+                # Queued now, this publication would wait for a connection
+                # that nothing will establish. Before the first connect()
+                # (state NEW) the offline queue stays available.
+                raise NotConnectedError(
+                    "Not connected and no connection is pending; call connect() first"
+                )
         handle = self._engine.outbound.queue_publish(
             topic,
             payload,
@@ -849,13 +879,69 @@ class AsyncClient:
                 self._intentional_disconnect = False
                 timeout = timeout if timeout is not None else self._connect_timeout
                 self._reconnect.reset()
-                connack = await self._connect_once_locked(host, port, ssl=ssl, timeout=timeout)
+                connack = await self._connect_with_policy(host, port, ssl=ssl, timeout=timeout)
             if self.is_connected:
                 self._lifecycle_hooks.connected(connack, lifecycle_token)
             return connack
         finally:
             if self._explicit_connect_task is task:
                 self._explicit_connect_task = None
+
+    async def _connect_with_policy(
+        self,
+        host: str,
+        port: int,
+        *,
+        ssl: ssl.SSLContext | bool | None,
+        timeout: float,
+    ) -> ConnAckPacket:
+        """Connect, retrying setup failures according to the reconnect policy.
+
+        Without a policy this is one attempt. With one, a service may start
+        before its broker: transient failures wait for the policy's backoff
+        and try again, until a terminal cause or exhaustion. A failed attempt
+        never ends the application message stream -- no connection was made,
+        so nothing it delivered is complete.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                return await self._connect_once_locked(
+                    host, port, ssl=ssl, timeout=timeout, reconnect_attempt=True
+                )
+            except asyncio.CancelledError:
+                # The caller abandoned connect(); nothing will retry for it.
+                self._abandon_connect(MQTTError("Connection attempt cancelled"))
+                raise
+            except Exception as exc:
+                if owner_cancelled():
+                    self._abandon_connect(exc)
+                    raise
+                self._disconnect_exc = exc
+                self._disconnect_rank = _CAUSE_TRANSPORT
+                retry = (
+                    self._reconnect.enabled
+                    and not self._intentional_disconnect
+                    and self._will_reconnect()
+                )
+                if not retry:
+                    self._abandon_connect(exc)
+                    raise
+                self._reconnect_pending = True
+                wake = self._connect_backoff_wake = loop.create_future()
+                try:
+                    await asyncio.wait({wake}, timeout=self._reconnect.next_delay())
+                finally:
+                    self._connect_backoff_wake = None
+                if self._intentional_disconnect:
+                    self._abandon_connect(exc)
+                    raise MQTTError("Connection cancelled by disconnect()") from exc
+
+    def _abandon_connect(self, cause: BaseException) -> None:
+        """Settle an explicit connect that gave up, keeping the message stream."""
+        self._intentional_disconnect = True
+        self._reconnect_pending = False
+        self._fail_pending(cause)
 
     async def _connect_once_locked(
         self,
@@ -1028,6 +1114,10 @@ class AsyncClient:
         self._disconnect_hook_origin = origin
         self._intentional_disconnect = True
         self._reconnect_pending = False
+        backoff = self._connect_backoff_wake
+        if backoff is not None and not backoff.done():
+            # A first connect() waiting between attempts gives up now.
+            backoff.set_result(None)
         connect_disconnect_fut = self._connect_disconnect_fut
         disconnecting_connect = (
             self._engine.state is ConnectionState.CONNECTING
@@ -1371,9 +1461,19 @@ class AsyncClient:
     def on_message(self, callback: _OnMessage | None) -> None:
         self._check_routes_mutable()
         if callback is not None:
+            self._require_callback_delivery("on_message")
             self._delivery.validate_message_callback(callback)
         self._on_message = callback
         self._refresh_message_callback()
+
+    def _require_callback_delivery(self, what: str) -> None:
+        # Iterator delivery never runs message callbacks; accepting one would
+        # leave messages() unread until its queue fills and stalls the reader.
+        if self._delivery.mode != "callback":
+            raise ValueError(
+                f"{what} requires message_delivery='callback'; "
+                "with iterator delivery, consume client.messages() instead"
+            )
 
     def _freeze_message_routes(self) -> None:
         if self._routes_frozen:
@@ -1394,6 +1494,7 @@ class AsyncClient:
         filter retains its position. Shared filters match their literal string.
         """
         self._check_routes_mutable()
+        self._require_callback_delivery("message_callback_add()")
         validate_subscribe_filter(topic_filter)
         self._delivery.validate_message_callback(callback)
         if self._topic_callbacks is None:
@@ -1878,7 +1979,12 @@ class AsyncClient:
         ):
             reader_connack.set_exception(terminal_cause)
         self._fail_non_replayable(terminal_cause)
-        will_reconnect = self._will_reconnect()
+        # A reader cancelled from outside the client (event-loop shutdown)
+        # has nobody left to reconnect for; starting a reconnect task now
+        # would only leave it pending when the loop closes.
+        external_cancel = owner_cancelled() and not self._reader_cancel_requested
+        self._reader_cancel_requested = False
+        will_reconnect = not external_cancel and self._will_reconnect()
         self._reconnect_pending = will_reconnect
         if not will_reconnect:
             self._fail_pending(terminal_cause)
@@ -1913,6 +2019,15 @@ class AsyncClient:
         self._reconnect_pending = False
         self._fail_pending(exc)
         self._delivery.close()
+
+    def _connection_pending(self) -> bool:
+        """Whether a connect() or the reconnect policy is working on a connection."""
+        reconnect = self._reconnect_task
+        return (
+            self._reconnect_pending
+            or self._explicit_connect_task is not None
+            or (reconnect is not None and not reconnect.done())
+        )
 
     def _retry_reason(self) -> int | None:
         """The reason code the reconnect policy judges: broker DISCONNECT, else CONNACK."""
@@ -1967,6 +2082,7 @@ class AsyncClient:
             # join here: its teardown can stop this writer/effect task.
             reader = self._reader_task
             if reader is not None and reader is not asyncio.current_task() and not reader.done():
+                self._reader_cancel_requested = True
                 reader.cancel()
 
     def _invoke_auth_handler(
@@ -2758,13 +2874,17 @@ class AsyncClient:
             for task in (self._effect_pump.task, *tasks)
             if task is not None and task is not current
         ]
-        for task in tasks_to_stop:
-            task.cancel()
-        for task in tasks_to_stop:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        self._reader_cancel_requested = True
+        try:
+            for task in tasks_to_stop:
+                task.cancel()
+            for task in tasks_to_stop:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        finally:
+            self._reader_cancel_requested = False
         # The joined reader may have left an interrupted lot behind.
         self._flush_delivery_carryover()
         if (

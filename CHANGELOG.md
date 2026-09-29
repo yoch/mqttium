@@ -15,6 +15,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - `ConnectRefusedError` (a `ProtocolError`) with `reason_code` and `properties`
   for refused CONNACKs, instead of a code embedded in the message.
 - `ReconnectPolicy(retry_refused=...)` to retry terminal CONNACK refusals.
+- `async with AsyncClient(...) as client:` disconnects on exit.
+- With a `ReconnectPolicy`, the first `connect()` retries transient failures
+  according to the policy, so a service can start before its broker.
 
 ### Changed
 
@@ -27,6 +30,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Refuse QoS 1/2 publications with `NotConnectedError` once the client is
+  stopped. They used to be queued for a connection nothing would establish,
+  and `receipt.wait()` hung until the queue filled.
+- A failed `connect()` no longer ends the `messages()` stream, so a consumer
+  started before connecting survives a broker that is not up yet.
+- Assigning `on_message` or calling `message_callback_add()` with iterator
+  delivery raises `ValueError` instead of being silently ignored while the
+  unread iterator queue fills and stalls the connection.
+- Event-loop shutdown without `disconnect()` no longer starts a reconnection
+  task that is destroyed while pending.
 - Detect a dead connection from a steady publisher. Keepalive now sends
   PINGREQ after `keepalive` seconds without receiving as well as without
   sending; a QoS 0 publisher to a half-open connection previously never pinged

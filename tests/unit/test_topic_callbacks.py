@@ -128,14 +128,13 @@ async def test_shared_subscription_filter_matches_literally() -> None:
     assert seen == ["normal"]
 
 
-async def test_iterator_mode_ignores_topic_callbacks() -> None:
+async def test_iterator_mode_refuses_topic_callbacks() -> None:
     client = AsyncClient(client_id="topic-iterator", message_delivery="iterator")
-    seen: list[str] = []
-    client.message_callback_add("sensors/+", lambda message: seen.append(message.topic))
+    with pytest.raises(ValueError, match="message_delivery='callback'"):
+        client.message_callback_add("sensors/+", lambda message: None)
 
     await _deliver(client, "sensors/1")
 
-    assert seen == []
     assert client._delivery.callback_invocations == 0
     assert (await anext(client.messages())).topic == "sensors/1"
 

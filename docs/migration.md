@@ -14,6 +14,17 @@
   iterator consumer (`MessageDeliveryError`) and TLS certificate verification
   failures. MQTT 5 *Session taken over* (`0x8E`) is terminal instead of retried.
   `ReconnectPolicy(retry_refused=True)` also retries terminal CONNACK refusals.
+- With a `ReconnectPolicy`, the first `connect()` retries transient failures
+  instead of failing on the first one; remove application retry loops around
+  it, or keep them for the no-policy case. A failed `connect()` no longer ends
+  the `messages()` stream.
+- QoS 1/2 `publish()` and `publish_nowait()` raise `NotConnectedError` once the
+  client is stopped (after `disconnect()` or a loss with no reconnection
+  pending) instead of queueing a publication that could never be sent. The
+  offline queue before the first `connect()` is unchanged.
+- Assigning `on_message` or calling `message_callback_add()` with iterator
+  delivery raises `ValueError`; it used to be silently ignored.
+- `AsyncClient` supports `async with`, which calls `disconnect()` on exit.
 
 ## Changes since 1.0.0rc17
 

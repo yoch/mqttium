@@ -76,7 +76,8 @@ async def test_unaccounted_specialized_delivery_modes(mode: str) -> None:
         **bounds,
     )
     received: list[bytes] = []
-    client.on_message = lambda message: received.append(message.payload)
+    if mode == "callback":
+        client.on_message = lambda message: received.append(message.payload)
 
     await _deliver(client, mode.encode())
     if mode == "callback":
@@ -87,13 +88,15 @@ async def test_unaccounted_specialized_delivery_modes(mode: str) -> None:
         assert (await anext(client.messages())).payload == mode.encode()
 
 
-async def test_iterator_mode_ignores_callback() -> None:
+async def test_iterator_mode_refuses_message_callback() -> None:
+    # A callback iterator delivery would never call leaves messages() unread
+    # until its queue stalls the reader; refuse it where it is configured.
     client = AsyncClient(client_id="delivery-iterator", message_delivery="iterator")
-    received: list[bytes] = []
-    client.on_message = lambda message: received.append(message.payload)
+    with pytest.raises(ValueError, match="message_delivery='callback'"):
+        client.on_message = lambda message: None
+    client.on_message = None  # clearing stays allowed
 
     await _deliver(client)
-    assert received == []
     assert (await anext(client.messages())).payload == b"x"
 
 

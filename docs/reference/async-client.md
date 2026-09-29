@@ -66,8 +66,10 @@ the reader, later packets are not processed until the callback returns.
 `message_delivery="callback"`.
 
 Matching topic filters run in registration order instead of `on_message`.
-Shared-subscription filters match the filter string literally. Iterator mode
-ignores message callbacks and routes. `on_message` and the routes freeze
+Shared-subscription filters match the filter string literally. Message
+callbacks and routes require `message_delivery="callback"`: with iterator
+delivery, assigning `on_message` or calling `message_callback_add()` raises
+`ValueError`, because nothing would read `messages()`. `on_message` and the routes freeze
 permanently on the first connection attempt; subscriptions remain mutable.
 Use `messages()` for asynchronous processing or explicitly manage application
 work with its own bounds and overflow policy.
@@ -140,6 +142,26 @@ protocol rules. Return an `AuthPacket` for a challenge response; use `async def`
 if producing it requires asynchronous work. Lifecycle reentrancy does not
 promise arbitrary reentrant operations from AUTH. See
 [enhanced authentication](../mqtt-5.md#enhanced-authentication).
+
+## Connecting, retrying and stopping
+
+With a `ReconnectPolicy`, the first `connect()` also retries transient failures
+according to the policy, so a service may start before its broker: the call
+returns once connected, or raises when the policy gives up or the cause is
+terminal (a refused CONNACK raises `ConnectRefusedError`). Between attempts
+`state` is `RECONNECTING`, and `disconnect()` makes the pending `connect()` raise
+immediately. Without a policy `connect()` makes one attempt. A failed `connect()`
+never ends the `messages()` stream: an iterator started earlier keeps waiting
+for a later connection.
+
+QoS 1 and QoS 2 publications made before the first `connect()` wait in the
+offline queue. Once the client is stopped -- after `disconnect()`, or after a
+loss with no reconnection pending -- `publish()` and `publish_nowait()` raise
+`NotConnectedError` instead of queueing work that nothing will send.
+
+`async with AsyncClient(...) as client:` scopes the client: leaving the block
+calls `disconnect()`. Cancelling the client's tasks from outside, as event-loop
+shutdown does, ends the connection without starting a reconnection.
 
 ## Loop confinement
 
