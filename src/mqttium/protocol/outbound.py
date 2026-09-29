@@ -46,7 +46,12 @@ from mqttium.protocol._sizing import publish_logical_size
 from mqttium.protocol.stats import OutboundStats
 from mqttium.topics import encode_validated_publish_topic, validate_publish_topic
 from mqttium.transport.writes import WriteItem
-from mqttium.types import OutboundMessage, OutboundMessageSummary, Properties
+from mqttium.types import (
+    OutboundMessage,
+    OutboundMessageSummary,
+    Properties,
+    _properties_without_topic_alias,
+)
 
 if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
@@ -165,11 +170,7 @@ class OutboundSession:
     @staticmethod
     def _properties_without_topic_alias(properties: Properties | None) -> Properties | None:
         """Return replay-safe properties without connection-scoped alias state."""
-        if properties is None or properties.get("topic_alias") is None:
-            return properties
-        values = dict(properties.values)
-        values.pop("topic_alias", None)
-        return Properties(values=values)
+        return _properties_without_topic_alias(properties)
 
     # --- effect emission ---------------------------------------------------
     # Always routed through the engine, never into a cached list: take_effects()

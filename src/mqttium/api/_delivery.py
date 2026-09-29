@@ -89,6 +89,7 @@ class ApplicationDelivery:
         self.message_ready = asyncio.Event()
         self.closed = asyncio.Event()
         self._stream_generation = 0
+        self._waiting_generation: int | None = None
         # Slow iterator admissions are not committed application messages yet.
         # Retire them independently when either their connection owner or the
         # application stream generation is replaced.
@@ -281,8 +282,7 @@ class ApplicationDelivery:
             except asyncio.QueueEmpty:
                 if self.closed.is_set():
                     return
-                self.message_ready.clear()
-                await self.message_ready.wait()
+                await self._wait_for_message()
             else:
                 self._wake_waiters()
                 yield cast(Message, item)
@@ -296,12 +296,35 @@ class ApplicationDelivery:
             except asyncio.QueueEmpty:
                 if self.closed.is_set():
                     return
-                self.message_ready.clear()
-                await self.message_ready.wait()
+                await self._wait_for_message()
             else:
                 message, size = cast(tuple[Message, int], item)
                 self.release(size)
                 yield message
+
+    async def _wait_for_message(self) -> None:
+        """Wait for the next message; refuse a second iterator waiting with it.
+
+        Every message is delivered to exactly one iterator, so two iterators
+        consumed at once split the stream between them. That is almost always
+        a caller expecting each one to see every message, and it loses half of
+        them silently, so the second waiter fails instead.
+        """
+        generation = self._stream_generation
+        if self._waiting_generation == generation:
+            raise MQTTError(
+                "messages() is already being consumed by another iterator; each "
+                "message is delivered once, so share a single iterator"
+            )
+        # Keyed by generation: an iterator retired by reset_stream() is still
+        # waking up when the new generation's iterator starts waiting.
+        self._waiting_generation = generation
+        try:
+            self.message_ready.clear()
+            await self.message_ready.wait()
+        finally:
+            if self._waiting_generation == generation:
+                self._waiting_generation = None
 
     def reset_stream(self) -> None:
         """Start a new iterator generation, carrying unread messages into it.

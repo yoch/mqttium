@@ -1549,7 +1549,8 @@ class AsyncClient:
         """Register a synchronous filtered callback before the first connection attempt.
 
         Matches run in registration order instead of on_message. Replacing a
-        filter retains its position. Shared filters match their literal string.
+        filter retains its position. A shared filter ``$share/<group>/<filter>``
+        matches messages by ``<filter>``, the Topic Name the broker delivers.
         """
         self._check_routes_mutable()
         self._require_callback_delivery("message_callback_add()")
@@ -1724,7 +1725,10 @@ class AsyncClient:
         """Acknowledge an inbound QoS>0 message when ``manual_ack=True``.
 
         Defers PUBACK (QoS 1) or PUBCOMP (QoS 2). PUBREC is always immediate.
-        The handle identifies its logical exchange, even after a transport
+        QoS 1 PUBACKs leave in arrival order [MQTT-4.6.0-2]: acknowledging a
+        later message first holds its PUBACK until every earlier QoS 1
+        message is acknowledged, so acknowledge every delivered message,
+        including discarded ones. The handle identifies its logical exchange, even after a transport
         reconnect resumes the same session. It cannot acknowledge a later
         exchange that reuses the packet identifier. Repeated acknowledgements
         are accepted while completion is pending, then rejected after completion.

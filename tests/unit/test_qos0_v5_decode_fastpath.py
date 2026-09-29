@@ -234,24 +234,31 @@ def test_v5_qos0_empty_topic_without_alias_is_protocol_error() -> None:
     )
 
 
-def test_v5_qos0_topic_alias_establish_and_reuse_preserve_hint() -> None:
+def test_v5_qos0_topic_alias_is_resolved_and_never_delivered() -> None:
     engine = _connected(alias_maximum=10)
-    properties = Properties()
-    properties = Properties({**properties.values, "topic_alias": 1})
-    table = encode_properties(properties, PUBLISH)
+    properties = Properties({"topic_alias": 1, "content_type": "text/plain"})
 
     engine.handle_raw(_raw("sensors/temp", b"first", properties))
     first = _message_effect(engine.take_effects())
     assert engine.inbound._aliases == {1: "sensors/temp"}
-    assert first.kind is EffectKind.DECODED_MESSAGE
-    assert first.decoded_property_wire_size == len(table)
-
     engine.handle_raw(_raw("", b"second", properties))
     second = _message_effect(engine.take_effects())
-    assert second.data.topic == "sensors/temp"
-    assert second.data.payload == b"second"
-    assert second.kind is EffectKind.DECODED_MESSAGE
-    assert second.decoded_property_wire_size == len(table)
+
+    for effect, payload in ((first, b"first"), (second, b"second")):
+        message = effect.data
+        assert (message.topic, message.payload) == ("sensors/temp", payload)
+        # The alias names a mapping on this connection only; the application
+        # receives properties it can forward, sized without the alias.
+        assert message.properties.values == {"content_type": "text/plain"}
+        assert effect.decoded_property_wire_size is None
+
+
+def test_v5_qos0_alias_only_properties_leave_an_empty_set() -> None:
+    engine = _connected(alias_maximum=10)
+    engine.handle_raw(_raw("sensors/temp", b"x", Properties({"topic_alias": 1})))
+    effect = _message_effect(engine.take_effects())
+    assert effect.kind is EffectKind.MESSAGE
+    assert not effect.data.properties.values
 
 
 @pytest.mark.parametrize(("alias", "maximum"), [(2, 1)])
