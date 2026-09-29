@@ -34,6 +34,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Resume a durable MQTT 5 session after a process restart. A new client that
+  connects with `clean_start=False` and holds no incomplete QoS exchange used
+  to close the connection on Session Present, so a durable subscriber could not
+  restart at all. MQTTium now accepts it; see the deviation from
+  `[MQTT-3.2.2-4]` in the conformance notes.
 - Refuse QoS 1/2 publications with `NotConnectedError` once the client is
   stopped. They used to be queued for a connection nothing would establish,
   and `receipt.wait()` hung until the queue filled.

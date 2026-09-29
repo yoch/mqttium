@@ -30,6 +30,11 @@
   only QoS 2 receipts fail with `SessionDiscardedError`. Remove application
   code that republished QoS 1 messages on that error. Consumers may see the
   message twice, as QoS 1 always allowed.
+- An MQTT 5 client connecting with `clean_start=False` accepts Session Present
+  even when it holds no incomplete QoS exchange, so a restarted durable
+  subscriber resumes its broker session instead of failing with
+  `ProtocolError`. Remove any workaround that connected once with
+  `clean_start=True` after a restart; it discarded the session.
 
 ## Changes since 1.0.0rc17
 

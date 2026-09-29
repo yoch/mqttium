@@ -658,21 +658,11 @@ class ProtocolEngine:
             raise ProtocolError(
                 "CONNACK reports Session Present after Clean Start [MQTT-3.2.2-1/-2]"
             )
-        if (
-            self.codec.is_mqtt5
-            and connack.session_present
-            # A successful earlier connection with a durable expiry is local
-            # knowledge of this Session even when no QoS exchange is currently
-            # incomplete. A fresh engine has no such marker and must still
-            # reject an otherwise-unexpected Session Present value.
-            and not self._prefer_session_resume
-            and not self.outbound.has_client_session_state()
-            and not self.inbound.has_client_session_state()
-        ):
-            self._protocol_disconnect(0x82)
-            raise ProtocolError(
-                "CONNACK reports Session Present but the Client has no Session State [MQTT-3.2.2-4]"
-            )
+        # Session Present after a request to resume (Clean Start 0) is what
+        # the Client asked for, even when it holds no incomplete QoS exchange:
+        # a restarted process resumes its broker-side subscriptions this way.
+        # MQTTium deliberately does not close the connection here as the
+        # letter of [MQTT-3.2.2-4] suggests; see docs/conformance.md.
 
     def _on_connack(self, raw: RawPacket) -> None:
         if self.state != ConnectionState.CONNECTING:

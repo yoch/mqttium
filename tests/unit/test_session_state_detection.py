@@ -51,11 +51,13 @@ def _engine(store, protocol=MQTTProtocolVersion.MQTTv5) -> ProtocolEngine:
     return engine
 
 
-def test_mqtt5_session_present_rejected_with_empty_client_session() -> None:
+def test_mqtt5_session_present_accepted_after_a_process_restart() -> None:
+    # A restarted process asks to resume (Clean Start 0) with nothing in
+    # flight: its broker-side subscriptions are the Session it resumes.
     engine = _engine(MemoryInflightStore(), MQTTProtocolVersion.MQTTv5)
     effects = _feed(engine, _connack(present=True, protocol=MQTTProtocolVersion.MQTTv5))
-    assert engine.state is ConnectionState.DISCONNECTED
-    assert any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
+    assert engine.state is ConnectionState.CONNECTED
+    assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
 
 
 def test_known_empty_durable_session_accepts_session_present() -> None:
@@ -114,7 +116,7 @@ def test_session_present_accepted_with_incomplete_outbound_exchange(state) -> No
     assert engine.state is ConnectionState.CONNECTED
 
 
-def test_queued_but_never_sent_outbound_is_not_client_session_state() -> None:
+def test_queued_but_never_sent_outbound_survives_a_resumed_session() -> None:
     store = MemoryInflightStore()
     store.put_out(
         stored_record(
@@ -130,8 +132,10 @@ def test_queued_but_never_sent_outbound_is_not_client_session_state() -> None:
     )
     engine = _engine(store)
     effects = _feed(engine, _connack(present=True, protocol=MQTTProtocolVersion.MQTTv5))
-    assert engine.state is ConnectionState.DISCONNECTED
-    assert any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
+    # Resuming is accepted; the never-sent publication stays queued for the
+    # resumed session rather than being mistaken for an exchange to replay.
+    assert engine.state is ConnectionState.CONNECTED
+    assert not any(effect.kind is EffectKind.PROTOCOL_ERROR for effect in effects)
     assert store.get_out(1) is not None
 
 

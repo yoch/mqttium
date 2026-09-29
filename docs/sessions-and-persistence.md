@@ -105,6 +105,11 @@ identity. An empty local store cannot reveal broker-only subscriptions from a
 previous process, so applications that depend on retaining those subscriptions
 must also configure a stable ClientID.
 
+A restarted process with a stable ClientID and `clean_start=False` resumes its
+broker Session even when its store is empty or in memory: MQTTium accepts
+Session Present after a request to resume, and the broker's retained
+subscriptions deliver again without a new SUBSCRIBE.
+
 ## What SQLite persists
 
 `SqliteInflightStore` persists protocol state that must remain consistent across
