@@ -10,6 +10,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 - A "Coming from Paho or aiomqtt" guide covering the differences that surface
   in real deployments, and an event-loop section in the compatibility matrix.
+- `ClientStats.connected_since`, `last_disconnect_error` and
+  `last_disconnect_reason_code`, and
+  `DeliveryStats.callback_invocations`, `callback_failures` and
+  `unrouted_messages`: a service can see how long it has been connected, why
+  the last connection ended, and whether callbacks fail or messages match no
+  route, without logging.
 - `ConnectError`, raised by `connect()` when DNS, TCP, TLS or the WebSocket
   upgrade fails. It is both an `MQTTError` and an `OSError`, with the original
   error as `__cause__`, so `except MQTTError` now covers every connection
@@ -75,6 +81,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Connect promptly to a host whose IPv6 address is unreachable: TCP, TLS and
+  WebSocket connections race address families (RFC 8305 happy eyeballs)
+  instead of waiting for the first address to time out.
+- WebSocket: accept a broker that echoes no subprotocol or the MQTT 3.1 name
+  `mqttv3.1`, omit the default port from the `Host` header (some reverse
+  proxies route on it), and refuse a URL with credentials instead of silently
+  dropping them.
 - Resume a durable MQTT 5 session after a process restart. A new client that
   connects with `clean_start=False` and holds no incomplete QoS exchange used
   to close the connection on Session Present, so a durable subscriber could not

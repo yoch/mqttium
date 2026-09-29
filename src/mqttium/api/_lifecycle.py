@@ -41,6 +41,8 @@ class LifecycleHooks:
         self.task: asyncio.Task[None] | None = None
         self.hook_task: asyncio.Task[None] | None = None
         self.pending: _Notification | None = None
+        # The cause most recently reported to on_disconnect, for stats().
+        self.last_disconnect_error: BaseException | None = None
         self._holds = 0
         self._released = asyncio.Event()
         self._released.set()
@@ -103,6 +105,7 @@ class LifecycleHooks:
     ) -> None:
         if token != self.token:
             return
+        self.last_disconnect_error = error
         self._cancel_obsolete(origin)
         self._reconnect_ready.clear()
         self.pending = _Notification(token, False, self.owner.on_disconnect, error)
