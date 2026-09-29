@@ -21,6 +21,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- A `message_callback_add()` route for a shared subscription
+  (`$share/<group>/<filter>`) matches messages by `<filter>`, the Topic Name
+  the broker actually delivers. It used to match only the literal
+  `$share/...` string, so the route never fired.
+- A second `messages()` iterator waiting at the same time as another raises
+  `MQTTError`: each message is delivered to one iterator only, so two
+  consumers silently split the stream between them.
+- Delivered `Message.properties` no longer contain `topic_alias`. The alias
+  is connection-local state, and forwarding it as-is made the next PUBLISH
+  reference a mapping the receiving broker does not have.
 - MQTT 3.1.1 no longer enforces inbound limits the broker was never told:
   `max_inbound_inflight` and `maximum_packet_size` now default to `None`,
   resolved to the protocol maximum on MQTT 3.1.1 and to the advertised 100

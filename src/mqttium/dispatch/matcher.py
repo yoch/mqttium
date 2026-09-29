@@ -23,6 +23,12 @@ class TopicMatcher:
 
     @staticmethod
     def _compile(topic_filter: str) -> tuple[str, ...] | None:
+        if topic_filter.startswith("$share/"):
+            # The broker delivers a shared subscription's messages under their
+            # real Topic Name, so "$share/<ShareName>/<filter>" matches as
+            # <filter>. It never has an exact-index entry: its key is the
+            # literal shared filter, which is no Topic Name.
+            return tuple(topic_filter.split("/", 2)[2].split("/"))
         levels = tuple(topic_filter.split("/"))
         return levels if any(level in {"+", "#"} for level in levels) else None
 
