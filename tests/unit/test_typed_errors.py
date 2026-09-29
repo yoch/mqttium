@@ -23,14 +23,19 @@ from tests.support import ScriptedBrokerTransport, transport_factory
 V5 = MQTTProtocolVersion.MQTTv5
 
 
-async def test_unreachable_broker_raises_connect_error() -> None:
+async def test_unreachable_broker_raises_connect_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Refuse deterministically: a closed port is refused at once on Linux but
+    # only times out on Windows, where the connection attempt is retried.
+    async def refused(*args: object, **kwargs: object) -> None:
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "create_connection", refused)
     client = AsyncClient("unreachable")
     with pytest.raises(ConnectError) as failed:
-        # Port 1 on the loopback refuses the connection.
-        await client.connect("127.0.0.1", 1, timeout=2)
+        await client.connect("127.0.0.1", 1883, timeout=2)
     assert isinstance(failed.value, MQTTError)
     assert isinstance(failed.value, OSError)
-    assert isinstance(failed.value.__cause__, OSError)
+    assert isinstance(failed.value.__cause__, ConnectionRefusedError)
     await client.disconnect()
 
 
