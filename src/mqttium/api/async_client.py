@@ -555,6 +555,7 @@ class AsyncClient:
         report = getattr(transport, "stats", None)
         transport_stats = report() if report is not None else TransportStats._unavailable(transport)
         engine = self._engine
+        last_error = self._lifecycle_hooks.last_disconnect_error
         return ClientStats(
             state=self.state,
             connections=self._connections,
@@ -578,7 +579,10 @@ class AsyncClient:
             connected_since=(
                 self._connected_since if self.state is ConnectionState.CONNECTED else None
             ),
-            last_disconnect_error=self._lifecycle_hooks.last_disconnect_error,
+            last_disconnect_error=(
+                None if last_error is None else f"{type(last_error).__name__}: {last_error}"
+            ),
+            last_disconnect_reason_code=getattr(last_error, "reason_code", None),
         )
 
     def _running_tasks(self) -> dict[str, bool]:

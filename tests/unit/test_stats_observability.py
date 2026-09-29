@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import json
 import time
 
+import pytest
+
 from mqttium.api import AsyncClient
-from mqttium.enums import MQTTProtocolVersion, QoS
-from mqttium.packets import PublishPacket
+from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
+from mqttium.errors import ConnectRefusedError
+from mqttium.packets import PublishPacket, encode_frame
 from tests.support import ScriptedBrokerTransport, transport_factory, wait_until
 
 
@@ -31,7 +36,10 @@ async def test_connected_since_and_last_disconnect_error() -> None:
         await wait_until(lambda: client.stats().last_disconnect_error is not None)
         stats = client.stats()
         assert stats.connected_since is None
-        assert isinstance(stats.last_disconnect_error, BaseException)
+        assert stats.last_disconnect_error is not None
+        assert stats.last_disconnect_error.split(":")[0].endswith("Error")
+        assert stats.last_disconnect_reason_code is None
+        json.dumps(dataclasses.asdict(stats))  # a snapshot stays serialisable
     finally:
         await client.disconnect()
 
@@ -62,3 +70,24 @@ async def test_callback_failures_and_unrouted_messages_are_counted() -> None:
     finally:
         asyncio.get_running_loop().set_exception_handler(None)
         await client.disconnect()
+
+
+class _RefusingBroker(ScriptedBrokerTransport):
+    def handle_packet(self, raw) -> None:  # noqa: ANN001
+        if raw.packet_type is PacketType.CONNECT:
+            self.push_rx(encode_frame(PacketType.CONNACK, 0, bytes((0, 5))))
+        else:
+            super().handle_packet(raw)
+
+
+async def test_refused_connack_reason_code_is_reported() -> None:
+    client = AsyncClient("refused-stats")
+    client._transport_factory = transport_factory(_RefusingBroker())
+    with pytest.raises(ConnectRefusedError):
+        await client.connect("broker")
+    await wait_until(lambda: client.stats().last_disconnect_reason_code is not None)
+    stats = client.stats()
+    assert stats.last_disconnect_reason_code == 5
+    assert stats.last_disconnect_error is not None
+    assert stats.last_disconnect_error.startswith("ConnectRefusedError")
+    await client.disconnect()

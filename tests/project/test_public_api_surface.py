@@ -198,6 +198,7 @@ def test_client_stats_fields_follow_the_constructor_vocabulary() -> None:
         "transport",
         "connected_since",
         "last_disconnect_error",
+        "last_disconnect_reason_code",
     )
     assert names(OutboundStats) == (
         "unacknowledged_messages",
