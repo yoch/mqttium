@@ -139,8 +139,9 @@ retry created while the automatic reader is joined.
 
 Permanent authentication, authorisation, and protocol errors stop retrying.
 Temporary broker-unavailable errors and network failures may retry. Pending
-receipts survive only while the broker session can still settle them; a clean
-CONNACK fails them with `SessionDiscardedError`. A receipt failed terminally (a
+QoS 2 receipts survive only while the broker session can still settle them; a
+clean CONNACK fails them with `SessionDiscardedError`, while unacknowledged
+QoS 1 publications are sent again as new. A receipt failed terminally (a
 refused CONNACK, a final connection loss, `disconnect()`) is a final answer:
 this client never sends that publication again, neither from its offline
 queue nor by session replay, and keeps its packet identifier reserved until

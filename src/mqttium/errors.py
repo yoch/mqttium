@@ -68,8 +68,9 @@ class SessionReplayError(MQTTError):
     the connection is ended locally, durable state and packet identifiers are
     kept, and a reconnect policy never retries it. Reported through
     ``on_disconnect`` or raised by ``connect()``. Connecting with
-    ``clean_start=True`` discards the session and fails those publications
-    with ``SessionDiscardedError``.
+    ``clean_start=True`` discards the session: unacknowledged QoS 1
+    publications are sent again as new, and QoS 2 ones fail with
+    ``SessionDiscardedError``.
     """
 
 
@@ -93,7 +94,12 @@ class MQTTTimeoutError(MQTTError, TimeoutError):
 
 
 class SessionDiscardedError(MQTTError):
-    """Pending publish was discarded because a clean session replaced the old one."""
+    """A QoS 2 publication was discarded because a new session replaced the old one.
+
+    Restarting a QoS 2 exchange the broker may already have delivered could
+    deliver it twice, so it fails instead. Unacknowledged QoS 1 publications
+    are sent again as new publications and never raise this error.
+    """
 
 
 class PublishBatchError(MQTTError):

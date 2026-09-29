@@ -18,8 +18,11 @@ On reconnect, CONNACK tells MQTTium whether that previous session is present.
 When `session_present` is true, MQTTium replays persisted outbound PUBLISH or
 PUBREL state, redelivers inbound QoS 1 still awaiting a manual `ack()`, and
 restores inbound QoS 2 deduplication state. When it is false, the broker can no
-longer complete those old exchanges; MQTTium fails pending receipts with
-`SessionDiscardedError` and releases the stale local state.
+longer complete those old exchanges. MQTTium sends every unacknowledged QoS 1
+publication again as a new one (DUP 0, same receipt, ahead of work that was
+never sent): QoS 1 is at least once, so the broker may deliver it twice. A QoS 2
+exchange cannot restart without risking a second delivery, so its receipt fails
+with `SessionDiscardedError` and its local state is released.
 
 A resumed session must resend every unacknowledged QoS 1/2 PUBLISH with its
 original packet identifier. If the new CONNACK forbids one of them (a lower
@@ -27,10 +30,11 @@ Maximum QoS, `Retain Available` of 0, or a smaller Maximum Packet Size), the
 session cannot be resumed. MQTTium ends the connection with
 `SessionReplayError`, keeps the durable exchanges and their packet
 identifiers, and does not retry automatically. Connect again with
-`clean_start=True` to discard that session (pending receipts then fail with
-`SessionDiscardedError`), or restore the broker limits. Publications that were
-only queued offline are not part of the broker session; a narrowed CONNACK
-fails each of them individually.
+`clean_start=True` to discard that session (QoS 2 receipts then fail with
+`SessionDiscardedError`, and QoS 1 publications are sent as new ones), or
+restore the broker limits. Publications that were only queued offline, or are
+sent again after a discarded session, are not part of the broker session; a
+narrowed CONNACK fails each of them individually.
 
 A client that has already failed a publication's receipt (after a refused
 CONNACK, a final connection loss or `disconnect()`) never sends it again: its
