@@ -29,7 +29,7 @@ promise or release date.
 
 ## Native API release boundary
 
-The stable 1.0 API is native-only. The façade and helpers are removed.
+The stable 1.x API is native-only. The façade and helpers are removed.
 Integration into `main` and release publication are separate steps. Keep
 versioning, migration guidance, installed-artifact checks and documentation
 deployment aligned when cutting the next candidate or final version.
