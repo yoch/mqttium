@@ -296,6 +296,14 @@ With `manual_ack=True`, inbound QoS 1 acknowledgement and the final QoS 2
 acknowledgement wait for `await client.ack(message)`. This lets an application
 align MQTT acknowledgement with its own durable operation.
 
+MQTT requires QoS 1 PUBACKs in the order the PUBLISH packets arrived
+`[MQTT-4.6.0-2]`. Acknowledging a later message first records the request, but
+its PUBACK leaves only once every earlier QoS 1 message has been acknowledged:
+one message that is never acknowledged holds back every PUBACK after it, and
+the broker's inflight window eventually stops delivery. Acknowledge every
+delivered QoS 1 message, including ones the application discards. Each
+unacknowledged message also occupies an inbound slot (`max_inbound_inflight`).
+
 Pass the delivered `Message` itself. Its private handle identifies the client
 and active logical exchange, not just the reusable packet identifier. Duplicate
 deliveries of that exchange share the identity. Reconstructed, foreign and

@@ -66,7 +66,8 @@ the reader, later packets are not processed until the callback returns.
 `message_delivery="callback"`.
 
 Matching topic filters run in registration order instead of `on_message`.
-Shared-subscription filters match the filter string literally. Message
+A shared-subscription filter `$share/<group>/<filter>` matches by `<filter>`,
+the Topic Name the broker delivers. Message
 callbacks and routes require `message_delivery="callback"`: with iterator
 delivery, assigning `on_message` or calling `message_callback_add()` raises
 `ValueError`, because nothing would read `messages()`. `on_message` and the routes freeze

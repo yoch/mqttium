@@ -114,7 +114,7 @@ def test_invalid_filter_is_rejected_before_registration() -> None:
     assert client._topic_callbacks is None
 
 
-async def test_shared_subscription_filter_matches_literally() -> None:
+async def test_shared_subscription_route_receives_its_messages() -> None:
     client = AsyncClient(client_id="topic-shared", message_delivery="callback")
     seen: list[str] = []
     client.message_callback_add(
@@ -125,7 +125,8 @@ async def test_shared_subscription_filter_matches_literally() -> None:
 
     await _deliver(client, "sensors/temp")
 
-    assert seen == ["normal"]
+    # The broker delivers shared-subscription messages under their Topic Name.
+    assert seen == ["shared", "normal"]
 
 
 async def test_iterator_mode_refuses_topic_callbacks() -> None:

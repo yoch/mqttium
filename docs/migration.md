@@ -25,6 +25,12 @@
 - Assigning `on_message` or calling `message_callback_add()` with iterator
   delivery raises `ValueError`; it used to be silently ignored.
 - `AsyncClient` supports `async with`, which calls `disconnect()` on exit.
+- `message_callback_add("$share/<group>/<filter>", ...)` routes match
+  `<filter>`; remove any workaround that registered the plain filter as well.
+- Consume `messages()` from one iterator. A second iterator waiting at the
+  same time raises `MQTTError`; fan messages out to several workers from a
+  single consumer instead.
+- `Message.properties` no longer includes `topic_alias`.
 - `connect()` raises `ConnectError` for DNS, TCP, TLS and WebSocket upgrade
   failures. It is still an `OSError`, so existing `except OSError` handlers
   keep working; code catching a specific subclass such as
