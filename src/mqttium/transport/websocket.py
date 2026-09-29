@@ -18,6 +18,7 @@ from mqttium.transport._stream import (
     write_buffer_needs_drain,
 )
 from mqttium.transport.stats import TransportStats
+from mqttium.transport.tcp import HAPPY_EYEBALLS_DELAY
 
 _MAX_HANDSHAKE_BYTES = 64 * 1024
 _MAX_CONTROL_PAYLOAD = 125
@@ -74,10 +75,15 @@ class WebSocketTransport:
         max_write_batch_bytes: int = 1 * 1024 * 1024,
     ) -> WebSocketTransport:
         host, port, path, use_ssl = _parse_websocket_endpoint(url, ssl)
+        default_port = 443 if url[:4].lower() == "wss:" else 80
         key = base64.b64encode(os.urandom(16)).decode("ascii")
-        request = _build_handshake_request(host, port, path, key, extra_headers)
+        request = _build_handshake_request(
+            host, port, path, key, extra_headers, default_port=default_port
+        )
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port, ssl=use_ssl),
+            asyncio.open_connection(
+                host, port, ssl=use_ssl, happy_eyeballs_delay=HAPPY_EYEBALLS_DELAY
+            ),
             timeout=timeout,
         )
         try:
@@ -279,6 +285,13 @@ def _parse_websocket_endpoint(url: str, ssl: Any) -> tuple[str, int, str, Any]:
     host = parsed.hostname
     if not host:
         raise ValueError("WebSocket URL must include a hostname")
+    if parsed.username is not None or parsed.password is not None:
+        # Credentials in the URL would be dropped silently: MQTT carries them
+        # in CONNECT, and HTTP authentication belongs in extra_headers.
+        raise ValueError(
+            "WebSocket URL must not contain credentials; use username/password "
+            "on AsyncClient or an Authorization header in extra_headers"
+        )
     port = parsed.port or (443 if parsed.scheme == "wss" else 80)
     path = parsed.path or "/"
     if parsed.query:
@@ -293,11 +306,17 @@ def _build_handshake_request(
     path: str,
     key: str,
     extra_headers: dict[str, str] | None,
+    *,
+    default_port: int | None = None,
 ) -> bytes:
     host_header = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    if port != default_port:
+        # RFC 7230 §5.4: omit the scheme's default port. Some reverse proxies
+        # route on the exact Host value and reject "host:443".
+        host_header = f"{host_header}:{port}"
     headers = [
         f"GET {path} HTTP/1.1",
-        f"Host: {host_header}:{port}",
+        f"Host: {host_header}",
         "Upgrade: websocket",
         "Connection: Upgrade",
         f"Sec-WebSocket-Key: {key}",
@@ -350,8 +369,12 @@ def _validate_handshake_response(head: bytes, key: str) -> None:
     }
     if "upgrade" not in connection_tokens:
         raise ConnectionError("WebSocket handshake missing Connection: Upgrade")
-    if headers.get("sec-websocket-protocol", "").lower() != "mqtt":
-        raise ConnectionError("WebSocket subprotocol 'mqtt' not negotiated")
+    # RFC 6455 §4.1: a server that selects no subprotocol omits the header,
+    # which is not a refusal; one that selects another subprotocol is. Older
+    # brokers answer with the MQTT 3.1 name "mqttv3.1".
+    subprotocol = headers.get("sec-websocket-protocol")
+    if subprotocol is not None and subprotocol.strip().lower() not in ("mqtt", "mqttv3.1"):
+        raise ConnectionError(f"WebSocket subprotocol {subprotocol!r} is not MQTT")
 
 
 def _parse_http_headers(lines: list[bytes]) -> dict[str, str]:

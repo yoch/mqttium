@@ -73,6 +73,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Connect promptly to a host whose IPv6 address is unreachable: TCP, TLS and
+  WebSocket connections race address families (RFC 8305 happy eyeballs)
+  instead of waiting for the first address to time out.
+- WebSocket: accept a broker that echoes no subprotocol or the MQTT 3.1 name
+  `mqttv3.1`, omit the default port from the `Host` header (some reverse
+  proxies route on it), and refuse a URL with credentials instead of silently
+  dropping them.
 - Resume a durable MQTT 5 session after a process restart. A new client that
   connects with `clean_start=False` and holds no incomplete QoS exchange used
   to close the connection on Session Present, so a durable subscriber could not
