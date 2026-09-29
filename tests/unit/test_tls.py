@@ -14,6 +14,7 @@ from mqttium.api.async_client import AsyncClient
 from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.enums import PacketType
 from mqttium.packets import encode_frame
+from mqttium.errors import ConnectError
 
 
 def _make_certs(tmp_path: Path) -> tuple[Path, Path]:
@@ -101,8 +102,9 @@ async def test_tls_rejects_untrusted_server(tmp_path: Path) -> None:
     async with server:
         # Default context trusts public CAs only: the self-signed cert fails.
         client = AsyncClient(client_id="tls-reject")
-        with pytest.raises(ssl.SSLError):
+        with pytest.raises(ConnectError) as failed:
             await client.connect("127.0.0.1", port, ssl=ssl.create_default_context(), timeout=5.0)
+        assert isinstance(failed.value.__cause__, ssl.SSLError)
         assert not client.is_connected
 
 
@@ -147,7 +149,7 @@ async def test_tls_rejects_hostname_mismatch(tmp_path: Path) -> None:
         client_ctx = ssl.create_default_context()
         client_ctx.load_verify_locations(cert)
         client = AsyncClient(client_id="tls-hostname")
-        with pytest.raises(ssl.SSLCertVerificationError):
+        with pytest.raises(ConnectError, match="CERTIFICATE_VERIFY_FAILED"):
             await client.connect(
                 "127.0.0.1",
                 port,

@@ -6,6 +6,7 @@ import asyncio
 
 from mqttium.api import AsyncClient
 from mqttium.protocol.reconnect import ReconnectPolicy
+from mqttium.errors import ConnectError
 from tests.support import ScriptedBrokerTransport, wait_until
 
 
@@ -115,10 +116,12 @@ async def test_reconnect_exhaustion_settles_receipt_and_unblocks_disconnect_hook
         await wait_until(lambda: client._lifecycle_hooks.hook_task is None)
 
         assert calls == 3  # initial connection + two allowed retry attempts
-        assert observed == [failure]
+        # The failed attempt surfaces as ConnectError, caused by the factory's error.
+        assert len(observed) == 1 and isinstance(observed[0], ConnectError)
+        assert observed[0].__cause__ is failure
         assert not client.is_connected
         assert client._delivery.closed.is_set()
-        assert client._disconnect_exc is failure
+        assert client._disconnect_exc is observed[0]
     finally:
         await client.disconnect()
 

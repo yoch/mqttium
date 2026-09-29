@@ -7,7 +7,7 @@ import pytest
 from mqttium.api import AsyncClient, ReconnectPolicy
 from mqttium.api import async_client
 from mqttium.enums import PacketType
-from mqttium.errors import MQTTTimeoutError
+from mqttium.errors import ConnectError, MQTTTimeoutError
 from mqttium.transport import websocket
 from tests.support import ScriptedBrokerTransport, wait_until
 
@@ -78,9 +78,9 @@ async def test_public_websocket_attempt_owns_upgrade_deadline(monkeypatch, overr
     monkeypatch.setattr(asyncio, "open_connection", open_connection)
     monkeypatch.setattr(websocket, "_read_handshake_response", read_upgrade)
     client = AsyncClient("websocket-deadline", connect_timeout=60, keepalive=0)
-    with pytest.raises(OSError) as caught:
+    with pytest.raises(ConnectError) as caught:
         await client.connect_ws("ws://unused/mqtt", timeout=override)
-    assert caught.value is cause
+    assert caught.value.__cause__ is cause
     assert writer.closed
     assert not any(client._running_tasks().values())
 

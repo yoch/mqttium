@@ -33,6 +33,7 @@ from mqttium.errors import (
     NotConnectedError,
     PacketTooLargeError,
     ProtocolError,
+    PublishRejectedError,
     SessionDiscardedError,
     SessionReplayError,
 )
@@ -646,7 +647,7 @@ class OutboundSession:
         self._finish(
             mid,
             OutboundQoSState.WAIT_PUBACK,
-            None if reason_code < 128 else ProtocolError(f"PUBACK reason_code={reason_code}"),
+            None if reason_code < 128 else PublishRejectedError("PUBACK", reason_code, properties),
         )
 
     def _require_pubrel_capacity(self, size: int) -> None:
@@ -666,7 +667,7 @@ class OutboundSession:
             self._finish(
                 mid,
                 OutboundQoSState.WAIT_PUBREC,
-                ProtocolError(f"PUBREC reason_code={reason_code}"),
+                PublishRejectedError("PUBREC", reason_code, properties),
             )
             return
         limit = self._engine.negotiated.maximum_packet_size
@@ -714,7 +715,7 @@ class OutboundSession:
         self._finish(
             mid,
             OutboundQoSState.WAIT_PUBCOMP,
-            None if reason_code < 128 else ProtocolError(f"PUBCOMP reason_code={reason_code}"),
+            None if reason_code < 128 else PublishRejectedError("PUBCOMP", reason_code, properties),
         )
 
     # --- launching and retransmission ---------------------------------------

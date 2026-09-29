@@ -58,6 +58,7 @@ from mqttium.dispatch.matcher import TopicMatcher
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.errors import (
     BrokerDisconnectError,
+    ConnectError,
     ConnectRefusedError,
     FlowControlError,
     MQTTError,
@@ -69,6 +70,7 @@ from mqttium.errors import (
     PacketTooLargeError,
     ProtocolError,
     SessionReplayError,
+    SubscribeError,
 )
 from mqttium.packets import (
     AuthPacket,
@@ -182,6 +184,18 @@ def _positive(name: str, value: float) -> None:
 def _non_negative_optional(name: str, value: int | None) -> None:
     if value is not None and value < 0:
         raise ValueError(f"{name} must be non-negative or None")
+
+
+def _protocol_version(protocol: object) -> MQTTProtocolVersion:
+    """Accept the enum or its wire level (4 or 5); refuse anything else."""
+    if isinstance(protocol, bool) or not isinstance(protocol, int):
+        raise TypeError("protocol must be MQTTProtocolVersion.MQTTv311 (4) or MQTTv5 (5)")
+    try:
+        version = MQTTProtocolVersion(protocol)
+    except ValueError:
+        name = "MQTT 3.1" if protocol == 3 else f"MQTT protocol level {protocol}"
+        raise ValueError(f"{name} is not supported; use 4 (MQTT 3.1.1) or 5 (MQTT 5)") from None
+    return version
 
 
 def _validate_client_arguments(
@@ -346,6 +360,9 @@ class AsyncClient:
         auth_handler: _OnAuth | None = None,
         auth_timeout: float = 10.0,
     ) -> None:
+        protocol = _protocol_version(protocol)
+        if isinstance(keepalive, bool) or not isinstance(keepalive, int):
+            raise TypeError("keepalive must be an int number of seconds")
         _validate_client_arguments(
             client_id=client_id,
             username=username,
@@ -742,7 +759,9 @@ class AsyncClient:
             MQTTError: If :meth:`disconnect` cancels connection setup.
             MQTTError: If a previous local terminal failure fail-stopped
                 this client; create a new one instead of reusing it.
-            OSError: If TCP/TLS setup or the initial MQTT CONNECT write fails.
+            ConnectError: If DNS, TCP or TLS setup fails (also an ``OSError``;
+                the original error is ``__cause__``).
+            OSError: If the initial MQTT CONNECT write fails.
             asyncio.CancelledError: If the calling task is cancelled.
         """
         return await self._connect_explicit(host, port, ssl=ssl, timeout=timeout)
@@ -768,7 +787,8 @@ class AsyncClient:
             ProtocolError: If the broker refuses or violates the protocol.
             MQTTError: If a previous local terminal failure fail-stopped
                 this client; create a new one instead of reusing it.
-            OSError: If Unix socket setup or the initial MQTT CONNECT write fails.
+            ConnectError: If Unix socket setup fails (also an ``OSError``).
+            OSError: If the initial MQTT CONNECT write fails.
             asyncio.CancelledError: If the calling task is cancelled.
         """
 
@@ -809,8 +829,9 @@ class AsyncClient:
             ProtocolError: If the broker refuses or violates the MQTT protocol.
             MQTTError: If a previous local terminal failure fail-stopped
                 this client; create a new one instead of reusing it.
-            ConnectionError: If the WebSocket upgrade, transport, or initial
-                MQTT CONNECT write fails.
+            ConnectError: If DNS, TCP, TLS or the WebSocket upgrade fails
+                (also an ``OSError``; the original error is ``__cause__``).
+            ConnectionError: If the initial MQTT CONNECT write fails.
             ValueError: If the URL or WebSocket options are invalid.
             asyncio.CancelledError: If the calling task is cancelled.
         """
@@ -994,12 +1015,7 @@ class AsyncClient:
         self._flush_delivery_carryover()
         deadline = loop.time() + timeout
         try:
-            try:
-                transport = await asyncio.wait_for(
-                    self._transport_factory(host, port, ssl=ssl), timeout=timeout
-                )
-            except TimeoutError as exc:
-                raise MQTTTimeoutError("Transport connection timed out") from exc
+            transport = await self._open_transport(host, port, ssl, timeout)
             self._transport = transport
             # Reject a misconfigured factory before CONNECT or background tasks.
             # Assign first so the normal failure cleanup closes the transport.
@@ -1068,6 +1084,23 @@ class AsyncClient:
                 pass
             self._retire_engine_connection()
             raise failure from failure.__cause__
+
+    async def _open_transport(
+        self, host: str, port: int, ssl: ssl.SSLContext | bool | None, timeout: float
+    ) -> AsyncTransport:
+        try:
+            return await asyncio.wait_for(
+                self._transport_factory(host, port, ssl=ssl), timeout=timeout
+            )
+        except TimeoutError as exc:
+            raise MQTTTimeoutError("Transport connection timed out") from exc
+        except OSError as exc:
+            if isinstance(exc, MQTTError):
+                raise
+            # DNS, TCP, TLS and WebSocket handshake failures: one MQTTError for
+            # every failure to reach the broker, still an OSError for existing
+            # handlers.
+            raise ConnectError(f"Could not connect to the broker: {exc}") from exc
 
     async def _await_connack_or_disconnect(self, timeout: float) -> ConnAckPacket:
         connack_fut = self._connack_fut
@@ -1566,9 +1599,13 @@ class AsyncClient:
             timeout: SUBACK deadline; ``subscribe_timeout`` is used when omitted.
 
         Returns:
-            Packet identifier and broker reason codes in request order.
+            Packet identifier, broker reason codes in request order, granted
+            QoS and MQTT 5 SUBACK properties.
 
         Raises:
+            SubscribeError: If the broker refused at least one filter; its
+                ``result`` holds the full SUBACK, and accepted filters stay
+                subscribed.
             MQTTTimeoutError: If SUBACK does not arrive before the deadline.
             ValueError: If ``timeout`` is not a finite positive number.
             ProtocolError: If a filter, option, property, or negotiated limit is
@@ -1594,7 +1631,10 @@ class AsyncClient:
                 self._effect_pump.collect_from_engine()
             # Settle earlier results before a released identifier can be reused.
             await self._effect_pump.drain()
-        return await self._await_request_ack(fut, self._sub_futs, mid, timeout, "SUBACK")
+        result = await self._await_request_ack(fut, self._sub_futs, mid, timeout, "SUBACK")
+        if any(code >= 0x80 for code in result.reason_codes):
+            raise SubscribeError(result)
+        return result
 
     async def unsubscribe(
         self,
@@ -2453,13 +2493,17 @@ class AsyncClient:
         raise data
 
     def _resolve_suback(self, packet: SubAckPacket) -> None:
-        sub_result = SubscribeResult(mid=packet.mid, reason_codes=packet.reason_codes)
+        sub_result = SubscribeResult(
+            mid=packet.mid, reason_codes=packet.reason_codes, properties=packet.properties
+        )
         sub_fut = self._sub_futs.pop(sub_result.mid, None)
         if sub_fut is not None and not sub_fut.done():
             sub_fut.set_result(sub_result)
 
     def _resolve_unsuback(self, packet: UnsubAckPacket) -> None:
-        unsub_result = UnsubscribeResult(mid=packet.mid, reason_codes=packet.reason_codes)
+        unsub_result = UnsubscribeResult(
+            mid=packet.mid, reason_codes=packet.reason_codes, properties=packet.properties
+        )
         unsub_fut = self._unsub_futs.pop(unsub_result.mid, None)
         if unsub_fut is not None and not unsub_fut.done():
             unsub_fut.set_result(unsub_result)

@@ -8,6 +8,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Added
 
+- `ConnectError`, raised by `connect()` when DNS, TCP, TLS or the WebSocket
+  upgrade fails. It is both an `MQTTError` and an `OSError`, with the original
+  error as `__cause__`, so `except MQTTError` now covers every connection
+  failure.
+- `PublishRejectedError` (a `ProtocolError`) with `reason_code` and
+  `properties` for a PUBACK, PUBREC or PUBCOMP failure code.
+- `SubscribeError` with the full `result` when the broker refuses a filter.
+  `SubscribeResult` gains `granted_qos` and `properties`, and
+  `UnsubscribeResult` gains `properties`; both were discarded before.
+- `protocol=` accepts the wire level `4` or `5` as well as the enum.
 - `ConnectionState.RECONNECTING`, reported while the reconnect policy will retry
   a lost connection; `DISCONNECTED` now means that no automatic reconnection is
   pending. The state is decided before `on_disconnect` runs, so a hook can tell
@@ -21,6 +31,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- `subscribe()` raises `SubscribeError` when the broker refuses any filter;
+  it used to return the failure reason code as if the subscription had
+  succeeded. Accepted filters of the same request stay subscribed.
+- `keepalive` must be an `int`; a float or string raises `TypeError` instead
+  of failing later or being silently accepted.
 - MQTT 3.1.1 no longer enforces inbound limits the broker was never told:
   `max_inbound_inflight` and `maximum_packet_size` now default to `None`,
   resolved to the protocol maximum on MQTT 3.1.1 and to the advertised 100
