@@ -453,6 +453,8 @@ class AsyncClient:
         self._teardown_final = False
         self._ping_pending = False
         self._ping_deadline = 0.0
+        # Monotonic time of the last byte received on the current connection.
+        self._last_inbound = 0.0
         self._host = ""
         self._port = 1883
         self._ssl: ssl.SSLContext | bool | None = None
@@ -921,7 +923,7 @@ class AsyncClient:
                     )
                     self._propose_disconnect_cause(refusal, _CAUSE_BROKER)
                 raise refusal
-            self._write_pump.last_outbound = time.monotonic()
+            self._write_pump.last_outbound = self._last_inbound = time.monotonic()
             self._keepalive_task = asyncio.create_task(
                 self._keepalive_loop(), name="mqttium-keepalive"
             )
@@ -1651,6 +1653,7 @@ class AsyncClient:
                     if not data:
                         break
                     self._decoder.feed(data)
+                self._last_inbound = time.monotonic()
                 # Process one bounded packet batch at a time. Applying its
                 # effects before decoding the next batch propagates delivery
                 # byte backpressure all the way to transport.read().
@@ -2046,6 +2049,13 @@ class AsyncClient:
                     continue
                 now = time.monotonic()
                 if self._ping_pending:
+                    if self._delivery_lane.active_count:
+                        # The reader is handing a lot to the application and
+                        # reads nothing until it finishes; a PINGRESP may
+                        # already wait behind it. Application backpressure is
+                        # not a dead connection, so the deadline restarts once
+                        # the reader reads again.
+                        self._ping_deadline = max(self._ping_deadline, now + self._ping_window(k))
                     if now >= self._ping_deadline:
                         self._propose_disconnect_cause(
                             MQTTTimeoutError("PINGRESP timed out"), _CAUSE_TRANSPORT
@@ -2057,7 +2067,10 @@ class AsyncClient:
                         return
                     await asyncio.sleep(min(0.5, self._ping_deadline - now))
                     continue
-                due = self._write_pump.last_outbound + k
+                # Ping after k seconds without sending or without receiving:
+                # a steady publisher to a half-open connection otherwise never
+                # learns that nothing comes back.
+                due = min(self._write_pump.last_outbound, self._last_inbound) + k
                 if now >= due:
                     try:
                         async with self._engine_lock:
@@ -2076,10 +2089,7 @@ class AsyncClient:
                     except FlowControlError:
                         pass
                     self._ping_pending = True
-                    ping_to = self._ping_timeout
-                    if ping_to is None:
-                        ping_to = max(k / 2, 5.0)
-                    self._ping_deadline = now + ping_to
+                    self._ping_deadline = now + self._ping_window(k)
                 else:
                     await asyncio.sleep(min(1.0, due - now))
         except asyncio.CancelledError as exc:
@@ -2089,6 +2099,10 @@ class AsyncClient:
             # the connection cannot detect a dead peer, so retire it.
             self._propose_disconnect_cause(dependency_failure(exc, "keepalive"), _CAUSE_TRANSPORT)
             await self._close_transport_after_connection_failure()
+
+    def _ping_window(self, keepalive: int) -> float:
+        ping_timeout = self._ping_timeout
+        return max(keepalive / 2, 5.0) if ping_timeout is None else ping_timeout
 
     async def _reconnect_loop(self) -> None:
         try:

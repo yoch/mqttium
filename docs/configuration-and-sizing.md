@@ -128,6 +128,14 @@ Every default deadline lives on the constructor; `connect*()`, `subscribe()`
 and `unsubscribe()` accept a per-call `timeout` override. `ReconnectPolicy`
 only describes the retry progression.
 
+The client sends PINGREQ after `keepalive` seconds without sending **or**
+without receiving, so a steady publisher to a half-open connection still
+detects the silent peer within one keepalive interval plus `ping_timeout`
+(by default `max(keepalive / 2, 5)` seconds). While the reader is handing a
+lot to the application -- a full iterator queue or a long callback batch -- it
+reads nothing, so the PINGRESP deadline restarts instead of blaming the
+connection for application backpressure.
+
 ## A sizing method
 
 1. Record the largest accepted topic, payload, and property set.
