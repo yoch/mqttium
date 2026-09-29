@@ -44,6 +44,10 @@ documented exception to SemVer; see the 1.1 migration notes.
 
 ### Changed
 
+- Reorganize the README around installation, a complete asyncio example, and
+  application needs while retaining delivery, backpressure, persistence,
+  monitoring, and performance guidance. Simplify the getting-started path and
+  keep pre-release history in the migration documentation.
 - A `message_callback_add()` route for a shared subscription
   (`$share/<group>/<filter>`) matches messages by `<filter>`, the Topic Name
   the broker actually delivers. It used to match only the literal
