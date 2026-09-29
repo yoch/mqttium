@@ -1,7 +1,7 @@
 # Release 1.1.0 evidence
 
 Date: 2026-09-29. Candidate runtime: `main` at
-`ef938eaaf4dafe1cc48f8cc471b5e402e6071011`. The release commit adds only
+`cd2c4289f5bd46bc880ab6ac9442a18eee486150`. The release commit adds only
 documentation, the version string, the frozen changelog section, release-facing
 installation and support text, and this report. Baseline for comparisons:
 `1.0.0` (`61aaa1cb7201e4b9e88dd3d984f007e80d8814e3`).
@@ -33,6 +33,7 @@ to adapt are in the [1.1 migration notes](../migration.md#changes-in-11).
 | Observability: connection age, last loss, callback failures, unrouted messages | #607 |
 | Transports: happy eyeballs, WebSocket handshakes met in practice | #606 |
 | Documentation: coming from Paho or aiomqtt, corrected examples, event loops, SQLite properties | #608 |
+| Performance: a per-lot cost introduced by #597, found by the release qualification | #609 |
 
 ### Report point 8, reproduced
 
@@ -56,6 +57,6 @@ levels, and a Mosquitto integration test pins it.
 - No age of the oldest message awaiting a manual acknowledgement: it would put
   a timestamp on every message.
 
-## Qualification of `ef938eaa`
+## Qualification of `cd2c4289`
 
 QUALIFICATION_PENDING
