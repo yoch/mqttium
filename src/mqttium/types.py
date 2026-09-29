@@ -217,3 +217,17 @@ class InboundMessage:
     properties: Properties | None = None
     user_acked: bool = False  # manual_ack: app called ack() before PUBREL
     logical_size: int = 0
+
+
+def _properties_without_topic_alias(properties: Properties | None) -> Properties | None:
+    """Return ``properties`` without Topic Alias, which is Network Connection state.
+
+    A Topic Alias names a mapping on one connection only: replaying it on
+    another connection, or handing it to an application that forwards the
+    properties, would reference a mapping that does not exist there.
+    """
+    if properties is None or properties.get("topic_alias") is None:
+        return properties
+    values = dict(properties.values)
+    values.pop("topic_alias", None)
+    return Properties(values=values)

@@ -25,6 +25,23 @@
 - Assigning `on_message` or calling `message_callback_add()` with iterator
   delivery raises `ValueError`; it used to be silently ignored.
 - `AsyncClient` supports `async with`, which calls `disconnect()` on exit.
+- `message_callback_add("$share/<group>/<filter>", ...)` routes match
+  `<filter>`; remove any workaround that registered the plain filter as well.
+- Consume `messages()` from one iterator. A second iterator waiting at the
+  same time raises `MQTTError`; fan messages out to several workers from a
+  single consumer instead.
+- `Message.properties` no longer includes `topic_alias`.
+- `connect()` raises `ConnectError` for DNS, TCP, TLS and WebSocket upgrade
+  failures. It is still an `OSError`, so existing `except OSError` handlers
+  keep working; code catching a specific subclass such as
+  `ConnectionRefusedError` or `ssl.SSLCertVerificationError` must inspect
+  `exc.__cause__` instead.
+- `subscribe()` raises `SubscribeError` when any filter is refused; read
+  `exc.result` for the per-filter reason codes. Code that checked
+  `reason_codes` for values of `0x80` or above can catch the error instead.
+- A refused publication fails its receipt with `PublishRejectedError`, a
+  `ProtocolError` subclass with `reason_code` and `properties`.
+- `keepalive` must be an `int`.
 - `max_inbound_inflight`, `maximum_packet_size` and `max_inbound_inflight_bytes`
   default to `None`. MQTT 5 still advertises and enforces 100 exchanges and
   16 MiB packets; MQTT 3.1.1 enforces inbound limits only when set explicitly,

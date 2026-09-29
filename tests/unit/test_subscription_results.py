@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from mqttium.api import AsyncClient, SubscribeResult, UnsubscribeResult
+from mqttium.errors import SubscribeError
 from mqttium.enums import MQTTProtocolVersion, PacketType
 from mqttium.packets import encode_frame
 from tests.support import ScriptedBrokerTransport, transport_factory, wait_until
@@ -41,6 +42,15 @@ class _HeldAckBroker(ScriptedBrokerTransport):
         self.push_rx(encode_frame(kind, 0, mid.to_bytes(2, "big") + properties + bytes(codes)))
 
 
+async def _result(task, unsubscribe):
+    """A refused filter fails subscribe() with the complete, ordered result."""
+    if unsubscribe:
+        return await asyncio.wait_for(task, 1)
+    with pytest.raises(SubscribeError) as refused:
+        await asyncio.wait_for(task, 1)
+    return refused.value.result
+
+
 @pytest.mark.parametrize("protocol", [V311, V5])
 @pytest.mark.parametrize("unsubscribe", [False, True])
 async def test_each_request_receives_its_own_ordered_reason_codes(protocol, unsubscribe):
@@ -63,10 +73,10 @@ async def test_each_request_receives_its_own_ordered_reason_codes(protocol, unsu
 
         # Acknowledge in reverse order: each future keeps its own identifier.
         broker.ack(second_mid, unsubscribe, second_codes)
-        second = await asyncio.wait_for(tasks[1], 1)
+        second = await _result(tasks[1], unsubscribe)
         assert not tasks[0].done()
         broker.ack(first_mid, unsubscribe, first_codes)
-        first = await asyncio.wait_for(tasks[0], 1)
+        first = await _result(tasks[0], unsubscribe)
 
         assert type(first) is model and type(second) is model
         assert (first.mid, first.reason_codes) == (first_mid, first_codes)

@@ -33,6 +33,7 @@ from mqttium.errors import (
     NotConnectedError,
     PacketTooLargeError,
     ProtocolError,
+    PublishRejectedError,
     SessionDiscardedError,
     SessionReplayError,
 )
@@ -45,7 +46,12 @@ from mqttium.protocol._sizing import publish_logical_size
 from mqttium.protocol.stats import OutboundStats
 from mqttium.topics import encode_validated_publish_topic, validate_publish_topic
 from mqttium.transport.writes import WriteItem
-from mqttium.types import OutboundMessage, OutboundMessageSummary, Properties
+from mqttium.types import (
+    OutboundMessage,
+    OutboundMessageSummary,
+    Properties,
+    _properties_without_topic_alias,
+)
 
 if TYPE_CHECKING:
     from mqttium.protocol.engine import ProtocolEngine
@@ -164,11 +170,7 @@ class OutboundSession:
     @staticmethod
     def _properties_without_topic_alias(properties: Properties | None) -> Properties | None:
         """Return replay-safe properties without connection-scoped alias state."""
-        if properties is None or properties.get("topic_alias") is None:
-            return properties
-        values = dict(properties.values)
-        values.pop("topic_alias", None)
-        return Properties(values=values)
+        return _properties_without_topic_alias(properties)
 
     # --- effect emission ---------------------------------------------------
     # Always routed through the engine, never into a cached list: take_effects()
@@ -646,7 +648,7 @@ class OutboundSession:
         self._finish(
             mid,
             OutboundQoSState.WAIT_PUBACK,
-            None if reason_code < 128 else ProtocolError(f"PUBACK reason_code={reason_code}"),
+            None if reason_code < 128 else PublishRejectedError("PUBACK", reason_code, properties),
         )
 
     def _require_pubrel_capacity(self, size: int) -> None:
@@ -666,7 +668,7 @@ class OutboundSession:
             self._finish(
                 mid,
                 OutboundQoSState.WAIT_PUBREC,
-                ProtocolError(f"PUBREC reason_code={reason_code}"),
+                PublishRejectedError("PUBREC", reason_code, properties),
             )
             return
         limit = self._engine.negotiated.maximum_packet_size
@@ -714,7 +716,7 @@ class OutboundSession:
         self._finish(
             mid,
             OutboundQoSState.WAIT_PUBCOMP,
-            None if reason_code < 128 else ProtocolError(f"PUBCOMP reason_code={reason_code}"),
+            None if reason_code < 128 else PublishRejectedError("PUBCOMP", reason_code, properties),
         )
 
     # --- launching and retransmission ---------------------------------------

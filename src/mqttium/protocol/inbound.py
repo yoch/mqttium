@@ -35,6 +35,7 @@ from mqttium.types import (
     Message,
     Properties,
     _decoded_message,
+    _properties_without_topic_alias,
 )
 
 if TYPE_CHECKING:
@@ -378,17 +379,24 @@ class InboundSession:
             assert properties is not None
             if not message.topic or properties.get("topic_alias") is not None:
                 topic = self._resolve_topic_fields(message.topic, properties)
-                if topic != message.topic:
-                    message = _decoded_message(
-                        topic,
-                        message.payload,
-                        QoS.AT_MOST_ONCE,
-                        message.retain,
-                        False,
-                        None,
-                        properties,
-                    )
-            decoded_property_wire_size = property_wire_size if properties.values else None
+                # The alias is connection state; the application gets the
+                # Topic Name and properties it can forward unchanged.
+                properties = _properties_without_topic_alias(properties)
+                assert properties is not None
+                # The wire size measured the alias; size the stripped set.
+                property_wire_size = 0
+                message = _decoded_message(
+                    topic,
+                    message.payload,
+                    QoS.AT_MOST_ONCE,
+                    message.retain,
+                    False,
+                    None,
+                    properties,
+                )
+            decoded_property_wire_size = (
+                property_wire_size if property_wire_size and properties.values else None
+            )
             self._engine._emit(
                 (
                     EffectKind.DECODED_MESSAGE
@@ -413,7 +421,13 @@ class InboundSession:
         ) = decode_publish_fields_v5(raw, qos)
         if not topic or properties.get("topic_alias") is not None:
             topic = self._resolve_topic_fields(topic, properties)
-        decoded_property_wire_size = property_wire_size if properties.values else None
+            properties = _properties_without_topic_alias(properties)
+            assert properties is not None
+            # The wire size measured the alias; size the stripped set.
+            property_wire_size = 0
+        decoded_property_wire_size = (
+            property_wire_size if property_wire_size and properties.values else None
+        )
         assert decoded_mid is not None
         handler = self._on_qos1 if qos is QoS.AT_LEAST_ONCE else self._on_qos2
         handler(
