@@ -200,6 +200,7 @@ nav:
       - Cookbook: cookbook.md
   - Migration:
       - Migrating to MQTTium: migration.md
+      - Coming from Paho or aiomqtt: paho-compatibility.md
   - Reference:
       - Native API: reference/index.md
       - AsyncClient: reference/async-client.md

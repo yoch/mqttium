@@ -18,6 +18,23 @@ edition, plugin, authentication provider, or deployment topology.
 The wheel is platform-independent Python. Transport availability still depends
 on the operating system; Unix-domain sockets are not a portable Windows API.
 
+## Event loops
+
+MQTTium runs on any `asyncio` event loop and never creates or configures one.
+
+| Loop | Receive path | Project status |
+| --- | --- | --- |
+| CPython's default selector loop (Linux, macOS) | Plain TCP reads straight into the decoder's buffer | Tested on every change |
+| Windows default `ProactorEventLoop` | Standard asyncio streams | Tested in the cross-platform jobs |
+| TLS on any loop | Standard asyncio streams | Tested |
+| Third-party loops (for example uvloop) | Standard asyncio streams | Not tested by the project |
+
+The faster receive path is reserved for the stdlib selector loop because its
+evidence is CPython-specific; every other loop uses the portable stream path
+with the same protocol behaviour. A third-party loop is expected to work
+through that path, but it is not part of the validation matrix; report issues
+with the loop name and version.
+
 ## MQTT protocol
 
 Only MQTT 3.1.1 and MQTT 5 are supported and tested.

@@ -8,6 +8,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Added
 
+- A "Coming from Paho or aiomqtt" guide covering the differences that surface
+  in real deployments, and an event-loop section in the compatibility matrix.
 - `ClientStats.connected_since`, `last_disconnect_error` and
   `last_disconnect_reason_code`, and
   `DeliveryStats.callback_invocations`, `callback_failures` and
