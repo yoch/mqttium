@@ -8,6 +8,7 @@ timeouts, persistence, and error policy with deployment-specific choices.
 ```python
 import asyncio
 
+from mqttium import ConnectionState, SubscribeError
 from mqttium.api import AsyncClient, ReconnectPolicy
 
 
@@ -16,19 +17,31 @@ async def run_service() -> None:
         "service-a",
         reconnect=ReconnectPolicy(max_retries=None),
     )
+    failure: list[BaseException] = []
 
     async def on_connect(connack):
         if not connack.session_present:
-            await client.subscribe("commands/service-a", qos=1)
+            try:
+                await client.subscribe("commands/service-a", qos=1)
+            except SubscribeError as exc:
+                # Refused by the broker (ACL, quota): running on would receive
+                # nothing, so stop and let the supervisor report it.
+                failure.append(exc)
+                await client.disconnect()
+
+    def on_disconnect(cause):
+        if client.state is ConnectionState.DISCONNECTED and cause is not None:
+            failure.append(cause)  # the reconnect policy gave up
 
     client.on_connect = on_connect
-    try:
+    client.on_disconnect = on_disconnect
+    async with client:
         await client.connect("broker.example", 8883, ssl=True)
-
+        # The stream ends when the client stops for good.
         async for message in client.messages():
             await handle_command(message)
-    finally:
-        await client.disconnect()
+    if failure:
+        raise RuntimeError("MQTT service stopped") from failure[0]
 
 
 asyncio.run(run_service())
@@ -38,6 +51,10 @@ Use `on_connect` to restore subscriptions when the broker starts a new session,
 including after automatic reconnect. MQTTium does not retain application
 subscription intent. A resumed session already contains its subscriptions;
 `clean_start=True`, the default, requests a new session.
+
+`subscribe()` raises `SubscribeError` when the broker refuses a filter, and
+`on_disconnect` sees `DISCONNECTED` only when no reconnection will follow;
+both are where a service decides to stop instead of running deaf.
 
 `connect()` does not wait for this hook to finish. Incoming processing also
 does not wait for it; add an application readiness signal if processing depends

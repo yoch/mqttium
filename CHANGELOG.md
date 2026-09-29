@@ -8,6 +8,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Added
 
+- A "Coming from Paho or aiomqtt" guide covering the differences that surface
+  in real deployments, and an event-loop section in the compatibility matrix.
 - `ConnectError`, raised by `connect()` when DNS, TCP, TLS or the WebSocket
   upgrade fails. It is both an `MQTTError` and an `OSError`, with the original
   error as `__cause__`, so `except MQTTError` now covers every connection

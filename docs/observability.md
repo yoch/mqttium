@@ -52,26 +52,30 @@ log = logging.getLogger("myapp.mqtt")
 class ObservedClient:
     def __init__(self, client: AsyncClient) -> None:
         self._client = client
-        self.published = 0
+        self.confirmed = 0
         self.errors = 0
-        self.last_publish_latency = 0.0
+        self.last_confirm_latency = 0.0
         client.on_disconnect = self._on_disconnect
 
-    async def publish(self, topic, payload, **kwargs):
+    async def publish_confirmed(self, topic, payload, **kwargs):
+        # publish() returns once the message is admitted; the broker's answer
+        # arrives on the receipt. Count and time the confirmation, not the
+        # admission, or failures after admission go unseen.
         started = time.monotonic()
         try:
             receipt = await self._client.publish(topic, payload, **kwargs)
-            self.published += 1
-            return receipt
-        except Exception:
+            await receipt.wait()
+        except Exception as exc:
             self.errors += 1
-            log.warning("MQTT publish failed for topic=%s", topic)
+            log.warning("MQTT publish to %s failed: %r", topic, exc)
             raise
-        finally:
-            self.last_publish_latency = time.monotonic() - started
+        self.confirmed += 1
+        self.last_confirm_latency = time.monotonic() - started
+        return receipt
 
     def _on_disconnect(self, error) -> None:
-        log.info("MQTT disconnected: %r", error)
+        # The state is final when the hook runs: RECONNECTING or DISCONNECTED.
+        log.info("MQTT disconnected (%s): %r", self._client.state.name, error)
 
     def __getattr__(self, name):
         return getattr(self._client, name)

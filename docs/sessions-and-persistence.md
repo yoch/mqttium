@@ -179,6 +179,19 @@ finally:
 structure makes that convenient. `close()` is idempotent, but closing inside an
 active store batch is rejected.
 
+Three properties of the store matter when sizing a deployment:
+
+- **Durability.** The database runs with `synchronous=NORMAL` in WAL mode: a
+  committed transaction survives a process crash, but the last transactions
+  before a power loss or kernel crash may be lost. Recovery then behaves like
+  a missing record: the broker session, not the store, decides what is resent.
+- **Event-loop blocking.** Every store call runs synchronously on the event
+  loop. A lock held by another connection to the same file makes a call wait
+  up to the five-second busy timeout, with the whole client stalled.
+- **One client per file.** A store file belongs to one client in one process.
+  Two clients sharing a file would contend for the lock and overwrite each
+  other's packet identifiers; give each client its own database.
+
 The database uses WAL mode and schema 5, recorded by
 `PRAGMA user_version`. Only new databases and schema 5 are accepted. Historical,
 future and inconsistent schemas are refused without migrating, resetting, or
