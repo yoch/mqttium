@@ -30,6 +30,20 @@ class ProtocolError(MQTTError):
     """Valid framing but illegal MQTT protocol usage."""
 
 
+class ConnectRefusedError(ProtocolError):
+    """The broker refused CONNECT with a nonzero CONNACK reason code.
+
+    ``reason_code`` is the CONNACK code (MQTT 3.1.1 return code or MQTT 5
+    reason code); ``properties`` holds the MQTT 5 CONNACK properties, such as a
+    Reason String, when the broker sent them.
+    """
+
+    def __init__(self, reason_code: int, properties: Properties | None = None) -> None:
+        self.reason_code = reason_code
+        self.properties = properties
+        super().__init__(f"Connection refused: reason_code={reason_code}")
+
+
 class PacketTooLargeError(ProtocolError):
     """Packet exceeds local or negotiated maximum size."""
 

@@ -166,9 +166,27 @@ different queues.
 `ReconnectPolicy` defaults to full-jitter exponential backoff starting at one
 second and capped at 60 seconds. Passing a policy enables reconnection;
 `reconnect=None` disables it. Set `max_retries=None` for an unbounded retry
-count only when the surrounding service is expected to remain alive. Terminal
-authentication, authorization, and protocol errors are not retried. Each
+count only when the surrounding service is expected to remain alive. Each
 attempt uses the client's `connect_timeout`.
+
+Reconnection stops only when connecting again cannot help:
+
+- a CONNACK refusal or broker DISCONNECT with a terminal reason code:
+  MQTT 3.1.1 return codes 1, 2, 4 and 5; MQTT 5 `0x81`, `0x82`, `0x84`–`0x87`,
+  `0x8A`, `0x8C`, `0x8E` (*Session taken over*), `0x90`, `0x95`, `0x99`–`0x9D`;
+- a malformed packet from the broker (`MalformedPacketError`);
+- a resumed session the new CONNACK forbids replaying (`SessionReplayError`) or a
+  mandatory acknowledgement the broker's packet limit can never admit
+  (`MandatoryResponseTooLargeError`);
+- a local store or invariant failure.
+
+Everything else is retried with backoff, including network and TLS failures (a
+certificate rejected during a rotation), broker protocol violations, local
+limit breaches and a slow application consumer. Set
+`ReconnectPolicy(retry_refused=True)` to retry terminal CONNACK refusals too, for
+brokers whose credentials or authorization can change while the client waits.
+`client.state` reads `RECONNECTING` while a retry is pending and `DISCONNECTED`
+once none will follow.
 
 MQTT 5 `Use another server` and `Server moved` are terminal. The application
 chooses any replacement endpoint explicitly. Broker DISCONNECT details arrive

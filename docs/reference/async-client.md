@@ -30,7 +30,7 @@ background thread.
 
 | Member | Meaning |
 | --- | --- |
-| `state` | Current `ConnectionState` |
+| `state` | Current `ConnectionState`; `RECONNECTING` while the reconnect policy will retry, `DISCONNECTED` once nothing will reconnect automatically |
 | `is_connected` | Whether the client is currently connected |
 | `negotiated` | Broker-negotiated MQTT settings after CONNACK |
 | `effective_client_id` | Requested or broker-assigned client identifier |
@@ -86,6 +86,23 @@ effect and connection locks have been released. A successful `connect()` and
 completion. `on_connect` may subscribe or publish normally; it is not a barrier
 that delays already-available incoming messages until initialization finishes.
 Use an application signal if processing depends on that initialization.
+
+`client.state` is already final when `on_disconnect` runs: `RECONNECTING` if
+the reconnect policy will try again, `DISCONNECTED` if the client stays down
+until the application calls `connect()`. A service that must stop, restart or
+alert when the client gives up checks it there:
+
+```python
+def on_disconnect(cause: BaseException | None) -> None:
+    if client.state is ConnectionState.DISCONNECTED:
+        stopped.set()  # no automatic reconnection will follow
+
+
+client.on_disconnect = on_disconnect
+```
+
+A refused CONNACK is a `ConnectRefusedError` whose `reason_code` (and MQTT 5
+`properties`) says why.
 
 Lifecycle notifications describe the latest state, not a lossless transition
 log. MQTTium retains one active hook and at most one pending notification;

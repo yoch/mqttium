@@ -6,8 +6,8 @@ import ssl
 import pytest
 
 from mqttium.api import AsyncClient, Properties
-from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
-from mqttium.errors import MalformedPacketError, ProtocolError
+from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType, QoS
+from mqttium.errors import ConnectRefusedError, MalformedPacketError, ProtocolError
 from mqttium.packets import PublishPacket, encode_frame
 from mqttium.protocol.reconnect import ReconnectPolicy
 from tests.support import ScriptedBrokerTransport, wait_until
@@ -58,9 +58,58 @@ async def stopped(client):
         (b"\xe1\x00", MalformedPacketError),
         # A zero topic alias has legal framing but violates MQTT 5.
         (b"\x30\x07\x00\x01t\x03\x23\x00\x00", MalformedPacketError),
+    ],
+)
+async def test_malformed_session_closes_stream_and_settles_pending(wire, error):
+    transport = QuietBroker()
+    client = AsyncClient(
+        "terminal-peer",
+        protocol=MQTTProtocolVersion.MQTTv5,
+        keepalive=0,
+        reconnect=retry_policy(),
+    )
+    attempts = []
+    disconnected = []
+    states = []
+
+    async def factory(*args, **kwargs):
+        attempts.append(True)
+        return transport
+
+    def on_disconnect(cause):
+        disconnected.append(cause)
+        states.append(client.state)
+
+    client._transport_factory = factory
+    client.on_disconnect = on_disconnect
+    try:
+        await client.connect("unused")
+        stream = client.messages()
+        receipt = await client.publish("pending", b"x", qos=1)
+        await asyncio.wait_for(transport.published.wait(), 1)
+        transport.push_rx(wire)
+        await stopped(client)
+        assert len(attempts) == 1
+        assert len(disconnected) == 1
+        assert isinstance(disconnected[0], error)
+        # The hook already sees the final state.
+        assert states == [ConnectionState.DISCONNECTED]
+        with pytest.raises(error) as caught:
+            await receipt.wait()
+        assert caught.value is disconnected[0]
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(anext(stream), 1)
+        assert client.stats().receipts.publish == 0
+    finally:
+        await client.disconnect()
+
+
+@pytest.mark.parametrize(
+    ("wire", "error"),
+    [
         # A second CONNACK on an established connection is a protocol error.
         (b"\x20\x03\x00\x00\x00", ProtocolError),
-        # The local decode budget must also stop retry and settle pending work.
+        # A local decode budget ends this connection, not the client.
         pytest.param(
             PublishPacket(
                 topic="amplified",
@@ -75,97 +124,84 @@ async def stopped(client):
         ),
     ],
 )
-async def test_malformed_session_closes_stream_and_settles_pending(wire, error):
-    transport = QuietBroker()
+async def test_peer_protocol_error_ends_the_connection_and_is_retried(wire, error):
+    first = QuietBroker()
+    second = QuietBroker()
     client = AsyncClient(
-        "terminal-peer",
+        "retried-peer",
         protocol=MQTTProtocolVersion.MQTTv5,
         keepalive=0,
         reconnect=retry_policy(),
     )
     attempts = []
     disconnected = []
+    states = []
 
     async def factory(*args, **kwargs):
         attempts.append(True)
-        return transport
+        return first if len(attempts) == 1 else second
+
+    def on_disconnect(cause):
+        disconnected.append(cause)
+        states.append(client.state)
 
     client._transport_factory = factory
-    client.on_disconnect = disconnected.append
+    client.on_disconnect = on_disconnect
     try:
         await client.connect("unused")
         stream = client.messages()
-        receipt = await client.publish("pending", b"x", qos=1)
-        await asyncio.wait_for(transport.published.wait(), 1)
-        transport.push_rx(wire)
-        await stopped(client)
-        assert len(attempts) == 1
-        assert len(disconnected) == 1
+        first.push_rx(wire)
+        await wait_until(lambda: len(attempts) == 2 and client.is_connected)
         assert isinstance(disconnected[0], error)
-        with pytest.raises(error) as caught:
-            await receipt.wait()
-        assert caught.value is disconnected[0]
-        with pytest.raises(StopAsyncIteration):
-            await asyncio.wait_for(anext(stream), 1)
-        assert client.stats().receipts.publish == 0
+        assert states == [ConnectionState.RECONNECTING]
+        packet = PublishPacket(
+            topic="after/retry", payload=b"ok", qos=QoS.AT_MOST_ONCE, retain=False, dup=False
+        )
+        second.push_rx(packet.encode(MQTTProtocolVersion.MQTTv5))
+        assert (await asyncio.wait_for(anext(stream), 1)).payload == b"ok"
+        await stream.aclose()
     finally:
         await client.disconnect()
 
 
-async def test_certificate_failure_reports_cause_and_allows_explicit_repair():
+async def test_certificate_failure_is_retried_until_the_rotation_completes():
     first = QuietBroker()
-    replacement = QuietBroker()
+    rotated = QuietBroker()
     cause = ssl.SSLCertVerificationError(1, "certificate verify failed: test CA")
     client = AsyncClient(
-        "terminal-tls",
+        "retried-tls",
         protocol=MQTTProtocolVersion.MQTTv5,
         keepalive=0,
         reconnect=retry_policy(),
     )
     attempts = []
-    disconnected = []
+    states = []
 
     async def factory(*args, **kwargs):
         attempts.append(True)
         if len(attempts) == 1:
             return first
-        raise cause
+        if len(attempts) == 2:
+            states.append(client.state)
+            raise cause
+        return rotated
 
     client._transport_factory = factory
-    client.on_disconnect = disconnected.append
     try:
         await client.connect("unused")
         stream = client.messages()
-        receipt = await client.publish("pending", b"x", qos=1)
-        await asyncio.wait_for(first.published.wait(), 1)
         first.push_rx(b"")
-        await stopped(client)
-        assert len(attempts) == 2
-        assert disconnected[-1] is cause
-        assert sum(item is cause for item in disconnected) == 1
-        with pytest.raises(ssl.SSLCertVerificationError) as caught:
-            await receipt.wait()
-        assert caught.value is cause
-        with pytest.raises(StopAsyncIteration):
-            await asyncio.wait_for(anext(stream), 1)
+        # A rejected certificate during a rotation is transient: the policy
+        # keeps trying and the same application stream resumes.
+        await wait_until(lambda: len(attempts) == 3 and client.is_connected)
+        assert states == [ConnectionState.RECONNECTING]
         assert client._local_terminal_failure is None
-
-        async def repaired(*args, **kwargs):
-            return replacement
-
-        client._transport_factory = repaired
-        await client.connect("repaired")
-        assert client.is_connected
-        with pytest.raises(StopAsyncIteration):
-            await anext(stream)
-        new_stream = client.messages()
         packet = PublishPacket(
-            topic="repaired", payload=b"ok", qos=QoS.AT_MOST_ONCE, retain=False, dup=False
+            topic="rotated", payload=b"ok", qos=QoS.AT_MOST_ONCE, retain=False, dup=False
         )
-        replacement.push_rx(packet.encode(MQTTProtocolVersion.MQTTv5))
-        message = await asyncio.wait_for(anext(new_stream), 1)
-        assert message.payload == b"ok"
-        await new_stream.aclose()
+        rotated.push_rx(packet.encode(MQTTProtocolVersion.MQTTv5))
+        assert (await asyncio.wait_for(anext(stream), 1)).payload == b"ok"
+        await stream.aclose()
     finally:
         await client.disconnect()
 
@@ -257,29 +293,39 @@ async def test_transient_setup_failure_keeps_backoff_and_same_application_stream
 
 
 @pytest.mark.parametrize(
-    ("protocol", "reason", "retry"),
+    ("protocol", "reason", "retry_refused", "retry"),
     [
-        (MQTTProtocolVersion.MQTTv311, 3, True),
-        (MQTTProtocolVersion.MQTTv311, 5, False),
-        (MQTTProtocolVersion.MQTTv5, 0x88, True),
-        (MQTTProtocolVersion.MQTTv5, 0x89, True),
-        (MQTTProtocolVersion.MQTTv5, 0x87, False),
+        (MQTTProtocolVersion.MQTTv311, 3, False, True),
+        (MQTTProtocolVersion.MQTTv311, 5, False, False),
+        (MQTTProtocolVersion.MQTTv311, 5, True, True),
+        (MQTTProtocolVersion.MQTTv5, 0x88, False, True),
+        (MQTTProtocolVersion.MQTTv5, 0x89, False, True),
+        (MQTTProtocolVersion.MQTTv5, 0x87, False, False),
+        (MQTTProtocolVersion.MQTTv5, 0x87, True, True),
     ],
 )
-async def test_connack_refusals_keep_reason_code_policy(protocol, reason, retry):
+async def test_connack_refusals_keep_reason_code_policy(protocol, reason, retry_refused, retry):
     brokers = [
         QuietBroker(protocol=protocol),
         QuietBroker(protocol=protocol, reason=reason),
         QuietBroker(protocol=protocol),
     ]
-    client = AsyncClient("reason-policy", protocol=protocol, keepalive=0, reconnect=retry_policy())
+    policy = ReconnectPolicy(
+        initial_delay=0.002, max_delay=0.008, stable_after=0, retry_refused=retry_refused
+    )
+    client = AsyncClient("reason-policy", protocol=protocol, keepalive=0, reconnect=policy)
     attempts = []
+    disconnected = []
 
     async def factory(*args, **kwargs):
         attempts.append(True)
         return brokers[min(len(attempts) - 1, 2)]
 
+    def on_disconnect(cause):
+        disconnected.append((cause, client.state))
+
     client._transport_factory = factory
+    client.on_disconnect = on_disconnect
     try:
         await client.connect("unused")
         stream = client.messages()
@@ -292,7 +338,65 @@ async def test_connack_refusals_keep_reason_code_policy(protocol, reason, retry)
             assert len(attempts) == 2
             with pytest.raises(StopAsyncIteration):
                 await asyncio.wait_for(anext(stream), 1)
+            # The refusal is typed, carries its code, and the hook that
+            # reports it already sees the final state.
+            refusal, state = disconnected[-1]
+            assert isinstance(refusal, ConnectRefusedError)
+            assert refusal.reason_code == reason
+            assert state is ConnectionState.DISCONNECTED
+            assert client.stats().state is ConnectionState.DISCONNECTED
         await stream.aclose()
     finally:
         await client.disconnect()
         await wait_until(lambda: not any(client._running_tasks().values()))
+
+
+async def test_session_taken_over_stops_instead_of_evicting_forever():
+    first = QuietBroker()
+    client = AsyncClient(
+        "taken-over",
+        protocol=MQTTProtocolVersion.MQTTv5,
+        keepalive=0,
+        reconnect=retry_policy(),
+    )
+    attempts = []
+    states = []
+
+    async def factory(*args, **kwargs):
+        attempts.append(True)
+        return first
+
+    client._transport_factory = factory
+    client.on_disconnect = lambda cause: states.append(client.state)
+    try:
+        await client.connect("unused")
+        first.push_rx(b"\xe0\x02\x8e\x00")  # DISCONNECT: Session taken over
+        await stopped(client)
+        assert len(attempts) == 1
+        assert states == [ConnectionState.DISCONNECTED]
+    finally:
+        await client.disconnect()
+
+
+async def test_stats_report_reconnecting_during_backoff():
+    first = QuietBroker()
+    client = AsyncClient(
+        "reconnecting-stats",
+        protocol=MQTTProtocolVersion.MQTTv5,
+        keepalive=0,
+        reconnect=ReconnectPolicy(initial_delay=30.0, max_delay=30.0),
+    )
+
+    async def factory(*args, **kwargs):
+        return first
+
+    client._transport_factory = factory
+    try:
+        await client.connect("unused")
+        first.push_rx(b"")
+        await wait_until(lambda: client.state is ConnectionState.RECONNECTING)
+        assert client.stats().state is ConnectionState.RECONNECTING
+        assert not client.is_connected
+    finally:
+        await client.disconnect()
+    assert client.state is ConnectionState.DISCONNECTED

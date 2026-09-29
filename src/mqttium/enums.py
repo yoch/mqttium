@@ -87,10 +87,16 @@ class InboundQoSState(IntEnum):
 
 
 class ConnectionState(IntEnum):
-    """Observable lifecycle state of an :class:`mqttium.api.AsyncClient`."""
+    """Observable lifecycle state of an :class:`mqttium.api.AsyncClient`.
+
+    ``RECONNECTING`` means the connection was lost and the reconnect policy
+    will try again. ``DISCONNECTED`` means no automatic reconnection is
+    pending: the client stays down until the application calls ``connect()``.
+    """
 
     NEW = 1
     CONNECTING = 2
     CONNECTED = 3
     DISCONNECTING = 4
     DISCONNECTED = 5
+    RECONNECTING = 6

@@ -32,6 +32,7 @@ from mqttium.api.stats import (
 )
 from mqttium.errors import (
     BrokerDisconnectError,
+    ConnectRefusedError,
     FlowControlError,
     MQTTError,
     MQTTTimeoutError,
@@ -54,6 +55,7 @@ from mqttium.types import Message, Properties
 
 STABLE_ROOT_EXPORTS = {
     "BrokerDisconnectError": BrokerDisconnectError,
+    "ConnectRefusedError": ConnectRefusedError,
     "ConnectionState": ConnectionState,
     "FlowControlError": FlowControlError,
     "MQTTError": MQTTError,
@@ -167,6 +169,7 @@ def test_reconnect_policy_describes_only_the_retry_progression() -> None:
         "max_delay": 60.0,
         "max_retries": None,
         "stable_after": 30.0,
+        "retry_refused": False,
     }
     parameters = inspect.signature(ReconnectPolicy).parameters
     assert {name: parameter.default for name, parameter in parameters.items()} == expected_defaults
@@ -360,7 +363,8 @@ def test_batch_error_carries_only_its_receipt() -> None:
 
 
 def test_stable_enumerations_have_no_unused_members() -> None:
-    # MQTT 3.1 is unsupported and no state is reported while reconnecting.
+    # MQTT 3.1 is unsupported. RECONNECTING is reported while the reconnect
+    # policy retries, so DISCONNECTED always means stopped.
     assert [level.name for level in MQTTProtocolVersion] == ["MQTTv311", "MQTTv5"]
     assert [state.name for state in ConnectionState] == [
         "NEW",
@@ -368,6 +372,7 @@ def test_stable_enumerations_have_no_unused_members() -> None:
         "CONNECTED",
         "DISCONNECTING",
         "DISCONNECTED",
+        "RECONNECTING",
     ]
 
 
