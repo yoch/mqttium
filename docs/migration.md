@@ -25,6 +25,11 @@
 - Assigning `on_message` or calling `message_callback_add()` with iterator
   delivery raises `ValueError`; it used to be silently ignored.
 - `AsyncClient` supports `async with`, which calls `disconnect()` on exit.
+- An MQTT 5 client connecting with `clean_start=False` accepts Session Present
+  even when it holds no incomplete QoS exchange, so a restarted durable
+  subscriber resumes its broker session instead of failing with
+  `ProtocolError`. Remove any workaround that connected once with
+  `clean_start=True` after a restart; it discarded the session.
 
 ## Changes since 1.0.0rc17
 

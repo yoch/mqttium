@@ -57,3 +57,37 @@ async def test_subscribe_only_durable_session_resumes() -> None:
         assert resumed.session_present is True
     finally:
         await client.disconnect()
+
+
+async def test_durable_session_resumes_after_a_process_restart() -> None:
+    """A new client instance (a restarted process) resumes its broker session."""
+    client_id = "mqttium-it-restart-resume"
+    topic = "mqttium/it/restart-resume"
+    options = {
+        "protocol": MQTTProtocolVersion.MQTTv5,
+        "clean_start": False,
+        "connect_properties": Properties({"session_expiry_interval": 60}),
+    }
+    first = AsyncClient(client_id, **options)
+    try:
+        await first.connect("127.0.0.1", 11883, timeout=5)
+        await first.subscribe(topic, qos=1)
+    finally:
+        await first.disconnect()
+
+    publisher = AsyncClient("mqttium-it-restart-publisher")
+    try:
+        await publisher.connect("127.0.0.1", 11883, timeout=5)
+        receipt = await publisher.publish(topic, b"while-offline", qos=1)
+        await receipt.wait()
+    finally:
+        await publisher.disconnect()
+
+    restarted = AsyncClient(client_id, **options)
+    try:
+        connack = await restarted.connect("127.0.0.1", 11883, timeout=5)
+        assert connack.session_present is True
+        message = await asyncio.wait_for(anext(restarted.messages()), timeout=5)
+        assert message.payload == b"while-offline"
+    finally:
+        await restarted.disconnect()

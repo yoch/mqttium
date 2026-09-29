@@ -57,7 +57,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=1883)
-    parser.add_argument("--client-id", default=f"mqttium-durable-{uuid.uuid4().hex}")
+    # The broker finds the session again only under the same identifier.
+    parser.add_argument("--client-id", default="mqttium-durable-example")
     parser.add_argument("--topic", default=f"mqttium/durable/{uuid.uuid4().hex}")
     parser.add_argument("--protocol", choices=("311", "5"), default="5")
     parser.add_argument("--session-expiry", type=int, default=86_400)
