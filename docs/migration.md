@@ -25,6 +25,17 @@
 - Assigning `on_message` or calling `message_callback_add()` with iterator
   delivery raises `ValueError`; it used to be silently ignored.
 - `AsyncClient` supports `async with`, which calls `disconnect()` on exit.
+- `max_inbound_inflight`, `maximum_packet_size` and `max_inbound_inflight_bytes`
+  default to `None`. MQTT 5 still advertises and enforces 100 exchanges and
+  16 MiB packets; MQTT 3.1.1 enforces inbound limits only when set explicitly,
+  and no client bounds inbound bytes by default. Pass the 1.0 values
+  (`100`, `16 * 1024 * 1024`, `64 * 1024 * 1024`) to keep the old local bounds.
+  An explicit `maximum_packet_size=None` used to mean 16 MiB on both protocols.
+- On MQTT 3.1.1, `max_outbound_inflight` defaults to 20 in flight instead of no
+  local limit. Set it explicitly for a broker configured with a larger window.
+- A publication larger than `max_unacknowledged_bytes` is admitted alone
+  instead of raising `FlowControlError`; set the bound above your largest
+  message if other publications must not wait behind it.
 - After a reconnect without a broker session, unacknowledged QoS 1
   publications are sent again as new ones and their receipts complete normally;
   only QoS 2 receipts fail with `SessionDiscardedError`. Remove application
