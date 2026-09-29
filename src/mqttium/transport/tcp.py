@@ -12,6 +12,11 @@ from mqttium.transport._push import DecoderPushProtocol, PushStreamTransport
 from mqttium.transport._stream import StreamTransport, StreamTransportBase
 
 
+# RFC 8305 recommends 250 ms before trying the next address family, so a host
+# whose IPv6 address is unreachable still connects promptly over IPv4.
+HAPPY_EYEBALLS_DELAY = 0.25
+
+
 class TcpTransport(StreamTransport):
     """asyncio stream transport with TCP_NODELAY enabled when available."""
 
@@ -30,7 +35,9 @@ class TcpTransport(StreamTransport):
             # TLS receives through SSLProtocol, which does not expose the raw
             # socket to a BufferedProtocol; Proactor and third-party loops keep
             # the mature stdlib path. Both still use the decoder's feed().
-            reader, writer = await asyncio.open_connection(host, port, ssl=ssl)
+            reader, writer = await asyncio.open_connection(
+                host, port, ssl=ssl, happy_eyeballs_delay=HAPPY_EYEBALLS_DELAY
+            )
             transport = cls(reader, writer)
         _set_nodelay(transport)
         return transport
@@ -55,7 +62,9 @@ async def _connect_push(
 ) -> PushStreamTransport:
     reader = asyncio.StreamReader(loop=loop)
     protocol = DecoderPushProtocol(reader, loop=loop)
-    transport, _ = await loop.create_connection(lambda: protocol, host, port)
+    transport, _ = await loop.create_connection(
+        lambda: protocol, host, port, happy_eyeballs_delay=HAPPY_EYEBALLS_DELAY
+    )
     writer = asyncio.StreamWriter(transport, protocol, reader, loop)
     return PushStreamTransport(reader, writer, protocol)
 

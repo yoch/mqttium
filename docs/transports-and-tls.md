@@ -12,6 +12,10 @@ await client.connect("broker.example", 1883, timeout=10)
 Plain TCP provides no confidentiality or peer authentication. Use it only on a
 trusted network or inside another authenticated tunnel.
 
+When a host name resolves to both IPv6 and IPv4 addresses, TCP, TLS and
+WebSocket connections race the address families (RFC 8305, 250 ms apart), so
+an unreachable IPv6 route does not hold the connection until the timeout.
+
 ## TLS
 
 Use Python's normal `SSLContext` so certificate authorities, client
@@ -51,8 +55,13 @@ await client.connect_ws(
 )
 ```
 
-The transport uses RFC 6455 binary frames and requests the MQTT subprotocol.
-Use `wss://` outside a trusted local environment. Extra headers are visible to
+The transport uses RFC 6455 binary frames and requests the `mqtt` subprotocol.
+A server answering `mqtt`, the MQTT 3.1 name `mqttv3.1`, or no subprotocol at
+all is accepted; any other subprotocol fails the connection. The `Host` header
+omits the scheme's default port (80 for `ws://`, 443 for `wss://`). A URL
+carrying credentials (`ws://user:secret@host/`) is refused: MQTT sends them in
+CONNECT through `username`/`password`, and HTTP authentication belongs in
+`extra_headers`. Use `wss://` outside a trusted local environment. Extra headers are visible to
 the WebSocket endpoint; do not place long-lived secrets in source code or logs.
 
 A WebSocket URL must include a hostname; there is no implicit `localhost`
@@ -129,8 +138,8 @@ See [Logging and Observability](observability.md) for application-owned diagnost
 - **Message:** the fragments of one WebSocket message, reassembled, must not
   exceed the same WebSocket limit.
 - **MQTT packet:** each MQTT packet carried in those bytes must not exceed the
-  client's `maximum_packet_size` (16 MiB when unset), whatever the WebSocket
-  sizes.
+  client's `maximum_packet_size` (see the configuration guide for its
+  per-protocol default), whatever the WebSocket sizes.
 
 The WebSocket limit is the larger of 16 MiB and the client's
 `maximum_packet_size`, the same value the decoder enforces and MQTT 5 CONNECT

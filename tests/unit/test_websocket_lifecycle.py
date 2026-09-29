@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 
 import pytest
 
 from mqttium.transport.websocket import (
     WebSocketTransport,
     _build_handshake_request,
+    _parse_websocket_endpoint,
     _read_handshake_response,
+    _validate_handshake_response,
 )
 
 
@@ -85,3 +89,49 @@ async def test_handshake_timeout_is_total_not_per_chunk() -> None:
         await _read_handshake_response(reader, timeout=0.05)  # type: ignore[arg-type]
 
     assert loop.time() - started < 0.10
+
+
+def test_host_header_omits_the_scheme_default_port() -> None:
+    request = _build_handshake_request(
+        "broker.example", 443, "/mqtt", "key", None, default_port=443
+    )
+    assert b"\r\nHost: broker.example\r\n" in request
+    request = _build_handshake_request(
+        "broker.example", 8443, "/mqtt", "key", None, default_port=443
+    )
+    assert b"\r\nHost: broker.example:8443\r\n" in request
+
+
+def _upgrade_response(key: str, subprotocol: str | None) -> bytes:
+    accept = base64.b64encode(
+        hashlib.sha1(
+            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode(), usedforsecurity=False
+        ).digest()
+    )
+    lines = [
+        b"HTTP/1.1 101 Switching Protocols",
+        b"Upgrade: websocket",
+        b"Connection: Upgrade",
+        b"Sec-WebSocket-Accept: " + accept,
+    ]
+    if subprotocol is not None:
+        lines.append(b"Sec-WebSocket-Protocol: " + subprotocol.encode())
+    return b"\r\n".join(lines)
+
+
+@pytest.mark.parametrize("subprotocol", ["mqtt", "MQTT", "mqttv3.1", None])
+def test_mqtt_or_absent_subprotocol_is_accepted(subprotocol: str | None) -> None:
+    _validate_handshake_response(_upgrade_response("key", subprotocol), "key")
+
+
+def test_foreign_subprotocol_is_refused() -> None:
+    with pytest.raises(ConnectionError, match="not MQTT"):
+        _validate_handshake_response(_upgrade_response("key", "chat"), "key")
+
+
+@pytest.mark.parametrize(
+    "url", ["ws://user:secret@broker.example/mqtt", "wss://user@broker.example/mqtt"]
+)
+def test_credentials_in_the_url_are_refused(url: str) -> None:
+    with pytest.raises(ValueError, match="credentials"):
+        _parse_websocket_endpoint(url, None)

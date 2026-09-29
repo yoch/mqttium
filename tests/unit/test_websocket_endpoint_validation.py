@@ -63,7 +63,7 @@ async def test_valid_websocket_tls_configuration_is_preserved(monkeypatch, url, 
     expected = True if tls is None and url.startswith("wss:") else tls
     host = "broker.example" if url.startswith("wss:") else "localhost"
     port = 443 if url.startswith("wss:") else 80
-    opening.assert_awaited_once_with(host, port, ssl=expected)
+    opening.assert_awaited_once_with(host, port, ssl=expected, happy_eyeballs_delay=0.25)
 
 
 def test_plain_websocket_retains_explicit_false_and_ipv6_endpoint():
