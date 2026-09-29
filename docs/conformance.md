@@ -111,11 +111,18 @@ State concept from publication rows alone, although broker-side subscriptions
 are also Session State and cannot be discovered through that store. Resume tests
 now request a non-clean connection explicitly.
 
-MQTTium also retains local knowledge of a durable Session established by the
-current client instance. A subscribe-only client can accept Session Present on
-its next connection even with no incomplete local QoS exchange. A fresh client
-with neither that marker nor persisted Client Session State still rejects an
-unexpected Session Present value as required by `[MQTT-3.2.2-4]`.
+**Deliberate deviation: `[MQTT-3.2.2-4]` (MQTT 5.0)** — *"If the Client does
+not have Session State and receives Session Present set to 1 it MUST close the
+Network Connection."*
+
+MQTTium accepts Session Present whenever it sent Clean Start 0, even when it
+holds no incomplete QoS exchange. A restarted process that asks to resume its
+durable Session has, by definition, lost the in-memory knowledge of it; the
+broker-side subscriptions it asked to keep are exactly what Session Present
+reports. Closing the connection, as the letter of the statement requires, made
+every durable subscriber fail on its first connection after a restart. MQTT
+3.1.1 has no equivalent statement, and Session Present after Clean Start 1 is
+still refused as above.
 
 Persisted Client Session State includes every stored inbound row, a QoS 1 row
 too. MQTT 5 section 4.1 lists only inbound QoS 2, but a stored QoS 1 row
