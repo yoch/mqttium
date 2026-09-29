@@ -498,6 +498,7 @@ class AsyncClient:
         self._ping_deadline = 0.0
         # Monotonic time of the last byte received on the current connection.
         self._last_inbound = 0.0
+        self._connected_since = 0.0
         self._host = ""
         self._port = 1883
         self._ssl: ssl.SSLContext | bool | None = None
@@ -574,6 +575,10 @@ class AsyncClient:
                 publish_waiters=self._publish_waiters,
             ),
             transport=transport_stats,
+            connected_since=(
+                self._connected_since if self.state is ConnectionState.CONNECTED else None
+            ),
+            last_disconnect_error=self._lifecycle_hooks.last_disconnect_error,
         )
 
     def _running_tasks(self) -> dict[str, bool]:
@@ -1063,7 +1068,9 @@ class AsyncClient:
                     self._propose_disconnect_cause(refusal, _CAUSE_BROKER)
                 raise refusal
             self._reconnect_pending = False
-            self._write_pump.last_outbound = self._last_inbound = time.monotonic()
+            self._write_pump.last_outbound = self._last_inbound = self._connected_since = (
+                time.monotonic()
+            )
             self._keepalive_task = asyncio.create_task(
                 self._keepalive_loop(), name="mqttium-keepalive"
             )
@@ -1580,8 +1587,11 @@ class AsyncClient:
             for callback in matcher.iter_match(message.topic):
                 matched = True
                 yield callback
-        if not matched and self._on_message is not None:
-            yield self._on_message
+        if not matched:
+            if self._on_message is not None:
+                yield self._on_message
+            else:
+                self._delivery.unrouted_messages += 1
 
     async def subscribe(
         self,

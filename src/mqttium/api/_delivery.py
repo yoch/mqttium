@@ -96,6 +96,8 @@ class ApplicationDelivery:
         self._admission_generation = 0
         self.iterator_admission_timeout = iterator_admission_timeout
         self.callback_invocations = 0
+        self.callback_failures = 0
+        self.unrouted_messages = 0
         self._since_yield = 0
         self._accept_iterator: IteratorAcceptor = (
             self._accept_iterator_unaccounted
@@ -111,6 +113,9 @@ class ApplicationDelivery:
             iterator_high_water_bytes=self.pending_high_water_bytes,
             iterator_byte_limit=self.max_iterator_bytes,
             waiters=self.waiters,
+            callback_invocations=self.callback_invocations,
+            callback_failures=self.callback_failures,
+            unrouted_messages=self.unrouted_messages,
         )
 
     def reopen(self) -> None:
@@ -179,6 +184,8 @@ class ApplicationDelivery:
                 if self._since_yield >= _CALLBACK_QUANTUM:
                     self._since_yield %= _CALLBACK_QUANTUM
                     return asyncio.sleep(0)
+            else:
+                self.unrouted_messages += 1
             return None
         return self._accept_iterator(message, property_wire_size)
 
@@ -364,6 +371,7 @@ class ApplicationDelivery:
         """
         if self.mode == "callback":
             if callback is None:
+                self.unrouted_messages += 1
                 return
             if isinstance(callback, MessageRoute):
                 for selected in callback.select(message):
@@ -444,6 +452,8 @@ class ApplicationDelivery:
                     "message callbacks must not return awaitables; use messages() for async work"
                 )
         except asyncio.CancelledError as exc:
+            self.callback_failures += 1
             self._propagate_callback_cancellation(callback, exc)
         except Exception as exc:
+            self.callback_failures += 1
             self.report_callback_error(callback, exc)

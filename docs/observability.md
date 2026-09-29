@@ -28,6 +28,8 @@ no sampler, logging, or formatting cost.
 | Protocol failures | typed exceptions such as `ProtocolError` and `MQTTTimeoutError` |
 | Nonzero broker disconnect details | `BrokerDisconnectError.reason_code` and `.properties` through `on_disconnect`, unless a more specific failure is present |
 | Queue and resource pressure | `client.stats()` |
+| Connection age and last loss | `stats().connected_since` (monotonic seconds) and `stats().last_disconnect_error` |
+| Failing callbacks and unrouted messages | `stats().delivery.callback_failures` and `.unrouted_messages` (callback delivery) |
 
 Iterator byte occupancy is measured only when `max_iterator_bytes` is finite.
 Setting that bound to `None` selects the count-bounded unaccounted path, so
