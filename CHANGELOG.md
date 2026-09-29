@@ -21,6 +21,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- When a reconnect finds no broker session (Session Present 0), unacknowledged
+  QoS 1 publications are sent again as new ones instead of failing with
+  `SessionDiscardedError`; they keep their receipts. QoS 2 publications still
+  fail, since restarting them could deliver them twice.
 - Reconnection stops only for causes that connecting again cannot cure
   (terminal reason codes, malformed packets, unresumable sessions, local store
   failures). Broker protocol violations, local limit breaches, a slow iterator

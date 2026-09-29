@@ -25,6 +25,11 @@
 - Assigning `on_message` or calling `message_callback_add()` with iterator
   delivery raises `ValueError`; it used to be silently ignored.
 - `AsyncClient` supports `async with`, which calls `disconnect()` on exit.
+- After a reconnect without a broker session, unacknowledged QoS 1
+  publications are sent again as new ones and their receipts complete normally;
+  only QoS 2 receipts fail with `SessionDiscardedError`. Remove application
+  code that republished QoS 1 messages on that error. Consumers may see the
+  message twice, as QoS 1 always allowed.
 - An MQTT 5 client connecting with `clean_start=False` accepts Session Present
   even when it holds no incomplete QoS exchange, so a restarted durable
   subscriber resumes its broker session instead of failing with
