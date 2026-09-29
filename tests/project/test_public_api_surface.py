@@ -32,6 +32,7 @@ from mqttium.api.stats import (
 )
 from mqttium.errors import (
     BrokerDisconnectError,
+    ConnectError,
     ConnectRefusedError,
     FlowControlError,
     MQTTError,
@@ -43,8 +44,10 @@ from mqttium.errors import (
     PacketTooLargeError,
     ProtocolError,
     PublishBatchError,
+    PublishRejectedError,
     SessionDiscardedError,
     SessionReplayError,
+    SubscribeError,
 )
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.packets import AuthPacket, ConnAckPacket, SubscribeOptions
@@ -55,6 +58,7 @@ from mqttium.types import Message, Properties
 
 STABLE_ROOT_EXPORTS = {
     "BrokerDisconnectError": BrokerDisconnectError,
+    "ConnectError": ConnectError,
     "ConnectRefusedError": ConnectRefusedError,
     "ConnectionState": ConnectionState,
     "FlowControlError": FlowControlError,
@@ -68,9 +72,11 @@ STABLE_ROOT_EXPORTS = {
     "PacketTooLargeError": PacketTooLargeError,
     "ProtocolError": ProtocolError,
     "PublishBatchError": PublishBatchError,
+    "PublishRejectedError": PublishRejectedError,
     "QoS": QoS,
     "SessionDiscardedError": SessionDiscardedError,
     "SessionReplayError": SessionReplayError,
+    "SubscribeError": SubscribeError,
 }
 
 STABLE_API_EXPORTS = {

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from mqttium.api.models import PublishBatchReceipt
+    from mqttium.api.models import PublishBatchReceipt, SubscribeResult
     from mqttium.types import Properties
 
 
@@ -30,6 +30,16 @@ class ProtocolError(MQTTError):
     """Valid framing but illegal MQTT protocol usage."""
 
 
+class ConnectError(MQTTError, OSError):
+    """The network connection to the broker could not be established.
+
+    Raised by ``connect()`` for DNS resolution, TCP, TLS and WebSocket
+    handshake failures; the original error is ``__cause__``. It is also an
+    ``OSError``, so ``except OSError`` keeps catching these failures while
+    ``except MQTTError`` now covers every connection failure.
+    """
+
+
 class ConnectRefusedError(ProtocolError):
     """The broker refused CONNECT with a nonzero CONNACK reason code.
 
@@ -42,6 +52,37 @@ class ConnectRefusedError(ProtocolError):
         self.reason_code = reason_code
         self.properties = properties
         super().__init__(f"Connection refused: reason_code={reason_code}")
+
+
+class PublishRejectedError(ProtocolError):
+    """The broker refused a QoS 1/2 publication with a failure reason code.
+
+    ``reason_code`` is the PUBACK, PUBREC or PUBCOMP reason code (0x80 or
+    above); ``properties`` holds the MQTT 5 acknowledgement properties, such
+    as a Reason String, when the broker sent them.
+    """
+
+    def __init__(self, packet: str, reason_code: int, properties: Properties | None = None) -> None:
+        self.reason_code = reason_code
+        self.properties = properties
+        super().__init__(f"{packet} reason_code={reason_code}")
+
+
+class SubscribeError(MQTTError):
+    """The broker refused at least one filter of a SUBSCRIBE request.
+
+    ``result`` is the complete SUBACK result, so filters the broker accepted
+    in the same request remain visible (they are subscribed).
+    """
+
+    def __init__(self, result: SubscribeResult) -> None:
+        self.result = result
+        refused = [
+            f"{index}:0x{code:02x}"
+            for index, code in enumerate(result.reason_codes)
+            if code >= 0x80
+        ]
+        super().__init__(f"Subscription refused for filter(s) {', '.join(refused)}")
 
 
 class PacketTooLargeError(ProtocolError):

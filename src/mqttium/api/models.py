@@ -266,10 +266,18 @@ class SubscribeResult:
     Attributes:
         mid: MQTT packet identifier used by the request.
         reason_codes: One broker reason code for every requested filter.
+        properties: MQTT 5 SUBACK properties, such as a Reason String, when
+            the broker sent them.
     """
 
     mid: int
     reason_codes: tuple[int, ...]
+    properties: Properties | None = None
+
+    @property
+    def granted_qos(self) -> tuple[QoS | None, ...]:
+        """Maximum QoS granted per filter, ``None`` where the broker refused it."""
+        return tuple(QoS(code) if code < 0x80 else None for code in self.reason_codes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,8 +285,10 @@ class UnsubscribeResult:
     """Broker acknowledgement for one unsubscribe request.
 
     MQTT 3.1.1 acknowledgements have no per-filter reason codes and therefore
-    expose an empty ``reason_codes`` tuple.
+    expose an empty ``reason_codes`` tuple. ``properties`` holds the MQTT 5
+    UNSUBACK properties when the broker sent them.
     """
 
     mid: int
     reason_codes: tuple[int, ...]
+    properties: Properties | None = None

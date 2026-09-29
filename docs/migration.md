@@ -25,6 +25,17 @@
 - Assigning `on_message` or calling `message_callback_add()` with iterator
   delivery raises `ValueError`; it used to be silently ignored.
 - `AsyncClient` supports `async with`, which calls `disconnect()` on exit.
+- `connect()` raises `ConnectError` for DNS, TCP, TLS and WebSocket upgrade
+  failures. It is still an `OSError`, so existing `except OSError` handlers
+  keep working; code catching a specific subclass such as
+  `ConnectionRefusedError` or `ssl.SSLCertVerificationError` must inspect
+  `exc.__cause__` instead.
+- `subscribe()` raises `SubscribeError` when any filter is refused; read
+  `exc.result` for the per-filter reason codes. Code that checked
+  `reason_codes` for values of `0x80` or above can catch the error instead.
+- A refused publication fails its receipt with `PublishRejectedError`, a
+  `ProtocolError` subclass with `reason_code` and `properties`.
+- `keepalive` must be an `int`.
 - After a reconnect without a broker session, unacknowledged QoS 1
   publications are sent again as new ones and their receipts complete normally;
   only QoS 2 receipts fail with `SessionDiscardedError`. Remove application

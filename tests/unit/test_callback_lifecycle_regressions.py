@@ -8,7 +8,7 @@ import pytest
 
 from mqttium.api import AsyncClient, ReconnectPolicy
 from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
-from mqttium.errors import MQTTTimeoutError, ProtocolError
+from mqttium.errors import ConnectError, MQTTTimeoutError, ProtocolError
 from mqttium.packets import PublishPacket, encode_frame
 from tests.support import ScriptedBrokerTransport, wait_until
 
@@ -650,7 +650,8 @@ async def test_hook_owned_connect_preserves_operation_failure(task_factory, prot
         }[failure_kind]
         assert isinstance(caught[0], expected)
         if failure_kind == "transport":
-            assert caught[0] is failure
+            assert isinstance(caught[0], ConnectError)
+            assert caught[0].__cause__ is failure
         assert not reports
         assert client._explicit_connect_task is None
         assert client._transport is None
