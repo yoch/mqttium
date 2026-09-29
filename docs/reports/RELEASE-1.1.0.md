@@ -59,4 +59,28 @@ levels, and a Mosquitto integration test pins it.
 
 ## Qualification of `cd2c4289`
 
-QUALIFICATION_PENDING
+| Evidence | Result |
+| --- | --- |
+| [CI 36577029558](https://github.com/yoch/mqttium/actions/runs/36577029558) and [ARM64 CI 36577029782](https://github.com/yoch/mqttium/actions/runs/36577029782) | Passed |
+| [Soak and broker interoperability 36578370402](https://github.com/yoch/mqttium/actions/runs/36578370402) | Passed: Linux and macOS soaks for MQTT 3.1.1 and 5, EMQX 5.8.9 and HiveMQ CE 2026.5 |
+| Strict ARM64 network gate vs 1.0.0, [36578366687](https://github.com/yoch/mqttium/actions/runs/36578366687) | Passed: QoS 1 receipt ACK throughput at windows 1, 20 and 64 within the gate per ABBA cycle, mostly 0.976–0.995 of 1.0.0 |
+| ARM64 paired regression vs 1.0.0, [36577040928](https://github.com/yoch/mqttium/actions/runs/36577040928) | Passed: strict writer-capacity A/B 0.994 (QoS 0) and 0.990 (QoS 1), A/A 1.001 and 1.002; strict paced writer-latency A/B lag 1.001 at 2,500 and 1.000 at 10,000 msgs/s, A/A 0.998 and 1.000; advisory network sweep 0.981–1.001 |
+
+### ARM64 paired microbenchmarks against 1.0.0
+
+Median candidate/base throughput over 11 pairs (run 36577040928): receive
+paths `ingress_engine_qos0_v5` 0.984 and `ingress_publish_qos1` 0.990;
+callback delivery `effect_single_message_callback` 0.985 and
+`delivery_callback` 0.964; iterator delivery `delivery_iterator` 0.987; every
+other scenario 0.99–1.024.
+
+### Performance found during qualification
+
+The first qualification of `ef938eaa` (run 36552990604) measured
+`effect_single_message_callback` at 0.904. Counting profiler-visible calls per
+delivered message isolated it to #597, whose carryover bookkeeping ran for every
+delivery lot: 41.22 calls per message against 37.22 in 1.0.0. #609 skips that
+bookkeeping when a lot is fully delivered and restores 37.22; the scenario
+returned to 0.985. `delivery_callback` executes the same calls per message as
+1.0.0; its remaining 0.964 is attributed to code layout, not to added work, and
+is accepted for the loss fixes it accompanies.
