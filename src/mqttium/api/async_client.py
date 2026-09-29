@@ -54,12 +54,12 @@ from mqttium.dispatch.matcher import TopicMatcher
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.errors import (
     BrokerDisconnectError,
+    ConnectRefusedError,
     FlowControlError,
     MQTTError,
     MQTTTimeoutError,
     MalformedPacketError,
     MandatoryResponseTooLargeError,
-    MessageDeliveryError,
     PublishBatchError,
     PacketTooLargeError,
     ProtocolError,
@@ -471,6 +471,10 @@ class AsyncClient:
         self._transport_factory: Callable[..., Awaitable[AsyncTransport]] = TcpTransport.connect
         self._last_disconnect: DisconnectInfo | None = None
         self._last_connack_reason: int | None = None
+        # Whether a lost connection will be retried by the reconnect policy.
+        # Decided before the disconnect notification, so on_disconnect can
+        # read the final state.
+        self._reconnect_pending = False
 
         self._on_message: _OnMessage | None = None
         self._message_callback: CallbackTarget | None = None
@@ -502,7 +506,7 @@ class AsyncClient:
         transport_stats = report() if report is not None else TransportStats._unavailable(transport)
         engine = self._engine
         return ClientStats(
-            state=engine.state,
+            state=self.state,
             connections=self._connections,
             reconnect_attempt=self._reconnect.attempt,
             outbound=engine.outbound.stats(),
@@ -541,8 +545,18 @@ class AsyncClient:
 
     @property
     def state(self) -> ConnectionState:
-        """Current protocol connection state."""
-        return self._engine.state
+        """Current connection state.
+
+        ``RECONNECTING`` while the reconnect policy will retry a lost
+        connection; ``DISCONNECTED`` once no automatic reconnection is pending.
+        """
+        state = self._engine.state
+        if self._reconnect_pending and state in (
+            ConnectionState.DISCONNECTED,
+            ConnectionState.CONNECTING,
+        ):
+            return ConnectionState.RECONNECTING
+        return state
 
     @property
     def is_connected(self) -> bool:
@@ -918,11 +932,10 @@ class AsyncClient:
             if connack.reason_code != 0:
                 refusal = self._disconnect_exc
                 if not isinstance(refusal, ProtocolError):
-                    refusal = ProtocolError(
-                        f"Connection refused: reason_code={connack.reason_code}"
-                    )
+                    refusal = ConnectRefusedError(connack.reason_code, connack.properties)
                     self._propose_disconnect_cause(refusal, _CAUSE_BROKER)
                 raise refusal
+            self._reconnect_pending = False
             self._write_pump.last_outbound = self._last_inbound = time.monotonic()
             self._keepalive_task = asyncio.create_task(
                 self._keepalive_loop(), name="mqttium-keepalive"
@@ -1014,6 +1027,7 @@ class AsyncClient:
         origin = self._lifecycle_hooks.begin_operation(replace_connection=False)
         self._disconnect_hook_origin = origin
         self._intentional_disconnect = True
+        self._reconnect_pending = False
         connect_disconnect_fut = self._connect_disconnect_fut
         disconnecting_connect = (
             self._engine.state is ConnectionState.CONNECTING
@@ -1865,6 +1879,7 @@ class AsyncClient:
             reader_connack.set_exception(terminal_cause)
         self._fail_non_replayable(terminal_cause)
         will_reconnect = self._will_reconnect()
+        self._reconnect_pending = will_reconnect
         if not will_reconnect:
             self._fail_pending(terminal_cause)
         # Retire resources before lifecycle user code can install a
@@ -1895,6 +1910,7 @@ class AsyncClient:
         ``_fail_pending`` already marks teardown final and wakes parked
         publishers; this adds the stream close that every terminal path shares.
         """
+        self._reconnect_pending = False
         self._fail_pending(exc)
         self._delivery.close()
 
@@ -1905,31 +1921,36 @@ class AsyncClient:
         return self._last_connack_reason
 
     def _permanent_connection_failure(self) -> bool:
-        exc = self._disconnect_exc
-        if isinstance(
-            exc,
+        """Whether the cause can never be cured by connecting again.
+
+        A refused CONNACK and a broker DISCONNECT are judged by their reason
+        code through the reconnect policy. Everything else is transient and
+        retried with backoff -- including local limit breaches, a slow
+        application consumer and a certificate rejected during rotation --
+        except a malformed peer, a session that cannot be resumed under the
+        new limits, a mandatory response the peer can never accept, and an
+        internal invariant failure.
+        """
+        return isinstance(
+            self._disconnect_exc,
             (
-                MessageDeliveryError,
                 MandatoryResponseTooLargeError,
                 SessionReplayError,
                 AssertionError,
-                ssl.SSLCertVerificationError,
                 MalformedPacketError,
             ),
-        ):
-            return True
-        # A refused CONNACK is also exposed as ProtocolError. Its validated
-        # reason remains the policy's decision (server busy/unavailable retry).
-        # Each attempt clears this reason before opening the transport.
-        return isinstance(exc, ProtocolError) and self._last_connack_reason is None
+        )
 
     def _will_reconnect(self) -> bool:
         reason = self._retry_reason()
+        # Each attempt clears the CONNACK reason; it is set only by a refusal,
+        # after which no broker DISCONNECT can follow on that connection.
+        refused = self._last_connack_reason is not None
         return (
             self._local_terminal_failure is None
             and not self._permanent_connection_failure()
             and not self._intentional_disconnect
-            and self._reconnect.should_retry(reason, self._engine.config.protocol)
+            and self._reconnect.should_retry(reason, self._engine.config.protocol, refused=refused)
         )
 
     async def _close_transport_after_connection_failure(self) -> None:
@@ -2542,7 +2563,7 @@ class AsyncClient:
         else:
             self._last_connack_reason = connack.reason_code
             self._propose_disconnect_cause(
-                ProtocolError(f"Connection refused: reason_code={connack.reason_code}"),
+                ConnectRefusedError(connack.reason_code, connack.properties),
                 _CAUSE_BROKER,
             )
         if self._connack_fut is not None and not self._connack_fut.done():

@@ -5,6 +5,7 @@ from __future__ import annotations
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.errors import (
     BrokerDisconnectError,
+    ConnectRefusedError,
     FlowControlError,
     MQTTError,
     MQTTTimeoutError,
@@ -21,6 +22,7 @@ from mqttium.errors import (
 
 __all__ = [
     "BrokerDisconnectError",
+    "ConnectRefusedError",
     "ConnectionState",
     "FlowControlError",
     "MQTTError",

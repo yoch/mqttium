@@ -20,6 +20,7 @@ _V5_TERMINAL = frozenset(
         0x87,  # Not authorized
         0x8A,  # Banned
         0x8C,  # Bad authentication method
+        0x8E,  # Session taken over: another client uses this identifier
         0x90,  # Topic Name invalid (Will Topic on CONNACK)
         0x95,  # Packet too large (CONNECT)
         0x99,  # Payload format invalid (Will Payload)
@@ -45,9 +46,15 @@ class ReconnectPolicy:
         max_delay: Maximum base delay before jitter.
         max_retries: Maximum attempts, or ``None`` for no count limit.
         stable_after: Connected duration after which attempt state resets.
+        retry_refused: Also retry a CONNACK refusal whose reason code is
+            terminal (bad credentials, not authorized, ...), for brokers whose
+            authorization can change while the client waits.
 
     Delays use full bounded jitter in the range 50–100% of the current base.
-    Terminal authentication, protocol, and capability failures are not retried.
+    Terminal authentication, protocol, and capability failures are not retried
+    unless ``retry_refused`` covers them; a broker DISCONNECT with *Session
+    taken over* is terminal, so two clients sharing an identifier do not evict
+    each other forever.
     """
 
     initial_delay: float = 1.0
@@ -55,6 +62,7 @@ class ReconnectPolicy:
     max_delay: float = 60.0
     max_retries: int | None = None
     stable_after: float = 30.0
+    retry_refused: bool = False
 
     def __post_init__(self) -> None:
         for name in ("initial_delay", "multiplier", "max_delay", "stable_after"):
@@ -105,14 +113,24 @@ class _ReconnectState:
         self._current_delay = min(self._current_delay * policy.multiplier, policy.max_delay)
         return delay
 
-    def should_retry(self, reason_code: int | None, protocol: MQTTProtocolVersion) -> bool:
-        """Return whether the next attempt is allowed for a disconnect reason."""
+    def should_retry(
+        self,
+        reason_code: int | None,
+        protocol: MQTTProtocolVersion,
+        *,
+        refused: bool = False,
+    ) -> bool:
+        """Return whether the next attempt is allowed for a disconnect reason.
+
+        ``refused`` marks ``reason_code`` as a CONNACK refusal rather than a
+        broker DISCONNECT; the policy's ``retry_refused`` applies only to it.
+        """
         policy = self.policy
         if policy is None:
             return False
         if policy.max_retries is not None and self._attempt >= policy.max_retries:
             return False
-        if reason_code is None:
+        if reason_code is None or (refused and policy.retry_refused):
             return True
         if protocol == MQTTProtocolVersion.MQTTv5:
             if reason_code in _V5_TERMINAL:

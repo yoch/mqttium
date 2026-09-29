@@ -1,5 +1,20 @@
 # Migrating to 1.0.0
 
+## Changes in 1.1
+
+- `ConnectionState.DISCONNECTED` now means that no automatic reconnection is
+  pending. While the reconnect policy will retry, `state` and
+  `stats().state` read the new `ConnectionState.RECONNECTING`. Code comparing
+  `state` against `DISCONNECTED` to detect a lost connection must also accept
+  `RECONNECTING`; code that exhaustively matches `ConnectionState` gains a case.
+- A refused CONNACK raises `ConnectRefusedError`, a `ProtocolError` subclass
+  with `reason_code` and `properties`; `except ProtocolError` still catches it.
+- Reconnection now retries causes it used to treat as permanent: broker protocol
+  violations other than malformed packets, local limit breaches, a slow
+  iterator consumer (`MessageDeliveryError`) and TLS certificate verification
+  failures. MQTT 5 *Session taken over* (`0x8E`) is terminal instead of retried.
+  `ReconnectPolicy(retry_refused=True)` also retries terminal CONNACK refusals.
+
 ## Changes since 1.0.0rc17
 
 The stable 1.0.0 release preserves RC17's client behavior, public API and SQLite

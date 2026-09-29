@@ -65,9 +65,14 @@ must be handled by the application.
 
 ## Reconnect stops
 
-Automatic reconnect is opt-in. It stops after `max_retries` and for terminal
-authentication, authorization, and protocol errors. Inspect the final CONNACK
-or DISCONNECT reason before increasing retry counts.
+Automatic reconnect is opt-in. It stops after `max_retries` and for the causes
+that reconnecting cannot cure, listed under
+[reconnect policy](configuration-and-sizing.md#reconnect-policy). `client.state`
+is `DISCONNECTED` (not `RECONNECTING`) once it has stopped, already inside
+`on_disconnect`. Inspect the final cause: a refused CONNACK is a
+`ConnectRefusedError` with `reason_code`, a broker DISCONNECT a
+`BrokerDisconnectError`. Consider `ReconnectPolicy(retry_refused=True)` when
+authorization is expected to recover, rather than raising retry counts.
 
 ## A durable session does not resume
 

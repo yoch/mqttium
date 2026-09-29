@@ -6,6 +6,25 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `ConnectionState.RECONNECTING`, reported while the reconnect policy will retry
+  a lost connection; `DISCONNECTED` now means that no automatic reconnection is
+  pending. The state is decided before `on_disconnect` runs, so a hook can tell
+  a transient loss from the end of the client.
+- `ConnectRefusedError` (a `ProtocolError`) with `reason_code` and `properties`
+  for refused CONNACKs, instead of a code embedded in the message.
+- `ReconnectPolicy(retry_refused=...)` to retry terminal CONNACK refusals.
+
+### Changed
+
+- Reconnection stops only for causes that connecting again cannot cure
+  (terminal reason codes, malformed packets, unresumable sessions, local store
+  failures). Broker protocol violations, local limit breaches, a slow iterator
+  consumer and certificate failures are retried with backoff; they used to stop
+  the client silently for good. MQTT 5 *Session taken over* is now terminal, so
+  two clients sharing an identifier stop evicting each other.
+
 ### Fixed
 
 - Detect a dead connection from a steady publisher. Keepalive now sends
