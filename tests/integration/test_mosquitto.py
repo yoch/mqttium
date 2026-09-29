@@ -91,3 +91,35 @@ async def test_durable_session_resumes_after_a_process_restart() -> None:
         assert message.payload == b"while-offline"
     finally:
         await restarted.disconnect()
+
+
+@pytest.mark.parametrize("qos", [1, 2])
+async def test_mqtt311_publish_burst_reaches_the_subscriber(qos: int) -> None:
+    """Mosquitto acknowledges and drops QoS 1/2 beyond 20 in flight on 3.1.1."""
+    count = 500
+    topic = f"mqttium/it/burst/{qos}"
+    received = 0
+    done = asyncio.Event()
+    sub = AsyncClient(f"burst-sub-{qos}", message_delivery="callback")
+    pub = AsyncClient(f"burst-pub-{qos}")
+
+    def on_message(msg) -> None:  # noqa: ANN001
+        nonlocal received
+        received += 1
+        if received == count:
+            done.set()
+
+    sub.on_message = on_message
+    try:
+        await sub.connect("127.0.0.1", 11883, timeout=5)
+        await sub.subscribe(topic, qos=qos)
+        await pub.connect("127.0.0.1", 11883, timeout=5)
+        receipts = [await pub.publish(topic, b"x" * 64, qos=qos) for _ in range(count)]
+        async with asyncio.timeout(10):
+            for receipt in receipts:
+                await receipt.wait()
+            await done.wait()
+    finally:
+        await pub.disconnect()
+        await sub.disconnect()
+    assert received == count

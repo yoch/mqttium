@@ -160,7 +160,10 @@ async def test_fatal_oversize_sends_disconnect_0x95_v5() -> None:
 
 
 async def test_fatal_oversize_no_disconnect_v311() -> None:
-    client = AsyncClient(client_id="c", protocol=MQTTProtocolVersion.MQTTv311)
+    # An explicit limit is still enforced on MQTT 3.1.1.
+    client = AsyncClient(
+        client_id="c", protocol=MQTTProtocolVersion.MQTTv311, maximum_packet_size=16 * 1024 * 1024
+    )
     fake = _FatalTransport(MQTTProtocolVersion.MQTTv311)
 
     async def factory(host: str, port: int, *, ssl: object = None) -> _FatalTransport:

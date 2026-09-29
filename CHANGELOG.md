@@ -21,6 +21,20 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- MQTT 3.1.1 no longer enforces inbound limits the broker was never told:
+  `max_inbound_inflight` and `maximum_packet_size` now default to `None`,
+  resolved to the protocol maximum on MQTT 3.1.1 and to the advertised 100
+  exchanges and 16 MiB on MQTT 5. `max_inbound_inflight_bytes` defaults to
+  `None` on both. A listener subscribed to a large retained message or a burst
+  of QoS 1/2 messages used to be disconnected, and never reconnected.
+- MQTT 3.1.1 keeps at most 20 outbound QoS 1/2 exchanges in flight unless
+  `max_outbound_inflight` is set. Mosquitto acknowledges and then silently
+  drops QoS 1/2 messages beyond its default window of 20 from a 3.1.1 client,
+  so a burst of `publish()` calls completed every receipt while subscribers
+  received only part of it.
+- A single publication larger than `max_unacknowledged_bytes` is admitted when
+  nothing else is unacknowledged, like the writer's oversized item, instead of
+  being refused forever with `FlowControlError`.
 - Reconnection stops only for causes that connecting again cannot cure
   (terminal reason codes, malformed packets, unresumable sessions, local store
   failures). Broker protocol violations, local limit breaches, a slow iterator
