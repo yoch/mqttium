@@ -106,12 +106,18 @@ class DeliveryLane:
                 if epoch == owner._connection_epoch:
                     owner._flush_released_completions()
             finally:
-                # A lot interrupted by cancellation is the oldest outstanding
-                # work: its acknowledged remainder goes ahead of any carryover.
-                kept = [effect for effect in effects if survives_connection(effect)]
-                self.carryover.extendleft(reversed(kept))
-                self.pending_count += len(kept)
-                self.applied += self.active_count - len(kept)
+                kept = 0
+                if effects:
+                    # A lot interrupted by cancellation is the oldest
+                    # outstanding work: its acknowledged remainder goes ahead
+                    # of any carryover. A fully delivered lot, the common
+                    # case, skips this (#597 cost a list and a deque call per
+                    # lot on every single-message delivery).
+                    survivors = [effect for effect in effects if survives_connection(effect)]
+                    self.carryover.extendleft(reversed(survivors))
+                    kept = len(survivors)
+                    self.pending_count += kept
+                self.applied += self.active_count - kept
                 self.active_count = 0
 
     @property
