@@ -65,8 +65,9 @@ async def test_connect_ws_forwards_tls_and_headers(
     )
     try:
         assert connack.reason_code == 0
-        # The attempt owns the deadline; frames and messages fit the MQTT limit.
-        assert calls == [("wss://broker.example/mqtt", context, headers, None, 16 * 1024 * 1024)]
+        # The attempt owns the deadline; frames fit the MQTT 3.1.1 packet limit,
+        # which is the protocol maximum unless configured.
+        assert calls == [("wss://broker.example/mqtt", context, headers, None, 268_435_460)]
         assert client.is_connected
     finally:
         await client.disconnect()

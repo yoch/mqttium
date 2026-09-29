@@ -20,6 +20,7 @@ import pytest
 
 from mqttium.codec.buffer import IncrementalDecoder, RawPacket
 from mqttium.enums import ConnectionState, OutboundQoSState, PacketType, QoS
+from mqttium.errors import FlowControlError
 from mqttium.packets import PublishPacket
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.persistence.sqlite import SqliteInflightStore
@@ -199,6 +200,35 @@ def test_launch_decision_matches_the_validation_snapshot(tmp_path: Path) -> None
         assert engine.take_effects() == []
         assert engine.store.get_out(queued.mid or 0).state is OutboundQoSState.QUEUED
         assert [msg.mid for msg in engine.outbound._queued] == [queued.mid]
+
+
+# --- one publication larger than the byte budget -------------------------------
+
+
+def test_an_oversized_publication_is_admitted_alone_into_an_empty_budget(
+    tmp_path: Path,
+) -> None:
+    for engine in [
+        _engine(max_unacknowledged_bytes=64),
+        _engine(tmp_path, max_unacknowledged_bytes=64),
+    ]:
+        large = engine.queue_publish("a/b", b"x" * 1000, qos=QoS.AT_LEAST_ONCE)
+        engine.take_effects()
+        assert engine.unacknowledged_bytes > 64
+
+        # Nothing else joins it, not even a small publication.
+        before = _snapshot(engine)
+        with pytest.raises(FlowControlError):
+            engine.queue_publish("a/b", b"y", qos=QoS.AT_LEAST_ONCE)
+        assert _snapshot(engine) == before
+
+        engine.handle_raw(RawPacket(PacketType.PUBACK, 0, (large.mid or 0).to_bytes(2, "big")))
+        engine.take_effects()
+        assert engine.unacknowledged_bytes == 0
+        engine.queue_publish("a/b", b"y", qos=QoS.AT_LEAST_ONCE)
+        # A second oversized publication waits for the budget to empty again.
+        with pytest.raises(FlowControlError):
+            engine.queue_publish("a/b", b"x" * 1000, qos=QoS.AT_LEAST_ONCE)
 
 
 # --- a discarded broker session requeues QoS 1 with everything it owns --------

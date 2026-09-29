@@ -207,36 +207,26 @@ class OutboundSession:
     def unacknowledged_high_water_bytes(self) -> int:
         return self._pending_high_water_bytes
 
-    def _resolved_alias_topic_for_sizing(self, properties: Properties) -> str:
-        alias = properties.get("topic_alias")
-        if alias is None:
-            return ""
-        return self._topic_aliases.get(int(alias), "")
-
-    def can_ever_admit(
-        self,
-        topic: str,
-        payload: bytes,
-        qos: QoS | int,
-        properties: Properties | None = None,
-    ) -> bool:
+    def can_ever_admit(self, qos: QoS | int) -> bool:
         if QoS(qos) == QoS.AT_MOST_ONCE:
             return True
+        # A publication larger than the byte budget is admitted alone once the
+        # budget is empty (see `_reserve`), so only the count can refuse it.
         message_limit = self.config.max_unacknowledged_messages
-        if message_limit is not None and message_limit < 1:
-            return False
-        byte_limit = self.config.max_unacknowledged_bytes
-        if not topic and properties is not None:
-            topic = self._resolved_alias_topic_for_sizing(properties)
-        logical_size = self.logical_size(topic, payload, properties)
-        return byte_limit is None or logical_size <= byte_limit
+        return message_limit is None or message_limit >= 1
 
     def _reserve(self, logical_size: int) -> None:
         message_limit = self.config.max_unacknowledged_messages
         if message_limit is not None and self._pending_messages >= message_limit:
             raise FlowControlError("Pending outbound message limit reached")
         byte_limit = self.config.max_unacknowledged_bytes
-        if byte_limit is not None and self._pending_bytes + logical_size > byte_limit:
+        if (
+            byte_limit is not None
+            and self._pending_bytes + logical_size > byte_limit
+            # Like the writer, admit one oversized publication into an empty
+            # budget: a limit must not refuse a valid message forever.
+            and self._pending_bytes
+        ):
             raise FlowControlError("Pending outbound byte limit reached")
         self._pending_messages += 1
         self._pending_bytes += logical_size

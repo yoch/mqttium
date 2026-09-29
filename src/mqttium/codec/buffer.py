@@ -26,6 +26,8 @@ from mqttium.errors import MalformedPacketError, PacketTooLargeError
 
 # Default local ceiling before CONNACK negotiation (256 MiB is the MQTT max).
 DEFAULT_MAX_PACKET_SIZE = 16 * 1024 * 1024
+# Largest packet MQTT can encode: a four-byte Remaining Length plus its header.
+PROTOCOL_MAX_PACKET_SIZE = 268_435_460
 # Steady-state receive size once a connection is demonstrably busy.
 DEFAULT_CAPACITY = 256 * 1024
 # Allocation floor. A decoder that only ever sees small frames -- an idle

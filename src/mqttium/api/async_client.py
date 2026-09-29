@@ -49,7 +49,11 @@ from mqttium.api.stats import (
     ReceiptStats,
     TransportStats,
 )
-from mqttium.codec.buffer import DEFAULT_MAX_PACKET_SIZE, IncrementalDecoder
+from mqttium.codec.buffer import (
+    DEFAULT_MAX_PACKET_SIZE,
+    PROTOCOL_MAX_PACKET_SIZE,
+    IncrementalDecoder,
+)
 from mqttium.dispatch.matcher import TopicMatcher
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.errors import (
@@ -124,6 +128,7 @@ _CAUSE_BROKER = 1  # broker DISCONNECT or refused CONNACK (first-wins with trans
 _CAUSE_PROTOCOL = 2  # peer protocol or decoding violations
 _CAUSE_LOCAL = 3  # local capability failures that make the session unusable
 _DEFAULT_MAX_ITERATOR_MESSAGES = 65_536
+_MQTT311_DEFAULT_OUTBOUND_INFLIGHT = 20
 _DEFAULT_MAX_ITERATOR_BYTES = 64 * 1024 * 1024
 
 _ReceiptT = TypeVar("_ReceiptT", "PublishReceipt", "PublishBatchReceipt")
@@ -262,16 +267,22 @@ class AsyncClient:
             Properties, such as ``will_delay_interval``.
         maximum_packet_size: Largest inbound packet accepted by the decoder;
             advertised to an MQTT 5 broker. Larger packets end the connection.
+            ``None`` means 16 MiB on MQTT 5 and the protocol maximum on MQTT
+            3.1.1, whose broker cannot be told a limit.
         topic_alias_maximum: Inbound topic aliases accepted from an MQTT 5
             broker.
         max_inbound_inflight: Concurrent inbound QoS 1/2 exchanges accepted;
             advertised as Receive Maximum on MQTT 5. A broker that exceeds it
-            is disconnected.
+            is disconnected. ``None`` means 100 on MQTT 5 and 65,535 (no
+            limit) on MQTT 3.1.1, whose broker cannot be told a limit.
         max_inbound_inflight_bytes: Logical bytes retained for inbound QoS 1/2
-            exchanges; ``None`` disables the bound. A broker that exceeds it is
-            disconnected with reason 0x97.
+            exchanges; ``None`` (the default) disables the bound. No broker
+            can be told this limit; one that exceeds it is disconnected with
+            reason 0x97.
         max_outbound_inflight: Optional local cap on concurrent outbound QoS
             1/2 exchanges, additionally bounded by broker negotiation.
+            ``None`` means the broker's Receive Maximum on MQTT 5 and 20 on
+            MQTT 3.1.1, whose broker cannot announce a window.
         max_unacknowledged_messages: Outbound QoS 1/2 publications admitted
             and not yet completed, including those waiting for an inflight
             slot; ``None`` disables the bound.
@@ -329,8 +340,8 @@ class AsyncClient:
         will: PublishMessage | None = None,
         maximum_packet_size: int | None = None,
         topic_alias_maximum: int = 0,
-        max_inbound_inflight: int = 100,
-        max_inbound_inflight_bytes: int | None = 64 * 1024 * 1024,
+        max_inbound_inflight: int | None = None,
+        max_inbound_inflight_bytes: int | None = None,
         max_outbound_inflight: int | None = None,
         max_unacknowledged_messages: int | None = 10_000,
         max_unacknowledged_bytes: int | None = 64 * 1024 * 1024,
@@ -391,10 +402,24 @@ class AsyncClient:
             # only way to acknowledge from a callback would be a detached task;
             # messages() is the delivery mode built for that processing shape.
             raise ValueError("manual_ack requires iterator delivery; use messages() and ack()")
-        effective_max_packet_size = (
-            maximum_packet_size if maximum_packet_size is not None else DEFAULT_MAX_PACKET_SIZE
+        # A limit the broker was never told is not a protocol violation, so
+        # MQTT 3.1.1 enforces inbound limits only when they are set explicitly.
+        is_mqtt5 = protocol == MQTTProtocolVersion.MQTTv5
+        effective_max_packet_size = maximum_packet_size
+        if effective_max_packet_size is None and is_mqtt5:
+            effective_max_packet_size = DEFAULT_MAX_PACKET_SIZE
+        if max_inbound_inflight is None:
+            max_inbound_inflight = 100 if is_mqtt5 else 65_535
+        if max_outbound_inflight is None and not is_mqtt5:
+            # An MQTT 3.1.1 broker cannot announce its window, and Mosquitto
+            # acknowledges then silently drops QoS 1/2 PUBLISHes beyond its
+            # default of 20 in flight. 20 is also Paho's default.
+            max_outbound_inflight = _MQTT311_DEFAULT_OUTBOUND_INFLIGHT
+        initial_decoder_max_packet_size = (
+            PROTOCOL_MAX_PACKET_SIZE
+            if effective_max_packet_size is None
+            else effective_max_packet_size
         )
-        initial_decoder_max_packet_size = effective_max_packet_size
         pwd = password.encode("utf-8") if isinstance(password, str) else password
         will_message, will_properties = _will_config(will)
         self._engine = ProtocolEngine(
@@ -1347,7 +1372,7 @@ class AsyncClient:
                         batch=batch,
                     )
                 except FlowControlError as exc:
-                    if not self._engine.outbound.can_ever_admit(topic, data, qos, properties):
+                    if not self._engine.outbound.can_ever_admit(qos):
                         raise
                     terminal = self._publish_wait_failure()
                     if terminal is not None:
