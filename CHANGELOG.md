@@ -8,6 +8,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Added
 
+- `ClientStats.connected_since`, `last_disconnect_error` and
+  `last_disconnect_reason_code`, and
+  `DeliveryStats.callback_invocations`, `callback_failures` and
+  `unrouted_messages`: a service can see how long it has been connected, why
+  the last connection ended, and whether callbacks fail or messages match no
+  route, without logging.
 - `ConnectError`, raised by `connect()` when DNS, TCP, TLS or the WebSocket
   upgrade fails. It is both an `MQTTError` and an `OSError`, with the original
   error as `__cause__`, so `except MQTTError` now covers every connection

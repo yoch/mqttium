@@ -196,6 +196,9 @@ def test_client_stats_fields_follow_the_constructor_vocabulary() -> None:
         "delivery",
         "receipts",
         "transport",
+        "connected_since",
+        "last_disconnect_error",
+        "last_disconnect_reason_code",
     )
     assert names(OutboundStats) == (
         "unacknowledged_messages",
@@ -234,6 +237,9 @@ def test_client_stats_fields_follow_the_constructor_vocabulary() -> None:
         "iterator_high_water_bytes",
         "iterator_byte_limit",
         "waiters",
+        "callback_invocations",
+        "callback_failures",
+        "unrouted_messages",
     )
     assert names(ReceiptStats) == (
         "publish",

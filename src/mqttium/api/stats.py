@@ -42,8 +42,11 @@ class DecoderStats:
 class DeliveryStats:
     """Messages held for the application, against the iterator bounds.
 
-    Callback delivery retains nothing, so every field stays at its idle value
-    in that mode. Iterator byte occupancy is tracked only when
+    Callback delivery retains nothing, so the iterator fields stay at their idle
+    values in that mode. ``callback_invocations`` counts message callback calls,
+    ``callback_failures`` the calls that raised (reported to the event loop's
+    exception handler), and ``unrouted_messages`` callback-mode messages that
+    matched no route and had no ``on_message``. Iterator byte occupancy is tracked only when
     ``max_iterator_bytes`` is finite; when that bound is ``None``,
     ``iterator_bytes`` and ``iterator_high_water_bytes`` stay at zero and the
     message-count fields remain authoritative.
@@ -55,6 +58,9 @@ class DeliveryStats:
     iterator_high_water_bytes: int
     iterator_byte_limit: int | None
     waiters: int
+    callback_invocations: int = 0
+    callback_failures: int = 0
+    unrouted_messages: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -78,6 +84,15 @@ class ClientStats:
     measured over the lifetime of the client or protocol engine. Calling
     :meth:`AsyncClient.stats` does not enable background sampling and does not
     reset any counter.
+
+    ``connected_since`` is the ``time.monotonic()`` value of the current
+    connection's CONNACK, ``None`` while not connected. ``last_disconnect_error``
+    describes the cause most recently reported to ``on_disconnect`` as
+    ``"ExceptionType: message"`` (``None`` for a clean disconnect or before
+    any loss), and ``last_disconnect_reason_code`` is its MQTT reason code when
+    it carries one (a refused CONNACK or a broker DISCONNECT). Both are kept
+    after a reconnect so a supervisor can see why the previous connection
+    ended; the snapshot stays JSON-serialisable.
     """
 
     state: ConnectionState
@@ -90,3 +105,6 @@ class ClientStats:
     delivery: DeliveryStats
     receipts: ReceiptStats
     transport: TransportStats
+    connected_since: float | None = None
+    last_disconnect_error: str | None = None
+    last_disconnect_reason_code: int | None = None
