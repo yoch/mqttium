@@ -1,0 +1,190 @@
+name: rpi5 bench micro-benchmarks
+run-name: "Bench micro-benchmarks (mqtt-python-client-bench ${{ github.sha }})"
+
+# Diagnostic only, never merged to main. Runs the micro-benchmarks in
+# yoch/mqtt-python-client-bench microbench/mqttium/ (pinned by BENCH_SHA) on the
+# quiet Raspberry Pi 5 runner: Mosquitto on core 0, orchestration on core 1,
+# the client under test on core 2, the C peer on core 3. Same locked client
+# versions and CPython 3.12 build (uv) as campaign 20260930T220715Z.
+
+on:
+  push:
+    branches: [microbench/bench-weaknesses-rpi5]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+env:
+  BENCH_SHA: 1e1e3e5d59a1bdd8181111234e720acfa4fdf1a5
+  UV_VERSION: "0.11.2"
+
+jobs:
+  microbench:
+    runs-on: [self-hosted, linux, ARM64, rpi5]
+    timeout-minutes: 120
+    steps:
+      - name: Set run-specific workspace
+        run: |
+          root="$RUNNER_TEMP/bench-mb-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          {
+            echo "JOB_ROOT=$root"
+            echo "UV_CACHE_DIR=$root/uv-cache"
+            echo "UV_PYTHON_INSTALL_DIR=$root/uv-python"
+            echo "UV_PROJECT_ENVIRONMENT=$root/venv"
+            echo "OUT=$root/out"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify host prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          for tool in cc openssl mosquitto taskset python3; do command -v "$tool"; done
+          if pgrep -a mosquitto; then
+            echo "A pre-existing Mosquitto process makes the runner unsafe for this job." >&2
+            exit 1
+          fi
+          rm -rf "$JOB_ROOT"
+          mkdir -p "$JOB_ROOT" "$OUT"
+          {
+            echo "model: $(tr -d '\0' < /proc/device-tree/model)"
+            echo "kernel: $(uname -r)"
+            echo "cores: $(nproc)"
+            echo "governor: $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort | uniq -c | xargs)"
+            echo "mosquitto: $(mosquitto -h 2>&1 | head -1)"
+            echo "loadavg at start: $(cat /proc/loadavg)"
+          } | tee "$OUT/host.txt"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: bench
+          persist-credentials: false
+
+      - name: Locked environment (uv, CPython 3.12)
+        working-directory: bench
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$JOB_ROOT/uv-boot"
+          "$JOB_ROOT/uv-boot/bin/pip" install -q "uv==$UV_VERSION"
+          "$JOB_ROOT/uv-boot/bin/uv" sync --frozen --python 3.12 --managed-python \
+            --extra dev --extra paho --extra gmqtt --extra aiomqtt --extra amqtt \
+            --extra awscrt --extra zmqtt --extra mqttium
+          "$UV_PROJECT_ENVIRONMENT/bin/python" -c "import sys; print(sys.version)" | tee -a "$OUT/host.txt"
+          "$JOB_ROOT/uv-boot/bin/uv" pip list --python "$UV_PROJECT_ENVIRONMENT/bin/python" \
+            | grep -iE "paho|gmqtt|awscrt|mqttium" | tee -a "$OUT/host.txt"
+
+      - name: Build the C peer and TLS certificates
+        working-directory: bench
+        run: |
+          PYTHONPATH=src "$UV_PROJECT_ENVIRONMENT/bin/python" -c "
+          from mqtt_client_bench import broker
+          from mqtt_client_bench.bench import peer
+          print(peer.ensure_built()); print(broker.ensure_certs())"
+
+      - name: Start Mosquitto on core 0
+        working-directory: bench
+        shell: bash
+        run: |
+          set -euo pipefail
+          certs="$PWD/build/certs"
+          cat > "$JOB_ROOT/mosquitto.conf" <<EOF
+          listener 11883 127.0.0.1
+          protocol mqtt
+          listener 11884 127.0.0.1
+          protocol mqtt
+          cafile $certs/ca.crt
+          certfile $certs/server.crt
+          keyfile $certs/server.key
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          sys_interval 1
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          packet_buffer_size 4096
+          max_keepalive 120
+          EOF
+          taskset -c 0 mosquitto -c "$JOB_ROOT/mosquitto.conf" > "$JOB_ROOT/mosquitto.log" 2>&1 &
+          echo "$!" > "$JOB_ROOT/mosquitto.pid"
+          "$UV_PROJECT_ENVIRONMENT/bin/python" - <<'PY'
+          import socket, time
+          for port in (11883, 11884):
+              deadline = time.monotonic() + 15
+              while True:
+                  try:
+                      socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                      break
+                  except OSError:
+                      if time.monotonic() > deadline:
+                          raise
+                      time.sleep(0.1)
+          PY
+
+      - name: Filter dispatch (pure CPU)
+        working-directory: bench
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=src taskset -c 2 "$UV_PROJECT_ENVIRONMENT/bin/python" microbench/mqttium/dispatch.py 2>&1 \
+            | tee "$OUT/dispatch.txt"
+
+      - name: Fixed-rate QoS 1 publish
+        working-directory: bench
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY="$UV_PROJECT_ENVIRONMENT/bin/python"
+          PYTHONPATH=src taskset -c 1 "$PY" microbench/mqttium/pub_fixed.py --trace-writes --repeat 3 2>&1 \
+            | tee "$OUT/pub_fixed.txt"
+          PYTHONPATH=src taskset -c 1 "$PY" microbench/mqttium/pub_fixed.py --profile 2>&1 \
+            | tee "$OUT/pub_profile.txt"
+
+      - name: Fixed-rate QoS 1 receive
+        working-directory: bench
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY="$UV_PROJECT_ENVIRONMENT/bin/python"
+          PYTHONPATH=src taskset -c 1 "$PY" microbench/mqttium/sub_fixed.py --repeat 3 2>&1 \
+            | tee "$OUT/sub_fixed.txt"
+          PYTHONPATH=src taskset -c 1 "$PY" microbench/mqttium/sub_fixed.py --repeat 3 \
+            --cases plain:2000:paho:fanin,plain:2000:paho:f100,plain:2000:mqttium:fanin,plain:2000:mqttium:f100 2>&1 \
+            | tee "$OUT/sub_filters.txt"
+          PYTHONPATH=src taskset -c 1 "$PY" microbench/mqttium/sub_fixed.py --profile \
+            --cases plain:2000:gmqtt,plain:2000:mqttium,plain:2000:mqttium:pull,tls:2000:gmqtt,tls:2000:mqttium,plain:5000:gmqtt,plain:5000:mqttium 2>&1 \
+            | tee "$OUT/sub_profile.txt"
+
+      - name: Record host load at end
+        if: always()
+        run: |
+          echo "loadavg at end: $(cat /proc/loadavg)" | tee -a "$OUT/host.txt"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: bench-microbench-rpi5
+          path: ${{ env.OUT }}
+          if-no-files-found: warn
+
+      - name: Stop Mosquitto and clean the workspace
+        if: always()
+        shell: bash
+        run: |
+          pidfile="$JOB_ROOT/mosquitto.pid"
+          if [ -f "$pidfile" ]; then
+            pid="$(cat "$pidfile")"
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+          fi
+          rm -rf "$JOB_ROOT"
