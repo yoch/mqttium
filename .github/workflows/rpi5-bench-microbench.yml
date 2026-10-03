@@ -1,5 +1,5 @@
 name: rpi5 bench micro-benchmarks
-run-name: "Bench micro-benchmarks (mqtt-python-client-bench ${{ github.sha }})"
+run-name: "Bench micro-benchmarks for mqttium weak points"
 
 # Diagnostic only, never merged to main. Runs the micro-benchmarks in
 # yoch/mqtt-python-client-bench microbench/mqttium/ (pinned by BENCH_SHA) on the
@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BENCH_SHA: 1e1e3e5d59a1bdd8181111234e720acfa4fdf1a5
+  BENCH_SHA: cd9f475eb27cacedff35a619fb70dd6cc0d3da2e
   UV_VERSION: "0.11.2"
 
 jobs:
