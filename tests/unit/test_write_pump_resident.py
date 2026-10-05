@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from mqttium.api._writer import WritePump
 
 
@@ -338,3 +340,13 @@ def test_queued_messages_still_tracks_qsize_not_resident() -> None:
     assert pump.queued_messages == 2
     assert pump.stats().queued_messages == 2
     assert pump.resident_messages == 3
+
+
+def test_write_pump_declares_its_slots() -> None:
+    # Past about 30 instance attributes CPython leaves its inline attribute
+    # layout and every attribute access on the pump gets slower; declared
+    # slots keep the send path independent of the field count.
+    pump = _pump()
+    assert not hasattr(pump, "__dict__")
+    with pytest.raises(AttributeError):
+        pump.undeclared_field = 1  # type: ignore[attr-defined]

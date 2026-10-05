@@ -792,8 +792,22 @@ class _RuntimeHarness:
             self._replace(self.client, "_publish_waiters", 1)
 
     def _replace(self, owner: object, name: str, replacement: object) -> None:
-        self._mutation_restores.append((owner, name, getattr(owner, name)))
-        setattr(owner, name, replacement)
+        if hasattr(owner, "__dict__"):
+            self._mutation_restores.append((owner, name, getattr(owner, name)))
+            setattr(owner, name, replacement)
+            return
+        # A slotted owner cannot shadow a method per instance: dispatch at
+        # class level so only ``owner`` sees the bound replacement.
+        cls = type(owner)
+        original = getattr(cls, name)
+
+        def dispatch(this: object, *args: Any, **kwargs: Any) -> Any:
+            if this is owner:
+                return replacement(*args, **kwargs)  # type: ignore[operator]
+            return original(this, *args, **kwargs)
+
+        self._mutation_restores.append((cls, name, original))
+        setattr(cls, name, dispatch)
 
     def _restore_mutations(self) -> None:
         while self._mutation_restores:

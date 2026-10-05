@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import patch_instance_method
+
 import asyncio
 from dataclasses import replace
 
@@ -94,7 +96,7 @@ async def test_writer_exception_after_handoff_is_never_retried(monkeypatch, nowa
             raise FlowControlError("failed after writer handoff")
 
         with monkeypatch.context() as patch:
-            patch.setattr(client._write_pump, "try_enqueue", ambiguous_failure)
+            patch_instance_method(patch, client._write_pump, "try_enqueue", ambiguous_failure)
             with pytest.raises(FlowControlError, match="after writer handoff"):
                 if nowait:
                     client.publish_nowait("t", b"one")
@@ -122,7 +124,7 @@ async def test_async_clean_writer_refusal_uses_existing_admission_path(monkeypat
             attempts.append(item)
             return False if len(attempts) == 1 else enqueue(item, epoch=epoch)
 
-        monkeypatch.setattr(client._write_pump, "try_enqueue", refuse_first)
+        patch_instance_method(monkeypatch, client._write_pump, "try_enqueue", refuse_first)
         receipt = await asyncio.wait_for(client.publish("t", b"one"), 1)
         await client._write_pump.join()
         assert receipt.is_done()
@@ -140,7 +142,9 @@ async def test_nowait_clean_refusal_does_not_commit_alias_or_wire(monkeypatch):
         await client.connect("fake")
         client._engine.negotiated = replace(client.negotiated, topic_alias_maximum=2)
         with monkeypatch.context() as patch:
-            patch.setattr(client._write_pump, "try_enqueue", lambda *args, **kwargs: False)
+            patch_instance_method(
+                patch, client._write_pump, "try_enqueue", lambda *args, **kwargs: False
+            )
             with pytest.raises(FlowControlError):
                 client.publish_nowait("t", b"one", properties=Properties({"topic_alias": 1}))
         assert client._engine.outbound._topic_aliases == {}
@@ -167,7 +171,7 @@ async def test_alias_is_committed_only_after_direct_writer_acceptance(monkeypatc
             return enqueue(item, epoch=epoch)
 
         with monkeypatch.context() as patch:
-            patch.setattr(client._write_pump, "try_enqueue", observe)
+            patch_instance_method(patch, client._write_pump, "try_enqueue", observe)
             await client.publish("t", b"one", properties=Properties({"topic_alias": 1}))
         assert aliases_at_handoff == [{}]
         assert client._engine.outbound._topic_aliases == {1: "t"}
@@ -290,7 +294,7 @@ async def test_batch_partial_handoff_failure_keeps_prefix_and_never_retries(
             return accepted
 
         with monkeypatch.context() as patch:
-            patch.setattr(client._write_pump, "try_enqueue", handoff_then_raise)
+            patch_instance_method(patch, client._write_pump, "try_enqueue", handoff_then_raise)
             with pytest.raises(PublishBatchError) as caught:
                 await client.publish_many(messages())
         receipt = caught.value.receipt
@@ -342,7 +346,7 @@ async def test_batch_clean_refusal_rolls_back_registration_before_fallback(monke
             return original_queue(session, *args, **kwargs)
 
         monkeypatch.setattr(PublishBatchReceipt, "_register", register)
-        monkeypatch.setattr(client._write_pump, "try_enqueue", enqueue)
+        patch_instance_method(monkeypatch, client._write_pump, "try_enqueue", enqueue)
         monkeypatch.setattr(type(client._engine.outbound), "queue_publish", general)
         receipt = await client.publish_many(
             [

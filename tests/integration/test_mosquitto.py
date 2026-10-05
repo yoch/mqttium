@@ -9,6 +9,7 @@ import pytest
 from mqttium.api import AsyncClient
 from mqttium.enums import MQTTProtocolVersion
 from mqttium.types import Properties
+from tests.support import patch_instance_method
 
 
 @pytest.mark.parametrize("protocol", [MQTTProtocolVersion.MQTTv311, MQTTProtocolVersion.MQTTv5])
@@ -151,7 +152,9 @@ async def test_done_callbacks_observe_every_publication(qos: int) -> None:
 
 
 @pytest.mark.parametrize("qos", [1, 2])
-async def test_reader_owns_the_ack_permit_in_callback_delivery(qos: int) -> None:
+async def test_reader_owns_the_ack_permit_in_callback_delivery(
+    qos: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """With auto-ack callback delivery the reader restores the ACK permit itself.
 
     Its eager ACKs schedule no next-turn re-arm callback, every exchange still
@@ -183,7 +186,7 @@ async def test_reader_owns_the_ack_permit_in_callback_delivery(qos: int) -> None
         await sub.connect("127.0.0.1", 11883, timeout=5)
         assert pump._ack_rearm_owner is sub._reader_task
         await sub.subscribe(topic, qos=qos)
-        pump._schedule_eager_rearm = counted_schedule  # type: ignore[method-assign]
+        patch_instance_method(monkeypatch, pump, "_schedule_eager_rearm", counted_schedule)
         await pub.connect("127.0.0.1", 11883, timeout=5)
         for _ in range(count):
             await (await pub.publish(topic, b"x" * 64, qos=qos)).wait()
