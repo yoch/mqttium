@@ -1,7 +1,7 @@
 # Release 1.2.0 evidence
 
 Date: 2026-10-05. Candidate runtime: `main` at
-`cfab7cc0a4e468e24d8a2c350b3228f40882aa50`. The release commit adds only
+`b2ae1018c05117b79554da216430253be75733b4`. The release commit adds only
 documentation, the version string, the frozen changelog section, release-facing
 installation and support text, and this report. Baseline for comparisons:
 `1.1.0` (`b611d492e418594fb8fbbeeb16cdc04088751fbe`).
@@ -33,8 +33,30 @@ A change that adds structure is kept only with a clear measured gain.
 | W3 | Fixed. Wildcard filters live in a prefix tree derived from Paho's `MQTTMatcher` (supplied by its author), walked iteratively, with exact filters still a dictionary lookup. Matching is checked against the previous linear matcher by seeded and Hypothesis differential tests. | #611 |
 | W2a | Fixed. When the reader is the only success-ACK producer (push transport, callback delivery, automatic acknowledgement), it restores the ACK eager permit itself just before it really suspends, instead of a callback costing a loop iteration. The `AckPermitTurn` TLA+ model checks that the rule stays one eager ACK per loop turn. | #612 |
 | W1b | Addressed by API. `PublishReceipt.add_done_callback()` and `PublishReceipt.exception()` observe each publication without a coroutine or task per message. | #613 |
+| Qualification | A send-path regression introduced by #612, found by the qualification and fixed before release (below). | #614 |
 | W1a | Kept as is (maintainer decision). Writing every frame of a burst eagerly is the "unbounded budget" #254 measured: budgets of 2, 4 and 8 already cost 5–13 % of closed-loop QoS 0 capacity. A cheaper end-of-turn flush would still send frames 2–5 of a burst at the end of the turn, for little latency gain and one more mechanism. | — |
 | W1c, W2b | Not pursued (maintainer decision). The remaining receive gap to gmqtt on the Pi, about 13 µs per message, is spread over many small steps of the effect pipeline (about 22 `len()` calls, two effect collections and two decoder passes per message) that carry Receive Maximum accounting, persistence and ordering. Shaving them would save under 1 µs per change and cost readability. | — |
+
+### Regression found during qualification
+
+The first qualification of `main` at `cfab7cc0` (ARM64 paired regression
+[37313227344](https://github.com/yoch/mqttium/actions/runs/37313227344)) passed
+its thresholds but showed the send path slower than 1.1.0: `writer_try_enqueue`
+0.809, `writer_enqueue_async` 0.825, `effect_send_inline` 0.920,
+`publish_nowait` QoS 0 0.951–0.954, strict writer capacity QoS 0 0.960 against
+an A/A of 0.999, and the advisory network sweep 0.979–0.99 at windows of 8 and
+more.
+
+A `try_enqueue` micro run on each merge of the campaign, with Python 3.11 and
+3.13, placed it at #612, which changed no line of the send path. #612 took
+`WritePump` from 29 to 31 instance attributes, past the point where CPython
+keeps its inline attribute layout, so every attribute access on the pump got
+slower. Without those two assignments the micro returned to the 1.1.0 baseline
+(3.13: 415–428 ns against 500–520 with them and 417–466 for 1.1.0).
+
+#614 declares `WritePump.__slots__`, so attribute access no longer depends on
+the number of fields: 304–319 ns against 330–342 for 1.1.0 on Python 3.11, and
+422–454 against 418–439 on 3.13. A guard test pins the slots.
 
 ### Rejected while implementing
 
@@ -84,6 +106,6 @@ Fixed-rate QoS 1 publish shares no changed path: 80.3–80.5 µs per message at
 - Receipt observation, per receipt: a task awaiting `wait()` 4.2 µs,
   `add_done_callback` 2.1 µs, the benchmark adapter's private future 1.6 µs.
 
-## Qualification of `cfab7cc0`
+## Qualification of `b2ae1018`
 
 QUALIFICATION_PENDING
