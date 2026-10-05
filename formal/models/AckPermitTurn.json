@@ -1,0 +1,26 @@
+{
+  "module": "AckPermitTurn.tla",
+  "status": "refinement",
+  "summary": "The reader that produces every success ACK restores the ACK eager permit as it really suspends: still one ACK eager write per loop turn, without the extra loop iteration the next-turn callback cost.",
+  "issues": [],
+  "tests": [
+    "tests/unit/test_writer_ack_rearm_owner.py",
+    "tests/integration/test_mosquitto.py"
+  ],
+  "configs": [
+    {
+      "config": "AckPermitTurn-callback.cfg",
+      "expect": "violation",
+      "invariant": "NoExtraTurn"
+    },
+    {
+      "config": "AckPermitTurn-naive.cfg",
+      "expect": "violation",
+      "invariant": "OneEagerAckPerTurn"
+    },
+    {
+      "config": "AckPermitTurn-owner.cfg",
+      "expect": "pass"
+    }
+  ]
+}

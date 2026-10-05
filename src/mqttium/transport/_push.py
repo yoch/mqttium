@@ -13,6 +13,7 @@ lifecycle stay with asyncio streams, exactly as in the StreamReader variant.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Protocol
 
@@ -212,7 +213,7 @@ class DecoderPushProtocol(asyncio.StreamReaderProtocol, asyncio.BufferedProtocol
 class PushStreamTransport(StreamTransportBase):
     """Stream transport whose reads are delivered into an attached decoder."""
 
-    __slots__ = ("_protocol", "_seen", "_resumptions", "_waits")
+    __slots__ = ("_protocol", "_resumptions", "_seen", "_waits", "before_wait")
 
     def __init__(
         self,
@@ -225,6 +226,9 @@ class PushStreamTransport(StreamTransportBase):
         self._seen = 0
         self._resumptions = 0
         self._waits = 0
+        # Called just before receive() actually suspends -- never when bytes
+        # are already waiting -- so its owner can act at the end of its turn.
+        self.before_wait: Callable[[], None] | None = None
 
     def attach_decoder(self, decoder: DecoderSink) -> None:
         self._protocol.attach(decoder)
@@ -253,6 +257,9 @@ class PushStreamTransport(StreamTransportBase):
             if protocol.at_eof:
                 return False
             self._waits += 1
+            before_wait = self.before_wait
+            if before_wait is not None:
+                before_wait()
             await protocol.wait_for_data()
             if protocol.exception is not None:
                 raise protocol.exception
