@@ -543,6 +543,61 @@ def _receipt_wait(scenario: str) -> ScenarioMeasurement:
     return asyncio.run(run())
 
 
+def _receipt_done_callback(_scenario: str) -> ScenarioMeasurement:
+    """Observe each receipt's completion without a coroutine or task.
+
+    Sources with ``PublishReceipt.add_done_callback`` use it; older ones use
+    what applications had to do there: one future in the receipt's waiter
+    list plus a future done callback (the benchmark's mqttium adapter).
+    """
+    from mqttium.api.models import PublishReceipt
+    from mqttium.enums import QoS
+
+    batch = 64
+    rounds = 3_000
+    warmup_rounds = 200
+
+    async def run() -> ScenarioMeasurement:
+        loop = asyncio.get_running_loop()
+        completed = 0
+
+        def on_done(_receipt: object) -> None:
+            nonlocal completed
+            completed += 1
+
+        native = hasattr(PublishReceipt, "add_done_callback")
+
+        def observe(receipt: Any) -> None:
+            if native:
+                receipt.add_done_callback(on_done)
+                return
+            waiter = loop.create_future()
+            if receipt._waiters is None:
+                receipt._waiters = [waiter]
+            else:
+                receipt._waiters.append(waiter)
+            waiter.add_done_callback(on_done)
+
+        started = 0.0
+        for index in range(warmup_rounds + rounds):
+            if index == warmup_rounds:
+                started = time.perf_counter()
+            receipts = [PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE) for _ in range(batch)]
+            for receipt in receipts:
+                observe(receipt)
+            for receipt in receipts:
+                receipt._settle()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        elapsed = time.perf_counter() - started
+        if completed != (warmup_rounds + rounds) * batch:
+            raise RuntimeError("not every receipt completion was observed")
+        operations = rounds * batch
+        return ScenarioMeasurement(elapsed, operations, operations / elapsed)
+
+    return asyncio.run(run())
+
+
 def _publish_completion(_scenario: str) -> ScenarioMeasurement:
     from mqttium.api import AsyncClient
     from mqttium.api.models import PublishReceipt
@@ -609,6 +664,7 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "receipt_settle_unawaited": _receipt,
     "receipt_wait_single": _receipt_wait,
     "receipt_wait_concurrent": _receipt_wait,
+    "receipt_done_callback": _receipt_done_callback,
     "publish_complete_receipt": _publish_completion,
 }
 

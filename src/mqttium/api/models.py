@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 from types import MappingProxyType
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from functools import partial
 
 from mqttium.enums import QoS
 from mqttium.errors import PublishBatchError
@@ -166,6 +167,14 @@ class PublishBatchReceipt:
             self._done.set()
 
 
+def _run_done_callback(
+    callback: Callable[[PublishReceipt], Any],
+    receipt: PublishReceipt,
+    _waiter: asyncio.Future[None],
+) -> None:
+    callback(receipt)
+
+
 class PublishReceipt:
     """Handle returned by ``AsyncClient.publish``.
 
@@ -253,6 +262,40 @@ class PublishReceipt:
                 raise
         if self._error is not None:
             raise self._error
+
+    def add_done_callback(self, callback: Callable[[PublishReceipt], Any]) -> None:
+        """Call ``callback(receipt)`` once the publication completes or fails.
+
+        The callback runs on the event loop through ``loop.call_soon``, never
+        synchronously inside the client, so it may call the client API. If the
+        receipt is already done it is scheduled at once. It is the
+        per-publication counterpart of :meth:`wait` for code that must not
+        create a coroutine or task per message; read the outcome with
+        :meth:`exception`. An exception raised by the callback goes to the
+        loop's exception handler. Must be called from the client's loop.
+        """
+        loop = asyncio.get_running_loop()
+        if self._settled or self._qos == QoS.AT_MOST_ONCE:
+            loop.call_soon(callback, self)
+            return
+        # One more waiter future, resolved by the same settlement as wait()'s.
+        waiter: asyncio.Future[None] = loop.create_future()
+        waiter.add_done_callback(partial(_run_done_callback, callback, self))
+        waiters = self._waiters
+        if waiters is None:
+            self._waiters = [waiter]
+        else:
+            waiters.append(waiter)
+
+    def exception(self) -> BaseException | None:
+        """The terminal error of a done publication, or ``None`` if it succeeded.
+
+        Raises:
+            asyncio.InvalidStateError: If the publication is not done yet.
+        """
+        if not self.is_done():
+            raise asyncio.InvalidStateError("publication is not done yet")
+        return self._error
 
     def is_done(self) -> bool:
         """Whether the publication reached its completion boundary."""
