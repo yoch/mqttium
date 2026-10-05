@@ -11,7 +11,7 @@ MQTTium supports Python 3.11 through 3.14 and has no runtime dependencies.
 Install MQTTium from PyPI:
 
 ```bash
-python -m pip install mqttium==1.1.0
+python -m pip install mqttium==1.2.0
 ```
 
 When upgrading from 1.0, read the

@@ -8,7 +8,7 @@ published release, from that same tag. Validation mode never publishes.
 ## Preparing the next release
 
 Between releases, `main` keeps the version of the last published release
-(currently `1.1.0`); never upload a tree under an already-used version.
+(currently `1.2.0`); never upload a tree under an already-used version.
 Keep changes in `[Unreleased]`, record the candidate commit and source
 fingerprint, and validate the current installation and migration instructions
 before deciding the next version.

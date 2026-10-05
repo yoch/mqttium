@@ -9,7 +9,7 @@ Python 3.11–3.14. It is built for production services, gateways, and connected
 devices that need explicit completion, bounded resource use, and reliable
 recovery.
 
-These pages describe the 1.x native API. The stable release is `1.1.0`.
+These pages describe the 1.x native API. The stable release is `1.2.0`.
 Follow the [installation instructions](getting-started.md)
 to run the examples, or select documentation for your installed release.
 
