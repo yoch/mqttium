@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from typing import Any
+
+import pytest
 
 from mqttium.codec.buffer import IncrementalDecoder, RawPacket
 from mqttium.codec.primitives import pack_u16
@@ -223,3 +227,24 @@ def mark_delivered_messages(engine: object, effects: list[EngineEffect]) -> list
                 effect.data.mid, effect.exchange_token
             )
     return effects
+
+
+def patch_instance_method(
+    monkeypatch: pytest.MonkeyPatch, obj: object, name: str, replacement: Callable[..., Any]
+) -> None:
+    """Replace ``name`` for ``obj`` only, including on a ``__slots__`` class.
+
+    A slotted instance has no ``__dict__`` to shadow a method in, so this
+    dispatches at class level: ``obj`` gets ``replacement`` (called without
+    ``self``), every other instance keeps the original. ``monkeypatch`` undoes
+    it like any other patch.
+    """
+    cls = type(obj)
+    original = getattr(cls, name)
+
+    def dispatch(self: object, *args: Any, **kwargs: Any) -> Any:
+        if self is obj:
+            return replacement(*args, **kwargs)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(cls, name, dispatch)

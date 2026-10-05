@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support import patch_instance_method
+
 import asyncio
 
 import pytest
@@ -98,7 +100,7 @@ async def test_qos1_effect_handoff_exception_keeps_prefix_without_retry(monkeypa
             return True
 
         with monkeypatch.context() as patch:
-            patch.setattr(client._write_pump, "try_enqueue", accepted_then_raise)
+            patch_instance_method(patch, client._write_pump, "try_enqueue", accepted_then_raise)
             with pytest.raises(PublishBatchError) as caught:
                 await client.publish_many(messages())
         assert caught.value.__cause__ is failure
