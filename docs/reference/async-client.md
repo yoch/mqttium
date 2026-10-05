@@ -42,7 +42,9 @@ background thread.
 
 `on_publish` is removed. Observe publication through `PublishReceipt` or
 `PublishBatchReceipt`; QoS 0 completion means writer admission, QoS 1 PUBACK,
-and QoS 2 PUBCOMP.
+and QoS 2 PUBCOMP. `PublishReceipt.add_done_callback(fn)` is the
+per-publication callback: `fn(receipt)` runs on the loop after completion and
+reads the outcome with `receipt.exception()`.
 
 Declare message callbacks with `def`. Async functions and async callable objects
 are rejected before registration changes. A synchronous callback returning an

@@ -13,6 +13,7 @@ changes between MQTTium versions.
 | Receive | `on_message(client, userdata, msg)` on the network thread | `async for message in client.messages:` | `async for message in client.messages():` (default), or `message_delivery="callback"` with a synchronous `on_message(message)` |
 | Per-topic callbacks | `message_callback_add(filter, cb)` | filter inside the loop | `message_callback_add(filter, cb)`, callback delivery only, registered before the first `connect()` |
 | Publish and confirm | `publish(...).wait_for_publish()` | `await client.publish(...)` | `receipt = await client.publish(...)`, then `await receipt.wait()` |
+| Per-publication completion callback | `on_publish(client, userdata, mid, ...)` | none | `receipt.add_done_callback(fn)`; `fn(receipt)` runs on the loop, `receipt.exception()` gives the outcome |
 | Reconnect | `reconnect_delay_set()` + `loop_forever()` | application loop around `async with` | `reconnect=ReconnectPolicy(...)` |
 | Shut down | `loop_stop()`, `disconnect()` | leave `async with` | `await client.disconnect()` or leave `async with` |
 
@@ -28,6 +29,12 @@ PUBCOMP (QoS 2) and raises `PublishRejectedError` with the broker's
 `reason_code` when it refuses the message. Awaiting every receipt serially
 limits throughput to one round trip per message; keep receipts and wait on
 them later, or use `publish_many()`.
+
+To act on each completion without a coroutine per message, the way Paho's
+`on_publish` is used, register `receipt.add_done_callback(fn)`. `fn(receipt)`
+runs later on the event loop, never inside the client, and
+`receipt.exception()` is `None` on success or the terminal error. A task per
+`receipt.wait()` costs about twice as much per message.
 
 ## Subscriptions are the application's, not the client's
 

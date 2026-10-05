@@ -6,6 +6,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `PublishReceipt.add_done_callback(fn)` and `PublishReceipt.exception()`.
+  `fn(receipt)` is scheduled on the event loop once the publication completes
+  or fails, so code can act on every PUBACK or PUBCOMP without a coroutine or
+  task per message (about half the cost of a task awaiting `wait()`); it is the
+  per-publication counterpart of Paho's `on_publish`. `exception()` returns the
+  terminal error of a done publication, or `None`. Receipts that nobody
+  observes are unchanged.
+
 ### Changed
 
 - Receiving QoS 1/2 messages through callback delivery costs one event-loop

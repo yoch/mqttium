@@ -126,6 +126,31 @@ async def test_mqtt311_publish_burst_reaches_the_subscriber(qos: int) -> None:
 
 
 @pytest.mark.parametrize("qos", [1, 2])
+async def test_done_callbacks_observe_every_publication(qos: int) -> None:
+    count = 100
+    outcomes: list[BaseException | None] = []
+    done = asyncio.Event()
+    client = AsyncClient(f"done-callback-{qos}")
+
+    def on_done(receipt) -> None:  # noqa: ANN001
+        outcomes.append(receipt.exception())
+        if len(outcomes) == count:
+            done.set()
+
+    try:
+        await client.connect("127.0.0.1", 11883, timeout=5)
+        for index in range(count):
+            client.publish_nowait(
+                f"mqttium/it/done/{qos}", b"%d" % index, qos=qos
+            ).add_done_callback(on_done)
+        async with asyncio.timeout(10):
+            await done.wait()
+    finally:
+        await client.disconnect()
+    assert outcomes == [None] * count
+
+
+@pytest.mark.parametrize("qos", [1, 2])
 async def test_reader_owns_the_ack_permit_in_callback_delivery(qos: int) -> None:
     """With auto-ack callback delivery the reader restores the ACK permit itself.
 
