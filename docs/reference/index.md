@@ -7,7 +7,7 @@ another module does not grant the same stability tier.
 
 | Entry point | Native names |
 | --- | --- |
-| `mqttium` | `MQTTError`, `MalformedPacketError`, `ProtocolError`, `PacketTooLargeError`, `MandatoryResponseTooLargeError`, `FlowControlError`, `MessageDeliveryError`, `NotConnectedError`, `MQTTTimeoutError`, `SessionDiscardedError`, `SessionReplayError`, `PublishBatchError`, `BrokerDisconnectError`, `MQTTProtocolVersion`, `QoS`, `ConnectionState`, `__version__` |
+| `mqttium` | `MQTTError`, `MalformedPacketError`, `ProtocolError`, `PacketTooLargeError`, `MandatoryResponseTooLargeError`, `FlowControlError`, `MessageDeliveryError`, `NotConnectedError`, `MQTTTimeoutError`, `SessionDiscardedError`, `SessionReplayError`, `PublishBatchError`, `BrokerDisconnectError`, `ConnectRefusedError`, `ConnectError`, `PublishRejectedError`, `SubscribeError`, `MQTTProtocolVersion`, `QoS`, `ConnectionState`, `__version__` |
 | `mqttium.api` | `AsyncClient`, `Message`, `Properties`, `PublishMessage`, `PublishReceipt`, `PublishBatchReceipt`, `SubscribeResult`, `UnsubscribeResult`, `SubscribeOptions`, `ConnAckPacket`, `AuthPacket`, `NegotiatedSettings`, `ReconnectPolicy`, `MessageDelivery`, `ClientStats` and its nested snapshots (`OutboundStats`, `InboundStats`, `WriterStats`, `DecoderStats`, `DeliveryStats`, `ReceiptStats`, `TransportStats`) |
 
 `mqttium.persistence` supports `MemoryInflightStore` and `SqliteInflightStore`:
@@ -43,6 +43,6 @@ See [Core Concepts](../core-concepts.md) before choosing timeouts or retry logic
 
 ## Stability rules
 
-The current pre-v1 API intentionally revises the earlier one. See the
+The 1.x native API grew out of RC17 and supersedes earlier candidates. See the
 [API contract](../api-stability.md) and [migration guide](../migration.md)
 for supported interfaces and incompatible changes.

@@ -44,12 +44,12 @@ a submission error carries a receipt for the committed prefix.
 ::: mqttium.api.SubscribeResult
     options:
       heading_level: 3
-      members: [mid, reason_codes]
+      members: [mid, reason_codes, granted_qos, properties]
 
 ::: mqttium.api.UnsubscribeResult
     options:
       heading_level: 3
-      members: [mid, reason_codes]
+      members: [mid, reason_codes, properties]
 
 These result types are frozen. They support value construction with `mid` and
 `reason_codes`, and inspection of those two fields; construct a new result to

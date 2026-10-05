@@ -30,7 +30,7 @@ background thread.
 
 | Member | Meaning |
 | --- | --- |
-| `state` | Current `ConnectionState` |
+| `state` | Current `ConnectionState`; `RECONNECTING` while the reconnect policy will retry, `DISCONNECTED` once nothing will reconnect automatically |
 | `is_connected` | Whether the client is currently connected |
 | `negotiated` | Broker-negotiated MQTT settings after CONNACK |
 | `effective_client_id` | Requested or broker-assigned client identifier |
@@ -42,7 +42,9 @@ background thread.
 
 `on_publish` is removed. Observe publication through `PublishReceipt` or
 `PublishBatchReceipt`; QoS 0 completion means writer admission, QoS 1 PUBACK,
-and QoS 2 PUBCOMP.
+and QoS 2 PUBCOMP. `PublishReceipt.add_done_callback(fn)` is the
+per-publication callback: `fn(receipt)` runs on the loop after completion and
+reads the outcome with `receipt.exception()`.
 
 Declare message callbacks with `def`. Async functions and async callable objects
 are rejected before registration changes. A synchronous callback returning an
@@ -66,8 +68,11 @@ the reader, later packets are not processed until the callback returns.
 `message_delivery="callback"`.
 
 Matching topic filters run in registration order instead of `on_message`.
-Shared-subscription filters match the filter string literally. Iterator mode
-ignores message callbacks and routes. `on_message` and the routes freeze
+A shared-subscription filter `$share/<group>/<filter>` matches by `<filter>`,
+the Topic Name the broker delivers. Message
+callbacks and routes require `message_delivery="callback"`: with iterator
+delivery, assigning `on_message` or calling `message_callback_add()` raises
+`ValueError`, because nothing would read `messages()`. `on_message` and the routes freeze
 permanently on the first connection attempt; subscriptions remain mutable.
 Use `messages()` for asynchronous processing or explicitly manage application
 work with its own bounds and overflow policy.
@@ -86,6 +91,23 @@ effect and connection locks have been released. A successful `connect()` and
 completion. `on_connect` may subscribe or publish normally; it is not a barrier
 that delays already-available incoming messages until initialization finishes.
 Use an application signal if processing depends on that initialization.
+
+`client.state` is already final when `on_disconnect` runs: `RECONNECTING` if
+the reconnect policy will try again, `DISCONNECTED` if the client stays down
+until the application calls `connect()`. A service that must stop, restart or
+alert when the client gives up checks it there:
+
+```python
+def on_disconnect(cause: BaseException | None) -> None:
+    if client.state is ConnectionState.DISCONNECTED:
+        stopped.set()  # no automatic reconnection will follow
+
+
+client.on_disconnect = on_disconnect
+```
+
+A refused CONNACK is a `ConnectRefusedError` whose `reason_code` (and MQTT 5
+`properties`) says why.
 
 Lifecycle notifications describe the latest state, not a lossless transition
 log. MQTTium retains one active hook and at most one pending notification;
@@ -123,6 +145,26 @@ protocol rules. Return an `AuthPacket` for a challenge response; use `async def`
 if producing it requires asynchronous work. Lifecycle reentrancy does not
 promise arbitrary reentrant operations from AUTH. See
 [enhanced authentication](../mqtt-5.md#enhanced-authentication).
+
+## Connecting, retrying and stopping
+
+With a `ReconnectPolicy`, the first `connect()` also retries transient failures
+according to the policy, so a service may start before its broker: the call
+returns once connected, or raises when the policy gives up or the cause is
+terminal (a refused CONNACK raises `ConnectRefusedError`). Between attempts
+`state` is `RECONNECTING`, and `disconnect()` makes the pending `connect()` raise
+immediately. Without a policy `connect()` makes one attempt. A failed `connect()`
+never ends the `messages()` stream: an iterator started earlier keeps waiting
+for a later connection.
+
+QoS 1 and QoS 2 publications made before the first `connect()` wait in the
+offline queue. Once the client is stopped -- after `disconnect()`, or after a
+loss with no reconnection pending -- `publish()` and `publish_nowait()` raise
+`NotConnectedError` instead of queueing work that nothing will send.
+
+`async with AsyncClient(...) as client:` scopes the client: leaving the block
+calls `disconnect()`. Cancelling the client's tasks from outside, as event-loop
+shutdown does, ends the connection without starting a reconnection.
 
 ## Loop confinement
 
@@ -162,4 +204,14 @@ A terminal disconnect ends the current generation. A later explicit `connect()`,
 `connect_unix()`, or `connect_ws()` starts a new generation. Iterators created for
 the previous generation stay terminal and cannot consume messages delivered by
 the new connection; call `messages()` again after the explicit connect to consume
-the replacement generation.
+the replacement generation. Messages the previous generation queued but did not
+yield move to the new generation first, in order: they are already committed to
+the application and are never discarded.
+
+A message the client has already acknowledged -- any QoS 0 message, and QoS 1
+with automatic acknowledgement -- has no other owner once its acknowledgement
+has left: the broker will not resend it. Connection loss, `disconnect()` or an
+explicit reconnect therefore still delivers it, in order, even when the
+iterator queue is full; this overshoot is bounded by one ingress lot. A QoS 2 or
+manually acknowledged delivery that was not handed over stays with session
+state, which redelivers it on a resumed session.

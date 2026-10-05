@@ -1,6 +1,93 @@
-# Migrating to 1.0.0rc17
+# Migrating to 1.2
 
-RC17 revises the RC16 API before 1.0. If you are upgrading from **1.0.0rc16**,
+## Changes in 1.2
+
+1.2.0 is additive: no 1.1 behaviour changes and nothing to migrate. It adds
+`PublishReceipt.add_done_callback()` and `PublishReceipt.exception()`, the
+per-publication counterpart of Paho's `on_publish`.
+
+## Changes in 1.1
+
+1.1.0 keeps the 1.0 API and SQLite schema 5, and corrects behaviour that
+real deployments of 1.0 found unsafe: silent losses, clients that stall, and
+limits enforced without the broker knowing them. Some corrections change what
+Stable interfaces do; each one is listed here with what to change. See the
+[exception note](api-stability.md#the-11-exception) in the API contract.
+
+
+- `ConnectionState.DISCONNECTED` now means that no automatic reconnection is
+  pending. While the reconnect policy will retry, `state` and
+  `stats().state` read the new `ConnectionState.RECONNECTING`. Code comparing
+  `state` against `DISCONNECTED` to detect a lost connection must also accept
+  `RECONNECTING`; code that exhaustively matches `ConnectionState` gains a case.
+- A refused CONNACK raises `ConnectRefusedError`, a `ProtocolError` subclass
+  with `reason_code` and `properties`; `except ProtocolError` still catches it.
+- Reconnection now retries causes it used to treat as permanent: broker protocol
+  violations other than malformed packets, local limit breaches, a slow
+  iterator consumer (`MessageDeliveryError`) and TLS certificate verification
+  failures. MQTT 5 *Session taken over* (`0x8E`) is terminal instead of retried.
+  `ReconnectPolicy(retry_refused=True)` also retries terminal CONNACK refusals.
+- With a `ReconnectPolicy`, the first `connect()` retries transient failures
+  instead of failing on the first one; remove application retry loops around
+  it, or keep them for the no-policy case. A failed `connect()` no longer ends
+  the `messages()` stream.
+- QoS 1/2 `publish()` and `publish_nowait()` raise `NotConnectedError` once the
+  client is stopped (after `disconnect()` or a loss with no reconnection
+  pending) instead of queueing a publication that could never be sent. The
+  offline queue before the first `connect()` is unchanged.
+- Assigning `on_message` or calling `message_callback_add()` with iterator
+  delivery raises `ValueError`; it used to be silently ignored.
+- `AsyncClient` supports `async with`, which calls `disconnect()` on exit.
+- `message_callback_add("$share/<group>/<filter>", ...)` routes match
+  `<filter>`; remove any workaround that registered the plain filter as well.
+- Consume `messages()` from one iterator. A second iterator waiting at the
+  same time raises `MQTTError`; fan messages out to several workers from a
+  single consumer instead.
+- `Message.properties` no longer includes `topic_alias`.
+- `connect()` raises `ConnectError` for DNS, TCP, TLS and WebSocket upgrade
+  failures. It is still an `OSError`, so existing `except OSError` handlers
+  keep working; code catching a specific subclass such as
+  `ConnectionRefusedError` or `ssl.SSLCertVerificationError` must inspect
+  `exc.__cause__` instead.
+- `subscribe()` raises `SubscribeError` when any filter is refused; read
+  `exc.result` for the per-filter reason codes. Code that checked
+  `reason_codes` for values of `0x80` or above can catch the error instead.
+- A refused publication fails its receipt with `PublishRejectedError`, a
+  `ProtocolError` subclass with `reason_code` and `properties`.
+- `keepalive` must be an `int`.
+- `max_inbound_inflight`, `maximum_packet_size` and `max_inbound_inflight_bytes`
+  default to `None`. MQTT 5 still advertises and enforces 100 exchanges and
+  16 MiB packets; MQTT 3.1.1 enforces inbound limits only when set explicitly,
+  and no client bounds inbound bytes by default. Pass the 1.0 values
+  (`100`, `16 * 1024 * 1024`, `64 * 1024 * 1024`) to keep the old local bounds.
+  An explicit `maximum_packet_size=None` used to mean 16 MiB on both protocols.
+- On MQTT 3.1.1, `max_outbound_inflight` defaults to 20 in flight instead of no
+  local limit. Set it explicitly for a broker configured with a larger window.
+- A publication larger than `max_unacknowledged_bytes` is admitted alone
+  instead of raising `FlowControlError`; set the bound above your largest
+  message if other publications must not wait behind it.
+- After a reconnect without a broker session, unacknowledged QoS 1
+  publications are sent again as new ones and their receipts complete normally;
+  only QoS 2 receipts fail with `SessionDiscardedError`. Remove application
+  code that republished QoS 1 messages on that error. Consumers may see the
+  message twice, as QoS 1 always allowed.
+- An MQTT 5 client connecting with `clean_start=False` accepts Session Present
+  even when it holds no incomplete QoS exchange, so a restarted durable
+  subscriber resumes its broker session instead of failing with
+  `ProtocolError`. Remove any workaround that connected once with
+  `clean_start=True` after a restart; it discarded the session.
+
+## Changes since 1.0.0rc17
+
+The stable 1.0.0 release preserves RC17's client behavior, public API and SQLite
+schema 5. RC17 applications need no API or database migration for this release.
+The support tiers in the [API contract](api-stability.md) remain distinct:
+Stable interfaces follow SemVer, while statistics and the supplied stores stay
+Provisional.
+
+## Upgrading from earlier candidates
+
+RC17 revised the RC16 API before 1.0. If you are upgrading from **1.0.0rc16**,
 start with [Changes since 1.0.0rc16](#changes-since-100rc16). If you are
 upgrading from **1.0.0rc14** (`c194597`, 2026-09-11), review the broader
 native-API changes throughout this guide as well.

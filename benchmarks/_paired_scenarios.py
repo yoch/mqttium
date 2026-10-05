@@ -470,6 +470,31 @@ def _websocket_mask(_scenario: str) -> ScenarioMeasurement:
     return _measure(lambda: _mask_payload(payload, b"abcd"), operations=20_000, warmup=500)
 
 
+def _dispatch(scenario: str) -> ScenarioMeasurement:
+    """Resolve the filtered callbacks for one delivered topic.
+
+    ``dispatch_match_exact`` registers exact filters only; the numbered cells
+    register that many wildcard filters on unrelated branches plus the one
+    that matches, so they show whether matching cost follows the filter count.
+    """
+    from mqttium.dispatch.matcher import TopicMatcher
+
+    matcher = TopicMatcher()
+    for index in range(50):
+        matcher[f"home/room{index}/temp"] = index
+    if scenario == "dispatch_match_exact":
+        topic = "home/room7/temp"
+    else:
+        for index in range(int(scenario.rsplit("_", 1)[1]) - 1):
+            matcher[f"zigbee2mqtt/device{index}/+"] = index
+        matcher["bench/+/temp"] = "match"
+        topic = TOPIC
+    iter_match = matcher.iter_match
+    if not list(iter_match(topic)):
+        raise RuntimeError(f"{scenario}: the probe topic matched nothing")
+    return _measure(lambda: list(iter_match(topic)), operations=100_000, warmup=2_000)
+
+
 def _receipt(_scenario: str) -> ScenarioMeasurement:
     from mqttium.api.models import PublishReceipt
     from mqttium.enums import QoS
@@ -513,6 +538,61 @@ def _receipt_wait(scenario: str) -> ScenarioMeasurement:
             await asyncio.gather(*tasks)
         elapsed = time.perf_counter() - started
         operations = rounds * batch * waiters
+        return ScenarioMeasurement(elapsed, operations, operations / elapsed)
+
+    return asyncio.run(run())
+
+
+def _receipt_done_callback(_scenario: str) -> ScenarioMeasurement:
+    """Observe each receipt's completion without a coroutine or task.
+
+    Sources with ``PublishReceipt.add_done_callback`` use it; older ones use
+    what applications had to do there: one future in the receipt's waiter
+    list plus a future done callback (the benchmark's mqttium adapter).
+    """
+    from mqttium.api.models import PublishReceipt
+    from mqttium.enums import QoS
+
+    batch = 64
+    rounds = 3_000
+    warmup_rounds = 200
+
+    async def run() -> ScenarioMeasurement:
+        loop = asyncio.get_running_loop()
+        completed = 0
+
+        def on_done(_receipt: object) -> None:
+            nonlocal completed
+            completed += 1
+
+        native = hasattr(PublishReceipt, "add_done_callback")
+
+        def observe(receipt: Any) -> None:
+            if native:
+                receipt.add_done_callback(on_done)
+                return
+            waiter = loop.create_future()
+            if receipt._waiters is None:
+                receipt._waiters = [waiter]
+            else:
+                receipt._waiters.append(waiter)
+            waiter.add_done_callback(on_done)
+
+        started = 0.0
+        for index in range(warmup_rounds + rounds):
+            if index == warmup_rounds:
+                started = time.perf_counter()
+            receipts = [PublishReceipt(mid=1, qos=QoS.AT_LEAST_ONCE) for _ in range(batch)]
+            for receipt in receipts:
+                observe(receipt)
+            for receipt in receipts:
+                receipt._settle()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        elapsed = time.perf_counter() - started
+        if completed != (warmup_rounds + rounds) * batch:
+            raise RuntimeError("not every receipt completion was observed")
+        operations = rounds * batch
         return ScenarioMeasurement(elapsed, operations, operations / elapsed)
 
     return asyncio.run(run())
@@ -578,9 +658,13 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "delivery_iterator": _delivery,
     "effect_single_message_callback": _single_message_effect,
     "websocket_mask_4k": _websocket_mask,
+    "dispatch_match_exact": _dispatch,
+    "dispatch_match_1": _dispatch,
+    "dispatch_match_100": _dispatch,
     "receipt_settle_unawaited": _receipt,
     "receipt_wait_single": _receipt_wait,
     "receipt_wait_concurrent": _receipt_wait,
+    "receipt_done_callback": _receipt_done_callback,
     "publish_complete_receipt": _publish_completion,
 }
 

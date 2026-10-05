@@ -32,6 +32,8 @@ from mqttium.api.stats import (
 )
 from mqttium.errors import (
     BrokerDisconnectError,
+    ConnectError,
+    ConnectRefusedError,
     FlowControlError,
     MQTTError,
     MQTTTimeoutError,
@@ -42,8 +44,10 @@ from mqttium.errors import (
     PacketTooLargeError,
     ProtocolError,
     PublishBatchError,
+    PublishRejectedError,
     SessionDiscardedError,
     SessionReplayError,
+    SubscribeError,
 )
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.packets import AuthPacket, ConnAckPacket, SubscribeOptions
@@ -54,6 +58,8 @@ from mqttium.types import Message, Properties
 
 STABLE_ROOT_EXPORTS = {
     "BrokerDisconnectError": BrokerDisconnectError,
+    "ConnectError": ConnectError,
+    "ConnectRefusedError": ConnectRefusedError,
     "ConnectionState": ConnectionState,
     "FlowControlError": FlowControlError,
     "MQTTError": MQTTError,
@@ -66,9 +72,11 @@ STABLE_ROOT_EXPORTS = {
     "PacketTooLargeError": PacketTooLargeError,
     "ProtocolError": ProtocolError,
     "PublishBatchError": PublishBatchError,
+    "PublishRejectedError": PublishRejectedError,
     "QoS": QoS,
     "SessionDiscardedError": SessionDiscardedError,
     "SessionReplayError": SessionReplayError,
+    "SubscribeError": SubscribeError,
 }
 
 STABLE_API_EXPORTS = {
@@ -128,8 +136,8 @@ def test_async_client_constructor_keywords_and_defaults() -> None:
         "will": None,
         "maximum_packet_size": None,
         "topic_alias_maximum": 0,
-        "max_inbound_inflight": 100,
-        "max_inbound_inflight_bytes": 64 * 1024 * 1024,
+        "max_inbound_inflight": None,
+        "max_inbound_inflight_bytes": None,
         "max_outbound_inflight": None,
         "max_unacknowledged_messages": 10_000,
         "max_unacknowledged_bytes": 64 * 1024 * 1024,
@@ -167,6 +175,7 @@ def test_reconnect_policy_describes_only_the_retry_progression() -> None:
         "max_delay": 60.0,
         "max_retries": None,
         "stable_after": 30.0,
+        "retry_refused": False,
     }
     parameters = inspect.signature(ReconnectPolicy).parameters
     assert {name: parameter.default for name, parameter in parameters.items()} == expected_defaults
@@ -187,6 +196,9 @@ def test_client_stats_fields_follow_the_constructor_vocabulary() -> None:
         "delivery",
         "receipts",
         "transport",
+        "connected_since",
+        "last_disconnect_error",
+        "last_disconnect_reason_code",
     )
     assert names(OutboundStats) == (
         "unacknowledged_messages",
@@ -225,6 +237,9 @@ def test_client_stats_fields_follow_the_constructor_vocabulary() -> None:
         "iterator_high_water_bytes",
         "iterator_byte_limit",
         "waiters",
+        "callback_invocations",
+        "callback_failures",
+        "unrouted_messages",
     )
     assert names(ReceiptStats) == (
         "publish",
@@ -360,7 +375,8 @@ def test_batch_error_carries_only_its_receipt() -> None:
 
 
 def test_stable_enumerations_have_no_unused_members() -> None:
-    # MQTT 3.1 is unsupported and no state is reported while reconnecting.
+    # MQTT 3.1 is unsupported. RECONNECTING is reported while the reconnect
+    # policy retries, so DISCONNECTED always means stopped.
     assert [level.name for level in MQTTProtocolVersion] == ["MQTTv311", "MQTTv5"]
     assert [state.name for state in ConnectionState] == [
         "NEW",
@@ -368,6 +384,7 @@ def test_stable_enumerations_have_no_unused_members() -> None:
         "CONNECTED",
         "DISCONNECTING",
         "DISCONNECTED",
+        "RECONNECTING",
     ]
 
 

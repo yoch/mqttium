@@ -49,21 +49,28 @@ from mqttium.api.stats import (
     ReceiptStats,
     TransportStats,
 )
-from mqttium.codec.buffer import DEFAULT_MAX_PACKET_SIZE, IncrementalDecoder
+from mqttium.codec.buffer import (
+    DEFAULT_MAX_PACKET_SIZE,
+    PROTOCOL_MAX_PACKET_SIZE,
+    IncrementalDecoder,
+)
 from mqttium.dispatch.matcher import TopicMatcher
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.errors import (
     BrokerDisconnectError,
+    ConnectError,
+    ConnectRefusedError,
     FlowControlError,
     MQTTError,
     MQTTTimeoutError,
+    NotConnectedError,
     MalformedPacketError,
     MandatoryResponseTooLargeError,
-    MessageDeliveryError,
     PublishBatchError,
     PacketTooLargeError,
     ProtocolError,
     SessionReplayError,
+    SubscribeError,
 )
 from mqttium.packets import (
     AuthPacket,
@@ -85,6 +92,7 @@ from mqttium.protocol.outbound import _PreparedPublish
 from mqttium.protocol.reconnect import ReconnectPolicy, _ReconnectState
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.topics import validate_subscribe_filter
+from mqttium.transport._push import PushStreamTransport
 from mqttium.transport._stream import AsyncTransport, DecoderPushTransport, PullTransport
 from mqttium.transport.tcp import TcpTransport
 from mqttium.transport.unix import UnixSocketTransport
@@ -121,6 +129,7 @@ _CAUSE_BROKER = 1  # broker DISCONNECT or refused CONNACK (first-wins with trans
 _CAUSE_PROTOCOL = 2  # peer protocol or decoding violations
 _CAUSE_LOCAL = 3  # local capability failures that make the session unusable
 _DEFAULT_MAX_ITERATOR_MESSAGES = 65_536
+_MQTT311_DEFAULT_OUTBOUND_INFLIGHT = 20
 _DEFAULT_MAX_ITERATOR_BYTES = 64 * 1024 * 1024
 
 _ReceiptT = TypeVar("_ReceiptT", "PublishReceipt", "PublishBatchReceipt")
@@ -176,6 +185,18 @@ def _positive(name: str, value: float) -> None:
 def _non_negative_optional(name: str, value: int | None) -> None:
     if value is not None and value < 0:
         raise ValueError(f"{name} must be non-negative or None")
+
+
+def _protocol_version(protocol: object) -> MQTTProtocolVersion:
+    """Accept the enum or its wire level (4 or 5); refuse anything else."""
+    if isinstance(protocol, bool) or not isinstance(protocol, int):
+        raise TypeError("protocol must be MQTTProtocolVersion.MQTTv311 (4) or MQTTv5 (5)")
+    try:
+        version = MQTTProtocolVersion(protocol)
+    except ValueError:
+        name = "MQTT 3.1" if protocol == 3 else f"MQTT protocol level {protocol}"
+        raise ValueError(f"{name} is not supported; use 4 (MQTT 3.1.1) or 5 (MQTT 5)") from None
+    return version
 
 
 def _validate_client_arguments(
@@ -247,16 +268,22 @@ class AsyncClient:
             Properties, such as ``will_delay_interval``.
         maximum_packet_size: Largest inbound packet accepted by the decoder;
             advertised to an MQTT 5 broker. Larger packets end the connection.
+            ``None`` means 16 MiB on MQTT 5 and the protocol maximum on MQTT
+            3.1.1, whose broker cannot be told a limit.
         topic_alias_maximum: Inbound topic aliases accepted from an MQTT 5
             broker.
         max_inbound_inflight: Concurrent inbound QoS 1/2 exchanges accepted;
             advertised as Receive Maximum on MQTT 5. A broker that exceeds it
-            is disconnected.
+            is disconnected. ``None`` means 100 on MQTT 5 and 65,535 (no
+            limit) on MQTT 3.1.1, whose broker cannot be told a limit.
         max_inbound_inflight_bytes: Logical bytes retained for inbound QoS 1/2
-            exchanges; ``None`` disables the bound. A broker that exceeds it is
-            disconnected with reason 0x97.
+            exchanges; ``None`` (the default) disables the bound. No broker
+            can be told this limit; one that exceeds it is disconnected with
+            reason 0x97.
         max_outbound_inflight: Optional local cap on concurrent outbound QoS
             1/2 exchanges, additionally bounded by broker negotiation.
+            ``None`` means the broker's Receive Maximum on MQTT 5 and 20 on
+            MQTT 3.1.1, whose broker cannot announce a window.
         max_unacknowledged_messages: Outbound QoS 1/2 publications admitted
             and not yet completed, including those waiting for an inflight
             slot; ``None`` disables the bound.
@@ -314,8 +341,8 @@ class AsyncClient:
         will: PublishMessage | None = None,
         maximum_packet_size: int | None = None,
         topic_alias_maximum: int = 0,
-        max_inbound_inflight: int = 100,
-        max_inbound_inflight_bytes: int | None = 64 * 1024 * 1024,
+        max_inbound_inflight: int | None = None,
+        max_inbound_inflight_bytes: int | None = None,
         max_outbound_inflight: int | None = None,
         max_unacknowledged_messages: int | None = 10_000,
         max_unacknowledged_bytes: int | None = 64 * 1024 * 1024,
@@ -334,6 +361,9 @@ class AsyncClient:
         auth_handler: _OnAuth | None = None,
         auth_timeout: float = 10.0,
     ) -> None:
+        protocol = _protocol_version(protocol)
+        if isinstance(keepalive, bool) or not isinstance(keepalive, int):
+            raise TypeError("keepalive must be an int number of seconds")
         _validate_client_arguments(
             client_id=client_id,
             username=username,
@@ -373,10 +403,24 @@ class AsyncClient:
             # only way to acknowledge from a callback would be a detached task;
             # messages() is the delivery mode built for that processing shape.
             raise ValueError("manual_ack requires iterator delivery; use messages() and ack()")
-        effective_max_packet_size = (
-            maximum_packet_size if maximum_packet_size is not None else DEFAULT_MAX_PACKET_SIZE
+        # A limit the broker was never told is not a protocol violation, so
+        # MQTT 3.1.1 enforces inbound limits only when they are set explicitly.
+        is_mqtt5 = protocol == MQTTProtocolVersion.MQTTv5
+        effective_max_packet_size = maximum_packet_size
+        if effective_max_packet_size is None and is_mqtt5:
+            effective_max_packet_size = DEFAULT_MAX_PACKET_SIZE
+        if max_inbound_inflight is None:
+            max_inbound_inflight = 100 if is_mqtt5 else 65_535
+        if max_outbound_inflight is None and not is_mqtt5:
+            # An MQTT 3.1.1 broker cannot announce its window, and Mosquitto
+            # acknowledges then silently drops QoS 1/2 PUBLISHes beyond its
+            # default of 20 in flight. 20 is also Paho's default.
+            max_outbound_inflight = _MQTT311_DEFAULT_OUTBOUND_INFLIGHT
+        initial_decoder_max_packet_size = (
+            PROTOCOL_MAX_PACKET_SIZE
+            if effective_max_packet_size is None
+            else effective_max_packet_size
         )
-        initial_decoder_max_packet_size = effective_max_packet_size
         pwd = password.encode("utf-8") if isinstance(password, str) else password
         will_message, will_properties = _will_config(will)
         self._engine = ProtocolEngine(
@@ -453,6 +497,9 @@ class AsyncClient:
         self._teardown_final = False
         self._ping_pending = False
         self._ping_deadline = 0.0
+        # Monotonic time of the last byte received on the current connection.
+        self._last_inbound = 0.0
+        self._connected_since = 0.0
         self._host = ""
         self._port = 1883
         self._ssl: ssl.SSLContext | bool | None = None
@@ -469,6 +516,16 @@ class AsyncClient:
         self._transport_factory: Callable[..., Awaitable[AsyncTransport]] = TcpTransport.connect
         self._last_disconnect: DisconnectInfo | None = None
         self._last_connack_reason: int | None = None
+        # Whether a lost connection will be retried by the reconnect policy.
+        # Decided before the disconnect notification, so on_disconnect can
+        # read the final state.
+        self._reconnect_pending = False
+        # Set while the client itself cancels its reader, to tell that apart
+        # from a cancellation imposed from outside (event-loop shutdown).
+        self._reader_cancel_requested = False
+        # Wakes a first connect() waiting between attempts when disconnect()
+        # abandons it.
+        self._connect_backoff_wake: asyncio.Future[None] | None = None
 
         self._on_message: _OnMessage | None = None
         self._message_callback: CallbackTarget | None = None
@@ -499,8 +556,9 @@ class AsyncClient:
         report = getattr(transport, "stats", None)
         transport_stats = report() if report is not None else TransportStats._unavailable(transport)
         engine = self._engine
+        last_error = self._lifecycle_hooks.last_disconnect_error
         return ClientStats(
-            state=engine.state,
+            state=self.state,
             connections=self._connections,
             reconnect_attempt=self._reconnect.attempt,
             outbound=engine.outbound.stats(),
@@ -519,6 +577,13 @@ class AsyncClient:
                 publish_waiters=self._publish_waiters,
             ),
             transport=transport_stats,
+            connected_since=(
+                self._connected_since if self.state is ConnectionState.CONNECTED else None
+            ),
+            last_disconnect_error=(
+                None if last_error is None else f"{type(last_error).__name__}: {last_error}"
+            ),
+            last_disconnect_reason_code=getattr(last_error, "reason_code", None),
         )
 
     def _running_tasks(self) -> dict[str, bool]:
@@ -537,10 +602,32 @@ class AsyncClient:
             "auth": running(self._auth_exchange.task),
         }
 
+    async def __aenter__(self) -> AsyncClient:
+        """Scope the client: ``async with AsyncClient(...) as client``.
+
+        Entering does not connect; call ``connect()`` inside the block. Leaving
+        the block always calls ``disconnect()``, also on error or cancellation.
+        """
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.disconnect()
+
     @property
     def state(self) -> ConnectionState:
-        """Current protocol connection state."""
-        return self._engine.state
+        """Current connection state.
+
+        ``RECONNECTING`` while the reconnect policy will retry a lost
+        connection; ``DISCONNECTED`` once no automatic reconnection is pending.
+        """
+        state = self._engine.state
+        if self._reconnect_pending and state in (
+            ConnectionState.NEW,
+            ConnectionState.DISCONNECTED,
+            ConnectionState.CONNECTING,
+        ):
+            return ConnectionState.RECONNECTING
+        return state
 
     @property
     def is_connected(self) -> bool:
@@ -615,10 +702,21 @@ class AsyncClient:
         prepared: _PreparedPublish | None = None,
     ) -> PublishReceipt | None:
         """Admit one operation and register its completion before collecting SEND."""
-        if qos != QoS.AT_MOST_ONCE and self._local_terminal_failure is not None:
-            raise MQTTError(
-                "Client is unusable after a local terminal failure; create a new AsyncClient"
-            )
+        if qos != QoS.AT_MOST_ONCE:
+            if self._local_terminal_failure is not None:
+                raise MQTTError(
+                    "Client is unusable after a local terminal failure; create a new AsyncClient"
+                )
+            if (
+                self._engine.state is ConnectionState.DISCONNECTED
+                and not self._connection_pending()
+            ):
+                # Queued now, this publication would wait for a connection
+                # that nothing will establish. Before the first connect()
+                # (state NEW) the offline queue stays available.
+                raise NotConnectedError(
+                    "Not connected and no connection is pending; call connect() first"
+                )
         handle = self._engine.outbound.queue_publish(
             topic,
             payload,
@@ -671,7 +769,9 @@ class AsyncClient:
             MQTTError: If :meth:`disconnect` cancels connection setup.
             MQTTError: If a previous local terminal failure fail-stopped
                 this client; create a new one instead of reusing it.
-            OSError: If TCP/TLS setup or the initial MQTT CONNECT write fails.
+            ConnectError: If DNS, TCP or TLS setup fails (also an ``OSError``;
+                the original error is ``__cause__``).
+            OSError: If the initial MQTT CONNECT write fails.
             asyncio.CancelledError: If the calling task is cancelled.
         """
         return await self._connect_explicit(host, port, ssl=ssl, timeout=timeout)
@@ -697,7 +797,8 @@ class AsyncClient:
             ProtocolError: If the broker refuses or violates the protocol.
             MQTTError: If a previous local terminal failure fail-stopped
                 this client; create a new one instead of reusing it.
-            OSError: If Unix socket setup or the initial MQTT CONNECT write fails.
+            ConnectError: If Unix socket setup fails (also an ``OSError``).
+            OSError: If the initial MQTT CONNECT write fails.
             asyncio.CancelledError: If the calling task is cancelled.
         """
 
@@ -738,8 +839,9 @@ class AsyncClient:
             ProtocolError: If the broker refuses or violates the MQTT protocol.
             MQTTError: If a previous local terminal failure fail-stopped
                 this client; create a new one instead of reusing it.
-            ConnectionError: If the WebSocket upgrade, transport, or initial
-                MQTT CONNECT write fails.
+            ConnectError: If DNS, TCP, TLS or the WebSocket upgrade fails
+                (also an ``OSError``; the original error is ``__cause__``).
+            ConnectionError: If the initial MQTT CONNECT write fails.
             ValueError: If the URL or WebSocket options are invalid.
             asyncio.CancelledError: If the calling task is cancelled.
         """
@@ -833,13 +935,69 @@ class AsyncClient:
                 self._intentional_disconnect = False
                 timeout = timeout if timeout is not None else self._connect_timeout
                 self._reconnect.reset()
-                connack = await self._connect_once_locked(host, port, ssl=ssl, timeout=timeout)
+                connack = await self._connect_with_policy(host, port, ssl=ssl, timeout=timeout)
             if self.is_connected:
                 self._lifecycle_hooks.connected(connack, lifecycle_token)
             return connack
         finally:
             if self._explicit_connect_task is task:
                 self._explicit_connect_task = None
+
+    async def _connect_with_policy(
+        self,
+        host: str,
+        port: int,
+        *,
+        ssl: ssl.SSLContext | bool | None,
+        timeout: float,
+    ) -> ConnAckPacket:
+        """Connect, retrying setup failures according to the reconnect policy.
+
+        Without a policy this is one attempt. With one, a service may start
+        before its broker: transient failures wait for the policy's backoff
+        and try again, until a terminal cause or exhaustion. A failed attempt
+        never ends the application message stream -- no connection was made,
+        so nothing it delivered is complete.
+        """
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                return await self._connect_once_locked(
+                    host, port, ssl=ssl, timeout=timeout, reconnect_attempt=True
+                )
+            except asyncio.CancelledError:
+                # The caller abandoned connect(); nothing will retry for it.
+                self._abandon_connect(MQTTError("Connection attempt cancelled"))
+                raise
+            except Exception as exc:
+                if owner_cancelled():
+                    self._abandon_connect(exc)
+                    raise
+                self._disconnect_exc = exc
+                self._disconnect_rank = _CAUSE_TRANSPORT
+                retry = (
+                    self._reconnect.enabled
+                    and not self._intentional_disconnect
+                    and self._will_reconnect()
+                )
+                if not retry:
+                    self._abandon_connect(exc)
+                    raise
+                self._reconnect_pending = True
+                wake = self._connect_backoff_wake = loop.create_future()
+                try:
+                    await asyncio.wait({wake}, timeout=self._reconnect.next_delay())
+                finally:
+                    self._connect_backoff_wake = None
+                if self._intentional_disconnect:
+                    self._abandon_connect(exc)
+                    raise MQTTError("Connection cancelled by disconnect()") from exc
+
+    def _abandon_connect(self, cause: BaseException) -> None:
+        """Settle an explicit connect that gave up, keeping the message stream."""
+        self._intentional_disconnect = True
+        self._reconnect_pending = False
+        self._fail_pending(cause)
 
     async def _connect_once_locked(
         self,
@@ -864,14 +1022,10 @@ class AsyncClient:
         # CONNACK; no old effect may cross into the new connection.
         await self._invalidate_connection_epoch()
         self._effect_pump.discard_connection_effects()
+        self._flush_delivery_carryover()
         deadline = loop.time() + timeout
         try:
-            try:
-                transport = await asyncio.wait_for(
-                    self._transport_factory(host, port, ssl=ssl), timeout=timeout
-                )
-            except TimeoutError as exc:
-                raise MQTTTimeoutError("Transport connection timed out") from exc
+            transport = await self._open_transport(host, port, ssl, timeout)
             self._transport = transport
             # Reject a misconfigured factory before CONNECT or background tasks.
             # Assign first so the normal failure cleanup closes the transport.
@@ -905,6 +1059,17 @@ class AsyncClient:
             self._write_pump.start(transport)
             await self._write_pump.enqueue(connect_packet)
             self._reader_task = asyncio.create_task(self._read_loop(), name="mqttium-reader")
+            if (
+                isinstance(transport, PushStreamTransport)
+                and self._delivery.mode == "callback"
+                and not self._engine.config.manual_ack
+            ):
+                # Here the reader produces every success ACK and every one of
+                # its suspensions is known, so it restores the ACK eager permit
+                # itself as its turn ends instead of costing a loop iteration.
+                self._write_pump.own_ack_rearm(self._reader_task)
+                transport.before_wait = self._write_pump.rearm_deferred_ack
+                self._delivery.before_yield = self._write_pump.rearm_deferred_ack
             try:
                 connack = await self._await_connack_or_disconnect(max(0.0, deadline - loop.time()))
             finally:
@@ -915,12 +1080,13 @@ class AsyncClient:
             if connack.reason_code != 0:
                 refusal = self._disconnect_exc
                 if not isinstance(refusal, ProtocolError):
-                    refusal = ProtocolError(
-                        f"Connection refused: reason_code={connack.reason_code}"
-                    )
+                    refusal = ConnectRefusedError(connack.reason_code, connack.properties)
                     self._propose_disconnect_cause(refusal, _CAUSE_BROKER)
                 raise refusal
-            self._write_pump.last_outbound = time.monotonic()
+            self._reconnect_pending = False
+            self._write_pump.last_outbound = self._last_inbound = self._connected_since = (
+                time.monotonic()
+            )
             self._keepalive_task = asyncio.create_task(
                 self._keepalive_loop(), name="mqttium-keepalive"
             )
@@ -941,6 +1107,23 @@ class AsyncClient:
                 pass
             self._retire_engine_connection()
             raise failure from failure.__cause__
+
+    async def _open_transport(
+        self, host: str, port: int, ssl: ssl.SSLContext | bool | None, timeout: float
+    ) -> AsyncTransport:
+        try:
+            return await asyncio.wait_for(
+                self._transport_factory(host, port, ssl=ssl), timeout=timeout
+            )
+        except TimeoutError as exc:
+            raise MQTTTimeoutError("Transport connection timed out") from exc
+        except OSError as exc:
+            if isinstance(exc, MQTTError):
+                raise
+            # DNS, TCP, TLS and WebSocket handshake failures: one MQTTError for
+            # every failure to reach the broker, still an OSError for existing
+            # handlers.
+            raise ConnectError(f"Could not connect to the broker: {exc}") from exc
 
     async def _await_connack_or_disconnect(self, timeout: float) -> ConnAckPacket:
         connack_fut = self._connack_fut
@@ -965,8 +1148,12 @@ class AsyncClient:
         Shutdown must not wait for application traffic to free a bounded queue,
         so a packet that cannot be admitted immediately is dropped rather than
         parked. StaleConnectionEffect is deliberately not caught here: whether a
-        dead epoch is an error depends on the caller.
+        dead epoch is an error depends on the caller. A packet for a transport
+        that is already closing has nowhere to go and is dropped.
         """
+        transport = self._transport
+        if transport is not None and transport.is_closing():
+            return
         if not self._write_pump.try_enqueue_terminal(packet, epoch=self._connection_epoch):
             return
         writer_task = self._write_pump.task
@@ -1007,6 +1194,11 @@ class AsyncClient:
         origin = self._lifecycle_hooks.begin_operation(replace_connection=False)
         self._disconnect_hook_origin = origin
         self._intentional_disconnect = True
+        self._reconnect_pending = False
+        backoff = self._connect_backoff_wake
+        if backoff is not None and not backoff.done():
+            # A first connect() waiting between attempts gives up now.
+            backoff.set_result(None)
         connect_disconnect_fut = self._connect_disconnect_fut
         disconnecting_connect = (
             self._engine.state is ConnectionState.CONNECTING
@@ -1203,7 +1395,7 @@ class AsyncClient:
                         batch=batch,
                     )
                 except FlowControlError as exc:
-                    if not self._engine.outbound.can_ever_admit(topic, data, qos, properties):
+                    if not self._engine.outbound.can_ever_admit(qos):
                         raise
                     terminal = self._publish_wait_failure()
                     if terminal is not None:
@@ -1350,9 +1542,19 @@ class AsyncClient:
     def on_message(self, callback: _OnMessage | None) -> None:
         self._check_routes_mutable()
         if callback is not None:
+            self._require_callback_delivery("on_message")
             self._delivery.validate_message_callback(callback)
         self._on_message = callback
         self._refresh_message_callback()
+
+    def _require_callback_delivery(self, what: str) -> None:
+        # Iterator delivery never runs message callbacks; accepting one would
+        # leave messages() unread until its queue fills and stalls the reader.
+        if self._delivery.mode != "callback":
+            raise ValueError(
+                f"{what} requires message_delivery='callback'; "
+                "with iterator delivery, consume client.messages() instead"
+            )
 
     def _freeze_message_routes(self) -> None:
         if self._routes_frozen:
@@ -1370,9 +1572,11 @@ class AsyncClient:
         """Register a synchronous filtered callback before the first connection attempt.
 
         Matches run in registration order instead of on_message. Replacing a
-        filter retains its position. Shared filters match their literal string.
+        filter retains its position. A shared filter ``$share/<group>/<filter>``
+        matches messages by ``<filter>``, the Topic Name the broker delivers.
         """
         self._check_routes_mutable()
+        self._require_callback_delivery("message_callback_add()")
         validate_subscribe_filter(topic_filter)
         self._delivery.validate_message_callback(callback)
         if self._topic_callbacks is None:
@@ -1399,8 +1603,11 @@ class AsyncClient:
             for callback in matcher.iter_match(message.topic):
                 matched = True
                 yield callback
-        if not matched and self._on_message is not None:
-            yield self._on_message
+        if not matched:
+            if self._on_message is not None:
+                yield self._on_message
+            else:
+                self._delivery.unrouted_messages += 1
 
     async def subscribe(
         self,
@@ -1419,9 +1626,13 @@ class AsyncClient:
             timeout: SUBACK deadline; ``subscribe_timeout`` is used when omitted.
 
         Returns:
-            Packet identifier and broker reason codes in request order.
+            Packet identifier, broker reason codes in request order, granted
+            QoS and MQTT 5 SUBACK properties.
 
         Raises:
+            SubscribeError: If the broker refused at least one filter; its
+                ``result`` holds the full SUBACK, and accepted filters stay
+                subscribed.
             MQTTTimeoutError: If SUBACK does not arrive before the deadline.
             ValueError: If ``timeout`` is not a finite positive number.
             ProtocolError: If a filter, option, property, or negotiated limit is
@@ -1447,7 +1658,10 @@ class AsyncClient:
                 self._effect_pump.collect_from_engine()
             # Settle earlier results before a released identifier can be reused.
             await self._effect_pump.drain()
-        return await self._await_request_ack(fut, self._sub_futs, mid, timeout, "SUBACK")
+        result = await self._await_request_ack(fut, self._sub_futs, mid, timeout, "SUBACK")
+        if any(code >= 0x80 for code in result.reason_codes):
+            raise SubscribeError(result)
+        return result
 
     async def unsubscribe(
         self,
@@ -1537,7 +1751,10 @@ class AsyncClient:
         """Acknowledge an inbound QoS>0 message when ``manual_ack=True``.
 
         Defers PUBACK (QoS 1) or PUBCOMP (QoS 2). PUBREC is always immediate.
-        The handle identifies its logical exchange, even after a transport
+        QoS 1 PUBACKs leave in arrival order [MQTT-4.6.0-2]: acknowledging a
+        later message first holds its PUBACK until every earlier QoS 1
+        message is acknowledged, so acknowledge every delivered message,
+        including discarded ones. The handle identifies its logical exchange, even after a transport
         reconnect resumes the same session. It cannot acknowledge a later
         exchange that reuses the packet identifier. Repeated acknowledgements
         are accepted while completion is pending, then rejected after completion.
@@ -1636,6 +1853,7 @@ class AsyncClient:
         else:  # pragma: no cover - a transport must offer one of the two
             raise TypeError(f"{type(self._transport).__name__} offers no receive capability")
         try:
+            write_pump = self._write_pump
             while not self._transport.is_closing():
                 if push is not None:
                     if not await push.receive():
@@ -1646,6 +1864,7 @@ class AsyncClient:
                     if not data:
                         break
                     self._decoder.feed(data)
+                self._last_inbound = time.monotonic()
                 # Process one bounded packet batch at a time. Applying its
                 # effects before decoding the next batch propagates delivery
                 # byte backpressure all the way to transport.read().
@@ -1735,6 +1954,8 @@ class AsyncClient:
                         and handled_bytes < _MAX_INGRESS_BATCH_BYTES
                     ):
                         break
+                    # This yield always suspends: it ends the reader's turn.
+                    write_pump.rearm_deferred_ack()
                     await asyncio.sleep(0)
         except asyncio.CancelledError as exc:
             # The client cancels its reader to retire the connection. A
@@ -1809,6 +2030,7 @@ class AsyncClient:
         self._effect_pump.collect_from_engine()
         self._auth_exchange.retire()
         await self._write_pump.wake_waiters()
+        self._flush_delivery_carryover()
         # The keepalive loop belongs to this reader's transport epoch. An
         # EOF or reader-side failure can end the reader without entering
         # _force_close(), so retire the task here before a reconnect can
@@ -1855,7 +2077,13 @@ class AsyncClient:
         ):
             reader_connack.set_exception(terminal_cause)
         self._fail_non_replayable(terminal_cause)
-        will_reconnect = self._will_reconnect()
+        # A reader cancelled from outside the client (event-loop shutdown)
+        # has nobody left to reconnect for; starting a reconnect task now
+        # would only leave it pending when the loop closes.
+        external_cancel = owner_cancelled() and not self._reader_cancel_requested
+        self._reader_cancel_requested = False
+        will_reconnect = not external_cancel and self._will_reconnect()
+        self._reconnect_pending = will_reconnect
         if not will_reconnect:
             self._fail_pending(terminal_cause)
         # Retire resources before lifecycle user code can install a
@@ -1886,8 +2114,18 @@ class AsyncClient:
         ``_fail_pending`` already marks teardown final and wakes parked
         publishers; this adds the stream close that every terminal path shares.
         """
+        self._reconnect_pending = False
         self._fail_pending(exc)
         self._delivery.close()
+
+    def _connection_pending(self) -> bool:
+        """Whether a connect() or the reconnect policy is working on a connection."""
+        reconnect = self._reconnect_task
+        return (
+            self._reconnect_pending
+            or self._explicit_connect_task is not None
+            or (reconnect is not None and not reconnect.done())
+        )
 
     def _retry_reason(self) -> int | None:
         """The reason code the reconnect policy judges: broker DISCONNECT, else CONNACK."""
@@ -1896,31 +2134,36 @@ class AsyncClient:
         return self._last_connack_reason
 
     def _permanent_connection_failure(self) -> bool:
-        exc = self._disconnect_exc
-        if isinstance(
-            exc,
+        """Whether the cause can never be cured by connecting again.
+
+        A refused CONNACK and a broker DISCONNECT are judged by their reason
+        code through the reconnect policy. Everything else is transient and
+        retried with backoff -- including local limit breaches, a slow
+        application consumer and a certificate rejected during rotation --
+        except a malformed peer, a session that cannot be resumed under the
+        new limits, a mandatory response the peer can never accept, and an
+        internal invariant failure.
+        """
+        return isinstance(
+            self._disconnect_exc,
             (
-                MessageDeliveryError,
                 MandatoryResponseTooLargeError,
                 SessionReplayError,
                 AssertionError,
-                ssl.SSLCertVerificationError,
                 MalformedPacketError,
             ),
-        ):
-            return True
-        # A refused CONNACK is also exposed as ProtocolError. Its validated
-        # reason remains the policy's decision (server busy/unavailable retry).
-        # Each attempt clears this reason before opening the transport.
-        return isinstance(exc, ProtocolError) and self._last_connack_reason is None
+        )
 
     def _will_reconnect(self) -> bool:
         reason = self._retry_reason()
+        # Each attempt clears the CONNACK reason; it is set only by a refusal,
+        # after which no broker DISCONNECT can follow on that connection.
+        refused = self._last_connack_reason is not None
         return (
             self._local_terminal_failure is None
             and not self._permanent_connection_failure()
             and not self._intentional_disconnect
-            and self._reconnect.should_retry(reason, self._engine.config.protocol)
+            and self._reconnect.should_retry(reason, self._engine.config.protocol, refused=refused)
         )
 
     async def _close_transport_after_connection_failure(self) -> None:
@@ -1937,6 +2180,7 @@ class AsyncClient:
             # join here: its teardown can stop this writer/effect task.
             reader = self._reader_task
             if reader is not None and reader is not asyncio.current_task() and not reader.done():
+                self._reader_cancel_requested = True
                 reader.cancel()
 
     def _invoke_auth_handler(
@@ -2040,6 +2284,13 @@ class AsyncClient:
                     continue
                 now = time.monotonic()
                 if self._ping_pending:
+                    if self._delivery_lane.active_count:
+                        # The reader is handing a lot to the application and
+                        # reads nothing until it finishes; a PINGRESP may
+                        # already wait behind it. Application backpressure is
+                        # not a dead connection, so the deadline restarts once
+                        # the reader reads again.
+                        self._ping_deadline = max(self._ping_deadline, now + self._ping_window(k))
                     if now >= self._ping_deadline:
                         self._propose_disconnect_cause(
                             MQTTTimeoutError("PINGRESP timed out"), _CAUSE_TRANSPORT
@@ -2051,7 +2302,10 @@ class AsyncClient:
                         return
                     await asyncio.sleep(min(0.5, self._ping_deadline - now))
                     continue
-                due = self._write_pump.last_outbound + k
+                # Ping after k seconds without sending or without receiving:
+                # a steady publisher to a half-open connection otherwise never
+                # learns that nothing comes back.
+                due = min(self._write_pump.last_outbound, self._last_inbound) + k
                 if now >= due:
                     try:
                         async with self._engine_lock:
@@ -2070,10 +2324,7 @@ class AsyncClient:
                     except FlowControlError:
                         pass
                     self._ping_pending = True
-                    ping_to = self._ping_timeout
-                    if ping_to is None:
-                        ping_to = max(k / 2, 5.0)
-                    self._ping_deadline = now + ping_to
+                    self._ping_deadline = now + self._ping_window(k)
                 else:
                     await asyncio.sleep(min(1.0, due - now))
         except asyncio.CancelledError as exc:
@@ -2083,6 +2334,10 @@ class AsyncClient:
             # the connection cannot detect a dead peer, so retire it.
             self._propose_disconnect_cause(dependency_failure(exc, "keepalive"), _CAUSE_TRANSPORT)
             await self._close_transport_after_connection_failure()
+
+    def _ping_window(self, keepalive: int) -> float:
+        ping_timeout = self._ping_timeout
+        return max(keepalive / 2, 5.0) if ping_timeout is None else ping_timeout
 
     async def _reconnect_loop(self) -> None:
         try:
@@ -2178,10 +2433,17 @@ class AsyncClient:
         if epoch != self._connection_epoch:
             return True
         kind = effect.kind
-        if kind is EffectKind.SEND:
-            return self._write_pump.try_enqueue(effect.data, epoch=epoch)
-        if kind is EffectKind.SEND_ACK:
-            return self._write_pump.try_enqueue_ack(effect.data, epoch=epoch)
+        if kind is EffectKind.SEND or kind is EffectKind.SEND_ACK:
+            try:
+                if kind is EffectKind.SEND:
+                    return self._write_pump.try_enqueue(effect.data, epoch=epoch)
+                return self._write_pump.try_enqueue_ack(effect.data, epoch=epoch)
+            except StaleConnectionEffect:
+                # The writer retired this connection before the reader did.
+                # Like the deferred lane, drop the send: teardown owns the
+                # publication from here, and the caller must not see an
+                # internal fence as an error.
+                return True
         if kind is EffectKind.CONNACK:
             connack: ConnAckPacket = effect.data
             self._resolve_connack(connack)
@@ -2264,13 +2526,17 @@ class AsyncClient:
         raise data
 
     def _resolve_suback(self, packet: SubAckPacket) -> None:
-        sub_result = SubscribeResult(mid=packet.mid, reason_codes=packet.reason_codes)
+        sub_result = SubscribeResult(
+            mid=packet.mid, reason_codes=packet.reason_codes, properties=packet.properties
+        )
         sub_fut = self._sub_futs.pop(sub_result.mid, None)
         if sub_fut is not None and not sub_fut.done():
             sub_fut.set_result(sub_result)
 
     def _resolve_unsuback(self, packet: UnsubAckPacket) -> None:
-        unsub_result = UnsubscribeResult(mid=packet.mid, reason_codes=packet.reason_codes)
+        unsub_result = UnsubscribeResult(
+            mid=packet.mid, reason_codes=packet.reason_codes, properties=packet.properties
+        )
         unsub_fut = self._unsub_futs.pop(unsub_result.mid, None)
         if unsub_fut is not None and not unsub_fut.done():
             unsub_fut.set_result(unsub_result)
@@ -2342,7 +2608,9 @@ class AsyncClient:
                 message, self._message_callback, effect.decoded_property_wire_size
             )
             if not effect.requires_delivery_mark or message.mid is None:
-                return pending
+                if pending is None or self._delivery.mode == "callback":
+                    return pending
+                return self._admit_acknowledged(message, effect.decoded_property_wire_size, pending)
             if pending is None or self._delivery.mode == "callback":
                 # The application owns the message now: a callback already ran,
                 # or the iterator queue accepted it. Mark before any await, so
@@ -2353,6 +2621,34 @@ class AsyncClient:
         if kind is EffectKind.CONTINUE_INBOUND_REPLAY:
             return self._continue_inbound_replay(epoch)
         raise MQTTError(f"Non-delivery effect in reader lane: {kind!r}")
+
+    async def _admit_acknowledged(
+        self,
+        message: Message,
+        property_wire_size: int | None,
+        pending: Awaitable[bool | None],
+    ) -> None:
+        """Finish a waiting admission for a message the client already acknowledged.
+
+        A replaced connection or stream retires the waiting admission, but
+        nothing else will ever deliver this message: commit it anyway.
+        """
+        if await pending is False:
+            self._delivery.deliver_acknowledged(message, None, property_wire_size)
+
+    def _flush_delivery_carryover(self) -> None:
+        """Hand retired connections' acknowledged messages to the application.
+
+        Called once the old reader has stopped, outside every protocol lock,
+        so callback mode may run application code here.
+        """
+        lane = self._delivery_lane
+        if not lane.carryover:
+            return
+        for effect in lane.take_carryover():
+            self._delivery.deliver_acknowledged(
+                effect.data, self._message_callback, effect.decoded_property_wire_size
+            )
 
     def _mark_delivered_locked(self, mid: int, token: object | None = None) -> None:
         """Record delivery of ``mid`` and apply the completion it releases.
@@ -2485,7 +2781,7 @@ class AsyncClient:
         else:
             self._last_connack_reason = connack.reason_code
             self._propose_disconnect_cause(
-                ProtocolError(f"Connection refused: reason_code={connack.reason_code}"),
+                ConnectRefusedError(connack.reason_code, connack.properties),
                 _CAUSE_BROKER,
             )
         if self._connack_fut is not None and not self._connack_fut.done():
@@ -2680,13 +2976,19 @@ class AsyncClient:
             for task in (self._effect_pump.task, *tasks)
             if task is not None and task is not current
         ]
-        for task in tasks_to_stop:
-            task.cancel()
-        for task in tasks_to_stop:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        self._reader_cancel_requested = True
+        try:
+            for task in tasks_to_stop:
+                task.cancel()
+            for task in tasks_to_stop:
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        finally:
+            self._reader_cancel_requested = False
+        # The joined reader may have left an interrupted lot behind.
+        self._flush_delivery_carryover()
         if (
             old_reader is not None
             and old_reader is not current

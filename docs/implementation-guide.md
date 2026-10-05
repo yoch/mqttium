@@ -97,9 +97,12 @@ identity for same-instance durable reconnects. It is not part of the inflight
 store contract; process-restart recovery requires a stable configured ClientID.
 
 `EngineConfig.max_inbound_inflight` defaults to 65535 because the standalone
-engine follows the protocol maximum. `AsyncClient` intentionally defaults to
-100 to provide an operationally bounded application client. The native default remains supported; the standalone
-engine configuration is internal.
+engine follows the protocol maximum. `AsyncClient` resolves its defaults per
+protocol: on MQTT 5 it advertises and enforces 100 exchanges and 16 MiB
+packets; on MQTT 3.1.1, whose broker cannot be told a limit, it enforces
+inbound limits only when configured, and keeps 20 outbound exchanges in flight
+because the broker cannot announce its window either. The standalone engine
+configuration is internal.
 
 Inbound and outbound topic aliases reset on every network connection. Alias
 zero, an inbound alias above the advertised maximum, or an unknown inbound
@@ -139,8 +142,9 @@ retry created while the automatic reader is joined.
 
 Permanent authentication, authorisation, and protocol errors stop retrying.
 Temporary broker-unavailable errors and network failures may retry. Pending
-receipts survive only while the broker session can still settle them; a clean
-CONNACK fails them with `SessionDiscardedError`. A receipt failed terminally (a
+QoS 2 receipts survive only while the broker session can still settle them; a
+clean CONNACK fails them with `SessionDiscardedError`, while unacknowledged
+QoS 1 publications are sent again as new. A receipt failed terminally (a
 refused CONNACK, a final connection loss, `disconnect()`) is a final answer:
 this client never sends that publication again, neither from its offline
 queue nor by session replay, and keeps its packet identifier reserved until

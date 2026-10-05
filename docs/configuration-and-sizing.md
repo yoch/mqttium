@@ -39,10 +39,24 @@ wire representation to degrade to, so the client refuses rather than ignores.
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
-| `max_inbound_inflight` | `100` | Concurrent inbound QoS 1/2 exchanges accepted; advertised as Receive Maximum on MQTT 5 |
-| `max_outbound_inflight` | `None` | Optional local cap below the broker's Receive Maximum |
-| `maximum_packet_size` | `None` | Largest inbound packet accepted by the decoder; advertised to an MQTT 5 broker |
+| `max_inbound_inflight` | `None` (MQTT 5: `100`; MQTT 3.1.1: no limit) | Concurrent inbound QoS 1/2 exchanges accepted; advertised as Receive Maximum on MQTT 5 |
+| `max_outbound_inflight` | `None` (MQTT 5: broker's Receive Maximum; MQTT 3.1.1: `20`) | Local cap on concurrent outbound QoS 1/2 exchanges |
+| `maximum_packet_size` | `None` (MQTT 5: 16 MiB; MQTT 3.1.1: no limit) | Largest inbound packet accepted by the decoder; advertised to an MQTT 5 broker |
 | `topic_alias_maximum` | `0` | Inbound topic aliases accepted from an MQTT 5 broker |
+
+An MQTT 3.1.1 broker is never told the client's inbound limits, so exceeding a
+default it could not know about is not a protocol violation: on MQTT 3.1.1 the
+inbound limits apply only when set explicitly, and "no limit" means the
+protocol maximum (65,535 exchanges, 268,435,460-byte packets). MQTT 5 advertises
+its defaults in CONNECT and enforces them.
+
+The outbound direction is the mirror image: an MQTT 3.1.1 broker cannot
+announce its window either. Mosquitto's default is 20 QoS 1/2 messages in
+flight per client, and beyond it the broker acknowledges a PUBLISH and then
+drops it, so the sender sees a completed receipt for a message no subscriber
+receives. MQTTium therefore keeps at most 20 outbound QoS 1/2 exchanges in
+flight on MQTT 3.1.1 unless `max_outbound_inflight` says otherwise; raise it
+only for a broker configured with a larger window.
 
 `max_inbound_inflight` controls inbound work. `max_outbound_inflight` controls
 outbound work. Neither changes the MQTT packet-identifier range.
@@ -60,7 +74,11 @@ for the client instance.
 | `max_unacknowledged_bytes` | `64 MiB` | Logical topic, payload, and property bytes of those publications |
 
 Both bounds refuse new admissions with `FlowControlError` (or park an awaiting
-`publish()` until capacity returns); they never disconnect.
+`publish()` until capacity returns); they never disconnect. Like the writer,
+the byte bound admits one publication larger than itself when nothing else is
+unacknowledged, so a valid large message is never refused forever: an
+awaiting `publish()` waits for the budget to empty, and `publish_nowait()`
+raises `FlowControlError` until it has.
 
 ### Writer and inbound protocol state
 
@@ -68,7 +86,7 @@ Both bounds refuse new admissions with `FlowControlError` (or park an awaiting
 | --- | ---: | --- |
 | `max_write_queue_messages` | `10_000` | Encoded frames resident in the writer |
 | `max_write_queue_bytes` | `1 MiB` | Encoded bytes resident in the writer |
-| `max_inbound_inflight_bytes` | `64 MiB` | Logical bytes retained for inbound QoS 1/2 exchanges |
+| `max_inbound_inflight_bytes` | `None` | Logical bytes retained for inbound QoS 1/2 exchanges |
 
 The writer admits one oversized item when otherwise empty so a configured byte
 limit cannot permanently block a valid large packet. No second item is admitted
@@ -80,9 +98,10 @@ broker exceeds `max_inbound_inflight` the client sends DISCONNECT with reason
 `0x93` (Receive Maximum exceeded); when a retained QoS 1/2 exchange would
 exceed `max_inbound_inflight_bytes` it sends DISCONNECT with reason `0x97`
 (Quota exceeded). Both end the connection and surface through
-`on_disconnect`; a reconnect policy may retry. On MQTT 3.1.1 the broker is not
-told either limit, so size `max_inbound_inflight` at or above the broker's
-own inflight window when using `manual_ack` with slow acknowledgement.
+`on_disconnect`; a reconnect policy retries. No broker is ever told
+`max_inbound_inflight_bytes`, and an MQTT 3.1.1 broker is not told
+`max_inbound_inflight` either, so set them only as a local safety bound, sized
+above what the broker may legitimately send.
 
 The reader decodes input in fixed lots of at most 256 packets or 1 MiB before
 handing effects to the application; that quantum is a fairness constant, not
@@ -128,6 +147,14 @@ Every default deadline lives on the constructor; `connect*()`, `subscribe()`
 and `unsubscribe()` accept a per-call `timeout` override. `ReconnectPolicy`
 only describes the retry progression.
 
+The client sends PINGREQ after `keepalive` seconds without sending **or**
+without receiving, so a steady publisher to a half-open connection still
+detects the silent peer within one keepalive interval plus `ping_timeout`
+(by default `max(keepalive / 2, 5)` seconds). While the reader is handing a
+lot to the application -- a full iterator queue or a long callback batch -- it
+reads nothing, so the PINGRESP deadline restarts instead of blaming the
+connection for application backpressure.
+
 ## A sizing method
 
 1. Record the largest accepted topic, payload, and property set.
@@ -158,9 +185,27 @@ different queues.
 `ReconnectPolicy` defaults to full-jitter exponential backoff starting at one
 second and capped at 60 seconds. Passing a policy enables reconnection;
 `reconnect=None` disables it. Set `max_retries=None` for an unbounded retry
-count only when the surrounding service is expected to remain alive. Terminal
-authentication, authorization, and protocol errors are not retried. Each
+count only when the surrounding service is expected to remain alive. Each
 attempt uses the client's `connect_timeout`.
+
+Reconnection stops only when connecting again cannot help:
+
+- a CONNACK refusal or broker DISCONNECT with a terminal reason code:
+  MQTT 3.1.1 return codes 1, 2, 4 and 5; MQTT 5 `0x81`, `0x82`, `0x84`–`0x87`,
+  `0x8A`, `0x8C`, `0x8E` (*Session taken over*), `0x90`, `0x95`, `0x99`–`0x9D`;
+- a malformed packet from the broker (`MalformedPacketError`);
+- a resumed session the new CONNACK forbids replaying (`SessionReplayError`) or a
+  mandatory acknowledgement the broker's packet limit can never admit
+  (`MandatoryResponseTooLargeError`);
+- a local store or invariant failure.
+
+Everything else is retried with backoff, including network and TLS failures (a
+certificate rejected during a rotation), broker protocol violations, local
+limit breaches and a slow application consumer. Set
+`ReconnectPolicy(retry_refused=True)` to retry terminal CONNACK refusals too, for
+brokers whose credentials or authorization can change while the client waits.
+`client.state` reads `RECONNECTING` while a retry is pending and `DISCONNECTED`
+once none will follow.
 
 MQTT 5 `Use another server` and `Server moved` are terminal. The application
 chooses any replacement endpoint explicitly. Broker DISCONNECT details arrive

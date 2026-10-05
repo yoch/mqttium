@@ -18,8 +18,11 @@ On reconnect, CONNACK tells MQTTium whether that previous session is present.
 When `session_present` is true, MQTTium replays persisted outbound PUBLISH or
 PUBREL state, redelivers inbound QoS 1 still awaiting a manual `ack()`, and
 restores inbound QoS 2 deduplication state. When it is false, the broker can no
-longer complete those old exchanges; MQTTium fails pending receipts with
-`SessionDiscardedError` and releases the stale local state.
+longer complete those old exchanges. MQTTium sends every unacknowledged QoS 1
+publication again as a new one (DUP 0, same receipt, ahead of work that was
+never sent): QoS 1 is at least once, so the broker may deliver it twice. A QoS 2
+exchange cannot restart without risking a second delivery, so its receipt fails
+with `SessionDiscardedError` and its local state is released.
 
 A resumed session must resend every unacknowledged QoS 1/2 PUBLISH with its
 original packet identifier. If the new CONNACK forbids one of them (a lower
@@ -27,10 +30,11 @@ Maximum QoS, `Retain Available` of 0, or a smaller Maximum Packet Size), the
 session cannot be resumed. MQTTium ends the connection with
 `SessionReplayError`, keeps the durable exchanges and their packet
 identifiers, and does not retry automatically. Connect again with
-`clean_start=True` to discard that session (pending receipts then fail with
-`SessionDiscardedError`), or restore the broker limits. Publications that were
-only queued offline are not part of the broker session; a narrowed CONNACK
-fails each of them individually.
+`clean_start=True` to discard that session (QoS 2 receipts then fail with
+`SessionDiscardedError`, and QoS 1 publications are sent as new ones), or
+restore the broker limits. Publications that were only queued offline, or are
+sent again after a discarded session, are not part of the broker session; a
+narrowed CONNACK fails each of them individually.
 
 A client that has already failed a publication's receipt (after a refused
 CONNACK, a final connection loss or `disconnect()`) never sends it again: its
@@ -101,6 +105,11 @@ identity. An empty local store cannot reveal broker-only subscriptions from a
 previous process, so applications that depend on retaining those subscriptions
 must also configure a stable ClientID.
 
+A restarted process with a stable ClientID and `clean_start=False` resumes its
+broker Session even when its store is empty or in memory: MQTTium accepts
+Session Present after a request to resume, and the broker's retained
+subscriptions deliver again without a new SUBSCRIBE.
+
 ## What SQLite persists
 
 `SqliteInflightStore` persists protocol state that must remain consistent across
@@ -170,7 +179,20 @@ finally:
 structure makes that convenient. `close()` is idempotent, but closing inside an
 active store batch is rejected.
 
-The database uses WAL mode and pre-v1 schema 5, recorded by
+Three properties of the store matter when sizing a deployment:
+
+- **Durability.** The database runs with `synchronous=NORMAL` in WAL mode: a
+  committed transaction survives a process crash, but the last transactions
+  before a power loss or kernel crash may be lost. Recovery then behaves like
+  a missing record: the broker session, not the store, decides what is resent.
+- **Event-loop blocking.** Every store call runs synchronously on the event
+  loop. A lock held by another connection to the same file makes a call wait
+  up to the five-second busy timeout, with the whole client stalled.
+- **One client per file.** A store file belongs to one client in one process.
+  Two clients sharing a file would contend for the lock and overwrite each
+  other's packet identifiers; give each client its own database.
+
+The database uses WAL mode and schema 5, recorded by
 `PRAGMA user_version`. Only new databases and schema 5 are accepted. Historical,
 future and inconsistent schemas are refused without migrating, resetting, or
 changing their committed schema and data. No historical size backfill is performed.
@@ -273,6 +295,14 @@ discarded instead of being applied to the replacement transport.
 With `manual_ack=True`, inbound QoS 1 acknowledgement and the final QoS 2
 acknowledgement wait for `await client.ack(message)`. This lets an application
 align MQTT acknowledgement with its own durable operation.
+
+MQTT requires QoS 1 PUBACKs in the order the PUBLISH packets arrived
+`[MQTT-4.6.0-2]`. Acknowledging a later message first records the request, but
+its PUBACK leaves only once every earlier QoS 1 message has been acknowledged:
+one message that is never acknowledged holds back every PUBACK after it, and
+the broker's inflight window eventually stops delivery. Acknowledge every
+delivered QoS 1 message, including ones the application discards. Each
+unacknowledged message also occupies an inbound slot (`max_inbound_inflight`).
 
 Pass the delivered `Message` itself. Its private handle identifies the client
 and active logical exchange, not just the reusable packet identifier. Duplicate

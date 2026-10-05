@@ -37,8 +37,10 @@ a changelog entry and migration guidance. Engine, codec, transport and store
 extension protocols are Internal and have no compatibility guarantee.
 The Paho facade and one-shot helpers have been removed.
 
-The latest published release, `1.0.0rc17`, revises the API of `1.0.0rc16`, itself
-an incompatible pre-v1 revision of `1.0.0rc14`. Use documentation matching your
+The current stable release is `1.2.0`, an additive release over `1.1.0`;
+`1.0.0` preserved the RC17 API. The 1.1 migration notes list the 1.0 behaviour
+1.1 corrects. Earlier candidates include
+incompatible revisions of RC16 and RC14. Use documentation matching your
 installed release. See the [migration guide](docs/migration.md) before upgrading
 an application or database.
 

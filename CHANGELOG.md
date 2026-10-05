@@ -6,12 +6,187 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-05
+
+Performance and observation improvements from a cross-client benchmark
+campaign. No behaviour change and no migration from 1.1.
+
+### Added
+
+- `PublishReceipt.add_done_callback(fn)` and `PublishReceipt.exception()`.
+  `fn(receipt)` is scheduled on the event loop once the publication completes
+  or fails, so code can act on every PUBACK or PUBCOMP without a coroutine or
+  task per message (about half the cost of a task awaiting `wait()`); it is the
+  per-publication counterpart of Paho's `on_publish`. `exception()` returns the
+  terminal error of a done publication, or `None`. Receipts that nobody
+  observes are unchanged.
+
+### Changed
+
+- Receiving QoS 1/2 messages through callback delivery costs one event-loop
+  iteration less per read: the reader restores the acknowledgement eager-write
+  permit itself as its turn ends, instead of scheduling a callback that ran in
+  a loop iteration of its own. Still at most one eager acknowledgement per loop
+  turn. On a Raspberry Pi 5, fixed-rate QoS 1 receive takes 7 % less CPU at
+  2,000 msgs/s and 5 % less at 5,000.
+- Filtered callbacks (`message_callback_add`) resolve wildcard filters through
+  a prefix tree derived from Paho's `MQTTMatcher`, walked iteratively. The cost
+  of matching a message no longer grows with the number of wildcard filters:
+  with 100 of them it falls from about 21 µs to under 1 µs on a desktop core,
+  and a single wildcard filter is about 15 % cheaper. Matching semantics and
+  registration order are unchanged and checked against the previous linear
+  matcher.
+
+## [1.1.0] - 2026-09-29
+
+Fixes from real deployments of 1.0. Some fixes change Stable behaviour as a
+documented exception to SemVer; see the 1.1 migration notes.
+
+### Added
+
+- A "Coming from Paho or aiomqtt" guide covering the differences that surface
+  in real deployments, and an event-loop section in the compatibility matrix.
+- `ClientStats.connected_since`, `last_disconnect_error` and
+  `last_disconnect_reason_code`, and
+  `DeliveryStats.callback_invocations`, `callback_failures` and
+  `unrouted_messages`: a service can see how long it has been connected, why
+  the last connection ended, and whether callbacks fail or messages match no
+  route, without logging.
+- `ConnectError`, raised by `connect()` when DNS, TCP, TLS or the WebSocket
+  upgrade fails. It is both an `MQTTError` and an `OSError`, with the original
+  error as `__cause__`, so `except MQTTError` now covers every connection
+  failure.
+- `PublishRejectedError` (a `ProtocolError`) with `reason_code` and
+  `properties` for a PUBACK, PUBREC or PUBCOMP failure code.
+- `SubscribeError` with the full `result` when the broker refuses a filter.
+  `SubscribeResult` gains `granted_qos` and `properties`, and
+  `UnsubscribeResult` gains `properties`; both were discarded before.
+- `protocol=` accepts the wire level `4` or `5` as well as the enum.
+- `ConnectionState.RECONNECTING`, reported while the reconnect policy will retry
+  a lost connection; `DISCONNECTED` now means that no automatic reconnection is
+  pending. The state is decided before `on_disconnect` runs, so a hook can tell
+  a transient loss from the end of the client.
+- `ConnectRefusedError` (a `ProtocolError`) with `reason_code` and `properties`
+  for refused CONNACKs, instead of a code embedded in the message.
+- `ReconnectPolicy(retry_refused=...)` to retry terminal CONNACK refusals.
+- `async with AsyncClient(...) as client:` disconnects on exit.
+- With a `ReconnectPolicy`, the first `connect()` retries transient failures
+  according to the policy, so a service can start before its broker.
+
+### Changed
+
+- Reorganize the README around installation, a complete asyncio example, and
+  application needs while retaining delivery, backpressure, persistence,
+  monitoring, and performance guidance. Simplify the getting-started path and
+  keep pre-release history in the migration documentation.
+- A `message_callback_add()` route for a shared subscription
+  (`$share/<group>/<filter>`) matches messages by `<filter>`, the Topic Name
+  the broker actually delivers. It used to match only the literal
+  `$share/...` string, so the route never fired.
+- A second `messages()` iterator waiting at the same time as another raises
+  `MQTTError`: each message is delivered to one iterator only, so two
+  consumers silently split the stream between them.
+- Delivered `Message.properties` no longer contain `topic_alias`. The alias
+  is connection-local state, and forwarding it as-is made the next PUBLISH
+  reference a mapping the receiving broker does not have.
+- `subscribe()` raises `SubscribeError` when the broker refuses any filter;
+  it used to return the failure reason code as if the subscription had
+  succeeded. Accepted filters of the same request stay subscribed.
+- `keepalive` must be an `int`; a float or string raises `TypeError` instead
+  of failing later or being silently accepted.
+- MQTT 3.1.1 no longer enforces inbound limits the broker was never told:
+  `max_inbound_inflight` and `maximum_packet_size` now default to `None`,
+  resolved to the protocol maximum on MQTT 3.1.1 and to the advertised 100
+  exchanges and 16 MiB on MQTT 5. `max_inbound_inflight_bytes` defaults to
+  `None` on both. A listener subscribed to a large retained message or a burst
+  of QoS 1/2 messages used to be disconnected, and never reconnected.
+- MQTT 3.1.1 keeps at most 20 outbound QoS 1/2 exchanges in flight unless
+  `max_outbound_inflight` is set. Mosquitto acknowledges and then silently
+  drops QoS 1/2 messages beyond its default window of 20 from a 3.1.1 client,
+  so a burst of `publish()` calls completed every receipt while subscribers
+  received only part of it.
+- A single publication larger than `max_unacknowledged_bytes` is admitted when
+  nothing else is unacknowledged, like the writer's oversized item, instead of
+  being refused forever with `FlowControlError`.
+- When a reconnect finds no broker session (Session Present 0), unacknowledged
+  QoS 1 publications are sent again as new ones instead of failing with
+  `SessionDiscardedError`; they keep their receipts. QoS 2 publications still
+  fail, since restarting them could deliver them twice.
+- Reconnection stops only for causes that connecting again cannot cure
+  (terminal reason codes, malformed packets, unresumable sessions, local store
+  failures). Broker protocol violations, local limit breaches, a slow iterator
+  consumer and certificate failures are retried with backoff; they used to stop
+  the client silently for good. MQTT 5 *Session taken over* is now terminal, so
+  two clients sharing an identifier stop evicting each other.
+
+### Fixed
+
+- Connect promptly to a host whose IPv6 address is unreachable: TCP, TLS and
+  WebSocket connections race address families (RFC 8305 happy eyeballs)
+  instead of waiting for the first address to time out.
+- WebSocket: accept a broker that echoes no subprotocol or the MQTT 3.1 name
+  `mqttv3.1`, omit the default port from the `Host` header (some reverse
+  proxies route on it), and refuse a URL with credentials instead of silently
+  dropping them.
+- Resume a durable MQTT 5 session after a process restart. A new client that
+  connects with `clean_start=False` and holds no incomplete QoS exchange used
+  to close the connection on Session Present, so a durable subscriber could not
+  restart at all. MQTTium now accepts it; see the deviation from
+  `[MQTT-3.2.2-4]` in the conformance notes.
+- Refuse QoS 1/2 publications with `NotConnectedError` once the client is
+  stopped. They used to be queued for a connection nothing would establish,
+  and `receipt.wait()` hung until the queue filled.
+- A failed `connect()` no longer ends the `messages()` stream, so a consumer
+  started before connecting survives a broker that is not up yet.
+- Assigning `on_message` or calling `message_callback_add()` with iterator
+  delivery raises `ValueError` instead of being silently ignored while the
+  unread iterator queue fills and stalls the connection.
+- Event-loop shutdown without `disconnect()` no longer starts a reconnection
+  task that is destroyed while pending.
+- Detect a dead connection from a steady publisher. Keepalive now sends
+  PINGREQ after `keepalive` seconds without receiving as well as without
+  sending; a QoS 0 publisher to a half-open connection previously never pinged
+  and kept completing receipts into the void.
+- Stop reporting application backpressure as `PINGRESP timed out`. While the
+  reader waits for iterator capacity or runs a callback batch it cannot read
+  the PINGRESP, so the deadline now restarts instead of tearing down a live
+  connection (and, with a clean session, losing its unacknowledged work).
+- Stop writing into a closed or lost transport. After a connection loss the
+  writer now fails on its next write instead of handing frames to a dead
+  socket, so asyncio no longer logs bursts of `socket.send() raised
+  exception`, and a terminal DISCONNECT is skipped for a transport that is
+  already closing.
+- Never surface the internal stale-connection fence from `publish()`: a send
+  for a connection the writer has already retired is dropped for teardown to
+  settle, like a deferred send.
+- Never discard a message the client has already acknowledged. QoS 0 and
+  automatically acknowledged QoS 1 messages decoded before a connection loss,
+  `disconnect()` or an explicit reconnect were dropped when the reader's lot or
+  a waiting iterator admission was retired, and an explicit reconnect emptied
+  the unread iterator queue. They are now delivered in order: unread messages
+  move to the new iterator generation, and interrupted lots are handed over
+  once the old reader stops, past the iterator bound by at most one lot.
+
+## [1.0.0] - 2026-09-28
+
+### Changed
+
+- Publish the first stable native release. The client implementation and public
+  API are unchanged from RC17; the Stable surface now follows the 1.x SemVer
+  and deprecation contract. Statistics and the two supplied inflight stores
+  remain Provisional.
+- Align installation instructions, migration guidance, support policy and
+  package metadata with the stable 1.0 release line.
+
 ### Fixed
 
 - Correct RC17 migration-table rendering, reconnect-hook ordering and renamed
   API fields in the maintained guides. Restore the published surface-review
   link, clarify the Read the Docs fallback and PyPI approval steps, and update
   examples for manual acknowledgement, publication deadlines and MQTT 5 Wills.
+- Disable broker Nagle in benchmark workloads to remove the delayed final-ACK
+  measurement tail. Keep overload behavior and collector costs documented
+  separately from sustained-rate comparisons.
 - Use fixed absolute rates in the open-loop release gate. Keep saturation lag
   diagnostic, require an eligible lower-rate comparison, and report CPU cost
   only with measured headroom. Enforce runner eligibility before each block of
@@ -1574,7 +1749,10 @@ See the [migration guide](docs/migration.md) for the breaking changes since
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.0.0rc17...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/yoch/mqttium/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/yoch/mqttium/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/yoch/mqttium/compare/v1.0.0rc17...v1.0.0
 [1.0.0rc17]: https://github.com/yoch/mqttium/compare/v1.0.0rc16...v1.0.0rc17
 [1.0.0rc16]: https://github.com/yoch/mqttium/compare/v1.0.0rc15...v1.0.0rc16
 [1.0.0rc15]: https://github.com/yoch/mqttium/compare/v1.0.0rc14...v1.0.0rc15

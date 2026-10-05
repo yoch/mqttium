@@ -19,6 +19,8 @@ exclude_docs: |
   experiments/
   reports/*.md
   !reports/README.md
+  !reports/RELEASE-1.1.0.md
+  !reports/FINAL-1.0.0-PUBLICATION-CHECKPOINT-2026-09-28.md
   !reports/RC17-AUDIT-CLOSURE-2026-09-28.md
   !reports/RC17-STABLE-PROMOTION-AUDIT-2026-09-27.md
   !reports/RC17-LONG-CAMPAIGN-CLOSURE-2026-09-27.md
@@ -199,6 +201,7 @@ nav:
       - Cookbook: cookbook.md
   - Migration:
       - Migrating to MQTTium: migration.md
+      - Coming from Paho or aiomqtt: paho-compatibility.md
   - Reference:
       - Native API: reference/index.md
       - AsyncClient: reference/async-client.md

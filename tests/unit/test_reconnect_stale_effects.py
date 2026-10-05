@@ -40,10 +40,10 @@ class ConnackTransport:
         return self._closing
 
 
-async def _cancel_send_under_backpressure(client: AsyncClient) -> int:
+async def _cancel_send_under_backpressure(client: AsyncClient, qos: int = 1) -> int:
     client._engine.state = ConnectionState.CONNECTED
     await client._write_pump.enqueue(b"x")
-    publishing = asyncio.create_task(client.publish("audit/stale", b"payload", qos=1))
+    publishing = asyncio.create_task(client.publish("audit/stale", b"payload", qos=qos))
     for _ in range(100):
         if client._write_pump.waiters:
             break
@@ -75,7 +75,7 @@ async def test_clean_reconnect_does_not_send_failed_old_publish() -> None:
         max_write_queue_messages=1,
         max_write_queue_bytes=1,
     )
-    mid = await _cancel_send_under_backpressure(client)
+    mid = await _cancel_send_under_backpressure(client, qos=2)
     transport = ConnackTransport(session_present=False)
 
     async def factory(host: str, port: int, *, ssl: object = None) -> ConnackTransport:
@@ -87,6 +87,39 @@ async def test_clean_reconnect_does_not_send_failed_old_publish() -> None:
 
     assert [packet.packet_type for packet in _packets(transport.written)] == [PacketType.CONNECT]
     assert mid not in client._receipts
+    await client._force_close()
+
+
+async def test_clean_reconnect_sends_an_old_qos1_publish_once_as_new() -> None:
+    client = AsyncClient(
+        client_id="audit-clean-qos1",
+        max_write_queue_messages=1,
+        max_write_queue_bytes=1,
+    )
+    mid = await _cancel_send_under_backpressure(client)
+    transport = ConnackTransport(session_present=False)
+
+    async def factory(host: str, port: int, *, ssl: object = None) -> ConnackTransport:
+        return transport
+
+    client._transport_factory = factory
+    await client.connect("fake", timeout=1.0)
+    packets = []
+    for _ in range(100):
+        packets = _packets(transport.written)
+        if sum(p.packet_type is PacketType.PUBLISH for p in packets) == 1:
+            break
+        await asyncio.sleep(0)
+
+    publishes = [
+        PublishPacket.decode(packet.flags, packet.remaining)
+        for packet in packets
+        if packet.packet_type is PacketType.PUBLISH
+    ]
+    assert len(publishes) == 1
+    assert publishes[0].mid == mid
+    assert publishes[0].dup is False
+    assert mid in client._receipts
     await client._force_close()
 
 

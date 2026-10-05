@@ -146,6 +146,10 @@ async def test_reset_message_stream_releases_abandoned_iterator_delivery() -> No
 
     await client._reset_message_stream()
 
+    # The unread message is carried into the new generation, and consuming it
+    # there releases its accounting exactly once.
+    assert client.stats().delivery.iterator_bytes > 0
+    assert await anext(client.messages()) is message
     assert client._delivery.messages_queue.empty()
     assert client.stats().delivery.iterator_bytes == 0
     assert not hasattr(message, "_delivery_references")

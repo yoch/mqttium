@@ -4,7 +4,7 @@ MQTTium's native protocol, transport, persistence, and public API foundations
 are implemented. Roadmap entries describe intended direction, not a support
 promise or release date.
 
-## Stable-release readiness
+## Release qualification
 
 - Complete the source, documentation, test, workflow, and packaging review.
 - Retain a clean local release manifest and exact artifact smokes.
@@ -29,7 +29,7 @@ promise or release date.
 
 ## Native API release boundary
 
-The current pre-v1 API is native-only. The façade and helpers are removed.
+The stable 1.x API is native-only. The façade and helpers are removed.
 Integration into `main` and release publication are separate steps. Keep
 versioning, migration guidance, installed-artifact checks and documentation
 deployment aligned when cutting the next candidate or final version.

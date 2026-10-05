@@ -56,6 +56,22 @@ All MQTTium-specific public errors derive from `MQTTError`.
     options:
       heading_level: 3
 
+::: mqttium.ConnectRefusedError
+    options:
+      heading_level: 3
+
+::: mqttium.ConnectError
+    options:
+      heading_level: 3
+
+::: mqttium.PublishRejectedError
+    options:
+      heading_level: 3
+
+::: mqttium.SubscribeError
+    options:
+      heading_level: 3
+
 Invalid arguments raise builtin exceptions, not `MQTTError`: a value of the
 wrong Python type raises `TypeError` (for example a `Properties` value of an
 unsupported type), and a value out of range raises `ValueError` (for example a

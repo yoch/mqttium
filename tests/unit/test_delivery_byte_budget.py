@@ -113,19 +113,20 @@ async def test_unbounded_iterator_keeps_count_backpressure() -> None:
     await stream.aclose()
 
 
-async def test_unbounded_iterator_reset_discards_bare_messages() -> None:
+async def test_unbounded_iterator_reset_carries_bare_messages() -> None:
     client = AsyncClient(
         message_delivery="iterator",
         max_iterator_messages=2,
         max_iterator_bytes=None,
     )
-    await deliver_message(client, Message(topic="delivery/reset", payload=b"payload"))
+    message = Message(topic="delivery/reset", payload=b"payload")
+    await deliver_message(client, message)
 
     client._delivery.close()
     client._delivery.reset_stream()
 
     stats = client.stats().delivery
-    assert client._delivery.messages_queue.empty()
+    assert client._delivery.messages_queue.get_nowait() is message
     assert stats.iterator_bytes == 0
     assert stats.iterator_high_water_bytes == 0
     assert stats.iterator_byte_limit is None
