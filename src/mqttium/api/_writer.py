@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from mqttium.api._cancel import dependency_failure, failure_for, owner_cancelled
 from mqttium.api._effects import StaleConnectionEffect
@@ -85,6 +86,13 @@ class WritePump:
         # connection.
         self._eager_generation = 0
         self._eager_rearm_scheduled = False
+        # The task that produces every success ACK of this connection, when one
+        # does (the reader without manual acknowledgement). Its eager ACK does
+        # not schedule a next-turn callback: the owner restores the permit
+        # itself as it suspends, which ends its turn, so the rule stays one ACK
+        # eager write per loop turn without an extra loop iteration per read.
+        self._ack_rearm_owner: asyncio.Task[Any] | None = None
+        self._ack_rearm_deferred = False
         # A producer-side eager or latency write can fail after exposing bytes.
         # Retained frames then remain ownership records only; the writer must
         # retire them and report the failure before any further transport write.
@@ -141,7 +149,31 @@ class WritePump:
         self._eager_armed = False
         self._ack_eager_armed = False
         self._eager_rearm_scheduled = False
+        self._ack_rearm_owner = None
+        self._ack_rearm_deferred = False
         self._write_nowait = None
+
+    def own_ack_rearm(self, task: asyncio.Task[Any] | None) -> None:
+        """Make ``task`` restore the ACK permit it consumes, or stop doing so.
+
+        Only valid for a task that is the sole producer of success ACKs on this
+        connection: another producer could otherwise take the restored permit
+        later in the same loop turn.
+        """
+        self._ack_rearm_owner = task
+        self._ack_rearm_deferred = False
+
+    def rearm_deferred_ack(self) -> None:
+        """Restore the ACK permit the owner consumed; call just before it suspends.
+
+        The owner's suspension ends its loop turn, so this is the same point the
+        next-turn callback would have reached, minus the extra loop iteration.
+        The permit returns only under the callback's own conditions.
+        """
+        if self._ack_rearm_deferred:
+            self._ack_rearm_deferred = False
+            if self._write_nowait is not None and not self._writing and self.queue.empty():
+                self._ack_eager_armed = True
 
     def _rearm_eager_if_idle(self, generation: int) -> None:
         if generation != self._eager_generation:
@@ -339,7 +371,11 @@ class WritePump:
         if not accepted:
             return False
         self._ack_eager_armed = False
-        self._schedule_eager_rearm()
+        owner = self._ack_rearm_owner
+        if owner is not None and asyncio.current_task() is owner:
+            self._ack_rearm_deferred = True
+        else:
+            self._schedule_eager_rearm()
         self.eager_writes += 1
         self.eager_bytes += len(item)
         self.last_outbound = time.monotonic()

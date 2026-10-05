@@ -148,3 +148,63 @@ async def test_done_callbacks_observe_every_publication(qos: int) -> None:
     finally:
         await client.disconnect()
     assert outcomes == [None] * count
+
+
+@pytest.mark.parametrize("qos", [1, 2])
+async def test_reader_owns_the_ack_permit_in_callback_delivery(qos: int) -> None:
+    """With auto-ack callback delivery the reader restores the ACK permit itself.
+
+    Its eager ACKs schedule no next-turn re-arm callback, every exchange still
+    completes, and the permit is back once the reader waits for more bytes.
+    """
+    count = 200
+    topic = f"mqttium/it/ack-owner/{qos}"
+    received = 0
+    done = asyncio.Event()
+    sub = AsyncClient(f"ack-owner-sub-{qos}", message_delivery="callback")
+    pub = AsyncClient(f"ack-owner-pub-{qos}")
+    rearm_callbacks = 0
+    pump = sub._write_pump
+    schedule = pump._schedule_eager_rearm
+
+    def counted_schedule() -> None:
+        nonlocal rearm_callbacks
+        rearm_callbacks += 1
+        schedule()
+
+    def on_message(msg) -> None:  # noqa: ANN001
+        nonlocal received
+        received += 1
+        if received == count:
+            done.set()
+
+    sub.on_message = on_message
+    try:
+        await sub.connect("127.0.0.1", 11883, timeout=5)
+        assert pump._ack_rearm_owner is sub._reader_task
+        await sub.subscribe(topic, qos=qos)
+        pump._schedule_eager_rearm = counted_schedule  # type: ignore[method-assign]
+        await pub.connect("127.0.0.1", 11883, timeout=5)
+        for _ in range(count):
+            await (await pub.publish(topic, b"x" * 64, qos=qos)).wait()
+        async with asyncio.timeout(10):
+            await done.wait()
+        await asyncio.sleep(0.05)
+        assert sub.stats().inbound.inflight == 0
+        assert pump.eager_writes > 0
+        assert rearm_callbacks == 0
+        assert pump._ack_eager_armed is True
+    finally:
+        await pub.disconnect()
+        await sub.disconnect()
+    assert received == count
+
+
+@pytest.mark.parametrize("manual_ack", [False, True])
+async def test_iterator_delivery_keeps_the_next_turn_ack_rearm(manual_ack: bool) -> None:
+    client = AsyncClient(f"ack-owner-iterator-{manual_ack}", manual_ack=manual_ack)
+    try:
+        await client.connect("127.0.0.1", 11883, timeout=5)
+        assert client._write_pump._ack_rearm_owner is None
+    finally:
+        await client.disconnect()

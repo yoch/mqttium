@@ -99,6 +99,9 @@ class ApplicationDelivery:
         self.callback_failures = 0
         self.unrouted_messages = 0
         self._since_yield = 0
+        # Called just before the callback fairness yield, which always
+        # suspends the delivering reader and so ends its loop turn.
+        self.before_yield: Callable[[], None] | None = None
         self._accept_iterator: IteratorAcceptor = (
             self._accept_iterator_unaccounted
             if max_iterator_bytes is None
@@ -183,6 +186,9 @@ class ApplicationDelivery:
                     self.invoke_sync_isolated(callback, message)
                 if self._since_yield >= _CALLBACK_QUANTUM:
                     self._since_yield %= _CALLBACK_QUANTUM
+                    before_yield = self.before_yield
+                    if before_yield is not None:
+                        before_yield()
                     return asyncio.sleep(0)
             else:
                 self.unrouted_messages += 1

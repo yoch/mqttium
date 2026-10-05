@@ -18,6 +18,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Changed
 
+- Receiving QoS 1/2 messages through callback delivery costs one event-loop
+  iteration less per read: the reader restores the acknowledgement eager-write
+  permit itself as its turn ends, instead of scheduling a callback that ran in
+  a loop iteration of its own. Still at most one eager acknowledgement per loop
+  turn. On a Raspberry Pi 5, fixed-rate QoS 1 receive takes 7 % less CPU at
+  2,000 msgs/s and 5 % less at 5,000.
 - Filtered callbacks (`message_callback_add`) resolve wildcard filters through
   a prefix tree derived from Paho's `MQTTMatcher`, walked iteratively. The cost
   of matching a message no longer grows with the number of wildcard filters:

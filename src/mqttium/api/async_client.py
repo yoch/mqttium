@@ -92,6 +92,7 @@ from mqttium.protocol.outbound import _PreparedPublish
 from mqttium.protocol.reconnect import ReconnectPolicy, _ReconnectState
 from mqttium.persistence.memory import MemoryInflightStore
 from mqttium.topics import validate_subscribe_filter
+from mqttium.transport._push import PushStreamTransport
 from mqttium.transport._stream import AsyncTransport, DecoderPushTransport, PullTransport
 from mqttium.transport.tcp import TcpTransport
 from mqttium.transport.unix import UnixSocketTransport
@@ -1058,6 +1059,17 @@ class AsyncClient:
             self._write_pump.start(transport)
             await self._write_pump.enqueue(connect_packet)
             self._reader_task = asyncio.create_task(self._read_loop(), name="mqttium-reader")
+            if (
+                isinstance(transport, PushStreamTransport)
+                and self._delivery.mode == "callback"
+                and not self._engine.config.manual_ack
+            ):
+                # Here the reader produces every success ACK and every one of
+                # its suspensions is known, so it restores the ACK eager permit
+                # itself as its turn ends instead of costing a loop iteration.
+                self._write_pump.own_ack_rearm(self._reader_task)
+                transport.before_wait = self._write_pump.rearm_deferred_ack
+                self._delivery.before_yield = self._write_pump.rearm_deferred_ack
             try:
                 connack = await self._await_connack_or_disconnect(max(0.0, deadline - loop.time()))
             finally:
@@ -1841,6 +1853,7 @@ class AsyncClient:
         else:  # pragma: no cover - a transport must offer one of the two
             raise TypeError(f"{type(self._transport).__name__} offers no receive capability")
         try:
+            write_pump = self._write_pump
             while not self._transport.is_closing():
                 if push is not None:
                     if not await push.receive():
@@ -1941,6 +1954,8 @@ class AsyncClient:
                         and handled_bytes < _MAX_INGRESS_BATCH_BYTES
                     ):
                         break
+                    # This yield always suspends: it ends the reader's turn.
+                    write_pump.rearm_deferred_ack()
                     await asyncio.sleep(0)
         except asyncio.CancelledError as exc:
             # The client cancels its reader to retire the connection. A
