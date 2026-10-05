@@ -31,10 +31,12 @@ support includes typed properties, Last Will, and enhanced authentication.
 ## Installation
 
 ```bash
-python -m pip install mqttium==1.1.0
+python -m pip install mqttium==1.2.0
 ```
 
-When upgrading from 1.0, review the
+1.2 adds `PublishReceipt.add_done_callback()` and faster topic-filter and
+acknowledgement paths; it needs no migration from 1.1. When upgrading from
+1.0, review the
 [1.1 migration notes](https://mqttium.readthedocs.io/en/v1.1.0/migration/#changes-in-11).
 The client API and SQLite schema stay on the 1.0 contract, but 1.1 corrects
 connection, subscription, limit, and session behaviours that may require an

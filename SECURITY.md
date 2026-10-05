@@ -6,13 +6,13 @@ Security fixes are applied to the latest stable release line and the `main`
 development branch. Users should upgrade to the newest patch release; older
 pre-release and superseded minor lines may not receive fixes.
 
-The current stable line is `1.1.x`, starting with `1.1.0`. Fixes land on
+The current stable line is `1.2.x`, starting with `1.2.0`. Fixes land on
 `main` and ship in a subsequent release. A source revision is not a new PyPI
 release, even while its version string still names the last published version.
 
 | Version | Security fixes |
 | --- | --- |
-| Latest `1.1.x` patch release | Supported |
+| Latest `1.2.x` patch release | Supported |
 | `main` | Supported for development and coordinated disclosure |
 | Older releases and pre-releases | Not guaranteed |
 

@@ -1,4 +1,10 @@
-# Migrating to 1.1
+# Migrating to 1.2
+
+## Changes in 1.2
+
+1.2.0 is additive: no 1.1 behaviour changes and nothing to migrate. It adds
+`PublishReceipt.add_done_callback()` and `PublishReceipt.exception()`, the
+per-publication counterpart of Paho's `on_publish`.
 
 ## Changes in 1.1
 
