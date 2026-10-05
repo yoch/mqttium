@@ -108,4 +108,20 @@ Fixed-rate QoS 1 publish shares no changed path: 80.3–80.5 µs per message at
 
 ## Qualification of `b2ae1018`
 
-QUALIFICATION_PENDING
+| Evidence | Result |
+| --- | --- |
+| [CI 37320131177](https://github.com/yoch/mqttium/actions/runs/37320131177) and [ARM64 CI 37320131343](https://github.com/yoch/mqttium/actions/runs/37320131343) | Passed |
+| [Soak and broker interoperability 37320177753](https://github.com/yoch/mqttium/actions/runs/37320177753) | Passed: Linux and macOS soaks for MQTT 3.1.1 and 5, EMQX 5.8.9 and HiveMQ CE 2026.5 |
+| Strict ARM64 network gate vs 1.1.0, [37325168769](https://github.com/yoch/mqttium/actions/runs/37325168769) | Passed: QoS 1 receipt ACK throughput at windows 1, 20 and 64 within the gate per ABBA cycle, mostly 0.989–1.009 of 1.1.0 |
+| ARM64 paired regression vs 1.1.0, [37320172164](https://github.com/yoch/mqttium/actions/runs/37320172164) | Passed: strict writer-capacity A/B 1.004 (QoS 0) and 1.003 (QoS 1), A/A 1.000 and 1.005; strict paced writer-latency A/B lag 1.000 at 2,500 and 0.999 at 10,000 msgs/s; advisory network sweep 0.993–1.008 |
+
+### ARM64 paired microbenchmarks against 1.1.0
+
+Median candidate/base throughput over 11 pairs (run 37320172164): the send
+path that regressed in the first qualification is back at or above 1.1.0
+(`writer_try_enqueue` 1.024, `writer_enqueue_async` 1.019, `effect_send_inline`
+1.003, `publish_nowait` QoS 0 0.998–1.003); every other existing scenario
+0.985–1.03. The new matcher scenarios measure 1.034 (exact filter), 1.133 (one
+wildcard filter) and 28.4 (100 wildcard filters). `receipt_done_callback`
+(0.838) compares the new public `add_done_callback()` with the benchmark
+adapter's private future on 1.1.0, not an existing path of 1.1.0.
