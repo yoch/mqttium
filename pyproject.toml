@@ -146,6 +146,7 @@ max-complexity = 15
 # and reservation cleanup together so their ordering/error semantics stay visible.
 "tests/**" = ["B017", "E731"]
 "tests/fuzz/test_hypothesis_fuzz.py" = ["E402"]
+"tests/fuzz/test_matcher_differential.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.11"
