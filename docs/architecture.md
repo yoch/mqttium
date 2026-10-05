@@ -130,7 +130,9 @@ emits undifferentiated MESSAGE effects and never imports dispatch code.
 Routes and the fallback freeze at the first connection attempt. Registration
 rejects async message callbacks before mutation. Matching synchronous routes
 execute in registration order for one message, with the fallback used when no
-route matches.
+route matches. Exact filters are a dictionary lookup; wildcard filters live in a
+prefix tree keyed by filter level, so matching follows the topic's levels and
+never scans unrelated filters.
 
 The construction-time delivery mode selects either iterator or callback
 delivery. In iterator mode every message has one byte charge and one queue
