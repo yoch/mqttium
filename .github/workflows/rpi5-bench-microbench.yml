@@ -1,5 +1,5 @@
 name: rpi5 bench micro-benchmarks
-run-name: "Bench micro-benchmarks for mqttium weak points"
+run-name: "Bench micro-benchmarks for mqttium weak points (arms A/B)"
 
 # Diagnostic only, never merged to main. Runs the micro-benchmarks in
 # yoch/mqtt-python-client-bench microbench/mqttium/ (pinned by BENCH_SHA) on the
@@ -20,6 +20,13 @@ concurrency:
 
 env:
   BENCH_SHA: cd9f475eb27cacedff35a619fb70dd6cc0d3da2e
+  # mqttium source trees compared in rotation (name=commit). Each arm imports
+  # mqttium from its own checkout through PYTHONPATH, ahead of the locked
+  # wheel; the other clients stay the locked ones.
+  MQTTIUM_ARMS: >-
+    v110=b611d492e418594fb8fbbeeb16cdc04088751fbe
+    main=71c49fc2643b46745ea1b880377fe2620cfb6076
+    w2a=036a896a549e9187f23665ce7a0457c77d4c181a
   UV_VERSION: "0.11.2"
 
 jobs:
@@ -131,39 +138,55 @@ jobs:
                       time.sleep(0.1)
           PY
 
-      - name: Filter dispatch (pure CPU)
-        working-directory: bench
+      - name: Check out the mqttium arms
         shell: bash
         run: |
           set -euo pipefail
-          PYTHONPATH=src taskset -c 2 "$UV_PROJECT_ENVIRONMENT/bin/python" microbench/mqttium/dispatch.py 2>&1 \
-            | tee "$OUT/dispatch.txt"
+          for arm in $MQTTIUM_ARMS; do
+            name="${arm%%=*}"; sha="${arm#*=}"
+            git clone -q --no-checkout "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "$JOB_ROOT/mq-$name"
+            git -C "$JOB_ROOT/mq-$name" checkout -q "$sha"
+            PYTHONPATH="$JOB_ROOT/mq-$name/src" "$UV_PROJECT_ENVIRONMENT/bin/python" -c \
+              "import mqttium, sys; print(sys.argv[1], mqttium.__file__)" "$name" | tee -a "$OUT/host.txt"
+          done
 
-      - name: Fixed-rate QoS 1 publish
+      - name: Fixed-rate QoS 1 receive and publish, arms in rotation
         working-directory: bench
         shell: bash
         run: |
           set -euo pipefail
           PY="$UV_PROJECT_ENVIRONMENT/bin/python"
-          PYTHONPATH=src taskset -c 1 "$PY" microbench/mqttium/pub_fixed.py --trace-writes --repeat 3 2>&1 \
-            | tee "$OUT/pub_fixed.txt"
-          PYTHONPATH=src taskset -c 1 "$PY" microbench/mqttium/pub_fixed.py --profile 2>&1 \
-            | tee "$OUT/pub_profile.txt"
+          for round in 1 2; do
+            for arm in $MQTTIUM_ARMS; do
+              name="${arm%%=*}"
+              export PYTHONPATH="src:$JOB_ROOT/mq-$name/src"
+              echo "=== round $round arm $name receive" | tee -a "$OUT/sub_arms.txt"
+              taskset -c 1 "$PY" microbench/mqttium/sub_fixed.py --repeat 3 \
+                --cases plain:2000:mqttium,plain:5000:mqttium,plain:2000:mqttium:f100 2>&1 \
+                | tee -a "$OUT/sub_arms.txt"
+              echo "=== round $round arm $name publish" | tee -a "$OUT/pub_arms.txt"
+              taskset -c 1 "$PY" microbench/mqttium/pub_fixed.py --trace-writes --repeat 3 \
+                --cases mqttium 2>&1 | tee -a "$OUT/pub_arms.txt"
+            done
+          done
 
-      - name: Fixed-rate QoS 1 receive
+      - name: Deterministic receive counters per arm
         working-directory: bench
         shell: bash
         run: |
           set -euo pipefail
           PY="$UV_PROJECT_ENVIRONMENT/bin/python"
-          PYTHONPATH=src taskset -c 1 "$PY" microbench/mqttium/sub_fixed.py --repeat 3 2>&1 \
-            | tee "$OUT/sub_fixed.txt"
-          PYTHONPATH=src taskset -c 1 "$PY" microbench/mqttium/sub_fixed.py --repeat 3 \
-            --cases plain:2000:paho:fanin,plain:2000:paho:f100,plain:2000:mqttium:fanin,plain:2000:mqttium:f100 2>&1 \
-            | tee "$OUT/sub_filters.txt"
-          PYTHONPATH=src taskset -c 1 "$PY" microbench/mqttium/sub_fixed.py --profile \
-            --cases plain:2000:gmqtt,plain:2000:mqttium,plain:2000:mqttium:pull,tls:2000:gmqtt,tls:2000:mqttium,plain:5000:gmqtt,plain:5000:mqttium 2>&1 \
-            | tee "$OUT/sub_profile.txt"
+          for arm in $MQTTIUM_ARMS; do
+            name="${arm%%=*}"
+            export PYTHONPATH="src:$JOB_ROOT/mq-$name/src"
+            echo "=== arm $name" | tee -a "$OUT/sub_profile_arms.txt"
+            taskset -c 1 "$PY" microbench/mqttium/sub_fixed.py --profile \
+              --cases plain:2000:mqttium,plain:5000:mqttium 2>&1 | tee -a "$OUT/sub_profile_arms.txt"
+          done
+          export PYTHONPATH=src
+          echo "=== gmqtt reference" | tee -a "$OUT/sub_profile_arms.txt"
+          taskset -c 1 "$PY" microbench/mqttium/sub_fixed.py --repeat 3 \
+            --cases plain:2000:gmqtt,plain:5000:gmqtt 2>&1 | tee -a "$OUT/sub_profile_arms.txt"
 
       - name: Record host load at end
         if: always()
