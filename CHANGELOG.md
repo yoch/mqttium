@@ -6,6 +6,16 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Filtered callbacks (`message_callback_add`) resolve wildcard filters through
+  a prefix tree derived from Paho's `MQTTMatcher`, walked iteratively. The cost
+  of matching a message no longer grows with the number of wildcard filters:
+  with 100 of them it falls from about 21 µs to under 1 µs on a desktop core,
+  and a single wildcard filter is about 15 % cheaper. Matching semantics and
+  registration order are unchanged and checked against the previous linear
+  matcher.
+
 ## [1.1.0] - 2026-09-29
 
 Fixes from real deployments of 1.0. Some fixes change Stable behaviour as a

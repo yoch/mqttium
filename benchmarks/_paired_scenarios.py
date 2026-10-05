@@ -470,6 +470,31 @@ def _websocket_mask(_scenario: str) -> ScenarioMeasurement:
     return _measure(lambda: _mask_payload(payload, b"abcd"), operations=20_000, warmup=500)
 
 
+def _dispatch(scenario: str) -> ScenarioMeasurement:
+    """Resolve the filtered callbacks for one delivered topic.
+
+    ``dispatch_match_exact`` registers exact filters only; the numbered cells
+    register that many wildcard filters on unrelated branches plus the one
+    that matches, so they show whether matching cost follows the filter count.
+    """
+    from mqttium.dispatch.matcher import TopicMatcher
+
+    matcher = TopicMatcher()
+    for index in range(50):
+        matcher[f"home/room{index}/temp"] = index
+    if scenario == "dispatch_match_exact":
+        topic = "home/room7/temp"
+    else:
+        for index in range(int(scenario.rsplit("_", 1)[1]) - 1):
+            matcher[f"zigbee2mqtt/device{index}/+"] = index
+        matcher["bench/+/temp"] = "match"
+        topic = TOPIC
+    iter_match = matcher.iter_match
+    if not list(iter_match(topic)):
+        raise RuntimeError(f"{scenario}: the probe topic matched nothing")
+    return _measure(lambda: list(iter_match(topic)), operations=100_000, warmup=2_000)
+
+
 def _receipt(_scenario: str) -> ScenarioMeasurement:
     from mqttium.api.models import PublishReceipt
     from mqttium.enums import QoS
@@ -578,6 +603,9 @@ REGISTRY: dict[str, Callable[[str], ScenarioMeasurement]] = {
     "delivery_iterator": _delivery,
     "effect_single_message_callback": _single_message_effect,
     "websocket_mask_4k": _websocket_mask,
+    "dispatch_match_exact": _dispatch,
+    "dispatch_match_1": _dispatch,
+    "dispatch_match_100": _dispatch,
     "receipt_settle_unawaited": _receipt,
     "receipt_wait_single": _receipt_wait,
     "receipt_wait_concurrent": _receipt_wait,
