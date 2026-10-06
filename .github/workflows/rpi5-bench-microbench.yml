@@ -1,5 +1,5 @@
 name: rpi5 bench micro-benchmarks
-run-name: "Bench micro-benchmarks for mqttium weak points (arms A/B)"
+run-name: "Bench micro-benchmarks: 1.2.0 publish path vs 1.1.0 (observer variants)"
 
 # Diagnostic only, never merged to main. Runs the micro-benchmarks in
 # yoch/mqtt-python-client-bench microbench/mqttium/ (pinned by BENCH_SHA) on the
@@ -25,8 +25,7 @@ env:
   # wheel; the other clients stay the locked ones.
   MQTTIUM_ARMS: >-
     v110=b611d492e418594fb8fbbeeb16cdc04088751fbe
-    main=71c49fc2643b46745ea1b880377fe2620cfb6076
-    w2a=036a896a549e9187f23665ce7a0457c77d4c181a
+    v120=7227c97ff15a36580ccaff3b9c32fa007aed966b
   UV_VERSION: "0.11.2"
 
 jobs:
@@ -150,7 +149,55 @@ jobs:
               "import mqttium, sys; print(sys.argv[1], mqttium.__file__)" "$name" | tee -a "$OUT/host.txt"
           done
 
-      - name: Fixed-rate QoS 1 receive and publish, arms in rotation
+      - name: Observer variants of the benchmark adapter
+        working-directory: bench
+        shell: bash
+        run: |
+          set -euo pipefail
+          # src       : the campaign adapter (private future in receipt._waiters)
+          # src-cb    : the same adapter observing receipts through the public
+          #             PublishReceipt.add_done_callback() (1.2.0 API)
+          cp -r src src-cb
+          "$UV_PROJECT_ENVIRONMENT/bin/python" - <<'PY'
+          import pathlib, re
+          p = pathlib.Path("src-cb/mqtt_client_bench/adapters/mqttium.py")
+          text = p.read_text()
+          pattern = re.compile(r"(def observe_receipt\(receipt: Any, on_complete: Any\) -> None:\n)(.*?)(\n\n\ndef )", re.S)
+          body = (
+              '    receipt.add_done_callback(\n'
+              '        lambda r: on_complete(128 if r.exception() is not None else 0)\n'
+              '    )'
+          )
+          new, count = pattern.subn(lambda m: m.group(1) + body + m.group(3), text, count=1)
+          assert count == 1, "observe_receipt not found"
+          p.write_text(new)
+          PY
+          grep -n -A4 "def observe_receipt" src-cb/mqtt_client_bench/adapters/mqttium.py | tee -a "$OUT/host.txt"
+
+      - name: Fixed-rate QoS 1 publish, 1.1.0 against 1.2.0, observer variants
+        working-directory: bench
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY="$UV_PROJECT_ENVIRONMENT/bin/python"
+          RATES=2000,5000,10000,20000
+          for round in 1 2; do
+            for arm in $MQTTIUM_ARMS; do
+              name="${arm%%=*}"
+              # library alone (noobserve) and the campaign observer (private future)
+              export PYTHONPATH="src:$JOB_ROOT/mq-$name/src"
+              echo "=== round $round arm $name adapter=private-future (+noobserve)" | tee -a "$OUT/pub_arms.txt"
+              taskset -c 1 "$PY" microbench/mqttium/pub_fixed.py --repeat 3 --rates "$RATES" \
+                --cases mqttium,mqttium:noobserve 2>&1 | tee -a "$OUT/pub_arms.txt"
+            done
+            # 1.2.0 observed through the public add_done_callback API
+            export PYTHONPATH="src-cb:$JOB_ROOT/mq-v120/src"
+            echo "=== round $round arm v120 adapter=add_done_callback" | tee -a "$OUT/pub_arms.txt"
+            taskset -c 1 "$PY" microbench/mqttium/pub_fixed.py --repeat 3 --rates "$RATES" \
+              --cases mqttium 2>&1 | tee -a "$OUT/pub_arms.txt"
+          done
+
+      - name: Receive with 100 callback filters, 1.1.0 against 1.2.0
         working-directory: bench
         shell: bash
         run: |
@@ -160,33 +207,18 @@ jobs:
             for arm in $MQTTIUM_ARMS; do
               name="${arm%%=*}"
               export PYTHONPATH="src:$JOB_ROOT/mq-$name/src"
-              echo "=== round $round arm $name receive" | tee -a "$OUT/sub_arms.txt"
+              echo "=== round $round arm $name" | tee -a "$OUT/sub_arms.txt"
               taskset -c 1 "$PY" microbench/mqttium/sub_fixed.py --repeat 3 \
-                --cases plain:2000:mqttium,plain:5000:mqttium,plain:2000:mqttium:f100 2>&1 \
-                | tee -a "$OUT/sub_arms.txt"
-              echo "=== round $round arm $name publish" | tee -a "$OUT/pub_arms.txt"
-              taskset -c 1 "$PY" microbench/mqttium/pub_fixed.py --trace-writes --repeat 3 \
-                --cases mqttium 2>&1 | tee -a "$OUT/pub_arms.txt"
+                --cases plain:2000:mqttium,plain:2000:mqttium:f100 2>&1 | tee -a "$OUT/sub_arms.txt"
             done
           done
-
-      - name: Deterministic receive counters per arm
-        working-directory: bench
-        shell: bash
-        run: |
-          set -euo pipefail
-          PY="$UV_PROJECT_ENVIRONMENT/bin/python"
           for arm in $MQTTIUM_ARMS; do
             name="${arm%%=*}"
             export PYTHONPATH="src:$JOB_ROOT/mq-$name/src"
-            echo "=== arm $name" | tee -a "$OUT/sub_profile_arms.txt"
+            echo "=== profile arm $name" | tee -a "$OUT/sub_profile_arms.txt"
             taskset -c 1 "$PY" microbench/mqttium/sub_fixed.py --profile \
-              --cases plain:2000:mqttium,plain:5000:mqttium 2>&1 | tee -a "$OUT/sub_profile_arms.txt"
+              --cases plain:2000:mqttium,plain:2000:mqttium:f100 2>&1 | tee -a "$OUT/sub_profile_arms.txt"
           done
-          export PYTHONPATH=src
-          echo "=== gmqtt reference" | tee -a "$OUT/sub_profile_arms.txt"
-          taskset -c 1 "$PY" microbench/mqttium/sub_fixed.py --repeat 3 \
-            --cases plain:2000:gmqtt,plain:5000:gmqtt 2>&1 | tee -a "$OUT/sub_profile_arms.txt"
 
       - name: Record host load at end
         if: always()
