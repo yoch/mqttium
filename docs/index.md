@@ -5,7 +5,7 @@
 </p>
 
 MQTTium is a dependency-free, async-native MQTT 3.1.1 and MQTT 5 client for
-Python 3.11–3.14. It is built for production services, gateways, and connected
+Python 3.11–3.15. It is built for production services, gateways, and connected
 devices that need explicit completion, bounded resource use, and reliable
 recovery.
 

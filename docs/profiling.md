@@ -39,6 +39,13 @@ Choose different physical cores, avoiding SMT siblings and other workloads.
 The scheduled performance-health job captures both 1 kHz and 10 kHz on 3.15;
 existing 3.12 timing and memory references remain separate.
 
+Sampling is not free. On GitHub-hosted `ubuntu-24.04` runners on 2026-10-11,
+the native `receive_iterator` workers retained 86–96% of their baseline
+throughput at 1 kHz but only 47–59% at 10 kHz, while same-code controls varied
+by up to 8%. A 10 kHz profile therefore observes a substantially slowed
+process: use it to find short-lived stacks, and prefer 1 kHz when the relative
+weight of execution and waits matters.
+
 ## Choose the question before the mode
 
 | Mode | Intended investigation |

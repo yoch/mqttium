@@ -6,7 +6,7 @@ delivery and shutdown.
 
 ## Requirements
 
-MQTTium supports Python 3.11 through 3.14 and has no runtime dependencies.
+MQTTium supports Python 3.11 through 3.15 and has no runtime dependencies.
 
 Install MQTTium from PyPI:
 
