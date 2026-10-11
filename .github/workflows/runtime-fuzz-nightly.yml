@@ -71,7 +71,7 @@ jobs:
           --expected-sha "$GITHUB_SHA"
       - name: Retain manifest, shard summaries, and failures
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: runtime-nightly-v1-arm64-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.JOB_ROOT }}/artifacts

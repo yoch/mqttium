@@ -105,7 +105,7 @@ jobs:
             --duration-seconds "$SOAK_DURATION_SECONDS" \
             --messages-per-cycle "$SOAK_MESSAGES" \
             --output "$RUNNER_TEMP/soak-mosquitto-${{ matrix.protocol }}.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: soak-mosquitto-${{ matrix.protocol }}-${{ github.run_id }}
@@ -149,7 +149,7 @@ jobs:
             --cycles "$SOAK_CYCLES" \
             --messages-per-cycle "$SOAK_MESSAGES" \
             --output "$RUNNER_TEMP/soak-macos-${{ matrix.protocol }}.json"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: soak-macos-${{ matrix.protocol }}-${{ github.run_id }}
@@ -204,7 +204,7 @@ jobs:
       - name: Broker logs
         if: always()
         run: docker logs mqttium-broker || true
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: soak-${{ matrix.broker }}-${{ github.run_id }}

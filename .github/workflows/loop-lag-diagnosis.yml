@@ -126,7 +126,7 @@ jobs:
             --output lag-analysis.json \
             --summary-output lag-analysis.md
           cat lag-analysis.md >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: loop-lag-archived-${{ github.run_id }}
           path: |
@@ -310,7 +310,7 @@ jobs:
           cat "$out/regimes.md" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: loop-lag-${{ inputs.mode }}-${{ github.run_id }}
           path: |
