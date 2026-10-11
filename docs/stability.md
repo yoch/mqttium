@@ -50,13 +50,13 @@ PYTHONPATH=src python benchmarks/soak.py \
 - manifests, JSON artefacts and broker logs retained outside the repository.
 
 After the source tree and local manifest are final, the GitHub matrix validates
-Python 3.11–3.14 and interoperability with EMQX and HiveMQ. Those environment-
+Python 3.11–3.15 and interoperability with EMQX and HiveMQ. Those environment-
 specific checks are release evidence for portability, but GitHub performance
 numbers remain advisory.
 
 Installed-artifact workflows separately install the exact PyPI artifact rather
 than the checkout. Their retained matrix covers wheel/sdist metadata and Stable
-imports on Python 3.11–3.14, TCP and TLS broker round trips, SQLite restart,
+imports on Python 3.11–3.15, TCP and TLS broker round trips, SQLite restart,
 WebSocket and Unix transports, cancellation
 and clean shutdown. They are manually dispatchable for every candidate.
 

@@ -116,7 +116,7 @@ exact candidate commit. If release metadata is changed after this preparation,
 validate the resulting distributions again at the release cut.
 
 Once the source and local manifest are final, run the GitHub matrix once for the
-platform-specific Python 3.11–3.14 and EMQX/HiveMQ checks. Those checks validate
+platform-specific Python 3.11–3.15 and EMQX/HiveMQ checks. Those checks validate
 portability and interoperability; they do not replace local performance
 evidence. Run the manual soak workflow to include macOS and EMQX/HiveMQ:
 pull-request runs cover only the short Linux/Mosquitto checks. A skipped job

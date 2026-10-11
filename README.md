@@ -15,7 +15,7 @@
   <a href="https://github.com/yoch/mqttium/blob/main/LICENSE"><img alt="Apache-2.0 license" src="https://img.shields.io/pypi/l/mqttium.svg"></a>
 </p>
 
-MQTTium is a fully typed MQTT client for **Python 3.11–3.14**, with no runtime
+MQTTium is a fully typed MQTT client for **Python 3.11–3.15**, with no runtime
 dependencies. It runs in the application's asyncio event loop and supports
 MQTT 3.1.1 and MQTT 5, QoS 0/1/2, and TCP, TLS, WebSocket, and Unix-domain sockets.
 Typical uses include services, gateways, and telemetry collectors.

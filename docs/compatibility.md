@@ -8,7 +8,7 @@ edition, plugin, authentication provider, or deployment topology.
 
 | Environment | Project status |
 | --- | --- |
-| CPython 3.11, 3.12, 3.13, 3.14 | Supported |
+| CPython 3.11, 3.12, 3.13, 3.14, 3.15 | Supported |
 | Linux | Full unit, Mosquitto integration, packaging, fuzz, and release-gate coverage |
 | macOS | Selected version endpoints and lifecycle coverage |
 | Windows | Selected version endpoints and lifecycle coverage |
