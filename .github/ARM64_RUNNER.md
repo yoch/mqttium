@@ -45,12 +45,16 @@ The repository runner probe on 2026-09-02 observed the actual `rpi5` runner as:
 - native Mosquitto broker/client tools and `taskset` available;
 - all CPU governors set to `performance` during strict validation.
 
+On 2026-10-11 the host additionally provided the distribution's `python3.15`
+package (3.15.0rc3) alongside system Python 3.14.8.
+
 `actions/setup-python` does **not** currently provide a Python ARM64 build for
 Debian 13, so the self-hosted workflows deliberately use the validated system
 Python 3.14 and create a fresh venv for each job. Python 3.11-3.15 compatibility
 continues to be enforced by the GitHub-hosted matrix. ARM64 correctness CI now
 also requires a separately provisioned `python3.15` executable and creates its
-own venv. Install it alongside system Python; do not replace `python3`. The
+own venv. Install it from the distribution's packages alongside system Python;
+do not replace `python3`. The
 3.14 and 3.15 arms run sequentially, and absence of 3.15 fails explicitly. The
 two arms check out the event's exact commit so a later push to `main` cannot
 change the source between Python versions. The performance and published-package
@@ -66,9 +70,12 @@ account:
 ```bash
 sudo apt update
 sudo apt install -y python3-venv mosquitto mosquitto-clients openssl util-linux
+sudo apt install -y python3.15 python3.15-venv
 ```
 
 `taskset` is provided by `util-linux`; the workflow verifies it explicitly.
+The second line requires a distribution release that packages Python 3.15;
+without it ARM64 CI fails at the 3.15 prerequisite check.
 The ARM64 workflows intentionally do not run `apt`, `sudo`, Docker, or `tc`.
 
 For benchmark evidence, use active cooling and set every CPU frequency governor
