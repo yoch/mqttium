@@ -54,7 +54,7 @@ jobs:
       - name: Unit coverage
         run: python -m pytest -q -W error --strict-config --strict-markers tests/unit tests/project --cov=mqttium --cov-branch --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=89
       - name: Retain coverage report
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-${{ github.sha }}
           path: coverage.xml
@@ -74,7 +74,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: coverage-${{ github.sha }}
       - name: Publish coverage to Codecov
@@ -224,7 +224,7 @@ jobs:
             tests/fuzz/test_runtime_pressure_fuzzer.py
       - name: Retain runtime schedule failures
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: runtime-fuzz-${{ matrix.python-version }}-${{ github.sha }}
           path: ${{ runner.temp }}/runtime-fuzz
@@ -270,7 +270,7 @@ jobs:
           PY
           "$RUNNER_TEMP/mqttium-wheel/bin/python" -m pip check
       - name: Upload distributions
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: distributions-${{ github.sha }}
           path: dist/*
@@ -294,7 +294,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.15"
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: distributions-${{ github.sha }}
           path: dist/
