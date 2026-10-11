@@ -63,6 +63,12 @@ count Python calls and resumptions, not operating-system context switches or
 system calls. Evaluate routing candidates separately against their immediate
 predecessor and the measured same-code noise.
 
+## Python 3.15 sampling
+
+Tachyon captures and fresh-process overhead controls are documented in
+[Python 3.15 profiling](profiling.md). Instrumented profiles explain execution
+and waiting; uninstrumented paired gates validate performance changes.
+
 ## What each benchmark answers
 
 - `hotpath_profile.py` counts calls, primitive calls, and allocations. These

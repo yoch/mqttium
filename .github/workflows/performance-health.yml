@@ -54,3 +54,36 @@ jobs:
             ${{ runner.temp }}/mqttium-bench/*.json
           if-no-files-found: warn
           retention-days: 30
+
+  sampling-python315:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [cpu, async-running, async-all]
+        rate: [1000, 10000]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.15"
+      - run: python -m pip install -e ".[dev]"
+      - name: Qualify native sampling with same-code controls
+        env:
+          MODE: ${{ matrix.mode }}
+          RATE: ${{ matrix.rate }}
+        run: >-
+          PYTHONPATH=src python benchmarks/sampling_profile.py --suite native
+          --scenario receive_iterator --mode "$MODE" --rate "$RATE"
+          --seconds 3 --cycles 2 --worker-cpu 0 --profiler-cpu 1
+          --output "$RUNNER_TEMP/tachyon"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: mqttium-tachyon-${{ matrix.mode }}-${{ matrix.rate }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/tachyon/
+          if-no-files-found: error
+          retention-days: 30
