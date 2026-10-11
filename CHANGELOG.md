@@ -6,6 +6,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Python 3.15 support, including blocking unit, integration, resilience, fuzz,
+  cross-platform endpoint and built-distribution checks.
+
 ### Fixed
 
 - The WebSocket memory benchmark writer now implements the stream closing

@@ -8,6 +8,7 @@ __pycache__/
 
 # Virtual environments and packaging
 .venv/
+.venv-*/
 *.egg-info/
 build/
 dist/

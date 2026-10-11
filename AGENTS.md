@@ -1,7 +1,7 @@
 # AGENTS.md
 
 MQTTium is a dependency-free, async-native MQTT 3.1.1 and MQTT 5.0 client for
-Python 3.11–3.14, licensed under Apache-2.0. This is the canonical repository
+Python 3.11–3.15, licensed under Apache-2.0. This is the canonical repository
 guide for coding agents. Detailed user and maintainer contracts live in `docs/`.
 
 ## Development loop

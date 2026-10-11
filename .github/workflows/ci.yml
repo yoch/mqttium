@@ -86,14 +86,14 @@ jobs:
           use_oidc: true
           version: v11.3.1
 
-  # Keep the generated contexts test (3.11) ... test (3.14) during migration.
+  # Keep the generated contexts test (3.11) ... test (3.15) during migration.
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -131,6 +131,10 @@ jobs:
     name: Resilience
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.15"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -138,7 +142,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: python -m pip install -e ".[dev]"
@@ -152,7 +156,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-15, windows-2025]
-        python-version: ["3.11", "3.14"]
+        python-version: ["3.11", "3.15"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -174,6 +178,10 @@ jobs:
     name: fuzz
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.15"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -181,7 +189,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: python -m pip install -e ".[fuzz]"
@@ -218,7 +226,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: runtime-fuzz-${{ github.sha }}
+          name: runtime-fuzz-${{ matrix.python-version }}-${{ github.sha }}
           path: ${{ runner.temp }}/runtime-fuzz
           if-no-files-found: ignore
           retention-days: 14
@@ -269,10 +277,55 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  package-python315:
+    name: Python 3.15 distribution (${{ matrix.distribution }})
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        distribution: [wheel, sdist]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.15"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: distributions-${{ github.sha }}
+          path: dist/
+      - name: Install the built distribution
+        env:
+          DISTRIBUTION: ${{ matrix.distribution }}
+        run: |
+          set -euo pipefail
+          if [ "$DISTRIBUTION" = wheel ]; then
+            python -m pip install --no-deps dist/*.whl
+          else
+            python -m pip install --no-deps dist/*.tar.gz
+          fi
+          python -m pip check
+      - name: Start Mosquitto
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > "$RUNNER_TEMP/mosquitto.conf"
+          mosquitto -c "$RUNNER_TEMP/mosquitto.conf" > "$RUNNER_TEMP/mosquitto.log" 2>&1 &
+          python tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:11883
+      - name: Exercise the installed Stable API outside the checkout
+        run: |
+          version="$(python -I -c 'import importlib.metadata; print(importlib.metadata.version("mqttium"))')"
+          python -I tests/installed_distribution_smoke.py --expected-version "$version" --host 127.0.0.1 --port 11883
+
   required:
     name: CI required
     if: always()
-    needs: [quality, test, resilience, cross-platform, fuzz, package]
+    needs: [quality, test, resilience, cross-platform, fuzz, package, package-python315]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:

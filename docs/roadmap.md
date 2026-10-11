@@ -8,7 +8,7 @@ promise or release date.
 
 - Complete the source, documentation, test, workflow, and packaging review.
 - Retain a clean local release manifest and exact artifact smokes.
-- Retain Python 3.11–3.14, cross-platform, and broker-interoperability evidence.
+- Retain Python 3.11–3.15, cross-platform, and broker-interoperability evidence.
 - Complete the long-running fuzz, reconnect, backpressure, memory, and soak
   campaigns defined by [Stability](stability.md).
 - Publish the Read the Docs `stable` and `latest` versions and verify their
@@ -46,7 +46,7 @@ deployment aligned when cutting the next candidate or final version.
 
 ## Permanent quality gates
 
-- Python 3.11–3.14 unit and Mosquitto integration coverage;
+- Python 3.11–3.15 unit and Mosquitto integration coverage;
 - cross-platform endpoint validation and ARM64 release evidence;
 - Ruff, mypy, Bandit, and the configured coverage threshold;
 - deterministic and Hypothesis fuzzing plus retained long campaigns;
