@@ -6,6 +6,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- The WebSocket memory benchmark writer now implements the stream closing
+  check, allowing the existing batching scenario to run on all Python versions.
+
 ## [1.2.0] - 2026-10-05
 
 Performance and observation improvements from a cross-client benchmark
