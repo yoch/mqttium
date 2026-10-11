@@ -47,9 +47,12 @@ The repository runner probe on 2026-09-02 observed the actual `rpi5` runner as:
 
 `actions/setup-python` does **not** currently provide a Python ARM64 build for
 Debian 13, so the self-hosted workflows deliberately use the validated system
-Python 3.14 and create a fresh venv for each job. Python 3.11-3.14 compatibility
-continues to be enforced by the existing GitHub-hosted matrix rather than being
-claimed by this ARM64 runner.
+Python 3.14 and create a fresh venv for each job. Python 3.11-3.15 compatibility
+continues to be enforced by the GitHub-hosted matrix. ARM64 correctness CI now
+also requires a separately provisioned `python3.15` executable and creates its
+own venv. Install it alongside system Python; do not replace `python3`. The
+3.14 and 3.15 arms run sequentially, and absence of 3.15 fails explicitly. The
+performance and published-package workflows retain their 3.14 reference.
 
 ## Host setup
 

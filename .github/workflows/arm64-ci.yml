@@ -14,11 +14,22 @@ concurrency:
 
 jobs:
   test:
-    name: ARM64 / system Python 3.14
+    name: ARM64 / Python ${{ matrix.python-version }}
     if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: [self-hosted, linux, ARM64]
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - python-version: "3.14"
+            executable: python3
+          - python-version: "3.15"
+            executable: python3.15
     env:
+      PYTHON_BIN: ${{ matrix.executable }}
+      EXPECTED_PYTHON: ${{ matrix.python-version }}
       MQTTIUM_REQUIRE_BROKER: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -32,11 +43,13 @@ jobs:
         run: |
           set -euo pipefail
           test "$(uname -m)" = "aarch64"
-          command -v python3
-          python3 - <<'PY'
+          command -v "$PYTHON_BIN"
+          "$PYTHON_BIN" - <<'PY'
+          import os
           import sys
-          if sys.version_info[:2] != (3, 14):
-              raise SystemExit(f"expected system Python 3.14, got {sys.version}")
+          expected = tuple(map(int, os.environ["EXPECTED_PYTHON"].split(".")))
+          if sys.version_info[:2] != expected:
+              raise SystemExit(f"expected Python {os.environ['EXPECTED_PYTHON']}, got {sys.version}")
           PY
           command -v openssl
           command -v mosquitto
@@ -50,7 +63,7 @@ jobs:
           set -euo pipefail
           rm -rf "$JOB_ROOT"
           mkdir -p "$JOB_ROOT"
-          python3 -m venv "$JOB_ROOT/venv"
+          "$PYTHON_BIN" -m venv "$JOB_ROOT/venv"
           echo "$JOB_ROOT/venv/bin" >> "$GITHUB_PATH"
       - run: python -m pip install -e ".[dev]"
       - name: Unit tests
