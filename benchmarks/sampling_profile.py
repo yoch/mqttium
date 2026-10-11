@@ -8,6 +8,8 @@ baseline; call counting and allocation profiling remain separate experiments.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import concurrent.futures
 import ctypes
 import json
 import math
@@ -46,8 +48,8 @@ def _flags(mode: str) -> list[str]:
 
 
 def _worker(args: argparse.Namespace) -> None:
-    import asyncio
-
+    # Each worker imports only its own suite so the sampled process carries no
+    # modules from the other suite.
     if args.suite == "micro":
         from _paired_scenarios import run_scenario
 
@@ -142,8 +144,6 @@ def _trial(args: argparse.Namespace, root: Path, index: int, instrumented: bool)
         )
         try:
             # Reading happens in a bounded helper thread: a hung warm-up must not hang the controller.
-            import concurrent.futures
-
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             ready = pool.submit(worker.stdout.readline)
             try:

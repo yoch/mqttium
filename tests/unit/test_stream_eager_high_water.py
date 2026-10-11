@@ -31,7 +31,7 @@ def _stream(buffered: int) -> tuple[StreamTransport, _Writer]:
     writer = _Writer(_BufferTransport(buffered))
     # write_nowait() only consults the writer/transport. Keep this unit test
     # independent of asyncio's process-global event-loop policy so it behaves
-    # identically on Python 3.11 through 3.14.
+    # identically on every supported Python version.
     stream = StreamTransport(
         cast(asyncio.StreamReader, object()),
         cast(asyncio.StreamWriter, writer),

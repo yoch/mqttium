@@ -19,6 +19,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 - The WebSocket memory benchmark writer now implements the stream closing
   check, allowing the existing batching scenario to run on all Python versions.
+- The documentation home and installation pages now list Python 3.15 as
+  supported.
 
 ## [1.2.0] - 2026-10-05
 
