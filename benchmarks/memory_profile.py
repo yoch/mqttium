@@ -758,6 +758,9 @@ class _CountingBatchWriter:
         self.total_bytes = 0
         self.max_batch_bytes = 0
 
+    def is_closing(self) -> bool:
+        return False
+
     def writelines(self, frames: list[bytes]) -> None:
         batch_bytes = sum(map(len, frames))
         self.batches += 1
