@@ -11,6 +11,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - Python 3.15 support, including blocking unit, integration, resilience, fuzz,
   cross-platform endpoint and built-distribution checks.
 
+- A Python 3.15 Tachyon diagnostic controller with fresh-process A/A controls,
+  alternating sampling trials, CPU/async recipes and retained raw/HTML profiles.
+  Scheduled captures qualify 1 kHz and 10 kHz without changing release gates.
+
 ### Fixed
 
 - The WebSocket memory benchmark writer now implements the stream closing
