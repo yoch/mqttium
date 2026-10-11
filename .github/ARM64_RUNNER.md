@@ -52,7 +52,9 @@ continues to be enforced by the GitHub-hosted matrix. ARM64 correctness CI now
 also requires a separately provisioned `python3.15` executable and creates its
 own venv. Install it alongside system Python; do not replace `python3`. The
 3.14 and 3.15 arms run sequentially, and absence of 3.15 fails explicitly. The
-performance and published-package workflows retain their 3.14 reference.
+two arms check out the event's exact commit so a later push to `main` cannot
+change the source between Python versions. The performance and published-package
+workflows retain their 3.14 reference.
 
 ## Host setup
 

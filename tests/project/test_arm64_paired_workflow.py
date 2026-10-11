@@ -31,3 +31,5 @@ def test_arm64_ci_isolates_python315_and_preserves_the_system_reference() -> Non
     assert '"$PYTHON_BIN" -m venv' in workflow
     assert "sys.version_info[:2] != expected" in workflow
     assert "max-parallel: 1" in workflow
+    assert "ref: ${{ github.sha }}" in workflow
+    assert "github.ref == 'refs/heads/main'" in workflow
