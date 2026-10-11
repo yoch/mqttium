@@ -6,6 +6,9 @@
 `PublishReceipt.add_done_callback()` and `PublishReceipt.exception()`, the
 per-publication counterpart of Paho's `on_publish`.
 
+1.2.1 adds Python 3.15 support. Its library code is that of 1.2.0, so there is
+nothing to migrate.
+
 ## Changes in 1.1
 
 1.1.0 keeps the 1.0 API and SQLite schema 5, and corrects behaviour that
