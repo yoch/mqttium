@@ -414,12 +414,14 @@ def compare(args):
                 ]
                 completed = subprocess.run(
                     command,
-                    check=True,
                     capture_output=True,
                     text=True,
                     env={**os.environ, "PYTHONHASHSEED": "0"},
                     timeout=120,
                 )
+                if completed.returncode:
+                    sys.stderr.write(completed.stderr)
+                    completed.check_returncode()
                 pair[arm] = json.loads(completed.stdout)
             pairs.append({"order": order, **pair})
         ratios = [p["base"]["cpu_ns_op"] / p["candidate"]["cpu_ns_op"] for p in pairs]
