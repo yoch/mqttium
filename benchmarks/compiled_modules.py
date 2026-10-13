@@ -256,7 +256,7 @@ def load_backend(args):
         if not path.is_relative_to(args.root.resolve()):
             raise AssertionError(f"Wrong source imported: {path}")
         compiled = any(str(path).endswith(s) for s in importlib.machinery.EXTENSION_SUFFIXES)
-        if compiled != (name in GROUPS[args.variant]):
+        if compiled != (name in GROUPS.get(args.variant, ())):
             raise AssertionError(f"Wrong backend: {path}")
         loaded[name] = str(path)
     if native_codec:
@@ -465,8 +465,9 @@ def main():
     parser.add_argument("action", choices=("build", "prepare-wheel", "worker", "compare"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--wheel", type=Path)
-    parser.add_argument("--variant", choices=GROUPS, default="wire")
-    parser.add_argument("--base-variant", choices=GROUPS, default="python")
+    # Other roots named native* hold extra native builds of the same wheel layout.
+    parser.add_argument("--variant", default="wire")
+    parser.add_argument("--base-variant", default="python")
     parser.add_argument("--cpu", type=int, default=min(os.sched_getaffinity(0)))
     parser.add_argument("--case", choices=(*DEFAULT_CASES, *NETWORK_CASES), default="encode_qos0")
     parser.add_argument("--host", default="127.0.0.1")
