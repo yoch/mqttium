@@ -114,6 +114,7 @@ validity conditions pass on an eligible runner.
 
 | Report | Status | Decision recorded |
 | --- | --- | --- |
+| [NATIVE-CODEC-AUDIT-2026-10-13](NATIVE-CODEC-AUDIT-2026-10-13.md) | Current evidence | PR #623 audit: packaging/generator fixes, sanitizer and cross-platform native validation, rejected VBI optimization with measured regressions |
 | [NATIVE-CODEC-2026-10-12](NATIVE-CODEC-2026-10-12.md) | Current evidence | Complete optional Cython backend, installed-wheel validation and paired local/network CPU measurements; shared-host network noise explicitly bounded |
 | [COMPILED-SUBMODULES-2026-10-12](COMPILED-SUBMODULES-2026-10-12.md) | Current evidence | Isolated Cython feasibility study: candidate inventory, paired CPU and loopback measurements, and initial backend-validation/distribution gaps; integration and follow-up measurements are in NATIVE-CODEC-2026-10-12 |
 | [PACKET-ID-POOL-PERFORMANCE](https://github.com/yoch/mqttium/blob/main/docs/reports/PACKET-ID-POOL-PERFORMANCE.md) | Current evidence | Outbound packet-identifier allocator |
