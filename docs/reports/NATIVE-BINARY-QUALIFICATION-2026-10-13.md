@@ -25,6 +25,11 @@ made the client slower.
 
 The x86-64 confirmation, macOS and Windows have not been measured here.
 
+**Decision (2026-10-13).** Fixed-rate reception does not reach the 5 % threshold
+set for publishing an installable binary option, so the maintainer kept the
+native codec as a build-from-source option. No `mqttium[binary]` distribution
+is published. The x86-64 confirmation is deferred.
+
 ## Method
 
 All numbers come from the self-hosted Raspberry Pi 5 runner with the
