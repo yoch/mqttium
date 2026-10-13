@@ -40,9 +40,25 @@ RENAMES = {
 # These generic tails are replaced by _assemble_publish. Any change needs a review
 # of the kernel, including new validation added after header allocation.
 ASSEMBLY_DIGESTS = {
-    "encode_publish_item_v311": "f2f60ebe8d5c042b6bff9f295c69c5cf48818086e658428280ef250b0972b17b",
-    "encode_publish_item_v5": "d12598076004547a1daf0e1caa3e61fcbfd8fc34a6fa882233e1c8a4eb638928",
+    "encode_publish_item_v311": "f30e725495b573b27ad3065d67b9c9689a7e2e19f5dcee132abaa61607b49c50",
+    "encode_publish_item_v5": "404fa0bf3ae9f541d6170253124e022f67470cd20ca411e538d2949f21ae8a66",
 }
+
+
+def _shape(value: object) -> object:
+    """Stable semantic form: ast.dump() changes empty-field formatting in 3.13."""
+    if isinstance(value, ast.AST):
+        return (
+            type(value).__name__,
+            tuple(
+                (name, _shape(field))
+                for name, field in ast.iter_fields(value)
+                if field is not None and field != []
+            ),
+        )
+    if isinstance(value, list):
+        return tuple(_shape(item) for item in value)
+    return value
 
 
 def _definitions(tree: ast.Module) -> list[str]:
@@ -248,7 +264,7 @@ def _optimize(tree: ast.Module) -> None:
                 and any(isinstance(t, ast.Name) and t.id == "header" for t in n.targets)
             )
             tail = ast.Module(body=node.body[index:], type_ignores=[])
-            digest = hashlib.sha256(ast.dump(tail).encode()).hexdigest()
+            digest = hashlib.sha256(repr(_shape(tail)).encode()).hexdigest()
             if digest != ASSEMBLY_DIGESTS[node.name]:
                 raise RuntimeError("PUBLISH assembly changed; review native kernel")
             props = "props" if node.name.endswith("v5") else "b''"
