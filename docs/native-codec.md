@@ -35,6 +35,13 @@ Use `MQTTIUM_BUILD_CODEC=0` (the default) for a pure-Python build. A requested
 native build fails if compilation fails; it does not silently produce a pure
 wheel. The release publication workflow retains its existing default build.
 
+With GCC, `MQTTIUM_CODEC_PGO=1` adds a profile-guided build: the hook compiles
+an instrumented extension, runs a broker-free client workload against it
+(`mqttium.codec._train`) and recompiles with the profile. Hot and cold code are
+separated, which matters when messages arrive one at a time and the code is not
+already in the processor's caches. Other compilers are refused rather than
+silently building without a profile.
+
 ## Backend selection
 
 Set `MQTTIUM_CODEC_BACKEND` before importing MQTTium:

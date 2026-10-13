@@ -47,3 +47,18 @@ def test_failed_native_build_cleans_only_its_owned_staging(hook, monkeypatch, tm
         hook.initialize("standard", {})
     assert sorted((tmp_path / "build").iterdir()) == [other]
     assert other.joinpath("keep").read_text() == "concurrent build"
+
+
+def test_profile_guided_build_requires_a_native_build(hook, monkeypatch, tmp_path):
+    monkeypatch.setenv("MQTTIUM_BUILD_CODEC", "0")
+    monkeypatch.setenv("MQTTIUM_CODEC_PGO", "1")
+    with pytest.raises(ValueError, match="requires MQTTIUM_BUILD_CODEC=1"):
+        hook.initialize("standard", {})
+    assert not list(tmp_path.iterdir())
+
+
+def test_profile_guided_build_rejects_unknown_values(hook, monkeypatch):
+    monkeypatch.setenv("MQTTIUM_BUILD_CODEC", "1")
+    monkeypatch.setenv("MQTTIUM_CODEC_PGO", "yes")
+    with pytest.raises(ValueError, match="MQTTIUM_CODEC_PGO must be 0 or 1"):
+        hook.initialize("standard", {})
