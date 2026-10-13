@@ -71,3 +71,9 @@ def decode_connack_v5(remaining: bytes) -> tuple[bool, int, Properties | None]:
     if reason != 0 and session_present:
         raise MalformedPacketError("CONNACK Session Present must be 0 when connection is refused")
     return session_present, reason, properties
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

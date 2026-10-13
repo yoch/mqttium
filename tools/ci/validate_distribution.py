@@ -34,6 +34,7 @@ _SDIST_ALLOWED_FILES = frozenset(
         "LICENSE",
         "NOTICE",
         "pyproject.toml",
+        "hatch_build.py",
         "PKG-INFO",
         ".gitignore",
     }

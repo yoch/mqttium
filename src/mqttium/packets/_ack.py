@@ -266,3 +266,9 @@ def encode_pubcomp_v5(
     mid: int, reason_code: int = 0, properties: Properties | None = None
 ) -> bytes:
     return _encode_ack_v5(0x70, PUBCOMP, _PUBCOMP_REASONS, mid, reason_code, properties)
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

@@ -8,6 +8,7 @@ import mqttium.packets._publish as publish_v5_module
 import mqttium.protocol.outbound as outbound_module
 
 from mqttium.codec.properties import PUBLISH, encode_properties
+from mqttium.codec._backend import implementation
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.packets import PubAckPacket
 from mqttium.packets._publish import encode_publish_item_v5
@@ -16,6 +17,8 @@ from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
 from mqttium.types import Properties
 from tests.support import feed_engine, write_item_bytes
+
+publish_v5_module = implementation(publish_v5_module)
 
 
 def _iot_properties() -> Properties:

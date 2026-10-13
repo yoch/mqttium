@@ -102,3 +102,9 @@ def _check_utf8_mqtt_topic(topic: str) -> int:
         return validate_utf8(topic)
     except ProtocolError as exc:
         raise ProtocolError(f"Invalid MQTT topic: {exc}") from exc
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

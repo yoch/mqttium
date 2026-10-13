@@ -58,3 +58,9 @@ def require_reason_code(reason: int, allowed: Collection[int], what: str) -> Non
     """Reject reason codes that are not defined for the packet type."""
     if reason not in allowed:
         raise MalformedPacketError(f"{what} contains invalid reason code 0x{reason:02x}")
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

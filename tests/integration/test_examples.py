@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+import mqttium
+
 ROOT = Path(__file__).resolve().parents[2]
 BROKER_HOST = "127.0.0.1"
 BROKER_PORT = 11883
@@ -17,7 +19,8 @@ BROKER_PORT = 11883
 
 def _run_example(script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(ROOT / "src")
+    # Exercise the same distribution as the parent, including installed wheels.
+    environment["PYTHONPATH"] = str(Path(mqttium.__file__).resolve().parent.parent)
     return subprocess.run(
         [
             sys.executable,

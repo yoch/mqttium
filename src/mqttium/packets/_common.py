@@ -38,3 +38,9 @@ def validate_payload_format(payload: bytes, properties: Properties | None) -> No
         raise ProtocolError(
             "Payload Format Indicator 1 requires a well-formed UTF-8 payload"
         ) from exc
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

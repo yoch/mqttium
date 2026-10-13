@@ -77,3 +77,9 @@ class ConnAckPacket:
             reason_code=reason_code,
             properties=properties,
         )
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

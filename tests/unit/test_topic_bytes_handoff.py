@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-import mqttium.packets._publish as publish_v5_module
 import mqttium.protocol.outbound as outbound_module
-import mqttium.topics as topics_module
 
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, QoS
 from mqttium.packets import PubAckPacket
@@ -35,58 +33,22 @@ def _connected_engine() -> ProtocolEngine:
     return engine
 
 
-def test_qos0_validation_hands_topic_bytes_to_encoder(monkeypatch) -> None:
-    validation_calls = 0
-    encoder_calls = 0
-    original_validation_encode = topics_module.encode_utf8
-    original_packet_encode = publish_v5_module.encode_utf8
-
-    def validation_encode(topic: str) -> bytes:
-        nonlocal validation_calls
-        validation_calls += 1
-        return original_validation_encode(topic)
-
-    def packet_encode(topic: str) -> bytes:
-        nonlocal encoder_calls
-        encoder_calls += 1
-        return original_packet_encode(topic)
-
-    monkeypatch.setattr(topics_module, "encode_utf8", validation_encode)
-    monkeypatch.setattr(publish_v5_module, "encode_utf8", packet_encode)
-
+def test_qos0_validation_hands_topic_bytes_to_encoder() -> None:
+    topic, encodes = _counting_str("capteurs/été/température")
     engine = _connected_engine()
-    item = engine.outbound.prepare_qos0("capteurs/été/température", b"payload")
+    item = engine.outbound.prepare_qos0(topic, b"payload")
 
     assert item
-    assert validation_calls == 1
-    assert encoder_calls == 0
+    assert len(encodes) == 1
 
 
-def test_qos1_connected_hands_topic_bytes_to_encoder(monkeypatch) -> None:
-    validation_calls = 0
-    encoder_calls = 0
-    original_validation_encode = topics_module.encode_utf8
-    original_packet_encode = publish_v5_module.encode_utf8
-
-    def validation_encode(topic: str) -> bytes:
-        nonlocal validation_calls
-        validation_calls += 1
-        return original_validation_encode(topic)
-
-    def packet_encode(topic: str) -> bytes:
-        nonlocal encoder_calls
-        encoder_calls += 1
-        return original_packet_encode(topic)
-
-    monkeypatch.setattr(topics_module, "encode_utf8", validation_encode)
-    monkeypatch.setattr(publish_v5_module, "encode_utf8", packet_encode)
-
+def test_qos1_connected_hands_topic_bytes_to_encoder() -> None:
+    topic, encodes = _counting_str("capteurs/été/température")
     engine = _connected_engine()
-    handle = engine.queue_publish("capteurs/été/température", b"payload", qos=1)
+    handle = engine.queue_publish(topic, b"payload", qos=1)
 
     assert handle.mid is not None
-    assert validation_calls == 1
-    assert encoder_calls == 0
+    assert len(encodes) == 1
 
 
 def test_qos1_offline_validation_does_not_preencode_topic(monkeypatch) -> None:

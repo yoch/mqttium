@@ -114,6 +114,8 @@ validity conditions pass on an eligible runner.
 
 | Report | Status | Decision recorded |
 | --- | --- | --- |
+| [NATIVE-CODEC-2026-10-12](NATIVE-CODEC-2026-10-12.md) | Current evidence | Complete optional Cython backend, installed-wheel validation and paired local/network CPU measurements; shared-host network noise explicitly bounded |
+| [COMPILED-SUBMODULES-2026-10-12](COMPILED-SUBMODULES-2026-10-12.md) | Current evidence | Isolated Cython feasibility study: candidate inventory, paired CPU and loopback measurements, and initial backend-validation/distribution gaps; integration and follow-up measurements are in NATIVE-CODEC-2026-10-12 |
 | [PACKET-ID-POOL-PERFORMANCE](https://github.com/yoch/mqttium/blob/main/docs/reports/PACKET-ID-POOL-PERFORMANCE.md) | Current evidence | Outbound packet-identifier allocator |
 | [PUBLISH-DECODE-PROFILE](https://github.com/yoch/mqttium/blob/main/docs/reports/PUBLISH-DECODE-PROFILE.md) | Current evidence | Rejected direct-buffer decode expansion |
 | [QOS1-FRAME-POLICY](https://github.com/yoch/mqttium/blob/main/docs/reports/QOS1-FRAME-POLICY.md) | Current evidence | QoS 1 encoded-frame retention policy |

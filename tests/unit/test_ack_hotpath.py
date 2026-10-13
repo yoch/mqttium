@@ -8,6 +8,7 @@ import mqttium.packets._ack as ack_v5
 import mqttium.protocol.inbound as inbound_module
 
 from mqttium.codec.buffer import RawPacket
+from mqttium.codec._backend import implementation
 from mqttium.codec.primitives import pack_u16, pack_utf8
 from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
 from mqttium.packets import PubAckPacket, PubCompPacket, PubRecPacket, PubRelPacket
@@ -22,6 +23,8 @@ from mqttium.protocol.effects import EffectKind
 from mqttium.protocol.engine import ProtocolEngine
 from mqttium.types import Properties
 from tests.support import mark_delivered_messages
+
+ack_v5 = implementation(ack_v5)
 
 
 def test_auto_qos1_puback_skips_packet_dataclass(monkeypatch) -> None:

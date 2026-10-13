@@ -190,6 +190,7 @@ nav:
   - Home: index.md
   - Get started:
       - Getting started: getting-started.md
+      - Compiled codec: native-codec.md
       - Core concepts: core-concepts.md
   - Guides:
       - Configuration and sizing: configuration-and-sizing.md

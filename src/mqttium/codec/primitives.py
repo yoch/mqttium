@@ -134,3 +134,9 @@ def _validate_mqtt_utf8(
     # encode its topic four times where the connected launch path encodes once.
     if "\x00" in text:
         raise error_type("[MQTT-1.5.4-2] Null in UTF-8 data")
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

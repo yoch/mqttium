@@ -155,3 +155,9 @@ def encode_disconnect_v5(
     body = bytearray((reason_code,))
     body.extend(encode_properties(properties, DISCONNECT))
     return encode_frame(PacketType.DISCONNECT, 0, body)
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

@@ -14,6 +14,9 @@ Install MQTTium from PyPI:
 python -m pip install mqttium==1.2.1
 ```
 
+For the optional compiled wire codec in a source checkout, see
+[Compiled codec](native-codec.md).
+
 When upgrading from 1.0, read the
 [1.1 migration notes](migration.md#changes-in-11). The client API and SQLite
 schema stay on the 1.0 contract, while several connection, subscription, limit,
