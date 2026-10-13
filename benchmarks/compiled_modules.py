@@ -28,9 +28,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 LEAVES = ("codec.vbi", "codec.primitives", "codec.properties", "codec.packet_validation", "topics")
 WIRE = (*LEAVES, "codec.buffer", "packets._publish", "packets._ack", "packets._common")
+# Synchronous protocol modules compiled as same-name extensions over either codec.
+PROTOCOL = (
+    "protocol.engine",
+    "protocol.inbound",
+    "protocol.outbound",
+    "protocol.flow_control",
+    "protocol.packet_ids",
+    "protocol._sizing",
+    "protocol.effects",
+    "persistence.memory",
+)
 GROUPS = {
     "python": (),
     "native": (),
+    "python_protocol": PROTOCOL,
+    "native_protocol": PROTOCOL,
     "leaves": LEAVES,
     "wire": WIRE,
     "packets": tuple(name for name in WIRE if name != "codec.buffer"),
@@ -121,7 +134,7 @@ def build(destination):
     )
 
 
-def prepare_wheel(destination, wheel):
+def prepare_wheel(destination, wheel, protocol=False):
     """Compare exactly the same installed bytes with an explicit backend choice."""
     destination.mkdir(parents=True, exist_ok=False)
     with ZipFile(wheel) as archive:
@@ -132,6 +145,7 @@ def prepare_wheel(destination, wheel):
             raise ValueError("Expected a compiled codec wheel")
         for variant in ("python", "native"):
             archive.extractall(destination / variant / "src")
+    extensions = build_protocol(destination) if protocol else {}
     write_json(
         destination / "manifest.json",
         {
@@ -140,8 +154,49 @@ def prepare_wheel(destination, wheel):
             "python": sys.version,
             "platform": platform.platform(),
             "backend_selection": "MQTTIUM_CODEC_BACKEND, same wheel in both arms",
+            "protocol_extension_sha256": extensions,
         },
     )
+
+
+def build_protocol(destination):
+    """Add *_protocol roots: the wheel's sources plus same-name protocol extensions."""
+    from Cython.Build import cythonize
+    from setuptools import Distribution, Extension
+
+    source = destination / "python" / "src"
+    extensions = [
+        Extension("mqttium." + name, [str(source / "mqttium" / (name.replace(".", "/") + ".py"))])
+        for name in PROTOCOL
+    ]
+    directives = {"language_level": 3, "annotation_typing": False, "binding": True}
+    distribution = Distribution(
+        {
+            "name": "mqttium-protocol-experiment",
+            "ext_modules": cythonize(extensions, compiler_directives=directives, quiet=True),
+        }
+    )
+    command = distribution.get_command_obj("build_ext")
+    command.build_lib = str(destination / "protocol-extensions")
+    command.build_temp = str(destination / "protocol-objects")
+    distribution.run_command("build_ext")
+    hashes = {}
+    for base in ("python", "native"):
+        target = destination / f"{base}_protocol" / "src"
+        shutil.copytree(destination / base / "src", target)
+        for name in PROTOCOL:
+            relative = Path("mqttium") / name.replace(".", "/")
+            artifact = (
+                destination
+                / "protocol-extensions"
+                / relative.with_suffix(sysconfig.get_config_var("EXT_SUFFIX"))
+            )
+            shutil.copy2(artifact, target / relative.parent / artifact.name)
+            hashes[name] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    # Cython generates C beside its inputs; keep the measured Python roots pristine.
+    for name in PROTOCOL:
+        (source / "mqttium" / (name.replace(".", "/") + ".c")).unlink(missing_ok=True)
+    return hashes
 
 
 def custom_case(name):
@@ -190,11 +245,12 @@ def custom_case(name):
 
 
 def load_backend(args):
-    os.environ["MQTTIUM_CODEC_BACKEND"] = "native" if args.variant == "native" else "python"
+    native_codec = args.variant.startswith("native")
+    os.environ["MQTTIUM_CODEC_BACKEND"] = "native" if native_codec else "python"
     os.sched_setaffinity(0, {args.cpu})
     sys.path.insert(0, str(args.root / "src"))
     loaded = {}
-    for name in GROUPS["combined"]:
+    for name in (*GROUPS["combined"], *PROTOCOL):
         module = importlib.import_module("mqttium." + name)
         path = Path(module.__file__).resolve()
         if not path.is_relative_to(args.root.resolve()):
@@ -203,7 +259,7 @@ def load_backend(args):
         if compiled != (name in GROUPS[args.variant]):
             raise AssertionError(f"Wrong backend: {path}")
         loaded[name] = str(path)
-    if args.variant == "native":
+    if native_codec:
         native = importlib.import_module("mqttium.codec._native")
         if not Path(native.__file__).resolve().is_relative_to(args.root.resolve()):
             raise AssertionError("Wrong native extension imported")
@@ -334,7 +390,7 @@ def compare(args):
             pair = {}
             order = ("base", "candidate") if repeat % 2 == 0 else ("candidate", "base")
             for arm in order:
-                variant = "python" if arm == "base" else args.variant
+                variant = args.base_variant if arm == "base" else args.variant
                 command = [
                     sys.executable,
                     str(Path(__file__).resolve()),
@@ -386,6 +442,7 @@ def compare(args):
         write_json(
             args.output,
             {
+                "base_variant": args.base_variant,
                 "variant": args.variant,
                 "cpu": args.cpu,
                 "repeat": args.repeat,
@@ -407,6 +464,7 @@ def main():
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--wheel", type=Path)
     parser.add_argument("--variant", choices=GROUPS, default="wire")
+    parser.add_argument("--base-variant", choices=GROUPS, default="python")
     parser.add_argument("--cpu", type=int, default=min(os.sched_getaffinity(0)))
     parser.add_argument("--case", choices=(*DEFAULT_CASES, *NETWORK_CASES), default="encode_qos0")
     parser.add_argument("--host", default="127.0.0.1")
@@ -417,6 +475,9 @@ def main():
     parser.add_argument("--repeat", type=int, default=6)
     parser.add_argument("--output", type=Path, default=Path("/tmp/compiled-modules.json"))
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--protocol", action="store_true", help="prepare-wheel: also build *_protocol roots"
+    )
     args = parser.parse_args()
     if args.action == "prepare-wheel" and args.wheel is None:
         parser.error("prepare-wheel requires --wheel")
@@ -426,7 +487,7 @@ def main():
         parser.error("--scale must be positive")
     {
         "build": lambda: build(args.root.resolve()),
-        "prepare-wheel": lambda: prepare_wheel(args.root.resolve(), args.wheel),
+        "prepare-wheel": lambda: prepare_wheel(args.root.resolve(), args.wheel, args.protocol),
         "worker": lambda: worker(args),
         "compare": lambda: compare(args),
     }[args.action]()
