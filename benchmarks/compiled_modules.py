@@ -250,13 +250,15 @@ def load_backend(args):
     os.sched_setaffinity(0, {args.cpu})
     sys.path.insert(0, str(args.root / "src"))
     loaded = {}
+    # Roots named *_typed hold protocol extensions built by another generator.
+    expected = GROUPS.get(args.variant, PROTOCOL if args.variant.endswith("_typed") else ())
     for name in (*GROUPS["combined"], *PROTOCOL):
         module = importlib.import_module("mqttium." + name)
         path = Path(module.__file__).resolve()
         if not path.is_relative_to(args.root.resolve()):
             raise AssertionError(f"Wrong source imported: {path}")
         compiled = any(str(path).endswith(s) for s in importlib.machinery.EXTENSION_SUFFIXES)
-        if compiled != (name in GROUPS.get(args.variant, ())):
+        if compiled != (name in expected):
             raise AssertionError(f"Wrong backend: {path}")
         loaded[name] = str(path)
     if native_codec:
