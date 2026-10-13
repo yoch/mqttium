@@ -54,6 +54,7 @@ Changelog = "https://github.com/yoch/mqttium/blob/main/CHANGELOG.md"
 [project.optional-dependencies]
 dev = [
     "actionlint-py>=1.7.12.24",
+    "hatchling>=1.27",
     "mypy>=1.17",
     "pytest>=8",
     "pytest-asyncio>=0.24",

@@ -37,6 +37,14 @@ RENAMES = {
 }
 
 
+# These generic tails are replaced by _assemble_publish. Any change needs a review
+# of the kernel, including new validation added after header allocation.
+ASSEMBLY_DIGESTS = {
+    "encode_publish_item_v311": "f2f60ebe8d5c042b6bff9f295c69c5cf48818086e658428280ef250b0972b17b",
+    "encode_publish_item_v5": "d12598076004547a1daf0e1caa3e61fcbfd8fc34a6fa882233e1c8a4eb638928",
+}
+
+
 def _definitions(tree: ast.Module) -> list[str]:
     result = []
     for node in tree.body:
@@ -48,6 +56,35 @@ def _definitions(tree: ast.Module) -> list[str]:
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             result.append(node.target.id)
     return result
+
+
+def _register_globals(tree: ast.Module, module: str, registry: dict[str, tuple[str, str]]) -> None:
+    """Fusing namespaces must not change the owner of a global used by a function."""
+    renames = RENAMES.get(module, {})
+    entries = [(renames.get(name, name), (module, name)) for name in _definitions(tree)]
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            entries.extend(
+                (alias.asname or alias.name.split(".")[0], ("import", alias.name))
+                for alias in node.names
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
+            source = node.module or ""
+            internal = source.removeprefix("mqttium.") in MODULES
+            for alias in node.names:
+                if alias.name == "*" or node.level:
+                    raise RuntimeError("Native codec requires explicit absolute imports")
+                origin_module = source.removeprefix("mqttium.") if internal else source
+                entries.append((alias.asname or alias.name, (origin_module, alias.name)))
+        elif isinstance(node, ast.For):
+            # Current module initialization only attaches codecs to property specs.
+            entries.extend(
+                (n.id, (module, n.id)) for n in ast.walk(node.target) if isinstance(n, ast.Name)
+            )
+    for name, origin in entries:
+        previous = registry.setdefault(name, origin)
+        if previous != origin:
+            raise RuntimeError(f"Native codec global collision: {name} ({previous} vs {origin})")
 
 
 def _locals(node: ast.FunctionDef, types: dict[str, str]) -> None:
@@ -77,6 +114,23 @@ def _decoder(node: ast.ClassDef) -> ast.ClassDef:
         and any(isinstance(t, ast.Name) and t.id == "__slots__" for t in n.targets)
     )
     names = ast.literal_eval(fields.value)
+    expected = {
+        "_buf",
+        "_view",
+        "_max_packet_size",
+        "_drain_had_large_frame",
+        "_start",
+        "_end",
+        "_capacity",
+        "_idle_drains",
+        "_window_peak",
+        "_offered",
+        "_target_window",
+        "_full_fills",
+        "_high_water",
+    }
+    if set(names) != expected:
+        raise RuntimeError("Decoder fields changed; review native storage types")
     object_fields = {"_buf", "_view", "_max_packet_size"}
     booleans = {"_drain_had_large_frame"}
     declarations = []
@@ -139,6 +193,16 @@ def _decoder(node: ast.ClassDef) -> ast.ClassDef:
                         and ast.unparse(statement.test)
                         == "remaining_length >= _VIEW_COPY_THRESHOLD"
                     ):
+                        expected_copy = ast.parse(
+                            "if remaining_length >= _VIEW_COPY_THRESHOLD:\n"
+                            "    body = bytes(self._view[body_start:body_end])\n"
+                            "else:\n"
+                            "    body = bytes(buf[body_start:body_end])"
+                        ).body[0]
+                        if ast.dump(statement) != ast.dump(expected_copy):
+                            raise RuntimeError(
+                                "Decoder copy block changed; review native generator"
+                            )
                         method.body[index] = ast.parse(
                             "body = _copy_owned(buf, body_start, remaining_length)"
                         ).body[0]
@@ -183,6 +247,10 @@ def _optimize(tree: ast.Module) -> None:
                 if isinstance(n, ast.Assign)
                 and any(isinstance(t, ast.Name) and t.id == "header" for t in n.targets)
             )
+            tail = ast.Module(body=node.body[index:], type_ignores=[])
+            digest = hashlib.sha256(ast.dump(tail).encode()).hexdigest()
+            if digest != ASSEMBLY_DIGESTS[node.name]:
+                raise RuntimeError("PUBLISH assembly changed; review native kernel")
             props = "props" if node.name.endswith("v5") else "b''"
             node.body[index:index] = ast.parse(
                 f"if type(topic_bytes) is bytes and type(payload) is bytes and type({props}) is bytes and (not level or type(mid) is int):\n    return _assemble_publish(topic_bytes, payload, {props}, int(level), flags, mid if level else 0, remaining_length)"
@@ -193,8 +261,9 @@ def generate(package: Path, destination: Path) -> None:
     """Fail on symbol collisions or changed copy boundaries rather than guessing."""
     exports = {}
     definitions: set[str] = set()
+    global_origins: dict[str, tuple[str, str]] = {}
     bodies = []
-    digest = hashlib.sha256()
+    digest = hashlib.sha256(Path(__file__).read_bytes())
     for module in MODULES:
         source = (
             (package / (module.replace(".", "/") + ".py"))
@@ -203,6 +272,7 @@ def generate(package: Path, destination: Path) -> None:
         )
         digest.update(module.encode() + b"\0" + source.encode())
         tree = ast.parse(source)
+        _register_globals(tree, module, global_origins)
         names = _definitions(tree)
         renames = RENAMES.get(module, {})
         native_names = {name: renames.get(name, name) for name in names}

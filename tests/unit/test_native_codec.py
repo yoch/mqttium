@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -120,3 +121,44 @@ def test_native_matches_python_on_wire_corpus():
     assert len(results[0]) == len(results[1])
     for index, (reference, native) in enumerate(zip(*results, strict=True)):
         assert reference == native, (index, reference, native)
+
+
+@pytest.mark.parametrize(
+    ("module", "before", "after", "error"),
+    [
+        (
+            "codec/primitives.py",
+            "import struct",
+            "import struct\nfrom math import pi as MAX_VBI",
+            "global collision",
+        ),
+        (
+            "codec/buffer.py",
+            "body = bytes(self._view[body_start:body_end])",
+            "assert False, 'new validation'\n            body = bytes(self._view[body_start:body_end])",
+            "copy block changed",
+        ),
+        ("codec/buffer.py", '"_high_water",', '"_high_water", "_new_object",', "fields changed"),
+        (
+            "packets/_publish.py",
+            "header = bytearray()",
+            "header = bytearray()\n    assert False, 'new validation'",
+            "PUBLISH assembly changed",
+        ),
+        (
+            "codec/primitives.py",
+            "import struct",
+            "import struct\nfrom math import *",
+            "explicit absolute imports",
+        ),
+    ],
+)
+def test_generator_rejects_unsafe_source_drift(tmp_path, module, before, after, error):
+    package = tmp_path / "mqttium"
+    shutil.copytree(ROOT / "src/mqttium", package, ignore=shutil.ignore_patterns("__pycache__"))
+    source = package / module
+    text = source.read_text()
+    assert before in text
+    source.write_text(text.replace(before, after, 1))
+    with pytest.raises(RuntimeError, match=error):
+        generate(package, tmp_path / "_native.pyx")

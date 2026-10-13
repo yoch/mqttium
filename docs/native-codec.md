@@ -17,7 +17,10 @@ MQTTIUM_CODEC_BACKEND=native python -c 'from mqttium.codec._backend import BACKE
 
 On PowerShell, set `$env:MQTTIUM_BUILD_CODEC = "1"` before running pip.
 Build isolation installs Cython and setuptools only for the native wheel build.
-The same Hatch hook works when installing the source distribution. Wheels are
+The same Hatch hook works when installing the source distribution. Native
+editable installs (`pip install -e`) are rejected explicitly: install a wheel or
+use `pip install .` and rebuild after changing codec sources. Pure-Python
+editable installs remain supported with `MQTTIUM_BUILD_CODEC=0`. Wheels are
 specific to the Python ABI and platform; this is not a stable-ABI extension.
 Installing an existing pure-Python wheel does not compile it. This unreleased
 feature does not imply that native wheels are available on PyPI.
@@ -58,8 +61,9 @@ validation, size limits and malformed-input handling remain in the reference
 sources. The GIL remains held; this accelerates individual operations rather
 than introducing client parallelism.
 
-The generator rejects global symbol collisions and changed decoder copy
-boundaries. When changing codec sources, validate both backends. Native CI
+The generator rejects global symbol collisions (including imports), changed
+decoder fields/copy blocks and unreviewed PUBLISH assembly changes. Its source
+fingerprint includes the generator as well as wire sources and kernels. When changing codec sources, validate both backends. Native CI
 builds from the sdist, exercises the installed wheel, compares deterministic
 wire/error corpora with Python, and runs unit, integration and fuzz tests.
 Source-tree tests alone do not exercise an installed extension: override the

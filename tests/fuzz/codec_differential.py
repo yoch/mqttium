@@ -9,8 +9,14 @@ import json
 import random
 
 from mqttium.codec.buffer import IncrementalDecoder
-from mqttium.codec.primitives import unpack_u16, unpack_u32, unpack_utf8
-from mqttium.codec.properties import PUBLISH, decode_properties
+from mqttium.codec.primitives import pack_utf8, unpack_u16, unpack_u32, unpack_utf8
+from mqttium.codec.properties import (
+    ALL_PACKETS,
+    PUBLISH,
+    _SPECS,
+    decode_properties,
+    encode_properties,
+)
 from mqttium.codec.vbi import decode_vbi, encode_vbi
 from mqttium.enums import MQTTProtocolVersion, QoS
 from mqttium.packets import PublishPacket
@@ -88,6 +94,8 @@ def main():
                         )
                     )
     rows.extend(fragmented_packets())
+    rows.extend(property_contexts())
+    rows.extend(stream_operations())
     print(json.dumps(rows, ensure_ascii=True, sort_keys=True))
 
 
@@ -113,6 +121,77 @@ def fragmented_packets():
                 decoder.feed(b"\x30\x03\x00\x01x")
                 assert raw.remaining is owned
                 rows.append(normalize(PublishPacket.decode(raw.flags, raw.remaining, version)))
+    return rows
+
+
+def property_contexts():
+    rows = []
+    examples = {
+        "B": 1,
+        "2I": 65535,
+        "4I": 4294967295,
+        "VBI": 268435455,
+        "S": "sensor/é",
+        "SP": (("site", "été"), ("site", "north")),
+        "BIN": b"\x00\xff",
+    }
+    for spec in _SPECS:
+        value = examples[spec.type.value]
+        if spec.name == "subscription_identifier":
+            value = (value,)
+        props = Properties({spec.name: value})
+        for packet in sorted(ALL_PACKETS):
+            rows.append(outcome(encode_properties, props, packet))
+            if packet not in spec.packets:
+                continue
+            wire = encode_properties(props, packet)
+            decoded, end = decode_properties(wire, 0, packet)
+            assert end == len(wire)
+            rows.append(normalize(decoded))
+            for stop in range(len(wire)):
+                rows.append(outcome(decode_properties, wire[:stop], 0, packet))
+    for value in ("", "ASCII", "été/東京/🌡", "\x00", "\ud800", "x" * 65535, "é" * 32768):
+        rows.append(outcome(pack_utf8, value))
+    return rows
+
+
+def stream_operations():
+    rng = random.Random(613)
+    rows = []
+    decoder = IncrementalDecoder()
+    for trial in range(120):
+        wire = b"".join(
+            PublishPacket("t/é", rng.randbytes(rng.randrange(4097)), 0, False, False).encode()
+            for _ in range(4)
+        )
+        received = []
+        offset = 0
+        while offset < len(wire):
+            size = min(rng.randrange(1, 1025), len(wire) - offset)
+            if trial % 2:
+                view = decoder.writable_window()
+                size = min(size, len(view))
+                view[:size] = wire[offset : offset + size]
+                view.release()
+                decoder.commit(size)
+            else:
+                decoder.feed(memoryview(wire)[offset : offset + size])
+            offset += size
+            while True:
+                ready = decoder.peek_packet_bounds()
+                packet = decoder.next_packet()
+                assert (ready is None) == (packet is None)
+                if packet is None:
+                    break
+                received.append(normalize(packet))
+        assert len(received) == 4 and decoder.buffered == 0
+        rows.append(received)
+        decoder.clear()
+    for _ in range(2000):
+        decoder = IncrementalDecoder(max_packet_size=4096)
+        decoder.feed(rng.randbytes(rng.randrange(64)))
+        rows.append(outcome(decoder.peek_packet_bounds))
+        rows.append(outcome(decoder.next_packet))
     return rows
 
 

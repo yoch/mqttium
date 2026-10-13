@@ -25,13 +25,27 @@ class NativeCodecHook(BuildHookInterface):
         if self.target_name != "wheel" or enabled == "0":
             return
 
-        from Cython.Build import cythonize
-        from setuptools import Distribution, Extension
+        if version == "editable":
+            raise ValueError(
+                "Native codec editable installs are unsupported; use "
+                "MQTTIUM_BUILD_CODEC=1 pip install . or build a wheel. "
+                "Use MQTTIUM_BUILD_CODEC=0 for a pure-Python editable install."
+            )
 
         root = Path(self.root)
         (root / "build").mkdir(exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix="native-codec-", dir=root / "build"))
         self._staging = staging
+        try:
+            self._build(root, staging, build_data)
+        except BaseException:
+            self.finalize(version, build_data, None)
+            raise
+
+    def _build(self, root, staging, build_data):
+        from Cython.Build import cythonize
+        from setuptools import Distribution, Extension
+
         spec = importlib.util.spec_from_file_location(
             "_codec_compile", root / "src/mqttium/codec/_compile.py"
         )
@@ -66,3 +80,4 @@ class NativeCodecHook(BuildHookInterface):
     def finalize(self, version, build_data, artifact_path):
         if self._staging is not None:
             shutil.rmtree(self._staging)
+            self._staging = None
