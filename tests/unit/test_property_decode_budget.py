@@ -8,7 +8,7 @@ import pytest
 
 from mqttium.api import AsyncClient
 from mqttium.codec import properties as codec
-from mqttium.codec._backend import implementation
+from mqttium.codec._backend import BACKEND, implementation
 from mqttium.codec.primitives import pack_utf8
 from mqttium.codec.vbi import encode_vbi
 from mqttium.enums import MQTTProtocolVersion, PacketType
@@ -124,10 +124,13 @@ def test_over_budget_value_is_not_decoded_or_retained(monkeypatch):
     traceback = caught.value.__traceback__
     while traceback is not None and traceback.tb_frame.f_code.co_name != "decode_properties":
         traceback = traceback.tb_next
-    if traceback is not None:
-        frame = traceback.tb_frame.f_locals
-        assert frame["seen"] == {}
-        assert not any(isinstance(value, list) and len(value) > 1 for value in frame.values())
+    if BACKEND == "native":
+        return
+    # Python frames also expose the decoder's partial state for inspection.
+    assert traceback is not None
+    frame = traceback.tb_frame.f_locals
+    assert frame["seen"] == {}
+    assert not any(isinstance(value, list) and len(value) > 1 for value in frame.values())
 
 
 async def test_wire_packet_limit_still_rejects_below_count_budget():

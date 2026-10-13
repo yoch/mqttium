@@ -14,7 +14,8 @@ import pytest
 
 import mqttium
 from mqttium.codec._backend import BACKEND
-from mqttium.codec._compile import MODULES, generate
+from mqttium.codec._compile import MODULES, generate, source_digest
+from mqttium.codec._digest import SOURCE_DIGEST
 
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_ROOT = Path(mqttium.__file__).resolve().parent.parent
@@ -101,12 +102,59 @@ def test_generator_is_deterministic_and_keeps_source_unchanged(tmp_path):
 @pytest.mark.skipif(BACKEND != "native", reason="native wheel job checks compiled implementation")
 def test_all_wire_modules_use_the_same_extension():
     native = importlib.import_module("mqttium.codec._native")
-    assert len(native.SOURCE_DIGEST) == 64
-    assert set(native.EXPORTS) == {"mqttium." + m for m in MODULES if m != "transport.writes"}
+    assert native.SOURCE_DIGEST == SOURCE_DIGEST
+    assert len(native.BUILD_DIGEST) == 64
+    assert set(native.EXPORTS) == {"mqttium." + m for m in MODULES}
     for name, exports in native.EXPORTS.items():
         module = importlib.import_module(name)
         for symbol, value in exports.items():
             assert getattr(module, symbol) is value, (name, symbol)
+            if isinstance(value, type):
+                assert value.__module__ == name, (name, symbol)
+
+
+def test_tracked_source_digest_matches_wire_sources():
+    # Regenerate with: python src/mqttium/codec/_compile.py
+    assert source_digest(ROOT / "src/mqttium") == SOURCE_DIGEST
+
+
+@pytest.mark.parametrize("mode", ["auto", "native"])
+def test_stale_native_backend_is_rejected(tmp_path, mode):
+    package = tmp_path / "mqttium" / "codec"
+    package.mkdir(parents=True)
+    package.parent.joinpath("__init__.py").write_text("")
+    package.joinpath("__init__.py").write_text("")
+    for name in ("_backend.py", "_digest.py"):
+        package.joinpath(name).write_text((PACKAGE_ROOT / "mqttium/codec" / name).read_text())
+    package.joinpath("_native.py").write_text("SOURCE_DIGEST = 'superseded'\nEXPORTS = {}\n")
+    result = _run(mode, "import mqttium.codec._backend", tmp_path)
+    assert result.returncode != 0
+    assert "generated from different MQTTium sources" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "module"),
+    [
+        ("AuthPacket", "mqttium.packets.control"),
+        ("ConnAckPacket", "mqttium.packets.connect"),
+        ("SubscribeOptions", "mqttium.packets.subscription"),
+    ],
+)
+def test_public_codec_types_keep_their_identity(name, module):
+    import pickle
+
+    import mqttium.api
+
+    cls = getattr(mqttium.api, name)
+    assert cls.__module__ == module
+    assert cls.__qualname__ == name
+    assert repr(cls).startswith(f"<class '{module}.{name}'")
+    value = {
+        "AuthPacket": lambda: cls(reason_code=0x18),
+        "ConnAckPacket": lambda: cls(session_present=True, reason_code=0),
+        "SubscribeOptions": lambda: cls(qos=1, no_local=True),
+    }[name]()
+    assert pickle.loads(pickle.dumps(value)) == value
 
 
 @pytest.mark.skipif(BACKEND != "native", reason="native wheel job runs both codec oracles")
@@ -150,6 +198,12 @@ def test_native_matches_python_on_wire_corpus():
             "import struct",
             "import struct\nfrom math import *",
             "explicit absolute imports",
+        ),
+        (
+            "codec/primitives.py",
+            '        raise MalformedPacketError("Incomplete UTF-8 string")',
+            '        raise MalformedPacketError("Incomplete UTF-8 string")\n    assert False, "new validation"',
+            "unpack_utf8 changed",
         ),
     ],
 )

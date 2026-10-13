@@ -19,3 +19,9 @@ def item_size(item: WriteItem) -> int:
     if isinstance(item, bytes):
         return len(item)
     return len(item[0]) + len(item[1])
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

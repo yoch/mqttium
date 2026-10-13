@@ -150,6 +150,7 @@ max-complexity = 15
 "src/mqttium/codec/*.py" = ["E402"]
 "src/mqttium/packets/*.py" = ["E402"]
 "src/mqttium/topics.py" = ["E402"]
+"src/mqttium/transport/writes.py" = ["E402"]
 "src/mqttium/protocol/__init__.py" = ["F401"]
 # The Paho façade's publish path deliberately keeps immediate/queued admission
 # and reservation cleanup together so their ordering/error semantics stay visible.

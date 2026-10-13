@@ -43,6 +43,17 @@ ASSEMBLY_DIGESTS = {
     "encode_publish_item_v311": "f30e725495b573b27ad3065d67b9c9689a7e2e19f5dcee132abaa61607b49c50",
     "encode_publish_item_v5": "404fa0bf3ae9f541d6170253124e022f67470cd20ca411e538d2949f21ae8a66",
 }
+# Kernels answer these functions for exact bytes before their Python body runs.
+# Any change to a body, such as added validation, needs a review of its kernel.
+FAST_PATH_DIGESTS = {
+    "unpack_u16": "32a5785b4989abcdb4a0483a37cc7ce85db342cf3655c6bf4828383e796a1304",
+    "unpack_u32": "a04ffce04f19e37b9ec3d8f15225d37e5529c0a7a2c53e34aaf74f34d98d6302",
+    "unpack_utf8": "e137ad8744617fadf4a79c0f7b9bdadd3f0d9c674c86da869ed2bf8ae1b597cd",
+}
+
+
+def _digest(node: ast.AST) -> str:
+    return hashlib.sha256(repr(_shape(node)).encode()).hexdigest()
 
 
 def _shape(value: object) -> object:
@@ -110,7 +121,7 @@ def _locals(node: ast.FunctionDef, types: dict[str, str]) -> None:
     node.decorator_list.append(decorated.decorator_list[0])
 
 
-def _fast_path(node: ast.FunctionDef, statements: str) -> None:
+def _insert_after_docstring(node: ast.FunctionDef | ast.ClassDef, statements: str) -> None:
     position = (
         1
         if node.body
@@ -244,13 +255,15 @@ def _optimize(tree: ast.Module) -> None:
                     "pos": "cython.Py_ssize_t",
                 },
             )
-        elif node.name in {"unpack_u16", "unpack_u32", "unpack_utf8"}:
+        elif node.name in FAST_PATH_DIGESTS:
+            if _digest(node) != FAST_PATH_DIGESTS[node.name]:
+                raise RuntimeError(f"{node.name} changed; review its native kernel")
             kernel = {
                 "unpack_u16": "_read_u16",
                 "unpack_u32": "_read_u32",
                 "unpack_utf8": "_read_utf8",
             }[node.name]
-            _fast_path(
+            _insert_after_docstring(
                 node,
                 f"if type(buffer) is bytes and type(offset) is int and 0 <= offset <= len(buffer):\n    return {kernel}(buffer, offset)",
             )
@@ -264,13 +277,25 @@ def _optimize(tree: ast.Module) -> None:
                 and any(isinstance(t, ast.Name) and t.id == "header" for t in n.targets)
             )
             tail = ast.Module(body=node.body[index:], type_ignores=[])
-            digest = hashlib.sha256(repr(_shape(tail)).encode()).hexdigest()
-            if digest != ASSEMBLY_DIGESTS[node.name]:
+            if _digest(tail) != ASSEMBLY_DIGESTS[node.name]:
                 raise RuntimeError("PUBLISH assembly changed; review native kernel")
             props = "props" if node.name.endswith("v5") else "b''"
             node.body[index:index] = ast.parse(
                 f"if type(topic_bytes) is bytes and type(payload) is bytes and type({props}) is bytes and (not level or type(mid) is int):\n    return _assemble_publish(topic_bytes, payload, {props}, int(level), flags, mid if level else 0, remaining_length)"
             ).body
+
+
+def _wire_source(package: Path, module: str) -> str:
+    path = package / (module.replace(".", "/") + ".py")
+    return path.read_text(encoding="utf-8").split(MARKER)[0]
+
+
+def source_digest(package: Path) -> str:
+    """Identify the maintained sources an extension must have been generated from."""
+    digest = hashlib.sha256()
+    for module in MODULES:
+        digest.update(module.encode() + b"\0" + _wire_source(package, module).encode())
+    return digest.hexdigest()
 
 
 def generate(package: Path, destination: Path) -> None:
@@ -279,15 +304,9 @@ def generate(package: Path, destination: Path) -> None:
     definitions: set[str] = set()
     global_origins: dict[str, tuple[str, str]] = {}
     bodies = []
-    digest = hashlib.sha256(Path(__file__).read_bytes())
+    owners: list[str] = []
     for module in MODULES:
-        source = (
-            (package / (module.replace(".", "/") + ".py"))
-            .read_text(encoding="utf-8")
-            .split(MARKER)[0]
-        )
-        digest.update(module.encode() + b"\0" + source.encode())
-        tree = ast.parse(source)
+        tree = ast.parse(_wire_source(package, module))
         _register_globals(tree, module, global_origins)
         names = _definitions(tree)
         renames = RENAMES.get(module, {})
@@ -299,8 +318,14 @@ def generate(package: Path, destination: Path) -> None:
         if collisions:
             raise RuntimeError(f"Native codec global collision in {module}: {sorted(collisions)}")
         definitions.update(native_names.values())
-        if module != "transport.writes":
-            exports["mqttium." + module] = native_names
+        exports["mqttium." + module] = native_names
+        # Public types keep their module for repr, pickling and introspection.
+        # Assigned after creation: dataclasses resolve annotations in their module.
+        owners.extend(
+            f"{native_names[node.name]}.__module__ = {'mqttium.' + module!r}"
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+        )
         body = []
         for node in tree.body:
             if not isinstance(node, ast.ImportFrom):
@@ -318,7 +343,8 @@ def generate(package: Path, destination: Path) -> None:
         _optimize(tree)
         bodies.append(ast.unparse(ast.fix_missing_locations(tree)))
     kernels = (package / "codec/_kernels.pxi").read_text(encoding="utf-8")
-    digest.update(kernels.encode())
+    sources = source_digest(package)
+    build = hashlib.sha256(Path(__file__).read_bytes() + kernels.encode() + sources.encode())
     mapping = ",\n".join(
         f"    {module!r}: {{{', '.join(f'{name!r}: {native}' for name, native in names.items())}}}"
         for module, names in exports.items()
@@ -328,6 +354,18 @@ def generate(package: Path, destination: Path) -> None:
         + kernels
         + "\n"
         + "\n\n".join(bodies)
-        + f"\nSOURCE_DIGEST = {digest.hexdigest()!r}\nEXPORTS = {{\n{mapping}\n}}\n",
+        + "\n"
+        + "\n".join(owners)
+        + f"\nSOURCE_DIGEST = {sources!r}\nBUILD_DIGEST = {build.hexdigest()!r}\n"
+        + f"EXPORTS = {{\n{mapping}\n}}\n",
+        encoding="utf-8",
+    )
+
+
+if __name__ == "__main__":
+    package = Path(__file__).resolve().parents[1]
+    (package / "codec/_digest.py").write_text(
+        '"""Sources a native codec must be generated from (python -m mqttium.codec._compile)."""\n\n'
+        f'SOURCE_DIGEST = "{source_digest(package)}"\n',
         encoding="utf-8",
     )

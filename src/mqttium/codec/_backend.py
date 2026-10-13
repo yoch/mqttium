@@ -18,6 +18,15 @@ if _choice != "python":
     except ModuleNotFoundError as exc:
         if exc.name != "mqttium.codec._native" or _choice == "native":
             raise
+    if _native is not None:
+        from mqttium.codec._digest import SOURCE_DIGEST
+
+        # A stale extension would silently run superseded codec code.
+        if _native.SOURCE_DIGEST != SOURCE_DIGEST:
+            raise ImportError(
+                "The native codec was generated from different MQTTium sources; "
+                "reinstall it or set MQTTIUM_CODEC_BACKEND=python"
+            )
 
 BACKEND = "native" if _native is not None else "python"
 

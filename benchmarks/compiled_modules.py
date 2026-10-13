@@ -213,6 +213,7 @@ def load_backend(args):
                 raise AssertionError(f"Incomplete native binding: {name}")
         loaded["native"] = str(native.__file__)
         loaded["source_digest"] = native.SOURCE_DIGEST
+        loaded["build_digest"] = native.BUILD_DIGEST
     return loaded
 
 

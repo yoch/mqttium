@@ -45,8 +45,9 @@ Set `MQTTIUM_CODEC_BACKEND` before importing MQTTium:
 | `native` | Require the extension; fail if it is missing. |
 | `python` | Use the Python reference even with a native wheel installed. |
 
-A broken extension or missing dependency always raises an import error in
-`auto` and `native` modes. Selection is process-wide and cannot be switched
+A broken extension, a missing dependency or an extension generated from other
+MQTTium sources always raises an import error in `auto` and `native` modes.
+Selection is process-wide and cannot be switched
 after import. Codec implementation types, globals and tracebacks are Internal
 and can differ between backends; client APIs and wire behaviour are unchanged.
 
@@ -62,8 +63,12 @@ sources. The GIL remains held; this accelerates individual operations rather
 than introducing client parallelism.
 
 The generator rejects global symbol collisions (including imports), changed
-decoder fields/copy blocks and unreviewed PUBLISH assembly changes. Its source
-fingerprint includes the generator as well as wire sources and kernels. When changing codec sources, validate both backends. Native CI
+decoder fields/copy blocks, and unreviewed PUBLISH assembly or kernel-backed
+reader changes. Native classes keep the module of their maintained source. The
+extension records the digest of the wire sources it was generated from, and the
+backend refuses it unless that digest matches `mqttium/codec/_digest.py`. When
+changing codec sources, regenerate that file with
+`python src/mqttium/codec/_compile.py` and validate both backends. Native CI
 builds from the sdist, exercises the installed wheel, compares deterministic
 wire/error corpora with Python, and runs unit, integration and fuzz tests.
 Source-tree tests alone do not exercise an installed extension: override the
