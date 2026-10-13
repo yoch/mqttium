@@ -1,0 +1,258 @@
+name: rpi5 native binary diagnostic
+run-name: "Native codec on the Pi 5: Hatch hook profile-guided build"
+
+# Diagnostic only, never merged to main. Builds the native codec wheel on the
+# quiet Raspberry Pi 5 runner, then compares the same wheel with
+# MQTTIUM_CODEC_BACKEND=python and =native, each with and without same-name
+# compiled protocol/ extensions. Mosquitto on core 0, orchestration on core 1,
+# the measured client on core 2, the bench's C peer on core 3.
+
+on:
+  push:
+    branches: [diag/native-binary-rpi5]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttium-arm64-runner
+  cancel-in-progress: false
+
+env:
+  BENCH_SHA: cd9f475eb27cacedff35a619fb70dd6cc0d3da2e
+  UV_VERSION: "0.11.2"
+  MICRO_CASES: encode_qos0,encode_qos1_v5,frame_64,frame_4096,properties_v5,ingress_engine_qos0,ingress_publish_qos1,qos1_cycle_memory,native_publish_nowait_qos0
+  NETWORK_CASES: network_311_qos0,network_311_qos1,network_5_qos0,network_5_qos1
+  O1_CFLAGS: -DNDEBUG -O3 -g0 -fomit-frame-pointer -fno-semantic-interposition -fno-plt
+
+jobs:
+  native:
+    runs-on: [self-hosted, linux, ARM64, rpi5]
+    timeout-minutes: 150
+    steps:
+      - name: Set run-specific workspace
+        run: |
+          root="$RUNNER_TEMP/native-bin-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          {
+            echo "JOB_ROOT=$root"
+            echo "UV_CACHE_DIR=$root/uv-cache"
+            echo "UV_PYTHON_INSTALL_DIR=$root/uv-python"
+            echo "UV_PROJECT_ENVIRONMENT=$root/venv"
+            echo "OUT=$root/out"
+          } >> "$GITHUB_ENV"
+
+      - name: Verify host prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          for tool in cc openssl mosquitto taskset python3; do command -v "$tool"; done
+          if pgrep -a mosquitto; then
+            echo "A pre-existing Mosquitto process makes the runner unsafe for this job." >&2
+            exit 1
+          fi
+          rm -rf "$JOB_ROOT"
+          mkdir -p "$JOB_ROOT" "$OUT"
+          {
+            echo "model: $(tr -d '\0' < /proc/device-tree/model)"
+            echo "kernel: $(uname -r)"
+            echo "cores: $(nproc)"
+            echo "governor: $(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort | uniq -c | xargs)"
+            echo "mosquitto: $(mosquitto -h 2>&1 | head -1)"
+            echo "cc: $(cc --version | head -1)"
+            echo "loadavg at start: $(cat /proc/loadavg)"
+          } | tee "$OUT/host.txt"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: mqttium
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: yoch/mqtt-python-client-bench
+          ref: ${{ env.BENCH_SHA }}
+          path: bench
+          persist-credentials: false
+
+      - name: Locked bench environment (uv, CPython 3.12) and build tools
+        working-directory: bench
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$JOB_ROOT/uv-boot"
+          "$JOB_ROOT/uv-boot/bin/pip" install -q "uv==$UV_VERSION"
+          "$JOB_ROOT/uv-boot/bin/uv" sync --frozen --python 3.12 --managed-python \
+            --extra dev --extra paho --extra gmqtt --extra aiomqtt --extra amqtt \
+            --extra awscrt --extra zmqtt --extra mqttium
+          PY="$UV_PROJECT_ENVIRONMENT/bin/python"
+          "$PY" -c "import sys; print(sys.version)" | tee -a "$OUT/host.txt"
+          # Same interpreter for the wheel, the protocol extensions and the harness.
+          "$JOB_ROOT/uv-boot/bin/uv" venv -q --python "$PY" "$JOB_ROOT/tools"
+          "$JOB_ROOT/uv-boot/bin/uv" pip install -q --python "$JOB_ROOT/tools/bin/python" \
+            "Cython>=3.2.4,<4" "setuptools>=80"
+          "$JOB_ROOT/tools/bin/python" -c "import Cython, sys; print('cython', Cython.__version__, sys.version)" \
+            | tee -a "$OUT/host.txt"
+
+      - name: Build the native wheels and the benchmark roots
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd mqttium
+          git rev-parse HEAD | tee -a "$OUT/host.txt"
+          MQTTIUM_BUILD_CODEC=1 "$JOB_ROOT/uv-boot/bin/uv" build -q --wheel \
+            --python "$JOB_ROOT/tools/bin/python" -o "$JOB_ROOT/dist" .
+          # The product path: the Hatch hook's own profile-guided build.
+          time MQTTIUM_BUILD_CODEC=1 MQTTIUM_CODEC_PGO=1 "$JOB_ROOT/uv-boot/bin/uv" build -q --wheel \
+            --python "$JOB_ROOT/tools/bin/python" -o "$JOB_ROOT/dist-pgo" .
+          ls -la "$JOB_ROOT/dist" "$JOB_ROOT/dist-pgo" | tee -a "$OUT/host.txt"
+          "$JOB_ROOT/tools/bin/python" benchmarks/compiled_modules.py prepare-wheel \
+            --root "$JOB_ROOT/roots" --wheel "$JOB_ROOT"/dist/*.whl
+          "$JOB_ROOT/tools/bin/python" -m zipfile -e "$JOB_ROOT"/dist-pgo/*.whl "$JOB_ROOT/roots/native_pgohook/src"
+          cp "$JOB_ROOT/roots/manifest.json" "$OUT/roots-manifest.json"
+
+      - name: Build the C peer and TLS certificates
+        working-directory: bench
+        run: |
+          PYTHONPATH=src "$UV_PROJECT_ENVIRONMENT/bin/python" -c "
+          from mqtt_client_bench import broker
+          from mqtt_client_bench.bench import peer
+          print(peer.ensure_built()); print(broker.ensure_certs())"
+
+      - name: Start Mosquitto on core 0
+        working-directory: bench
+        shell: bash
+        run: |
+          set -euo pipefail
+          certs="$PWD/build/certs"
+          cat > "$JOB_ROOT/mosquitto.conf" <<EOF
+          listener 11883 127.0.0.1
+          protocol mqtt
+          listener 11884 127.0.0.1
+          protocol mqtt
+          cafile $certs/ca.crt
+          certfile $certs/server.crt
+          keyfile $certs/server.key
+          set_tcp_nodelay true
+          allow_anonymous true
+          persistence false
+          connection_messages false
+          log_dest stdout
+          log_type error
+          sys_interval 1
+          max_inflight_messages 1000
+          max_queued_messages 10000
+          max_packet_size 16777216
+          packet_buffer_size 4096
+          max_keepalive 120
+          EOF
+          taskset -c 0 mosquitto -c "$JOB_ROOT/mosquitto.conf" > "$JOB_ROOT/mosquitto.log" 2>&1 &
+          echo "$!" > "$JOB_ROOT/mosquitto.pid"
+          "$UV_PROJECT_ENVIRONMENT/bin/python" - <<'PY'
+          import socket, time
+          for port in (11883, 11884):
+              deadline = time.monotonic() + 15
+              while True:
+                  try:
+                      socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                      break
+                  except OSError:
+                      if time.monotonic() > deadline:
+                          raise
+                      time.sleep(0.1)
+          PY
+
+      - name: Start a second Mosquitto without max_keepalive on core 0
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The closed-loop harness connects with keepalive=0, which Mosquitto
+          # rejects for MQTT 3.1.1 when max_keepalive is set.
+          printf 'listener 18885 127.0.0.1\nallow_anonymous true\npersistence false\nset_tcp_nodelay true\nmax_inflight_messages 1000\nmax_queued_messages 10000\n' \
+            > "$JOB_ROOT/mosquitto-loop.conf"
+          taskset -c 0 mosquitto -c "$JOB_ROOT/mosquitto-loop.conf" > "$JOB_ROOT/mosquitto-loop.log" 2>&1 &
+          echo "$!" > "$JOB_ROOT/mosquitto-loop.pid"
+          "$UV_PROJECT_ENVIRONMENT/bin/python" - <<'PY'
+          import socket, time
+          deadline = time.monotonic() + 15
+          while True:
+              try:
+                  socket.create_connection(("127.0.0.1", 18885), timeout=1).close()
+                  break
+              except OSError:
+                  if time.monotonic() > deadline:
+                      raise
+                  time.sleep(0.1)
+          PY
+
+      - name: Experimental PGO trained with Mosquitto loopback (reference)
+        working-directory: mqttium
+        shell: bash
+        run: |
+          set -euo pipefail
+          taskset -c 1-2 "$JOB_ROOT/tools/bin/python" benchmarks/pgo_native_experiment.py . "$JOB_ROOT/roots" native_pgo \
+            --port 18885 --cpu 2 2>&1 | grep -v Warning | tail -2 | tee -a "$OUT/host.txt"
+
+      - name: Paired micro and closed-loop, hook PGO
+        working-directory: mqttium/benchmarks
+        shell: bash
+        run: |
+          set -euo pipefail
+          for pair in native_pgo:native_pgohook python:native_pgohook; do
+            base="${pair%%:*}"; variant="${pair#*:}"
+            echo "=== micro $base -> $variant" | tee -a "$OUT/summary.txt"
+            taskset -c 1 "$JOB_ROOT/tools/bin/python" compiled_modules.py compare \
+              --root "$JOB_ROOT/roots" --base-variant "$base" --variant "$variant" --cpu 2 \
+              --cases "$MICRO_CASES" --repeat 6 --output "$OUT/micro-$base-$variant.json" 2>&1 | tee -a "$OUT/summary.txt"
+            echo "=== network $base -> $variant" | tee -a "$OUT/summary.txt"
+            taskset -c 1 "$JOB_ROOT/tools/bin/python" compiled_modules.py compare \
+              --root "$JOB_ROOT/roots" --base-variant "$base" --variant "$variant" --cpu 2 \
+              --cases "$NETWORK_CASES" --repeat 6 --count 24000 --port 18885 \
+              --output "$OUT/network-$base-$variant.json" 2>&1 | tee -a "$OUT/summary.txt"
+          done
+
+      - name: Fixed-rate QoS 1 receive and publish, hook PGO
+        working-directory: bench
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY="$UV_PROJECT_ENVIRONMENT/bin/python"
+          for round in 1 2; do
+            for arm in python native_pgo native_pgohook; do
+              backend=python
+              case "$arm" in native*) backend=native ;; esac
+              export MQTTIUM_CODEC_BACKEND="$backend"
+              export PYTHONPATH="src:$JOB_ROOT/roots/$arm/src"
+              echo "=== round $round arm $arm receive" | tee -a "$OUT/fixed.txt"
+              taskset -c 1 "$PY" microbench/mqttium/sub_fixed.py --repeat 3 \
+                --cases plain:2000:mqttium,plain:5000:mqttium,plain:10000:mqttium 2>&1 | tee -a "$OUT/fixed.txt"
+              echo "=== round $round arm $arm publish" | tee -a "$OUT/fixed.txt"
+              taskset -c 1 "$PY" microbench/mqttium/pub_fixed.py --repeat 3 --rates 2000,5000,10000 \
+                --cases mqttium 2>&1 | tee -a "$OUT/fixed.txt"
+            done
+          done
+
+      - name: Record host load at end
+        if: always()
+        run: |
+          echo "loadavg at end: $(cat /proc/loadavg)" | tee -a "$OUT/host.txt"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: native-binary-rpi5
+          path: ${{ env.OUT }}
+          if-no-files-found: warn
+
+      - name: Stop Mosquitto and clean the workspace
+        if: always()
+        shell: bash
+        run: |
+          for pidfile in "$JOB_ROOT/mosquitto.pid" "$JOB_ROOT/mosquitto-loop.pid"; do
+            if [ -f "$pidfile" ]; then
+              pid="$(cat "$pidfile")"
+              kill "$pid" 2>/dev/null || true
+              wait "$pid" 2>/dev/null || true
+            fi
+          done
+          rm -rf "$JOB_ROOT"
