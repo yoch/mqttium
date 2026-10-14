@@ -114,6 +114,7 @@ validity conditions pass on an eligible runner.
 
 | Report | Status | Decision recorded |
 | --- | --- | --- |
+| [NATIVE-BINARY-X86-CONFIRMATION-2026-10-14](NATIVE-BINARY-X86-CONFIRMATION-2026-10-14.md) | Current evidence | x86-64 (i7-3770) repeat of the Pi 5 qualification: hook PGO build saves 5.6–8.7 % closed-loop CPU and 5 % at 10,000/s publish, neutral at lower publish rates and at fixed-rate receive; confirms the build-from-source decision |
 | [NATIVE-BINARY-QUALIFICATION-2026-10-13](NATIVE-BINARY-QUALIFICATION-2026-10-13.md) | Current evidence | Raspberry Pi 5 end-to-end qualification: hook PGO build saves 7–13 % closed-loop and 6–10 % fixed-rate publish CPU, neutral fixed-rate receive; cache-miss cause of the default build's receive regression; generic and typed protocol compilation, C flags and micro-only training rejected with measurements |
 | [NATIVE-CODEC-AUDIT-2026-10-13](NATIVE-CODEC-AUDIT-2026-10-13.md) | Current evidence | PR #623 audit: packaging/generator fixes, sanitizer and cross-platform native validation, rejected VBI optimization with measured regressions |
 | [NATIVE-CODEC-2026-10-12](NATIVE-CODEC-2026-10-12.md) | Current evidence | Complete optional Cython backend, installed-wheel validation and paired local/network CPU measurements; shared-host network noise explicitly bounded |
