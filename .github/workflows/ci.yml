@@ -38,8 +38,8 @@ jobs:
           set -euo pipefail
           test -z "$(git ls-files | grep -E '(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache|dist|build|.*\.egg-info)(/|$)|(^|/)\.coverage($|\.)|\.py[co]$|\.(patch|diff)$' || true)"
           test -z "$(grep -RIl --exclude-dir=.git -E 'mqttnext|MQTTNext|MQTTNEXT' src tests examples benchmarks || true)"
-      - run: ruff format --check src tests benchmarks tools
-      - run: ruff check src tests benchmarks tools
+      - run: ruff format --check src tests benchmarks tools hatch_build.py
+      - run: ruff check src tests benchmarks tools hatch_build.py
       - run: mypy src/mqttium
       - run: bandit -q -ll -r src
       - name: Build documentation with strict links and navigation
@@ -149,7 +149,7 @@ jobs:
       - run: python -m pytest -q -W error --strict-config --strict-markers tests/resilience
 
   cross-platform:
-    name: Cross-platform (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    name: Cross-platform (${{ matrix.os }}, Python ${{ matrix.python-version }}, ${{ matrix.backend }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     strategy:
@@ -157,6 +157,7 @@ jobs:
       matrix:
         os: [macos-15, windows-2025]
         python-version: ["3.11", "3.15"]
+        backend: [python, native]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -168,10 +169,20 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
       - run: python -m pip install -e ".[dev]"
+      - name: Build and install native wheel
+        if: matrix.backend == 'native'
+        env:
+          MQTTIUM_BUILD_CODEC: "1"
+        run: |
+          python -m pip install build
+          python -m build --wheel
+          python -c "import glob, subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', '--no-deps', *glob.glob('dist/*.whl')])"
       - name: Require OpenSSL for TLS tests
         run: python -c "import shutil; assert shutil.which('openssl'), 'OpenSSL is required for TLS tests'"
       - name: Unit and socket-resilience tests
-        run: python -m pytest -q -W error --strict-config --strict-markers tests/unit tests/resilience
+        env:
+          MQTTIUM_CODEC_BACKEND: ${{ matrix.backend }}
+        run: python -m pytest -q -o pythonpath= -W error --strict-config --strict-markers tests/unit tests/resilience
 
   # Keep this job name until branch protection has migrated to "CI required".
   fuzz:
@@ -322,10 +333,60 @@ jobs:
           version="$(python -I -c 'import importlib.metadata; print(importlib.metadata.version("mqttium"))')"
           python -I tests/installed_distribution_smoke.py --expected-version "$version" --host 127.0.0.1 --port 11883
 
+  native-codec:
+    name: Native codec (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - run: python -m pip install ".[dev,fuzz,release]"
+      - name: Build native wheel from sdist through Hatch
+        env:
+          MQTTIUM_BUILD_CODEC: "1"
+        run: |
+          python -m build
+          twine check --strict dist/*
+          check-wheel-contents dist/*.whl
+          python tools/ci/validate_distribution.py
+          python -m pip install --force-reinstall --no-deps dist/*.whl
+          python -m pip check
+      - name: Installed native codec and Python differential oracle
+        env:
+          MQTTIUM_CODEC_BACKEND: native
+        run: |
+          python -m pytest -q -o pythonpath= tests/unit tests/project
+          python tests/fuzz/fuzz.py --seed 1 --iterations 20000
+          python -m pytest -q -o pythonpath= tests/fuzz/test_hypothesis_fuzz.py tests/fuzz/test_stateful_invariants.py
+      - name: Start Mosquitto
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mosquitto
+          printf 'listener 11883 127.0.0.1\nallow_anonymous true\npersistence false\n' > "$RUNNER_TEMP/native-mosquitto.conf"
+          mosquitto -c "$RUNNER_TEMP/native-mosquitto.conf" > "$RUNNER_TEMP/native-mosquitto.log" 2>&1 &
+          python tools/ci/wait_for_endpoints.py --tcp 127.0.0.1:11883
+      - name: Installed native codec integration
+        env:
+          MQTTIUM_CODEC_BACKEND: native
+          MQTTIUM_REQUIRE_BROKER: "1"
+        run: python -m pytest -q -o pythonpath= tests/integration
+
   required:
     name: CI required
     if: always()
-    needs: [quality, test, resilience, cross-platform, fuzz, package, package-python315]
+    needs: [quality, test, resilience, cross-platform, fuzz, package, package-python315, native-codec]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:

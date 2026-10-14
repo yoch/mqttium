@@ -6,6 +6,17 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Optional complete Cython codec, built with `MQTTIUM_BUILD_CODEC=1` through
+  the existing Hatch backend. Framing and all MQTT 3.1.1/5 packet codecs share
+  one extension with bounded native wire operations and no runtime dependency.
+  `MQTTIUM_CODEC_BACKEND=auto|python|native` selects the implementation before
+  import; the default build remains pure Python. With GCC,
+  `MQTTIUM_CODEC_PGO=1` trains the extension on a broker-free client workload
+  and rebuilds it with the profile. A native extension generated from other
+  sources is refused at import.
+
 ## [1.2.1] - 2026-10-11
 
 Python 3.15 support. The library code is unchanged from 1.2.0, apart from its

@@ -78,3 +78,9 @@ def encode_unsubscribe_v5(
     for topic in topics:
         body.extend(pack_utf8(topic))
     return encode_frame(PacketType.UNSUBSCRIBE, 0x02, body)
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

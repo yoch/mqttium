@@ -79,3 +79,9 @@ def decode_unsuback_v5(
     for reason in reason_codes:
         require_reason_code(reason, _UNSUBACK_REASONS, UNSUBACK)
     return mid, reason_codes, properties
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

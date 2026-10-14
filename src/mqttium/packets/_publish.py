@@ -222,3 +222,9 @@ def encode_publish_item_v5(
         return bytes(header), bytes(payload)
     header.extend(payload)
     return bytes(header)
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

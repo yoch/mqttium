@@ -76,3 +76,9 @@ def encode_disconnect(
     if protocol is MQTTProtocolVersion.MQTTv5:
         return encode_disconnect_v5(reason_code, properties)
     return encode_disconnect_v311(reason_code, properties)
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

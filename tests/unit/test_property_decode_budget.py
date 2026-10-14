@@ -1,11 +1,14 @@
 """Bound repeated-property amplification before CONNECT or packet delivery."""
 
 import asyncio
+import gc
+import weakref
 
 import pytest
 
 from mqttium.api import AsyncClient
 from mqttium.codec import properties as codec
+from mqttium.codec._backend import BACKEND, implementation
 from mqttium.codec.primitives import pack_utf8
 from mqttium.codec.vbi import encode_vbi
 from mqttium.enums import MQTTProtocolVersion, PacketType
@@ -14,6 +17,7 @@ from mqttium.packets import ConnAckPacket, PublishPacket, encode_frame
 from mqttium.types import Properties
 from tests.support import ScriptedBrokerTransport, transport_factory, wait_until
 
+codec = implementation(codec)
 LIMIT = 1024
 
 
@@ -93,11 +97,18 @@ def test_publish_packet_uses_combined_repeatable_budget():
 def test_over_budget_value_is_not_decoded_or_retained(monkeypatch):
     unpack = codec.unpack_utf8
     calls = 0
+    decoded = []
+
+    class TrackedString(str):
+        pass
 
     def counted_unpack(buf, offset):
         nonlocal calls
         calls += 1
-        return unpack(buf, offset)
+        value, end = unpack(buf, offset)
+        tracked = TrackedString(value)
+        decoded.append(weakref.ref(tracked))
+        return tracked, end
 
     monkeypatch.setattr(codec, "unpack_utf8", counted_unpack)
     # The first excess property has no value. The budget must reject it before
@@ -106,9 +117,16 @@ def test_over_budget_value_is_not_decoded_or_retained(monkeypatch):
     with pytest.raises(ProtocolError, match="decode budget") as caught:
         ConnAckPacket.decode(b"\x00\x00" + encode_vbi(len(body)) + body, MQTTProtocolVersion.MQTTv5)
     assert calls == 2 * LIMIT
+    # Retain the exception while checking the amplified values themselves. This
+    # works for both Python tracebacks and native frames without f_locals.
+    gc.collect()
+    assert sum(ref() is not None for ref in decoded) <= 2
     traceback = caught.value.__traceback__
     while traceback is not None and traceback.tb_frame.f_code.co_name != "decode_properties":
         traceback = traceback.tb_next
+    if BACKEND == "native":
+        return
+    # Python frames also expose the decoder's partial state for inspection.
     assert traceback is not None
     frame = traceback.tb_frame.f_locals
     assert frame["seen"] == {}

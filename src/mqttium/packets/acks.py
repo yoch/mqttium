@@ -127,3 +127,9 @@ class PubCompPacket:
         else:
             mid, reason, props = decode_pubcomp_v311(remaining)
         return cls(mid=mid, reason_code=reason, properties=props)
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

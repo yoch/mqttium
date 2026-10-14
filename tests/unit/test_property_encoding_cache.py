@@ -5,9 +5,12 @@ from __future__ import annotations
 import mqttium.codec.properties as properties_module
 
 from mqttium.api.async_client import AsyncClient
+from mqttium.codec._backend import implementation
 from mqttium.codec.properties import PUBLISH, decode_properties, encode_properties
 from mqttium.enums import MQTTProtocolVersion
 from mqttium.types import Message, Properties
+
+properties_module = implementation(properties_module)
 
 
 def test_delivery_logical_size_reuses_cached_mqtt5_property_body(monkeypatch) -> None:

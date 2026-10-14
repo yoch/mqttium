@@ -434,3 +434,9 @@ def decode_properties(  # noqa: C901 -- keep wire validation and its resource bo
     if pos != end:
         raise MalformedPacketError("Properties length does not match consumed bytes")
     return Properties(seen), end
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

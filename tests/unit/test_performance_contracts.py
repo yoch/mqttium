@@ -4,6 +4,7 @@ import pytest
 
 import mqttium.protocol.outbound as outbound_module
 from mqttium.api.async_client import AsyncClient
+from mqttium.codec._backend import implementation
 from mqttium.enums import MQTTProtocolVersion
 from mqttium.protocol.engine import EngineConfig, ProtocolEngine
 from mqttium.types import Properties
@@ -61,6 +62,7 @@ def test_connected_qos1_launch_reuses_cached_property_body(monkeypatch: pytest.M
     import mqttium.codec.properties as properties_module
     from mqttium.enums import ConnectionState
 
+    properties_module = implementation(properties_module)
     calls = 0
     # Count whole-table encodes rather than per-value ones: that is the contract
     # ("the cached body is reused"), and it does not move when the per-value

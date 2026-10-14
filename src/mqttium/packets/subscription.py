@@ -125,3 +125,9 @@ class UnsubAckPacket:
         else:
             mid, reason_codes, properties = decode_unsuback_v311(remaining)
         return cls(mid=mid, reason_codes=reason_codes, properties=properties)
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)

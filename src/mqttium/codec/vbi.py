@@ -94,3 +94,9 @@ def vbi_len(value: int) -> int:
     if value < 2_097_152:
         return 3
     return 4
+
+
+# Select the complete codec implementation.
+from mqttium.codec._backend import bind as _bind_backend
+
+_bind_backend(globals(), __name__)
