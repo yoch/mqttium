@@ -1,5 +1,7 @@
 site_name: MQTTium
-site_description: Dependency-free asyncio MQTT 3.1.1 and MQTT 5 client for Python
+site_description: >-
+  Dependency-free asyncio MQTT 3.1.1 and MQTT 5 client for Python, with explicit
+  backpressure and durable sessions.
 site_url: !ENV [READTHEDOCS_CANONICAL_URL, 'https://mqttium.readthedocs.io/en/latest/']
 repo_url: https://github.com/yoch/mqttium
 repo_name: yoch/mqttium
@@ -165,6 +167,18 @@ plugins:
           - roadmap.md
         Historical evidence:
           - reports/README.md: Curated archive index; report bodies are historical
+
+extra:
+  # Search-result and link-preview title; the header keeps site_name.
+  home_title: MQTTium – async MQTT 3.1.1 and MQTT 5 client for Python
+  title_suffix: MQTTium async MQTT client for Python
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/yoch/mqttium
+      name: MQTTium source on GitHub
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/mqttium/
+      name: MQTTium on PyPI
 
 markdown_extensions:
   - admonition

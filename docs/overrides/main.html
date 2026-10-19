@@ -1,12 +1,37 @@
 {% extends "base.html" %}
 
+{% if page.meta and page.meta.title %}
+  {% set seo_title = page.meta.title ~ " - " ~ config.extra.title_suffix %}
+{% elif page.title and not page.is_homepage %}
+  {% set seo_title = (page.title | striptags) ~ " - " ~ config.extra.title_suffix %}
+{% else %}
+  {% set seo_title = config.extra.home_title %}
+{% endif %}
+{% if page.meta and page.meta.description %}
+  {% set seo_description = page.meta.description %}
+{% else %}
+  {% set seo_description = config.site_description %}
+{% endif %}
+
+{% block htmltitle %}
+  <title>{{ seo_title }}</title>
+{% endblock %}
+
 {% block extrahead %}
   {{ super() }}
   <meta property="og:type" content="website">
+  <meta property="og:site_name" content="{{ config.site_name }}">
+  <meta property="og:title" content="{{ seo_title }}">
+  <meta property="og:description" content="{{ seo_description }}">
+  {% if page.canonical_url %}
+    <meta property="og:url" content="{{ page.canonical_url }}">
+  {% endif %}
   <meta property="og:image" content="https://raw.githubusercontent.com/yoch/mqttium/main/docs/assets/mqttium-social-preview.png">
   <meta property="og:image:width" content="1280">
   <meta property="og:image:height" content="640">
   <meta property="og:image:alt" content="MQTTium — dependable async-native MQTT for Python">
   <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{ seo_title }}">
+  <meta name="twitter:description" content="{{ seo_description }}">
   <meta name="twitter:image" content="https://raw.githubusercontent.com/yoch/mqttium/main/docs/assets/mqttium-social-preview.png">
 {% endblock %}
