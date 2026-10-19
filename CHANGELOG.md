@@ -6,6 +6,14 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Documentation
+
+- Describe the package as a dependency-free asyncio MQTT 3.1.1 and MQTT 5
+  client in the PyPI summary and site description. Give documentation pages
+  descriptive titles with Open Graph and Twitter title and description tags,
+  and link the PyPI package and GitHub source from the site footer, home page
+  and installation guide.
+
 ## [1.2.1] - 2026-10-11
 
 Python 3.15 support. The library code is unchanged from 1.2.0, apart from its

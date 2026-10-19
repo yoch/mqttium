@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mqttium"
 dynamic = ["version"]
-description = "Reliable async-native MQTT client for Python"
+description = "Dependency-free asyncio MQTT 3.1.1 and MQTT 5 client for Python, with explicit backpressure and durable sessions."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
