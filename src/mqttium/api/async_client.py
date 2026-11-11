@@ -2513,7 +2513,11 @@ class AsyncClient:
                 # Ping after k seconds without sending or without receiving:
                 # a steady publisher to a half-open connection otherwise never
                 # learns that nothing comes back.
-                due = min(self._write_pump.last_outbound, self._last_inbound) + k
+                # The PINGREQ leaves a margin before the interval ends: the
+                # interval between packets must not exceed Keep Alive
+                # [MQTT-3.1.2-23], and a timer never fires early.
+                idle_since = min(self._write_pump.last_outbound, self._last_inbound)
+                due = idle_since + k - min(1.0, k / 10)
                 if now >= due:
                     try:
                         async with self._engine_lock:

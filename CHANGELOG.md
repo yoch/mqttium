@@ -41,6 +41,12 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- PINGREQ leaves before the keep-alive interval ends (a margin of a tenth of
+  the interval, at most one second) instead of a few milliseconds after it,
+  as MQTT 3.1.1 requires of the interval between packets [MQTT-3.1.2-23].
+- The representation of the internal CONNECT packet and engine configuration
+  no longer shows the password or the CONNECT properties, which carry
+  Authentication Data.
 - The SQLite store's unsupported-schema error no longer calls itself an
   experiment.
 - `disconnect()` that lands while the reader is still releasing a lost

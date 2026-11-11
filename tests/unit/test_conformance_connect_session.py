@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import time
+
 import pytest
 
 from mqttium.api.async_client import AsyncClient
@@ -371,6 +373,33 @@ async def _idle_client_sends_pingreq(protocol: MQTTProtocolVersion) -> None:
         await wait_until(lambda: broker.pingreqs >= 1, timeout=1.5)
     finally:
         await client.disconnect()
+
+
+class _TimestampingBroker(ScriptedBrokerTransport):
+    """Records when each packet type was last written by the client."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.written_at: dict[PacketType, float] = {}
+
+    def handle_packet(self, raw: RawPacket) -> None:
+        self.written_at[raw.packet_type] = time.monotonic()
+        super().handle_packet(raw)
+
+
+async def _pingreq_leaves_within_the_keep_alive() -> None:
+    keepalive = 2
+    broker = _TimestampingBroker()
+    client = AsyncClient(client_id="idle", keepalive=keepalive, ping_timeout=2.0)
+    client._transport_factory = transport_factory(broker)
+    await client.connect("broker", 1883, timeout=2.0)
+    try:
+        await wait_until(lambda: PacketType.PINGREQ in broker.written_at, timeout=3.0)
+    finally:
+        await client.disconnect()
+    # CONNECT was the last packet sent: the next one leaves before Keep Alive.
+    interval = broker.written_at[PacketType.PINGREQ] - broker.written_at[PacketType.CONNECT]
+    assert interval < keepalive
 
 
 class _ServerKeepAliveBroker(ScriptedBrokerTransport):
@@ -900,6 +929,14 @@ def test_mqtt5_3_1_3_1_connect_payload_field_order() -> None:
     Header. These fields, if present, MUST appear in the order Client Identifier,
     Will Properties, Will Topic, Will Payload, User Name, Password"""
     _connect_payload_field_order()
+
+
+async def test_mqtt311_3_1_2_23_pingreq_leaves_within_the_keep_alive() -> None:
+    """[MQTT-3.1.2-23] It is the responsibility of the Client to ensure that the
+    interval between Control Packets being sent does not exceed the Keep Alive
+    value. In the absence of sending any other Control Packets, the Client MUST send
+    a PINGREQ Packet"""
+    await _pingreq_leaves_within_the_keep_alive()
 
 
 async def test_mqtt5_3_1_2_20_idle_client_sends_pingreq() -> None:

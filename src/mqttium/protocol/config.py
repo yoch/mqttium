@@ -31,7 +31,8 @@ class EngineConfig:
     # None disables the corresponding limit; zero rejects every new QoS>0 publish.
     max_unacknowledged_messages: int | None = 10_000
     max_unacknowledged_bytes: int | None = 64 * 1024 * 1024
-    connect_properties: Properties | None = None
+    # Out of the representation: Authentication Data travels here.
+    connect_properties: Properties | None = field(default=None, repr=False)
     will: Message | None = field(default=None, repr=False)
     will_properties: Properties | None = None
     # Local maximum packet size announced to broker (and enforced on ingress).

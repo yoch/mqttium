@@ -378,10 +378,12 @@
         "section": "3.1.2",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "cited",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_2_23_pingreq_leaves_within_the_keep_alive"
+        ],
         "cited_in": [
-          "tests/unit/test_conformance_connect_session.py"
+          "src/mqttium/api/async_client.py"
         ]
       },
       {
@@ -1791,7 +1793,9 @@
         "verified_by": [
           "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_2_23_session_state_is_stored_after_the_connection_closes"
         ],
-        "cited_in": []
+        "cited_in": [
+          "src/mqttium/api/async_client.py"
+        ]
       },
       {
         "label": "MQTT-3.1.2-24",

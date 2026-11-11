@@ -206,18 +206,20 @@ connection is retried; a refused `publish()` fails that call.
 
 ### T12 — Credentials appear in logs, errors or representations
 
-**Status:** Open.
+**Status:** Partial.
 
 The library writes no log and prints nothing. No exception message includes
 a username, a password or authentication data, and `stats()` carries no
-credential. The engine configuration keeps the password and the will out of
-its representation.
+credential. The engine configuration and the CONNECT packet keep the
+password, the will and the CONNECT properties, where Authentication Data
+travels, out of their representation.
 
-*Residual risk, untested:* two Internal objects still show secrets in their
-`repr()`, which a debugger or a traceback that prints local variables would
-expose: the transient `ConnectPacket` shows the password, and the engine
-configuration shows `connect_properties`, including `authentication_data`.
-A `Message` representation includes its payload by design.
+*Residual risk:* a `Properties` object shows its values, so authentication
+data is visible in the representation of the object the application built
+and of an AUTH packet. A `Message` representation includes its payload by
+design.
+
+- `tests/unit/test_secret_representation.py`
 
 ## Supply chain
 
