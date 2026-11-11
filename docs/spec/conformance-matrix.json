@@ -1375,8 +1375,10 @@
         "section": "6.0.0",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_websocket.py::test_mqtt311_6_0_0_1_packets_travel_in_binary_frames"
+        ],
         "cited_in": []
       },
       {
@@ -1384,24 +1386,28 @@
         "section": "6.0.0",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_websocket.py::test_mqtt311_6_0_0_2_packets_are_not_aligned_on_frames"
+        ],
         "cited_in": []
       },
       {
         "label": "MQTT-6.0.0-3",
         "section": "6.0.0",
-        "applicability": "both",
-        "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "applicability": "client",
+        "applicability_basis": "reviewed",
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_websocket.py::test_mqtt311_6_0_0_3_client_offers_the_mqtt_subprotocol"
+        ],
         "cited_in": []
       },
       {
         "label": "MQTT-6.0.0-4",
         "section": "6.0.0",
-        "applicability": "both",
-        "applicability_basis": "mention",
+        "applicability": "server",
+        "applicability_basis": "reviewed",
         "evidence": "none",
         "verified_by": [],
         "cited_in": []
@@ -3999,8 +4005,10 @@
         "section": "6.0.0",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_websocket.py::test_mqtt5_6_0_0_1_packets_travel_in_binary_frames"
+        ],
         "cited_in": []
       },
       {
@@ -4008,8 +4016,10 @@
         "section": "6.0.0",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_websocket.py::test_mqtt5_6_0_0_2_packets_are_not_aligned_on_frames"
+        ],
         "cited_in": []
       },
       {
@@ -4017,8 +4027,10 @@
         "section": "6.0.0",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_websocket.py::test_mqtt5_6_0_0_3_client_offers_the_mqtt_subprotocol"
+        ],
         "cited_in": []
       },
       {

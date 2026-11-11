@@ -108,6 +108,25 @@ async def test_tls_rejects_untrusted_server(tmp_path: Path) -> None:
         assert not client.is_connected
 
 
+async def test_ssl_true_verifies_the_server_certificate(tmp_path: Path) -> None:
+    """``ssl=True`` is the shorthand most callers use: it must verify, not just encrypt."""
+    key, cert = _make_certs(tmp_path)
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(cert, key)
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0, ssl=server_ctx)
+    port = server.sockets[0].getsockname()[1]
+    async with server:
+        client = AsyncClient(client_id="tls-true")
+        with pytest.raises(ConnectError) as failed:
+            await client.connect("localhost", port, ssl=True, timeout=5.0)
+        assert isinstance(failed.value.__cause__, ssl.SSLCertVerificationError)
+        assert not client.is_connected
+
+
 async def test_tls_rejects_hostname_mismatch(tmp_path: Path) -> None:
     if shutil.which("openssl") is None:
         pytest.skip("openssl not available")

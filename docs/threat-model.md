@@ -139,8 +139,7 @@ verification, TLS 1.2 or later. MQTTium builds no context of its own and does
 not weaken one.
 
 *Residual risk:* a caller-supplied `SSLContext` with verification disabled is
-used as given. The rejection tests pass an explicit default context; the
-`ssl=True` shorthand has no test of its own.
+used as given.
 
 - `tests/unit/test_tls.py`
 - `tests/unit/test_websocket_endpoint_validation.py`
@@ -158,7 +157,7 @@ seconds).
 
 ### T9 — A WebSocket endpoint that is not an MQTT broker
 
-**Status:** Partial.
+**Status:** Checked.
 
 The handshake response is bounded to 64 KiB under a timeout; the accept key
 and the upgrade headers are validated; a subprotocol other than MQTT is
@@ -168,9 +167,9 @@ extra headers are refused. A response that selects no subprotocol is
 accepted, as RFC 6455 allows, so the handshake alone does not tell a broker
 from another WebSocket endpoint: the MQTT exchange that follows does.
 
-*Residual risk:* an accept-key mismatch, missing upgrade headers and the
-handshake size limit are enforced in the code but have no test.
+A text frame ends the connection.
 
+- `tests/unit/test_conformance_websocket.py`
 - `tests/unit/test_websocket.py`
 - `tests/unit/test_websocket_lifecycle.py`
 - `tests/unit/test_websocket_client_receive_limit.py`
