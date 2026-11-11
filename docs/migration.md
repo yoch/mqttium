@@ -9,6 +9,29 @@ per-publication counterpart of Paho's `on_publish`.
 1.2.1 adds Python 3.15 support. Its library code is that of 1.2.0, so there is
 nothing to migrate.
 
+## Unreleased changes
+
+These follow the 2026-11-11 assurance review and make a timeout argument
+bound the call it is passed to.
+
+- `subscribe(timeout=)` and `unsubscribe(timeout=)` now also cover the
+  transfer of the request to the writer, not only the wait for
+  SUBACK/UNSUBACK. A call stuck behind a blocked writer now raises
+  `MQTTTimeoutError` at its deadline. Nothing to change unless code relied on
+  the request outliving its timeout while the writer was blocked.
+- `connect*(timeout=)` now bounds the whole call. With a `ReconnectPolicy`,
+  retries and backoff spend the same deadline, and its expiry raises
+  `MQTTTimeoutError` (with the last failure as `__cause__`) instead of
+  retrying for as long as the policy allows. To keep waiting for a broker
+  that starts late, omit `timeout`: `connect_timeout` then bounds each
+  attempt, as before.
+- `publish()`, `PublishReceipt.wait()` and `PublishBatchReceipt.wait()` accept
+  an optional `timeout`. Omitting it keeps the previous behaviour.
+- A task cancelled inside `disconnect()` or `connect*()` now ends cancelled.
+  Code that relied on continuing after such a cancellation must not.
+- TCP connections enable TCP keepalive. See
+  [Configuration and sizing](configuration-and-sizing.md).
+
 ## Changes in 1.1
 
 1.1.0 keeps the 1.0 API and SQLite schema 5, and corrects behaviour that

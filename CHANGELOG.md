@@ -6,6 +6,25 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `publish()`, `PublishReceipt.wait()` and `PublishBatchReceipt.wait()` accept
+  an optional `timeout`. A `publish()` that times out before admission admits
+  nothing; a receipt wait that times out leaves the publication active.
+- TCP connections enable TCP keepalive (60 s idle, 10 s interval, 3 probes),
+  a transport-level net under MQTT keepalive that also works with
+  `keepalive=0`.
+
+### Changed
+
+- `subscribe(timeout=)` and `unsubscribe(timeout=)` bound the whole call,
+  including the transfer of the request to the writer. They used to bound
+  only the wait for SUBACK/UNSUBACK.
+- `connect*(timeout=)` bounds the whole call, including the retries of a
+  reconnect policy, and raises `MQTTTimeoutError` at its deadline. Without
+  `timeout`, `connect_timeout` still bounds each attempt and the policy
+  decides how long to keep trying. See the migration notes.
+
 ### Fixed
 
 - `disconnect()` that lands while the reader is still releasing a lost

@@ -155,6 +155,19 @@ lot to the application -- a full iterator queue or a long callback batch -- it
 reads nothing, so the PINGRESP deadline restarts instead of blaming the
 connection for application backpressure.
 
+**Liveness bounds require `keepalive > 0`.** MQTT keepalive is the only
+mechanism that detects a peer whose host is still up while its application has
+stopped reading or answering. With `keepalive=0`, `publish()`, `subscribe()`,
+receipts and `messages()` have no library-provided bound against such a peer,
+and the state stays `CONNECTED`.
+
+TCP connections additionally enable TCP keepalive (60 s idle, 10 s interval,
+3 probes; plus the matching unacknowledged-data timeout where the platform has
+one). This ends a connection to a vanished host or across a cut path after
+about 90 seconds even with `keepalive=0`. It is a safety net below MQTT
+keepalive, not a substitute: a host that still answers TCP is never detected
+by it. It does not apply to Unix sockets.
+
 ## A sizing method
 
 1. Record the largest accepted topic, payload, and property set.

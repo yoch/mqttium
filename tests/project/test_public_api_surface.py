@@ -285,7 +285,7 @@ def test_async_client_stable_method_parameter_contract() -> None:
         "connect_unix": ("self", "path", "timeout"),
         "connect_ws": ("self", "url", "ssl", "extra_headers", "timeout"),
         "disconnect": ("self", "reason_code"),
-        "publish": ("self", "topic", "payload", "qos", "retain", "properties"),
+        "publish": ("self", "topic", "payload", "qos", "retain", "properties", "timeout"),
         "publish_nowait": ("self", "topic", "payload", "qos", "retain", "properties"),
         "publish_many": (
             "self",

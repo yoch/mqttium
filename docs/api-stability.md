@@ -139,8 +139,9 @@ can fall back to ordinary admission; an exception after handoff is never retried
 binary data. `ReconnectPolicy` is immutable retry-progression configuration;
 passing one enables reconnection, `None` disables it, and each client owns its
 retry state. Every default deadline (`connect_timeout`, `ping_timeout`,
-`subscribe_timeout`, `auth_timeout`) is a constructor argument; `connect*()`,
-`subscribe()` and `unsubscribe()` take a per-call override. CONNECT limits use
+`subscribe_timeout`, `auth_timeout`) is a constructor argument. A `timeout`
+passed to `connect*()`, `subscribe()`, `unsubscribe()`, `publish()` or a
+receipt's `wait()` bounds that whole call. CONNECT limits use
 dedicated constructor arguments, never precedence between duplicate property
 keys and arguments.
 

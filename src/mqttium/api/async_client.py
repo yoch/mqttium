@@ -755,8 +755,10 @@ class AsyncClient:
             port: Broker TCP port.
             ssl: TLS context, ``True`` for a default context, or ``None`` for
                 clear-text TCP.
-            timeout: Transport and CONNACK deadline; ``connect_timeout`` is
-                used when omitted.
+            timeout: Deadline for the whole call, reconnect-policy retries
+                included. When omitted, ``connect_timeout`` bounds each
+                attempt and the reconnect policy alone decides how long the
+                call keeps trying.
 
         Returns:
             The successful CONNACK packet and its negotiated properties.
@@ -786,7 +788,7 @@ class AsyncClient:
 
         Args:
             path: Filesystem path of the broker's AF_UNIX socket.
-            timeout: Transport and CONNACK deadline.
+            timeout: Deadline for the whole call; see :meth:`connect`.
 
         Returns:
             The successful CONNACK packet.
@@ -828,7 +830,7 @@ class AsyncClient:
             url: ``ws://`` or ``wss://`` broker endpoint, including its path.
             ssl: TLS context or default-context selector for ``wss://``.
             extra_headers: Additional HTTP headers for the upgrade request.
-            timeout: Transport and CONNACK deadline.
+            timeout: Deadline for the whole call; see :meth:`connect`.
 
         Returns:
             The successful CONNACK packet.
@@ -933,9 +935,17 @@ class AsyncClient:
                     # plain TCP connect (custom transports rely on this seam).
                     self._transport_factory = TcpTransport.connect
                 self._intentional_disconnect = False
+                # An explicit ``timeout`` bounds the whole call, retries
+                # included. The constructor default bounds each attempt, so a
+                # reconnect policy can still wait for a broker that starts late.
+                call_deadline = (
+                    None if timeout is None else asyncio.get_running_loop().time() + timeout
+                )
                 timeout = timeout if timeout is not None else self._connect_timeout
                 self._reconnect.reset()
-                connack = await self._connect_with_policy(host, port, ssl=ssl, timeout=timeout)
+                connack = await self._connect_with_policy(
+                    host, port, ssl=ssl, timeout=timeout, call_deadline=call_deadline
+                )
             if self.is_connected:
                 self._lifecycle_hooks.connected(connack, lifecycle_token)
             return connack
@@ -950,6 +960,7 @@ class AsyncClient:
         *,
         ssl: ssl.SSLContext | bool | None,
         timeout: float,
+        call_deadline: float | None = None,
     ) -> ConnAckPacket:
         """Connect, retrying setup failures according to the reconnect policy.
 
@@ -958,12 +969,19 @@ class AsyncClient:
         and try again, until a terminal cause or exhaustion. A failed attempt
         never ends the application message stream -- no connection was made,
         so nothing it delivered is complete.
+
+        ``call_deadline`` is the loop time at which the caller's own
+        ``timeout`` expires. Attempts and backoff only spend what remains of
+        it, and its expiry ends the call with :class:`MQTTTimeoutError`.
         """
         loop = asyncio.get_running_loop()
         while True:
+            attempt_timeout = timeout
+            if call_deadline is not None:
+                attempt_timeout = min(timeout, max(call_deadline - loop.time(), 0.001))
             try:
                 return await self._connect_once_locked(
-                    host, port, ssl=ssl, timeout=timeout, reconnect_attempt=True
+                    host, port, ssl=ssl, timeout=attempt_timeout, reconnect_attempt=True
                 )
             except asyncio.CancelledError:
                 # The caller abandoned connect(); nothing will retry for it.
@@ -984,14 +1002,24 @@ class AsyncClient:
                     self._abandon_connect(exc)
                     raise
                 self._reconnect_pending = True
+                delay = self._reconnect.next_delay()
+                if call_deadline is not None:
+                    delay = min(delay, max(call_deadline - loop.time(), 0.0))
                 wake = self._connect_backoff_wake = loop.create_future()
                 try:
-                    await asyncio.wait({wake}, timeout=self._reconnect.next_delay())
+                    await asyncio.wait({wake}, timeout=delay)
                 finally:
                     self._connect_backoff_wake = None
                 if self._intentional_disconnect:
                     self._abandon_connect(exc)
                     raise MQTTError("Connection cancelled by disconnect()") from exc
+                if call_deadline is not None and loop.time() >= call_deadline:
+                    self._abandon_connect(exc)
+                    if isinstance(exc, MQTTTimeoutError):
+                        raise
+                    raise MQTTTimeoutError(
+                        "connect() timed out before the broker accepted a connection"
+                    ) from exc
 
     def _abandon_connect(self, cause: BaseException) -> None:
         """Settle an explicit connect that gave up, keeping the message stream."""
@@ -1347,6 +1375,7 @@ class AsyncClient:
         qos: int | QoS = 0,
         retain: bool = False,
         properties: Properties | None = None,
+        timeout: float | None = None,
     ) -> PublishReceipt:
         """Wait for admission and bounded effect transfer, returning a receipt.
 
@@ -1354,12 +1383,52 @@ class AsyncClient:
         leave an active publication: cancelling this call is not an MQTT undo.
         QoS 0 completes on writer handoff; QoS 1/2 complete on protocol ACK.
         Cancelling receipt.wait() never cancels the exchange or other waiters.
+
+        ``timeout`` bounds this call. If it expires before the publication is
+        admitted, nothing is admitted and :class:`MQTTTimeoutError` is raised.
+        A publication admitted before the deadline is never undone: its
+        receipt is returned at the deadline even if the transfer to the
+        writer is still pending. Without ``timeout`` the call waits as long as
+        the connection, or its reconnect policy, lasts.
+
+        Raises:
+            MQTTTimeoutError: If ``timeout`` expires before admission.
+            ValueError: If ``timeout`` is not a finite positive number.
         """
+        deadline = None
+        if timeout is not None:
+            _positive("timeout", timeout)
+            deadline = asyncio.get_running_loop().time() + timeout
         receipt = await self._publish_one(
-            topic, payload, qos=qos, retain=retain, properties=properties
+            topic, payload, qos=qos, retain=retain, properties=properties, deadline=deadline
         )
         assert receipt is not None
         return receipt
+
+    @staticmethod
+    async def _before_deadline(waiting: Awaitable[Any], deadline: float | None) -> bool:
+        """Await ``waiting``; return ``False`` if ``deadline`` expired first.
+
+        ``deadline`` is a loop time, so one call-level timeout bounds every
+        wait of that call. The interrupted wait sees an ordinary cancellation
+        and unwinds through its own cancellation path.
+        """
+        if deadline is None:
+            await waiting
+            return True
+        scope = asyncio.timeout_at(deadline)
+        try:
+            async with scope:
+                await waiting
+        except TimeoutError:
+            if not scope.expired():
+                raise
+            return False
+        return True
+
+    async def _settle_before_publish(self, deadline: float | None) -> None:
+        if not await self._before_deadline(self._effect_pump.drain(), deadline):
+            raise MQTTTimeoutError("publish() timed out before admission")
 
     async def _publish_one(
         self,
@@ -1370,6 +1439,7 @@ class AsyncClient:
         retain: bool,
         properties: Properties | None,
         batch: PublishBatchReceipt | None = None,
+        deadline: float | None = None,
     ) -> PublishReceipt | None:
         data = _owned_payload(payload)
         while True:
@@ -1377,7 +1447,7 @@ class AsyncClient:
             # still waits behind delivery. Settle that old receipt before the
             # identifier can be registered again, including within one batch.
             if not self._effect_pump.settled():
-                await self._effect_pump.drain()
+                await self._settle_before_publish(deadline)
             if qos == QoS.AT_MOST_ONCE:
                 direct = self._try_direct_qos0_publish(
                     topic, data, retain=retain, properties=properties, batch=batch
@@ -1412,11 +1482,13 @@ class AsyncClient:
                 # Deferred SEND payloads are outside the writer's budget until
                 # transfer. Await it before admitting another batch element.
                 if self._effect_pump.pending:
-                    await self._effect_pump.drain()
+                    # Admitted: a deadline ends the wait, never the publication.
+                    await self._before_deadline(self._effect_pump.drain(), deadline)
                 if qos != QoS.AT_MOST_ONCE:
                     self._write_pump._try_flush_latency_batch()
                 return receipt
-            await self._wait_publish_space(waiter)
+            if not await self._before_deadline(self._wait_publish_space(waiter), deadline):
+                raise MQTTTimeoutError("publish() timed out waiting for admission")
             terminal = self._publish_wait_failure()
             if terminal is not None:
                 # Parked through a final teardown, which failed every pending
@@ -1627,7 +1699,8 @@ class AsyncClient:
             topics: One filter, an iterable of filters, or filter/options pairs.
             qos: Default maximum QoS for plain string filters.
             properties: MQTT 5 SUBSCRIBE properties.
-            timeout: SUBACK deadline; ``subscribe_timeout`` is used when omitted.
+            timeout: Deadline for the whole call, from submission to SUBACK;
+                ``subscribe_timeout`` is used when omitted.
 
         Returns:
             Packet identifier, broker reason codes in request order, granted
@@ -1637,7 +1710,8 @@ class AsyncClient:
             SubscribeError: If the broker refused at least one filter; its
                 ``result`` holds the full SUBACK, and accepted filters stay
                 subscribed.
-            MQTTTimeoutError: If SUBACK does not arrive before the deadline.
+            MQTTTimeoutError: If the request cannot be sent, or SUBACK does not
+                arrive, before the deadline.
             ValueError: If ``timeout`` is not a finite positive number.
             ProtocolError: If a filter, option, property, or negotiated limit is
                 invalid.
@@ -1649,6 +1723,7 @@ class AsyncClient:
         if not isinstance(topics, str):
             topics = tuple(topics)
         loop = asyncio.get_running_loop()
+        deadline = loop.time() + (timeout if timeout is not None else self._subscribe_timeout)
         while True:
             async with self._engine_lock:
                 # Reject a terminal or invalid request before waiting on effects.
@@ -1661,8 +1736,9 @@ class AsyncClient:
                     break
                 self._effect_pump.collect_from_engine()
             # Settle earlier results before a released identifier can be reused.
-            await self._effect_pump.drain()
-        result = await self._await_request_ack(fut, self._sub_futs, mid, timeout, "SUBACK")
+            if not await self._before_deadline(self._effect_pump.drain(), deadline):
+                raise MQTTTimeoutError("SUBSCRIBE timed out before it could be sent")
+        result = await self._await_request_ack(fut, self._sub_futs, mid, deadline, "SUBACK")
         if any(code >= 0x80 for code in result.reason_codes):
             raise SubscribeError(result)
         return result
@@ -1677,14 +1753,16 @@ class AsyncClient:
 
         Args:
             topics: One topic filter or an iterable of filters.
-            timeout: UNSUBACK deadline; ``subscribe_timeout`` is used when omitted.
+            timeout: Deadline for the whole call, from submission to
+                UNSUBACK; ``subscribe_timeout`` is used when omitted.
 
         Returns:
             Packet identifier and MQTT 5 reason codes. MQTT 3.1.1 returns an
             empty reason-code tuple.
 
         Raises:
-            MQTTTimeoutError: If UNSUBACK does not arrive before the deadline.
+            MQTTTimeoutError: If the request cannot be sent, or UNSUBACK does
+                not arrive, before the deadline.
             ValueError: If ``timeout`` is not a finite positive number.
             ProtocolError: If a filter is invalid.
             NotConnectedError: If the client cannot submit the request.
@@ -1695,6 +1773,7 @@ class AsyncClient:
         if not isinstance(topics, str):
             topics = tuple(topics)
         loop = asyncio.get_running_loop()
+        deadline = loop.time() + (timeout if timeout is not None else self._subscribe_timeout)
         while True:
             async with self._engine_lock:
                 # Reject a terminal or invalid request before waiting on effects.
@@ -1707,26 +1786,31 @@ class AsyncClient:
                     break
                 self._effect_pump.collect_from_engine()
             # Settle earlier results before a released identifier can be reused.
-            await self._effect_pump.drain()
-        return await self._await_request_ack(fut, self._unsub_futs, mid, timeout, "UNSUBACK")
+            if not await self._before_deadline(self._effect_pump.drain(), deadline):
+                raise MQTTTimeoutError("UNSUBSCRIBE timed out before it could be sent")
+        return await self._await_request_ack(fut, self._unsub_futs, mid, deadline, "UNSUBACK")
 
     async def _await_request_ack(
         self,
         fut: asyncio.Future[_AckResultT],
         futs: dict[int, asyncio.Future[_AckResultT]],
         mid: int,
-        timeout: float | None,
+        deadline: float,
         ack_name: str,
     ) -> _AckResultT:
-        """Flush effects and await one registered SUBACK/UNSUBACK future."""
+        """Flush effects and await one registered SUBACK/UNSUBACK future.
+
+        One deadline covers the transfer to the writer and the wait for the
+        acknowledgement.
+        """
         try:
-            await self._effect_pump.drain()
-            try:
-                return await asyncio.wait_for(
-                    fut, timeout=timeout if timeout is not None else self._subscribe_timeout
+            if not await self._before_deadline(self._effect_pump.drain(), deadline):
+                raise MQTTTimeoutError(
+                    f"{ack_name} timed out for mid={mid} before the request left"
                 )
-            except TimeoutError as exc:
-                raise MQTTTimeoutError(f"{ack_name} timed out for mid={mid}") from exc
+            if not await self._before_deadline(fut, deadline):
+                raise MQTTTimeoutError(f"{ack_name} timed out for mid={mid}")
+            return fut.result()
         finally:
             # Caller ownership spans transfer as well as ACK waiting. Protocol
             # identifiers remain owned by the engine until ACK or teardown.
