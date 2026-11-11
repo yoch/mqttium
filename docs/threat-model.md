@@ -208,18 +208,24 @@ connection is retried; a refused `publish()` fails that call.
 
 ### T12 — Credentials appear in logs, errors or representations
 
-**Status:** Open.
+**Status:** Partial.
 
-The library writes no log and prints nothing. No exception message includes
-a username, a password or authentication data, and `stats()` carries no
-credential. The engine configuration keeps the password and the will out of
-its representation.
+The library writes no log and prints nothing. The engine configuration and
+the CONNECT packet keep the password, the will payload, the will properties
+and the CONNECT properties, where Authentication Data travels, out of their
+representation. A binary property of the wrong type, such as authentication
+data passed as text, is refused by naming its type, not its value.
 
-*Residual risk, untested:* two Internal objects still show secrets in their
-`repr()`, which a debugger or a traceback that prints local variables would
-expose: the transient `ConnectPacket` shows the password, and the engine
-configuration shows `connect_properties`, including `authentication_data`.
-A `Message` representation includes its payload by design.
+*Residual risk:* the user name and the will topic stay visible in those
+representations. A `Properties` object shows its values, so authentication
+data is visible in the representation of the object the application built
+and of an AUTH packet. A `Message` representation includes its payload by
+design. Errors about other mistyped properties quote the value they refuse.
+`stats()` reports the last disconnect cause as text, which for a failed
+WebSocket handshake includes the server's status line. No test searches
+every exception message for a credential.
+
+- `tests/unit/test_secret_representation.py`
 
 ## Supply chain
 

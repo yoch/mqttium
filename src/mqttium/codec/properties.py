@@ -249,7 +249,8 @@ def _encode_string_pair(value: Any) -> bytes:
 
 def _encode_binary(value: Any) -> bytes:
     if not isinstance(value, (bytes, bytearray)):
-        raise ProtocolError(f"Invalid binary property value: {value!r}")
+        # Binary properties carry authentication data: name the type only.
+        raise ProtocolError(f"Invalid binary property value of type {type(value).__name__}")
     try:
         return pack_binary(bytes(value))
     except ValueError as exc:

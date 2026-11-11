@@ -14,6 +14,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import asyncio
+import time
+
 import pytest
 
 from mqttium.api.async_client import AsyncClient
@@ -380,6 +383,49 @@ async def _idle_client_sends_pingreq(protocol: MQTTProtocolVersion) -> None:
         await wait_until(lambda: broker.pingreqs >= 1, timeout=1.5)
     finally:
         await client.disconnect()
+
+
+class _SlowBroker(ScriptedBrokerTransport):
+    """Answers CONNECT and PINGREQ late, and records when each packet arrives."""
+
+    def __init__(self, delay: float) -> None:
+        super().__init__(auto_pingresp=False)
+        self.delay = delay
+        self.arrivals: list[tuple[PacketType, float]] = []
+
+    def handle_packet(self, raw: RawPacket) -> None:
+        self.arrivals.append((raw.packet_type, time.monotonic()))
+        loop = asyncio.get_running_loop()
+        if raw.packet_type is PacketType.CONNECT:
+            loop.call_later(self.delay, self.push_rx, _connack(V311))
+        elif raw.packet_type is PacketType.PINGREQ:
+            loop.call_later(self.delay, self.push_rx, bytes((0xD0, 0x00)))
+        else:
+            super().handle_packet(raw)
+
+
+async def _pingreq_leaves_within_the_keep_alive() -> None:
+    keepalive = 2
+    # A broker slower than the client's margin, on CONNACK and on PINGRESP:
+    # neither answer may postpone the next packet the client owes.
+    broker = _SlowBroker(delay=0.5)
+    client = AsyncClient(client_id="idle", keepalive=keepalive, ping_timeout=2.0)
+    client._transport_factory = transport_factory(broker)
+    await client.connect("broker", 1883, timeout=2.0)
+
+    def pings() -> int:
+        return sum(kind is PacketType.PINGREQ for kind, _at in broker.arrivals)
+
+    try:
+        await wait_until(lambda: pings() >= 2, timeout=6.0)
+    finally:
+        await client.disconnect()
+    sent = [at for kind, at in broker.arrivals if kind is not PacketType.DISCONNECT]
+    intervals = [later - earlier for earlier, later in zip(sent, sent[1:], strict=False)]
+    # CONNECT, PINGREQ, PINGREQ: nothing else was sent, and no interval
+    # between two packets reaches the Keep Alive.
+    assert len(intervals) >= 2
+    assert all(interval < keepalive for interval in intervals), intervals
 
 
 class _ServerKeepAliveBroker(ScriptedBrokerTransport):
@@ -909,6 +955,14 @@ def test_mqtt5_3_1_3_1_connect_payload_field_order() -> None:
     Header. These fields, if present, MUST appear in the order Client Identifier,
     Will Properties, Will Topic, Will Payload, User Name, Password"""
     _connect_payload_field_order()
+
+
+async def test_mqtt311_3_1_2_23_pingreq_leaves_within_the_keep_alive() -> None:
+    """[MQTT-3.1.2-23] It is the responsibility of the Client to ensure that the
+    interval between Control Packets being sent does not exceed the Keep Alive
+    value. In the absence of sending any other Control Packets, the Client MUST send
+    a PINGREQ Packet"""
+    await _pingreq_leaves_within_the_keep_alive()
 
 
 async def test_mqtt5_3_1_2_20_idle_client_sends_pingreq() -> None:

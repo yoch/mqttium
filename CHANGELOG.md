@@ -45,6 +45,15 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- PINGREQ leaves before the keep-alive interval ends (a margin of a tenth of
+  the interval, at most one second) instead of a few milliseconds after it,
+  as MQTT 3.1.1 requires of the interval between packets [MQTT-3.1.2-23].
+  The interval counts from the last packet sent, CONNECT included, and a
+  late PINGRESP no longer delays the next PINGREQ.
+- A binary property of the wrong type is refused without quoting its value.
+- The representation of the internal CONNECT packet and engine configuration
+  no longer shows the password, the will payload and properties, or the
+  CONNECT properties, which carry Authentication Data.
 - A keepalive ping falling due while `disconnect()` drained its DISCONNECT
   no longer aborts the graceful shutdown.
 - `disconnect()` and `connect()` called from the cleanup of an already

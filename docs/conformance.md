@@ -50,7 +50,7 @@ Conformance is asserted three ways, in decreasing order of strength:
 
 ### Gaps found and fixed
 
-Five of the six are in what MQTTium **sends**, and that asymmetry is
+Six of the seven are in what MQTTium **sends**, and that asymmetry is
 structural rather than accidental: inbound frames pass through one validating
 decoder — which refused every one of the nine malformed shapes probed — whereas
 outbound rules live at the call sites that build packets, where a rule specific
@@ -146,6 +146,17 @@ too. MQTT 5 section 4.1 lists only inbound QoS 2, but a stored QoS 1 row
 only when the broker resends its PUBLISH on a resumed session. Rejecting
 Session Present for it would reject every reconnect and strand the row.
 
+**`[MQTT-3.1.2-23]` (MQTT 3.1.1)** — *"It is the responsibility of the Client
+to ensure that the interval between Control Packets being sent does not exceed
+the Keep Alive value."*
+
+The keep-alive loop sent PINGREQ once the Keep Alive had elapsed since the
+last packet, so the PINGREQ left a few milliseconds (2 to 7, measured) after
+the interval. No Server disconnects for that, since its own limit is one and a
+half times the Keep Alive, but the interval was exceeded. The PINGREQ now
+leaves a margin before the interval ends: a tenth of the Keep Alive, at most
+one second.
+
 **`[MQTT-3.1.2-22]` (MQTT 3.1.1)** — *"If the User Name Flag is set to 0, the
 Password Flag MUST be set to 0."*
 
@@ -218,21 +229,6 @@ Recorded as observations, not as evidence. All were probed and held:
   reconnect with a present session, which is the behaviour MQTT 5 expects of a
   client that is not using a retransmit timer.
 
-### Open observation: keep-alive margin (MQTT 3.1.1)
-
-**`[MQTT-3.1.2-23]` (MQTT 3.1.1)** — *"It is the responsibility of the Client
-to ensure that the interval between Control Packets being sent does not exceed
-the Keep Alive value."*
-
-The keep-alive loop sends PINGREQ once the Keep Alive has elapsed since the
-last packet, not before: measured against the scripted broker, the PINGREQ
-leaves a few milliseconds (2 to 7) after the interval. The interval is therefore
-exceeded by the timer's latency. A Server closes the connection only after one
-and a half times the Keep Alive ([MQTT-3.1.2-24]), so no disconnection results,
-and the MQTT 5 wording ([MQTT-3.1.2-20], verified) sets no such bound. The
-statement is left without evidence in the matrix rather than tested against a
-looser bound than it states.
-
 ## Coverage
 
 The two documents contain **390 numbered conformance statements** (139 in 3.1.1,
@@ -256,7 +252,7 @@ suites and by live interoperability against Mosquitto, and no counter-example is
 known — but "no known counter-example" is not the same as conformance, and this
 document does not present it as such.
 
-The honest summary: six violations were found and fixed, five of them in what
+The honest summary: seven violations were found and fixed, six of them in what
 the client sends; the receiver-side validation that was probed held up without
 exception; and the remaining statements are covered by behaviour rather than by
 citation. The discovery rate is not yet zero, so no claim of full conformance is

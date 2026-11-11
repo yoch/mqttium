@@ -23,7 +23,7 @@ holds in every case, and an unverified one is not a known violation. See
 
 | Version | Statements | Bind a client | Verified | Cited only | No evidence |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| MQTT 3.1.1 | 139 | 73 | 35 | 12 | 26 |
+| MQTT 3.1.1 | 139 | 73 | 36 | 11 | 26 |
 | MQTT 5.0 | 251 | 134 | 75 | 10 | 49 |
 
 The last three columns count only the statements that bind a client.
@@ -35,7 +35,7 @@ The last three columns count only the statements that bind a client.
 | 1.5 | 3 | 0 | 2 | 1 |
 | 2.2 | 2 | 0 | 0 | 2 |
 | 2.3 | 5 | 5 | 0 | 0 |
-| 3.1 | 20 | 17 | 2 | 1 |
+| 3.1 | 20 | 18 | 1 | 1 |
 | 3.3 | 6 | 3 | 3 | 0 |
 | 3.6 | 1 | 0 | 0 | 1 |
 | 3.8 | 4 | 1 | 1 | 2 |
@@ -70,6 +70,7 @@ The last three columns count only the statements that bind a client.
 - `MQTT-3.1.2-20` — `test_mqtt311_3_1_2_20_no_password_without_its_flag`
 - `MQTT-3.1.2-21` — `test_mqtt311_3_1_2_21_password_present_with_its_flag`
 - `MQTT-3.1.2-22` — `test_mqtt_3_1_2_22_mqtt311_rejects_a_password_without_a_username`
+- `MQTT-3.1.2-23` — `test_mqtt311_3_1_2_23_pingreq_leaves_within_the_keep_alive`
 - `MQTT-3.1.3-1` — `test_mqtt_3_1_3_1_connect_payload_field_order`
 - `MQTT-3.1.3-3` — `test_mqtt311_3_1_3_3_client_id_is_the_first_payload_field`
 - `MQTT-3.1.3-4` — `test_mqtt311_3_1_3_4_client_id_is_utf8`
@@ -92,7 +93,7 @@ The last three columns count only the statements that bind a client.
 
 ### Cited only
 
-`MQTT-1.5.3-1`, `MQTT-1.5.3-2`, `MQTT-3.1.2-9`, `MQTT-3.1.2-23`, `MQTT-3.3.1-2`, `MQTT-3.3.1-4`, `MQTT-3.3.2-2`, `MQTT-3.8.3-2`, `MQTT-3.14.4-1`, `MQTT-4.6.0-2`, `MQTT-4.7.3-2`, `MQTT-4.7.3-3`
+`MQTT-1.5.3-1`, `MQTT-1.5.3-2`, `MQTT-3.1.2-9`, `MQTT-3.3.1-2`, `MQTT-3.3.1-4`, `MQTT-3.3.2-2`, `MQTT-3.8.3-2`, `MQTT-3.14.4-1`, `MQTT-4.6.0-2`, `MQTT-4.7.3-2`, `MQTT-4.7.3-3`
 
 ### No evidence
 

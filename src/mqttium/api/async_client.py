@@ -1164,9 +1164,10 @@ class AsyncClient:
                     self._propose_disconnect_cause(refusal, _CAUSE_BROKER)
                 raise refusal
             self._reconnect_pending = False
-            self._write_pump.last_outbound = self._last_inbound = self._connected_since = (
-                time.monotonic()
-            )
+            # The writer stamped the CONNECT (and any AUTH) when it left:
+            # that stamp stays, so the first keep-alive interval counts from
+            # the last packet sent, not from the CONNACK that answered it.
+            self._last_inbound = self._connected_since = time.monotonic()
             self._keepalive_task = asyncio.create_task(
                 self._keepalive_loop(), name="mqttium-keepalive"
             )
@@ -2557,12 +2558,21 @@ class AsyncClient:
                         # terminal delivery shutdown after the transport breaks.
                         await self._close_transport_after_connection_failure()
                         return
-                    await asyncio.sleep(min(0.5, self._ping_deadline - now))
+                    # Wake no later than the next ping would be due, so a
+                    # PINGRESP arriving just before it does not make that
+                    # ping late by this loop's own polling period.
+                    next_due = self._keepalive_due(k)
+                    await asyncio.sleep(
+                        min(0.5, self._ping_deadline - now, max(next_due - now, 0.01))
+                    )
                     continue
                 # Ping after k seconds without sending or without receiving:
                 # a steady publisher to a half-open connection otherwise never
                 # learns that nothing comes back.
-                due = min(self._write_pump.last_outbound, self._last_inbound) + k
+                # The PINGREQ leaves a margin before the interval ends: the
+                # interval between packets must not exceed Keep Alive
+                # [MQTT-3.1.2-23], and a timer never fires early.
+                due = self._keepalive_due(k)
                 if now >= due:
                     try:
                         async with self._engine_lock:
@@ -2602,6 +2612,11 @@ class AsyncClient:
             # detection while the connection still looks alive: retire it.
             self._propose_disconnect_cause(exc, _CAUSE_TRANSPORT)
             await self._close_transport_after_connection_failure()
+
+    def _keepalive_due(self, keepalive: int) -> float:
+        """When the next PINGREQ must leave, a margin before the interval ends."""
+        idle_since = min(self._write_pump.last_outbound, self._last_inbound)
+        return idle_since + keepalive - min(1.0, keepalive / 10)
 
     def _ping_window(self, keepalive: int) -> float:
         ping_timeout = self._ping_timeout

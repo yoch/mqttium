@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from mqttium.enums import MQTTProtocolVersion, QoS
 from mqttium.errors import ProtocolError
@@ -17,14 +17,15 @@ class ConnectPacket:
     clean_start: bool = True
     keepalive: int = 60
     username: str | None = None
-    password: bytes | None = None
+    password: bytes | None = field(default=None, repr=False)
     will_topic: str | None = None
-    will_payload: bytes = b""
+    will_payload: bytes = field(default=b"", repr=False)
     will_qos: QoS = QoS.AT_MOST_ONCE
     will_retain: bool = False
-    will_properties: Properties | None = None
+    will_properties: Properties | None = field(default=None, repr=False)
     protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311
-    properties: Properties | None = None
+    # Authentication Data travels in the CONNECT properties.
+    properties: Properties | None = field(default=None, repr=False)
 
     def encode(self) -> bytes:
         if self.protocol is MQTTProtocolVersion.MQTTv311:
