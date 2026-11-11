@@ -14,8 +14,10 @@ from __future__ import annotations
 
 from tests.support import stored_record
 
+import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -785,8 +787,18 @@ _QUOTATION = re.compile(
 _ANY_LABEL = re.compile(r"\[(MQTT-\d+(?:\.\d+)*-\d+)\]")
 
 
-def _normalise(text: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+def _matrix_tool():
+    """The matrix generator: one matching rule for this check and the matrix."""
+    path = Path(__file__).resolve().parents[2] / "tools" / "build_conformance_matrix.py"
+    spec = importlib.util.spec_from_file_location("build_conformance_matrix", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["build_conformance_matrix"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_MATRIX = _matrix_tool()
 
 
 def _check_quotations(source: str, where: str, *, verbatim: bool = True) -> int:
@@ -806,21 +818,13 @@ def _check_quotations(source: str, where: str, *, verbatim: bool = True) -> int:
 
     checked = 0
     for label, quoted in _QUOTATION.findall(source) if verbatim else ():
-        quoted_words = _normalise(quoted)
-        if not quoted_words:
+        if not _MATRIX.normalise(quoted):
             continue
         candidates = {
             version: known[label] for version, known in by_version.items() if label in known
         }
-        matched = False
-        for text in candidates.values():
-            actual = _normalise(text)
-            # The docstring may stop early, but what it does quote must be exact.
-            prefix = " ".join(quoted_words.split()[: len(actual.split())])
-            if actual.startswith(prefix) or prefix in actual:
-                matched = True
-                break
-        if not matched:
+        # The docstring may stop early, but what it does quote must be exact.
+        if not any(_MATRIX.quote_matches(quoted, text) for text in candidates.values()):
             rendered = "\n".join(f"  MQTT {v}: {t[:170]}" for v, t in candidates.items())
             pytest.fail(
                 f"{where}: {label} is misquoted\n  docstring: {quoted.strip()[:170]}\n{rendered}"

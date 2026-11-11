@@ -149,6 +149,7 @@ plugins:
           - architecture.md
           - implementation-guide.md
           - conformance.md
+          - conformance-matrix.md
           - guarantees.md
           - observability.md
         Maintainers:
@@ -214,6 +215,7 @@ nav:
       - Architecture: architecture.md
       - Implementation contracts: implementation-guide.md
       - Protocol conformance: conformance.md
+      - Conformance matrix: conformance-matrix.md
       - Behavioural guarantees: guarantees.md
       - Logging and observability: observability.md
   - Maintainers:
