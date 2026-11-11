@@ -42,6 +42,7 @@ Every configuration declares one outcome, and the runner fails on any other:
 | `pass` | Exhaustive check with no invariant violation and no deadlock |
 | `violation` | TLC reports exactly the named `invariant` as violated |
 | `deadlock` | TLC reports a reachable deadlock |
+| `liveness` | TLC reports that the configuration's one temporal `PROPERTY`, named by the sidecar's `property`, is violated |
 
 A defect is documented by a configuration describing the released behaviour,
 which must keep producing its counterexample, and a configuration describing
@@ -54,6 +55,33 @@ model defines a `Terminal` predicate and a `Quiescent == Terminal /\ UNCHANGED
 vars` step. This lets TLC keep deadlock checking on and still report any stuck
 state that is not a legitimate end of the run. Unbounded counters need a
 `CONSTRAINT` so that the check terminates.
+
+## Liveness properties
+
+An invariant says that nothing bad is reachable. It cannot say that a wait
+ends: a model in which a receipt stays pending for ever violates no
+invariant. A temporal property (`P ~> Q`, `<>[]P`) does, and is checked from a
+configuration that names it with `PROPERTY`.
+
+- **Fairness is stated, and only of the library.** A temporal property is
+  checked against a specification that adds weak fairness
+  (`FairSpec == Spec /\ WF_vars(Action)`) on the actions the client itself
+  performs and on deadlines it arms. Nothing is assumed of the application,
+  of the peer, or of a timer whose duration is the user's choice: a property
+  that only holds if the consumer eventually reads, or if the broker
+  eventually answers, is not a guarantee of the client.
+- **One property per `liveness` configuration.** TLC does not say which
+  temporal property failed, so the released-behaviour configuration declares
+  exactly one, and sets `CHECK_DEADLOCK FALSE` so that a stuck state is
+  reported as the unmet property instead of as a deadlock.
+- **The repaired configuration checks the same property and must pass**, with
+  deadlock checking left on. Its sidecar entry names the property too, and a
+  project test compares that name with the configuration's `PROPERTY`: a
+  repaired configuration that lost its property cannot pass unnoticed.
+
+What this establishes is bounded like every model here: the property holds
+for the modelled actions under the stated fairness. It says nothing about a
+wait the model does not contain, and it is not a proof about the Python code.
 
 ## Model status
 

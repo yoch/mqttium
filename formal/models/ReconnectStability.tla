@@ -57,6 +57,14 @@ Next == Loss \/ TimerFires \/ Wake \/ Quiescent
 
 Spec == Init /\ [][Next]_vars
 
+\* The supervisor runs whenever it can. Nothing is assumed of the stability
+\* timer: stable_after may be arbitrarily long, so a retry that needs the
+\* timer to fire first is not guaranteed to happen.
+FairSpec == Spec /\ WF_vars(Wake)
+
+\* A lost replacement connection is always retried.
+LossIsRetried == (conn = "lost") ~> (supervisor = "retrying")
+
 \* A lost replacement never leaves the supervisor asleep behind the timer.
 NoSleepThroughLoss == (conn = "lost" /\ supervisor = "waiting") => CanWake
 

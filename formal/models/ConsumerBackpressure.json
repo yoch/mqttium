@@ -1,0 +1,36 @@
+{
+  "module": "ConsumerBackpressure.tla",
+  "status": "refinement",
+  "summary": "A messages() consumer that awaits a receipt inside its loop waits on a reader parked on the full iterator queue; the admission deadline bounds that cycle, and a consumer that does not wait on the reader never enters it.",
+  "issues": [
+    630
+  ],
+  "tests": [
+    "tests/unit/test_iterator_consumer_deadlock.py",
+    "tests/unit/test_delivery_backpressure.py"
+  ],
+  "configs": [
+    {
+      "config": "ConsumerBackpressure-v121.cfg",
+      "expect": "deadlock"
+    },
+    {
+      "config": "ConsumerBackpressure-callback.cfg",
+      "expect": "pass"
+    },
+    {
+      "config": "ConsumerBackpressure-fixed.cfg",
+      "expect": "pass"
+    },
+    {
+      "config": "ConsumerBackpressure-v121-liveness.cfg",
+      "expect": "liveness",
+      "property": "AwaitingEnds"
+    },
+    {
+      "config": "ConsumerBackpressure-fixed-liveness.cfg",
+      "expect": "pass",
+      "property": "AwaitingEnds"
+    }
+  ]
+}

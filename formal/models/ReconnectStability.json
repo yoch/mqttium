@@ -17,6 +17,16 @@
     {
       "config": "ReconnectStability-fixed.cfg",
       "expect": "pass"
+    },
+    {
+      "config": "ReconnectStability-rc15-liveness.cfg",
+      "expect": "liveness",
+      "property": "LossIsRetried"
+    },
+    {
+      "config": "ReconnectStability-fixed-liveness.cfg",
+      "expect": "pass",
+      "property": "LossIsRetried"
     }
   ]
 }

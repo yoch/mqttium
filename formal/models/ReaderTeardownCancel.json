@@ -1,0 +1,38 @@
+{
+  "module": "ReaderTeardownCancel.tla",
+  "status": "refinement",
+  "summary": "A cancellation reaching the reader while it releases a lost connection never ends it before its reconnect decision is carried out: RECONNECTING has a reconnect task, and a terminal disconnect settles the receipts kept for replay.",
+  "issues": [
+    630
+  ],
+  "tests": [
+    "tests/unit/test_reader_teardown_second_cancel.py",
+    "tests/unit/test_disconnect_reader_teardown_race.py"
+  ],
+  "configs": [
+    {
+      "config": "ReaderTeardownCancel-v121-reconnect.cfg",
+      "expect": "violation",
+      "invariant": "ReconnectingHasOwner"
+    },
+    {
+      "config": "ReaderTeardownCancel-v121-receipts.cfg",
+      "expect": "violation",
+      "invariant": "TerminalSettlesReceipts"
+    },
+    {
+      "config": "ReaderTeardownCancel-fixed.cfg",
+      "expect": "pass"
+    },
+    {
+      "config": "ReaderTeardownCancel-v121-liveness.cfg",
+      "expect": "liveness",
+      "property": "PendingIsEventuallyOwned"
+    },
+    {
+      "config": "ReaderTeardownCancel-fixed-liveness.cfg",
+      "expect": "pass",
+      "property": "PendingIsEventuallyOwned"
+    }
+  ]
+}

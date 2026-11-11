@@ -183,11 +183,52 @@ writes, parked-publisher wake/accounting, writer parking, and all four lifecycle
 overlaps. Failure artifacts use schema `mqttium-runtime-fuzz-v3` and retain the
 profile, family, settlement plan, pressure high water, and owner snapshot.
 
+## Runtime teardown target
+
+`tests/fuzz/runtime_teardown_fuzzer.py` is the V4 profile over the V1 harness.
+The V1 transport gates only the first `close()`, which a schedule's broker EOF
+consumes, so the reader's own release of a lost connection never suspended and
+no schedule could cancel it there. V4 gates every later `close()` and aims
+four cancellers at that window, after a generated connected-state history:
+
+- a terminal `disconnect()` while the loss was still reconnectable;
+- a terminal `disconnect()` with no reconnect policy;
+- a client-internal cancellation, as a failing writer, keepalive, effect or
+  authentication task issues;
+- a cancellation from outside the client.
+
+About three schedules in four leave a QoS 1 publication unacknowledged, which
+is what a stranded teardown loses. Beyond the V1 oracles, a client that is
+`RECONNECTING` with neither a reader nor a reconnect task fails at once, and
+the internal family must reach a replacement connection. Two test-only
+mutations restore the 1.2.1 behaviour: the cancellation ends the reader at its
+release, or the interrupted teardown completes without settling receipts.
+Campaign coverage requires every family, a release window in every schedule
+and at least one pending publication. Failure artifacts keep the V1 schema
+with a `teardown` owner section.
+
+Its reach is narrow and should be read as such. Every schedule cancels the
+reader at one suspension point, the gated `close()`: the random yields before
+the cancellation do not move it. Mutations that drop the receipt settlement,
+the interruption result or the reconnect decision are caught; mutations that
+move the writer wake-up out of the cancellation guard, skip the stream close
+when interrupted, or swallow the final re-raise are not caught by this
+profile, nor by the unit tests. The deterministic tests that cancel at each
+turn of a multi-turn `close()` cover more suspension points than V4 does.
+
+V4 is additive: V1, V2 and V3 schedules, seeds and artifacts are unchanged.
+
+Wall-clock behaviour is out of reach of these turn-driven schedules and stays
+with deterministic tests: the `messages()` admission deadline
+(`tests/unit/test_iterator_consumer_deadlock.py`), TCP and MQTT keepalive, and
+SQLite lock contention (`tests/unit/test_sqlite_lock_contention.py`).
+
 ### Campaign levels
 
 1. **PR smoke:** 12 fixed healthy V1 seeds at 24 steps, 12 fixed healthy V2
-   seeds at 48 steps, 32 coverage-gated V3 seeds at 36 steps, bounded pytest
-   qualification of all six V1, four V2, and eight V3 mutations, plus the
+   seeds at 48 steps, 32 coverage-gated V3 seeds at 36 steps, 32
+   coverage-gated V4 seeds at 28 steps, bounded pytest qualification of all
+   six V1, four V2, eight V3 and two V4 mutations, plus the
    stateful invariant campaign at 6 seeds × 200 steps.
 2. **ARM64 nightly:** 50,000 seeds at 32 steps, split into ten disjoint
    5,000-seed shards. The workflow run number advances a monotonic seed range

@@ -6,7 +6,9 @@ outcome TLC must produce:
 
 * ``pass`` -- exhaustive check, no invariant violation and no deadlock;
 * ``violation`` -- TLC must report exactly the named invariant as violated;
-* ``deadlock`` -- TLC must report a reachable deadlock.
+* ``deadlock`` -- TLC must report a reachable deadlock;
+* ``liveness`` -- TLC must report that the configuration's one temporal
+  ``PROPERTY``, named by the sidecar, is violated.
 
 A ``violation`` expectation is how a model documents a defect: the
 configuration describing the released behaviour must keep producing its
@@ -48,12 +50,15 @@ TLA2TOOLS_URL = (
 )
 TLA2TOOLS_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
 
-EXPECTATIONS = frozenset({"pass", "violation", "deadlock"})
+EXPECTATIONS = frozenset({"pass", "violation", "deadlock", "liveness"})
 STATUSES = frozenset({"refinement", "legacy-flag"})
 
 _PASSED = "Model checking completed. No error has been found."
 _INVARIANT = re.compile(r"^Error: Invariant (\w+) is violated", re.MULTILINE)
 _DEADLOCK = "Error: Deadlock reached."
+# TLC does not name the violated property, so a ``liveness`` configuration
+# declares exactly one: the violation is then attributable to it.
+_TEMPORAL = "Error: Temporal properties were violated."
 _STATES = re.compile(r"^(\d+) states generated, (\d+) distinct states found", re.MULTILINE)
 
 
@@ -64,6 +69,7 @@ class Check:
     config: Path
     expect: str
     invariant: str | None
+    property: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +102,7 @@ def checks_for(sidecar: dict[str, object]) -> list[Check]:
             config=path.parent / entry["config"],
             expect=entry["expect"],
             invariant=entry.get("invariant"),
+            property=entry.get("property"),
         )
         for entry in configs
     ]
@@ -144,6 +151,8 @@ def classify(output: str) -> Outcome:
         return Outcome("violation", invariant.group(1), distinct, output)
     if _DEADLOCK in output:
         return Outcome("deadlock", None, distinct, output)
+    if _TEMPORAL in output:
+        return Outcome("liveness", None, distinct, output)
     if _PASSED in output:
         return Outcome("pass", None, distinct, output)
     return Outcome("error", None, distinct, output)
@@ -194,6 +203,11 @@ def _describe(outcome: Outcome) -> str:
     return detail
 
 
+def _expected(check: Check) -> str:
+    named = check.invariant or check.property
+    return check.expect + (f" {named}" if named else "")
+
+
 def print_index(sidecars: list[dict[str, object]]) -> None:
     for sidecar in sidecars:
         path = sidecar["_path"]
@@ -202,8 +216,7 @@ def print_index(sidecars: list[dict[str, object]]) -> None:
         print(f"{path.stem} [{sidecar['status']}] {issues}")
         print(f"    {sidecar['summary']}")
         for check in checks_for(sidecar):
-            expected = check.expect + (f" {check.invariant}" if check.invariant else "")
-            print(f"    {check.config.name}: expect {expected}")
+            print(f"    {check.config.name}: expect {_expected(check)}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -235,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
             outcome = run_check(check, jar, java)
             ok = matches(check, outcome)
             failures += not ok
-            expected = check.expect + (f" {check.invariant}" if check.invariant else "")
+            expected = _expected(check)
             status = "ok  " if ok else "FAIL"
             print(
                 f"{status} {check.model}/{check.config.name}: "

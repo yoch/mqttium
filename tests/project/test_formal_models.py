@@ -56,6 +56,15 @@ def test_sidecars_are_well_formed() -> None:
         for entry in configs:
             assert entry["expect"] in run_tlc.EXPECTATIONS, name
             assert ("invariant" in entry) == (entry["expect"] == "violation"), name
+            # A temporal property is named by the configuration expected to
+            # violate it and by the repaired one expected to satisfy it.
+            assert "property" not in entry or entry["expect"] in ("liveness", "pass"), name
+            assert "property" in entry or entry["expect"] != "liveness", name
+        violated = {e["property"] for e in configs if e["expect"] == "liveness"}
+        satisfied = {e["property"] for e in configs if e["expect"] == "pass" and "property" in e}
+        assert violated <= satisfied, (
+            f"{name}: no repaired configuration checks {violated - satisfied}"
+        )
 
 
 def test_modules_and_configs_are_runnable_by_tlc() -> None:
@@ -70,6 +79,39 @@ def test_modules_and_configs_are_runnable_by_tlc() -> None:
             named = re.findall(r"^(?:INVARIANT|CONSTRAINT)\s+(\w+)", config_text, re.MULTILINE)
             if check.invariant is not None:
                 assert check.invariant in named, check.config.name
+            properties = re.findall(r"^PROPERTY\s+(\w+)", config_text, re.MULTILINE)
+            # What the configuration checks is what its sidecar entry names:
+            # a repaired configuration that lost its PROPERTY would otherwise
+            # still "pass", having checked nothing temporal.
+            assert properties == ([check.property] if check.property else []), check.config.name
+            if check.expect == "pass" and check.property:
+                # Deadlock checking stays on where the property must hold.
+                assert not re.search(r"^CHECK_DEADLOCK\s+FALSE", config_text, re.MULTILINE), (
+                    check.config.name
+                )
+            if check.expect == "liveness":
+                # TLC does not say which temporal property failed: with exactly
+                # one declared, the reported violation can only be that one.
+                assert properties == [check.property], check.config.name
+                # A stuck state must surface as the temporal violation, not as
+                # the deadlock TLC would otherwise report first.
+                assert re.search(r"^CHECK_DEADLOCK\s+FALSE", config_text, re.MULTILINE), (
+                    check.config.name
+                )
+            if properties:
+                # A temporal property means nothing without a fairness condition.
+                specification = re.search(r"^SPECIFICATION\s+(\w+)", config_text, re.MULTILINE)
+                assert specification is not None
+                definition = re.search(
+                    rf"^{specification.group(1)}\s*==(.*?)(?=^\S|\Z)",
+                    module_text,
+                    re.MULTILINE | re.DOTALL,
+                )
+                assert definition is not None, check.config.name
+                assert re.search(r"\b[WS]F_|Fairness", definition.group(1)), (
+                    f"{check.config.name}: {specification.group(1)} states no fairness"
+                )
+            named = named + properties
             for operator in named:
                 assert re.search(_OPERATOR.format(name=operator), module_text, re.MULTILINE), (
                     f"{check.config.name}: {operator} is not defined in {check.module.name}"
@@ -85,6 +127,14 @@ def test_tlc_outcome_classification() -> None:
     violated = run_tlc.classify("Error: Invariant NoStaleCommit is violated.\n")
     assert (violated.kind, violated.invariant) == ("violation", "NoStaleCommit")
     assert run_tlc.classify("Error: Deadlock reached.\n").kind == "deadlock"
+    stuck = run_tlc.classify(
+        "Error: Temporal properties were violated.\n"
+        "Error: The following behavior constitutes a counter-example:\n"
+    )
+    assert stuck.kind == "liveness"
+    liveness = run_tlc.Check("M", MODELS / "M.tla", MODELS / "M.cfg", "liveness", None, "Ends")
+    assert run_tlc.matches(liveness, stuck) is True
+    assert run_tlc.matches(liveness, passed) is False
     assert run_tlc.classify("Error: The configuration file did not specify").kind == "error"
     check = run_tlc.Check("M", MODELS / "M.tla", MODELS / "M.cfg", "violation", "Inv")
     assert run_tlc.matches(check, violated) is False
