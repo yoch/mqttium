@@ -25,8 +25,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - `iterator_admission_timeout` defaults to 60 seconds instead of `None`. A
   `messages()` consumer that frees no space in a full queue for that long now
   ends the connection with `MessageDeliveryError` instead of leaving it
-  `CONNECTED` with the reader stopped; this also bounds a consumer that
-  awaits a receipt inside its loop. Pass `None` for the previous behaviour.
+  `CONNECTED` with the reader stopped. Without a reconnect policy this also
+  ends a consumer that awaits a receipt inside its loop; with one, the
+  receipt is kept for replay and that consumer stays blocked across
+  reconnections. Pass `None` for the previous behaviour.
 - `connect*(timeout=)` bounds the whole call, including the retries of a
   reconnect policy, and raises `MQTTTimeoutError` at its deadline. Without
   `timeout`, `connect_timeout` still bounds each attempt and the policy
