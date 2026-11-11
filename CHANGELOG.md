@@ -34,6 +34,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- A keepalive ping falling due while `disconnect()` drained its DISCONNECT
+  no longer aborts the graceful shutdown.
+- `disconnect()` and `connect()` called from the cleanup of an already
+  cancelled task are not cancelled a second time.
 - A message whose admission to the `messages()` queue timed out was dropped
   although it had already been acknowledged to the broker. It now stays at
   the head of the messages carried over to the next connection.

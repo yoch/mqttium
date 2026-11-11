@@ -30,11 +30,24 @@ class DependencyCancelledError(MQTTError):
     """
 
 
-def owner_cancelled(task: asyncio.Task[object] | None = None) -> bool:
-    """Whether ``task`` (default: the current task) has been asked to cancel."""
+def owner_cancelled(task: asyncio.Task[object] | None = None, *, since: int = 0) -> bool:
+    """Whether ``task`` (default: the current task) has been asked to cancel.
+
+    ``since`` is a count taken earlier with :func:`cancel_requests`: only a
+    request made after it counts. A task cancelled once and now running its
+    cleanup still reports that request; code that joins another task there
+    must not mistake the joined task's outcome for a new request.
+    """
     if task is None:
         task = asyncio.current_task()
-    return task is not None and task.cancelling() > 0
+    return task is not None and task.cancelling() > since
+
+
+def cancel_requests(task: asyncio.Task[object] | None = None) -> int:
+    """Pending cancellation requests of ``task`` (default: the current task)."""
+    if task is None:
+        task = asyncio.current_task()
+    return task.cancelling() if task is not None else 0
 
 
 def dependency_failure(
