@@ -92,9 +92,12 @@ class DeliveryLane:
                     if pending is not None:
                         try:
                             await pending
-                        except asyncio.CancelledError:
-                            # An iterator admission cancelled before commit
-                            # did not deliver; a callback yield already did.
+                        except (asyncio.CancelledError, Exception):
+                            # An iterator admission that did not commit did
+                            # not deliver, whether it was cancelled or failed
+                            # (its deadline expired); a callback yield already
+                            # did. The broker will not resend an acknowledged
+                            # message, so it stays the head of the carryover.
                             if owner._delivery.mode == "iterator" and survives_connection(effect):
                                 effects.appendleft(effect)
                             raise

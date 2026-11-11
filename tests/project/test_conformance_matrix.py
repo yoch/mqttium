@@ -87,5 +87,53 @@ def test_a_quotation_is_attributed_to_the_version_it_reproduces() -> None:
     assert v311.text != v5.text
     assert matrix.quote_matches(v311.text, v311.text)
     assert not matrix.quote_matches(v311.text, v5.text)
-    assert matrix.quote_matches(v5.text[:60], v5.text)  # a quotation may stop early
     assert not matrix.quote_matches("", v5.text)
+    # A quotation that stops early, or lifts a few words, proves nothing: the
+    # part left out is often the obligation itself.
+    assert not matrix.quote_matches(v5.text[:60], v5.text)
+    assert not matrix.quote_matches("A", v5.text)
+    assert not matrix.quote_matches(" ".join(v5.text.split()[3:9]), v5.text)
+    assert matrix.quote_matches(v5.text.upper().replace(" ", "\n"), v5.text)
+
+
+def _verified_from(source: str, name: str = "tests/unit/test_planted.py") -> set[tuple[str, str]]:
+    statements = matrix.load_statements()
+    return matrix._verify_quotations(source, name, statements)
+
+
+def test_only_a_test_that_runs_counts_as_evidence() -> None:
+    statements = matrix.load_statements()
+    text = statements[("5.0", "MQTT-2.2.1-2")].text
+    doc = f'    """[MQTT-2.2.1-2] {text}"""\n'
+    body = "    assert True\n"
+    ran = {("5.0", "MQTT-2.2.1-2")}
+    assert _verified_from(f"def test_ok():\n{doc}{body}") == ran
+    assert _verified_from(f"async def test_ok():\n{doc}{body}") == ran
+    # Never run, never collected, or nothing but a docstring.
+    assert _verified_from(f"@pytest.mark.skip\ndef test_skipped():\n{doc}{body}") == set()
+    assert _verified_from(f"@pytest.mark.xfail(strict=True)\ndef test_x():\n{doc}{body}") == set()
+    assert _verified_from(f"def test_empty():\n{doc}") == set()
+    nested = f"def helper():\n    def test_inner():\n    {doc}    {body}"
+    assert _verified_from(nested) == set()
+    assert _verified_from(f"def test_ok():\n{doc}{body}", "tests/helpers.py") == set()
+
+
+def test_a_test_named_for_one_version_is_evidence_for_that_version_only() -> None:
+    statements = matrix.load_statements()
+    label = next(
+        label
+        for (version, label), statement in sorted(statements.items())
+        if version == "5.0"
+        and ("3.1.1", label) in statements
+        and matrix.quote_matches(statement.text, statements[("3.1.1", label)].text)
+    )
+    text = statements[("5.0", label)].text
+    source = 'def {name}():\n    """[{label}] {text}"""\n    assert True\n'
+    both = {("3.1.1", label), ("5.0", label)}
+    assert _verified_from(source.format(name="test_shared", label=label, text=text)) == both
+    assert _verified_from(source.format(name="test_mqtt5_x", label=label, text=text)) == {
+        ("5.0", label)
+    }
+    assert _verified_from(source.format(name="test_mqtt311_x", label=label, text=text)) == {
+        ("3.1.1", label)
+    }

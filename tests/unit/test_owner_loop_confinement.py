@@ -14,7 +14,14 @@ from mqttium.api import AsyncClient, PublishMessage
 from mqttium.types import Message
 from tests.support import ScriptedBrokerTransport, transport_factory
 
+
+async def _publish_nowait(client: AsyncClient) -> None:
+    client.publish_nowait("t", b"x")
+
+
 _CALLS = {
+    "auth": lambda c: c.auth(),
+    "publish_nowait": _publish_nowait,
     "publish": lambda c: c.publish("t", b"x"),
     "publish_many": lambda c: c.publish_many([PublishMessage("t", b"x")]),
     "subscribe": lambda c: c.subscribe("t"),
@@ -62,3 +69,17 @@ async def test_call_from_another_loop_is_refused(name):
 async def test_an_unconnected_client_is_not_bound_yet():
     client = AsyncClient("unbound", keepalive=0)
     await client.disconnect()  # no owner loop yet: nothing to refuse
+
+
+def test_a_late_disconnect_after_the_owner_loop_closed_is_harmless() -> None:
+    """Idempotent cleanup in a second ``asyncio.run``: the loop that owned the
+    client is closed and runs nothing, so there is no one to race."""
+    client = AsyncClient("late")
+    client._transport_factory = transport_factory(ScriptedBrokerTransport())
+
+    async def session() -> None:
+        await client.connect("unused")
+        await client.disconnect()
+
+    asyncio.run(session())
+    asyncio.run(client.disconnect())

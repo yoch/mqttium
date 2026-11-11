@@ -159,11 +159,13 @@ seconds).
 
 **Status:** Checked.
 
-The handshake response is bounded to 64 KiB under a timeout; the accept key,
-the upgrade headers and the subprotocol are validated; frames are bounded
-before they are buffered; masking keys come from the operating system's
-random source. Credentials in a URL and line breaks in extra headers are
-refused.
+The handshake response is bounded to 64 KiB under a timeout; the accept key
+and the upgrade headers are validated; a subprotocol other than MQTT is
+refused; frames are bounded before they are buffered; masking keys come from
+the operating system's random source. Credentials in a URL and line breaks in
+extra headers are refused. A response that selects no subprotocol is
+accepted, as RFC 6455 allows, so the handshake alone does not tell a broker
+from another WebSocket endpoint: the MQTT exchange that follows does.
 
 A text frame ends the connection.
 
@@ -207,16 +209,20 @@ connection is retried; a refused `publish()` fails that call.
 
 **Status:** Partial.
 
-The library writes no log and prints nothing. No exception message includes
-a username, a password or authentication data, and `stats()` carries no
-credential. The engine configuration and the CONNECT packet keep the
-password, the will and the CONNECT properties, where Authentication Data
-travels, out of their representation.
+The library writes no log and prints nothing. The engine configuration and
+the CONNECT packet keep the password, the will payload, the will properties
+and the CONNECT properties, where Authentication Data travels, out of their
+representation. A binary property of the wrong type, such as authentication
+data passed as text, is refused by naming its type, not its value.
 
-*Residual risk:* a `Properties` object shows its values, so authentication
+*Residual risk:* the user name and the will topic stay visible in those
+representations. A `Properties` object shows its values, so authentication
 data is visible in the representation of the object the application built
 and of an AUTH packet. A `Message` representation includes its payload by
-design.
+design. Errors about other mistyped properties quote the value they refuse.
+`stats()` reports the last disconnect cause as text, which for a failed
+WebSocket handshake includes the server's status line. No test searches
+every exception message for a credential.
 
 - `tests/unit/test_secret_representation.py`
 

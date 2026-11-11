@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Never, TypeVar
 
 from mqttium.api._auth import AuthExchange
 from mqttium.api._cancel import (
+    cancel_requests,
     dependency_failure,
     failure_for,
     ignoring_dependency_failures,
@@ -512,7 +513,6 @@ class AsyncClient:
         self._is_store_lock_refusal: Callable[[BaseException], bool] = getattr(
             engine_store, "is_lock_refusal", lambda _exc: False
         )
-        self._ingress_lock_refusal: BaseException | None = None
         # Set once a connection is torn down, cleared by the next connect. Read
         # by _publish_wait_failure(); _closed is set too late in teardown to use.
         self._teardown_final = False
@@ -931,7 +931,13 @@ class AsyncClient:
             # token valid if this caller is cancelled while waiting for the lock.
             self._lifecycle_hooks.begin_operation(replace_connection=False)
             async with self._lifecycle_lock:
-                await self._prepare_explicit_connect()
+                try:
+                    await self._prepare_explicit_connect()
+                except asyncio.CancelledError:
+                    # The takeover already stopped the automatic reconnect;
+                    # a caller that leaves here leaves nobody to reconnect.
+                    self._abandon_connect(MQTTError("Connection attempt cancelled"))
+                    raise
                 # Rechecked, not just entry-checked: the latch is set-once, so a
                 # failure that landed while waiting on the lock is observed here.
                 if self._local_terminal_failure is not None:
@@ -1133,9 +1139,10 @@ class AsyncClient:
                     self._propose_disconnect_cause(refusal, _CAUSE_BROKER)
                 raise refusal
             self._reconnect_pending = False
-            self._write_pump.last_outbound = self._last_inbound = self._connected_since = (
-                time.monotonic()
-            )
+            # The writer stamped the CONNECT (and any AUTH) when it left:
+            # that stamp stays, so the first keep-alive interval counts from
+            # the last packet sent, not from the CONNACK that answered it.
+            self._last_inbound = self._connected_since = time.monotonic()
             self._keepalive_task = asyncio.create_task(
                 self._keepalive_loop(), name="mqttium-keepalive"
             )
@@ -1225,7 +1232,13 @@ class AsyncClient:
         with that loop, which nothing in the client is built to survive.
         """
         owner_loop = self._owner_loop
-        if owner_loop is not None and owner_loop is not asyncio.get_running_loop():
+        if (
+            owner_loop is not None
+            and owner_loop is not asyncio.get_running_loop()
+            and not owner_loop.is_closed()
+        ):
+            # A closed loop runs nothing: a late, idempotent call made after
+            # it ended (a disconnect() in a second asyncio.run) races nobody.
             raise RuntimeError("AsyncClient is bound to a different event loop")
 
     async def disconnect(self, reason_code: int = 0) -> None:
@@ -1322,6 +1335,11 @@ class AsyncClient:
                 # Transport cleanup completes before the separate lifecycle owner
                 # can notify user code; hooks never become a prerequisite here.
                 await self._force_close()
+                if not self._will_reconnect():
+                    # Normally the reader settled pending work as it retired.
+                    # When it had already gone, leaving a transport behind,
+                    # nobody did: the shutdown is terminal either way.
+                    self._terminal_shutdown(self._disconnect_exc or MQTTError("Disconnected"))
 
     def publish_nowait(
         self,
@@ -1628,6 +1646,7 @@ class AsyncClient:
         properties: Properties | None = None,
     ) -> None:
         """Send a client AUTH packet (MQTT 5 continue / re-authenticate)."""
+        self._check_owner_loop()
         async with self._engine_lock:
             if self.auth_handler is None:
                 raise MQTTError("auth() requires an auth_handler")
@@ -1915,14 +1934,18 @@ class AsyncClient:
             raise
         await self._effect_pump.drain()
 
-    def _process_ingress_batch(self) -> tuple[int, int, bool, MQTTError | None]:
+    def _process_ingress_batch(
+        self,
+    ) -> tuple[int, int, bool, MQTTError | None, BaseException | None]:
         """Decode until a byte/count bound, an auto-PUBACK handoff boundary,
         or the first peer error.
 
         A packet that will write the store first reserves its write lock. A
         refused lock ends the lot before that packet, which is dropped
         unapplied; the reader then retires the connection as a transient
-        loss, and the broker resends what was never acknowledged.
+        loss, and the broker resends what was never acknowledged. The refusal
+        is returned with its lot, never stored on the client: a reader that
+        leaves before raising it must not hand it to the next connection.
 
         A malformed, oversized or protocol-violating packet ends the lot at
         that packet. It is returned, not raised, so the valid prefix before it
@@ -1946,8 +1969,8 @@ class AsyncClient:
                     # Bytes after DISCONNECT belong to no connection: the
                     # engine ignores whole packets there, and undecodable
                     # ones must not replace the terminal reason either.
-                    return count, decoded_bytes, False, None
-                return count, decoded_bytes, False, exc
+                    return count, decoded_bytes, False, None, None
+                return count, decoded_bytes, False, exc, None
             if packet is None:
                 break
             if reserve is not None and engine.may_write_store(packet):
@@ -1961,15 +1984,14 @@ class AsyncClient:
                 except Exception as exc:
                     if not self._is_store_lock_refusal(exc):
                         raise
-                    self._ingress_lock_refusal = exc
-                    return count, decoded_bytes, False, None
+                    return count, decoded_bytes, False, None, exc
                 reserve = None
             peer_error = handle_raw(packet)
             if peer_error is not None:
                 # handle_raw() emitted it as the lot's last effect; the reader
                 # raises it after the prefix instead, so drop that copy.
                 engine._effects.pop()
-                return count + 1, decoded_bytes, False, peer_error
+                return count + 1, decoded_bytes, False, peer_error, None
             count += 1
             decoded_bytes += len(packet.remaining) + 5
             # Auto-PUBACK slots remain owned until take_effects(). Stop exactly
@@ -1977,10 +1999,10 @@ class AsyncClient:
             # the effect handoff below can release them before another PUBLISH.
             # Control packets and QoS 0 traffic retain the full 256-packet batch.
             if inbound._autoack_handoff_required:
-                return count, decoded_bytes, True, None
+                return count, decoded_bytes, True, None, None
             if decoded_bytes >= max_bytes:
                 break
-        return count, decoded_bytes, False, None
+        return count, decoded_bytes, False, None, None
 
     async def _read_loop(self) -> None:  # noqa: C901
         assert self._transport is not None
@@ -2022,9 +2044,13 @@ class AsyncClient:
                         effect_start = len(self._engine._effects)
                         try:
                             with self._engine.store.batch():
-                                handled, handled_bytes, handoff_required, peer_error = (
-                                    self._process_ingress_batch()
-                                )
+                                (
+                                    handled,
+                                    handled_bytes,
+                                    handoff_required,
+                                    peer_error,
+                                    lock_refusal,
+                                ) = self._process_ingress_batch()
                         except (
                             MandatoryResponseTooLargeError,
                             SessionReplayError,
@@ -2090,12 +2116,10 @@ class AsyncClient:
                         # delivered; only now does the peer error retire the
                         # connection.
                         raise peer_error
-                    lock_refusal = self._ingress_lock_refusal
                     if lock_refusal is not None:
                         # Same ordering for a refused store lock. Nothing was
                         # applied for the dropped packet, so this is an
                         # ordinary, retryable loss of the connection.
-                        self._ingress_lock_refusal = None
                         raise lock_refusal
                     # A batch that stopped short of both bounds emptied the
                     # buffer, so there is nothing to decode until the next
@@ -2292,7 +2316,12 @@ class AsyncClient:
         # decision with this reader: ending here would keep the client
         # RECONNECTING with no task to reconnect it.
         self._reader_cancel_requested = False
-        if self._transport is reader_transport and not interrupted:
+        if self._transport is reader_transport and (
+            not interrupted or reader_transport.is_closing()
+        ):
+            # Interrupted or not, a transport whose close has begun is no
+            # longer a connection: leaving it in place would make a later
+            # disconnect() take the path of a live one.
             self._transport = None
         if will_reconnect and not self._will_reconnect():
             # A terminal disconnect() landed while the resources were being
@@ -2508,7 +2537,13 @@ class AsyncClient:
                         # terminal delivery shutdown after the transport breaks.
                         await self._close_transport_after_connection_failure()
                         return
-                    await asyncio.sleep(min(0.5, self._ping_deadline - now))
+                    # Wake no later than the next ping would be due, so a
+                    # PINGRESP arriving just before it does not make that
+                    # ping late by this loop's own polling period.
+                    next_due = self._keepalive_due(k)
+                    await asyncio.sleep(
+                        min(0.5, self._ping_deadline - now, max(next_due - now, 0.01))
+                    )
                     continue
                 # Ping after k seconds without sending or without receiving:
                 # a steady publisher to a half-open connection otherwise never
@@ -2516,13 +2551,18 @@ class AsyncClient:
                 # The PINGREQ leaves a margin before the interval ends: the
                 # interval between packets must not exceed Keep Alive
                 # [MQTT-3.1.2-23], and a timer never fires early.
-                idle_since = min(self._write_pump.last_outbound, self._last_inbound)
-                due = idle_since + k - min(1.0, k / 10)
+                due = self._keepalive_due(k)
                 if now >= due:
                     try:
                         async with self._engine_lock:
                             self._engine.queue_ping()
                             self._effect_pump.collect_from_engine()
+                    except NotConnectedError:
+                        # The engine left CONNECTED while this loop slept: a
+                        # disconnect() draining its DISCONNECT, or a teardown
+                        # under way. That owner finishes the connection; a
+                        # ping that can no longer be sent is not a failure.
+                        return
                     except PacketTooLargeError as exc:
                         # A broker limit below the two-byte PINGREQ leaves no
                         # conforming keepalive packet to send.
@@ -2551,6 +2591,11 @@ class AsyncClient:
             # detection while the connection still looks alive: retire it.
             self._propose_disconnect_cause(exc, _CAUSE_TRANSPORT)
             await self._close_transport_after_connection_failure()
+
+    def _keepalive_due(self, keepalive: int) -> float:
+        """When the next PINGREQ must leave, a margin before the interval ends."""
+        idle_since = min(self._write_pump.last_outbound, self._last_inbound)
+        return idle_since + keepalive - min(1.0, keepalive / 10)
 
     def _ping_window(self, keepalive: int) -> float:
         ping_timeout = self._ping_timeout
@@ -3028,12 +3073,16 @@ class AsyncClient:
         if reconnect_task is None or reconnect_task is asyncio.current_task():
             return False
         reconnect_task.cancel()
+        # Only a cancellation requested during this join is the caller's. A
+        # task already cancelled earlier, now running its cleanup, must not
+        # have the reconnect task's own outcome charged to it again.
+        requests_before = cancel_requests()
         caller_cancelled = False
         while True:
             try:
                 await reconnect_task
             except asyncio.CancelledError:
-                caller_cancelled = caller_cancelled or owner_cancelled()
+                caller_cancelled = caller_cancelled or owner_cancelled(since=requests_before)
             except Exception:
                 # The supervisor's own failure is not the caller's outcome.
                 break

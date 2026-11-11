@@ -34,7 +34,7 @@ class EngineConfig:
     # Out of the representation: Authentication Data travels here.
     connect_properties: Properties | None = field(default=None, repr=False)
     will: Message | None = field(default=None, repr=False)
-    will_properties: Properties | None = None
+    will_properties: Properties | None = field(default=None, repr=False)
     # Local maximum packet size announced to broker (and enforced on ingress).
     maximum_packet_size: int | None = None
     topic_alias_maximum: int = 0  # announced to broker for inbound aliases
