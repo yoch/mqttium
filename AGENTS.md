@@ -10,8 +10,8 @@ This project uses pip, not uv. Runtime dependencies must remain empty.
 
 ```bash
 python -m pip install -e ".[dev,fuzz,security,release,docs]"
-ruff format --check src tests benchmarks
-ruff check src tests benchmarks
+ruff format --check src tests benchmarks tools
+ruff check src tests benchmarks tools
 mypy src/mqttium
 bandit -q -ll -r src
 python -m pytest -q tests/unit tests/project
@@ -63,7 +63,7 @@ clock access, or user callbacks into `protocol/`.
   lifecycle hooks after their triggering protocol transition and transport
   cleanup.
 
-This is the current pre-v1 native API. Paho and one-shot helpers are removed.
+This is the native 1.x API. Paho and one-shot helpers are removed.
 Native APIs and the two supplied stores are the supported surface; engine,
 codecs and extension protocols are Internal.
 
@@ -163,9 +163,8 @@ evidence justifies a change:
 
 ## API and documentation contracts
 
-The current pre-v1 native API deliberately revises the `1.0.0rc14` surface. Its
-contract is defined by the API stability document, not importability or
-`__all__`. The general project tier definitions are:
+The native API contract is defined by the API stability document, not
+importability or `__all__`. The general project tier definitions are:
 
 - **Stable** follows SemVer and the documented deprecation process.
 - **Provisional** is supported and tested but may evolve with changelog and

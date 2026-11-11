@@ -130,6 +130,18 @@ validity conditions pass on an eligible runner.
 | [AUTO-QOS1-MESSAGE-BATCH-DELIVERY](https://github.com/yoch/mqttium/blob/main/docs/reports/AUTO-QOS1-MESSAGE-BATCH-DELIVERY.md) | Current evidence | Automatic QoS 1 delivery batching |
 | [RECEIPT-WAITER-FUTURES-2026-09-06](https://github.com/yoch/mqttium/blob/main/docs/reports/RECEIPT-WAITER-FUTURES-2026-09-06.md) | Current evidence | Per-waiter futures for `PublishReceipt.wait()`; matched-load campaign blocks the change on a median-latency regression at 5000 msg/s |
 
+## Mission briefs and bounded investigations
+
+| Report | Status | Use instead or interpretation |
+| --- | --- | --- |
+| [FORMAL-INBOUND-SESSION-OWNERSHIP-2026-09-24](https://github.com/yoch/mqttium/blob/main/docs/reports/FORMAL-INBOUND-SESSION-OWNERSHIP-2026-09-24.md) | Current evidence | Bounded formal investigation of inbound QoS state at `5774db3`; TLC was not run in that environment. The model now lives and runs as `formal/models/InboundSession.tla` |
+| [MISSION-DROP-EXECUTABLE-MQTT31](https://github.com/yoch/mqttium/blob/main/docs/reports/MISSION-DROP-EXECUTABLE-MQTT31.md) | Current evidence | Scoping brief for removing executable MQTT 3.1 support at its named base commit; not a contract |
+| [MISSION-INTERNAL-TEST-SEAM-CLEANUP](https://github.com/yoch/mqttium/blob/main/docs/reports/MISSION-INTERNAL-TEST-SEAM-CLEANUP.md) | Current evidence | Scoping brief for removing private test-only compatibility facades at its named base commit; not a contract |
+| [MISSION-INVESTIGATE-DELIVERY-BOTH](https://github.com/yoch/mqttium/blob/main/docs/reports/MISSION-INVESTIGATE-DELIVERY-BOTH.md) | Current evidence | Investigation of `message_delivery="both"` against the Stable surface at its named base commit; not a contract |
+| [MISSION-INVESTIGATE-TINY-PEER-PACKET-LIMIT](https://github.com/yoch/mqttium/blob/main/docs/reports/MISSION-INVESTIGATE-TINY-PEER-PACKET-LIMIT.md) | Current evidence | Investigation of an MQTT 5 peer `maximum_packet_size` below 4 at its named base commit; not a contract |
+| [MISSION-PERSISTENCE-CONTRACT-PRUNING](https://github.com/yoch/mqttium/blob/main/docs/reports/MISSION-PERSISTENCE-CONTRACT-PRUNING.md) | Current evidence | Scoping brief and measured candidate for pruning the persistence contract; not a contract |
+| [MISSION-STRICT-PROTOCOL-ERROR-EFFECTS](https://github.com/yoch/mqttium/blob/main/docs/reports/MISSION-STRICT-PROTOCOL-ERROR-EFFECTS.md) | Current evidence | Scoping brief for aligning Internal `PROTOCOL_ERROR` payloads with engine exceptions at its named base commit; not a contract |
+
 ## Adding evidence
 
 1. Put methodology and maintained guarantees in a current contract, not a

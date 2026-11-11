@@ -17,8 +17,8 @@ extension protocols are Internal. Importability does not change a tier.
 ```bash
 python -m pip install -e ".[dev,fuzz,security,release,docs]"
 
-ruff format --check src tests benchmarks
-ruff check src tests benchmarks
+ruff format --check src tests benchmarks tools
+ruff check src tests benchmarks tools
 mypy src/mqttium
 bandit -q -ll -r src
 python -m pytest -q tests/unit tests/project

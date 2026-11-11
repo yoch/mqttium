@@ -69,3 +69,17 @@ def test_documented_examples_are_shipped() -> None:
         "runtime_stats.py",
     }
     assert expected <= {path.name for path in (ROOT / "examples").glob("*.py")}
+
+
+def test_every_report_is_indexed_exactly_once() -> None:
+    """The report index promises that each report body appears exactly once."""
+    reports = ROOT / "docs" / "reports"
+    index = (reports / "README.md").read_text(encoding="utf-8")
+    miscounted = {}
+    for path in sorted(reports.glob("*.md")):
+        if path.name == "README.md":
+            continue
+        links = re.findall(r"\]\((?:[^)]*/)?" + re.escape(path.name) + r"\)", index)
+        if len(links) != 1:
+            miscounted[path.name] = len(links)
+    assert miscounted == {}

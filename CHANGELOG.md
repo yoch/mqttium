@@ -32,6 +32,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- The SQLite store's unsupported-schema error no longer calls itself an
+  experiment.
 - `disconnect()` that lands while the reader is still releasing a lost
   connection no longer leaves QoS 1/2 receipts pending for ever, and
   `on_disconnect` now runs for that loss.

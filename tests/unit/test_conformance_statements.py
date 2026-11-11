@@ -789,14 +789,12 @@ def _normalise(text: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
 
 
-def test_quoted_statements_match_the_vendored_specification() -> None:
-    """Every ``[MQTT-…]`` quote in this module must match the extracted text.
+def _check_quotations(source: str, where: str, *, verbatim: bool = True) -> int:
+    """Check every label, and every verbatim quotation, of ``source``.
 
-    Without this, a docstring could confidently cite a statement it does not
-    actually reproduce — which is exactly how the wrong clause was cited for the
-    inbound packet-id collision fix.
+    Returns the number of quotations compared. With ``verbatim=False`` only
+    the labels are checked: outside this module a docstring may paraphrase.
     """
-    source = Path(__file__).read_text(encoding="utf-8")
     # 119 labels exist in both specifications and 112 of them say different
     # things, so a bare label is only meaningful per version. A quote is
     # accepted when it matches the statement in either vendored document.
@@ -804,10 +802,10 @@ def test_quoted_statements_match_the_vendored_specification() -> None:
 
     for label in set(_ANY_LABEL.findall(source)):
         if not any(label in known for known in by_version.values()):
-            pytest.fail(f"{label} is not a statement in either vendored specification")
+            pytest.fail(f"{where}: {label} is not a statement in either vendored specification")
 
     checked = 0
-    for label, quoted in _QUOTATION.findall(source):
+    for label, quoted in _QUOTATION.findall(source) if verbatim else ():
         quoted_words = _normalise(quoted)
         if not quoted_words:
             continue
@@ -824,8 +822,21 @@ def test_quoted_statements_match_the_vendored_specification() -> None:
                 break
         if not matched:
             rendered = "\n".join(f"  MQTT {v}: {t[:170]}" for v, t in candidates.items())
-            pytest.fail(f"{label} is misquoted\n  docstring: {quoted.strip()[:170]}\n{rendered}")
+            pytest.fail(
+                f"{where}: {label} is misquoted\n  docstring: {quoted.strip()[:170]}\n{rendered}"
+            )
         checked += 1
+    return checked
+
+
+def test_quoted_statements_match_the_vendored_specification() -> None:
+    """Every ``[MQTT-…]`` quote in this module must match the extracted text.
+
+    Without this, a docstring could confidently cite a statement it does not
+    actually reproduce — which is exactly how the wrong clause was cited for the
+    inbound packet-id collision fix.
+    """
+    checked = _check_quotations(Path(__file__).read_text(encoding="utf-8"), Path(__file__).name)
 
     # A floor, not a coverage target: it exists so a broken _QUOTATION regex
     # cannot make this test pass by matching nothing. Adding tests need not
@@ -883,3 +894,29 @@ def test_vendored_statement_index_is_well_formed(version: str) -> None:
     if version == "5.0":
         assert by_id["MQTT-4.2-1"]["appendix_id"] == "MQTT-4.2.0-1"
         assert "MQTT-4.2.0-1" not in by_id
+
+
+# The extractor's own tests build synthetic labels to exercise the parser.
+_SYNTHETIC_LABEL_SOURCES = frozenset({"tests/unit/test_spec_extractor.py"})
+
+
+def test_statement_labels_cited_anywhere_exist() -> None:
+    """Every label in another test module or in the library names a real statement.
+
+    A label in a comment or docstring of ``src/`` or of another test is a
+    claim about the specification too, and was checked by nobody. Those
+    places may paraphrase, so only the label itself is checked there.
+    """
+    root = Path(__file__).resolve().parents[2]
+    seen = 0
+    for directory in ("src", "tests"):
+        for path in sorted((root / directory).rglob("*.py")):
+            relative = path.relative_to(root).as_posix()
+            if relative in _SYNTHETIC_LABEL_SOURCES or path == Path(__file__).resolve():
+                continue
+            source = path.read_text(encoding="utf-8")
+            if "MQTT-" not in source:
+                continue
+            _check_quotations(source, relative, verbatim=False)
+            seen += 1
+    assert seen >= 10, f"only {seen} other files cite a statement; the scan is broken"
