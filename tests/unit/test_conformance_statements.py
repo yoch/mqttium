@@ -14,8 +14,10 @@ from __future__ import annotations
 
 from tests.support import stored_record
 
+import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -199,7 +201,7 @@ def test_mqtt5_allows_a_password_without_a_username() -> None:
     assert not flags & 0x80, "no username flag is expected"
 
 
-def test_mqtt_3_3_2_2_publish_topic_must_not_contain_wildcards() -> None:
+def test_mqtt5_3_3_2_2_publish_topic_must_not_contain_wildcards() -> None:
     """[MQTT-3.3.2-2] The Topic Name in the PUBLISH packet MUST NOT contain
     wildcard characters."""
     engine = _connected()
@@ -255,7 +257,7 @@ def test_mqtt_3_3_1_4_publish_must_not_have_both_qos_bits_set(
     assert _rejects(engine, encode_frame(PacketType.PUBLISH, 0b0110, b"\x00\x01t\x00\x01\x00"))
 
 
-def test_mqtt_3_3_1_2_qos0_publish_must_not_set_dup() -> None:
+def test_mqtt5_3_3_1_2_qos0_publish_must_not_set_dup() -> None:
     """[MQTT-3.3.1-2] The DUP flag MUST be set to 0 for all QoS 0 messages."""
     engine = _connected()
     assert _rejects(engine, encode_frame(PacketType.PUBLISH, 0b1000, b"\x00\x01t\x00"))
@@ -377,7 +379,7 @@ def _auth_connack(method: str = "M") -> bytes:
 
 
 def test_mqtt_3_15_1_1_auth_reserved_flags_are_validated() -> None:
-    """[MQTT-3.15.1-1] Bits 3,2,1 and 0 of the Fixed Header of the AUTH packet
+    """First part of [MQTT-3.15.1-1] Bits 3,2,1 and 0 of the Fixed Header of the AUTH packet
     are reserved and MUST all be set to 0."""
     properties = Properties()
     properties = Properties({**properties.values, "authentication_method": "M"})
@@ -581,7 +583,7 @@ def test_mqtt_4_9_0_3_a_full_send_quota_does_not_block_other_packets() -> None:
     assert [e for e in engine.take_effects() if e.kind is EffectKind.SEND], "PINGREQ was delayed"
 
 
-def test_mqtt_4_7_3_2_null_character_is_refused_in_topics_and_filters() -> None:
+def test_mqtt5_4_7_3_2_null_character_is_refused_in_topics_and_filters() -> None:
     """[MQTT-4.7.3-2] Topic Names and Topic Filters MUST NOT include the null
     character (Unicode U+0000)."""
     engine = _connected()
@@ -610,7 +612,7 @@ def test_mqtt_4_7_3_3_topics_longer_than_65535_bytes_are_refused() -> None:
     ],
 )
 def test_mqtt_4_8_2_2_share_name_rules(topic_filter: str, legal: bool) -> None:
-    """[MQTT-4.8.2-2] The ShareName MUST NOT contain the characters "/", "+" or
+    """First part of [MQTT-4.8.2-2] The ShareName MUST NOT contain the characters "/", "+" or
     "#", but MUST be followed by a "/" character."""
     engine = _connected()
     if legal:
@@ -739,7 +741,7 @@ def test_empty_client_id_is_caught_when_a_resumed_session_forces_clean_start() -
     ],
 )
 def test_mqtt_1_5_3_2_connect_strings_reject_ill_formed_utf8(field: str, config: dict) -> None:
-    """[MQTT-1.5.3-2] A UTF-8 encoded string MUST NOT include an encoding of the
+    """First part of [MQTT-1.5.3-2] A UTF-8 encoded string MUST NOT include an encoding of the
     null character U+0000.
 
     [MQTT-1.5.3-1] additionally requires well-formed UTF-8, which is why the
@@ -785,8 +787,18 @@ _QUOTATION = re.compile(
 _ANY_LABEL = re.compile(r"\[(MQTT-\d+(?:\.\d+)*-\d+)\]")
 
 
-def _normalise(text: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+def _matrix_tool():
+    """The matrix generator: one matching rule for this check and the matrix."""
+    path = Path(__file__).resolve().parents[2] / "tools" / "build_conformance_matrix.py"
+    spec = importlib.util.spec_from_file_location("build_conformance_matrix", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["build_conformance_matrix"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_MATRIX = _matrix_tool()
 
 
 def _check_quotations(source: str, where: str, *, verbatim: bool = True) -> int:
@@ -806,21 +818,13 @@ def _check_quotations(source: str, where: str, *, verbatim: bool = True) -> int:
 
     checked = 0
     for label, quoted in _QUOTATION.findall(source) if verbatim else ():
-        quoted_words = _normalise(quoted)
-        if not quoted_words:
+        if not _MATRIX.normalise(quoted):
             continue
         candidates = {
             version: known[label] for version, known in by_version.items() if label in known
         }
-        matched = False
-        for text in candidates.values():
-            actual = _normalise(text)
-            # The docstring may stop early, but what it does quote must be exact.
-            prefix = " ".join(quoted_words.split()[: len(actual.split())])
-            if actual.startswith(prefix) or prefix in actual:
-                matched = True
-                break
-        if not matched:
+        # The whole statement is quoted: a quotation that stops early is refused.
+        if not any(_MATRIX.quote_matches(quoted, text) for text in candidates.values()):
             rendered = "\n".join(f"  MQTT {v}: {t[:170]}" for v, t in candidates.items())
             pytest.fail(
                 f"{where}: {label} is misquoted\n  docstring: {quoted.strip()[:170]}\n{rendered}"

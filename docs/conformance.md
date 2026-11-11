@@ -154,33 +154,19 @@ encoded. The inbound direction is unchanged and covered by its own test.
 
 ### Verified by executable check
 
-| Statement | Version | Subject |
-| --- | --- | --- |
-| `MQTT-3.1.3-7` | 3.1.1 | An empty ClientId requires a clean session |
-| `MQTT-1.5.3-1` / `-2` | 3.1.1 | CONNECT strings reject U+0000 and ill-formed UTF-8 |
-| `MQTT-3.1.3-1` | 3.1.1 | CONNECT payload field order |
-| `MQTT-3.15.2-1` | 5.0 | A Client cannot send a Server-only AUTH reason code |
-| `MQTT-4.12.0-3` | 5.0 | A Client answers a Server AUTH with 0x18 |
-| §3.14.2.2.2 | 5.0 | DISCONNECT cannot extend a session that was never durable |
-| `MQTT-3.14.4-1` | 5.0 | Nothing is sent after DISCONNECT |
-| `MQTT-4.3.3-6` | 5.0 | Replay sends PUBREL, never the PUBLISH again |
-| `MQTT-4.9.0-3` | 5.0 | A full send quota does not delay SUBSCRIBE or PINGREQ |
-| `MQTT-4.7.3-2` / `-3` | 5.0 | Null character and 65,535-byte limits on topics and filters |
-| `MQTT-4.8.2-2` | 5.0 | ShareName rules for `$share/` filters |
-| `MQTT-3.2.2-1` / `-2` | 3.1.1, 5.0 | Session Present after a clean connection closes the connection |
-| `MQTT-3.3.2-8` | 5.0 | Topic Alias 0 is refused |
-| `MQTT-3.15.1-1` | 5.0 | Reserved AUTH fixed-header bits |
-| `MQTT-4.6.0-2` | 5.0 | PUBACK order follows PUBLISH arrival order |
-| `MQTT-3.1.2-22` | 3.1.1 | No password flag without a username flag (and MQTT 5 still allows it) |
-| `MQTT-3.1.2-21` | 5.0 | Server Keep Alive replaces the requested value |
-| `MQTT-3.3.2-2` | 5.0 | No wildcard in a PUBLISH topic name |
-| `MQTT-3.3.4-6` | 5.0 | No Subscription Identifier on an outbound PUBLISH |
-| `MQTT-3.8.3-2` | 5.0 | SUBSCRIBE carries at least one filter |
-| `MQTT-3.3.1-4` | 3.1.1, 5.0 | PUBLISH must not set both QoS bits |
-| `MQTT-3.3.1-2` | 3.1.1, 5.0 | QoS 0 PUBLISH must not set DUP |
-| `MQTT-2.1.3-1` | 5.0 | Reserved fixed-header flags, over PUBACK, PUBREL, SUBACK, PINGRESP and DISCONNECT |
-| `MQTT-3.14.1-1` | 5.0 | Reserved bits on DISCONNECT |
-| `MQTT-2.2.1-3` / `-4` | 5.0 | Receiving mirror: a QoS > 0 PUBLISH with identifier 0 is refused |
+The statements a test verifies are listed, per specification version, in the
+generated [conformance matrix](conformance-matrix.md). It replaces the table
+this page used to keep by hand, which had drifted from the tests: a statement
+is listed there only when a test's docstring quotes it in full and the
+quotation matches the vendored text of that version.
+
+What "verified" means is narrow. The matrix establishes that a collected,
+unskipped test carries the statement's exact words; it cannot establish that
+the test's assertions cover every obligation in them. A test named
+`test_mqtt311_…` or `test_mqtt5_…` counts for that version only. Statements
+that bind the Server are classified as such and are not counted for the
+client, even where a test checks how the client reacts to a Server that
+breaks them.
 
 Receiver-side validation was probed across nine malformed-frame shapes and
 refused every one, answering with a protocol error rather than a crash or a
@@ -230,9 +216,15 @@ Recorded as observations, not as evidence. All were probed and held:
 
 The two documents contain **390 numbered conformance statements** (139 in 3.1.1,
 251 in 5.0). The MQTT 5 appendix typo documented in [`spec/`](spec/README.md)
-does not create a second rule. A crude attribution pass puts roughly **290** of
-them within reach of a client implementation; the remainder bind the Server
-only.
+does not create a second rule. The same label often names a different
+statement in each document, so coverage is counted per version.
+
+[`spec/applicability.json`](spec/README.md) records which party each statement
+binds. The [conformance matrix](conformance-matrix.md) gives, for the
+statements that bind a client, how many a test verifies, how many are only
+cited, and how many have no evidence, by section. Those generated figures
+replace the earlier estimate of "roughly 290" statements within reach of a
+client.
 
 Of those, the statements above are individually verified — §4 (operational
 behaviour: QoS flows, ordering, flow control, topics, shared subscriptions) and
@@ -252,8 +244,17 @@ made.
 ## Extending this
 
 Add a test to `tests/unit/test_conformance_statements.py` whose docstring opens
-with the statement label followed by its verbatim text; the self-check will
-verify the quote and reject a label that does not exist. Then add a row above.
+with the statement label followed by its complete verbatim text; the
+self-check will verify the quote and reject a label that does not exist, and
+a quotation that stops early is refused. Then run
+`python tools/build_conformance_matrix.py`: the matrix is generated, and
+`tests/project/test_conformance_matrix.py` fails while it is stale.
+
+A statement naming both the Client and the Server needs an entry in
+`docs/spec/applicability.json`; the generator refuses to guess. A statement
+naming one party, or none, is classified by that mention without a warning,
+which is wrong for passive constructions: read it and add an entry when the
+party it names is not the one it binds.
 
 Regenerate the index with `python tools/extract_spec_statements.py` when OASIS
 publishes a new archive, and re-read this file against the new statement set.
