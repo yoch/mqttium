@@ -13,7 +13,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   nothing; a receipt wait that times out leaves the publication active.
 - TCP connections enable TCP keepalive (60 s idle, 10 s interval, 3 probes),
   a transport-level net under MQTT keepalive that also works with
-  `keepalive=0`.
+  `keepalive=0`. On Linux, written data that makes no progress for about 90
+  seconds, including data a live broker does not read, now ends the
+  connection.
 
 ### Changed
 
@@ -32,6 +34,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- A message whose admission to the `messages()` queue timed out was dropped
+  although it had already been acknowledged to the broker. It now stays at
+  the head of the messages carried over to the next connection.
 - The SQLite store's unsupported-schema error no longer calls itself an
   experiment.
 - `disconnect()` that lands while the reader is still releasing a lost
