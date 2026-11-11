@@ -6,6 +6,18 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- `disconnect()` that lands while the reader is still releasing a lost
+  connection no longer leaves QoS 1/2 receipts pending for ever, and
+  `on_disconnect` now runs for that loss.
+- A task cancelled inside `disconnect()` or `connect()` while they stop the
+  automatic reconnect now ends cancelled. The cancellation used to be
+  absorbed, so `asyncio.timeout()` and `TaskGroup` cancellation were lost;
+  a committed `disconnect()` still completes its shutdown first.
+- An unexpected failure of the keepalive loop now ends the connection with
+  that failure as its cause, instead of silently ending dead-peer detection.
+
 ## [1.2.1] - 2026-10-11
 
 Python 3.15 support. The library code is unchanged from 1.2.0, apart from its

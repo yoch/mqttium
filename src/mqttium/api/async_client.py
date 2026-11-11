@@ -1205,18 +1205,22 @@ class AsyncClient:
             and connect_disconnect_fut is not None
             and not connect_disconnect_fut.done()
         )
+        caller_cancelled = False
         if disconnecting_connect:
             assert connect_disconnect_fut is not None
             connect_disconnect_fut.set_result(reason_code)
         else:
-            reconnect_task = self._reconnect_task
-            if reconnect_task is not None and reconnect_task is not asyncio.current_task():
-                reconnect_task.cancel()
-                try:
-                    await reconnect_task
-                except asyncio.CancelledError:
-                    pass
-                self._reconnect_task = None
+            caller_cancelled = await self._cancel_automatic_reconnect(defer_cancellation=True)
+        try:
+            await self._disconnect_locked(reason_code, disconnecting_connect)
+        finally:
+            if caller_cancelled:
+                # The shutdown is committed and has now finished; the caller's
+                # own cancellation, absorbed while joining the reconnect task,
+                # is delivered instead of being lost.
+                raise asyncio.CancelledError
+
+    async def _disconnect_locked(self, reason_code: int, disconnecting_connect: bool) -> None:
         should_close = False
         packet_failure = False
         try:
@@ -1995,6 +1999,25 @@ class AsyncClient:
         finally:
             await self._retire_reader_connection(lifecycle_token, reader_transport, reader_connack)
 
+    async def _release_reader_resources(self, reader_transport: AsyncTransport) -> bool:
+        """Stop the writer and close the reader's transport.
+
+        Returns whether the reader was cancelled meanwhile. The canceller (a
+        terminal ``disconnect()`` or an explicit ``connect()``) then finishes
+        closing the resources, but settlement still belongs to the reader:
+        ending here would leave receipts pending and drop ``on_disconnect``.
+        """
+        try:
+            await self._write_pump.wake_waiters()
+            await self._write_pump.stop()
+            with ignoring_dependency_failures():
+                await reader_transport.close()
+        except asyncio.CancelledError:
+            if not owner_cancelled():
+                raise
+            return True
+        return False
+
     async def _retire_reader_connection(
         self,
         lifecycle_token: int,
@@ -2086,20 +2109,45 @@ class AsyncClient:
         self._reconnect_pending = will_reconnect
         if not will_reconnect:
             self._fail_pending(terminal_cause)
+        await self._finish_reader_retirement(
+            reader_transport,
+            will_reconnect,
+            terminal_cause,
+            None if clean_disconnect else terminal_cause,
+            lifecycle_token,
+            hook_origin,
+        )
+
+    async def _finish_reader_retirement(
+        self,
+        reader_transport: AsyncTransport,
+        will_reconnect: bool,
+        terminal_cause: BaseException,
+        hook_cause: BaseException | None,
+        lifecycle_token: int,
+        hook_origin: asyncio.Task[Any] | None,
+    ) -> None:
+        """Release the reader's resources, then hand the loss to its owners."""
         # Retire resources before lifecycle user code can install a
         # replacement. Replayable state remains in the protocol store.
-        await self._write_pump.wake_waiters()
-        await self._write_pump.stop()
-        with ignoring_dependency_failures():
-            await reader_transport.close()
-        if self._transport is reader_transport:
+        interrupted = await self._release_reader_resources(reader_transport)
+        if interrupted and will_reconnect and self._will_reconnect():
+            # Still reconnectable: whoever cancelled owns what follows.
+            raise asyncio.CancelledError
+        if self._transport is reader_transport and not interrupted:
             self._transport = None
+        if will_reconnect and not self._will_reconnect():
+            # A terminal disconnect() landed while the resources were being
+            # released: nothing will replay the pending work any more.
+            will_reconnect = False
+            self._reconnect_pending = False
+            self._fail_pending(terminal_cause)
         if not will_reconnect:
             # A reconnectable loss must not terminate the application
             # message stream: the same iterator resumes after reconnect.
             self._delivery.close()
         self._lifecycle_hooks.disconnected(
-            None if clean_disconnect else terminal_cause,
+            hook_cause,
             lifecycle_token,
             hook_origin,
         )
@@ -2107,6 +2155,8 @@ class AsyncClient:
             self._reconnect_task = asyncio.create_task(
                 self._reconnect_loop(), name="mqttium-reconnect"
             )
+        if interrupted:
+            raise asyncio.CancelledError
 
     def _terminal_shutdown(self, exc: BaseException) -> None:
         """Fail pending work and close the application stream, terminally.
@@ -2333,6 +2383,11 @@ class AsyncClient:
             # A PINGREQ dependency raised CancelledError: without keepalive
             # the connection cannot detect a dead peer, so retire it.
             self._propose_disconnect_cause(dependency_failure(exc, "keepalive"), _CAUSE_TRANSPORT)
+            await self._close_transport_after_connection_failure()
+        except Exception as exc:
+            # Any other keepalive failure would silently end dead-peer
+            # detection while the connection still looks alive: retire it.
+            self._propose_disconnect_cause(exc, _CAUSE_TRANSPORT)
             await self._close_transport_after_connection_failure()
 
     def _ping_window(self, keepalive: int) -> float:
@@ -2798,16 +2853,35 @@ class AsyncClient:
             return None
         return self._disconnect_exc or MQTTError("Connection closed")
 
-    async def _cancel_automatic_reconnect(self) -> None:
+    async def _cancel_automatic_reconnect(self, *, defer_cancellation: bool = False) -> bool:
+        """Cancel and join the reconnect task.
+
+        Joining a task this method cancelled raises ``CancelledError`` as that
+        task's outcome, and also when the caller itself is cancelled meanwhile.
+        The caller's cancellation is never lost: it propagates once the join is
+        complete, or is reported (``True``) when ``defer_cancellation`` asks to
+        finish a committed shutdown first.
+        """
         reconnect_task = self._reconnect_task
         if reconnect_task is None or reconnect_task is asyncio.current_task():
-            return
+            return False
         reconnect_task.cancel()
-        try:
-            await reconnect_task
-        except asyncio.CancelledError:
-            pass
-        self._reconnect_task = None
+        caller_cancelled = False
+        while True:
+            try:
+                await reconnect_task
+            except asyncio.CancelledError:
+                caller_cancelled = caller_cancelled or owner_cancelled()
+            except Exception:
+                # The supervisor's own failure is not the caller's outcome.
+                break
+            if reconnect_task.done():
+                break
+        if self._reconnect_task is reconnect_task:
+            self._reconnect_task = None
+        if caller_cancelled and not defer_cancellation:
+            raise asyncio.CancelledError
+        return caller_cancelled
 
     def _has_active_explicit_connection(self) -> bool:
         reconnect_task = self._reconnect_task
