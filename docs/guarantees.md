@@ -57,8 +57,11 @@ connection by design.
 *Precondition:* the loss is detected. A peer whose host still answers TCP
 while its application has stopped is detected only by MQTT keepalive, so this
 bound needs `keepalive > 0`: detection takes at most `keepalive` plus
-`ping_timeout`. With `keepalive=0` only TCP keepalive remains (about 90
-seconds, for a vanished host or a cut path, TCP transports only).
+`ping_timeout`. While the `messages()` queue is full the reader reads no
+PINGRESP and that deadline is suspended: detection then waits for
+`iterator_admission_timeout` as well (G3), and has no bound when that is
+`None`. With `keepalive=0` only TCP keepalive remains (about 90 seconds, for
+a vanished host or a cut path, TCP transports only).
 
 - `tests/unit/test_keepalive.py`
 - `tests/unit/test_keepalive_real_world.py`
@@ -68,17 +71,26 @@ seconds, for a vanished host or a cut path, TCP transports only).
 
 ### G3 — Application backpressure cannot stall the client silently
 
-**Status:** Checked.
+**Status:** Partial.
 
 While the `messages()` queue is full the reader reads nothing, so no
 acknowledgement or PINGRESP is processed. That state lasts at most
 `iterator_admission_timeout` (60 seconds by default): the connection then
-fails with `MessageDeliveryError`, which a reconnect policy retries. A
-consumer that awaits a receipt inside its own loop is therefore bounded too.
+fails with `MessageDeliveryError`. No message already acknowledged to the
+broker is lost by that failure.
 
 *Precondition:* `iterator_admission_timeout` is not `None`. Callback delivery
 has no queue: a blocking callback blocks the event loop and is outside this
 guarantee.
+
+*Limit:* what is bounded is the connection, not every wait. A consumer that
+awaits a QoS 1/2 receipt inside its own `messages()` loop is released by that
+failure only when nothing reconnects. With a reconnect policy the receipt is
+kept for replay and the queue is still full on the next connection: the
+connection is lost and re-made every `iterator_admission_timeout` while the
+consumer stays blocked. Bound that wait with `wait(timeout=)`, or do not
+await a receipt there. The model covers the case without a policy, and
+assumes a broker that acknowledges.
 
 - `tests/unit/test_iterator_consumer_deadlock.py`
 - `tests/unit/test_delivery_backpressure.py`
@@ -143,10 +155,11 @@ before it starts the reconnect.
 
 A failure of the writer, of the keepalive loop or of the effect flush ends
 the connection with that failure as its cause, reported through
-`on_disconnect`, receipts and `stats().last_disconnect_error`.
+`on_disconnect` and receipts.
 
-*Limit:* an exception raised inside the reader's own teardown is not covered
-by a test.
+*Limit:* the cited tests cover the writer and the keepalive loop. A failing
+effect flush, an exception raised inside the reader's own teardown, and the
+cause shown by `stats()` are not covered by a test.
 
 - `tests/unit/test_keepalive_unexpected_failure.py`
 - `tests/unit/test_dependency_cancellation.py`
@@ -156,7 +169,7 @@ by a test.
 
 ### G8 — Cancelling a public awaitable is honoured and leaves consistent state
 
-**Status:** Checked.
+**Status:** Partial.
 
 A task cancelled inside `connect*()`, `disconnect()`, `publish()`,
 `publish_many()`, `subscribe()`, `unsubscribe()` or a receipt wait ends
@@ -165,6 +178,12 @@ after, the publication stays active and its packet identifier, flow slot and
 store row stay owned by the client. A committed `disconnect()` finishes its
 shutdown before the cancellation is delivered.
 
+*Limit:* the tests cancel at chosen suspension points of each call, not at
+every one. For a cancelled `publish()` they assert what was admitted and what
+was not; ownership of the identifier, slot and row afterwards is asserted for
+the admission transaction, not through a cancelled call.
+
+- `tests/unit/test_async_publish_admission.py`
 - `tests/unit/test_disconnect_join_cancellation.py`
 - `tests/unit/test_disconnect_cancellation.py`
 - `tests/unit/test_request_cancellation.py`
@@ -176,14 +195,17 @@ shutdown before the cancellation is delivered.
 
 ### G9 — Misuse from another event loop is refused
 
-**Status:** Checked.
+**Status:** Partial.
 
-Every awaitable entry point and `publish_nowait()` raise `RuntimeError` when
-called from another event loop than the one that connected the client,
-instead of running concurrently with it.
+`publish()`, `publish_many()`, `publish_nowait()`, `subscribe()`,
+`unsubscribe()`, `ack()`, `auth()` and `disconnect()` raise `RuntimeError`
+when called from another running event loop than the one that connected the
+client, instead of running concurrently with it. `connect*()` is refused too,
+as already connected or by the same check.
 
-*Limit:* `stats()` and plain attribute reads from another thread are not
-checked.
+*Limit:* `receipt.wait()`, iterating `messages()`, `stats()` and plain
+attribute reads from another loop or thread are not checked. A loop that has
+closed owns nothing: a late `disconnect()` after it is accepted.
 
 - `tests/unit/test_owner_loop_confinement.py`
 

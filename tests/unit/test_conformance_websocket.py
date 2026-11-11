@@ -170,6 +170,42 @@ async def _packets_travel_in_binary_frames(protocol: MQTTProtocolVersion) -> Non
     assert peer.opcodes and set(peer.opcodes) <= {_BINARY, 0x8}
     assert peer.closed_by_client.is_set()
     assert not client.is_connected
+    await _both_write_paths_send_binary_frames()
+
+
+async def _both_write_paths_send_binary_frames() -> None:
+    """The transport has two ways to write, one packet or several at once."""
+    received: list[tuple[int, bytes]] = []
+    done = asyncio.Event()
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peer = _Peer(reader, writer)
+        try:
+            await peer.upgrade()
+            # Payloads past 125 bytes use the extended length that
+            # read_frame decodes; anything else would desynchronise it.
+            while sum(len(payload) for _opcode, payload in received) < 600:
+                payload = await peer.read_frame()
+                received.append((peer.opcodes[-1], payload))
+            done.set()
+            await peer.wait_closed_by_client()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    async with server:
+        transport = await WebSocketTransport.connect(f"ws://127.0.0.1:{port}/mqtt", timeout=2.0)
+        try:
+            await transport.write(b"a" * 200)
+            await transport.write_many([b"b" * 200, b"c" * 200])
+            await asyncio.wait_for(done.wait(), timeout=2.0)
+        finally:
+            await transport.close()
+    assert {opcode for opcode, _payload in received} == {_BINARY}
+    assert b"".join(payload for _opcode, payload in received) == (
+        b"a" * 200 + b"b" * 200 + b"c" * 200
+    )
 
 
 async def _packets_are_not_aligned_on_frames(protocol: MQTTProtocolVersion) -> None:
