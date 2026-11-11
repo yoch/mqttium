@@ -83,3 +83,19 @@ def test_a_late_disconnect_after_the_owner_loop_closed_is_harmless() -> None:
 
     asyncio.run(session())
     asyncio.run(client.disconnect())
+
+
+def test_only_disconnect_is_accepted_after_the_owner_loop_closed() -> None:
+    """What any other call would wait on belongs to the loop that is gone."""
+    client = AsyncClient("late-publish")
+    client._transport_factory = transport_factory(ScriptedBrokerTransport())
+
+    async def session() -> None:
+        await client.connect("unused")
+        await client.disconnect()
+
+    asyncio.run(session())
+    for name in ("publish", "subscribe", "unsubscribe"):
+        with pytest.raises(RuntimeError, match="different event loop"):
+            asyncio.run(_CALLS[name](client))
+    asyncio.run(client.disconnect())
