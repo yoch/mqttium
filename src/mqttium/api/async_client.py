@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Never, TypeVar
 
 from mqttium.api._auth import AuthExchange
 from mqttium.api._cancel import (
+    cancel_requests,
     dependency_failure,
     failure_for,
     ignoring_dependency_failures,
@@ -930,7 +931,13 @@ class AsyncClient:
             # token valid if this caller is cancelled while waiting for the lock.
             self._lifecycle_hooks.begin_operation(replace_connection=False)
             async with self._lifecycle_lock:
-                await self._prepare_explicit_connect()
+                try:
+                    await self._prepare_explicit_connect()
+                except asyncio.CancelledError:
+                    # The takeover already stopped the automatic reconnect;
+                    # a caller that leaves here leaves nobody to reconnect.
+                    self._abandon_connect(MQTTError("Connection attempt cancelled"))
+                    raise
                 # Rechecked, not just entry-checked: the latch is set-once, so a
                 # failure that landed while waiting on the lock is observed here.
                 if self._local_terminal_failure is not None:
@@ -1224,7 +1231,13 @@ class AsyncClient:
         with that loop, which nothing in the client is built to survive.
         """
         owner_loop = self._owner_loop
-        if owner_loop is not None and owner_loop is not asyncio.get_running_loop():
+        if (
+            owner_loop is not None
+            and owner_loop is not asyncio.get_running_loop()
+            and not owner_loop.is_closed()
+        ):
+            # A closed loop runs nothing: a late, idempotent call made after
+            # it ended (a disconnect() in a second asyncio.run) races nobody.
             raise RuntimeError("AsyncClient is bound to a different event loop")
 
     async def disconnect(self, reason_code: int = 0) -> None:
@@ -1321,6 +1334,11 @@ class AsyncClient:
                 # Transport cleanup completes before the separate lifecycle owner
                 # can notify user code; hooks never become a prerequisite here.
                 await self._force_close()
+                if not self._will_reconnect():
+                    # Normally the reader settled pending work as it retired.
+                    # When it had already gone, leaving a transport behind,
+                    # nobody did: the shutdown is terminal either way.
+                    self._terminal_shutdown(self._disconnect_exc or MQTTError("Disconnected"))
 
     def publish_nowait(
         self,
@@ -1627,6 +1645,7 @@ class AsyncClient:
         properties: Properties | None = None,
     ) -> None:
         """Send a client AUTH packet (MQTT 5 continue / re-authenticate)."""
+        self._check_owner_loop()
         async with self._engine_lock:
             if self.auth_handler is None:
                 raise MQTTError("auth() requires an auth_handler")
@@ -2296,7 +2315,12 @@ class AsyncClient:
         # decision with this reader: ending here would keep the client
         # RECONNECTING with no task to reconnect it.
         self._reader_cancel_requested = False
-        if self._transport is reader_transport and not interrupted:
+        if self._transport is reader_transport and (
+            not interrupted or reader_transport.is_closing()
+        ):
+            # Interrupted or not, a transport whose close has begun is no
+            # longer a connection: leaving it in place would make a later
+            # disconnect() take the path of a live one.
             self._transport = None
         if will_reconnect and not self._will_reconnect():
             # A terminal disconnect() landed while the resources were being
@@ -2523,6 +2547,12 @@ class AsyncClient:
                         async with self._engine_lock:
                             self._engine.queue_ping()
                             self._effect_pump.collect_from_engine()
+                    except NotConnectedError:
+                        # The engine left CONNECTED while this loop slept: a
+                        # disconnect() draining its DISCONNECT, or a teardown
+                        # under way. That owner finishes the connection; a
+                        # ping that can no longer be sent is not a failure.
+                        return
                     except PacketTooLargeError as exc:
                         # A broker limit below the two-byte PINGREQ leaves no
                         # conforming keepalive packet to send.
@@ -3028,12 +3058,16 @@ class AsyncClient:
         if reconnect_task is None or reconnect_task is asyncio.current_task():
             return False
         reconnect_task.cancel()
+        # Only a cancellation requested during this join is the caller's. A
+        # task already cancelled earlier, now running its cleanup, must not
+        # have the reconnect task's own outcome charged to it again.
+        requests_before = cancel_requests()
         caller_cancelled = False
         while True:
             try:
                 await reconnect_task
             except asyncio.CancelledError:
-                caller_cancelled = caller_cancelled or owner_cancelled()
+                caller_cancelled = caller_cancelled or owner_cancelled(since=requests_before)
             except Exception:
                 # The supervisor's own failure is not the caller's outcome.
                 break
