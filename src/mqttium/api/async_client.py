@@ -544,10 +544,16 @@ class AsyncClient:
         # Set while the client itself cancels its reader, to tell that apart
         # from a cancellation imposed from outside (event-loop shutdown).
         self._reader_cancel_requested = False
-        # The task running a lifecycle teardown while it joins the reader: the
-        # reader's own retirement must not cancel it, even when it is the AUTH
-        # handler calling disconnect().
+        # The task running a lifecycle teardown while it joins the reader, and
+        # every task inside disconnect(). A teardown carried out on their
+        # behalf, by the reader or by a connecting task, must not cancel them,
+        # even when one is the AUTH handler calling disconnect().
         self._teardown_owner: asyncio.Task[Any] | None = None
+        self._disconnect_callers: set[asyncio.Task[Any]] = set()
+        # Counts disconnect() calls. A connect() that was overtaken by one
+        # gives up instead of clearing the intent it recorded: of two
+        # overlapping lifecycle calls, the one made last decides.
+        self._disconnect_requests = 0
         # Wakes a first connect() waiting between attempts when disconnect()
         # abandons it.
         self._connect_backoff_wake: asyncio.Future[None] | None = None
@@ -929,6 +935,7 @@ class AsyncClient:
         task = asyncio.current_task()
         assert task is not None
         self._explicit_connect_task = task
+        disconnects_seen = self._disconnect_requests
         try:
             self._freeze_message_routes()
             # Cancel obsolete hook work immediately, but keep the live reader's
@@ -969,6 +976,13 @@ class AsyncClient:
                     # alternative endpoint: an injected factory must survive a
                     # plain TCP connect (custom transports rely on this seam).
                     self._transport_factory = TcpTransport.connect
+                if self._disconnect_requests != disconnects_seen:
+                    # disconnect() was called while this call waited for the
+                    # lifecycle lock or replaced the previous connection.
+                    # Connecting now would undo it: the later call decides.
+                    cancelled = MQTTError("Connection cancelled by disconnect()")
+                    self._abandon_connect(cancelled)
+                    raise cancelled
                 self._intentional_disconnect = False
                 # An explicit ``timeout`` bounds the whole call, retries
                 # included. The constructor default bounds each attempt, so a
@@ -1294,6 +1308,7 @@ class AsyncClient:
         origin = self._lifecycle_hooks.begin_operation(replace_connection=False)
         self._disconnect_hook_origin = origin
         self._intentional_disconnect = True
+        self._disconnect_requests += 1
         self._reconnect_pending = False
         backoff = self._connect_backoff_wake
         if backoff is not None and not backoff.done():
@@ -1306,14 +1321,22 @@ class AsyncClient:
             and not connect_disconnect_fut.done()
         )
         caller_cancelled = False
-        if disconnecting_connect:
-            assert connect_disconnect_fut is not None
-            connect_disconnect_fut.set_result(reason_code)
-        else:
-            caller_cancelled = await self._cancel_automatic_reconnect(defer_cancellation=True)
+        # This task owns the shutdown from here on. The reader may retire, or
+        # a connecting task may force the close, before this call reaches its
+        # own forced close: neither may cancel an AUTH handler that is the
+        # caller.
+        caller = asyncio.current_task()
+        assert caller is not None
+        self._disconnect_callers.add(caller)
         try:
+            if disconnecting_connect:
+                assert connect_disconnect_fut is not None
+                connect_disconnect_fut.set_result(reason_code)
+            else:
+                caller_cancelled = await self._cancel_automatic_reconnect(defer_cancellation=True)
             await self._disconnect_locked(reason_code, disconnecting_connect)
         finally:
+            self._disconnect_callers.discard(caller)
             if caller_cancelled:
                 # The shutdown is committed and has now finished; the caller's
                 # own cancellation, absorbed while joining the reconnect task,
@@ -1327,6 +1350,11 @@ class AsyncClient:
             async with self._lifecycle_lock:
                 if disconnecting_connect:
                     return
+                # A connect() called after this disconnect() may have held the
+                # lock first and cleared the intent. This shutdown runs after
+                # it: the connection it closes must not be reconnected.
+                self._intentional_disconnect = True
+                self._reconnect_pending = False
                 if self._transport is None:
                     # No live transport (e.g. called inside a reconnect gap): the
                     # intentional shutdown is still terminal for receipts and the
@@ -2245,7 +2273,7 @@ class AsyncClient:
         self._retire_connection_epoch()
         self._engine.notify_transport_closed()
         self._effect_pump.collect_from_engine()
-        self._auth_exchange.retire(spare=self._teardown_owner)
+        self._auth_exchange.retire(spare=self._auth_handler_spared())
         await self._write_pump.wake_waiters()
         self._flush_delivery_carryover()
         # The keepalive loop belongs to this reader's transport epoch. An
@@ -3284,9 +3312,16 @@ class AsyncClient:
                 pass
         return caller_cancelled
 
+    def _auth_handler_spared(self) -> set[asyncio.Task[Any]]:
+        """Tasks a retiring AUTH exchange must not cancel: those tearing down."""
+        spared = set(self._disconnect_callers)
+        if self._teardown_owner is not None:
+            spared.add(self._teardown_owner)
+        return spared
+
     async def _force_close_transport(self, *, preserve_reconnect: bool) -> None:
         await self._invalidate_connection_epoch()
-        self._auth_exchange.retire()
+        self._auth_exchange.retire(spare=self._auth_handler_spared())
         current = asyncio.current_task()
         old_reader = self._reader_task
         tasks = [

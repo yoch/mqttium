@@ -45,6 +45,15 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- `disconnect()` leaves the client disconnected when it overlaps a
+  `connect()`. The `connect()` used to clear the request once it held the
+  lifecycle lock, and with a reconnect policy the client reconnected by itself
+  after both calls had returned, from a task nothing referenced. A `connect()`
+  overtaken by a later `disconnect()` now raises `MQTTError` ("Connection
+  cancelled by disconnect()") without opening a connection.
+- `disconnect()` called from an authentication handler returns when the broker
+  closes the connection on DISCONNECT, or when the handler runs during the
+  CONNECT handshake, instead of raising `CancelledError` into the handler.
 - PINGREQ leaves before the keep-alive interval ends (a margin of a tenth of
   the interval, at most one second) instead of a few milliseconds after it,
   as MQTT 3.1.1 requires of the interval between packets [MQTT-3.1.2-23].

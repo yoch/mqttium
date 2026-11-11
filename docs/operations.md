@@ -316,6 +316,13 @@ Keep disconnect and store closure in `finally` blocks. A normal disconnect:
 4. closes transport, reader, writer, keepalive and effect work; the reader
    finishes any callback it is already running.
 
+When `disconnect()` returns, the client is disconnected and no reconnect
+attempt is pending, whatever `connect()` overlapped it. A `connect()` that was
+still in progress when `disconnect()` was called ends with `MQTTError`. A
+`connect()` called while a `disconnect()` is in progress either connects once
+the shutdown has finished, or is closed by that shutdown; call it after
+`disconnect()` has returned to be sure of the first.
+
 Lifecycle-hook completion is separate: `disconnect()` can return before
 `on_disconnect` finishes. Hook cancellation is cooperative; hooks must release
 application resources in `finally` blocks.
