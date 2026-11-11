@@ -217,10 +217,8 @@ Intended bound: one reader lot (256 packets or 1 MiB) of synchronous work.
 Known exceptions, not yet bounded:
 
 - every `SqliteInflightStore` call is synchronous; a write lock held by
-  another connection stalls the loop for up to ten seconds, and during
-  ingress ends the client for good (pinned by
-  `tests/unit/test_sqlite_lock_contention.py` as current behaviour, not as a
-  guarantee);
+  another connection stalls the loop for up to 0.25 seconds while receiving
+  and up to ten seconds in `publish()` (see G13 for what survives it);
 - replay of persisted outbound records at reconnect, and store hydration in
   the constructor, are linear in the number of records and do not yield.
 
@@ -262,3 +260,20 @@ broker cannot be told a limit.
 - `tests/resilience/test_decoder_header_budget.py`
 - `tests/resilience/test_hostile_broker.py`
 - `formal/models/SendQuotaOwnership.tla`
+
+### G13 — A store lock held by another connection does not end the client
+
+**Status:** Partial.
+
+While receiving, the write lock is reserved before the engine applies a
+packet that writes. A refusal drops that packet unapplied: the connection is
+lost and retried, the broker resends what was never acknowledged, and nothing
+in memory is ahead of the store. A refused `publish()` fails that call only.
+
+*Precondition:* `SqliteInflightStore`; the memory store has no lock.
+*Limit:* marking a delivery and `ack()` write outside a reserved lot and
+still fail-stop the client when the lock is refused, as does any store failure
+that is not a lock refusal.
+
+- `tests/unit/test_sqlite_lock_contention.py`
+- `formal/models/IngressLockRefusal.tla`

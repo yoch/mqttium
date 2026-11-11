@@ -43,6 +43,12 @@ _RecordT = TypeVar("_RecordT")
 # floor so a large `page_size` cannot produce "too many SQL variables".
 _MAX_SQL_VARIABLES = 900
 _SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
+# A write lock reserved before the engine has seen a packet can be refused
+# without consequence: nothing was mutated, and the connection is retried. It
+# therefore waits far less than a write whose failure cannot be undone.
+_SQLITE_RESERVE_BUSY_TIMEOUT_SECONDS = 0.25
+# Primary result codes of a lock another connection holds.
+_SQLITE_LOCK_REFUSALS = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
 
 # Page statements: fully written out, never composed, so no SQL text in this
 # module derives from a value. Every column except `payload` is listed first, so
@@ -524,6 +530,36 @@ class SqliteInflightStore:
                     self._transaction_started = False
                     self._rollback_only = False
                 raise refusal
+
+    def reserve_batch_write(self) -> None:
+        """Take the write lock of the open batch now, before anything is written.
+
+        ``batch()`` otherwise takes it at the first mutation, by which time the
+        caller may have changed state that only a successful write justifies.
+        A caller that knows a mutation is coming reserves first: a refusal
+        (see :meth:`is_lock_refusal`) then leaves nothing to undo. Outside a
+        batch, or once the batch owns its transaction, this does nothing.
+        """
+        with self._lock:
+            if not self._batch_depth or self._transaction_started:
+                return
+            conn = self._conn
+            conn.execute(f"PRAGMA busy_timeout={int(_SQLITE_RESERVE_BUSY_TIMEOUT_SECONDS * 1000)}")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                # Recorded before the timeout is restored: if that statement
+                # failed, the batch must still own, and end, this transaction.
+                self._transaction_started = True
+            finally:
+                conn.execute(f"PRAGMA busy_timeout={int(_SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}")
+
+    @staticmethod
+    def is_lock_refusal(exc: BaseException) -> bool:
+        """Whether ``exc`` only says that another connection holds the lock."""
+        if not isinstance(exc, sqlite3.OperationalError):
+            return False
+        code = getattr(exc, "sqlite_errorcode", None)
+        return code is not None and (code & 0xFF) in _SQLITE_LOCK_REFUSALS
 
     def _ensure_write_transaction(self) -> None:
         """Open the batch transaction on its first actual mutation."""

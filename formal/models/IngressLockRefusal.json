@@ -1,0 +1,27 @@
+{
+  "module": "IngressLockRefusal.tla",
+  "status": "refinement",
+  "summary": "The reader reserves the store's write lock before the engine applies a packet that writes, so a lock held by another connection drops an unapplied packet and the connection is retried, instead of fail-stopping the client or leaving memory ahead of the store.",
+  "issues": [
+    630
+  ],
+  "tests": [
+    "tests/unit/test_sqlite_lock_contention.py"
+  ],
+  "configs": [
+    {
+      "config": "IngressLockRefusal-v121.cfg",
+      "expect": "violation",
+      "invariant": "ContentionIsNotTerminal"
+    },
+    {
+      "config": "IngressLockRefusal-retry.cfg",
+      "expect": "violation",
+      "invariant": "MemoryMatchesStore"
+    },
+    {
+      "config": "IngressLockRefusal-fixed.cfg",
+      "expect": "pass"
+    }
+  ]
+}

@@ -31,6 +31,12 @@ class InflightStore(Protocol):
     SQLite uses a transaction, memory uses a no-op context. The engine owns
     per-publication compensation; no cross-backend application transaction is
     promised. Neither backend suppresses a failure.
+
+    A store whose write lock can be refused may also offer
+    ``reserve_batch_write()`` and ``is_lock_refusal(exc)``: the runtime then
+    reserves the lock before the engine applies a packet that writes, and
+    treats a refusal as a lost connection instead of a failed store. The
+    memory store has no lock and offers neither.
     """
 
     def batch(self) -> AbstractContextManager[None]: ...

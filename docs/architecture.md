@@ -299,7 +299,9 @@ SQLite schema 5 accepts new databases and this exact format. Older, future and
 inconsistent formats are refused after validation in one WAL-aware read transaction,
 before configuring journal mode. Refusal preserves committed schema and data;
 normal SQLite recovery and checkpointing may change physical files.
-Write batches start lazily on the first mutation. Memory batches only group
+Write batches start lazily on the first mutation; the reader reserves the
+write lock earlier only for a packet that will write, so that a refused lock
+finds nothing to undo. Memory batches only group
 internal operations; they do not promise application-level rollback.
 
 Metadata columns precede payload BLOBs. Replay snapshots ordered identifiers and
