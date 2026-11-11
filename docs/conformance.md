@@ -157,8 +157,16 @@ encoded. The inbound direction is unchanged and covered by its own test.
 The statements a test verifies are listed, per specification version, in the
 generated [conformance matrix](conformance-matrix.md). It replaces the table
 this page used to keep by hand, which had drifted from the tests: a statement
-is listed there only when a test's docstring quotes it and the quotation
-matches the vendored text of that version.
+is listed there only when a test's docstring quotes it in full and the
+quotation matches the vendored text of that version.
+
+What "verified" means is narrow. The matrix establishes that a collected,
+unskipped test carries the statement's exact words; it cannot establish that
+the test's assertions cover every obligation in them. A test named
+`test_mqtt311_…` or `test_mqtt5_…` counts for that version only. Statements
+that bind the Server are classified as such and are not counted for the
+client, even where a test checks how the client reacts to a Server that
+breaks them.
 
 Receiver-side validation was probed across nine malformed-frame shapes and
 refused every one, answering with a protocol error rather than a crash or a
@@ -236,13 +244,17 @@ made.
 ## Extending this
 
 Add a test to `tests/unit/test_conformance_statements.py` whose docstring opens
-with the statement label followed by its verbatim text; the self-check will
-verify the quote and reject a label that does not exist. Then run
+with the statement label followed by its complete verbatim text; the
+self-check will verify the quote and reject a label that does not exist, and
+a quotation that stops early is refused. Then run
 `python tools/build_conformance_matrix.py`: the matrix is generated, and
 `tests/project/test_conformance_matrix.py` fails while it is stale.
 
 A statement naming both the Client and the Server needs an entry in
-`docs/spec/applicability.json`; the generator refuses to guess.
+`docs/spec/applicability.json`; the generator refuses to guess. A statement
+naming one party, or none, is classified by that mention without a warning,
+which is wrong for passive constructions: read it and add an entry when the
+party it names is not the one it binds.
 
 Regenerate the index with `python tools/extract_spec_statements.py` when OASIS
 publishes a new archive, and re-read this file against the new statement set.

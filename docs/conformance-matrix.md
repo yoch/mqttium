@@ -23,8 +23,8 @@ holds in every case, and an unverified one is not a known violation. See
 
 | Version | Statements | Bind a client | Verified | Cited only | No evidence |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| MQTT 3.1.1 | 139 | 77 | 8 | 9 | 60 |
-| MQTT 5.0 | 251 | 139 | 19 | 17 | 103 |
+| MQTT 3.1.1 | 139 | 77 | 3 | 14 | 60 |
+| MQTT 5.0 | 251 | 135 | 17 | 18 | 100 |
 
 The last three columns count only the statements that bind a client.
 
@@ -32,22 +32,22 @@ The last three columns count only the statements that bind a client.
 
 | Section | Bind a client | Verified | Cited only | No evidence |
 | --- | ---: | ---: | ---: | ---: |
-| 1.5 | 3 | 1 | 1 | 1 |
+| 1.5 | 3 | 0 | 2 | 1 |
 | 2.2 | 2 | 0 | 0 | 2 |
-| 2.3 | 6 | 0 | 0 | 6 |
-| 3.1 | 20 | 3 | 2 | 15 |
+| 2.3 | 5 | 0 | 0 | 5 |
+| 3.1 | 21 | 3 | 2 | 16 |
 | 3.2 | 2 | 0 | 1 | 1 |
-| 3.3 | 7 | 3 | 0 | 4 |
+| 3.3 | 7 | 0 | 3 | 4 |
+| 3.6 | 1 | 0 | 0 | 1 |
 | 3.8 | 4 | 0 | 1 | 3 |
-| 3.9 | 2 | 0 | 0 | 2 |
-| 3.10 | 2 | 0 | 0 | 2 |
+| 3.10 | 3 | 0 | 0 | 3 |
 | 3.14 | 2 | 0 | 1 | 1 |
 | 4.1 | 2 | 0 | 0 | 2 |
 | 4.3 | 5 | 0 | 0 | 5 |
 | 4.4 | 1 | 0 | 1 | 0 |
 | 4.5 | 1 | 0 | 0 | 1 |
 | 4.6 | 4 | 0 | 1 | 3 |
-| 4.7 | 6 | 1 | 1 | 4 |
+| 4.7 | 6 | 0 | 2 | 4 |
 | 4.8 | 2 | 0 | 0 | 2 |
 | 6.0 | 4 | 0 | 0 | 4 |
 | 7.0 | 1 | 0 | 0 | 1 |
@@ -55,22 +55,17 @@ The last three columns count only the statements that bind a client.
 
 ### Verified
 
-- `MQTT-1.5.3-2` — `test_mqtt_1_5_3_2_connect_strings_reject_ill_formed_utf8`
 - `MQTT-3.1.2-22` — `test_mqtt_3_1_2_22_mqtt311_rejects_a_password_without_a_username`
 - `MQTT-3.1.3-1` — `test_mqtt_3_1_3_1_connect_payload_field_order`
 - `MQTT-3.1.3-7` — `test_mqtt_3_1_3_7_empty_client_id_requires_a_clean_session`
-- `MQTT-3.3.1-2` — `test_mqtt_3_3_1_2_qos0_publish_must_not_set_dup`
-- `MQTT-3.3.1-4` — `test_mqtt_3_3_1_4_publish_must_not_have_both_qos_bits_set`
-- `MQTT-3.3.2-2` — `test_mqtt_3_3_2_2_publish_topic_must_not_contain_wildcards`
-- `MQTT-4.7.3-2` — `test_mqtt_4_7_3_2_null_character_is_refused_in_topics_and_filters`
 
 ### Cited only
 
-`MQTT-1.5.3-1`, `MQTT-3.1.2-11`, `MQTT-3.1.2-21`, `MQTT-3.2.2-4`, `MQTT-3.8.3-2`, `MQTT-3.14.4-1`, `MQTT-4.4.0-1`, `MQTT-4.6.0-2`, `MQTT-4.7.3-3`
+`MQTT-1.5.3-1`, `MQTT-1.5.3-2`, `MQTT-3.1.2-11`, `MQTT-3.1.2-21`, `MQTT-3.2.2-4`, `MQTT-3.3.1-2`, `MQTT-3.3.1-4`, `MQTT-3.3.2-2`, `MQTT-3.8.3-2`, `MQTT-3.14.4-1`, `MQTT-4.4.0-1`, `MQTT-4.6.0-2`, `MQTT-4.7.3-2`, `MQTT-4.7.3-3`
 
 ### No evidence
 
-`MQTT-1.5.3-3`, `MQTT-2.2.2-1`, `MQTT-2.2.2-2`, `MQTT-2.3.1-1`, `MQTT-2.3.1-2`, `MQTT-2.3.1-3`, `MQTT-2.3.1-5`, `MQTT-2.3.1-6`, `MQTT-2.3.1-7`, `MQTT-3.1.0-1`, `MQTT-3.1.2-6`, `MQTT-3.1.2-12`, `MQTT-3.1.2-13`, `MQTT-3.1.2-14`, `MQTT-3.1.2-15`, `MQTT-3.1.2-18`, `MQTT-3.1.2-19`, `MQTT-3.1.2-20`, `MQTT-3.1.2-23`, `MQTT-3.1.3-2`, `MQTT-3.1.3-3`, `MQTT-3.1.3-4`, `MQTT-3.1.3-10`, `MQTT-3.1.3-11`, `MQTT-3.2.2-5`, `MQTT-3.3.1-1`, `MQTT-3.3.1-6`, `MQTT-3.3.2-1`, `MQTT-3.3.4-1`, `MQTT-3.8.3-1`, `MQTT-3.8.3-3`, `MQTT-3.8.4-2`, `MQTT-3.9.3-1`, `MQTT-3.9.3-2`, `MQTT-3.10.3-1`, `MQTT-3.10.3-2`, `MQTT-3.14.4-2`, `MQTT-4.1.0-1`, `MQTT-4.1.0-2`, `MQTT-4.3.1-1`, `MQTT-4.3.2-1`, `MQTT-4.3.2-2`, `MQTT-4.3.3-1`, `MQTT-4.3.3-2`, `MQTT-4.5.0-2`, `MQTT-4.6.0-1`, `MQTT-4.6.0-3`, `MQTT-4.6.0-4`, `MQTT-4.7.1-1`, `MQTT-4.7.1-2`, `MQTT-4.7.1-3`, `MQTT-4.7.3-1`, `MQTT-4.8.0-1`, `MQTT-4.8.0-2`, `MQTT-6.0.0-1`, `MQTT-6.0.0-2`, `MQTT-6.0.0-3`, `MQTT-6.0.0-4`, `MQTT-7.0.0-2`, `MQTT-7.1.2-1`
+`MQTT-1.5.3-3`, `MQTT-2.2.2-1`, `MQTT-2.2.2-2`, `MQTT-2.3.1-1`, `MQTT-2.3.1-2`, `MQTT-2.3.1-3`, `MQTT-2.3.1-5`, `MQTT-2.3.1-6`, `MQTT-3.1.0-1`, `MQTT-3.1.2-6`, `MQTT-3.1.2-9`, `MQTT-3.1.2-12`, `MQTT-3.1.2-13`, `MQTT-3.1.2-14`, `MQTT-3.1.2-15`, `MQTT-3.1.2-18`, `MQTT-3.1.2-19`, `MQTT-3.1.2-20`, `MQTT-3.1.2-23`, `MQTT-3.1.3-2`, `MQTT-3.1.3-3`, `MQTT-3.1.3-4`, `MQTT-3.1.3-10`, `MQTT-3.1.3-11`, `MQTT-3.2.2-5`, `MQTT-3.3.1-1`, `MQTT-3.3.1-6`, `MQTT-3.3.2-1`, `MQTT-3.3.4-1`, `MQTT-3.6.1-1`, `MQTT-3.8.1-1`, `MQTT-3.8.3-1`, `MQTT-3.8.3-3`, `MQTT-3.10.1-1`, `MQTT-3.10.3-1`, `MQTT-3.10.3-2`, `MQTT-3.14.4-2`, `MQTT-4.1.0-1`, `MQTT-4.1.0-2`, `MQTT-4.3.1-1`, `MQTT-4.3.2-1`, `MQTT-4.3.2-2`, `MQTT-4.3.3-1`, `MQTT-4.3.3-2`, `MQTT-4.5.0-2`, `MQTT-4.6.0-1`, `MQTT-4.6.0-3`, `MQTT-4.6.0-4`, `MQTT-4.7.1-1`, `MQTT-4.7.1-2`, `MQTT-4.7.1-3`, `MQTT-4.7.3-1`, `MQTT-4.8.0-1`, `MQTT-4.8.0-2`, `MQTT-6.0.0-1`, `MQTT-6.0.0-2`, `MQTT-6.0.0-3`, `MQTT-6.0.0-4`, `MQTT-7.0.0-2`, `MQTT-7.1.2-1`
 
 ## MQTT 5.0
 
@@ -78,20 +73,18 @@ The last three columns count only the statements that bind a client.
 | --- | ---: | ---: | ---: | ---: |
 | 1.5 | 5 | 0 | 2 | 3 |
 | 2.1 | 1 | 1 | 0 | 0 |
-| 2.2 | 5 | 0 | 1 | 4 |
-| 3.1 | 21 | 1 | 3 | 17 |
-| 3.2 | 9 | 0 | 3 | 6 |
+| 2.2 | 4 | 0 | 1 | 3 |
+| 3.1 | 22 | 1 | 3 | 18 |
+| 3.2 | 8 | 0 | 2 | 6 |
 | 3.3 | 17 | 6 | 0 | 11 |
 | 3.4 | 3 | 0 | 0 | 3 |
 | 3.5 | 3 | 0 | 0 | 3 |
-| 3.6 | 3 | 0 | 0 | 3 |
+| 3.6 | 4 | 0 | 0 | 4 |
 | 3.7 | 3 | 0 | 0 | 3 |
-| 3.8 | 6 | 1 | 0 | 5 |
-| 3.9 | 1 | 0 | 0 | 1 |
-| 3.10 | 2 | 0 | 0 | 2 |
-| 3.11 | 1 | 0 | 0 | 1 |
-| 3.14 | 7 | 1 | 2 | 4 |
-| 3.15 | 4 | 2 | 0 | 2 |
+| 3.8 | 4 | 1 | 0 | 3 |
+| 3.10 | 3 | 0 | 0 | 3 |
+| 3.14 | 6 | 1 | 2 | 3 |
+| 3.15 | 4 | 1 | 1 | 2 |
 | 4.1 | 1 | 0 | 0 | 1 |
 | 4.2 | 1 | 0 | 1 | 0 |
 | 4.3 | 19 | 1 | 2 | 16 |
@@ -99,7 +92,7 @@ The last three columns count only the statements that bind a client.
 | 4.5 | 1 | 0 | 0 | 1 |
 | 4.6 | 4 | 1 | 0 | 3 |
 | 4.7 | 6 | 2 | 0 | 4 |
-| 4.8 | 2 | 1 | 0 | 1 |
+| 4.8 | 2 | 0 | 1 | 1 |
 | 4.9 | 3 | 1 | 1 | 1 |
 | 4.12 | 5 | 1 | 1 | 3 |
 | 4.13 | 1 | 0 | 0 | 1 |
@@ -109,28 +102,26 @@ The last three columns count only the statements that bind a client.
 
 - `MQTT-2.1.3-1` — `test_mqtt_2_1_3_1_reserved_fixed_header_flags_are_validated`
 - `MQTT-3.1.2-21` — `test_mqtt_3_1_2_21_server_keep_alive_replaces_the_requested_value`
-- `MQTT-3.3.1-2` — `test_mqtt_3_3_1_2_qos0_publish_must_not_set_dup`
+- `MQTT-3.3.1-2` — `test_mqtt5_3_3_1_2_qos0_publish_must_not_set_dup`
 - `MQTT-3.3.1-4` — `test_mqtt_3_3_1_4_publish_must_not_have_both_qos_bits_set`
-- `MQTT-3.3.2-2` — `test_mqtt_3_3_2_2_publish_topic_must_not_contain_wildcards`
+- `MQTT-3.3.2-2` — `test_mqtt5_3_3_2_2_publish_topic_must_not_contain_wildcards`
 - `MQTT-3.3.2-8` — `test_mqtt_3_3_2_8_topic_alias_zero_is_refused`
 - `MQTT-3.3.2-14` — `test_mqtt_3_3_2_14_response_topic_must_not_contain_wildcards`
 - `MQTT-3.3.4-6` — `test_mqtt_3_3_4_6_outbound_publish_rejects_a_subscription_identifier`
 - `MQTT-3.8.3-2` — `test_mqtt_3_8_3_2_subscribe_requires_at_least_one_filter`
 - `MQTT-3.14.4-1` — `test_mqtt_3_14_4_1_nothing_is_sent_after_disconnect`
-- `MQTT-3.15.1-1` — `test_mqtt_3_15_1_1_auth_reserved_flags_are_validated`
 - `MQTT-3.15.2-1` — `test_mqtt_3_15_2_1_client_cannot_send_a_server_only_auth_reason_code`
 - `MQTT-4.3.3-6` — `test_mqtt_4_3_3_6_replay_sends_pubrel_not_publish`
 - `MQTT-4.6.0-2` — `test_mqtt_4_6_0_2_pubacks_follow_the_order_the_publishes_arrived`
-- `MQTT-4.7.3-2` — `test_mqtt_4_7_3_2_null_character_is_refused_in_topics_and_filters`
+- `MQTT-4.7.3-2` — `test_mqtt5_4_7_3_2_null_character_is_refused_in_topics_and_filters`
 - `MQTT-4.7.3-3` — `test_mqtt_4_7_3_3_topics_longer_than_65535_bytes_are_refused`
-- `MQTT-4.8.2-2` — `test_mqtt_4_8_2_2_share_name_rules`
 - `MQTT-4.9.0-3` — `test_mqtt_4_9_0_3_a_full_send_quota_does_not_block_other_packets`
 - `MQTT-4.12.0-3` — `test_mqtt_4_12_0_3_client_answers_a_server_auth_with_continue`
 
 ### Cited only
 
-`MQTT-1.5.4-1`, `MQTT-1.5.4-2`, `MQTT-2.2.1-3`, `MQTT-3.1.2-11`, `MQTT-3.1.3-1`, `MQTT-3.1.3-7`, `MQTT-3.2.2-1`, `MQTT-3.2.2-4`, `MQTT-3.2.2-11`, `MQTT-3.14.1-1`, `MQTT-3.14.2-1`, `MQTT-4.2-1`, `MQTT-4.3.2-5`, `MQTT-4.3.3-4`, `MQTT-4.4.0-1`, `MQTT-4.9.0-1`, `MQTT-4.12.0-5`
+`MQTT-1.5.4-1`, `MQTT-1.5.4-2`, `MQTT-2.2.1-3`, `MQTT-3.1.2-11`, `MQTT-3.1.3-1`, `MQTT-3.1.3-7`, `MQTT-3.2.2-4`, `MQTT-3.2.2-11`, `MQTT-3.14.1-1`, `MQTT-3.14.2-1`, `MQTT-3.15.1-1`, `MQTT-4.2-1`, `MQTT-4.3.2-5`, `MQTT-4.3.3-4`, `MQTT-4.4.0-1`, `MQTT-4.8.2-2`, `MQTT-4.9.0-1`, `MQTT-4.12.0-5`
 
 ### No evidence
 
-`MQTT-1.5.4-3`, `MQTT-1.5.5-1`, `MQTT-1.5.7-1`, `MQTT-2.2.1-2`, `MQTT-2.2.1-5`, `MQTT-2.2.1-6`, `MQTT-2.2.2-1`, `MQTT-3.1.0-1`, `MQTT-3.1.2-4`, `MQTT-3.1.2-9`, `MQTT-3.1.2-12`, `MQTT-3.1.2-13`, `MQTT-3.1.2-16`, `MQTT-3.1.2-17`, `MQTT-3.1.2-18`, `MQTT-3.1.2-19`, `MQTT-3.1.2-20`, `MQTT-3.1.2-23`, `MQTT-3.1.2-30`, `MQTT-3.1.3-2`, `MQTT-3.1.3-3`, `MQTT-3.1.3-4`, `MQTT-3.1.3-11`, `MQTT-3.1.3-12`, `MQTT-3.2.2-5`, `MQTT-3.2.2-14`, `MQTT-3.2.2-15`, `MQTT-3.2.2-17`, `MQTT-3.2.2-18`, `MQTT-3.2.2-21`, `MQTT-3.3.1-1`, `MQTT-3.3.1-3`, `MQTT-3.3.2-1`, `MQTT-3.3.2-7`, `MQTT-3.3.2-9`, `MQTT-3.3.2-10`, `MQTT-3.3.2-13`, `MQTT-3.3.2-19`, `MQTT-3.3.4-1`, `MQTT-3.3.4-7`, `MQTT-3.3.4-8`, `MQTT-3.4.2-1`, `MQTT-3.4.2-2`, `MQTT-3.4.2-3`, `MQTT-3.5.2-1`, `MQTT-3.5.2-2`, `MQTT-3.5.2-3`, `MQTT-3.6.2-1`, `MQTT-3.6.2-2`, `MQTT-3.6.2-3`, `MQTT-3.7.2-1`, `MQTT-3.7.2-2`, `MQTT-3.7.2-3`, `MQTT-3.8.3-1`, `MQTT-3.8.3-4`, `MQTT-3.8.4-2`, `MQTT-3.8.4-4`, `MQTT-3.8.4-7`, `MQTT-3.9.3-1`, `MQTT-3.10.3-1`, `MQTT-3.10.3-2`, `MQTT-3.11.3-1`, `MQTT-3.14.2-3`, `MQTT-3.14.2-4`, `MQTT-3.14.4-2`, `MQTT-3.14.4-3`, `MQTT-3.15.2-2`, `MQTT-3.15.2-3`, `MQTT-4.1.0-1`, `MQTT-4.3.1-1`, `MQTT-4.3.2-1`, `MQTT-4.3.2-2`, `MQTT-4.3.2-3`, `MQTT-4.3.2-4`, `MQTT-4.3.3-1`, `MQTT-4.3.3-2`, `MQTT-4.3.3-3`, `MQTT-4.3.3-5`, `MQTT-4.3.3-7`, `MQTT-4.3.3-8`, `MQTT-4.3.3-9`, `MQTT-4.3.3-10`, `MQTT-4.3.3-11`, `MQTT-4.3.3-12`, `MQTT-4.3.3-13`, `MQTT-4.4.0-2`, `MQTT-4.5.0-2`, `MQTT-4.6.0-1`, `MQTT-4.6.0-3`, `MQTT-4.6.0-4`, `MQTT-4.7.0-1`, `MQTT-4.7.1-1`, `MQTT-4.7.1-2`, `MQTT-4.7.3-1`, `MQTT-4.8.2-1`, `MQTT-4.9.0-2`, `MQTT-4.12.0-7`, `MQTT-4.12.1-1`, `MQTT-4.12.1-2`, `MQTT-4.13.2-1`, `MQTT-6.0.0-1`, `MQTT-6.0.0-2`, `MQTT-6.0.0-3`
+`MQTT-1.5.4-3`, `MQTT-1.5.5-1`, `MQTT-1.5.7-1`, `MQTT-2.2.1-2`, `MQTT-2.2.1-5`, `MQTT-2.2.2-1`, `MQTT-3.1.0-1`, `MQTT-3.1.2-1`, `MQTT-3.1.2-4`, `MQTT-3.1.2-9`, `MQTT-3.1.2-12`, `MQTT-3.1.2-13`, `MQTT-3.1.2-16`, `MQTT-3.1.2-17`, `MQTT-3.1.2-18`, `MQTT-3.1.2-19`, `MQTT-3.1.2-20`, `MQTT-3.1.2-23`, `MQTT-3.1.2-30`, `MQTT-3.1.3-2`, `MQTT-3.1.3-3`, `MQTT-3.1.3-4`, `MQTT-3.1.3-11`, `MQTT-3.1.3-12`, `MQTT-3.2.2-5`, `MQTT-3.2.2-14`, `MQTT-3.2.2-15`, `MQTT-3.2.2-17`, `MQTT-3.2.2-18`, `MQTT-3.2.2-21`, `MQTT-3.3.1-1`, `MQTT-3.3.1-3`, `MQTT-3.3.2-1`, `MQTT-3.3.2-7`, `MQTT-3.3.2-9`, `MQTT-3.3.2-10`, `MQTT-3.3.2-13`, `MQTT-3.3.2-19`, `MQTT-3.3.4-1`, `MQTT-3.3.4-7`, `MQTT-3.3.4-8`, `MQTT-3.4.2-1`, `MQTT-3.4.2-2`, `MQTT-3.4.2-3`, `MQTT-3.5.2-1`, `MQTT-3.5.2-2`, `MQTT-3.5.2-3`, `MQTT-3.6.1-1`, `MQTT-3.6.2-1`, `MQTT-3.6.2-2`, `MQTT-3.6.2-3`, `MQTT-3.7.2-1`, `MQTT-3.7.2-2`, `MQTT-3.7.2-3`, `MQTT-3.8.1-1`, `MQTT-3.8.3-1`, `MQTT-3.8.3-4`, `MQTT-3.10.1-1`, `MQTT-3.10.3-1`, `MQTT-3.10.3-2`, `MQTT-3.14.2-3`, `MQTT-3.14.2-4`, `MQTT-3.14.4-2`, `MQTT-3.15.2-2`, `MQTT-3.15.2-3`, `MQTT-4.1.0-1`, `MQTT-4.3.1-1`, `MQTT-4.3.2-1`, `MQTT-4.3.2-2`, `MQTT-4.3.2-3`, `MQTT-4.3.2-4`, `MQTT-4.3.3-1`, `MQTT-4.3.3-2`, `MQTT-4.3.3-3`, `MQTT-4.3.3-5`, `MQTT-4.3.3-7`, `MQTT-4.3.3-8`, `MQTT-4.3.3-9`, `MQTT-4.3.3-10`, `MQTT-4.3.3-11`, `MQTT-4.3.3-12`, `MQTT-4.3.3-13`, `MQTT-4.4.0-2`, `MQTT-4.5.0-2`, `MQTT-4.6.0-1`, `MQTT-4.6.0-3`, `MQTT-4.6.0-4`, `MQTT-4.7.0-1`, `MQTT-4.7.1-1`, `MQTT-4.7.1-2`, `MQTT-4.7.3-1`, `MQTT-4.8.2-1`, `MQTT-4.9.0-2`, `MQTT-4.12.0-7`, `MQTT-4.12.1-1`, `MQTT-4.12.1-2`, `MQTT-4.13.2-1`, `MQTT-6.0.0-1`, `MQTT-6.0.0-2`, `MQTT-6.0.0-3`
