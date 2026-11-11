@@ -23,8 +23,8 @@ holds in every case, and an unverified one is not a known violation. See
 
 | Version | Statements | Bind a client | Verified | Cited only | No evidence |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| MQTT 3.1.1 | 139 | 73 | 64 | 1 | 8 |
-| MQTT 5.0 | 251 | 138 | 112 | 2 | 24 |
+| MQTT 3.1.1 | 139 | 72 | 67 | 1 | 4 |
+| MQTT 5.0 | 251 | 138 | 115 | 2 | 21 |
 
 The last three columns count only the statements that bind a client.
 
@@ -48,7 +48,7 @@ The last three columns count only the statements that bind a client.
 | 4.6 | 4 | 4 | 0 | 0 |
 | 4.7 | 6 | 6 | 0 | 0 |
 | 4.8 | 2 | 1 | 0 | 1 |
-| 6.0 | 4 | 0 | 0 | 4 |
+| 6.0 | 3 | 3 | 0 | 0 |
 | 7.0 | 1 | 0 | 0 | 1 |
 | 7.1 | 1 | 0 | 0 | 1 |
 
@@ -118,6 +118,9 @@ The last three columns count only the statements that bind a client.
 - `MQTT-4.7.3-2` — `test_mqtt_4_7_3_2_null_character_is_refused_in_topics_and_filters`
 - `MQTT-4.7.3-3` — `test_mqtt311_4_7_3_3_topics_and_filters_fit_in_65535_bytes`
 - `MQTT-4.8.0-1` — `test_mqtt311_4_8_0_1_protocol_violation_closes_the_connection`
+- `MQTT-6.0.0-1` — `test_mqtt311_6_0_0_1_packets_travel_in_binary_frames`, `test_mqtt5_6_0_0_1_packets_travel_in_binary_frames`
+- `MQTT-6.0.0-2` — `test_mqtt311_6_0_0_2_packets_are_not_aligned_on_frames`, `test_mqtt5_6_0_0_2_packets_are_not_aligned_on_frames`
+- `MQTT-6.0.0-3` — `test_mqtt311_6_0_0_3_client_offers_the_mqtt_subprotocol`, `test_mqtt5_6_0_0_3_client_offers_the_mqtt_subprotocol`
 
 ### Cited only
 
@@ -125,7 +128,7 @@ The last three columns count only the statements that bind a client.
 
 ### No evidence
 
-`MQTT-3.1.3-2`, `MQTT-4.8.0-2`, `MQTT-6.0.0-1`, `MQTT-6.0.0-2`, `MQTT-6.0.0-3`, `MQTT-6.0.0-4`, `MQTT-7.0.0-2`, `MQTT-7.1.2-1`
+`MQTT-3.1.3-2`, `MQTT-4.8.0-2`, `MQTT-7.0.0-2`, `MQTT-7.1.2-1`
 
 ## MQTT 5.0
 
@@ -158,7 +161,7 @@ The last three columns count only the statements that bind a client.
 | 4.9 | 3 | 3 | 0 | 0 |
 | 4.12 | 5 | 4 | 0 | 1 |
 | 4.13 | 1 | 0 | 0 | 1 |
-| 6.0 | 3 | 0 | 0 | 3 |
+| 6.0 | 3 | 3 | 0 | 0 |
 
 ### Verified
 
@@ -274,6 +277,9 @@ The last three columns count only the statements that bind a client.
 - `MQTT-4.12.0-5` — `test_mqtt5_4_12_0_5_auth_packets_repeat_the_connect_method`
 - `MQTT-4.12.0-7` — `test_mqtt5_4_12_0_7_no_auth_without_an_authentication_method`
 - `MQTT-4.12.1-1` — `test_mqtt5_4_12_1_1_reauthentication_starts_with_reason_0x19`
+- `MQTT-6.0.0-1` — `test_mqtt311_6_0_0_1_packets_travel_in_binary_frames`, `test_mqtt5_6_0_0_1_packets_travel_in_binary_frames`
+- `MQTT-6.0.0-2` — `test_mqtt311_6_0_0_2_packets_are_not_aligned_on_frames`, `test_mqtt5_6_0_0_2_packets_are_not_aligned_on_frames`
+- `MQTT-6.0.0-3` — `test_mqtt311_6_0_0_3_client_offers_the_mqtt_subprotocol`, `test_mqtt5_6_0_0_3_client_offers_the_mqtt_subprotocol`
 
 ### Cited only
 
@@ -281,4 +287,4 @@ The last three columns count only the statements that bind a client.
 
 ### No evidence
 
-`MQTT-3.1.3-2`, `MQTT-3.4.2-2`, `MQTT-3.4.2-3`, `MQTT-3.5.2-2`, `MQTT-3.5.2-3`, `MQTT-3.6.2-2`, `MQTT-3.6.2-3`, `MQTT-3.7.2-2`, `MQTT-3.7.2-3`, `MQTT-3.8.3-4`, `MQTT-3.8.4-4`, `MQTT-3.14.2-3`, `MQTT-3.14.2-4`, `MQTT-3.14.4-3`, `MQTT-3.15.2-2`, `MQTT-3.15.2-3`, `MQTT-4.3.3-7`, `MQTT-4.3.3-9`, `MQTT-4.3.3-13`, `MQTT-4.12.1-2`, `MQTT-4.13.2-1`, `MQTT-6.0.0-1`, `MQTT-6.0.0-2`, `MQTT-6.0.0-3`
+`MQTT-3.1.3-2`, `MQTT-3.4.2-2`, `MQTT-3.4.2-3`, `MQTT-3.5.2-2`, `MQTT-3.5.2-3`, `MQTT-3.6.2-2`, `MQTT-3.6.2-3`, `MQTT-3.7.2-2`, `MQTT-3.7.2-3`, `MQTT-3.8.3-4`, `MQTT-3.8.4-4`, `MQTT-3.14.2-3`, `MQTT-3.14.2-4`, `MQTT-3.14.4-3`, `MQTT-3.15.2-2`, `MQTT-3.15.2-3`, `MQTT-4.3.3-7`, `MQTT-4.3.3-9`, `MQTT-4.3.3-13`, `MQTT-4.12.1-2`, `MQTT-4.13.2-1`

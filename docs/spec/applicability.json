@@ -52,6 +52,8 @@
       "MQTT-4.6.0-6": "server",
       "MQTT-4.8.0-1": "both",
       "MQTT-4.8.0-2": "both",
+      "MQTT-6.0.0-3": "client",
+      "MQTT-6.0.0-4": "server",
       "MQTT-7.0.0-1": "server",
       "MQTT-7.1.1-1": "server",
       "MQTT-7.1.2-1": "client"
