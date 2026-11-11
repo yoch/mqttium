@@ -199,6 +199,13 @@ Known exceptions, not yet bounded:
   and up to ten seconds in `publish()` (see G13 for what survives it);
 - replay of persisted outbound records at reconnect, and store hydration in
   the constructor, are linear in the number of records and do not yield.
+  Indicative figures, hosted container, at the default limit of 10 000
+  unacknowledged publications: 45 to 170 milliseconds to process the CONNACK
+  of a resumed session with `SqliteInflightStore` (17 to 52 with the memory
+  store), and 40 to 60 milliseconds to construct the client. The pause is
+  proportional to the number of records: `max_unacknowledged_messages` is
+  what bounds it. It was measured and left as it is; splitting it would add
+  a connected-but-replaying state to the engine.
 
 ## Durability and bounds
 
