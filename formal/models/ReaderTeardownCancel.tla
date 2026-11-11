@@ -85,6 +85,14 @@ Next == InternalFailure \/ Disconnect \/ ExternalCancel \/ Complete \/ Quiescent
 
 Spec == Init /\ [][Next]_vars
 
+\* The reader itself always runs to the end of its teardown; nothing is
+\* assumed of the parties that may cancel it.
+FairSpec == Spec /\ WF_vars(Complete)
+
+\* A pending reconnect decision is eventually owned by a reconnect task, or
+\* withdrawn: the client never stays RECONNECTING with nothing behind it.
+PendingIsEventuallyOwned == <>[](pending => task)
+
 \* RECONNECTING always has something reconnecting it.
 ReconnectingHasOwner == (reader = "finished" /\ pending) => task
 

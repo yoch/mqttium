@@ -23,6 +23,15 @@
     {
       "config": "ReaderTeardownCancel-fixed.cfg",
       "expect": "pass"
+    },
+    {
+      "config": "ReaderTeardownCancel-v121-liveness.cfg",
+      "expect": "liveness",
+      "property": "PendingIsEventuallyOwned"
+    },
+    {
+      "config": "ReaderTeardownCancel-fixed-liveness.cfg",
+      "expect": "pass"
     }
   ]
 }

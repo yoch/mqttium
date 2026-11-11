@@ -35,7 +35,9 @@ observed held; the writer, keepalive, effect and authentication tasks cancel
 the reader and never join it.
 
 *Precondition:* none. *Limit:* the argument is by construction and by the
-checks below; no model checks it as a temporal property.
+checks below. Temporal properties are model-checked for three waits only (the
+consumer's receipt, the reader's reconnect decision, the retry after a lost
+replacement); the others are not modelled.
 
 - `tests/project/test_engine_lock_discipline.py`
 - `tests/project/test_cancellation_discipline.py`

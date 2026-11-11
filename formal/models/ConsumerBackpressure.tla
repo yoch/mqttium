@@ -100,6 +100,21 @@ Next == ReadMessage \/ ReadAck \/ SpaceFreed \/ Take \/ AdmissionDeadline \/ Qui
 
 Spec == Init /\ [][Next]_vars
 
+\* Fairness is assumed of the library and of time, never of the application:
+\* the reader keeps reading, a freed slot wakes it, and a deadline that is
+\* armed expires. Nothing obliges the consumer to take a message.
+Fairness ==
+  /\ WF_vars(ReadMessage)
+  /\ WF_vars(ReadAck)
+  /\ WF_vars(SpaceFreed)
+  /\ WF_vars(AdmissionDeadline)
+
+FairSpec == Spec /\ Fairness
+
+\* A consumer waiting for its receipt always gets an answer: the
+\* acknowledgement, or the failure of the connection.
+AwaitingEnds == (consumer = "awaiting") ~> (consumer # "awaiting")
+
 \* A consumer never waits on a reader that waits on it without a bound.
 WaitCycleIsBounded ==
   (conn = "up" /\ reader = "parked" /\ queue = Capacity /\ consumer = "awaiting") => Deadline
