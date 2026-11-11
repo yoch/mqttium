@@ -544,6 +544,10 @@ class AsyncClient:
         # Set while the client itself cancels its reader, to tell that apart
         # from a cancellation imposed from outside (event-loop shutdown).
         self._reader_cancel_requested = False
+        # The task running a lifecycle teardown while it joins the reader: the
+        # reader's own retirement must not cancel it, even when it is the AUTH
+        # handler calling disconnect().
+        self._teardown_owner: asyncio.Task[Any] | None = None
         # Wakes a first connect() waiting between attempts when disconnect()
         # abandons it.
         self._connect_backoff_wake: asyncio.Future[None] | None = None
@@ -934,9 +938,13 @@ class AsyncClient:
                 try:
                     await self._prepare_explicit_connect()
                 except asyncio.CancelledError:
-                    # The takeover already stopped the automatic reconnect;
-                    # a caller that leaves here leaves nobody to reconnect.
-                    self._abandon_connect(MQTTError("Connection attempt cancelled"))
+                    # The takeover already stopped the automatic reconnect. A
+                    # live connection it had not yet replaced needs nothing:
+                    # its reader starts a new one on the next loss. With no
+                    # connection left, a caller that leaves here leaves
+                    # nobody to reconnect.
+                    if not self._has_live_connection():
+                        self._abandon_connect(MQTTError("Connection attempt cancelled"))
                     raise
                 # Rechecked, not just entry-checked: the latch is set-once, so a
                 # failure that landed while waiting on the lock is observed here.
@@ -1035,6 +1043,11 @@ class AsyncClient:
                 wake = self._connect_backoff_wake = loop.create_future()
                 try:
                     await asyncio.wait({wake}, timeout=delay)
+                except asyncio.CancelledError:
+                    # Cancelled between two attempts: as during one, nothing
+                    # will retry for the caller that left.
+                    self._abandon_connect(MQTTError("Connection attempt cancelled"))
+                    raise
                 finally:
                     self._connect_backoff_wake = None
                 if self._intentional_disconnect:
@@ -1047,6 +1060,18 @@ class AsyncClient:
                     raise MQTTTimeoutError(
                         "connect() timed out before the broker accepted a connection"
                     ) from exc
+
+    def _has_live_connection(self) -> bool:
+        """A connected transport that is not closing, with its reader running."""
+        transport = self._transport
+        reader = self._reader_task
+        return (
+            self._engine.state is ConnectionState.CONNECTED
+            and transport is not None
+            and not transport.is_closing()
+            and reader is not None
+            and not reader.done()
+        )
 
     def _abandon_connect(self, cause: BaseException) -> None:
         """Settle an explicit connect that gave up, keeping the message stream."""
@@ -1223,7 +1248,7 @@ class AsyncClient:
         packet = self._engine.begin_disconnect(reason_code)
         await self._flush_terminal_packet(packet, _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT)
 
-    def _check_owner_loop(self) -> None:
+    def _check_owner_loop(self, *, after_owner_closed: bool = False) -> None:
         """Refuse a call made from another event loop than the client's.
 
         The client is confined to the loop that first connected it. A call
@@ -1231,14 +1256,15 @@ class AsyncClient:
         with that loop, which nothing in the client is built to survive.
         """
         owner_loop = self._owner_loop
-        if (
-            owner_loop is not None
-            and owner_loop is not asyncio.get_running_loop()
-            and not owner_loop.is_closed()
-        ):
-            # A closed loop runs nothing: a late, idempotent call made after
-            # it ended (a disconnect() in a second asyncio.run) races nobody.
-            raise RuntimeError("AsyncClient is bound to a different event loop")
+        if owner_loop is None or owner_loop is asyncio.get_running_loop():
+            return
+        if after_owner_closed and owner_loop.is_closed():
+            # A closed loop runs nothing: a late, idempotent disconnect()
+            # made after it ended (in a second asyncio.run) races nobody.
+            # Nothing else is accepted there: what the call would wait on
+            # belongs to the loop that is gone.
+            return
+        raise RuntimeError("AsyncClient is bound to a different event loop")
 
     async def disconnect(self, reason_code: int = 0) -> None:
         """Disconnect gracefully and stop connection-scoped tasks.
@@ -1256,7 +1282,7 @@ class AsyncClient:
         Raises:
             ProtocolError: If the reason code is invalid for the protocol.
         """
-        self._check_owner_loop()
+        self._check_owner_loop(after_owner_closed=True)
         if self._transport is not None and self._engine.state in (
             ConnectionState.CONNECTING,
             ConnectionState.CONNECTED,
@@ -1334,11 +1360,6 @@ class AsyncClient:
                 # Transport cleanup completes before the separate lifecycle owner
                 # can notify user code; hooks never become a prerequisite here.
                 await self._force_close()
-                if not self._will_reconnect():
-                    # Normally the reader settled pending work as it retired.
-                    # When it had already gone, leaving a transport behind,
-                    # nobody did: the shutdown is terminal either way.
-                    self._terminal_shutdown(self._disconnect_exc or MQTTError("Disconnected"))
 
     def publish_nowait(
         self,
@@ -2223,7 +2244,7 @@ class AsyncClient:
         self._retire_connection_epoch()
         self._engine.notify_transport_closed()
         self._effect_pump.collect_from_engine()
-        self._auth_exchange.retire()
+        self._auth_exchange.retire(spare=self._teardown_owner)
         await self._write_pump.wake_waiters()
         self._flush_delivery_carryover()
         # The keepalive loop belongs to this reader's transport epoch. An
@@ -3226,6 +3247,28 @@ class AsyncClient:
         finally:
             self._lifecycle_hooks.release()
 
+    @staticmethod
+    async def _cancel_and_join(tasks: list[asyncio.Task[Any]]) -> bool:
+        """Cancel ``tasks`` and wait for each; report a cancellation of the caller.
+
+        A joined task ends with ``CancelledError`` because it was cancelled
+        here. The same exception also reports a cancellation of the caller
+        made meanwhile: that one is returned, for the caller to deliver once
+        its own cleanup has finished, instead of being absorbed with the first.
+        """
+        requests_before = cancel_requests()
+        caller_cancelled = False
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                caller_cancelled = caller_cancelled or owner_cancelled(since=requests_before)
+            except Exception:  # noqa: S110 - the joined task's own failure
+                pass
+        return caller_cancelled
+
     async def _force_close_transport(self, *, preserve_reconnect: bool) -> None:
         await self._invalidate_connection_epoch()
         self._auth_exchange.retire()
@@ -3247,16 +3290,12 @@ class AsyncClient:
             if task is not None and task is not current
         ]
         self._reader_cancel_requested = True
+        self._teardown_owner = current
         try:
-            for task in tasks_to_stop:
-                task.cancel()
-            for task in tasks_to_stop:
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            caller_cancelled = await self._cancel_and_join(tasks_to_stop)
         finally:
             self._reader_cancel_requested = False
+            self._teardown_owner = None
         # The joined reader may have left an interrupted lot behind.
         self._flush_delivery_carryover()
         if (
@@ -3267,6 +3306,8 @@ class AsyncClient:
         ):
             # A concurrent lifecycle operation installed a replacement while
             # the old reader was being joined. Preserve the new ownership.
+            if caller_cancelled:
+                raise asyncio.CancelledError
             return
         await self._write_pump.stop()
         self._effect_pump.discard_connection_effects(settle_publish=True)
@@ -3295,3 +3336,5 @@ class AsyncClient:
         if not preserve_reconnect:
             # Only the really-terminal teardown closes the application stream.
             self._delivery.close()
+        if caller_cancelled:
+            raise asyncio.CancelledError
