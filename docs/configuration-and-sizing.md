@@ -80,6 +80,14 @@ unacknowledged, so a valid large message is never refused forever: an
 awaiting `publish()` waits for the budget to empty, and `publish_nowait()`
 raises `FlowControlError` until it has.
 
+The message bound also sizes a pause. When a session is resumed, every
+unacknowledged publication is read back and resent or re-queued in one
+synchronous step, so the event loop does nothing else meanwhile. As an
+indication (hosted container, not a guarantee), 10 000 records took 45 to 170
+milliseconds with `SqliteInflightStore` and 17 to 52 with the memory store;
+the pause grows in proportion. Lower `max_unacknowledged_messages` if a pause
+of that order at reconnection matters to the application.
+
 ### Writer and inbound protocol state
 
 | Setting | Default | Purpose |
