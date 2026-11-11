@@ -502,6 +502,17 @@ class AsyncClient:
         # connect() is refused. Never cleared; the application must create
         # a new client.
         self._local_terminal_failure: BaseException | None = None
+        # A store whose write lock can be refused lets the reader reserve it
+        # before the engine sees a packet that will write; other stores pay
+        # nothing for this.
+        engine_store = self._engine.store
+        self._reserve_store_write: Callable[[], None] | None = getattr(
+            engine_store, "reserve_batch_write", None
+        )
+        self._is_store_lock_refusal: Callable[[BaseException], bool] = getattr(
+            engine_store, "is_lock_refusal", lambda _exc: False
+        )
+        self._ingress_lock_refusal: BaseException | None = None
         # Set once a connection is torn down, cleared by the next connect. Read
         # by _publish_wait_failure(); _closed is set too late in teardown to use.
         self._teardown_final = False
@@ -1908,6 +1919,11 @@ class AsyncClient:
         """Decode until a byte/count bound, an auto-PUBACK handoff boundary,
         or the first peer error.
 
+        A packet that will write the store first reserves its write lock. A
+        refused lock ends the lot before that packet, which is dropped
+        unapplied; the reader then retires the connection as a transient
+        loss, and the broker resends what was never acknowledged.
+
         A malformed, oversized or protocol-violating packet ends the lot at
         that packet. It is returned, not raised, so the valid prefix before it
         commits and completes like any lot: the peer error must neither roll
@@ -1919,6 +1935,7 @@ class AsyncClient:
         handle_raw = engine.handle_raw
         inbound = engine.inbound
         max_bytes = _MAX_INGRESS_BATCH_BYTES
+        reserve = self._reserve_store_write
         count = 0
         decoded_bytes = 0
         for _ in range(256):
@@ -1933,6 +1950,20 @@ class AsyncClient:
                 return count, decoded_bytes, False, exc
             if packet is None:
                 break
+            if reserve is not None and engine.may_write_store(packet):
+                # Take the store's write lock before the engine changes
+                # anything for this packet. Refused, the packet was never
+                # applied: the lot ends at the prefix before it and the
+                # connection is retried, instead of a rolled-back lot whose
+                # effects the engine had already applied in memory.
+                try:
+                    reserve()
+                except Exception as exc:
+                    if not self._is_store_lock_refusal(exc):
+                        raise
+                    self._ingress_lock_refusal = exc
+                    return count, decoded_bytes, False, None
+                reserve = None
             peer_error = handle_raw(packet)
             if peer_error is not None:
                 # handle_raw() emitted it as the lot's last effect; the reader
@@ -2059,6 +2090,13 @@ class AsyncClient:
                         # delivered; only now does the peer error retire the
                         # connection.
                         raise peer_error
+                    lock_refusal = self._ingress_lock_refusal
+                    if lock_refusal is not None:
+                        # Same ordering for a refused store lock. Nothing was
+                        # applied for the dropped packet, so this is an
+                        # ordinary, retryable loss of the connection.
+                        self._ingress_lock_refusal = None
+                        raise lock_refusal
                     # A batch that stopped short of both bounds emptied the
                     # buffer, so there is nothing to decode until the next
                     # read(). Re-entering only to observe handled == 0 cost a

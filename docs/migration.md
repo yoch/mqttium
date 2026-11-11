@@ -35,6 +35,11 @@ bound the call it is passed to.
   it. A consumer that legitimately processes one message for longer than a
   minute while the queue is full should raise the value or pass `None` to
   keep the previous unbounded wait.
+- With `SqliteInflightStore`, a write lock held by another connection while
+  the client is receiving now ends the connection as a retryable loss, with
+  the `sqlite3.OperationalError` as its cause, instead of making the client
+  permanently unusable. Code that treated that error in `on_disconnect` as
+  terminal should let its reconnect policy apply.
 - TCP connections enable TCP keepalive. See
   [Configuration and sizing](configuration-and-sizing.md).
 

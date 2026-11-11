@@ -25,6 +25,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   ends the connection with `MessageDeliveryError` instead of leaving it
   `CONNECTED` with the reader stopped; this also bounds a consumer that
   awaits a receipt inside its loop. Pass `None` for the previous behaviour.
+- `SqliteInflightStore`: while receiving, the client reserves the write lock
+  (waiting at most 0.25 s) before applying a packet that writes. A lock held
+  by another connection now drops that packet unapplied and ends the
+  connection as a retryable loss, instead of fail-stopping the client. Other
+  store failures still fail-stop.
 - `connect*(timeout=)` bounds the whole call, including the retries of a
   reconnect policy, and raises `MQTTTimeoutError` at its deadline. Without
   `timeout`, `connect_timeout` still bounds each attempt and the policy

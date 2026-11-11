@@ -63,6 +63,16 @@ SubscriptionRequest = tuple[Callable[[int], WriteItem], PacketType, int]
 
 # MQTT 5 Table 3-11: 0x00 (Success) is sent by the Server only.
 _CLIENT_AUTH_REASON_CODES = frozenset({0x18, 0x19})
+# Packets whose handling writes the inflight store whatever the session holds.
+_STORE_WRITING_PACKETS = frozenset(
+    {
+        PacketType.CONNACK,
+        PacketType.PUBACK,
+        PacketType.PUBREC,
+        PacketType.PUBREL,
+        PacketType.PUBCOMP,
+    }
+)
 
 
 class ProtocolEngine:
@@ -553,6 +563,23 @@ class ProtocolEngine:
         self._release_pending_subscription_requests()
         if was != ConnectionState.DISCONNECTED:
             self._emit(EffectKind.DISCONNECTED, DisconnectInfo(from_broker=False))
+
+    def may_write_store(self, raw: RawPacket) -> bool:
+        """Whether handling ``raw`` can write the inflight store.
+
+        Conservative and cheap: a true answer lets a runtime reserve the
+        store's write lock before any state changes, a false one promises that
+        the handler writes nothing. An automatically acknowledged QoS 1
+        PUBLISH writes only to complete a row recovered from an earlier
+        session.
+        """
+        packet_type = raw.packet_type
+        if packet_type is PacketType.PUBLISH:
+            qos = (raw.flags >> 1) & 0x03
+            if qos == 0:
+                return False
+            return qos != 1 or self.config.manual_ack or self.inbound._stored_inbound > 0
+        return packet_type in _STORE_WRITING_PACKETS
 
     def handle_raw(self, raw: RawPacket) -> MQTTError | None:
         """Apply one packet; return the peer error turned into PROTOCOL_ERROR.

@@ -188,15 +188,26 @@ Three properties of the store matter when sizing a deployment:
 - **Event-loop blocking.** Every store call runs synchronously on the event
   loop. A lock held by another connection to the same file makes a call wait
   up to the five-second busy timeout, with the whole client stalled.
-- **Lock contention is not transient.** If another connection still holds
-  the write lock when the busy timeout expires, the outcome depends on where
-  the client was. A `publish()` raises `sqlite3.OperationalError` after
-  stalling the loop for up to ten seconds (the write, then its rollback), and
-  the client stays usable. While *receiving*, the failed write rolls back a
-  whole ingress lot whose effects the engine has already applied in memory, so
-  the client fail-stops: the connection ends, no reconnect is attempted, and a
-  later `connect()` is refused. Create a new client. Never open the store file
-  from another process, a backup tool included, while its client runs.
+- **Lock contention.** If another connection holds the write lock, the
+  outcome depends on whether anything had been changed when it was refused.
+  - *Receiving.* Before the engine applies a packet that will write
+    (CONNACK, PUBACK, PUBREC, PUBREL, PUBCOMP, a QoS 2 PUBLISH, a QoS 1
+    PUBLISH that is persisted), the reader reserves the write lock, waiting at
+    most 0.25 seconds. A refusal drops that packet unapplied and ends the
+    connection with the `sqlite3.OperationalError` as its cause. It is an
+    ordinary loss: a reconnect policy retries, the broker resends what was
+    never acknowledged, and the client stays usable.
+  - *Publishing.* A `publish()` whose write is refused raises
+    `sqlite3.OperationalError` after stalling the loop for up to ten seconds
+    (the write, then its rollback). Nothing is admitted and the client stays
+    usable.
+  - *Marking a delivery, `ack()`, and any other store failure* (an I/O error,
+    a failed commit) still fail-stop the client: the engine has already
+    changed state the store did not record. The connection ends, no reconnect
+    is attempted and a later `connect()` is refused; create a new client.
+
+  Never open the store file from another process, a backup tool included,
+  while its client runs.
 - **One client per file.** A store file belongs to one client in one process.
   Two clients sharing a file would contend for the lock and overwrite each
   other's packet identifiers; give each client its own database.
