@@ -13,7 +13,8 @@ from mqttium.api import AsyncClient
 from mqttium.enums import ConnectionState, QoS
 from mqttium.errors import MessageDeliveryError, MQTTError
 from mqttium.packets import PublishPacket
-from tests.support import ScriptedBrokerTransport, transport_factory
+from mqttium.protocol.reconnect import ReconnectPolicy
+from tests.support import ScriptedBrokerTransport, transport_factory, wait_until
 
 
 def _backlog(count: int) -> bytes:
@@ -80,3 +81,50 @@ def test_admission_deadline_is_finite_by_default_and_can_be_disabled():
     )
     with pytest.raises(ValueError):
         AsyncClient("callback-set", message_delivery="callback", iterator_admission_timeout=1.0)
+
+
+async def test_admission_deadline_loses_no_acknowledged_message() -> None:
+    """The message whose admission timed out was already acknowledged to the
+    broker, which will not resend it: it must reach the application, in order,
+    like the rest of its lot."""
+    transports: list[ScriptedBrokerTransport] = []
+
+    async def factory(host: str, port: int, *, ssl: object = None) -> ScriptedBrokerTransport:
+        transports.append(ScriptedBrokerTransport())
+        return transports[-1]
+
+    client = AsyncClient(
+        "slow-consumer",
+        keepalive=0,
+        max_iterator_messages=2,
+        iterator_admission_timeout=0.2,
+        reconnect=ReconnectPolicy(initial_delay=0.02, max_delay=0.02),
+    )
+    client._transport_factory = factory
+    await client.connect("unused")
+    protocol = transports[0].protocol
+    transports[0].push_rx(
+        b"".join(
+            PublishPacket(
+                topic="in", payload=b"m%d" % index, qos=1, retain=False, dup=False, mid=index
+            ).encode(protocol)
+            for index in range(1, 7)
+        )
+    )
+    received: list[bytes] = []
+
+    async def consume() -> None:
+        async for message in client.messages():
+            received.append(bytes(message.payload))
+            await asyncio.sleep(0.3)  # alive, but slower than the deadline
+
+    consumer = asyncio.create_task(consume())
+    try:
+        await wait_until(lambda: len(received) >= 6, timeout=10.0)
+    finally:
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        await client.disconnect()
+    assert received == [b"m1", b"m2", b"m3", b"m4", b"m5", b"m6"]
+    # The deadline did fire: the connection was lost and re-established.
+    assert len(transports) >= 2
