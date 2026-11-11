@@ -550,9 +550,9 @@ class AsyncClient:
         # even when one is the AUTH handler calling disconnect().
         self._teardown_owner: asyncio.Task[Any] | None = None
         self._disconnect_callers: set[asyncio.Task[Any]] = set()
-        # Counts disconnect() calls. A connect() that was overtaken by one
-        # gives up instead of clearing the intent it recorded: of two
-        # overlapping lifecycle calls, the one made last decides.
+        # Counts disconnect() calls. A connect() that one of them overtook
+        # before it committed gives up instead of clearing the intent that
+        # disconnect() recorded.
         self._disconnect_requests = 0
         # Wakes a first connect() waiting between attempts when disconnect()
         # abandons it.
@@ -960,6 +960,15 @@ class AsyncClient:
                         "Client is unusable after a local terminal failure; "
                         "create a new AsyncClient instead of reusing this one"
                     )
+                if self._disconnect_requests != disconnects_seen:
+                    # disconnect() was called while this call waited for the
+                    # lifecycle lock or replaced the previous connection.
+                    # Connecting now would undo it. Checked before the hook
+                    # token moves, so the replaced connection's on_disconnect
+                    # is still delivered.
+                    cancelled = MQTTError("Connection cancelled by disconnect()")
+                    self._abandon_connect(cancelled)
+                    raise cancelled
                 self._lifecycle_hooks.begin_operation()
                 lifecycle_token = self._lifecycle_hooks.token
                 was_alt = self._unix_path is not None or self._ws_url is not None
@@ -976,13 +985,6 @@ class AsyncClient:
                     # alternative endpoint: an injected factory must survive a
                     # plain TCP connect (custom transports rely on this seam).
                     self._transport_factory = TcpTransport.connect
-                if self._disconnect_requests != disconnects_seen:
-                    # disconnect() was called while this call waited for the
-                    # lifecycle lock or replaced the previous connection.
-                    # Connecting now would undo it: the later call decides.
-                    cancelled = MQTTError("Connection cancelled by disconnect()")
-                    self._abandon_connect(cancelled)
-                    raise cancelled
                 self._intentional_disconnect = False
                 # An explicit ``timeout`` bounds the whole call, retries
                 # included. The constructor default bounds each attempt, so a

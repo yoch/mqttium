@@ -13,6 +13,7 @@ import pytest
 
 from mqttium.api import AsyncClient
 from mqttium.enums import ConnectionState, PacketType
+from mqttium.errors import MQTTError
 from mqttium.protocol.reconnect import ReconnectPolicy
 from tests.support import ScriptedBrokerTransport
 
@@ -171,10 +172,13 @@ async def test_a_disconnect_that_returns_last_stays_disconnected(turns: int) -> 
     client.on_disconnect = on_disconnect
     order: list[str] = []
 
+    failures: list[BaseException] = []
+
     async def connect() -> None:
         try:
             await client.connect("unused")
-        except Exception:
+        except Exception as exc:
+            failures.append(exc)
             order.append("connect failed")
         else:
             order.append("connect returned")
@@ -183,18 +187,28 @@ async def test_a_disconnect_that_returns_last_stays_disconnected(turns: int) -> 
         await client.disconnect()
         order.append("disconnect returned")
 
+    before = len(transports)
     connecting = asyncio.create_task(connect())
     for _ in range(turns):
         await asyncio.sleep(0)
     disconnecting = asyncio.create_task(disconnect())
     await asyncio.wait_for(asyncio.gather(connecting, disconnecting), 5)
     try:
-        if order[-1] == "disconnect returned":
-            opened = len(transports)
-            await asyncio.sleep(0.2)  # twenty reconnect delays
-            assert client.state is ConnectionState.DISCONNECTED
-            assert _client_tasks() == []
-            assert len(transports) == opened, "the client reconnected after disconnect()"
+        assert order[-1] == "disconnect returned"
+        opened = len(transports)
+        await asyncio.sleep(0.2)  # twenty reconnect delays
+        assert client.state is ConnectionState.DISCONNECTED
+        assert _client_tasks() == []
+        assert len(transports) == opened, "the client reconnected after disconnect()"
+        if failures:
+            assert isinstance(failures[0], MQTTError)
+            assert "cancelled by disconnect()" in str(failures[0])
+        if turns == 0:
+            # Overtaken before it replaced anything: it opens no connection,
+            # and the connection it found is reported closed exactly once.
+            assert failures
+            assert opened == before
+            assert causes == [None]
     finally:
         await asyncio.wait_for(client.disconnect(), 3)
 

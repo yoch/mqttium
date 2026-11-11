@@ -65,12 +65,14 @@ class AuthExchange:
         """
         self.pending.clear()
         task = self.task
-        if (
-            task is not None
-            and task is not asyncio.current_task()
-            and task not in spare
-            and not task.done()
-        ):
+        if task is None or task.done():
+            return
+        if task is asyncio.current_task() or task in spare:
+            # It finishes its own call, but no longer serves the exchange: a
+            # later connection's challenge must not queue behind a handler
+            # that is waiting for that very connection to be torn down.
+            self.task = None
+        else:
             task.cancel()
 
     async def _run(self) -> None:
@@ -78,7 +80,8 @@ class AuthExchange:
         # hand_off() runs during effect collection; an eager task factory
         # would otherwise start the handler inside that critical section.
         await asyncio.sleep(0)
-        while self.pending:
+        this_task = asyncio.current_task()
+        while self.pending and self.task is this_task:
             packet, challenge, epoch = self.pending.popleft()
             if epoch != owner._connection_epoch:
                 continue
