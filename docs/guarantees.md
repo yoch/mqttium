@@ -224,7 +224,7 @@ Known exceptions, not yet bounded:
   Indicative figures, hosted container, at the default limit of 10 000
   unacknowledged publications: 45 to 170 milliseconds to process the CONNACK
   of a resumed session with `SqliteInflightStore` (17 to 52 with the memory
-  store), and 40 to 60 milliseconds to construct the client
+  store), and 40 to 60 milliseconds to construct the client over SQLite
   (`benchmarks/replay_pause.py` reproduces them). The pause is
   proportional to the number of records: `max_unacknowledged_messages` is
   what bounds it. It was measured and left as it is; splitting it would add
