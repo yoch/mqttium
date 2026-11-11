@@ -190,17 +190,31 @@ unfinished publications and is capped by the broker's own Receive Maximum.
 
 Timeouts protect different boundaries:
 
-- `connect_timeout` limits every connection attempt, explicit or automatic;
-  `connect(..., timeout=...)` overrides it for one explicit call;
+- `connect_timeout` limits every connection attempt, explicit or automatic.
+  `connect(..., timeout=...)` instead bounds that whole call, including the
+  retries and backoff of a reconnect policy;
 - `ping_timeout` limits the wait for PINGRESP;
-- `subscribe_timeout` is the default SUBACK/UNSUBACK deadline; `subscribe()`
-  and `unsubscribe()` accept a per-call override. Only the acknowledgement
-  wait raises `MQTTTimeoutError`; a failure while handing the request to the
-  writer propagates unchanged. Timeout or cancellation abandons only the
-  caller's result: a request already sent stays in flight, and its packet
-  identifier is released by the late acknowledgement or connection teardown;
-- `iterator_admission_timeout=None` waits indefinitely; a positive value covers iterator
-  byte reservation and queue admission with one deadline. Callback delivery has
+- `subscribe_timeout` is the default deadline of `subscribe()` and
+  `unsubscribe()`, which accept a per-call override. The deadline covers the
+  whole call: handing the request to the writer and waiting for
+  SUBACK/UNSUBACK. Its expiry raises `MQTTTimeoutError`; a connection failure
+  during either phase propagates unchanged. Timeout or cancellation abandons
+  only the caller's result: a request already sent stays in flight, and its
+  packet identifier is released by the late acknowledgement or connection
+  teardown;
+- `publish(..., timeout=...)` bounds admission. If it expires first, nothing
+  is admitted and `MQTTTimeoutError` is raised; a publication admitted before
+  the deadline is returned as a receipt and is never undone. Without it,
+  `publish()` waits as long as the connection or its reconnect policy lasts;
+- `receipt.wait(timeout=...)` and `batch.wait(timeout=...)` bound that wait
+  only. The publication stays active after `MQTTTimeoutError`, and
+  `is_done()` tells this timeout apart from a publication that failed. MQTTium
+  never retransmits within a session, so without a timeout a receipt waits
+  until the broker acknowledges or the connection ends;
+- `iterator_admission_timeout` (60 seconds by default) covers iterator byte
+  reservation and queue admission with one deadline. When the consumer frees
+  no space in time the connection fails with `MessageDeliveryError`, which a
+  reconnect policy retries. `None` waits indefinitely. Callback delivery has
   no queue: synchronous callbacks run on the reader and are never timed out or
   preempted.
 
@@ -273,8 +287,20 @@ input queue is saturated can still prevent the needed read. Use an independently
 draining consumer plus an application producer with explicit queue/byte bounds
 and a nonblocking overflow policy, or separate receiving and publishing
 connections. Simply inserting another bounded queue and waiting when it is full
-does not remove that dependency. A finite `iterator_admission_timeout` provides bounded
-failure, not a promise to sustain an arbitrary offered rate.
+does not remove that dependency. The default `iterator_admission_timeout`
+provides bounded failure, not a promise to sustain an arbitrary offered rate.
+
+In particular, never await something only the reader can deliver from inside
+the `messages()` loop while the queue may be full: a QoS 1/2
+`receipt.wait()`, `subscribe()`, `unsubscribe()` or `ack()`. The reader is
+waiting for the consumer, and the consumer for the reader. With the default
+deadline that cycle ends as a connection failure after 60 seconds; with
+`iterator_admission_timeout=None` it never ends. The failure reaches the
+consumer only when nothing reconnects: with a `ReconnectPolicy` a QoS 1/2
+receipt is kept for replay, the queue is still full on the next connection,
+and the consumer stays blocked while the connection is lost and re-made every
+60 seconds. Use `publish_nowait()` with `receipt.add_done_callback()`, pass
+`wait(timeout=)`, or hand the reply to a separate task.
 
 Synchronous message callbacks can use `publish_nowait()` with an explicit
 refusal policy. Avoid unbounded task creation or busy retry loops. The

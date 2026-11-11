@@ -188,6 +188,15 @@ Three properties of the store matter when sizing a deployment:
 - **Event-loop blocking.** Every store call runs synchronously on the event
   loop. A lock held by another connection to the same file makes a call wait
   up to the five-second busy timeout, with the whole client stalled.
+- **Lock contention is not transient.** If another connection still holds
+  the write lock when the busy timeout expires, the outcome depends on where
+  the client was. A `publish()` raises `sqlite3.OperationalError` after
+  stalling the loop for up to ten seconds (the write, then its rollback), and
+  the client stays usable. While *receiving*, the failed write rolls back a
+  whole ingress lot whose effects the engine has already applied in memory, so
+  the client fail-stops: the connection ends, no reconnect is attempted, and a
+  later `connect()` is refused. Create a new client. Never open the store file
+  from another process, a backup tool included, while its client runs.
 - **One client per file.** A store file belongs to one client in one process.
   Two clients sharing a file would contend for the lock and overwrite each
   other's packet identifiers; give each client its own database.

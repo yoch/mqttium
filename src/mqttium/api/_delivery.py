@@ -231,6 +231,13 @@ class ApplicationDelivery:
         self._enqueue_accounted(message, size)
         return None
 
+    def _admission_timed_out(self) -> MessageDeliveryError:
+        return MessageDeliveryError(
+            "Application delivery capacity timed out: the messages() consumer freed "
+            f"no queue space within {self.iterator_admission_timeout:g} s. A consumer "
+            "must not await a receipt, subscribe() or ack() result while the queue is full"
+        )
+
     async def _accept_waiting_unaccounted(self, message: Message, generation: int) -> bool:
         """Wait for count capacity; return whether the message was committed.
 
@@ -247,7 +254,7 @@ class ApplicationDelivery:
                     finally:
                         self.waiters -= 1
         except TimeoutError as exc:
-            raise MessageDeliveryError("Application delivery capacity timed out") from exc
+            raise self._admission_timed_out() from exc
         if generation != self._admission_generation:
             return False
         self._enqueue_unaccounted(message)
@@ -274,7 +281,7 @@ class ApplicationDelivery:
                     finally:
                         self.waiters -= 1
         except TimeoutError as exc:
-            raise MessageDeliveryError("Application delivery capacity timed out") from exc
+            raise self._admission_timed_out() from exc
         if generation != self._admission_generation:
             return False
         self._enqueue_accounted(message, size)

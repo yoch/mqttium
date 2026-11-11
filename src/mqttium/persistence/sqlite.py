@@ -306,7 +306,7 @@ class SqliteInflightStore:
             return True
         if version != SQLITE_SCHEMA_VERSION:
             raise RuntimeError(
-                f"Unsupported SQLite schema {version}; this experiment requires schema {SQLITE_SCHEMA_VERSION}"
+                f"Unsupported SQLite schema {version}; this store requires schema {SQLITE_SCHEMA_VERSION}"
             )
         if tables != {"outbound", "inbound"}:
             raise RuntimeError("Inconsistent SQLite schema: expected outbound and inbound tables")

@@ -143,8 +143,6 @@ max-complexity = 15
 
 [tool.ruff.lint.per-file-ignores]
 "src/mqttium/protocol/__init__.py" = ["F401"]
-# The Paho façade's publish path deliberately keeps immediate/queued admission
-# and reservation cleanup together so their ordering/error semantics stay visible.
 "tests/**" = ["B017", "E731"]
 "tests/fuzz/test_hypothesis_fuzz.py" = ["E402"]
 "tests/fuzz/test_matcher_differential.py" = ["E402"]

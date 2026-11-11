@@ -6,6 +6,62 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `publish()`, `PublishReceipt.wait()` and `PublishBatchReceipt.wait()` accept
+  an optional `timeout`. A `publish()` that times out before admission admits
+  nothing; a receipt wait that times out leaves the publication active.
+- TCP connections enable TCP keepalive (60 s idle, 10 s interval, 3 probes),
+  a transport-level net under MQTT keepalive that also works with
+  `keepalive=0`. On Linux, written data that makes no progress for about 90
+  seconds, including data a live broker does not read, now ends the
+  connection.
+
+### Changed
+
+- `subscribe(timeout=)` and `unsubscribe(timeout=)` bound the whole call,
+  including the transfer of the request to the writer. They used to bound
+  only the wait for SUBACK/UNSUBACK.
+- `iterator_admission_timeout` defaults to 60 seconds instead of `None`. A
+  `messages()` consumer that frees no space in a full queue for that long now
+  ends the connection with `MessageDeliveryError` instead of leaving it
+  `CONNECTED` with the reader stopped. Without a reconnect policy this also
+  ends a consumer that awaits a receipt inside its loop; with one, the
+  receipt is kept for replay and that consumer stays blocked across
+  reconnections. Pass `None` for the previous behaviour.
+- `connect*(timeout=)` bounds the whole call, including the retries of a
+  reconnect policy, and raises `MQTTTimeoutError` at its deadline. Without
+  `timeout`, `connect_timeout` still bounds each attempt and the policy
+  decides how long to keep trying. See the migration notes.
+
+### Fixed
+
+- A keepalive ping falling due while `disconnect()` drained its DISCONNECT
+  no longer aborts the graceful shutdown.
+- `disconnect()` and `connect()` called from the cleanup of an already
+  cancelled task are not cancelled a second time.
+- A message whose admission to the `messages()` queue timed out was dropped
+  although it had already been acknowledged to the broker. It now stays at
+  the head of the messages carried over to the next connection.
+- The SQLite store's unsupported-schema error no longer calls itself an
+  experiment.
+- `disconnect()` that lands while the reader is still releasing a lost
+  connection no longer leaves QoS 1/2 receipts pending for ever, and
+  `on_disconnect` now runs for that loss.
+- A task cancelled inside `disconnect()` or `connect()` while they stop the
+  automatic reconnect now ends cancelled. The cancellation used to be
+  absorbed, so `asyncio.timeout()` and `TaskGroup` cancellation were lost;
+  a committed `disconnect()` still completes its shutdown first.
+- A connection failure reported while the reader was already releasing a
+  lost connection could leave the client `RECONNECTING` for ever with nothing
+  reconnecting it. The reader now always completes its reconnect decision.
+- `publish()`, `publish_many()`, `subscribe()`, `unsubscribe()`, `ack()` and
+  `disconnect()` called from another event loop than the client's now raise
+  `RuntimeError`, as `connect()` and `publish_nowait()` already did, instead
+  of racing the owner loop.
+- An unexpected failure of the keepalive loop now ends the connection with
+  that failure as its cause, instead of silently ending dead-peer detection.
+
 ## [1.2.1] - 2026-10-11
 
 Python 3.15 support. The library code is unchanged from 1.2.0, apart from its

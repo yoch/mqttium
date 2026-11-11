@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Never, TypeVar
 
 from mqttium.api._auth import AuthExchange
 from mqttium.api._cancel import (
+    cancel_requests,
     dependency_failure,
     failure_for,
     ignoring_dependency_failures,
@@ -131,6 +132,11 @@ _CAUSE_LOCAL = 3  # local capability failures that make the session unusable
 _DEFAULT_MAX_ITERATOR_MESSAGES = 65_536
 _MQTT311_DEFAULT_OUTBOUND_INFLIGHT = 20
 _DEFAULT_MAX_ITERATOR_BYTES = 64 * 1024 * 1024
+# A full iterator queue stops the reader, and with it every acknowledgement
+# and PINGRESP behind the waiting message. A finite default turns a consumer
+# that never frees a slot into a named connection failure instead of a client
+# that stays CONNECTED while nothing moves.
+_DEFAULT_ITERATOR_ADMISSION_TIMEOUT = 60.0
 
 _ReceiptT = TypeVar("_ReceiptT", "PublishReceipt", "PublishBatchReceipt")
 _AckResultT = TypeVar("_AckResultT", "SubscribeResult", "UnsubscribeResult")
@@ -300,8 +306,13 @@ class AsyncClient:
         max_iterator_messages: Iterator queue count bound.
         max_iterator_bytes: Logical bytes retained in the iterator queue;
             ``None`` disables the bound.
-        iterator_admission_timeout: Optional deadline for admitting one
-            message into the iterator queue; ``None`` waits without deadline.
+        iterator_admission_timeout: Deadline for admitting one message into
+            a full iterator queue. On expiry the connection fails with
+            :class:`MessageDeliveryError`, which the reconnect policy may
+            retry. ``None`` waits without deadline: the reader then reads
+            nothing while the application does not consume, so a consumer
+            that awaits a receipt or an acknowledgement inside its
+            ``messages()`` loop can wait for ever.
         store: Optional inflight store used for durable QoS state. Combine it
             with ``clean_start=False`` to resume the session it holds.
         reconnect: Reconnection policy. ``None`` disables reconnection.
@@ -352,7 +363,7 @@ class AsyncClient:
         manual_ack: bool = False,
         max_iterator_messages: int = _DEFAULT_MAX_ITERATOR_MESSAGES,
         max_iterator_bytes: int | None = _DEFAULT_MAX_ITERATOR_BYTES,
-        iterator_admission_timeout: float | None = None,
+        iterator_admission_timeout: float | None = _DEFAULT_ITERATOR_ADMISSION_TIMEOUT,
         store: MemoryInflightStore | SqliteInflightStore | None = None,
         reconnect: ReconnectPolicy | None = None,
         connect_timeout: float = 30.0,
@@ -390,7 +401,7 @@ class AsyncClient:
         if message_delivery == "callback" and (
             max_iterator_messages != _DEFAULT_MAX_ITERATOR_MESSAGES
             or max_iterator_bytes != _DEFAULT_MAX_ITERATOR_BYTES
-            or iterator_admission_timeout is not None
+            or iterator_admission_timeout not in (None, _DEFAULT_ITERATOR_ADMISSION_TIMEOUT)
         ):
             # Callback delivery retains nothing on the application's behalf, so
             # an iterator bound would describe a queue that does not exist.
@@ -523,6 +534,10 @@ class AsyncClient:
         # Set while the client itself cancels its reader, to tell that apart
         # from a cancellation imposed from outside (event-loop shutdown).
         self._reader_cancel_requested = False
+        # The task running a lifecycle teardown while it joins the reader: the
+        # reader's own retirement must not cancel it, even when it is the AUTH
+        # handler calling disconnect().
+        self._teardown_owner: asyncio.Task[Any] | None = None
         # Wakes a first connect() waiting between attempts when disconnect()
         # abandons it.
         self._connect_backoff_wake: asyncio.Future[None] | None = None
@@ -755,8 +770,10 @@ class AsyncClient:
             port: Broker TCP port.
             ssl: TLS context, ``True`` for a default context, or ``None`` for
                 clear-text TCP.
-            timeout: Transport and CONNACK deadline; ``connect_timeout`` is
-                used when omitted.
+            timeout: Deadline for the whole call, reconnect-policy retries
+                included. When omitted, ``connect_timeout`` bounds each
+                attempt and the reconnect policy alone decides how long the
+                call keeps trying.
 
         Returns:
             The successful CONNACK packet and its negotiated properties.
@@ -786,7 +803,7 @@ class AsyncClient:
 
         Args:
             path: Filesystem path of the broker's AF_UNIX socket.
-            timeout: Transport and CONNACK deadline.
+            timeout: Deadline for the whole call; see :meth:`connect`.
 
         Returns:
             The successful CONNACK packet.
@@ -828,7 +845,7 @@ class AsyncClient:
             url: ``ws://`` or ``wss://`` broker endpoint, including its path.
             ssl: TLS context or default-context selector for ``wss://``.
             extra_headers: Additional HTTP headers for the upgrade request.
-            timeout: Transport and CONNACK deadline.
+            timeout: Deadline for the whole call; see :meth:`connect`.
 
         Returns:
             The successful CONNACK packet.
@@ -908,7 +925,17 @@ class AsyncClient:
             # token valid if this caller is cancelled while waiting for the lock.
             self._lifecycle_hooks.begin_operation(replace_connection=False)
             async with self._lifecycle_lock:
-                await self._prepare_explicit_connect()
+                try:
+                    await self._prepare_explicit_connect()
+                except asyncio.CancelledError:
+                    # The takeover already stopped the automatic reconnect. A
+                    # live connection it had not yet replaced needs nothing:
+                    # its reader starts a new one on the next loss. With no
+                    # connection left, a caller that leaves here leaves
+                    # nobody to reconnect.
+                    if not self._has_live_connection():
+                        self._abandon_connect(MQTTError("Connection attempt cancelled"))
+                    raise
                 # Rechecked, not just entry-checked: the latch is set-once, so a
                 # failure that landed while waiting on the lock is observed here.
                 if self._local_terminal_failure is not None:
@@ -933,9 +960,17 @@ class AsyncClient:
                     # plain TCP connect (custom transports rely on this seam).
                     self._transport_factory = TcpTransport.connect
                 self._intentional_disconnect = False
+                # An explicit ``timeout`` bounds the whole call, retries
+                # included. The constructor default bounds each attempt, so a
+                # reconnect policy can still wait for a broker that starts late.
+                call_deadline = (
+                    None if timeout is None else asyncio.get_running_loop().time() + timeout
+                )
                 timeout = timeout if timeout is not None else self._connect_timeout
                 self._reconnect.reset()
-                connack = await self._connect_with_policy(host, port, ssl=ssl, timeout=timeout)
+                connack = await self._connect_with_policy(
+                    host, port, ssl=ssl, timeout=timeout, call_deadline=call_deadline
+                )
             if self.is_connected:
                 self._lifecycle_hooks.connected(connack, lifecycle_token)
             return connack
@@ -950,6 +985,7 @@ class AsyncClient:
         *,
         ssl: ssl.SSLContext | bool | None,
         timeout: float,
+        call_deadline: float | None = None,
     ) -> ConnAckPacket:
         """Connect, retrying setup failures according to the reconnect policy.
 
@@ -958,12 +994,19 @@ class AsyncClient:
         and try again, until a terminal cause or exhaustion. A failed attempt
         never ends the application message stream -- no connection was made,
         so nothing it delivered is complete.
+
+        ``call_deadline`` is the loop time at which the caller's own
+        ``timeout`` expires. Attempts and backoff only spend what remains of
+        it, and its expiry ends the call with :class:`MQTTTimeoutError`.
         """
         loop = asyncio.get_running_loop()
         while True:
+            attempt_timeout = timeout
+            if call_deadline is not None:
+                attempt_timeout = min(timeout, max(call_deadline - loop.time(), 0.001))
             try:
                 return await self._connect_once_locked(
-                    host, port, ssl=ssl, timeout=timeout, reconnect_attempt=True
+                    host, port, ssl=ssl, timeout=attempt_timeout, reconnect_attempt=True
                 )
             except asyncio.CancelledError:
                 # The caller abandoned connect(); nothing will retry for it.
@@ -984,14 +1027,41 @@ class AsyncClient:
                     self._abandon_connect(exc)
                     raise
                 self._reconnect_pending = True
+                delay = self._reconnect.next_delay()
+                if call_deadline is not None:
+                    delay = min(delay, max(call_deadline - loop.time(), 0.0))
                 wake = self._connect_backoff_wake = loop.create_future()
                 try:
-                    await asyncio.wait({wake}, timeout=self._reconnect.next_delay())
+                    await asyncio.wait({wake}, timeout=delay)
+                except asyncio.CancelledError:
+                    # Cancelled between two attempts: as during one, nothing
+                    # will retry for the caller that left.
+                    self._abandon_connect(MQTTError("Connection attempt cancelled"))
+                    raise
                 finally:
                     self._connect_backoff_wake = None
                 if self._intentional_disconnect:
                     self._abandon_connect(exc)
                     raise MQTTError("Connection cancelled by disconnect()") from exc
+                if call_deadline is not None and loop.time() >= call_deadline:
+                    self._abandon_connect(exc)
+                    if isinstance(exc, MQTTTimeoutError):
+                        raise
+                    raise MQTTTimeoutError(
+                        "connect() timed out before the broker accepted a connection"
+                    ) from exc
+
+    def _has_live_connection(self) -> bool:
+        """A connected transport that is not closing, with its reader running."""
+        transport = self._transport
+        reader = self._reader_task
+        return (
+            self._engine.state is ConnectionState.CONNECTED
+            and transport is not None
+            and not transport.is_closing()
+            and reader is not None
+            and not reader.done()
+        )
 
     def _abandon_connect(self, cause: BaseException) -> None:
         """Settle an explicit connect that gave up, keeping the message stream."""
@@ -1168,6 +1238,24 @@ class AsyncClient:
         packet = self._engine.begin_disconnect(reason_code)
         await self._flush_terminal_packet(packet, _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT)
 
+    def _check_owner_loop(self, *, after_owner_closed: bool = False) -> None:
+        """Refuse a call made from another event loop than the client's.
+
+        The client is confined to the loop that first connected it. A call
+        from another loop would run engine and transport code concurrently
+        with that loop, which nothing in the client is built to survive.
+        """
+        owner_loop = self._owner_loop
+        if owner_loop is None or owner_loop is asyncio.get_running_loop():
+            return
+        if after_owner_closed and owner_loop.is_closed():
+            # A closed loop runs nothing: a late, idempotent disconnect()
+            # made after it ended (in a second asyncio.run) races nobody.
+            # Nothing else is accepted there: what the call would wait on
+            # belongs to the loop that is gone.
+            return
+        raise RuntimeError("AsyncClient is bound to a different event loop")
+
     async def disconnect(self, reason_code: int = 0) -> None:
         """Disconnect gracefully and stop connection-scoped tasks.
 
@@ -1184,6 +1272,7 @@ class AsyncClient:
         Raises:
             ProtocolError: If the reason code is invalid for the protocol.
         """
+        self._check_owner_loop(after_owner_closed=True)
         if self._transport is not None and self._engine.state in (
             ConnectionState.CONNECTING,
             ConnectionState.CONNECTED,
@@ -1205,18 +1294,22 @@ class AsyncClient:
             and connect_disconnect_fut is not None
             and not connect_disconnect_fut.done()
         )
+        caller_cancelled = False
         if disconnecting_connect:
             assert connect_disconnect_fut is not None
             connect_disconnect_fut.set_result(reason_code)
         else:
-            reconnect_task = self._reconnect_task
-            if reconnect_task is not None and reconnect_task is not asyncio.current_task():
-                reconnect_task.cancel()
-                try:
-                    await reconnect_task
-                except asyncio.CancelledError:
-                    pass
-                self._reconnect_task = None
+            caller_cancelled = await self._cancel_automatic_reconnect(defer_cancellation=True)
+        try:
+            await self._disconnect_locked(reason_code, disconnecting_connect)
+        finally:
+            if caller_cancelled:
+                # The shutdown is committed and has now finished; the caller's
+                # own cancellation, absorbed while joining the reconnect task,
+                # is delivered instead of being lost.
+                raise asyncio.CancelledError
+
+    async def _disconnect_locked(self, reason_code: int, disconnecting_connect: bool) -> None:
         should_close = False
         packet_failure = False
         try:
@@ -1343,6 +1436,7 @@ class AsyncClient:
         qos: int | QoS = 0,
         retain: bool = False,
         properties: Properties | None = None,
+        timeout: float | None = None,
     ) -> PublishReceipt:
         """Wait for admission and bounded effect transfer, returning a receipt.
 
@@ -1350,12 +1444,53 @@ class AsyncClient:
         leave an active publication: cancelling this call is not an MQTT undo.
         QoS 0 completes on writer handoff; QoS 1/2 complete on protocol ACK.
         Cancelling receipt.wait() never cancels the exchange or other waiters.
+
+        ``timeout`` bounds this call. If it expires before the publication is
+        admitted, nothing is admitted and :class:`MQTTTimeoutError` is raised.
+        A publication admitted before the deadline is never undone: its
+        receipt is returned at the deadline even if the transfer to the
+        writer is still pending. Without ``timeout`` the call waits as long as
+        the connection, or its reconnect policy, lasts.
+
+        Raises:
+            MQTTTimeoutError: If ``timeout`` expires before admission.
+            ValueError: If ``timeout`` is not a finite positive number.
         """
+        self._check_owner_loop()
+        deadline = None
+        if timeout is not None:
+            _positive("timeout", timeout)
+            deadline = asyncio.get_running_loop().time() + timeout
         receipt = await self._publish_one(
-            topic, payload, qos=qos, retain=retain, properties=properties
+            topic, payload, qos=qos, retain=retain, properties=properties, deadline=deadline
         )
         assert receipt is not None
         return receipt
+
+    @staticmethod
+    async def _before_deadline(waiting: Awaitable[Any], deadline: float | None) -> bool:
+        """Await ``waiting``; return ``False`` if ``deadline`` expired first.
+
+        ``deadline`` is a loop time, so one call-level timeout bounds every
+        wait of that call. The interrupted wait sees an ordinary cancellation
+        and unwinds through its own cancellation path.
+        """
+        if deadline is None:
+            await waiting
+            return True
+        scope = asyncio.timeout_at(deadline)
+        try:
+            async with scope:
+                await waiting
+        except TimeoutError:
+            if not scope.expired():
+                raise
+            return False
+        return True
+
+    async def _settle_before_publish(self, deadline: float | None) -> None:
+        if not await self._before_deadline(self._effect_pump.drain(), deadline):
+            raise MQTTTimeoutError("publish() timed out before admission")
 
     async def _publish_one(
         self,
@@ -1366,6 +1501,7 @@ class AsyncClient:
         retain: bool,
         properties: Properties | None,
         batch: PublishBatchReceipt | None = None,
+        deadline: float | None = None,
     ) -> PublishReceipt | None:
         data = _owned_payload(payload)
         while True:
@@ -1373,7 +1509,7 @@ class AsyncClient:
             # still waits behind delivery. Settle that old receipt before the
             # identifier can be registered again, including within one batch.
             if not self._effect_pump.settled():
-                await self._effect_pump.drain()
+                await self._settle_before_publish(deadline)
             if qos == QoS.AT_MOST_ONCE:
                 direct = self._try_direct_qos0_publish(
                     topic, data, retain=retain, properties=properties, batch=batch
@@ -1408,11 +1544,13 @@ class AsyncClient:
                 # Deferred SEND payloads are outside the writer's budget until
                 # transfer. Await it before admitting another batch element.
                 if self._effect_pump.pending:
-                    await self._effect_pump.drain()
+                    # Admitted: a deadline ends the wait, never the publication.
+                    await self._before_deadline(self._effect_pump.drain(), deadline)
                 if qos != QoS.AT_MOST_ONCE:
                     self._write_pump._try_flush_latency_batch()
                 return receipt
-            await self._wait_publish_space(waiter)
+            if not await self._before_deadline(self._wait_publish_space(waiter), deadline):
+                raise MQTTTimeoutError("publish() timed out waiting for admission")
             terminal = self._publish_wait_failure()
             if terminal is not None:
                 # Parked through a final teardown, which failed every pending
@@ -1470,6 +1608,7 @@ class AsyncClient:
         Cancellation propagates unchanged and leaves that prefix active.
         No input chunk or per-publication task is created.
         """
+        self._check_owner_loop()
         receipt = PublishBatchReceipt(max_failure_details=max_failure_details)
         try:
             source = iter(messages)
@@ -1517,6 +1656,7 @@ class AsyncClient:
         properties: Properties | None = None,
     ) -> None:
         """Send a client AUTH packet (MQTT 5 continue / re-authenticate)."""
+        self._check_owner_loop()
         async with self._engine_lock:
             if self.auth_handler is None:
                 raise MQTTError("auth() requires an auth_handler")
@@ -1623,7 +1763,8 @@ class AsyncClient:
             topics: One filter, an iterable of filters, or filter/options pairs.
             qos: Default maximum QoS for plain string filters.
             properties: MQTT 5 SUBSCRIBE properties.
-            timeout: SUBACK deadline; ``subscribe_timeout`` is used when omitted.
+            timeout: Deadline for the whole call, from submission to SUBACK;
+                ``subscribe_timeout`` is used when omitted.
 
         Returns:
             Packet identifier, broker reason codes in request order, granted
@@ -1633,18 +1774,21 @@ class AsyncClient:
             SubscribeError: If the broker refused at least one filter; its
                 ``result`` holds the full SUBACK, and accepted filters stay
                 subscribed.
-            MQTTTimeoutError: If SUBACK does not arrive before the deadline.
+            MQTTTimeoutError: If the request cannot be sent, or SUBACK does not
+                arrive, before the deadline.
             ValueError: If ``timeout`` is not a finite positive number.
             ProtocolError: If a filter, option, property, or negotiated limit is
                 invalid.
             NotConnectedError: If the client cannot submit the request.
         """
+        self._check_owner_loop()
         if timeout is not None:
             _positive("timeout", timeout)
         # Admission may validate more than once; consume a one-shot iterable once.
         if not isinstance(topics, str):
             topics = tuple(topics)
         loop = asyncio.get_running_loop()
+        deadline = loop.time() + (timeout if timeout is not None else self._subscribe_timeout)
         while True:
             async with self._engine_lock:
                 # Reject a terminal or invalid request before waiting on effects.
@@ -1657,8 +1801,9 @@ class AsyncClient:
                     break
                 self._effect_pump.collect_from_engine()
             # Settle earlier results before a released identifier can be reused.
-            await self._effect_pump.drain()
-        result = await self._await_request_ack(fut, self._sub_futs, mid, timeout, "SUBACK")
+            if not await self._before_deadline(self._effect_pump.drain(), deadline):
+                raise MQTTTimeoutError("SUBSCRIBE timed out before it could be sent")
+        result = await self._await_request_ack(fut, self._sub_futs, mid, deadline, "SUBACK")
         if any(code >= 0x80 for code in result.reason_codes):
             raise SubscribeError(result)
         return result
@@ -1673,24 +1818,28 @@ class AsyncClient:
 
         Args:
             topics: One topic filter or an iterable of filters.
-            timeout: UNSUBACK deadline; ``subscribe_timeout`` is used when omitted.
+            timeout: Deadline for the whole call, from submission to
+                UNSUBACK; ``subscribe_timeout`` is used when omitted.
 
         Returns:
             Packet identifier and MQTT 5 reason codes. MQTT 3.1.1 returns an
             empty reason-code tuple.
 
         Raises:
-            MQTTTimeoutError: If UNSUBACK does not arrive before the deadline.
+            MQTTTimeoutError: If the request cannot be sent, or UNSUBACK does
+                not arrive, before the deadline.
             ValueError: If ``timeout`` is not a finite positive number.
             ProtocolError: If a filter is invalid.
             NotConnectedError: If the client cannot submit the request.
         """
+        self._check_owner_loop()
         if timeout is not None:
             _positive("timeout", timeout)
         # Admission may validate more than once; consume a one-shot iterable once.
         if not isinstance(topics, str):
             topics = tuple(topics)
         loop = asyncio.get_running_loop()
+        deadline = loop.time() + (timeout if timeout is not None else self._subscribe_timeout)
         while True:
             async with self._engine_lock:
                 # Reject a terminal or invalid request before waiting on effects.
@@ -1703,26 +1852,31 @@ class AsyncClient:
                     break
                 self._effect_pump.collect_from_engine()
             # Settle earlier results before a released identifier can be reused.
-            await self._effect_pump.drain()
-        return await self._await_request_ack(fut, self._unsub_futs, mid, timeout, "UNSUBACK")
+            if not await self._before_deadline(self._effect_pump.drain(), deadline):
+                raise MQTTTimeoutError("UNSUBSCRIBE timed out before it could be sent")
+        return await self._await_request_ack(fut, self._unsub_futs, mid, deadline, "UNSUBACK")
 
     async def _await_request_ack(
         self,
         fut: asyncio.Future[_AckResultT],
         futs: dict[int, asyncio.Future[_AckResultT]],
         mid: int,
-        timeout: float | None,
+        deadline: float,
         ack_name: str,
     ) -> _AckResultT:
-        """Flush effects and await one registered SUBACK/UNSUBACK future."""
+        """Flush effects and await one registered SUBACK/UNSUBACK future.
+
+        One deadline covers the transfer to the writer and the wait for the
+        acknowledgement.
+        """
         try:
-            await self._effect_pump.drain()
-            try:
-                return await asyncio.wait_for(
-                    fut, timeout=timeout if timeout is not None else self._subscribe_timeout
+            if not await self._before_deadline(self._effect_pump.drain(), deadline):
+                raise MQTTTimeoutError(
+                    f"{ack_name} timed out for mid={mid} before the request left"
                 )
-            except TimeoutError as exc:
-                raise MQTTTimeoutError(f"{ack_name} timed out for mid={mid}") from exc
+            if not await self._before_deadline(fut, deadline):
+                raise MQTTTimeoutError(f"{ack_name} timed out for mid={mid}")
+            return fut.result()
         finally:
             # Caller ownership spans transfer as well as ACK waiting. Protocol
             # identifiers remain owned by the engine until ACK or teardown.
@@ -1774,6 +1928,7 @@ class AsyncClient:
                 flushing; already accepted acknowledgement state is not rolled
                 back.
         """
+        self._check_owner_loop()
         if message.mid is None:
             return
         try:
@@ -1995,6 +2150,25 @@ class AsyncClient:
         finally:
             await self._retire_reader_connection(lifecycle_token, reader_transport, reader_connack)
 
+    async def _release_reader_resources(self, reader_transport: AsyncTransport) -> bool:
+        """Stop the writer and close the reader's transport.
+
+        Returns whether the reader was cancelled meanwhile. The canceller (a
+        terminal ``disconnect()`` or an explicit ``connect()``) then finishes
+        closing the resources, but settlement still belongs to the reader:
+        ending here would leave receipts pending and drop ``on_disconnect``.
+        """
+        try:
+            await self._write_pump.wake_waiters()
+            await self._write_pump.stop()
+            with ignoring_dependency_failures():
+                await reader_transport.close()
+        except asyncio.CancelledError:
+            if not owner_cancelled():
+                raise
+            return True
+        return False
+
     async def _retire_reader_connection(
         self,
         lifecycle_token: int,
@@ -2028,7 +2202,7 @@ class AsyncClient:
         self._retire_connection_epoch()
         self._engine.notify_transport_closed()
         self._effect_pump.collect_from_engine()
-        self._auth_exchange.retire()
+        self._auth_exchange.retire(spare=self._teardown_owner)
         await self._write_pump.wake_waiters()
         self._flush_delivery_carryover()
         # The keepalive loop belongs to this reader's transport epoch. An
@@ -2086,20 +2260,59 @@ class AsyncClient:
         self._reconnect_pending = will_reconnect
         if not will_reconnect:
             self._fail_pending(terminal_cause)
+        await self._finish_reader_retirement(
+            reader_transport,
+            will_reconnect,
+            terminal_cause,
+            None if clean_disconnect else terminal_cause,
+            lifecycle_token,
+            hook_origin,
+        )
+
+    async def _finish_reader_retirement(
+        self,
+        reader_transport: AsyncTransport,
+        will_reconnect: bool,
+        terminal_cause: BaseException,
+        hook_cause: BaseException | None,
+        lifecycle_token: int,
+        hook_origin: asyncio.Task[Any] | None,
+    ) -> None:
+        """Release the reader's resources, then hand the loss to its owners."""
         # Retire resources before lifecycle user code can install a
         # replacement. Replayable state remains in the protocol store.
-        await self._write_pump.wake_waiters()
-        await self._write_pump.stop()
-        with ignoring_dependency_failures():
-            await reader_transport.close()
-        if self._transport is reader_transport:
+        interrupted = await self._release_reader_resources(reader_transport)
+        if interrupted and will_reconnect and not self._reader_cancel_requested:
+            # Cancelled from outside the client (event-loop shutdown): nobody
+            # is left to reconnect for, exactly as when that cancellation
+            # arrives before the reconnect decision.
+            will_reconnect = False
+            self._reconnect_pending = False
+            self._fail_pending(terminal_cause)
+        # A cancellation requested by the client itself (a failing writer,
+        # keepalive, effect or auth task, or a lifecycle operation) leaves the
+        # decision with this reader: ending here would keep the client
+        # RECONNECTING with no task to reconnect it.
+        self._reader_cancel_requested = False
+        if self._transport is reader_transport and (
+            not interrupted or reader_transport.is_closing()
+        ):
+            # Interrupted or not, a transport whose close has begun is no
+            # longer a connection: leaving it in place would make a later
+            # disconnect() take the path of a live one.
             self._transport = None
+        if will_reconnect and not self._will_reconnect():
+            # A terminal disconnect() landed while the resources were being
+            # released: nothing will replay the pending work any more.
+            will_reconnect = False
+            self._reconnect_pending = False
+            self._fail_pending(terminal_cause)
         if not will_reconnect:
             # A reconnectable loss must not terminate the application
             # message stream: the same iterator resumes after reconnect.
             self._delivery.close()
         self._lifecycle_hooks.disconnected(
-            None if clean_disconnect else terminal_cause,
+            hook_cause,
             lifecycle_token,
             hook_origin,
         )
@@ -2107,6 +2320,8 @@ class AsyncClient:
             self._reconnect_task = asyncio.create_task(
                 self._reconnect_loop(), name="mqttium-reconnect"
             )
+        if interrupted:
+            raise asyncio.CancelledError
 
     def _terminal_shutdown(self, exc: BaseException) -> None:
         """Fail pending work and close the application stream, terminally.
@@ -2311,6 +2526,12 @@ class AsyncClient:
                         async with self._engine_lock:
                             self._engine.queue_ping()
                             self._effect_pump.collect_from_engine()
+                    except NotConnectedError:
+                        # The engine left CONNECTED while this loop slept: a
+                        # disconnect() draining its DISCONNECT, or a teardown
+                        # under way. That owner finishes the connection; a
+                        # ping that can no longer be sent is not a failure.
+                        return
                     except PacketTooLargeError as exc:
                         # A broker limit below the two-byte PINGREQ leaves no
                         # conforming keepalive packet to send.
@@ -2333,6 +2554,11 @@ class AsyncClient:
             # A PINGREQ dependency raised CancelledError: without keepalive
             # the connection cannot detect a dead peer, so retire it.
             self._propose_disconnect_cause(dependency_failure(exc, "keepalive"), _CAUSE_TRANSPORT)
+            await self._close_transport_after_connection_failure()
+        except Exception as exc:
+            # Any other keepalive failure would silently end dead-peer
+            # detection while the connection still looks alive: retire it.
+            self._propose_disconnect_cause(exc, _CAUSE_TRANSPORT)
             await self._close_transport_after_connection_failure()
 
     def _ping_window(self, keepalive: int) -> float:
@@ -2798,16 +3024,39 @@ class AsyncClient:
             return None
         return self._disconnect_exc or MQTTError("Connection closed")
 
-    async def _cancel_automatic_reconnect(self) -> None:
+    async def _cancel_automatic_reconnect(self, *, defer_cancellation: bool = False) -> bool:
+        """Cancel and join the reconnect task.
+
+        Joining a task this method cancelled raises ``CancelledError`` as that
+        task's outcome, and also when the caller itself is cancelled meanwhile.
+        The caller's cancellation is never lost: it propagates once the join is
+        complete, or is reported (``True``) when ``defer_cancellation`` asks to
+        finish a committed shutdown first.
+        """
         reconnect_task = self._reconnect_task
         if reconnect_task is None or reconnect_task is asyncio.current_task():
-            return
+            return False
         reconnect_task.cancel()
-        try:
-            await reconnect_task
-        except asyncio.CancelledError:
-            pass
-        self._reconnect_task = None
+        # Only a cancellation requested during this join is the caller's. A
+        # task already cancelled earlier, now running its cleanup, must not
+        # have the reconnect task's own outcome charged to it again.
+        requests_before = cancel_requests()
+        caller_cancelled = False
+        while True:
+            try:
+                await reconnect_task
+            except asyncio.CancelledError:
+                caller_cancelled = caller_cancelled or owner_cancelled(since=requests_before)
+            except Exception:
+                # The supervisor's own failure is not the caller's outcome.
+                break
+            if reconnect_task.done():
+                break
+        if self._reconnect_task is reconnect_task:
+            self._reconnect_task = None
+        if caller_cancelled and not defer_cancellation:
+            raise asyncio.CancelledError
+        return caller_cancelled
 
     def _has_active_explicit_connection(self) -> bool:
         reconnect_task = self._reconnect_task
@@ -2956,6 +3205,28 @@ class AsyncClient:
         finally:
             self._lifecycle_hooks.release()
 
+    @staticmethod
+    async def _cancel_and_join(tasks: list[asyncio.Task[Any]]) -> bool:
+        """Cancel ``tasks`` and wait for each; report a cancellation of the caller.
+
+        A joined task ends with ``CancelledError`` because it was cancelled
+        here. The same exception also reports a cancellation of the caller
+        made meanwhile: that one is returned, for the caller to deliver once
+        its own cleanup has finished, instead of being absorbed with the first.
+        """
+        requests_before = cancel_requests()
+        caller_cancelled = False
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                caller_cancelled = caller_cancelled or owner_cancelled(since=requests_before)
+            except Exception:  # noqa: S110 - the joined task's own failure
+                pass
+        return caller_cancelled
+
     async def _force_close_transport(self, *, preserve_reconnect: bool) -> None:
         await self._invalidate_connection_epoch()
         self._auth_exchange.retire()
@@ -2977,16 +3248,12 @@ class AsyncClient:
             if task is not None and task is not current
         ]
         self._reader_cancel_requested = True
+        self._teardown_owner = current
         try:
-            for task in tasks_to_stop:
-                task.cancel()
-            for task in tasks_to_stop:
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            caller_cancelled = await self._cancel_and_join(tasks_to_stop)
         finally:
             self._reader_cancel_requested = False
+            self._teardown_owner = None
         # The joined reader may have left an interrupted lot behind.
         self._flush_delivery_carryover()
         if (
@@ -2997,6 +3264,8 @@ class AsyncClient:
         ):
             # A concurrent lifecycle operation installed a replacement while
             # the old reader was being joined. Preserve the new ownership.
+            if caller_cancelled:
+                raise asyncio.CancelledError
             return
         await self._write_pump.stop()
         self._effect_pump.discard_connection_effects(settle_publish=True)
@@ -3025,3 +3294,5 @@ class AsyncClient:
         if not preserve_reconnect:
             # Only the really-terminal teardown closes the application stream.
             self._delivery.close()
+        if caller_cancelled:
+            raise asyncio.CancelledError

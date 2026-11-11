@@ -30,9 +30,6 @@ _CANCEL_TYPES = frozenset({"asyncio.CancelledError", "CancelledError", "BaseExce
 _SWALLOW_ALLOWED = {
     ("api/_effects.py", "_done"): "done callback of a finished task; cancellation is its outcome",
     ("api/_writer.py", "stop"): "joins the writer task this method just cancelled",
-    ("api/async_client.py", "disconnect"): "joins the reconnect task it just cancelled",
-    ("api/async_client.py", "_cancel_automatic_reconnect"): "joins the task it just cancelled",
-    ("api/async_client.py", "_force_close_transport"): "joins the tasks it just cancelled",
     (
         "api/async_client.py",
         "_retire_reader_connection",

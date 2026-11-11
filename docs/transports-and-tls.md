@@ -99,12 +99,18 @@ storage, and redaction policy. See [MQTT 5](mqtt-5.md).
 
 ## Timeouts and failure handling
 
-A connect timeout is one deadline per attempt: TCP, Unix or WebSocket setup,
-including TLS and the WebSocket upgrade, spends the same budget as the wait
-for CONNACK, which only receives what remains. `connect_timeout` on the client
-applies to explicit calls that omit `timeout` and to every automatic reconnect
-attempt. Closing a previous connection, reconnect backoff and lifecycle hooks
-are outside the attempt. Independently of that budget, asyncio aborts a TLS
+Within one attempt, TCP, Unix or WebSocket setup, including TLS and the
+WebSocket upgrade, spends the same budget as the wait for CONNACK, which only
+receives what remains.
+
+An explicit `timeout` passed to `connect*()` bounds the whole call: when a
+`ReconnectPolicy` retries setup failures, every attempt and every backoff
+spends the same deadline, and its expiry raises `MQTTTimeoutError` with the
+last failure as its cause. `connect_timeout` on the client is a per-attempt
+bound: it applies to explicit calls that omit `timeout` and to every automatic
+reconnect attempt, and then the policy alone decides how long `connect*()`
+keeps trying (indefinitely with the default `max_retries=None`). Closing a
+previous connection and lifecycle hooks are outside both budgets. Independently of that budget, asyncio aborts a TLS
 handshake that takes longer than 60 seconds with an `OSError`. Treat
 certificate failures, broker
 authorization failures, and malformed protocol traffic as terminal until the

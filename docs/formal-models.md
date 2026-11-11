@@ -76,8 +76,9 @@ python tools/formal/run_tlc.py --list     # index of models, issues and expectat
 The runner needs Java 11 or newer. On first use it downloads the pinned
 `tla2tools.jar` release, checks its SHA-256, and caches it under
 `~/.cache/mqttium/formal/`. To use a pre-fetched copy, set
-`MQTTIUM_TLA2TOOLS_JAR`; its hash is still checked. The `Formal models`
-workflow runs the same command for changes under `formal/` or `tools/formal/`.
+`MQTTIUM_TLA2TOOLS_JAR`; its hash is still checked. The required CI gate runs the
+same command on every change, because a runtime change can invalidate the
+predicates a model encodes without touching `formal/`.
 `tests/project/test_formal_models.py` checks the sidecars without Java.
 
 ## Tying models to code

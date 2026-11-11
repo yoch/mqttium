@@ -6,12 +6,33 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Literal
 from types import MappingProxyType
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from functools import partial
 
 from mqttium.enums import QoS
-from mqttium.errors import PublishBatchError
+from mqttium.errors import MQTTTimeoutError, PublishBatchError
 from mqttium.types import Properties, _owned_payload
+
+
+async def _wait_bounded(waiting: Coroutine[Any, Any, None], timeout: float, what: str) -> None:
+    """Await a receipt's unbounded wait under the caller's own deadline.
+
+    Only the expiry of this deadline becomes "timed out waiting": a receipt
+    that *failed* with a timeout (a lost PINGRESP, for example) re-raises that
+    failure unchanged.
+    """
+    if not timeout > 0 or timeout == float("inf"):
+        waiting.close()
+        raise ValueError("timeout must be a finite positive number")
+    scope = asyncio.timeout(timeout)
+    try:
+        async with scope:
+            await waiting
+    except TimeoutError as exc:
+        if not scope.expired():
+            raise
+        raise MQTTTimeoutError(f"Timed out waiting for the {what} to complete") from exc
+
 
 MessageDelivery = Literal["iterator", "callback"]
 """How the client hands inbound messages to the application."""
@@ -101,14 +122,20 @@ class PublishBatchReceipt:
         """Whether submission is sealed and all admitted messages settled."""
         return self._done.is_set()
 
-    async def wait(self) -> None:
+    async def wait(self, timeout: float | None = None) -> None:
         """Wait for aggregate completion and raise on any failure.
+
+        ``timeout`` bounds this wait only; on expiry the batch stays active.
 
         Raises:
             PublishBatchError: If admission failed fatally or one or more
                 admitted publications completed with an error. The exception
                 references this receipt and its bounded failure details.
+            MQTTTimeoutError: If ``timeout`` expires first.
         """
+        if timeout is not None:
+            await _wait_bounded(self.wait(), timeout, "batch")
+            return
         await self._done.wait()
         if self._fatal is not None:
             raise PublishBatchError(self, cause=self._fatal) from self._fatal
@@ -230,13 +257,22 @@ class PublishReceipt:
                 if not waiter.done():
                     waiter.set_result(None)
 
-    async def wait(self) -> None:
+    async def wait(self, timeout: float | None = None) -> None:
         """Wait for protocol completion and re-raise its terminal error.
 
         QoS 0 is already complete when the receipt is returned. Each waiter
         parks on its own future, so cancelling one waiter does not cancel the
         receipt or any other waiter.
+
+        ``timeout`` bounds this wait only: on expiry it raises
+        :class:`MQTTTimeoutError` and the publication stays active, so
+        :meth:`is_done` is still false and the receipt can be awaited again.
+        There is no retransmission within a session, so a broker that never
+        acknowledges holds the receipt until the connection ends.
         """
+        if timeout is not None:
+            await _wait_bounded(self.wait(), timeout, "publication")
+            return
         if self._qos != QoS.AT_MOST_ONCE and not self._settled:
             waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             waiters = self._waiters

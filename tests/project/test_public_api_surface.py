@@ -147,7 +147,7 @@ def test_async_client_constructor_keywords_and_defaults() -> None:
         "manual_ack": False,
         "max_iterator_messages": 65_536,
         "max_iterator_bytes": 64 * 1024 * 1024,
-        "iterator_admission_timeout": None,
+        "iterator_admission_timeout": 60.0,
         "store": None,
         "reconnect": None,
         "connect_timeout": 30.0,
@@ -285,7 +285,7 @@ def test_async_client_stable_method_parameter_contract() -> None:
         "connect_unix": ("self", "path", "timeout"),
         "connect_ws": ("self", "url", "ssl", "extra_headers", "timeout"),
         "disconnect": ("self", "reason_code"),
-        "publish": ("self", "topic", "payload", "qos", "retain", "properties"),
+        "publish": ("self", "topic", "payload", "qos", "retain", "properties", "timeout"),
         "publish_nowait": ("self", "topic", "payload", "qos", "retain", "properties"),
         "publish_many": (
             "self",

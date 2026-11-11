@@ -16,9 +16,24 @@ from mqttium.transport._stream import StreamTransport, StreamTransportBase
 # whose IPv6 address is unreachable still connects promptly over IPv4.
 HAPPY_EYEBALLS_DELAY = 0.25
 
+# Transport-level dead-peer detection, independent of MQTT keepalive. An idle
+# connection is probed after TCP_KEEPALIVE_IDLE seconds, then every
+# TCP_KEEPALIVE_INTERVAL seconds, and dropped after TCP_KEEPALIVE_PROBES
+# unanswered probes: about 90 seconds for a vanished host or a cut path. Where
+# the platform has it (TCP_USER_TIMEOUT, Linux), the same bound applies to
+# written data that makes no progress: data never acknowledged, and also data
+# a live peer does not read, so a broker that applies TCP backpressure for
+# that long loses the connection. An idle connection to a peer whose host
+# still answers TCP while its application has stopped is not detected: only
+# MQTT keepalive sees that.
+TCP_KEEPALIVE_IDLE = 60
+TCP_KEEPALIVE_INTERVAL = 10
+TCP_KEEPALIVE_PROBES = 3
+_TCP_DEAD_PEER_SECONDS = TCP_KEEPALIVE_IDLE + TCP_KEEPALIVE_INTERVAL * TCP_KEEPALIVE_PROBES
+
 
 class TcpTransport(StreamTransport):
-    """asyncio stream transport with TCP_NODELAY enabled when available."""
+    """asyncio stream transport with TCP_NODELAY and TCP keepalive when available."""
 
     @classmethod
     async def connect(
@@ -39,7 +54,7 @@ class TcpTransport(StreamTransport):
                 host, port, ssl=ssl, happy_eyeballs_delay=HAPPY_EYEBALLS_DELAY
             )
             transport = cls(reader, writer)
-        _set_nodelay(transport)
+        _configure_socket(transport)
         return transport
 
 
@@ -69,8 +84,25 @@ async def _connect_push(
     return PushStreamTransport(reader, writer, protocol)
 
 
-def _set_nodelay(transport: StreamTransportBase) -> None:
+def _configure_socket(transport: StreamTransportBase) -> None:
     sock = transport._writer.get_extra_info("socket")
-    if sock is not None:
+    if sock is None:
+        return
+    options = [
+        (socket.IPPROTO_TCP, "TCP_NODELAY", 1),
+        (socket.SOL_SOCKET, "SO_KEEPALIVE", 1),
+        # macOS names the idle time TCP_KEEPALIVE; elsewhere it is TCP_KEEPIDLE.
+        (socket.IPPROTO_TCP, "TCP_KEEPIDLE", TCP_KEEPALIVE_IDLE),
+        (socket.IPPROTO_TCP, "TCP_KEEPALIVE", TCP_KEEPALIVE_IDLE),
+        (socket.IPPROTO_TCP, "TCP_KEEPINTVL", TCP_KEEPALIVE_INTERVAL),
+        (socket.IPPROTO_TCP, "TCP_KEEPCNT", TCP_KEEPALIVE_PROBES),
+        (socket.IPPROTO_TCP, "TCP_USER_TIMEOUT", _TCP_DEAD_PEER_SECONDS * 1000),
+    ]
+    for level, name, value in options:
+        option = getattr(socket, name, None)
+        if option is None:
+            continue
+        # Each option is best effort: a platform or socket type without it
+        # keeps the others.
         with suppress(OSError):
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setsockopt(level, option, value)

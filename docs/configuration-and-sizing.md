@@ -115,7 +115,7 @@ a memory bound, and is not configurable.
 | `manual_ack` | `False` | Let the application control inbound QoS acknowledgement timing; iterator delivery only |
 | `max_iterator_messages` | `65_536` | Iterator queue count bound |
 | `max_iterator_bytes` | `64 MiB` | Topic, payload and property bytes retained in the iterator queue |
-| `iterator_admission_timeout` | `None` | Optional positive deadline for admitting one message into the iterator queue |
+| `iterator_admission_timeout` | `60.0` | Deadline for admitting one message into a full iterator queue; on expiry the connection fails with `MessageDeliveryError`. `None` waits without deadline |
 
 `max_iterator_bytes=None` disables both the iterator byte limit and byte
 accounting: `delivery.iterator_bytes` and `iterator_high_water_bytes` remain
@@ -154,6 +154,23 @@ detects the silent peer within one keepalive interval plus `ping_timeout`
 lot to the application -- a full iterator queue or a long callback batch -- it
 reads nothing, so the PINGRESP deadline restarts instead of blaming the
 connection for application backpressure.
+
+**Liveness bounds require `keepalive > 0`.** MQTT keepalive is the only
+mechanism that detects a peer whose host is still up while its application has
+stopped reading or answering. With `keepalive=0`, `publish()`, `subscribe()`,
+receipts and `messages()` have no library-provided bound against such a peer,
+and the state stays `CONNECTED`.
+
+TCP connections additionally enable TCP keepalive (60 s idle, 10 s interval,
+3 probes; plus the matching unacknowledged-data timeout where the platform has
+one). This ends a connection to a vanished host or across a cut path after
+about 90 seconds even with `keepalive=0`. It is a safety net below MQTT
+keepalive, not a substitute: an idle connection to a host that still answers
+TCP is never detected by it. It does not apply to Unix sockets.
+
+On Linux the unacknowledged-data timeout also covers data the peer does not
+read: a broker that applies TCP backpressure to this client for about 90
+seconds loses the connection, where it previously waited without limit.
 
 ## A sizing method
 
