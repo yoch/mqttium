@@ -547,9 +547,11 @@ class SqliteInflightStore:
             conn.execute(f"PRAGMA busy_timeout={int(_SQLITE_RESERVE_BUSY_TIMEOUT_SECONDS * 1000)}")
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                # Recorded before the timeout is restored: if that statement
+                # failed, the batch must still own, and end, this transaction.
+                self._transaction_started = True
             finally:
                 conn.execute(f"PRAGMA busy_timeout={int(_SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}")
-            self._transaction_started = True
 
     @staticmethod
     def is_lock_refusal(exc: BaseException) -> bool:

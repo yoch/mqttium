@@ -283,3 +283,38 @@ def _written(transport: ScriptedBrokerTransport) -> list[RawPacket]:
     for chunk in transport.written:
         decoder.feed(chunk)
     return list(decoder.drain_packets())
+
+
+async def test_a_refusal_never_raised_does_not_reach_the_next_connection(
+    tmp_path, short_busy_timeouts
+) -> None:
+    """The refusal belongs to its lot. A reader that leaves before raising it —
+    here parked on a full iterator queue when the application disconnects —
+    must not leave it for the reader of the next connection."""
+    path = tmp_path / "inflight.db"
+    client, store, transports, causes = await _client(path, max_iterator_messages=1)
+    protocol = transports[0].protocol
+    other = _hold_write_lock(path)
+    try:
+        # One lot: the second QoS 0 parks the reader in delivery, behind it the
+        # QoS 2 PUBLISH whose reservation is refused.
+        transports[0].push_rx(
+            _inbound(QoS.AT_MOST_ONCE, None, protocol) * 2 + _inbound(QoS.EXACTLY_ONCE, 7, protocol)
+        )
+        await asyncio.sleep(0.2)
+        assert client.is_connected and causes == []
+        await client.disconnect()
+    finally:
+        other.execute("ROLLBACK")
+        other.close()
+    causes.clear()
+
+    # The lock is free and nobody touches the file again.
+    await client.connect("unused")
+    await asyncio.sleep(0.2)
+    try:
+        assert client.is_connected
+        assert causes == []
+    finally:
+        await client.disconnect()
+        store.close()

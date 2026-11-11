@@ -512,7 +512,6 @@ class AsyncClient:
         self._is_store_lock_refusal: Callable[[BaseException], bool] = getattr(
             engine_store, "is_lock_refusal", lambda _exc: False
         )
-        self._ingress_lock_refusal: BaseException | None = None
         # Set once a connection is torn down, cleared by the next connect. Read
         # by _publish_wait_failure(); _closed is set too late in teardown to use.
         self._teardown_final = False
@@ -1915,14 +1914,18 @@ class AsyncClient:
             raise
         await self._effect_pump.drain()
 
-    def _process_ingress_batch(self) -> tuple[int, int, bool, MQTTError | None]:
+    def _process_ingress_batch(
+        self,
+    ) -> tuple[int, int, bool, MQTTError | None, BaseException | None]:
         """Decode until a byte/count bound, an auto-PUBACK handoff boundary,
         or the first peer error.
 
         A packet that will write the store first reserves its write lock. A
         refused lock ends the lot before that packet, which is dropped
         unapplied; the reader then retires the connection as a transient
-        loss, and the broker resends what was never acknowledged.
+        loss, and the broker resends what was never acknowledged. The refusal
+        is returned with its lot, never stored on the client: a reader that
+        leaves before raising it must not hand it to the next connection.
 
         A malformed, oversized or protocol-violating packet ends the lot at
         that packet. It is returned, not raised, so the valid prefix before it
@@ -1946,8 +1949,8 @@ class AsyncClient:
                     # Bytes after DISCONNECT belong to no connection: the
                     # engine ignores whole packets there, and undecodable
                     # ones must not replace the terminal reason either.
-                    return count, decoded_bytes, False, None
-                return count, decoded_bytes, False, exc
+                    return count, decoded_bytes, False, None, None
+                return count, decoded_bytes, False, exc, None
             if packet is None:
                 break
             if reserve is not None and engine.may_write_store(packet):
@@ -1961,15 +1964,14 @@ class AsyncClient:
                 except Exception as exc:
                     if not self._is_store_lock_refusal(exc):
                         raise
-                    self._ingress_lock_refusal = exc
-                    return count, decoded_bytes, False, None
+                    return count, decoded_bytes, False, None, exc
                 reserve = None
             peer_error = handle_raw(packet)
             if peer_error is not None:
                 # handle_raw() emitted it as the lot's last effect; the reader
                 # raises it after the prefix instead, so drop that copy.
                 engine._effects.pop()
-                return count + 1, decoded_bytes, False, peer_error
+                return count + 1, decoded_bytes, False, peer_error, None
             count += 1
             decoded_bytes += len(packet.remaining) + 5
             # Auto-PUBACK slots remain owned until take_effects(). Stop exactly
@@ -1977,10 +1979,10 @@ class AsyncClient:
             # the effect handoff below can release them before another PUBLISH.
             # Control packets and QoS 0 traffic retain the full 256-packet batch.
             if inbound._autoack_handoff_required:
-                return count, decoded_bytes, True, None
+                return count, decoded_bytes, True, None, None
             if decoded_bytes >= max_bytes:
                 break
-        return count, decoded_bytes, False, None
+        return count, decoded_bytes, False, None, None
 
     async def _read_loop(self) -> None:  # noqa: C901
         assert self._transport is not None
@@ -2022,9 +2024,13 @@ class AsyncClient:
                         effect_start = len(self._engine._effects)
                         try:
                             with self._engine.store.batch():
-                                handled, handled_bytes, handoff_required, peer_error = (
-                                    self._process_ingress_batch()
-                                )
+                                (
+                                    handled,
+                                    handled_bytes,
+                                    handoff_required,
+                                    peer_error,
+                                    lock_refusal,
+                                ) = self._process_ingress_batch()
                         except (
                             MandatoryResponseTooLargeError,
                             SessionReplayError,
@@ -2090,12 +2096,10 @@ class AsyncClient:
                         # delivered; only now does the peer error retire the
                         # connection.
                         raise peer_error
-                    lock_refusal = self._ingress_lock_refusal
                     if lock_refusal is not None:
                         # Same ordering for a refused store lock. Nothing was
                         # applied for the dropped packet, so this is an
                         # ordinary, retryable loss of the connection.
-                        self._ingress_lock_refusal = None
                         raise lock_refusal
                     # A batch that stopped short of both bounds emptied the
                     # buffer, so there is nothing to decode until the next
