@@ -25,7 +25,8 @@
     },
     {
       "config": "ReconnectStability-fixed-liveness.cfg",
-      "expect": "pass"
+      "expect": "pass",
+      "property": "LossIsRetried"
     }
   ]
 }

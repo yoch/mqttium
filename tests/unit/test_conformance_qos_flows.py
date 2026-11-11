@@ -176,6 +176,10 @@ def _qos2_sender(protocol: MQTTProtocolVersion) -> None:
     (pubrel,) = _wire(_feed(engine, PubRecPacket(mid=first).encode(protocol)))
     assert pubrel.packet_type is PacketType.PUBREL and _mid(pubrel) == first
     assert store.get_out(first) is not None  # the PUBREL is unacknowledged until PUBCOMP
+    # Once the PUBREL is sent the PUBLISH is never sent again: a late or
+    # repeated PUBREC is answered with PUBREL only.
+    (again,) = _wire(_feed(engine, PubRecPacket(mid=first).encode(protocol)))
+    assert again.packet_type is PacketType.PUBREL and _mid(again) == first
     effects = _feed(engine, PubCompPacket(mid=first).encode(protocol))
     assert any(effect.kind is EffectKind.PUBLISH_COMPLETE for effect in effects)
     assert store.get_out(first) is None

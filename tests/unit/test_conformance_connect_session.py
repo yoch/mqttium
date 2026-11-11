@@ -358,6 +358,15 @@ def _connect_payload_field_order() -> None:
         "username",
         "password",
     )
+    # The field names above follow from the flags. What proves the order is
+    # that each value, all different, is found at the position the
+    # specification gives it: any two fields swapped would be read as each
+    # other's value.
+    assert connect.client_id == b"conformance"
+    assert connect.will_topic == b"will/topic"
+    assert connect.will_payload == b"gone"
+    assert connect.username == b"user"
+    assert connect.password == b"secret"
 
 
 async def _idle_client_sends_pingreq(protocol: MQTTProtocolVersion) -> None:
