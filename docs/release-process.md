@@ -159,6 +159,9 @@ package version, rebuilds and validates the distributions, installs the wheel in
 an isolated environment, and passes that same Actions artifact to the protected
 PyPI publishing job.
 
+After publication, verify the PyPI attestation of both files with the command
+in `SECURITY.md`.
+
 ## Failure handling
 
 A failure before the final PyPI step publishes nothing and can be corrected

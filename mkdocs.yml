@@ -151,6 +151,7 @@ plugins:
           - conformance.md
           - conformance-matrix.md
           - guarantees.md
+          - threat-model.md
           - observability.md
         Maintainers:
           - testing.md
@@ -217,6 +218,7 @@ nav:
       - Protocol conformance: conformance.md
       - Conformance matrix: conformance-matrix.md
       - Behavioural guarantees: guarantees.md
+      - Threat model: threat-model.md
       - Logging and observability: observability.md
   - Maintainers:
       - Testing and coverage: testing.md

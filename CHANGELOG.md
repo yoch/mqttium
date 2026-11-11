@@ -8,6 +8,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Added
 
+- `SECURITY.md` documents how to verify a release against the signed
+  attestation PyPI already serves for it.
+- A threat model lists what the library defends against, the tests behind
+  each defence, and the risks left to the application.
 - `publish()`, `PublishReceipt.wait()` and `PublishBatchReceipt.wait()` accept
   an optional `timeout`. A `publish()` that times out before admission admits
   nothing; a receipt wait that times out leaves the publication active.

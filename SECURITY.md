@@ -36,6 +36,24 @@ You should receive an initial acknowledgement within seven days. A remediation
 timeline depends on severity, reproducibility, coordination needs, and release
 risk. Please allow a fix and advisory to be prepared before public disclosure.
 
+## Verifying a release
+
+Every distribution on PyPI is published by `publish.yml` in this repository
+through Trusted Publishing, and PyPI serves a signed attestation that says so.
+To check that a release file was published from this repository:
+
+```bash
+python -m pip install pypi-attestations
+pypi-attestations verify pypi --repository https://github.com/yoch/mqttium pypi:mqttium-1.2.1-py3-none-any.whl
+```
+
+The command fetches that file and its attestation from PyPI, prints `OK`
+followed by the file name, and fails if the file was not published from this
+repository. It works for the source distribution too.
+
+MQTTium has no runtime dependency, so installing it brings in no other
+package.
+
 ## Security boundaries
 
 MQTTium implements MQTT transport and protocol behaviour. Applications remain
@@ -45,3 +63,6 @@ application-level idempotency.
 
 Plain TCP and `ws://` do not provide confidentiality or peer authentication.
 Use TLS with hostname and certificate verification on untrusted networks.
+
+The [threat model](docs/threat-model.md) lists what the library defends
+against, the tests behind each defence, and the risks left to the application.
