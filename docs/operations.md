@@ -295,8 +295,12 @@ the `messages()` loop while the queue may be full: a QoS 1/2
 `receipt.wait()`, `subscribe()`, `unsubscribe()` or `ack()`. The reader is
 waiting for the consumer, and the consumer for the reader. With the default
 deadline that cycle ends as a connection failure after 60 seconds; with
-`iterator_admission_timeout=None` it never ends. Use `publish_nowait()` with
-`receipt.add_done_callback()`, or hand the reply to a separate task.
+`iterator_admission_timeout=None` it never ends. The failure reaches the
+consumer only when nothing reconnects: with a `ReconnectPolicy` a QoS 1/2
+receipt is kept for replay, the queue is still full on the next connection,
+and the consumer stays blocked while the connection is lost and re-made every
+60 seconds. Use `publish_nowait()` with `receipt.add_done_callback()`, pass
+`wait(timeout=)`, or hand the reply to a separate task.
 
 Synchronous message callbacks can use `publish_nowait()` with an explicit
 refusal policy. Avoid unbounded task creation or busy retry loops. The

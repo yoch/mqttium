@@ -9,6 +9,8 @@ go through the client runtime and a scripted broker.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from mqttium.api.async_client import AsyncClient
@@ -172,6 +174,14 @@ def _wildcards_only_in_filters(protocol: MQTTProtocolVersion) -> None:
             engine.queue_publish(topic, b"payload", qos=1)
         engine.queue_subscribe(topic)
     assert _types(engine.take_effects()) == [PacketType.SUBSCRIBE] * 4
+    # A wildcard character anywhere in a Topic Name, not only as a whole
+    # level, where it would not even be a valid filter.
+    for topic in ("sport+", "a#b", "sport/tennis#", "+sport", "sp+rt/tennis"):
+        with pytest.raises(ProtocolError):
+            engine.queue_publish(topic, b"payload")
+        with pytest.raises(ProtocolError):
+            engine.queue_publish(topic, b"payload", qos=1)
+    assert _wire(engine.take_effects()) == []
     assert engine.unacknowledged_messages == 0
 
 
@@ -491,13 +501,24 @@ async def _closes_on(protocol: MQTTProtocolVersion, violation: bytes) -> Scripte
 
 
 async def _invalid_flags_close_the_connection() -> None:
-    # PUBACK, SUBACK and PINGRESP with a reserved flag bit set.
-    for violation in (
-        encode_frame(PacketType.PUBACK, 0b0001, _u16(1)),
-        encode_frame(PacketType.SUBACK, 0b0010, _u16(1) + b"\x00"),
-        bytes((0xD1, 0x00)),
+    # PUBACK, PUBREC and PINGRESP with a reserved flag bit set. Each would be
+    # tolerated with its flags at zero (an acknowledgement nobody waits for is
+    # ignored or answered, an unasked PINGRESP is harmless): only the flags
+    # close the connection.
+    for packet_type, body in (
+        (PacketType.PUBACK, _u16(1)),
+        (PacketType.PUBREC, _u16(1)),
+        (PacketType.PINGRESP, b""),
     ):
-        await _closes_on(V311, violation)
+        # Control: the same packet with its flags at zero is tolerated.
+        broker = _ViolatingBroker(V311, encode_frame(packet_type, 0, body))
+        client = AsyncClient(client_id="control", protocol=V311, keepalive=0)
+        client._transport_factory = transport_factory(broker)
+        await client.connect("broker", 1883, timeout=2.0)
+        await asyncio.sleep(0.05)
+        assert client.is_connected, packet_type
+        await client.disconnect()
+        await _closes_on(V311, encode_frame(packet_type, 0b0001, body))
 
 
 async def _protocol_violation_closes_the_connection() -> None:
@@ -650,8 +671,6 @@ def _no_properties_is_a_zero_property_length() -> None:
     assert bytes(publish.remaining) == _u16(1) + b"t" + b"\x00" + b"payload"
     assert bytes(subscribe.remaining)[2] == 0
     assert bytes(unsubscribe.remaining)[2] == 0
-    connect = _engine(V5, connect_properties=None, max_inbound_inflight=65535).begin_connect()
-    assert connect[0] == 0x10
 
 
 def _user_property_strings_are_utf8() -> None:

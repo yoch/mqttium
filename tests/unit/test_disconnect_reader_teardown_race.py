@@ -31,8 +31,13 @@ class _SlowCloseSilentBroker(ScriptedBrokerTransport):
         super().handle_packet(raw)
 
     async def close(self):
-        self.closing.set()
-        await self.release.wait()
+        # Only the reader's own release is held: other tasks close the
+        # transport too (the effect flush does, first), and parking one of
+        # them would not exercise the reader's teardown at all.
+        task = asyncio.current_task()
+        if task is not None and task.get_name() == "mqttium-reader":
+            self.closing.set()
+            await self.release.wait()
         await super().close()
 
 

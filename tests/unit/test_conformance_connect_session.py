@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import asyncio
 import time
 
 import pytest
@@ -360,6 +361,15 @@ def _connect_payload_field_order() -> None:
         "username",
         "password",
     )
+    # The field names above follow from the flags. What proves the order is
+    # that each value, all different, is found at the position the
+    # specification gives it: any two fields swapped would be read as each
+    # other's value.
+    assert connect.client_id == b"conformance"
+    assert connect.will_topic == b"will/topic"
+    assert connect.will_payload == b"gone"
+    assert connect.username == b"user"
+    assert connect.password == b"secret"
 
 
 async def _idle_client_sends_pingreq(protocol: MQTTProtocolVersion) -> None:
@@ -375,31 +385,47 @@ async def _idle_client_sends_pingreq(protocol: MQTTProtocolVersion) -> None:
         await client.disconnect()
 
 
-class _TimestampingBroker(ScriptedBrokerTransport):
-    """Records when each packet type was last written by the client."""
+class _SlowBroker(ScriptedBrokerTransport):
+    """Answers CONNECT and PINGREQ late, and records when each packet arrives."""
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.written_at: dict[PacketType, float] = {}
+    def __init__(self, delay: float) -> None:
+        super().__init__(auto_pingresp=False)
+        self.delay = delay
+        self.arrivals: list[tuple[PacketType, float]] = []
 
     def handle_packet(self, raw: RawPacket) -> None:
-        self.written_at[raw.packet_type] = time.monotonic()
-        super().handle_packet(raw)
+        self.arrivals.append((raw.packet_type, time.monotonic()))
+        loop = asyncio.get_running_loop()
+        if raw.packet_type is PacketType.CONNECT:
+            loop.call_later(self.delay, self.push_rx, _connack(V311))
+        elif raw.packet_type is PacketType.PINGREQ:
+            loop.call_later(self.delay, self.push_rx, bytes((0xD0, 0x00)))
+        else:
+            super().handle_packet(raw)
 
 
 async def _pingreq_leaves_within_the_keep_alive() -> None:
     keepalive = 2
-    broker = _TimestampingBroker()
+    # A broker slower than the client's margin, on CONNACK and on PINGRESP:
+    # neither answer may postpone the next packet the client owes.
+    broker = _SlowBroker(delay=0.5)
     client = AsyncClient(client_id="idle", keepalive=keepalive, ping_timeout=2.0)
     client._transport_factory = transport_factory(broker)
     await client.connect("broker", 1883, timeout=2.0)
+
+    def pings() -> int:
+        return sum(kind is PacketType.PINGREQ for kind, _at in broker.arrivals)
+
     try:
-        await wait_until(lambda: PacketType.PINGREQ in broker.written_at, timeout=3.0)
+        await wait_until(lambda: pings() >= 2, timeout=6.0)
     finally:
         await client.disconnect()
-    # CONNECT was the last packet sent: the next one leaves before Keep Alive.
-    interval = broker.written_at[PacketType.PINGREQ] - broker.written_at[PacketType.CONNECT]
-    assert interval < keepalive
+    sent = [at for kind, at in broker.arrivals if kind is not PacketType.DISCONNECT]
+    intervals = [later - earlier for earlier, later in zip(sent, sent[1:], strict=False)]
+    # CONNECT, PINGREQ, PINGREQ: nothing else was sent, and no interval
+    # between two packets reaches the Keep Alive.
+    assert len(intervals) >= 2
+    assert all(interval < keepalive for interval in intervals), intervals
 
 
 class _ServerKeepAliveBroker(ScriptedBrokerTransport):
