@@ -131,8 +131,11 @@
         "section": "3.1.0",
         "applicability": "client",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_0_1_first_packet_is_connect",
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_0_1_first_packet_is_connect"
+        ],
         "cited_in": []
       },
       {
@@ -176,9 +179,11 @@
         "section": "3.1.2",
         "applicability": "server",
         "applicability_basis": "reviewed",
-        "evidence": "none",
+        "evidence": "cited",
         "verified_by": [],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_connect_session.py"
+        ]
       },
       {
         "label": "MQTT-3.1.2-5",
@@ -194,8 +199,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_2_6_clean_session_discards_the_previous_session"
+        ],
         "cited_in": []
       },
       {
@@ -212,9 +219,11 @@
         "section": "3.1.2",
         "applicability": "server",
         "applicability_basis": "mention",
-        "evidence": "none",
+        "evidence": "cited",
         "verified_by": [],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_connect_session.py"
+        ]
       },
       {
         "label": "MQTT-3.1.2-10",
@@ -230,8 +239,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "cited",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_2_11_no_will_flag_means_no_will_fields"
+        ],
         "cited_in": [
           "tests/unit/test_conformance_statements.py"
         ]
@@ -239,19 +250,23 @@
       {
         "label": "MQTT-3.1.2-12",
         "section": "3.1.2",
-        "applicability": "both",
-        "applicability_basis": "mention",
-        "evidence": "none",
+        "applicability": "server",
+        "applicability_basis": "reviewed",
+        "evidence": "cited",
         "verified_by": [],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_connect_session.py"
+        ]
       },
       {
         "label": "MQTT-3.1.2-13",
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_2_13_no_will_flag_means_will_qos_zero"
+        ],
         "cited_in": []
       },
       {
@@ -259,8 +274,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_2_14_will_qos_is_never_three"
+        ],
         "cited_in": []
       },
       {
@@ -268,8 +285,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_2_15_no_will_flag_means_will_retain_zero"
+        ],
         "cited_in": []
       },
       {
@@ -277,26 +296,32 @@
         "section": "3.1.2",
         "applicability": "server",
         "applicability_basis": "mention",
-        "evidence": "none",
+        "evidence": "cited",
         "verified_by": [],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_connect_session.py"
+        ]
       },
       {
         "label": "MQTT-3.1.2-17",
         "section": "3.1.2",
         "applicability": "server",
         "applicability_basis": "mention",
-        "evidence": "none",
+        "evidence": "cited",
         "verified_by": [],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_connect_session.py"
+        ]
       },
       {
         "label": "MQTT-3.1.2-18",
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_2_18_no_user_name_without_its_flag"
+        ],
         "cited_in": []
       },
       {
@@ -304,8 +329,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_2_19_user_name_present_with_its_flag"
+        ],
         "cited_in": []
       },
       {
@@ -313,8 +340,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_2_20_no_password_without_its_flag"
+        ],
         "cited_in": []
       },
       {
@@ -322,8 +351,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "cited",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_2_21_password_present_with_its_flag"
+        ],
         "cited_in": [
           "tests/unit/test_conformance_statements.py"
         ]
@@ -338,7 +369,8 @@
           "tests/unit/test_conformance_statements.py::test_mqtt_3_1_2_22_mqtt311_rejects_a_password_without_a_username"
         ],
         "cited_in": [
-          "src/mqttium/protocol/engine.py"
+          "src/mqttium/protocol/engine.py",
+          "tests/unit/test_conformance_connect_session.py"
         ]
       },
       {
@@ -346,9 +378,11 @@
         "section": "3.1.2",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "none",
+        "evidence": "cited",
         "verified_by": [],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_connect_session.py"
+        ]
       },
       {
         "label": "MQTT-3.1.2-24",
@@ -368,7 +402,9 @@
         "verified_by": [
           "tests/unit/test_conformance_statements.py::test_mqtt_3_1_3_1_connect_payload_field_order"
         ],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_connect_session.py"
+        ]
       },
       {
         "label": "MQTT-3.1.3-2",
@@ -384,8 +420,10 @@
         "section": "3.1.3",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_3_3_client_id_is_the_first_payload_field"
+        ],
         "cited_in": []
       },
       {
@@ -393,8 +431,11 @@
         "section": "3.1.3",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_3_4_client_id_is_utf8",
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_3_4_client_id_is_utf8"
+        ],
         "cited_in": []
       },
       {
@@ -453,8 +494,10 @@
         "section": "3.1.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_3_10_will_topic_is_utf8"
+        ],
         "cited_in": []
       },
       {
@@ -462,8 +505,10 @@
         "section": "3.1.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_3_11_user_name_is_utf8"
+        ],
         "cited_in": []
       },
       {
@@ -556,8 +601,8 @@
       {
         "label": "MQTT-3.2.2-4",
         "section": "3.2.2",
-        "applicability": "both",
-        "applicability_basis": "mention",
+        "applicability": "server",
+        "applicability_basis": "reviewed",
         "evidence": "cited",
         "verified_by": [],
         "cited_in": [
@@ -568,11 +613,13 @@
       {
         "label": "MQTT-3.2.2-5",
         "section": "3.2.2",
-        "applicability": "both",
-        "applicability_basis": "mention",
-        "evidence": "none",
+        "applicability": "server",
+        "applicability_basis": "reviewed",
+        "evidence": "cited",
         "verified_by": [],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_connect_session.py"
+        ]
       },
       {
         "label": "MQTT-3.2.2-6",
@@ -611,8 +658,10 @@
         "section": "3.3.1",
         "applicability": "server",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_3_1_3_dup_reflects_retransmission_only"
+        ],
         "cited_in": []
       },
       {
@@ -638,8 +687,8 @@
       {
         "label": "MQTT-3.3.1-6",
         "section": "3.3.1",
-        "applicability": "both",
-        "applicability_basis": "mention",
+        "applicability": "server",
+        "applicability_basis": "reviewed",
         "evidence": "none",
         "verified_by": [],
         "cited_in": []
@@ -703,8 +752,11 @@
         "section": "3.3.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_3_2_1_topic_name_leads_the_variable_header",
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_3_2_1_topic_name_leads_the_variable_header"
+        ],
         "cited_in": []
       },
       {
@@ -732,8 +784,10 @@
         "section": "3.3.4",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_3_4_1_receiver_answers_by_qos"
+        ],
         "cited_in": []
       },
       {
@@ -1014,8 +1068,10 @@
         "section": "4.1.0",
         "applicability": "both",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_4_1_0_1_session_state_is_stored_for_the_whole_session"
+        ],
         "cited_in": []
       },
       {
@@ -1023,8 +1079,10 @@
         "section": "4.1.0",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_4_1_0_2_session_lasts_as_long_as_the_connection"
+        ],
         "cited_in": []
       },
       {
@@ -1474,8 +1532,11 @@
         "section": "3.1.0",
         "applicability": "client",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_0_1_first_packet_is_connect",
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_0_1_first_packet_is_connect"
+        ],
         "cited_in": []
       },
       {
@@ -1519,8 +1580,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_2_4_clean_start_discards_the_existing_session"
+        ],
         "cited_in": []
       },
       {
@@ -1537,9 +1600,11 @@
         "section": "3.1.2",
         "applicability": "server",
         "applicability_basis": "reviewed",
-        "evidence": "none",
+        "evidence": "cited",
         "verified_by": [],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_connect_session.py"
+        ]
       },
       {
         "label": "MQTT-3.1.2-7",
@@ -1564,8 +1629,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_2_9_will_flag_brings_the_will_fields"
+        ],
         "cited_in": []
       },
       {
@@ -1582,8 +1649,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "cited",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_2_11_no_will_flag_means_will_qos_zero"
+        ],
         "cited_in": [
           "tests/unit/test_conformance_statements.py"
         ]
@@ -1593,8 +1662,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_2_12_will_qos_is_zero_one_or_two"
+        ],
         "cited_in": []
       },
       {
@@ -1602,8 +1673,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_2_13_no_will_flag_means_will_retain_zero"
+        ],
         "cited_in": []
       },
       {
@@ -1611,26 +1684,32 @@
         "section": "3.1.2",
         "applicability": "server",
         "applicability_basis": "mention",
-        "evidence": "none",
+        "evidence": "cited",
         "verified_by": [],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_connect_session.py"
+        ]
       },
       {
         "label": "MQTT-3.1.2-15",
         "section": "3.1.2",
         "applicability": "server",
         "applicability_basis": "mention",
-        "evidence": "none",
+        "evidence": "cited",
         "verified_by": [],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_connect_session.py"
+        ]
       },
       {
         "label": "MQTT-3.1.2-16",
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_2_16_no_user_name_without_its_flag"
+        ],
         "cited_in": []
       },
       {
@@ -1638,8 +1717,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_2_17_user_name_present_with_its_flag"
+        ],
         "cited_in": []
       },
       {
@@ -1647,8 +1728,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_2_18_no_password_without_its_flag"
+        ],
         "cited_in": []
       },
       {
@@ -1656,8 +1739,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_2_19_password_present_with_its_flag"
+        ],
         "cited_in": []
       },
       {
@@ -1665,8 +1750,10 @@
         "section": "3.1.2",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_2_20_idle_client_sends_pingreq"
+        ],
         "cited_in": []
       },
       {
@@ -1678,7 +1765,9 @@
         "verified_by": [
           "tests/unit/test_conformance_statements.py::test_mqtt_3_1_2_21_server_keep_alive_replaces_the_requested_value"
         ],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_connect_session.py"
+        ]
       },
       {
         "label": "MQTT-3.1.2-22",
@@ -1689,6 +1778,7 @@
         "verified_by": [],
         "cited_in": [
           "src/mqttium/protocol/engine.py",
+          "tests/unit/test_conformance_connect_session.py",
           "tests/unit/test_conformance_statements.py"
         ]
       },
@@ -1697,8 +1787,10 @@
         "section": "3.1.2",
         "applicability": "both",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_2_23_session_state_is_stored_after_the_connection_closes"
+        ],
         "cited_in": []
       },
       {
@@ -1762,8 +1854,10 @@
         "section": "3.1.2",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_2_30_nothing_but_auth_before_connack"
+        ],
         "cited_in": []
       },
       {
@@ -1771,8 +1865,10 @@
         "section": "3.1.3",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "cited",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_3_1_connect_payload_field_order"
+        ],
         "cited_in": [
           "tests/unit/test_conformance_statements.py"
         ]
@@ -1791,8 +1887,10 @@
         "section": "3.1.3",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_3_3_client_id_is_the_first_payload_field"
+        ],
         "cited_in": []
       },
       {
@@ -1800,8 +1898,11 @@
         "section": "3.1.3",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_1_3_4_client_id_is_utf8",
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_3_4_client_id_is_utf8"
+        ],
         "cited_in": []
       },
       {
@@ -1825,8 +1926,8 @@
       {
         "label": "MQTT-3.1.3-7",
         "section": "3.1.3",
-        "applicability": "client",
-        "applicability_basis": "mention",
+        "applicability": "server",
+        "applicability_basis": "reviewed",
         "evidence": "cited",
         "verified_by": [],
         "cited_in": [
@@ -1859,17 +1960,21 @@
         "section": "3.1.3",
         "applicability": "server",
         "applicability_basis": "mention",
-        "evidence": "none",
+        "evidence": "cited",
         "verified_by": [],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_connect_session.py"
+        ]
       },
       {
         "label": "MQTT-3.1.3-11",
         "section": "3.1.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_3_11_will_topic_is_utf8"
+        ],
         "cited_in": []
       },
       {
@@ -1877,8 +1982,10 @@
         "section": "3.1.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_1_3_12_user_name_is_utf8"
+        ],
         "cited_in": []
       },
       {
@@ -2005,8 +2112,10 @@
         "section": "3.2.2",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_2_2_5_session_present_zero_discards_client_state"
+        ],
         "cited_in": []
       },
       {
@@ -2059,8 +2168,10 @@
         "section": "3.2.2",
         "applicability": "client",
         "applicability_basis": "reviewed",
-        "evidence": "cited",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_2_2_11_maximum_qos_is_not_exceeded"
+        ],
         "cited_in": [
           "tests/unit/test_resumed_session_replay_conflict.py"
         ]
@@ -2088,8 +2199,10 @@
         "section": "3.2.2",
         "applicability": "client",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_2_2_14_retain_is_not_sent_when_unavailable"
+        ],
         "cited_in": []
       },
       {
@@ -2097,8 +2210,10 @@
         "section": "3.2.2",
         "applicability": "client",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_2_2_15_maximum_packet_size_is_not_exceeded"
+        ],
         "cited_in": []
       },
       {
@@ -2117,8 +2232,10 @@
         "section": "3.2.2",
         "applicability": "client",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_2_2_17_topic_alias_stays_within_the_server_maximum"
+        ],
         "cited_in": []
       },
       {
@@ -2126,8 +2243,10 @@
         "section": "3.2.2",
         "applicability": "client",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_2_2_18_no_topic_alias_without_a_server_maximum"
+        ],
         "cited_in": []
       },
       {
@@ -2153,8 +2272,10 @@
         "section": "3.2.2",
         "applicability": "client",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_2_2_21_server_keep_alive_replaces_the_requested_one"
+        ],
         "cited_in": []
       },
       {
@@ -2194,8 +2315,10 @@
         "section": "3.3.1",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_3_1_3_dup_reflects_retransmission_only"
+        ],
         "cited_in": []
       },
       {
@@ -2295,8 +2418,11 @@
         "section": "3.3.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt311_3_3_2_1_topic_name_leads_the_variable_header",
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_3_2_1_topic_name_leads_the_variable_header"
+        ],
         "cited_in": []
       },
       {
@@ -2351,8 +2477,10 @@
         "section": "3.3.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_3_2_7_inbound_aliases_do_not_outlive_the_connection"
+        ],
         "cited_in": []
       },
       {
@@ -2371,8 +2499,10 @@
         "section": "3.3.2",
         "applicability": "client",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_3_2_9_topic_alias_stays_within_the_connack_maximum"
+        ],
         "cited_in": []
       },
       {
@@ -2380,8 +2510,10 @@
         "section": "3.3.2",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_3_2_10_every_alias_up_to_the_announced_maximum_is_accepted"
+        ],
         "cited_in": []
       },
       {
@@ -2407,8 +2539,10 @@
         "section": "3.3.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_3_2_13_response_topic_is_utf8"
+        ],
         "cited_in": []
       },
       {
@@ -2463,8 +2597,10 @@
         "section": "3.3.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_3_2_19_content_type_is_utf8"
+        ],
         "cited_in": []
       },
       {
@@ -2481,8 +2617,10 @@
         "section": "3.3.4",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_3_4_1_receiver_answers_by_qos"
+        ],
         "cited_in": []
       },
       {
@@ -2539,8 +2677,10 @@
         "section": "3.3.4",
         "applicability": "client",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_3_4_7_receive_maximum_bounds_unacknowledged_publishes"
+        ],
         "cited_in": []
       },
       {
@@ -2548,8 +2688,10 @@
         "section": "3.3.4",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_3_3_4_8_full_send_window_delays_only_qos_publishes"
+        ],
         "cited_in": []
       },
       {
@@ -3122,8 +3264,10 @@
         "section": "4.1.0",
         "applicability": "both",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_connect_session.py::test_mqtt5_4_1_0_1_session_state_is_kept_while_connected"
+        ],
         "cited_in": []
       },
       {
@@ -3131,9 +3275,11 @@
         "section": "4.1.0",
         "applicability": "server",
         "applicability_basis": "mention",
-        "evidence": "none",
+        "evidence": "cited",
         "verified_by": [],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_connect_session.py"
+        ]
       },
       {
         "label": "MQTT-4.2-1",

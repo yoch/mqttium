@@ -168,13 +168,6 @@ silent accept.
 
 Recorded as observations, not as evidence. All were probed and held:
 
-- **CONNECT construction** — Will Flag 0 forces Will QoS and Will Retain to 0
-  and omits the will payload; a configured will encodes its QoS and retain
-  faithfully; credential flags always describe the payload that follows them.
-- **Nothing but AUTH or DISCONNECT reaches the wire before CONNACK**
-  (`[MQTT-3.1.2-30]`). A QoS 1 publish issued while connecting is admitted to
-  the offline queue but emits no frame until the session is established; QoS 0,
-  SUBSCRIBE and PINGREQ are refused outright.
 - **Topic and filter validation** — wildcards refused in a publish topic,
   zero-length topics and filters refused, `sport/#/x`, `sport#` and `sp+rt/a`
   refused while `sport/+/x`, `sport/#`, `+/tennis/#`, `#` and `+` are accepted.
@@ -197,12 +190,24 @@ Recorded as observations, not as evidence. All were probed and held:
   names, `$`-prefixed topics, UTF-8 validation.
 - **Property table** (`codec/properties.py`) — per-packet-type allowlists,
   duplicate detection, `subscription_identifier` cardinality on SUBSCRIBE.
-- **Negotiation** (`protocol/negotiated.py`) — `maximum_qos`, `retain_available`,
-  `maximum_packet_size`, `topic_alias_maximum`, `receive_maximum`, all enforced
-  before a publish is admitted rather than by silent degradation.
 - **No in-session retransmission** — PUBLISH/PUBREL are replayed only on
   reconnect with a present session, which is the behaviour MQTT 5 expects of a
   client that is not using a retransmit timer.
+
+### Open observation: keep-alive margin (MQTT 3.1.1)
+
+**`[MQTT-3.1.2-23]` (MQTT 3.1.1)** — *"It is the responsibility of the Client
+to ensure that the interval between Control Packets being sent does not exceed
+the Keep Alive value."*
+
+The keep-alive loop sends PINGREQ once the Keep Alive has elapsed since the
+last packet, not before: measured against the scripted broker, the PINGREQ
+leaves a few milliseconds (2 to 7) after the interval. The interval is therefore
+exceeded by the timer's latency. A Server closes the connection only after one
+and a half times the Keep Alive ([MQTT-3.1.2-24]), so no disconnection results,
+and the MQTT 5 wording ([MQTT-3.1.2-20], verified) sets no such bound. The
+statement is left without evidence in the matrix rather than tested against a
+looser bound than it states.
 
 ## Coverage
 
