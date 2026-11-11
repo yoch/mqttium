@@ -20,9 +20,12 @@ HAPPY_EYEBALLS_DELAY = 0.25
 # connection is probed after TCP_KEEPALIVE_IDLE seconds, then every
 # TCP_KEEPALIVE_INTERVAL seconds, and dropped after TCP_KEEPALIVE_PROBES
 # unanswered probes: about 90 seconds for a vanished host or a cut path. Where
-# the platform has it, the same bound applies to written data that is never
-# acknowledged. It cannot see a peer whose host still answers TCP while its
-# application has stopped: only MQTT keepalive detects that.
+# the platform has it (TCP_USER_TIMEOUT, Linux), the same bound applies to
+# written data that makes no progress: data never acknowledged, and also data
+# a live peer does not read, so a broker that applies TCP backpressure for
+# that long loses the connection. An idle connection to a peer whose host
+# still answers TCP while its application has stopped is not detected: only
+# MQTT keepalive sees that.
 TCP_KEEPALIVE_IDLE = 60
 TCP_KEEPALIVE_INTERVAL = 10
 TCP_KEEPALIVE_PROBES = 3
