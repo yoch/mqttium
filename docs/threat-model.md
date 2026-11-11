@@ -160,11 +160,13 @@ seconds).
 
 **Status:** Partial.
 
-The handshake response is bounded to 64 KiB under a timeout; the accept key,
-the upgrade headers and the subprotocol are validated; frames are bounded
-before they are buffered; masking keys come from the operating system's
-random source. Credentials in a URL and line breaks in extra headers are
-refused.
+The handshake response is bounded to 64 KiB under a timeout; the accept key
+and the upgrade headers are validated; a subprotocol other than MQTT is
+refused; frames are bounded before they are buffered; masking keys come from
+the operating system's random source. Credentials in a URL and line breaks in
+extra headers are refused. A response that selects no subprotocol is
+accepted, as RFC 6455 allows, so the handshake alone does not tell a broker
+from another WebSocket endpoint: the MQTT exchange that follows does.
 
 *Residual risk:* an accept-key mismatch, missing upgrade headers and the
 handshake size limit are enforced in the code but have no test.
