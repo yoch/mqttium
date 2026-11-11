@@ -56,7 +56,15 @@ def test_sidecars_are_well_formed() -> None:
         for entry in configs:
             assert entry["expect"] in run_tlc.EXPECTATIONS, name
             assert ("invariant" in entry) == (entry["expect"] == "violation"), name
-            assert ("property" in entry) == (entry["expect"] == "liveness"), name
+            # A temporal property is named by the configuration expected to
+            # violate it and by the repaired one expected to satisfy it.
+            assert "property" not in entry or entry["expect"] in ("liveness", "pass"), name
+            assert "property" in entry or entry["expect"] != "liveness", name
+        violated = {e["property"] for e in configs if e["expect"] == "liveness"}
+        satisfied = {e["property"] for e in configs if e["expect"] == "pass" and "property" in e}
+        assert violated <= satisfied, (
+            f"{name}: no repaired configuration checks {violated - satisfied}"
+        )
 
 
 def test_modules_and_configs_are_runnable_by_tlc() -> None:
@@ -72,6 +80,15 @@ def test_modules_and_configs_are_runnable_by_tlc() -> None:
             if check.invariant is not None:
                 assert check.invariant in named, check.config.name
             properties = re.findall(r"^PROPERTY\s+(\w+)", config_text, re.MULTILINE)
+            # What the configuration checks is what its sidecar entry names:
+            # a repaired configuration that lost its PROPERTY would otherwise
+            # still "pass", having checked nothing temporal.
+            assert properties == ([check.property] if check.property else []), check.config.name
+            if check.expect == "pass" and check.property:
+                # Deadlock checking stays on where the property must hold.
+                assert not re.search(r"^CHECK_DEADLOCK\s+FALSE", config_text, re.MULTILINE), (
+                    check.config.name
+                )
             if check.expect == "liveness":
                 # TLC does not say which temporal property failed: with exactly
                 # one declared, the reported violation can only be that one.

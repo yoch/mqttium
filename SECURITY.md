@@ -40,15 +40,16 @@ risk. Please allow a fix and advisory to be prepared before public disclosure.
 
 Every distribution on PyPI is published by `publish.yml` in this repository
 through Trusted Publishing, and PyPI serves a signed attestation that says so.
-To check a downloaded file against it:
+To check that a release file was published from this repository:
 
 ```bash
 python -m pip install pypi-attestations
 pypi-attestations verify pypi --repository https://github.com/yoch/mqttium pypi:mqttium-1.2.1-py3-none-any.whl
 ```
 
-The command prints `OK` followed by the file name, and fails if the file was
-not published from this repository. It works for the source distribution too.
+The command fetches that file and its attestation from PyPI, prints `OK`
+followed by the file name, and fails if the file was not published from this
+repository. It works for the source distribution too.
 
 MQTTium has no runtime dependency, so installing it brings in no other
 package.

@@ -89,13 +89,35 @@ def normalise(text: str) -> str:
 
 
 def quote_matches(quoted: str, text: str) -> bool:
-    """Whether ``quoted`` reproduces ``text``, possibly stopping early."""
+    """Whether ``quoted`` reproduces ``text`` in full.
+
+    Case, punctuation and line breaks are ignored; words are not. A quotation
+    that stops early is refused: the part left out is often the obligation
+    (a statement cut before "NOT" reads as its opposite).
+    """
     quoted_words = normalise(quoted)
-    if not quoted_words:
+    return bool(quoted_words) and quoted_words == normalise(text)
+
+
+# A test named for one specification version is evidence for that version
+# only, even where the other version states the same words under the label.
+_VERSION_PREFIXES = {"test_mqtt311_": "3.1.1", "test_mqtt5_": "5.0"}
+_NEVER_RUN = ("skip", "xfail")
+
+
+def _is_evidence(node: ast.stmt) -> bool:
+    """A collected test function that pytest runs and that does something."""
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return False
-    actual = normalise(text)
-    prefix = " ".join(quoted_words.split()[: len(actual.split())])
-    return actual.startswith(prefix) or prefix in actual
+    if not node.name.startswith("test_"):
+        return False
+    if any(
+        word in ast.unparse(decorator) for decorator in node.decorator_list for word in _NEVER_RUN
+    ):
+        return False
+    # More than a docstring: a body that asserts nothing cannot be told from
+    # one that does by reading, but an empty one can.
+    return len(node.body) > 1
 
 
 def _index(version: str) -> list[dict[str, str]]:
@@ -168,16 +190,23 @@ def _verify_quotations(
 ) -> set[tuple[str, str]]:
     """Record the statements whose text a test docstring of ``source`` quotes."""
     verified: set[tuple[str, str]] = set()
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+    if not Path(relative).name.startswith("test_"):
+        return verified  # pytest does not collect it
+    # Module level only: a function nested in another is never collected.
+    for node in ast.parse(source).body:
+        if not _is_evidence(node):
             continue
-        if not node.name.startswith("test_"):
-            continue
+        assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         match = _QUOTATION.match(ast.get_docstring(node, clean=True) or "")
         if match is None:
             continue
         label, quoted = match.groups()
+        only = next(
+            (v for prefix, v in _VERSION_PREFIXES.items() if node.name.startswith(prefix)), None
+        )
         for version in VERSIONS:
+            if only is not None and version != only:
+                continue
             statement = statements.get((version, label))
             if statement is not None and quote_matches(quoted, statement.text):
                 statement.verified_by.append(f"{relative}::{node.name}")

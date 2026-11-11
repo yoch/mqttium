@@ -19,10 +19,10 @@ class ConnectPacket:
     username: str | None = None
     password: bytes | None = field(default=None, repr=False)
     will_topic: str | None = None
-    will_payload: bytes = b""
+    will_payload: bytes = field(default=b"", repr=False)
     will_qos: QoS = QoS.AT_MOST_ONCE
     will_retain: bool = False
-    will_properties: Properties | None = None
+    will_properties: Properties | None = field(default=None, repr=False)
     protocol: MQTTProtocolVersion = MQTTProtocolVersion.MQTTv311
     # Authentication Data travels in the CONNECT properties.
     properties: Properties | None = field(default=None, repr=False)
