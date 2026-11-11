@@ -56,8 +56,10 @@
         "section": "2.3.1",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt311_2_3_1_1_identified_packets_carry_a_non_zero_identifier"
+        ],
         "cited_in": []
       },
       {
@@ -65,8 +67,10 @@
         "section": "2.3.1",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt311_2_3_1_2_new_packets_are_assigned_an_unused_identifier"
+        ],
         "cited_in": []
       },
       {
@@ -74,8 +78,10 @@
         "section": "2.3.1",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt311_2_3_1_3_resent_packet_keeps_its_identifier"
+        ],
         "cited_in": []
       },
       {
@@ -94,8 +100,10 @@
         "section": "2.3.1",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt311_2_3_1_5_qos0_publish_carries_no_packet_identifier"
+        ],
         "cited_in": []
       },
       {
@@ -103,8 +111,10 @@
         "section": "2.3.1",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt311_2_3_1_6_acknowledgements_carry_the_publish_identifier"
+        ],
         "cited_in": []
       },
       {
@@ -578,8 +588,10 @@
         "section": "3.3.1",
         "applicability": "both",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt311_3_3_1_1_redelivered_publish_sets_dup"
+        ],
         "cited_in": []
       },
       {
@@ -784,8 +796,10 @@
         "section": "3.8.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt311_3_8_3_3_subscribe_requires_a_topic_filter"
+        ],
         "cited_in": []
       },
       {
@@ -883,8 +897,10 @@
         "section": "3.10.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt311_3_10_3_2_unsubscribe_requires_a_topic_filter"
+        ],
         "cited_in": []
       },
       {
@@ -1014,8 +1030,10 @@
         "section": "4.3.1",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt311_4_3_1_1_qos0_publish_is_sent_with_dup_clear"
+        ],
         "cited_in": []
       },
       {
@@ -1023,8 +1041,10 @@
         "section": "4.3.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt311_4_3_2_1_qos1_sender_protocol"
+        ],
         "cited_in": []
       },
       {
@@ -1032,8 +1052,10 @@
         "section": "4.3.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt311_4_3_2_2_qos1_receiver_protocol"
+        ],
         "cited_in": []
       },
       {
@@ -1041,8 +1063,10 @@
         "section": "4.3.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt311_4_3_3_1_qos2_sender_protocol"
+        ],
         "cited_in": []
       },
       {
@@ -1050,8 +1074,10 @@
         "section": "4.3.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt311_4_3_3_2_qos2_receiver_protocol"
+        ],
         "cited_in": []
       },
       {
@@ -1059,8 +1085,10 @@
         "section": "4.4.0",
         "applicability": "both",
         "applicability_basis": "reviewed",
-        "evidence": "cited",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt311_4_4_0_1_resumed_session_resends_unacknowledged_packets"
+        ],
         "cited_in": [
           "src/mqttium/errors.py",
           "src/mqttium/protocol/inbound.py",
@@ -1376,8 +1404,10 @@
         "section": "2.2.1",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_2_2_1_2_qos0_publish_carries_no_packet_identifier"
+        ],
         "cited_in": []
       },
       {
@@ -1385,8 +1415,10 @@
         "section": "2.2.1",
         "applicability": "client",
         "applicability_basis": "mention",
-        "evidence": "cited",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_2_2_1_3_new_packets_are_assigned_an_unused_identifier"
+        ],
         "cited_in": [
           "tests/unit/test_conformance_statements.py"
         ]
@@ -1409,8 +1441,10 @@
         "section": "2.2.1",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_2_2_1_5_acknowledgements_carry_the_publish_identifier"
+        ],
         "cited_in": []
       },
       {
@@ -2133,8 +2167,10 @@
         "section": "3.3.1",
         "applicability": "both",
         "applicability_basis": "reviewed",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_3_3_1_1_redelivered_publish_sets_dup"
+        ],
         "cited_in": []
       },
       {
@@ -2683,9 +2719,11 @@
         "section": "3.8.3",
         "applicability": "server",
         "applicability_basis": "reviewed",
-        "evidence": "none",
+        "evidence": "cited",
         "verified_by": [],
-        "cited_in": []
+        "cited_in": [
+          "tests/unit/test_conformance_qos_flows.py"
+        ]
       },
       {
         "label": "MQTT-3.8.3-4",
@@ -2836,8 +2874,10 @@
         "section": "3.10.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_3_10_3_2_unsubscribe_requires_a_topic_filter"
+        ],
         "cited_in": []
       },
       {
@@ -3105,8 +3145,10 @@
         "section": "4.3.1",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_1_1_qos0_publish_is_sent_with_dup_clear"
+        ],
         "cited_in": []
       },
       {
@@ -3114,8 +3156,10 @@
         "section": "4.3.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_2_1_qos1_sender_assigns_an_unused_identifier"
+        ],
         "cited_in": []
       },
       {
@@ -3123,8 +3167,10 @@
         "section": "4.3.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_2_2_qos1_sender_sends_qos1_with_dup_clear"
+        ],
         "cited_in": []
       },
       {
@@ -3132,8 +3178,10 @@
         "section": "4.3.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_2_3_qos1_publish_is_unacknowledged_until_puback"
+        ],
         "cited_in": []
       },
       {
@@ -3141,8 +3189,10 @@
         "section": "4.3.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_2_4_qos1_receiver_answers_with_puback"
+        ],
         "cited_in": []
       },
       {
@@ -3150,8 +3200,10 @@
         "section": "4.3.2",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "cited",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_2_5_qos1_identifier_is_new_after_puback"
+        ],
         "cited_in": [
           "src/mqttium/protocol/inbound.py",
           "tests/unit/test_manual_ack_resend_race.py"
@@ -3162,8 +3214,10 @@
         "section": "4.3.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_3_1_qos2_sender_assigns_an_unused_identifier"
+        ],
         "cited_in": []
       },
       {
@@ -3171,8 +3225,10 @@
         "section": "4.3.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_3_2_qos2_sender_sends_qos2_with_dup_clear"
+        ],
         "cited_in": []
       },
       {
@@ -3180,8 +3236,10 @@
         "section": "4.3.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_3_3_qos2_publish_is_unacknowledged_until_pubrec"
+        ],
         "cited_in": []
       },
       {
@@ -3189,8 +3247,10 @@
         "section": "4.3.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "cited",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_3_4_qos2_sender_answers_pubrec_with_pubrel"
+        ],
         "cited_in": [
           "src/mqttium/protocol/outbound.py",
           "tests/unit/test_outbound_pubrec_phases.py",
@@ -3202,8 +3262,10 @@
         "section": "4.3.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_3_5_qos2_pubrel_is_unacknowledged_until_pubcomp"
+        ],
         "cited_in": []
       },
       {
@@ -3233,8 +3295,10 @@
         "section": "4.3.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_3_8_qos2_receiver_answers_with_pubrec"
+        ],
         "cited_in": []
       },
       {
@@ -3251,8 +3315,10 @@
         "section": "4.3.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_3_10_qos2_repeated_publish_is_not_delivered_twice"
+        ],
         "cited_in": []
       },
       {
@@ -3260,8 +3326,10 @@
         "section": "4.3.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_3_11_qos2_receiver_answers_pubrel_with_pubcomp"
+        ],
         "cited_in": []
       },
       {
@@ -3269,8 +3337,10 @@
         "section": "4.3.3",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_3_3_12_qos2_identifier_is_new_after_pubcomp"
+        ],
         "cited_in": []
       },
       {
@@ -3287,8 +3357,10 @@
         "section": "4.4.0",
         "applicability": "both",
         "applicability_basis": "reviewed",
-        "evidence": "cited",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_4_0_1_resumed_session_resends_unacknowledged_packets"
+        ],
         "cited_in": [
           "src/mqttium/errors.py",
           "src/mqttium/protocol/inbound.py",
@@ -3301,8 +3373,10 @@
         "section": "4.4.0",
         "applicability": "both",
         "applicability_basis": "mention",
-        "evidence": "none",
-        "verified_by": [],
+        "evidence": "verified",
+        "verified_by": [
+          "tests/unit/test_conformance_qos_flows.py::test_mqtt5_4_4_0_2_negatively_acknowledged_publish_is_not_retransmitted"
+        ],
         "cited_in": []
       },
       {
