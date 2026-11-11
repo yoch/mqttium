@@ -165,8 +165,12 @@ TCP connections additionally enable TCP keepalive (60 s idle, 10 s interval,
 3 probes; plus the matching unacknowledged-data timeout where the platform has
 one). This ends a connection to a vanished host or across a cut path after
 about 90 seconds even with `keepalive=0`. It is a safety net below MQTT
-keepalive, not a substitute: a host that still answers TCP is never detected
-by it. It does not apply to Unix sockets.
+keepalive, not a substitute: an idle connection to a host that still answers
+TCP is never detected by it. It does not apply to Unix sockets.
+
+On Linux the unacknowledged-data timeout also covers data the peer does not
+read: a broker that applies TCP backpressure to this client for about 90
+seconds loses the connection, where it previously waited without limit.
 
 ## A sizing method
 

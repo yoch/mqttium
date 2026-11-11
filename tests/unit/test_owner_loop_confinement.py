@@ -62,3 +62,17 @@ async def test_call_from_another_loop_is_refused(name):
 async def test_an_unconnected_client_is_not_bound_yet():
     client = AsyncClient("unbound", keepalive=0)
     await client.disconnect()  # no owner loop yet: nothing to refuse
+
+
+def test_a_late_disconnect_after_the_owner_loop_closed_is_harmless() -> None:
+    """Idempotent cleanup in a second ``asyncio.run``: the loop that owned the
+    client is closed and runs nothing, so there is no one to race."""
+    client = AsyncClient("late")
+    client._transport_factory = transport_factory(ScriptedBrokerTransport())
+
+    async def session() -> None:
+        await client.connect("unused")
+        await client.disconnect()
+
+    asyncio.run(session())
+    asyncio.run(client.disconnect())

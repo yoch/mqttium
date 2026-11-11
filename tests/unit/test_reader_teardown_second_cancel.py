@@ -80,3 +80,55 @@ async def test_external_cancellation_during_teardown_is_never_stranded(turns):
         assert not stranded
     finally:
         await client.disconnect()
+
+
+class _SilentMultiTurnClose(_MultiTurnClose):
+    def handle_packet(self, raw):
+        from mqttium.enums import PacketType
+
+        if raw.packet_type is PacketType.PUBLISH:
+            return  # never acknowledged
+        super().handle_packet(raw)
+
+
+@pytest.mark.parametrize("turns", range(14))
+async def test_disconnect_after_an_interrupted_release_settles_receipts(turns: int) -> None:
+    """The interrupted reader keeps the reconnect decision and is gone before
+    the backoff ends. A ``disconnect()`` in that gap finds no reader to settle
+    pending work: it must do so itself, and no stale transport may remain."""
+    from mqttium.errors import MQTTError
+
+    transport = _SilentMultiTurnClose()
+    attempts = 0
+
+    async def factory(host, port, *, ssl=None):
+        nonlocal attempts
+        attempts += 1
+        if attempts > 1:
+            raise OSError("down")
+        return transport
+
+    client = AsyncClient(
+        "gap",
+        keepalive=0,
+        clean_start=False,
+        reconnect=ReconnectPolicy(initial_delay=30, max_delay=30),
+    )
+    client._transport_factory = factory
+    await client.connect("unused")
+    receipt = await client.publish("topic", b"payload", qos=1)
+    reader = client._reader_task
+    assert reader is not None
+    transport.push_rx(b"")
+    for _ in range(turns):
+        await asyncio.sleep(0)
+    if not reader.done():
+        await client._close_transport_after_connection_failure()
+    await asyncio.sleep(0.05)
+    assert reader.done()
+    assert client._transport is None
+
+    await asyncio.wait_for(client.disconnect(), 2)
+    assert client.state is ConnectionState.DISCONNECTED
+    with pytest.raises(MQTTError):
+        await asyncio.wait_for(receipt.wait(), 1)
