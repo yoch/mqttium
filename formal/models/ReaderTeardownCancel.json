@@ -31,7 +31,8 @@
     },
     {
       "config": "ReaderTeardownCancel-fixed-liveness.cfg",
-      "expect": "pass"
+      "expect": "pass",
+      "property": "PendingIsEventuallyOwned"
     }
   ]
 }

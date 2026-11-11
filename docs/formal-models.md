@@ -75,7 +75,9 @@ configuration that names it with `PROPERTY`.
   exactly one, and sets `CHECK_DEADLOCK FALSE` so that a stuck state is
   reported as the unmet property instead of as a deadlock.
 - **The repaired configuration checks the same property and must pass**, with
-  deadlock checking left on.
+  deadlock checking left on. Its sidecar entry names the property too, and a
+  project test compares that name with the configuration's `PROPERTY`: a
+  repaired configuration that lost its property cannot pass unnoticed.
 
 What this establishes is bounded like every model here: the property holds
 for the modelled actions under the stated fairness. It says nothing about a

@@ -17,7 +17,9 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   nothing; a receipt wait that times out leaves the publication active.
 - TCP connections enable TCP keepalive (60 s idle, 10 s interval, 3 probes),
   a transport-level net under MQTT keepalive that also works with
-  `keepalive=0`.
+  `keepalive=0`. On Linux, written data that makes no progress for about 90
+  seconds, including data a live broker does not read, now ends the
+  connection.
 
 ### Changed
 
@@ -27,8 +29,10 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - `iterator_admission_timeout` defaults to 60 seconds instead of `None`. A
   `messages()` consumer that frees no space in a full queue for that long now
   ends the connection with `MessageDeliveryError` instead of leaving it
-  `CONNECTED` with the reader stopped; this also bounds a consumer that
-  awaits a receipt inside its loop. Pass `None` for the previous behaviour.
+  `CONNECTED` with the reader stopped. Without a reconnect policy this also
+  ends a consumer that awaits a receipt inside its loop; with one, the
+  receipt is kept for replay and that consumer stays blocked across
+  reconnections. Pass `None` for the previous behaviour.
 - `SqliteInflightStore`: while receiving, the client reserves the write lock
   (waiting at most 0.25 s) before applying a packet that writes. A lock held
   by another connection now drops that packet unapplied and ends the
@@ -41,6 +45,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- A keepalive ping falling due while `disconnect()` drained its DISCONNECT
+  no longer aborts the graceful shutdown.
+- `disconnect()` and `connect()` called from the cleanup of an already
+  cancelled task are not cancelled a second time.
+- A message whose admission to the `messages()` queue timed out was dropped
+  although it had already been acknowledged to the broker. It now stays at
+  the head of the messages carried over to the next connection.
 - The SQLite store's unsupported-schema error no longer calls itself an
   experiment.
 - `disconnect()` that lands while the reader is still releasing a lost
