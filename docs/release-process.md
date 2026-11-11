@@ -159,6 +159,31 @@ package version, rebuilds and validates the distributions, installs the wheel in
 an isolated environment, and passes that same Actions artifact to the protected
 PyPI publishing job.
 
+## Release evidence
+
+A release leaves the following, all derived from the one build:
+
+| Evidence | Where | Produced by |
+| --- | --- | --- |
+| Publish attestation (PEP 740) | PyPI, per file | the `publish` job, by default |
+| Build-provenance attestation | GitHub attestations | the `attest` job |
+| CycloneDX SBOM and its attestation | GitHub release assets and attestations | the `build` and `attest` jobs |
+| The published wheel and sdist | GitHub release assets | the `release-assets` job |
+
+`tools/ci/generate_sbom.py` writes the SBOM from the built files: their
+SHA-256 digests and the wheel's declared requirements. It refuses a wheel
+that declares a runtime dependency.
+
+`attest` and `release-assets` run after `verify-pypi`. They do not gate the
+publication, which has already happened and cannot be undone; if one fails,
+re-run that job. After a release, verify the PyPI attestation with the
+command in `SECURITY.md` and confirm that the release page lists both
+distributions and the SBOM.
+
+The `CodeQL` workflow analyses the Python sources and the workflows on every
+pull request. The `OpenSSF Scorecard` workflow runs on `main` and weekly.
+Neither is part of the required checks.
+
 ## Failure handling
 
 A failure before the final PyPI step publishes nothing and can be corrected

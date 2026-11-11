@@ -36,6 +36,31 @@ You should receive an initial acknowledgement within seven days. A remediation
 timeline depends on severity, reproducibility, coordination needs, and release
 risk. Please allow a fix and advisory to be prepared before public disclosure.
 
+## Verifying a release
+
+Every distribution on PyPI is published by `publish.yml` in this repository
+through Trusted Publishing, and PyPI serves a signed attestation that says so.
+To check a downloaded file against it:
+
+```bash
+python -m pip install pypi-attestations
+pypi-attestations verify pypi --repository https://github.com/yoch/mqttium pypi:mqttium-1.2.1-py3-none-any.whl
+```
+
+The command prints `OK` followed by the file name, and fails if the file was
+not published from this repository. It works for the source distribution too.
+
+Releases made after 1.2.1 also carry, on their GitHub release page, the same
+two distributions and a CycloneDX SBOM generated from them, with GitHub
+attestations for build provenance and for the SBOM:
+
+```bash
+gh attestation verify mqttium-<version>-py3-none-any.whl --repo yoch/mqttium
+```
+
+MQTTium has no runtime dependency; the SBOM is built from the wheel's own
+metadata and the release fails if that metadata declares one.
+
 ## Security boundaries
 
 MQTTium implements MQTT transport and protocol behaviour. Applications remain
@@ -45,3 +70,6 @@ application-level idempotency.
 
 Plain TCP and `ws://` do not provide confidentiality or peer authentication.
 Use TLS with hostname and certificate verification on untrusted networks.
+
+The [threat model](docs/threat-model.md) lists what the library defends
+against, the tests behind each defence, and the risks left to the application.
