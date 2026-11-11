@@ -236,10 +236,14 @@ jobs:
           PYTHONPATH=src python -m tests.fuzz.runtime_pressure_fuzzer \
             --seed 0 --seeds 32 --steps 36 --require-coverage \
             --artifacts-dir "$RUNNER_TEMP/runtime-fuzz/pressure"
+          PYTHONPATH=src python -m tests.fuzz.runtime_teardown_fuzzer \
+            --seed 0 --seeds 32 --steps 28 \
+            --artifacts-dir "$RUNNER_TEMP/runtime-fuzz/teardown"
           python -m pytest -q -W error --strict-config --strict-markers \
             tests/fuzz/test_runtime_fuzzer.py \
             tests/fuzz/test_runtime_composition_fuzzer.py \
-            tests/fuzz/test_runtime_pressure_fuzzer.py
+            tests/fuzz/test_runtime_pressure_fuzzer.py \
+            tests/fuzz/test_runtime_teardown_fuzzer.py
       - name: Retain runtime schedule failures
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

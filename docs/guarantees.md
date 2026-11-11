@@ -115,6 +115,7 @@ connected, answers pings and never acknowledges holds the receipt until the
 connection ends; bound that case with `wait(timeout=)`.
 
 - `tests/unit/test_disconnect_reader_teardown_race.py`
+- `tests/fuzz/test_runtime_teardown_fuzzer.py`
 - `tests/unit/test_failed_receipt_seal.py`
 - `tests/unit/test_reconnect_receipts.py`
 - `tests/unit/test_publish_receipt_waiters.py`
@@ -130,6 +131,7 @@ reported while the reader releases a lost connection cannot end the reader
 before it starts the reconnect.
 
 - `tests/unit/test_reader_teardown_second_cancel.py`
+- `tests/fuzz/test_runtime_teardown_fuzzer.py`
 - `tests/unit/test_disconnect_hook_reconnect_progress.py`
 - `formal/models/ReaderTeardownCancel.tla`
 - `formal/models/ReconnectStability.tla`
