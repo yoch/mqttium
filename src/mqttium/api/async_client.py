@@ -131,6 +131,11 @@ _CAUSE_LOCAL = 3  # local capability failures that make the session unusable
 _DEFAULT_MAX_ITERATOR_MESSAGES = 65_536
 _MQTT311_DEFAULT_OUTBOUND_INFLIGHT = 20
 _DEFAULT_MAX_ITERATOR_BYTES = 64 * 1024 * 1024
+# A full iterator queue stops the reader, and with it every acknowledgement
+# and PINGRESP behind the waiting message. A finite default turns a consumer
+# that never frees a slot into a named connection failure instead of a client
+# that stays CONNECTED while nothing moves.
+_DEFAULT_ITERATOR_ADMISSION_TIMEOUT = 60.0
 
 _ReceiptT = TypeVar("_ReceiptT", "PublishReceipt", "PublishBatchReceipt")
 _AckResultT = TypeVar("_AckResultT", "SubscribeResult", "UnsubscribeResult")
@@ -300,8 +305,13 @@ class AsyncClient:
         max_iterator_messages: Iterator queue count bound.
         max_iterator_bytes: Logical bytes retained in the iterator queue;
             ``None`` disables the bound.
-        iterator_admission_timeout: Optional deadline for admitting one
-            message into the iterator queue; ``None`` waits without deadline.
+        iterator_admission_timeout: Deadline for admitting one message into
+            a full iterator queue. On expiry the connection fails with
+            :class:`MessageDeliveryError`, which the reconnect policy may
+            retry. ``None`` waits without deadline: the reader then reads
+            nothing while the application does not consume, so a consumer
+            that awaits a receipt or an acknowledgement inside its
+            ``messages()`` loop can wait for ever.
         store: Optional inflight store used for durable QoS state. Combine it
             with ``clean_start=False`` to resume the session it holds.
         reconnect: Reconnection policy. ``None`` disables reconnection.
@@ -352,7 +362,7 @@ class AsyncClient:
         manual_ack: bool = False,
         max_iterator_messages: int = _DEFAULT_MAX_ITERATOR_MESSAGES,
         max_iterator_bytes: int | None = _DEFAULT_MAX_ITERATOR_BYTES,
-        iterator_admission_timeout: float | None = None,
+        iterator_admission_timeout: float | None = _DEFAULT_ITERATOR_ADMISSION_TIMEOUT,
         store: MemoryInflightStore | SqliteInflightStore | None = None,
         reconnect: ReconnectPolicy | None = None,
         connect_timeout: float = 30.0,
@@ -390,7 +400,7 @@ class AsyncClient:
         if message_delivery == "callback" and (
             max_iterator_messages != _DEFAULT_MAX_ITERATOR_MESSAGES
             or max_iterator_bytes != _DEFAULT_MAX_ITERATOR_BYTES
-            or iterator_admission_timeout is not None
+            or iterator_admission_timeout not in (None, _DEFAULT_ITERATOR_ADMISSION_TIMEOUT)
         ):
             # Callback delivery retains nothing on the application's behalf, so
             # an iterator bound would describe a queue that does not exist.

@@ -29,6 +29,12 @@ bound the call it is passed to.
   an optional `timeout`. Omitting it keeps the previous behaviour.
 - A task cancelled inside `disconnect()` or `connect*()` now ends cancelled.
   Code that relied on continuing after such a cancellation must not.
+- `iterator_admission_timeout` now defaults to 60 seconds instead of `None`.
+  A `messages()` consumer that leaves a full queue untouched for that long
+  ends the connection with `MessageDeliveryError`; a reconnect policy retries
+  it. A consumer that legitimately processes one message for longer than a
+  minute while the queue is full should raise the value or pass `None` to
+  keep the previous unbounded wait.
 - TCP connections enable TCP keepalive. See
   [Configuration and sizing](configuration-and-sizing.md).
 

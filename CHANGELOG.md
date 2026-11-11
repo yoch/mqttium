@@ -20,6 +20,11 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - `subscribe(timeout=)` and `unsubscribe(timeout=)` bound the whole call,
   including the transfer of the request to the writer. They used to bound
   only the wait for SUBACK/UNSUBACK.
+- `iterator_admission_timeout` defaults to 60 seconds instead of `None`. A
+  `messages()` consumer that frees no space in a full queue for that long now
+  ends the connection with `MessageDeliveryError` instead of leaving it
+  `CONNECTED` with the reader stopped; this also bounds a consumer that
+  awaits a receipt inside its loop. Pass `None` for the previous behaviour.
 - `connect*(timeout=)` bounds the whole call, including the retries of a
   reconnect policy, and raises `MQTTTimeoutError` at its deadline. Without
   `timeout`, `connect_timeout` still bounds each attempt and the policy

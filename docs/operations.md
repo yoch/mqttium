@@ -211,8 +211,10 @@ Timeouts protect different boundaries:
   `is_done()` tells this timeout apart from a publication that failed. MQTTium
   never retransmits within a session, so without a timeout a receipt waits
   until the broker acknowledges or the connection ends;
-- `iterator_admission_timeout=None` waits indefinitely; a positive value covers iterator
-  byte reservation and queue admission with one deadline. Callback delivery has
+- `iterator_admission_timeout` (60 seconds by default) covers iterator byte
+  reservation and queue admission with one deadline. When the consumer frees
+  no space in time the connection fails with `MessageDeliveryError`, which a
+  reconnect policy retries. `None` waits indefinitely. Callback delivery has
   no queue: synchronous callbacks run on the reader and are never timed out or
   preempted.
 
@@ -285,8 +287,16 @@ input queue is saturated can still prevent the needed read. Use an independently
 draining consumer plus an application producer with explicit queue/byte bounds
 and a nonblocking overflow policy, or separate receiving and publishing
 connections. Simply inserting another bounded queue and waiting when it is full
-does not remove that dependency. A finite `iterator_admission_timeout` provides bounded
-failure, not a promise to sustain an arbitrary offered rate.
+does not remove that dependency. The default `iterator_admission_timeout`
+provides bounded failure, not a promise to sustain an arbitrary offered rate.
+
+In particular, never await something only the reader can deliver from inside
+the `messages()` loop while the queue may be full: a QoS 1/2
+`receipt.wait()`, `subscribe()`, `unsubscribe()` or `ack()`. The reader is
+waiting for the consumer, and the consumer for the reader. With the default
+deadline that cycle ends as a connection failure after 60 seconds; with
+`iterator_admission_timeout=None` it never ends. Use `publish_nowait()` with
+`receipt.add_done_callback()`, or hand the reply to a separate task.
 
 Synchronous message callbacks can use `publish_nowait()` with an explicit
 refusal policy. Avoid unbounded task creation or busy retry loops. The

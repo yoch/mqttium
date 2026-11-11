@@ -115,7 +115,7 @@ a memory bound, and is not configurable.
 | `manual_ack` | `False` | Let the application control inbound QoS acknowledgement timing; iterator delivery only |
 | `max_iterator_messages` | `65_536` | Iterator queue count bound |
 | `max_iterator_bytes` | `64 MiB` | Topic, payload and property bytes retained in the iterator queue |
-| `iterator_admission_timeout` | `None` | Optional positive deadline for admitting one message into the iterator queue |
+| `iterator_admission_timeout` | `60.0` | Deadline for admitting one message into a full iterator queue; on expiry the connection fails with `MessageDeliveryError`. `None` waits without deadline |
 
 `max_iterator_bytes=None` disables both the iterator byte limit and byte
 accounting: `delivery.iterator_bytes` and `iterator_high_water_bytes` remain

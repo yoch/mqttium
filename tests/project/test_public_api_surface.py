@@ -147,7 +147,7 @@ def test_async_client_constructor_keywords_and_defaults() -> None:
         "manual_ack": False,
         "max_iterator_messages": 65_536,
         "max_iterator_bytes": 64 * 1024 * 1024,
-        "iterator_admission_timeout": None,
+        "iterator_admission_timeout": 60.0,
         "store": None,
         "reconnect": None,
         "connect_timeout": 30.0,

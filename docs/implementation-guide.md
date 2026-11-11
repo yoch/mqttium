@@ -305,8 +305,8 @@ effect lane nor the reader waits for it. Its answer goes through
 exchange no longer waits for.
 
 
-`iterator_admission_timeout=None` has no deadline. A positive timeout covers both byte
-reservation and queue insertion with one deadline. Timeout or an impossible
+`iterator_admission_timeout` defaults to 60 seconds and covers both byte
+reservation and queue insertion with one deadline; `None` has no deadline. Timeout or an impossible
 message raises `MessageDeliveryError`, releases acquired credits and leaves
 persisted delivery state unmarked. A delivered mark denotes queue acceptance
 in iterator mode and completed callback invocation in callback mode.

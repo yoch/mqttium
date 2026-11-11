@@ -169,9 +169,9 @@ bounds remain independent and are named after what they bound:
 Maximum windows, `max_write_queue_*` for encoded frames, `max_iterator_*` for
 the application queue. Outbound bounds refuse or park the producer; inbound
 bounds end the connection. The reader's decode quantum is a fixed constant.
-`iterator_admission_timeout=None` waits for application capacity without a
-deadline; a positive value covers the entire byte-and-queue admission with one
-deadline. A message that cannot ever fit fails immediately.
+`iterator_admission_timeout` (default 60 seconds) covers the entire
+byte-and-queue admission with one deadline and ends the connection when it
+expires; `None` waits for application capacity without a deadline. A message that cannot ever fit fails immediately.
 
 `ClientStats` is an immutable snapshot of what the client is doing for the
 application without a logger: connection state, lifetime connection count,

@@ -62,8 +62,10 @@ async def test_timeout_is_one_deadline_across_queue_and_byte_waits() -> None:
     await stream.aclose()
 
 
-async def test_default_delivery_wait_has_no_deadline_and_cancels_cleanly() -> None:
-    client = AsyncClient(max_iterator_messages=1, max_iterator_bytes=2)
+async def test_unbounded_delivery_wait_has_no_deadline_and_cancels_cleanly() -> None:
+    client = AsyncClient(
+        max_iterator_messages=1, max_iterator_bytes=2, iterator_admission_timeout=None
+    )
     delivery = client._delivery
     assert delivery.iterator_admission_timeout is None
     await accept_message(delivery, Message(topic="a", payload=b""))
