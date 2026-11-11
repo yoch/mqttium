@@ -29,7 +29,8 @@
     },
     {
       "config": "ConsumerBackpressure-fixed-liveness.cfg",
-      "expect": "pass"
+      "expect": "pass",
+      "property": "AwaitingEnds"
     }
   ]
 }

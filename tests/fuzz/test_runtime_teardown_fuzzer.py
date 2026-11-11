@@ -72,11 +72,9 @@ def test_coverage_assertion_rejects_a_cold_surface() -> None:
             TeardownFamily.EXTERNAL_CANCEL,
             "RECONNECTING with neither a reader nor a reconnect task",
         ),
-        (
-            TeardownMutation.RELEASE_CANCEL_ENDS_READER,
-            TeardownFamily.DISCONNECT_RECONNECTABLE,
-            "publish receipt survived terminal teardown",
-        ),
+        # Not paired with DISCONNECT_RECONNECTABLE: a terminal disconnect()
+        # settles pending work itself when no reader is left to do it, so a
+        # reader ended at its release loses nothing in that family.
         (
             TeardownMutation.INTERRUPTED_TEARDOWN_KEEPS_RECEIPTS,
             TeardownFamily.EXTERNAL_CANCEL,
