@@ -54,15 +54,23 @@ class AuthExchange:
         if self.task is None or self.task.done():
             self.task = asyncio.create_task(self._run(), name="mqttium-auth")
 
-    def retire(self) -> None:
+    def retire(self, spare: asyncio.Task[object] | None = None) -> None:
         """Forget the connection's challenges and stop a running handler.
 
         Never joined: the handler may be the caller (disconnect() from the
-        handler) or be waiting for work only this teardown completes.
+        handler) or be waiting for work only this teardown completes. A
+        handler that is running the teardown itself is ``spare``: it is the
+        current task when it retires directly, and the task the reader names
+        when the reader retires on its behalf.
         """
         self.pending.clear()
         task = self.task
-        if task is not None and task is not asyncio.current_task() and not task.done():
+        if (
+            task is not None
+            and task is not asyncio.current_task()
+            and task is not spare
+            and not task.done()
+        ):
             task.cancel()
 
     async def _run(self) -> None:
