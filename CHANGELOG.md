@@ -39,6 +39,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   automatic reconnect now ends cancelled. The cancellation used to be
   absorbed, so `asyncio.timeout()` and `TaskGroup` cancellation were lost;
   a committed `disconnect()` still completes its shutdown first.
+- A connection failure reported while the reader was already releasing a
+  lost connection could leave the client `RECONNECTING` for ever with nothing
+  reconnecting it. The reader now always completes its reconnect decision.
+- `publish()`, `publish_many()`, `subscribe()`, `unsubscribe()`, `ack()` and
+  `disconnect()` called from another event loop than the client's now raise
+  `RuntimeError`, as `connect()` and `publish_nowait()` already did, instead
+  of racing the owner loop.
 - An unexpected failure of the keepalive loop now ends the connection with
   that failure as its cause, instead of silently ending dead-peer detection.
 

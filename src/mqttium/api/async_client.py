@@ -1206,6 +1206,17 @@ class AsyncClient:
         packet = self._engine.begin_disconnect(reason_code)
         await self._flush_terminal_packet(packet, _GRACEFUL_DISCONNECT_DRAIN_TIMEOUT)
 
+    def _check_owner_loop(self) -> None:
+        """Refuse a call made from another event loop than the client's.
+
+        The client is confined to the loop that first connected it. A call
+        from another loop would run engine and transport code concurrently
+        with that loop, which nothing in the client is built to survive.
+        """
+        owner_loop = self._owner_loop
+        if owner_loop is not None and owner_loop is not asyncio.get_running_loop():
+            raise RuntimeError("AsyncClient is bound to a different event loop")
+
     async def disconnect(self, reason_code: int = 0) -> None:
         """Disconnect gracefully and stop connection-scoped tasks.
 
@@ -1222,6 +1233,7 @@ class AsyncClient:
         Raises:
             ProtocolError: If the reason code is invalid for the protocol.
         """
+        self._check_owner_loop()
         if self._transport is not None and self._engine.state in (
             ConnectionState.CONNECTING,
             ConnectionState.CONNECTED,
@@ -1405,6 +1417,7 @@ class AsyncClient:
             MQTTTimeoutError: If ``timeout`` expires before admission.
             ValueError: If ``timeout`` is not a finite positive number.
         """
+        self._check_owner_loop()
         deadline = None
         if timeout is not None:
             _positive("timeout", timeout)
@@ -1556,6 +1569,7 @@ class AsyncClient:
         Cancellation propagates unchanged and leaves that prefix active.
         No input chunk or per-publication task is created.
         """
+        self._check_owner_loop()
         receipt = PublishBatchReceipt(max_failure_details=max_failure_details)
         try:
             source = iter(messages)
@@ -1727,6 +1741,7 @@ class AsyncClient:
                 invalid.
             NotConnectedError: If the client cannot submit the request.
         """
+        self._check_owner_loop()
         if timeout is not None:
             _positive("timeout", timeout)
         # Admission may validate more than once; consume a one-shot iterable once.
@@ -1777,6 +1792,7 @@ class AsyncClient:
             ProtocolError: If a filter is invalid.
             NotConnectedError: If the client cannot submit the request.
         """
+        self._check_owner_loop()
         if timeout is not None:
             _positive("timeout", timeout)
         # Admission may validate more than once; consume a one-shot iterable once.
@@ -1872,6 +1888,7 @@ class AsyncClient:
                 flushing; already accepted acknowledgement state is not rolled
                 back.
         """
+        self._check_owner_loop()
         if message.mid is None:
             return
         try:
@@ -2225,9 +2242,18 @@ class AsyncClient:
         # Retire resources before lifecycle user code can install a
         # replacement. Replayable state remains in the protocol store.
         interrupted = await self._release_reader_resources(reader_transport)
-        if interrupted and will_reconnect and self._will_reconnect():
-            # Still reconnectable: whoever cancelled owns what follows.
-            raise asyncio.CancelledError
+        if interrupted and will_reconnect and not self._reader_cancel_requested:
+            # Cancelled from outside the client (event-loop shutdown): nobody
+            # is left to reconnect for, exactly as when that cancellation
+            # arrives before the reconnect decision.
+            will_reconnect = False
+            self._reconnect_pending = False
+            self._fail_pending(terminal_cause)
+        # A cancellation requested by the client itself (a failing writer,
+        # keepalive, effect or auth task, or a lifecycle operation) leaves the
+        # decision with this reader: ending here would keep the client
+        # RECONNECTING with no task to reconnect it.
+        self._reader_cancel_requested = False
         if self._transport is reader_transport and not interrupted:
             self._transport = None
         if will_reconnect and not self._will_reconnect():
