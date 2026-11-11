@@ -225,23 +225,25 @@ A `Message` representation includes its payload by design.
 
 **Status:** Checked.
 
-MQTTium has no runtime dependency. The release SBOM is generated from the
-built wheel's own metadata and the build fails if that metadata declares one.
+MQTTium has no runtime dependency, and a test fails if the package metadata
+declares one.
 
-- `tests/project/test_sbom.py`
+- `tests/project/test_release_metadata.py`
 
 ### T14 — A published artifact is not the one that was built and tested
 
 **Status:** Partial.
 
 One build produces the distributions; the same files are validated, smoke
-tested, published through PyPI Trusted Publishing and attested. PyPI serves a
-signed publish attestation naming this repository and `publish.yml`. Actions
-are pinned by commit and workflows are audited in CI.
+tested and published through PyPI Trusted Publishing. PyPI serves a signed
+publish attestation naming this repository and `publish.yml`; `SECURITY.md`
+gives the command that verifies it. Actions are pinned by commit and
+workflows are audited in CI.
 
 *Residual risk:* the build is not bit-for-bit reproducible, so the evidence
 is the attestation, not an independent rebuild. The attestation's presence is
-checked by hand after a release, not by a test.
+checked by hand after a release, not by a test. There is no SBOM, no static
+analysis beyond `bandit`, and no OpenSSF Scorecard; none was judged worth its
+upkeep for a package without dependencies at this stage.
 
-- `tests/project/test_sbom.py`
 - `tests/project/test_release_metadata.py`

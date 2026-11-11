@@ -24,6 +24,13 @@ def _package_version() -> str:
     )
 
 
+def test_the_package_declares_no_runtime_dependency() -> None:
+    import tomllib
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert project["dependencies"] == []
+
+
 def test_release_version_matches_changelog() -> None:
     version = _package_version()
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")

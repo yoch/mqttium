@@ -8,10 +8,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Added
 
-- Releases carry a CycloneDX SBOM generated from the built distributions, and
-  GitHub attestations for build provenance and for the SBOM. `SECURITY.md`
-  documents how to verify a release, including the PyPI attestation that
-  releases already carried.
+- `SECURITY.md` documents how to verify a release against the signed
+  attestation PyPI already serves for it.
 - A threat model lists what the library defends against, the tests behind
   each defence, and the risks left to the application.
 - `publish()`, `PublishReceipt.wait()` and `PublishBatchReceipt.wait()` accept

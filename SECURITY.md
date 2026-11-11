@@ -50,16 +50,8 @@ pypi-attestations verify pypi --repository https://github.com/yoch/mqttium pypi:
 The command prints `OK` followed by the file name, and fails if the file was
 not published from this repository. It works for the source distribution too.
 
-Releases made after 1.2.1 also carry, on their GitHub release page, the same
-two distributions and a CycloneDX SBOM generated from them, with GitHub
-attestations for build provenance and for the SBOM:
-
-```bash
-gh attestation verify mqttium-<version>-py3-none-any.whl --repo yoch/mqttium
-```
-
-MQTTium has no runtime dependency; the SBOM is built from the wheel's own
-metadata and the release fails if that metadata declares one.
+MQTTium has no runtime dependency, so installing it brings in no other
+package.
 
 ## Security boundaries
 
