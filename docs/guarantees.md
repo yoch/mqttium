@@ -81,6 +81,7 @@ guarantee.
 - `tests/unit/test_iterator_consumer_deadlock.py`
 - `tests/unit/test_delivery_backpressure.py`
 - `tests/unit/test_observed_facts_under_backpressure.py`
+- `formal/models/ConsumerBackpressure.tla`
 
 ### G4 — A timeout argument bounds the whole call
 
@@ -116,6 +117,7 @@ connection ends; bound that case with `wait(timeout=)`.
 - `tests/unit/test_reconnect_receipts.py`
 - `tests/unit/test_publish_receipt_waiters.py`
 - `formal/models/SealedFailedReceipt.tla`
+- `formal/models/ReaderTeardownCancel.tla`
 
 ### G6 — The client is never reconnecting with nothing reconnecting it
 
@@ -127,6 +129,7 @@ before it starts the reconnect.
 
 - `tests/unit/test_reader_teardown_second_cancel.py`
 - `tests/unit/test_disconnect_hook_reconnect_progress.py`
+- `formal/models/ReaderTeardownCancel.tla`
 - `formal/models/ReconnectStability.tla`
 - `formal/models/LifecycleReconnectHook.tla`
 
