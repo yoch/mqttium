@@ -207,6 +207,15 @@ Campaign coverage requires every family, a release window in every schedule
 and at least one pending publication. Failure artifacts keep the V1 schema
 with a `teardown` owner section.
 
+Its reach is narrow and should be read as such. Every schedule cancels the
+reader at one suspension point, the gated `close()`: the random yields before
+the cancellation do not move it. Mutations that drop the receipt settlement,
+the interruption result or the reconnect decision are caught; mutations that
+move the writer wake-up out of the cancellation guard, skip the stream close
+when interrupted, or swallow the final re-raise are not caught by this
+profile, nor by the unit tests. The deterministic tests that cancel at each
+turn of a multi-turn `close()` cover more suspension points than V4 does.
+
 V4 is additive: V1, V2 and V3 schedules, seeds and artifacts are unchanged.
 
 Wall-clock behaviour is out of reach of these turn-driven schedules and stays

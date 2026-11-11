@@ -14,7 +14,14 @@ from mqttium.api import AsyncClient, PublishMessage
 from mqttium.types import Message
 from tests.support import ScriptedBrokerTransport, transport_factory
 
+
+async def _publish_nowait(client: AsyncClient) -> None:
+    client.publish_nowait("t", b"x")
+
+
 _CALLS = {
+    "auth": lambda c: c.auth(),
+    "publish_nowait": _publish_nowait,
     "publish": lambda c: c.publish("t", b"x"),
     "publish_many": lambda c: c.publish_many([PublishMessage("t", b"x")]),
     "subscribe": lambda c: c.subscribe("t"),
