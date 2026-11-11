@@ -179,15 +179,6 @@ silent accept.
 
 Recorded as observations, not as evidence. All were probed and held:
 
-- **Topic and filter validation** — wildcards refused in a publish topic,
-  zero-length topics and filters refused, `sport/#/x`, `sport#` and `sp+rt/a`
-  refused while `sport/+/x`, `sport/#`, `+/tennis/#`, `#` and `+` are accepted.
-- **UNSUBSCRIBE requires at least one filter.**
-- **Acknowledgement reason codes** — every PUBACK, PUBREC, PUBREL and PUBCOMP
-  MQTTium emits carries a value defined for that packet, including the `0x92`
-  it answers an orphan PUBREC with.
-- **SUBACK reason codes** are surfaced in the order of the filters that were
-  subscribed.
 - **Packet identifier ownership.** An inbound PUBLISH whose identifier is still
   held by an unfinished exchange of the other QoS is refused with `0x82`
   (`protocol/inbound.py`). The identifier is provably still the broker's:
@@ -197,8 +188,6 @@ Recorded as observations, not as evidence. All were probed and held:
   acknowledgement is handed to the writer. After that handoff, and after a
   manual `ack()`, a broker that reuses the identifier before receiving the
   acknowledgement is not detected (#541); a conforming broker never does so.
-- **Topic and filter rules** (`topics.py`) — wildcard placement, zero-length
-  names, `$`-prefixed topics, UTF-8 validation.
 - **Property table** (`codec/properties.py`) — per-packet-type allowlists,
   duplicate detection, `subscription_identifier` cardinality on SUBSCRIBE.
 - **No in-session retransmission** — PUBLISH/PUBREL are replayed only on
