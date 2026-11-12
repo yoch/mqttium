@@ -13,6 +13,7 @@ import pytest
 
 from mqttium.api import AsyncClient
 from mqttium.enums import ConnectionState, PacketType
+from mqttium.errors import MQTTError
 from mqttium.protocol.reconnect import ReconnectPolicy
 from tests.support import ScriptedBrokerTransport
 
@@ -147,3 +148,107 @@ async def test_connect_cancelled_between_attempts_is_not_left_reconnecting() -> 
     assert not client._reconnect_pending
     assert not any(client._running_tasks().values())
     await client.disconnect()
+
+
+def _client_tasks() -> list[str]:
+    """Every live client task, referenced by the client or not."""
+    return sorted(
+        task.get_name()
+        for task in asyncio.all_tasks()
+        if task.get_name().startswith("mqttium") and not task.done()
+    )
+
+
+@pytest.mark.parametrize("turns", range(0, 24, 2))
+async def test_a_disconnect_that_returns_last_stays_disconnected(turns: int) -> None:
+    """``connect()`` is under way when ``disconnect()`` is called and returns
+    after it: the client is disconnected and nothing reconnects behind it."""
+    client, transports = await _automatically_reconnected()
+    causes: list[BaseException | None] = []
+
+    async def on_disconnect(cause: BaseException | None) -> None:
+        causes.append(cause)
+
+    client.on_disconnect = on_disconnect
+    order: list[str] = []
+
+    failures: list[BaseException] = []
+
+    async def connect() -> None:
+        try:
+            await client.connect("unused")
+        except Exception as exc:
+            failures.append(exc)
+            order.append("connect failed")
+        else:
+            order.append("connect returned")
+
+    async def disconnect() -> None:
+        await client.disconnect()
+        order.append("disconnect returned")
+
+    before = len(transports)
+    connecting = asyncio.create_task(connect())
+    for _ in range(turns):
+        await asyncio.sleep(0)
+    disconnecting = asyncio.create_task(disconnect())
+    await asyncio.wait_for(asyncio.gather(connecting, disconnecting), 5)
+    try:
+        assert order[-1] == "disconnect returned"
+        opened = len(transports)
+        await asyncio.sleep(0.2)  # twenty reconnect delays
+        assert client.state is ConnectionState.DISCONNECTED
+        assert _client_tasks() == []
+        assert len(transports) == opened, "the client reconnected after disconnect()"
+        if failures:
+            assert isinstance(failures[0], MQTTError)
+            assert "cancelled by disconnect()" in str(failures[0])
+        if turns == 0:
+            # Overtaken before it replaced anything: it opens no connection,
+            # and the connection it found is reported closed exactly once.
+            assert failures
+            assert opened == before
+            assert len(causes) == 1
+    finally:
+        await asyncio.wait_for(client.disconnect(), 3)
+
+
+@pytest.mark.parametrize("turns", range(0, 24, 2))
+async def test_a_connect_that_returns_last_stays_connected(turns: int) -> None:
+    """The other order: ``disconnect()`` first, ``connect()`` returning last
+    and successfully leaves a whole, live connection."""
+    client, transports = await _automatically_reconnected()
+    order: list[str] = []
+
+    async def connect() -> None:
+        try:
+            await client.connect("unused")
+        except Exception:
+            order.append("connect failed")
+        else:
+            order.append("connect returned")
+
+    async def disconnect() -> None:
+        await client.disconnect()
+        order.append("disconnect returned")
+
+    disconnecting = asyncio.create_task(disconnect())
+    for _ in range(turns):
+        await asyncio.sleep(0)
+    connecting = asyncio.create_task(connect())
+    await asyncio.wait_for(asyncio.gather(connecting, disconnecting), 5)
+    opened = len(transports)
+    await asyncio.sleep(0.2)  # twenty reconnect delays
+    try:
+        assert len(transports) == opened, "a connection was opened after both calls returned"
+        if order[-1] == "connect returned":
+            assert client.is_connected
+            assert client._transport is not None and not client._transport.is_closing()
+            assert not client._delivery.closed.is_set()
+        else:
+            # disconnect() started first but ran after the connect(): it still
+            # returned last, so the client is disconnected and stays so.
+            assert client.state is ConnectionState.DISCONNECTED
+            assert _client_tasks() == []
+    finally:
+        await asyncio.wait_for(client.disconnect(), 3)
