@@ -1,18 +1,11 @@
-# Migrating to 1.2
+# Migrating to 1.3
 
-## Changes in 1.2
+## Changes in 1.3
 
-1.2.0 is additive: no 1.1 behaviour changes and nothing to migrate. It adds
-`PublishReceipt.add_done_callback()` and `PublishReceipt.exception()`, the
-per-publication counterpart of Paho's `on_publish`.
-
-1.2.1 adds Python 3.15 support. Its library code is that of 1.2.0, so there is
-nothing to migrate.
-
-## Unreleased changes
-
-These follow the 2026-11-11 assurance review and make a timeout argument
-bound the call it is passed to.
+1.3.0 follows the 2026-11-11 assurance review. Most of it fixes defects; the
+changes below can require an application adjustment. They are Stable
+behaviour changes made in a minor release, as recorded in the
+[API contract](api-stability.md#the-13-exception).
 
 - `subscribe(timeout=)` and `unsubscribe(timeout=)` now also cover the
   transfer of the request to the writer, not only the wait for
@@ -40,8 +33,21 @@ bound the call it is passed to.
   the `sqlite3.OperationalError` as its cause, instead of making the client
   permanently unusable. Code that treated that error in `on_disconnect` as
   terminal should let its reconnect policy apply.
+- `publish()`, `publish_many()`, `subscribe()`, `unsubscribe()`, `ack()`,
+  `auth()` and `disconnect()` called from another event loop than the
+  client's raise `RuntimeError`, as `connect()` and `publish_nowait()`
+  already did. A client is used from the loop that connected it.
 - TCP connections enable TCP keepalive. See
   [Configuration and sizing](configuration-and-sizing.md).
+
+## Changes in 1.2
+
+1.2.0 is additive: no 1.1 behaviour changes and nothing to migrate. It adds
+`PublishReceipt.add_done_callback()` and `PublishReceipt.exception()`, the
+per-publication counterpart of Paho's `on_publish`.
+
+1.2.1 adds Python 3.15 support. Its library code is that of 1.2.0, so there is
+nothing to migrate.
 
 ## Changes in 1.1
 

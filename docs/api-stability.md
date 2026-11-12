@@ -27,6 +27,18 @@ limits the broker was never told about, and connection failures outside
 [1.1 migration notes](migration.md#changes-in-11). This exception is not a
 precedent: later 1.x releases follow the rule above.
 
+### The 1.3 exception
+
+1.3.0 is a minor release that again changes a few Stable behaviours, all
+small and all in the direction of bounding a wait or reporting a failure
+that used to be silent: a `timeout=` argument now bounds the whole call it is
+passed to, `iterator_admission_timeout` defaults to 60 seconds, a task
+cancelled inside `connect*()` or `disconnect()` now ends cancelled, and a call
+from another event loop raises `RuntimeError`. The project chose a minor
+version because its user base is still small and each change is narrow; every
+change and the code to adapt are listed in the
+[1.3 migration notes](migration.md#changes-in-13).
+
 **Provisional** covers `ClientStats`, its nested immutable snapshots,
 `MemoryInflightStore` and `SqliteInflightStore`. These remain supported and
 tested, but may evolve in a minor release with a changelog entry and migration
