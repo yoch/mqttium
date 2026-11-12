@@ -88,8 +88,8 @@ class ClientStats:
     ``connected_since`` is the ``time.monotonic()`` value of the current
     connection's CONNACK, ``None`` while not connected. ``last_disconnect_error``
     describes the cause most recently reported to ``on_disconnect`` as
-    ``"ExceptionType: message"`` (``None`` for a clean disconnect or before
-    any loss), and ``last_disconnect_reason_code`` is its MQTT reason code when
+    ``"ExceptionType: message"`` (``None`` when ``disconnect()`` closed an
+    established connection, or before any loss), and ``last_disconnect_reason_code`` is its MQTT reason code when
     it carries one (a refused CONNACK or a broker DISCONNECT). Both are kept
     after a reconnect so a supervisor can see why the previous connection
     ended; the snapshot stays JSON-serialisable.

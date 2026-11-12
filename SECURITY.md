@@ -44,7 +44,7 @@ To check that a release file was published from this repository:
 
 ```bash
 python -m pip install pypi-attestations
-pypi-attestations verify pypi --repository https://github.com/yoch/mqttium pypi:mqttium-1.2.1-py3-none-any.whl
+pypi-attestations verify pypi --repository https://github.com/yoch/mqttium pypi:mqttium-1.3.0-py3-none-any.whl
 ```
 
 The command fetches that file and its attestation from PyPI, prints `OK`
