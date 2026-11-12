@@ -66,9 +66,12 @@ collects pending effects before it reuses an identifier. A broker DISCONNECT
 latches its cause and seals the writer at collection, so output parked for
 capacity fails at once. A peer protocol error fails a pending CONNACK wait at
 collection.
-A Server AUTH is handed at collection to one `AuthExchange` task per client,
-which runs `auth_handler` calls in arrival order outside the effect lane and the
-reader. The handler may therefore await client operations, messages from the
+A Server AUTH is handed at collection to the `AuthExchange` task of the
+client, which runs `auth_handler` calls in arrival order outside the effect lane
+and the reader. A handler that is tearing down its own connection (it awaits
+`disconnect()`) is detached rather than cancelled: it finishes its call, and a
+later connection's challenge starts a new handler task, so two calls can overlap
+across a reconnection. The handler may therefore await client operations, messages from the
 same read, existing receipts or `disconnect()`. Each AUTH Continue carries a
 challenge token; `ProtocolEngine.respond_auth()` sends the handler's answer only
 while the exchange still waits for that challenge, so an answer to AUTH Success

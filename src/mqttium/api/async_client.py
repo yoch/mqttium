@@ -630,7 +630,7 @@ class AsyncClient:
             "reconnect": running(self._reconnect_task),
             "effect_flush": running(self._effect_pump.task),
             "lifecycle": running(self._lifecycle_hooks.task),
-            "auth": running(self._auth_exchange.task),
+            "auth": self._auth_exchange.running,
         }
 
     async def __aenter__(self) -> AsyncClient:

@@ -467,3 +467,26 @@ async def test_a_handler_inside_disconnect_does_not_block_the_next_handshake() -
         assert not any(client._running_tasks().values())
     finally:
         await asyncio.wait_for(client.disconnect(), 3)
+
+
+async def test_a_detached_handler_stays_visible_until_it_ends() -> None:
+    """A handler that keeps working after its own ``disconnect()`` is no
+    longer the exchange's task, but it is still referenced and reported."""
+    broker = _ClosingBroker()
+    client: AsyncClient | None = None
+    release = asyncio.Event()
+    disconnected = asyncio.Event()
+
+    async def handler(packet: AuthPacket) -> None:
+        assert client is not None
+        await client.disconnect()
+        disconnected.set()
+        await release.wait()
+
+    client = await _client(handler, broker)
+    broker.push_rx(_auth(0x18))
+    await asyncio.wait_for(disconnected.wait(), 2)
+    assert client._auth_exchange.task is None
+    assert client._running_tasks()["auth"]
+    release.set()
+    await wait_until(lambda: not any(client._running_tasks().values()))

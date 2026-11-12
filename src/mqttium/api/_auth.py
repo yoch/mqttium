@@ -3,8 +3,9 @@
 The ``auth_handler`` is user code and may await the client itself: publish,
 subscribe, disconnect, or a message or receipt the same read delivered. It
 therefore never runs inside the effect pump or the reader. Each Server AUTH
-is handed to one task owned by this class, in arrival order. The handler's
-answer goes back through ``ProtocolEngine.respond_auth()``, which drops an
+is handed to one task owned by this class, in arrival order. A handler that
+is tearing its own connection down is detached: it finishes its call, and a
+later connection's challenges go to a new task. The handler's answer goes back through ``ProtocolEngine.respond_auth()``, which drops an
 answer the exchange no longer waits for (#501 #502 #523 #527 #528 #535).
 """
 
@@ -48,6 +49,9 @@ class AuthExchange:
         self.owner = owner
         self.pending: deque[tuple[AuthPacket, object, int]] = deque()
         self.task: asyncio.Task[None] | None = None
+        # Handlers finishing a call for a connection that is gone. Kept only
+        # so that each stays referenced and visible until it ends.
+        self.detached: set[asyncio.Task[None]] = set()
 
     def hand_off(self, packet: AuthPacket, challenge: object, epoch: int) -> None:
         self.pending.append((packet, challenge, epoch))
@@ -59,9 +63,11 @@ class AuthExchange:
 
         Never joined: the handler may be the caller (disconnect() from the
         handler) or be waiting for work only this teardown completes. A
-        handler that is running the teardown itself is spared: it is the
-        current task when it retires directly, and one of the ``spare`` tasks
-        when the reader or a connecting task retires on its behalf.
+        handler that is running the teardown itself is not cancelled: it is
+        the current task when it retires directly, and one of the ``spare``
+        tasks when the reader or a connecting task retires on its behalf. It
+        is detached instead, and may still be running when a later
+        connection's challenge starts a new handler call.
         """
         self.pending.clear()
         task = self.task
@@ -72,8 +78,15 @@ class AuthExchange:
             # later connection's challenge must not queue behind a handler
             # that is waiting for that very connection to be torn down.
             self.task = None
+            self.detached.add(task)
+            task.add_done_callback(self.detached.discard)
         else:
             task.cancel()
+
+    @property
+    def running(self) -> bool:
+        task = self.task
+        return (task is not None and not task.done()) or bool(self.detached)
 
     async def _run(self) -> None:
         owner = self.owner

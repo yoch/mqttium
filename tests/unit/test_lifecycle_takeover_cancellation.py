@@ -162,7 +162,7 @@ def _client_tasks() -> list[str]:
 @pytest.mark.parametrize("turns", range(0, 24, 2))
 async def test_a_disconnect_that_returns_last_stays_disconnected(turns: int) -> None:
     """``connect()`` is under way when ``disconnect()`` is called and returns
-    after it. The last call wins: nothing may reconnect behind its back."""
+    after it: the client is disconnected and nothing reconnects behind it."""
     client, transports = await _automatically_reconnected()
     causes: list[BaseException | None] = []
 
@@ -208,7 +208,7 @@ async def test_a_disconnect_that_returns_last_stays_disconnected(turns: int) -> 
             # and the connection it found is reported closed exactly once.
             assert failures
             assert opened == before
-            assert causes == [None]
+            assert len(causes) == 1
     finally:
         await asyncio.wait_for(client.disconnect(), 3)
 

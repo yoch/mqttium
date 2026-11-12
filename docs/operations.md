@@ -319,16 +319,19 @@ Keep disconnect and store closure in `finally` blocks. A normal disconnect:
 When `disconnect()` returns, the client is disconnected and no reconnect
 attempt is pending, whatever `connect()` overlapped it. The overlapped
 `connect()` either ends with `MQTTError`, or returns a connection that the
-shutdown then closes; this holds even when the `disconnect()` call is itself
-cancelled or times out. `disconnect()` waits for a `connect()` that holds the
-lifecycle: one that retries without a `timeout` against an unreachable broker
-keeps it waiting, so bound either call when both can overlap. To reconnect,
-call `connect()` after `disconnect()` has returned.
+shutdown then closes. `disconnect()` waits for a connection attempt that a
+`connect()` already has in progress, for at most that attempt's
+`connect_timeout`. A `disconnect()` that is cancelled or times out while it
+waits gives no such guarantee: the `connect()` may complete and stay connected.
+To reconnect, call `connect()` after `disconnect()` has returned.
 
 An authentication handler may `await client.disconnect()` directly. Running it
 in another task (`asyncio.shield()`, `asyncio.create_task()`, or
 `asyncio.wait_for()` on Python 3.11) does not carry that guarantee: the handler
-can then be cancelled by the shutdown it requested.
+can then be cancelled by the shutdown it requested. A handler that keeps
+working after its `disconnect()` returned is not interrupted by a later
+`connect()`; if the new connection is challenged, a second handler call runs
+alongside it.
 
 Lifecycle-hook completion is separate: `disconnect()` can return before
 `on_disconnect` finishes. Hook cancellation is cooperative; hooks must release

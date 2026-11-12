@@ -55,6 +55,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 - An authentication handler that awaits `disconnect()` directly gets its
   return when the broker closes the connection on DISCONNECT, or when the
   handler runs during the CONNECT handshake, instead of `CancelledError`.
+  Such a handler is no longer cancelled by a later `connect()` either: a
+  challenge on the new connection starts a second handler call.
 - PINGREQ leaves before the keep-alive interval ends (a margin of a tenth of
   the interval, at most one second) instead of a few milliseconds after it,
   as MQTT 3.1.1 requires of the interval between packets [MQTT-3.1.2-23].
