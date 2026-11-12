@@ -1218,9 +1218,7 @@ class AsyncClient:
         cause (a CONNACK timeout, for one), not the one a close synthesizes.
         """
         failure = failure_for(exc, "connection setup")
-        # A setup ended by disconnect() keeps the cause that names it; what
-        # the interrupted handshake raised on its way out is secondary.
-        if isinstance(failure, Exception) and not self._intentional_disconnect:
+        if isinstance(failure, Exception):
             self._propose_disconnect_cause(failure, _CAUSE_TRANSPORT)
         return failure
 
@@ -1254,8 +1252,13 @@ class AsyncClient:
         if not done:
             raise MQTTTimeoutError("CONNACK timed out")
         if disconnect_fut in done:
+            # Offered first, so neither a CONNACK resolved in the same turn
+            # nor an error raised on the way out can turn this into a clean
+            # close or another cause.
+            cancelled = MQTTError("Connection cancelled by disconnect()")
+            self._propose_disconnect_cause(cancelled, _CAUSE_BROKER)
             await self._send_connecting_disconnect(disconnect_fut.result())
-            raise MQTTError("Connection cancelled by disconnect()")
+            raise cancelled
         return connack_fut.result()
 
     async def _flush_terminal_packet(self, packet: WriteItem, timeout: float) -> None:

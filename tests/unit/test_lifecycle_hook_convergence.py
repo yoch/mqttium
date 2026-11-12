@@ -18,8 +18,9 @@ import asyncio
 import pytest
 
 from mqttium.api import AsyncClient
-from mqttium.enums import ConnectionState, PacketType
-from mqttium.errors import MQTTError, MQTTTimeoutError
+from mqttium.enums import ConnectionState, MQTTProtocolVersion, PacketType
+from mqttium.errors import BrokerDisconnectError, MQTTError, MQTTTimeoutError
+from mqttium.packets import encode_frame
 from mqttium.protocol.reconnect import ReconnectPolicy
 from tests.support import ScriptedBrokerTransport, wait_until
 
@@ -30,8 +31,8 @@ class _Broker(ScriptedBrokerTransport):
 
     close_delay = 0.0
 
-    def __init__(self, *, silent: bool = False) -> None:
-        super().__init__()
+    def __init__(self, *, silent: bool = False, protocol=MQTTProtocolVersion.MQTTv311) -> None:
+        super().__init__(protocol=protocol)
         self.silent = silent
 
     def handle_packet(self, raw) -> None:
@@ -52,18 +53,24 @@ class _World:
         self.refuse = False
         self.silent = False
         self.hooks: list[tuple[str, BaseException | None]] = []
+        self.protocol = MQTTProtocolVersion.MQTTv311
+        self.factory_delay = 0.0
 
     async def factory(self, host, port, *, ssl=None):
         if self.hang:
             await asyncio.sleep(3600)
         if self.refuse:
             raise OSError("connection refused")
-        transport = _Broker(silent=self.silent)
+        if self.factory_delay:
+            await asyncio.sleep(self.factory_delay)
+        transport = _Broker(silent=self.silent, protocol=self.protocol)
         self.transports.append(transport)
         return transport
 
     def client(self, **kwargs) -> AsyncClient:
-        client = AsyncClient("convergence", keepalive=0, clean_start=False, **kwargs)
+        client = AsyncClient(
+            "convergence", keepalive=0, clean_start=False, protocol=self.protocol, **kwargs
+        )
         client._transport_factory = self.factory
 
         async def on_connect(packet) -> None:
@@ -215,9 +222,12 @@ async def test_a_connect_cancelled_before_its_takeover_reports_nothing_more(turn
     connecting.cancel()
     await asyncio.wait({connecting}, timeout=3)
     try:
+        await asyncio.sleep(0.2)  # the old transport takes 50 ms to close
         await _settled(client)
         reports = [cause for kind, cause in world.hooks[before:] if kind == "D"]
-        assert all(cause is not None for cause in reports), world.hooks
+        # At most once: a reconnection that completed may coalesce it.
+        assert len(reports) <= 1 and None not in reports, world.hooks
+        _assert_converged(world, client)
     finally:
         await asyncio.wait_for(client.disconnect(), 3)
 
@@ -335,3 +345,85 @@ async def test_a_second_disconnect_keeps_the_first_report(turns: int) -> None:
     await _settled(client)
     assert client.state is ConnectionState.DISCONNECTED
     _assert_converged(world, client)
+
+
+@pytest.mark.parametrize("turns", range(16))
+async def test_a_connect_ended_by_disconnect_is_never_a_clean_close(turns: int) -> None:
+    """A CONNACK resolved in the same turn as disconnect() does not turn the
+    cancelled connect() into a clean close: connect() raised, so the report
+    names the cancellation."""
+    world = _World()
+    client = world.client()
+    connecting = asyncio.create_task(client.connect("unused"))
+    for _ in range(turns):
+        await asyncio.sleep(0)
+    await asyncio.wait_for(client.disconnect(), 3)
+    await asyncio.wait({connecting}, timeout=3)
+    await _settled(client)
+    if connecting.exception() is not None:
+        assert ("D", None) not in world.hooks, world.hooks
+        assert client.stats().last_disconnect_error is not None
+
+
+async def test_a_connack_timeout_after_a_waiting_disconnect_stays_a_timeout() -> None:
+    """disconnect() waits while the transport opens; the CONNACK then times
+    out. The report is the timeout, not a cancellation that never happened."""
+    world = _World()
+    world.silent = True
+    world.factory_delay = 0.05
+    client = world.client(connect_timeout=0.2)
+    connecting = asyncio.create_task(client.connect("unused"))
+    await asyncio.sleep(0.01)
+    await asyncio.wait_for(client.disconnect(), 3)
+    await asyncio.wait({connecting}, timeout=3)
+    await _settled(client)
+    assert isinstance(connecting.exception(), MQTTTimeoutError)
+    causes = [cause for kind, cause in world.hooks if kind == "D"]
+    assert causes and isinstance(causes[-1], MQTTTimeoutError), causes
+
+
+@pytest.mark.parametrize("turns", range(20))
+async def test_a_failed_takeover_reports_the_loss_with_its_own_cause(turns: int) -> None:
+    """The superseded report keeps the loss's cause, here a broker
+    DISCONNECT, even when the worker had already taken it."""
+    world = _World()
+    world.protocol = MQTTProtocolVersion.MQTTv5
+    client = await _automatically_reconnected(world)
+    before = len(world.hooks)
+    world.hang = True
+    world.transports[-1].push_rx(encode_frame(PacketType.DISCONNECT, 0, b"\x8b\x00"))
+    for _ in range(turns):
+        await asyncio.sleep(0)
+    try:
+        with pytest.raises(MQTTError):
+            await client.connect("unused", timeout=0.05)
+        await _settled(client)
+        reports = [cause for kind, cause in world.hooks[before:] if kind == "D"]
+        assert reports and isinstance(reports[-1], BrokerDisconnectError), world.hooks
+    finally:
+        world.hang = False
+        await asyncio.wait_for(client.disconnect(), 3)
+
+
+async def test_disconnect_cancels_a_running_on_disconnect() -> None:
+    """Once its callback runs, an on_disconnect is cancelled by an external
+    disconnect(), as for any obsolete active hook."""
+    world = _World()
+    client = world.client()
+    entered = asyncio.Event()
+    outcome: list[str] = []
+
+    async def on_disconnect(cause) -> None:
+        entered.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            outcome.append("cancelled")
+            raise
+
+    client.on_disconnect = on_disconnect
+    await client.connect("unused")
+    world.transports[0].push_rx(b"")
+    await asyncio.wait_for(entered.wait(), 3)
+    await asyncio.wait_for(client.disconnect(), 3)
+    await wait_until(lambda: outcome == ["cancelled"], timeout=3)

@@ -44,6 +44,7 @@ class LifecycleHooks:
         # whether it has reached the user callback.
         self._hook_connected = False
         self._hook_started = False
+        self._hook_event: _Notification | None = None
         self.pending: _Notification | None = None
         # Kind of the last notification the application was given: True
         # after on_connect, False after on_disconnect. It changes when the
@@ -75,9 +76,17 @@ class LifecycleHooks:
         origin = self.hook_task if preserve_hook else direct_origin
         pending = self.pending
         if replace_connection:
-            if pending is not None and not pending.connected and pending.token == self.token:
-                assert not isinstance(pending.value, ConnAckPacket)
-                self._superseded_cause = pending.value
+            superseded = pending
+            if superseded is None and self.hook_task is not None and not self._hook_started:
+                # Taken by the worker but not yet told: superseded all the same.
+                superseded = self._hook_event
+            if (
+                superseded is not None
+                and not superseded.connected
+                and superseded.token == self.token
+            ):
+                assert not isinstance(superseded.value, ConnAckPacket)
+                self._superseded_cause = superseded.value
             self.token += 1
             self.pending = None
         elif pending is not None and pending.connected:
@@ -220,6 +229,7 @@ class LifecycleHooks:
                     self.hook_task = task
                     self._hook_connected = event.connected
                     self._hook_started = False
+                    self._hook_event = event
                     try:
                         await task
                     except asyncio.CancelledError:
@@ -229,6 +239,9 @@ class LifecycleHooks:
                             raise
                     finally:
                         self.hook_task = None
+                        self._hook_event = None
+                        self._hook_connected = False
+                        self._hook_started = False
                 if not event.connected and event.token == self.token and self.pending is None:
                     self._reconnect_ready.set()
         finally:
