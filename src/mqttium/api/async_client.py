@@ -1094,6 +1094,9 @@ class AsyncClient:
         self._intentional_disconnect = True
         self._reconnect_pending = False
         self._fail_pending(cause)
+        # A takeover superseded the replaced connection's on_disconnect; it
+        # was closed at the application's request, hence no cause.
+        self._lifecycle_hooks.settle(None)
 
     async def _connect_once_locked(
         self,
@@ -1191,7 +1194,7 @@ class AsyncClient:
         except BaseException as exc:
             # The transport factory or CONNECT write can raise CancelledError
             # although the caller was not cancelled (#529).
-            failure = failure_for(exc, "connection setup")
+            failure = self._setup_failure(exc)
             if not reconnect_attempt:
                 self._intentional_disconnect = True
             if self._connack_fut is not None and not self._connack_fut.done():
@@ -1204,6 +1207,17 @@ class AsyncClient:
                 pass
             self._retire_engine_connection()
             raise failure from failure.__cause__
+
+    def _setup_failure(self, exc: BaseException) -> BaseException:
+        """Classify a setup failure and offer it as the attempt's cause.
+
+        The attempt's own reader reports the loss: it must carry the real
+        cause (a CONNACK timeout, for one), not the one a close synthesizes.
+        """
+        failure = failure_for(exc, "connection setup")
+        if isinstance(failure, Exception):
+            self._propose_disconnect_cause(failure, _CAUSE_TRANSPORT)
+        return failure
 
     async def _open_transport(
         self, host: str, port: int, ssl: ssl.SSLContext | bool | None, timeout: float
@@ -2259,8 +2273,19 @@ class AsyncClient:
         connection's resources and hands the loss to the lifecycle hooks and
         the reconnect policy.
         """
+        # Only a connection that got its CONNACK can be closed cleanly: a
+        # disconnect() during the handshake also moves the engine to
+        # DISCONNECTING, but there was no connection to close.
+        # A reader started without a handshake has no CONNACK to check.
+        established = reader_connack is None or (
+            reader_connack.done()
+            and not reader_connack.cancelled()
+            and reader_connack.exception() is None
+            and reader_connack.result().reason_code == 0
+        )
         clean_disconnect = (
-            self._intentional_disconnect
+            established
+            and self._intentional_disconnect
             and self._engine.state in (ConnectionState.CONNECTED, ConnectionState.DISCONNECTING)
             and self._disconnect_exc is None
         )
@@ -2310,6 +2335,10 @@ class AsyncClient:
             ):
                 self._propose_disconnect_cause(
                     BrokerDisconnectError(info.reason_code, info.properties), _CAUSE_BROKER
+                )
+            elif self._intentional_disconnect and not established:
+                self._propose_disconnect_cause(
+                    MQTTError("Connection cancelled by disconnect()"), _CAUSE_SYNTHETIC
                 )
             else:
                 self._propose_disconnect_cause(MQTTError("Connection closed"), _CAUSE_SYNTHETIC)

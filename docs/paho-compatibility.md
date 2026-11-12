@@ -91,7 +91,10 @@ before its broker. Network failures raise `ConnectError`, which is both an
 They run on their own task, after the connection work is done, and one pending
 notification replaces an older one that has not started: a fast
 disconnect/reconnect sequence can produce one `on_connect` for the latest
-connection instead of a callback per transition. Read `client.state` or
+connection instead of a callback per transition. The last hook still matches
+the final state, and `on_disconnect(None)` only reports an established
+connection closed by `disconnect()` or replaced by `connect()`. Read
+`client.state` or
 `client.stats()` when you need the current state rather than counting hooks.
 
 ## No internal logging

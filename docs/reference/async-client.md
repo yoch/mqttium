@@ -126,8 +126,20 @@ already replaced when the takeover began. A hook awaiting its own connection
 attempt receives that operation's failure normally; this caller preservation
 ends when the connection call exits.
 
+The latest state is never left out. Once lifecycle calls have returned and
+pending hooks have run, the last hook delivered matches the client: a client
+that is no longer connected, and was last told `on_connect`, has received
+`on_disconnect` after it. This holds when a `connect()` that replaced a
+connection then fails, times out, is cancelled or is overtaken by
+`disconnect()`.
+
 `on_disconnect` runs after the old connection resources are retired, with the
-original cause or `None` for clean closure. Automatic retry waits until that
+original cause, or `None` when a connection that had received its CONNACK was
+closed at the application's request: by `disconnect()`, or replaced by
+`connect()`. Anything else carries an exception, including a failed connection
+attempt (`ConnectRefusedError`, `MQTTTimeoutError` for a CONNACK that did not
+arrive) and an attempt that `disconnect()` interrupted before its CONNACK
+(`MQTTError("Connection cancelled by disconnect()")`). Automatic retry waits until that
 hook has started, not until it returns, then rechecks explicit user intent, so
 a hook may await work that only the replacement connection can complete. The
 replacement's `on_connect` still runs after the hook returns. Hook exceptions and a

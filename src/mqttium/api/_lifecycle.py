@@ -41,6 +41,10 @@ class LifecycleHooks:
         self.task: asyncio.Task[None] | None = None
         self.hook_task: asyncio.Task[None] | None = None
         self.pending: _Notification | None = None
+        # Kind of the last notification taken for delivery: True after
+        # on_connect, False after on_disconnect. What the application was last
+        # told is this, or the pending notification when there is one.
+        self._delivered_connected = False
         # The cause most recently reported to on_disconnect, for stats().
         self.last_disconnect_error: BaseException | None = None
         self._holds = 0
@@ -111,6 +115,23 @@ class LifecycleHooks:
         self.pending = _Notification(token, False, self.owner.on_disconnect, error)
         self._ensure_worker()
 
+    @property
+    def announced_connected(self) -> bool:
+        pending = self.pending
+        if pending is not None and pending.token == self.token:
+            return pending.connected
+        return self._delivered_connected
+
+    def settle(self, error: BaseException | None) -> None:
+        """Report the loss of a connection the application was told about.
+
+        A lifecycle operation that superseded the connection's own
+        notification, then ended without a connection, must not leave
+        ``on_connect`` as the last word.
+        """
+        if self.announced_connected:
+            self.disconnected(error, self.token)
+
     def retiring(self, token: int, origin: asyncio.Task[None] | None = None) -> None:
         """Close retry admission before resource cleanup can suspend."""
         if token == self.token:
@@ -164,6 +185,7 @@ class LifecycleHooks:
                 self.pending = None
                 if event.token != self.token:
                     continue
+                self._delivered_connected = event.connected
                 if event.callback is not None:
                     task = asyncio.create_task(self._invoke(event), name="mqttium-lifecycle-hook")
                     self.hook_task = task

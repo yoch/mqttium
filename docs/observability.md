@@ -22,7 +22,7 @@ no sampler, logging, or formatting cost.
 | Need | API |
 | --- | --- |
 | Publish completion or failure | `await receipt.wait()` and `receipt.is_done()` |
-| Latest connection lifecycle state | `on_connect` and `on_disconnect`; obsolete pending transitions may be coalesced |
+| Latest connection lifecycle state | `on_connect` and `on_disconnect`; obsolete pending transitions may be coalesced, the last hook matches the final state |
 | Incoming messages | `on_message`, `message_callback_add`, or `async for message in client.messages()` |
 | Current state | `client.is_connected`, `client.state`, `client.negotiated` |
 | Protocol failures | typed exceptions such as `ProtocolError` and `MQTTTimeoutError` |
