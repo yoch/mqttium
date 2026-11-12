@@ -93,7 +93,7 @@ notification replaces an older one that has not started: a fast
 disconnect/reconnect sequence can produce one `on_connect` for the latest
 connection instead of a callback per transition. The last hook still matches
 the final state, and `on_disconnect(None)` only reports an established
-connection closed by `disconnect()` or replaced by `connect()`. Read
+connection closed by `disconnect()`. Read
 `client.state` or
 `client.stats()` when you need the current state rather than counting hooks.
 

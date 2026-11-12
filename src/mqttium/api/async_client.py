@@ -994,9 +994,15 @@ class AsyncClient:
                 )
                 timeout = timeout if timeout is not None else self._connect_timeout
                 self._reconnect.reset()
-                connack = await self._connect_with_policy(
-                    host, port, ssl=ssl, timeout=timeout, call_deadline=call_deadline
-                )
+                try:
+                    connack = await self._connect_with_policy(
+                        host, port, ssl=ssl, timeout=timeout, call_deadline=call_deadline
+                    )
+                except BaseException:
+                    # The token moved above: the replaced connection's own
+                    # on_disconnect was superseded. Nothing replaces it now.
+                    self._lifecycle_hooks.settle(MQTTError("Connection closed"))
+                    raise
             if self.is_connected:
                 self._lifecycle_hooks.connected(connack, lifecycle_token)
             return connack
@@ -1094,9 +1100,6 @@ class AsyncClient:
         self._intentional_disconnect = True
         self._reconnect_pending = False
         self._fail_pending(cause)
-        # A takeover superseded the replaced connection's on_disconnect; it
-        # was closed at the application's request, hence no cause.
-        self._lifecycle_hooks.settle(None)
 
     async def _connect_once_locked(
         self,
@@ -1215,7 +1218,9 @@ class AsyncClient:
         cause (a CONNACK timeout, for one), not the one a close synthesizes.
         """
         failure = failure_for(exc, "connection setup")
-        if isinstance(failure, Exception):
+        # A setup ended by disconnect() keeps the cause that names it; what
+        # the interrupted handshake raised on its way out is secondary.
+        if isinstance(failure, Exception) and not self._intentional_disconnect:
             self._propose_disconnect_cause(failure, _CAUSE_TRANSPORT)
         return failure
 

@@ -112,8 +112,9 @@ A refused CONNACK is a `ConnectRefusedError` whose `reason_code` (and MQTT 5
 Lifecycle notifications describe the latest state, not a lossless transition
 log. MQTTium retains one active hook and at most one pending notification;
 newer state replaces obsolete pending state. An external connection replacement
-cancels an obsolete active hook; an external `disconnect()` cancels an active
-`on_connect`, never the `on_disconnect` that reports a loss or a pending one. A lifecycle operation awaited
+or disconnect cancels an obsolete active hook. A `disconnect()` never discards
+an `on_disconnect` that has not reached its callback yet: a loss recorded
+before it is still reported. A lifecycle operation awaited
 directly by that same hook preserves its caller, so `on_connect` can await
 `disconnect()` and `on_disconnect` can await a replacement `connect()`. An
 application-created task is a separate caller. Hooks must cooperate with
@@ -135,11 +136,12 @@ connection then fails, times out, is cancelled or is overtaken by
 `disconnect()`.
 
 `on_disconnect` runs after the old connection resources are retired, with the
-original cause, or `None` when a connection that had received its CONNACK was
-closed at the application's request: by `disconnect()`, or replaced by
-`connect()`. Anything else carries an exception, including a failed connection
-attempt (`ConnectRefusedError`, `MQTTTimeoutError` for a CONNACK that did not
-arrive) and an attempt that `disconnect()` interrupted before its CONNACK
+original cause, or `None` when `disconnect()` closed a connection that had
+received its CONNACK. Anything else carries an exception: a lost connection, a
+connection replaced by `connect()` (`MQTTError("Connection closed")` when it is
+reported), a failed connection attempt (`ConnectRefusedError`,
+`MQTTTimeoutError` for a CONNACK that did not arrive), and an attempt that
+`disconnect()` interrupted before its CONNACK
 (`MQTTError("Connection cancelled by disconnect()")`). Automatic retry waits until that
 hook has started, not until it returns, then rechecks explicit user intent, so
 a hook may await work that only the replacement connection can complete. The

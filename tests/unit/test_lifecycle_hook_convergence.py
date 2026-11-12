@@ -21,11 +21,14 @@ from mqttium.api import AsyncClient
 from mqttium.enums import ConnectionState, PacketType
 from mqttium.errors import MQTTError, MQTTTimeoutError
 from mqttium.protocol.reconnect import ReconnectPolicy
-from tests.support import ScriptedBrokerTransport
+from tests.support import ScriptedBrokerTransport, wait_until
 
 
 class _Broker(ScriptedBrokerTransport):
-    """Acknowledges CONNECT unless told to stay silent."""
+    """Acknowledges CONNECT unless told to stay silent; ``close()`` can take
+    a moment, as TLS does."""
+
+    close_delay = 0.0
 
     def __init__(self, *, silent: bool = False) -> None:
         super().__init__()
@@ -36,17 +39,25 @@ class _Broker(ScriptedBrokerTransport):
             return
         super().handle_packet(raw)
 
+    async def close(self) -> None:
+        if self.close_delay:
+            await asyncio.sleep(self.close_delay)
+        await super().close()
+
 
 class _World:
     def __init__(self) -> None:
         self.transports: list[_Broker] = []
         self.hang = False
+        self.refuse = False
         self.silent = False
         self.hooks: list[tuple[str, BaseException | None]] = []
 
     async def factory(self, host, port, *, ssl=None):
         if self.hang:
             await asyncio.sleep(3600)
+        if self.refuse:
+            raise OSError("connection refused")
         transport = _Broker(silent=self.silent)
         self.transports.append(transport)
         return transport
@@ -145,23 +156,114 @@ async def test_a_takeover_overtaken_by_disconnect_ends_with_on_disconnect(turns:
     _assert_converged(world, client)
 
 
-@pytest.mark.parametrize("turns", range(16))
-async def test_a_replaced_connection_is_reported_as_requested(turns: int) -> None:
-    """A connection that ``connect()`` replaces was closed at the
-    application's request, whenever the takeover landed."""
+@pytest.mark.parametrize("turns", range(20))
+async def test_a_loss_then_a_failed_takeover_ends_with_the_loss_report(turns: int) -> None:
+    """The loss's on_disconnect may have been taken by the worker, but not
+    started, when the takeover supersedes it: that hook told the
+    application nothing, so the failed takeover must still report the loss."""
     world = _World()
     client = await _automatically_reconnected(world)
     before = len(world.hooks)
+    world.hang = True
+    world.transports[-1].push_rx(b"")
+    for _ in range(turns):
+        await asyncio.sleep(0)
     try:
-        for _ in range(turns):
-            await asyncio.sleep(0)
-        await asyncio.wait_for(client.connect("unused"), 3)
+        with pytest.raises(MQTTError):
+            await client.connect("unused", timeout=0.05)
         await _settled(client)
-        assert client.is_connected
+        assert client.state is ConnectionState.DISCONNECTED
         _assert_converged(world, client)
-        assert all(cause is None for kind, cause in world.hooks[before:] if kind == "D")
+        reports = [cause for kind, cause in world.hooks[before:] if kind == "D"]
+        assert reports and all(cause is not None for cause in reports), world.hooks
+    finally:
+        world.hang = False
+        await asyncio.wait_for(client.disconnect(), 3)
+
+
+async def test_a_replaced_connection_is_reported_with_a_cause() -> None:
+    """A takeover that never gets a connection reports the connection it
+    replaced; only disconnect() reports None."""
+    world = _World()
+    client = await _automatically_reconnected(world)
+    before = len(world.hooks)
+    world.hang = True
+    try:
+        with pytest.raises(MQTTError):
+            await client.connect("unused", timeout=0.05)
+        await _settled(client)
+        reports = [cause for kind, cause in world.hooks[before:] if kind == "D"]
+        assert reports and all(cause is not None for cause in reports), world.hooks
+    finally:
+        world.hang = False
+        await asyncio.wait_for(client.disconnect(), 3)
+
+
+@pytest.mark.parametrize("turns", range(12))
+async def test_a_connect_cancelled_before_its_takeover_reports_nothing_more(turns: int) -> None:
+    """Cancelled before it replaced anything, connect() superseded no
+    notification: the loss is reported once, by its own reader."""
+    world = _World()
+    client = await _automatically_reconnected(world)
+    before = len(world.hooks)
+    for transport in world.transports:
+        transport.close_delay = 0.05
+    world.transports[-1].push_rx(b"")
+    connecting = asyncio.create_task(client.connect("unused"))
+    for _ in range(turns):
+        await asyncio.sleep(0)
+    connecting.cancel()
+    await asyncio.wait({connecting}, timeout=3)
+    try:
+        await _settled(client)
+        reports = [cause for kind, cause in world.hooks[before:] if kind == "D"]
+        assert all(cause is not None for cause in reports), world.hooks
     finally:
         await asyncio.wait_for(client.disconnect(), 3)
+
+
+@pytest.mark.parametrize("failure", ["hang", "refuse"])
+async def test_a_hook_awaiting_its_own_takeover_receives_the_failure(failure: str) -> None:
+    """Caller preservation: the on_connect that awaits connect() gets that
+    connect's failure and is not cancelled by the report that follows."""
+    world = _World()
+    log: list[str] = []
+    client = world.client(
+        connect_timeout=5.0,
+        reconnect=ReconnectPolicy(initial_delay=0.01, max_delay=0.01, stable_after=30),
+    )
+    connects = 0
+
+    async def on_connect(packet) -> None:
+        nonlocal connects
+        connects += 1
+        world.hooks.append(("C", None))
+        if connects != 2:
+            return
+        if failure == "hang":
+            world.hang = True
+        else:
+            world.refuse = True
+        try:
+            await client.connect("unused", timeout=0.05)
+        except MQTTError:
+            log.append("failed")
+        try:
+            await asyncio.sleep(0.01)
+            log.append("finished")
+        except asyncio.CancelledError:
+            log.append("cancelled")
+            raise
+
+    client.on_connect = on_connect
+    await client.connect("unused")
+    await _settled(client)
+    world.transports[0].push_rx(b"")
+    await wait_until(lambda: "finished" in log or "cancelled" in log, timeout=3)
+    world.hang = False
+    world.refuse = False
+    await asyncio.wait_for(client.disconnect(), 3)
+    assert log == ["failed", "finished"]
 
 
 @pytest.mark.parametrize("turns", range(0, 12, 2))
@@ -177,7 +279,8 @@ async def test_disconnect_during_the_handshake_is_not_a_clean_close(turns: int) 
     await asyncio.wait({connecting}, timeout=3)
     await _settled(client)
     assert not any(kind == "C" for kind, _ in world.hooks)
-    assert all(cause is not None for kind, cause in world.hooks if kind == "D"), world.hooks
+    reports = [cause for kind, cause in world.hooks if kind == "D"]
+    assert reports and all(cause is not None for cause in reports), world.hooks
 
 
 async def test_a_connack_timeout_is_reported_as_a_timeout() -> None:

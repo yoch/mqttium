@@ -40,12 +40,15 @@ class LifecycleHooks:
         self.token = 0
         self.task: asyncio.Task[None] | None = None
         self.hook_task: asyncio.Task[None] | None = None
-        # Whether hook_task delivers on_connect (True) or on_disconnect.
+        # Whether hook_task delivers on_connect (True) or on_disconnect, and
+        # whether it has reached the user callback.
         self._hook_connected = False
+        self._hook_started = False
         self.pending: _Notification | None = None
-        # Kind of the last notification taken for delivery: True after
-        # on_connect, False after on_disconnect. What the application was last
-        # told is this, or the pending notification when there is one.
+        # Kind of the last notification the application was given: True
+        # after on_connect, False after on_disconnect. It changes when the
+        # callback is reached, not when the worker takes the event: a hook
+        # cancelled before its user code told nobody anything.
         self._delivered_connected = False
         # The cause of an on_disconnect a connection replacement superseded,
         # handed to settle() if that replacement ends without a connection.
@@ -82,9 +85,10 @@ class LifecycleHooks:
             # report of a loss already recorded: that one is the latest state.
             self.pending = None
         self._reconnect_ready.set()
-        # A running on_disconnect still reports the latest state: only a
-        # connection replacement makes it obsolete, not a disconnect().
-        if not preserve_hook and (replace_connection or self._hook_connected):
+        # disconnect() does not make an on_disconnect obsolete before it has
+        # been told: a hook taken for it but not yet started runs. Once its
+        # user code runs, external replacement cancels it as before.
+        if not preserve_hook and (replace_connection or self._hook_connected or self._hook_started):
             self._cancel_obsolete(direct_origin)
         return origin
 
@@ -139,16 +143,20 @@ class LifecycleHooks:
             return pending.connected
         return self._delivered_connected
 
-    def settle(self, error: BaseException | None) -> None:
+    def settle(self, error: BaseException) -> None:
         """Report the loss of a connection the application was told about.
 
-        A lifecycle operation that superseded the connection's own
-        notification, then ended without a connection, must not leave
-        ``on_connect`` as the last word.
+        A connection replacement superseded the replaced connection's own
+        notification; when it ends without a connection, ``on_connect`` must
+        not stay the last word. The superseded cause wins over ``error``. A
+        hook awaiting the replacement itself is its caller and is preserved.
         """
-        if self.announced_connected:
-            superseded = self._superseded_cause
-            self.disconnected(superseded if superseded is not None else error, self.token)
+        if not self.announced_connected:
+            return
+        superseded = self._superseded_cause
+        current = asyncio.current_task()
+        origin = self.hook_task if self.hook_task is current else None
+        self.disconnected(superseded if superseded is not None else error, self.token, origin)
 
     def retiring(self, token: int, origin: asyncio.Task[None] | None = None) -> None:
         """Close retry admission before resource cleanup can suspend."""
@@ -172,6 +180,8 @@ class LifecycleHooks:
             pass
         if event.token != self.token:
             return
+        self._hook_started = True
+        self._delivered_connected = event.connected
         if not event.connected:
             # The disconnect hook is now the lifecycle owner, no longer a
             # pending state a retry could overwrite: automatic reconnect may
@@ -203,11 +213,13 @@ class LifecycleHooks:
                 self.pending = None
                 if event.token != self.token:
                     continue
-                self._delivered_connected = event.connected
-                if event.callback is not None:
+                if event.callback is None:
+                    self._delivered_connected = event.connected
+                else:
                     task = asyncio.create_task(self._invoke(event), name="mqttium-lifecycle-hook")
                     self.hook_task = task
                     self._hook_connected = event.connected
+                    self._hook_started = False
                     try:
                         await task
                     except asyncio.CancelledError:
