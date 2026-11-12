@@ -495,6 +495,8 @@ class AsyncClient:
         self._sub_futs: dict[int, asyncio.Future[SubscribeResult]] = {}
         self._unsub_futs: dict[int, asyncio.Future[UnsubscribeResult]] = {}
         self._disconnect_exc: BaseException | None = None
+        # Whether the current connection was returned by a successful connect.
+        self._connection_handed_over = False
         self._disconnect_rank = _CAUSE_TRANSPORT
         # Set once by a local-terminal ingress failure (inside the read-loop
         # batch or while applying an effect that touches persistence). While
@@ -1141,6 +1143,7 @@ class AsyncClient:
             self._delivery.reopen()
             self._disconnect_hook_origin = None
             self._disconnect_exc = None
+            self._connection_handed_over = False
             self._disconnect_rank = _CAUSE_TRANSPORT
             self._teardown_final = False
             self._last_disconnect = None
@@ -1172,13 +1175,7 @@ class AsyncClient:
                 self._write_pump.own_ack_rearm(self._reader_task)
                 transport.before_wait = self._write_pump.rearm_deferred_ack
                 self._delivery.before_yield = self._write_pump.rearm_deferred_ack
-            try:
-                connack = await self._await_connack_or_disconnect(max(0.0, deadline - loop.time()))
-            finally:
-                connect_disconnect_fut = self._connect_disconnect_fut
-                self._connect_disconnect_fut = None
-                if connect_disconnect_fut is not None and not connect_disconnect_fut.done():
-                    connect_disconnect_fut.cancel()
+            connack = await self._await_handshake(max(0.0, deadline - loop.time()))
             if connack.reason_code != 0:
                 refusal = self._disconnect_exc
                 if not isinstance(refusal, ProtocolError):
@@ -1193,6 +1190,9 @@ class AsyncClient:
             self._keepalive_task = asyncio.create_task(
                 self._keepalive_loop(), name="mqttium-keepalive"
             )
+            # The connection now belongs to the application: only from here
+            # can its close be a clean one.
+            self._connection_handed_over = True
             return connack
         except BaseException as exc:
             # The transport factory or CONNECT write can raise CancelledError
@@ -1239,6 +1239,16 @@ class AsyncClient:
             # handlers.
             raise ConnectError(f"Could not connect to the broker: {exc}") from exc
 
+    async def _await_handshake(self, timeout: float) -> ConnAckPacket:
+        """Wait for CONNACK or disconnect(), then retire the disconnect future."""
+        try:
+            return await self._await_connack_or_disconnect(timeout)
+        finally:
+            connect_disconnect_fut = self._connect_disconnect_fut
+            self._connect_disconnect_fut = None
+            if connect_disconnect_fut is not None and not connect_disconnect_fut.done():
+                connect_disconnect_fut.cancel()
+
     async def _await_connack_or_disconnect(self, timeout: float) -> ConnAckPacket:
         connack_fut = self._connack_fut
         disconnect_fut = self._connect_disconnect_fut
@@ -1252,13 +1262,8 @@ class AsyncClient:
         if not done:
             raise MQTTTimeoutError("CONNACK timed out")
         if disconnect_fut in done:
-            # Offered first, so neither a CONNACK resolved in the same turn
-            # nor an error raised on the way out can turn this into a clean
-            # close or another cause.
-            cancelled = MQTTError("Connection cancelled by disconnect()")
-            self._propose_disconnect_cause(cancelled, _CAUSE_BROKER)
             await self._send_connecting_disconnect(disconnect_fut.result())
-            raise cancelled
+            raise MQTTError("Connection cancelled by disconnect()")
         return connack_fut.result()
 
     async def _flush_terminal_packet(self, packet: WriteItem, timeout: float) -> None:
@@ -2285,8 +2290,12 @@ class AsyncClient:
         # disconnect() during the handshake also moves the engine to
         # DISCONNECTING, but there was no connection to close.
         # A reader started without a handshake has no CONNACK to check.
+        # The connection must have been handed to the application: a CONNACK
+        # that arrived while a cancelled or interrupted connect() was failing
+        # does not make its forced close a clean one.
         established = reader_connack is None or (
-            reader_connack.done()
+            self._connection_handed_over
+            and reader_connack.done()
             and not reader_connack.cancelled()
             and reader_connack.exception() is None
             and reader_connack.result().reason_code == 0

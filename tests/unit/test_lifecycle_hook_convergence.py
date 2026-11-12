@@ -427,3 +427,21 @@ async def test_disconnect_cancels_a_running_on_disconnect() -> None:
     await asyncio.wait_for(entered.wait(), 3)
     await asyncio.wait_for(client.disconnect(), 3)
     await wait_until(lambda: outcome == ["cancelled"], timeout=3)
+
+
+@pytest.mark.parametrize("turns", range(12))
+async def test_a_cancelled_connect_then_disconnect_is_not_a_clean_close(turns: int) -> None:
+    """The usual shutdown of a starting client: cancel its connect(), then
+    disconnect(). A CONNACK that arrives meanwhile does not hand the
+    connection to anyone, so its forced close is not reported as clean."""
+    world = _World()
+    client = world.client()
+    connecting = asyncio.create_task(client.connect("unused"))
+    for _ in range(turns):
+        await asyncio.sleep(0)
+    connecting.cancel()
+    await asyncio.wait_for(client.disconnect(), 3)
+    await asyncio.wait({connecting}, timeout=3)
+    await _settled(client)
+    if connecting.cancelled() or connecting.exception() is not None:
+        assert ("D", None) not in world.hooks, world.hooks
