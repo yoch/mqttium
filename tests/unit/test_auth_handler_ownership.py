@@ -17,6 +17,7 @@ from mqttium.codec.buffer import IncrementalDecoder
 from mqttium.codec.properties import encode_properties
 from mqttium.enums import MQTTProtocolVersion, PacketType, QoS
 from mqttium.errors import BrokerDisconnectError, ProtocolError
+from mqttium.errors import MQTTError
 from mqttium.packets import AuthPacket, PubAckPacket, PublishPacket, encode_frame
 from mqttium.protocol.effects import EffectKind, EngineEffect
 from mqttium.types import Properties
@@ -290,3 +291,202 @@ async def test_queued_auth_effect_is_handed_to_the_exchange() -> None:
     effect = EngineEffect(EffectKind.AUTH, AuthPacket(reason_code=0x18), exchange_token=7)
     await client._apply_effect(effect, nowait=True)
     assert handed == [(7, client._connection_epoch)]
+
+
+class _ClosingBroker(_ReauthBroker):
+    """Closes the socket on DISCONNECT, as brokers do, and may challenge
+    during the CONNECT handshake instead of accepting at once."""
+
+    def __init__(self, *, challenge_on_connect: bool = False) -> None:
+        super().__init__()
+        self.challenge_on_connect = challenge_on_connect
+
+    async def write(self, data: bytes | tuple[bytes, bytes]) -> None:
+        wire = data if isinstance(data, bytes) else data[0] + data[1]
+        probe = IncrementalDecoder()
+        probe.feed(wire)
+        kinds = [raw.packet_type for raw in probe.drain_packets()]
+        if self.challenge_on_connect and PacketType.CONNECT in kinds:
+            self.push_rx(_auth(0x18))
+            return
+        await super().write(data)
+        if PacketType.DISCONNECT in kinds:
+            self.push_rx(b"")
+
+
+@pytest.mark.parametrize("reconnect", [False, True])
+async def test_handler_can_disconnect_when_the_broker_closes_on_disconnect(
+    reconnect: bool,
+) -> None:
+    """The broker's close retires the reader before the forced close starts.
+    The handler running the shutdown must not be cancelled by it."""
+    from mqttium.protocol.reconnect import ReconnectPolicy
+
+    broker = _ClosingBroker()
+    client: AsyncClient | None = None
+    outcome: list[str] = []
+    finished = asyncio.Event()
+
+    async def handler(packet: AuthPacket) -> None:
+        assert client is not None
+        try:
+            await client.disconnect()
+            outcome.append("returned")
+        except BaseException as exc:
+            outcome.append(type(exc).__name__)
+            raise
+        finally:
+            finished.set()
+
+    policy = ReconnectPolicy(initial_delay=0.01, max_delay=0.01) if reconnect else None
+    client = await _client(handler, broker, reconnect=policy)
+    broker.push_rx(_auth(0x18))
+    await asyncio.wait_for(finished.wait(), 2)
+    assert outcome == ["returned"]
+    assert not client.is_connected
+    await wait_until(lambda: not any(client._running_tasks().values()))
+
+
+async def test_handler_can_disconnect_during_the_connect_handshake() -> None:
+    """Challenged before CONNACK, the handler gives up the connection. The
+    connecting task's own teardown must not cancel it."""
+    broker = _ClosingBroker(challenge_on_connect=True)
+    client: AsyncClient | None = None
+    outcome: list[str] = []
+    finished = asyncio.Event()
+
+    async def handler(packet: AuthPacket) -> None:
+        assert client is not None
+        try:
+            await client.disconnect()
+            outcome.append("returned")
+        except BaseException as exc:
+            outcome.append(type(exc).__name__)
+            raise
+        finally:
+            finished.set()
+
+    client = AsyncClient(
+        "auth-handshake",
+        protocol=V5,
+        connect_properties=METHOD,
+        auth_handler=handler,
+        auth_timeout=2.0,
+        keepalive=0,
+    )
+    client._transport_factory = transport_factory(broker)
+    with pytest.raises(MQTTError):
+        await client.connect("fake", timeout=2.0)
+    await asyncio.wait_for(finished.wait(), 2)
+    assert outcome == ["returned"]
+    assert not client.is_connected
+    await wait_until(lambda: not any(client._running_tasks().values()))
+
+
+class _HandshakeBroker(_ReauthBroker):
+    """Closes on DISCONNECT; challenges once during CONNECT when asked to."""
+
+    def __init__(self, *, challenge: bool) -> None:
+        super().__init__()
+        self.challenge = challenge
+
+    async def write(self, data: bytes | tuple[bytes, bytes]) -> None:
+        wire = data if isinstance(data, bytes) else data[0] + data[1]
+        probe = IncrementalDecoder()
+        probe.feed(wire)
+        kinds = [raw.packet_type for raw in probe.drain_packets()]
+        if self.challenge and PacketType.CONNECT in kinds:
+            self.push_rx(_auth(0x18))
+        elif self.challenge and PacketType.AUTH in kinds:
+            body = b"\x00\x00" + encode_properties(METHOD, "CONNACK")
+            self.push_rx(encode_frame(PacketType.CONNACK, 0, body))
+        else:
+            await super().write(data)
+        if PacketType.DISCONNECT in kinds:
+            self.push_rx(b"")
+
+
+async def test_a_handler_inside_disconnect_does_not_block_the_next_handshake() -> None:
+    """The handler is parked in ``disconnect()`` behind a ``connect()`` whose
+    own handshake is challenged. A spared handler no longer serves the
+    exchange: a fresh one answers, and neither call waits for the other."""
+    from mqttium.protocol.reconnect import ReconnectPolicy
+
+    brokers: list[_HandshakeBroker] = []
+    client: AsyncClient | None = None
+    events: list[str] = []
+    connecting: list[asyncio.Task[object]] = []
+
+    async def factory(host: str, port: int, *, ssl: object = None) -> _HandshakeBroker:
+        broker = _HandshakeBroker(challenge=len(brokers) >= 2)
+        brokers.append(broker)
+        return broker
+
+    async def handler(packet: AuthPacket) -> AuthPacket | None:
+        assert client is not None
+        if not connecting:
+            # First call, on the automatically re-established connection:
+            # disconnect() suspends on the reconnect supervisor, and the
+            # connect() started here takes the lifecycle lock first.
+            connecting.append(asyncio.create_task(client.connect("fake")))
+            try:
+                await client.disconnect()
+                events.append("disconnect returned")
+            except BaseException as exc:
+                events.append(f"disconnect {type(exc).__name__}")
+                raise
+            return None
+        events.append("second handler answered")
+        return AuthPacket(reason_code=0x18, properties=METHOD)
+
+    client = AsyncClient(
+        "auth-three-actors",
+        protocol=V5,
+        connect_properties=METHOD,
+        auth_handler=handler,
+        auth_timeout=5.0,
+        keepalive=0,
+        connect_timeout=0.5,
+        reconnect=ReconnectPolicy(initial_delay=0.01, max_delay=0.01, stable_after=30),
+    )
+    client._transport_factory = factory
+    await client.connect("fake")
+    try:
+        brokers[0].push_rx(b"")
+        await wait_until(lambda: len(brokers) == 2 and client.is_connected)
+        assert client._running_tasks()["reconnect"]
+        await client.auth()
+        brokers[1].push_rx(_auth(0x18))
+        await wait_until(lambda: bool(connecting))
+        await asyncio.wait_for(connecting[0], 2)
+        await wait_until(lambda: "disconnect returned" in events, timeout=2)
+        assert events == ["second handler answered", "disconnect returned"]
+        # disconnect() ran after the connect(): the client stays disconnected.
+        await asyncio.sleep(0.1)
+        assert not client.is_connected
+        assert not any(client._running_tasks().values())
+    finally:
+        await asyncio.wait_for(client.disconnect(), 3)
+
+
+async def test_a_detached_handler_stays_visible_until_it_ends() -> None:
+    """A handler that keeps working after its own ``disconnect()`` is no
+    longer the exchange's task, but it is still referenced and reported."""
+    broker = _ClosingBroker()
+    client: AsyncClient | None = None
+    release = asyncio.Event()
+    disconnected = asyncio.Event()
+
+    async def handler(packet: AuthPacket) -> None:
+        assert client is not None
+        await client.disconnect()
+        disconnected.set()
+        await release.wait()
+
+    client = await _client(handler, broker)
+    broker.push_rx(_auth(0x18))
+    await asyncio.wait_for(disconnected.wait(), 2)
+    assert client._auth_exchange.task is None
+    assert client._running_tasks()["auth"]
+    release.set()
+    await wait_until(lambda: not any(client._running_tasks().values()))

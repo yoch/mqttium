@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-12
+
+Fixes from an assurance review of the connection lifecycle, keep-alive and
+lifecycle hooks, and timeouts that bound the whole call they are passed to.
+A few Stable behaviours change in this minor release; each is listed, with
+the code to adapt, in the [1.3 migration notes](https://mqttium.readthedocs.io/en/v1.3.0/migration/#changes-in-13).
+
 ### Added
 
 - `SECURITY.md` documents how to verify a release against the signed
@@ -45,6 +52,29 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Lifecycle hooks converge on the client's state. A `connect()` that replaced
+  a connection and then failed, timed out, was cancelled or was overtaken by
+  `disconnect()` left `on_connect` as the last hook of a disconnected client;
+  it now delivers `on_disconnect`. `on_disconnect(None)` is now reserved for a
+  connection that had received its CONNACK and was closed by `disconnect()`:
+  a `disconnect()` that interrupts a handshake before its CONNACK reports
+  `MQTTError("Connection cancelled by disconnect()")`, and a CONNACK that did
+  not arrive reports `MQTTTimeoutError` instead of "Connection closed".
+  A `disconnect()` made after a loss, or a second `disconnect()`, no longer
+  drops the `on_disconnect` of the connection already closed before that
+  hook has reached its callback.
+- `disconnect()` leaves the client disconnected when it overlaps a
+  `connect()`. The `connect()` used to clear the request once it held the
+  lifecycle lock, and with a reconnect policy the client reconnected by itself
+  after both calls had returned, from a task nothing referenced. A `connect()`
+  that a later `disconnect()` overtakes before it starts its own attempt now
+  raises `MQTTError` ("Connection cancelled by disconnect()") without opening
+  a connection.
+- An authentication handler that awaits `disconnect()` directly gets its
+  return when the broker closes the connection on DISCONNECT, or when the
+  handler runs during the CONNECT handshake, instead of `CancelledError`.
+  Such a handler is no longer cancelled by a later `connect()` either: a
+  challenge on the new connection starts a second handler call.
 - PINGREQ leaves before the keep-alive interval ends (a margin of a tenth of
   the interval, at most one second) instead of a few milliseconds after it,
   as MQTT 3.1.1 requires of the interval between packets [MQTT-3.1.2-23].
@@ -1844,7 +1874,8 @@ See the [migration guide](docs/migration.md) for the breaking changes since
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/yoch/mqttium/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/yoch/mqttium/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/yoch/mqttium/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/yoch/mqttium/compare/v1.0.0...v1.1.0

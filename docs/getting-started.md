@@ -11,11 +11,12 @@ MQTTium supports Python 3.11 through 3.15 and has no runtime dependencies.
 Install MQTTium from PyPI:
 
 ```bash
-python -m pip install mqttium==1.2.1
+python -m pip install mqttium==1.3.0
 ```
 
-When upgrading from 1.0, read the
-[1.1 migration notes](migration.md#changes-in-11). The client API and SQLite
+When upgrading from 1.2, read the
+[1.3 migration notes](migration.md#changes-in-13). When upgrading from 1.0,
+also read the [1.1 migration notes](migration.md#changes-in-11). The client API and SQLite
 schema stay on the 1.0 contract, while several connection, subscription, limit,
 and session behaviours are corrected. For earlier versions, use the complete
 [migration guide](migration.md) and the documentation matching the installed

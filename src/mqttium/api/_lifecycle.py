@@ -40,7 +40,20 @@ class LifecycleHooks:
         self.token = 0
         self.task: asyncio.Task[None] | None = None
         self.hook_task: asyncio.Task[None] | None = None
+        # Whether hook_task delivers on_connect (True) or on_disconnect, and
+        # whether it has reached the user callback.
+        self._hook_connected = False
+        self._hook_started = False
+        self._hook_event: _Notification | None = None
         self.pending: _Notification | None = None
+        # Kind of the last notification the application was given: True
+        # after on_connect, False after on_disconnect. It changes when the
+        # callback is reached, not when the worker takes the event: a hook
+        # cancelled before its user code told nobody anything.
+        self._delivered_connected = False
+        # The cause of an on_disconnect a connection replacement superseded,
+        # handed to settle() if that replacement ends without a connection.
+        self._superseded_cause: BaseException | None = None
         # The cause most recently reported to on_disconnect, for stats().
         self.last_disconnect_error: BaseException | None = None
         self._holds = 0
@@ -61,11 +74,30 @@ class LifecycleHooks:
         current = asyncio.current_task()
         direct_origin = self.hook_task if self.hook_task is current else None
         origin = self.hook_task if preserve_hook else direct_origin
+        pending = self.pending
         if replace_connection:
+            superseded = pending
+            if superseded is None and self.hook_task is not None and not self._hook_started:
+                # Taken by the worker but not yet told: superseded all the same.
+                superseded = self._hook_event
+            if (
+                superseded is not None
+                and not superseded.connected
+                and superseded.token == self.token
+            ):
+                assert not isinstance(superseded.value, ConnAckPacket)
+                self._superseded_cause = superseded.value
             self.token += 1
-        self.pending = None
+            self.pending = None
+        elif pending is not None and pending.connected:
+            # disconnect() supersedes an on_connect not yet started, never the
+            # report of a loss already recorded: that one is the latest state.
+            self.pending = None
         self._reconnect_ready.set()
-        if not preserve_hook:
+        # disconnect() does not make an on_disconnect obsolete before it has
+        # been told: a hook taken for it but not yet started runs. Once its
+        # user code runs, external replacement cancels it as before.
+        if not preserve_hook and (replace_connection or self._hook_connected or self._hook_started):
             self._cancel_obsolete(direct_origin)
         return origin
 
@@ -94,6 +126,7 @@ class LifecycleHooks:
         if token != self.token or packet.reason_code != 0:
             return
         self._reconnect_ready.set()
+        self._superseded_cause = None
         self.pending = _Notification(token, True, self.owner.on_connect, packet)
         self._ensure_worker()
 
@@ -106,10 +139,33 @@ class LifecycleHooks:
         if token != self.token:
             return
         self.last_disconnect_error = error
+        self._superseded_cause = None
         self._cancel_obsolete(origin)
         self._reconnect_ready.clear()
         self.pending = _Notification(token, False, self.owner.on_disconnect, error)
         self._ensure_worker()
+
+    @property
+    def announced_connected(self) -> bool:
+        pending = self.pending
+        if pending is not None and pending.token == self.token:
+            return pending.connected
+        return self._delivered_connected
+
+    def settle(self, error: BaseException) -> None:
+        """Report the loss of a connection the application was told about.
+
+        A connection replacement superseded the replaced connection's own
+        notification; when it ends without a connection, ``on_connect`` must
+        not stay the last word. The superseded cause wins over ``error``. A
+        hook awaiting the replacement itself is its caller and is preserved.
+        """
+        if not self.announced_connected:
+            return
+        superseded = self._superseded_cause
+        current = asyncio.current_task()
+        origin = self.hook_task if self.hook_task is current else None
+        self.disconnected(superseded if superseded is not None else error, self.token, origin)
 
     def retiring(self, token: int, origin: asyncio.Task[None] | None = None) -> None:
         """Close retry admission before resource cleanup can suspend."""
@@ -133,6 +189,8 @@ class LifecycleHooks:
             pass
         if event.token != self.token:
             return
+        self._hook_started = True
+        self._delivered_connected = event.connected
         if not event.connected:
             # The disconnect hook is now the lifecycle owner, no longer a
             # pending state a retry could overwrite: automatic reconnect may
@@ -164,9 +222,14 @@ class LifecycleHooks:
                 self.pending = None
                 if event.token != self.token:
                     continue
-                if event.callback is not None:
+                if event.callback is None:
+                    self._delivered_connected = event.connected
+                else:
                     task = asyncio.create_task(self._invoke(event), name="mqttium-lifecycle-hook")
                     self.hook_task = task
+                    self._hook_connected = event.connected
+                    self._hook_started = False
+                    self._hook_event = event
                     try:
                         await task
                     except asyncio.CancelledError:
@@ -176,6 +239,9 @@ class LifecycleHooks:
                             raise
                     finally:
                         self.hook_task = None
+                        self._hook_event = None
+                        self._hook_connected = False
+                        self._hook_started = False
                 if not event.connected and event.token == self.token and self.pending is None:
                     self._reconnect_ready.set()
         finally:
