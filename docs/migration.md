@@ -39,6 +39,13 @@ behaviour changes made in a minor release, as recorded in the
   already did. A client is used from the loop that connected it.
 - TCP connections enable TCP keepalive. See
   [Configuration and sizing](configuration-and-sizing.md).
+- `on_disconnect(None)` now only reports a connection that `connect()`
+  returned and `disconnect()` closed. A `disconnect()` that interrupts a
+  handshake reports `MQTTError("Connection cancelled by disconnect()")`, and a
+  CONNACK that does not arrive reports `MQTTTimeoutError` instead of
+  `MQTTError("Connection closed")`. Code that treated any `None` as a
+  completed shutdown is unaffected; code that matched the old messages
+  should match the exception types instead.
 
 ## Changes in 1.2
 
