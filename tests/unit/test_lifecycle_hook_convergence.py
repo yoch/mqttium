@@ -189,3 +189,46 @@ async def test_a_connack_timeout_is_reported_as_a_timeout() -> None:
     await _settled(client)
     causes = [cause for kind, cause in world.hooks if kind == "D"]
     assert causes and isinstance(causes[-1], MQTTTimeoutError), causes
+
+
+@pytest.mark.parametrize("turns", range(40))
+async def test_disconnect_after_a_loss_keeps_the_loss_report(turns: int) -> None:
+    """``disconnect()`` supersedes a pending ``on_connect``, never the
+    pending report of a loss that already happened."""
+    world = _World()
+    client = world.client()
+    await client.connect("unused")
+    await _settled(client)
+    world.transports[0].push_rx(b"")
+    for _ in range(turns):
+        await asyncio.sleep(0)
+    await asyncio.wait_for(client.disconnect(), 3)
+    await _settled(client)
+    assert client.state is ConnectionState.DISCONNECTED
+    _assert_converged(world, client)
+
+
+@pytest.mark.parametrize("turns", range(1, 40))
+async def test_a_second_disconnect_keeps_the_first_report(turns: int) -> None:
+    """The first ``disconnect()`` is cancelled part-way; the second one,
+    made from its cleanup, must not drop the report of the closed connection."""
+    world = _World()
+    client = world.client()
+    await client.connect("unused")
+    await _settled(client)
+
+    async def disconnect_twice() -> None:
+        try:
+            await client.disconnect()
+            await asyncio.sleep(3600)
+        finally:
+            await client.disconnect()
+
+    task = asyncio.create_task(disconnect_twice())
+    for _ in range(turns):
+        await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.wait({task}, timeout=3)
+    await _settled(client)
+    assert client.state is ConnectionState.DISCONNECTED
+    _assert_converged(world, client)

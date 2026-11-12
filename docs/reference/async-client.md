@@ -112,7 +112,8 @@ A refused CONNACK is a `ConnectRefusedError` whose `reason_code` (and MQTT 5
 Lifecycle notifications describe the latest state, not a lossless transition
 log. MQTTium retains one active hook and at most one pending notification;
 newer state replaces obsolete pending state. An external connection replacement
-or disconnect cancels an obsolete active hook. A lifecycle operation awaited
+cancels an obsolete active hook; an external `disconnect()` cancels an active
+`on_connect`, never the `on_disconnect` that reports a loss or a pending one. A lifecycle operation awaited
 directly by that same hook preserves its caller, so `on_connect` can await
 `disconnect()` and `on_disconnect` can await a replacement `connect()`. An
 application-created task is a separate caller. Hooks must cooperate with

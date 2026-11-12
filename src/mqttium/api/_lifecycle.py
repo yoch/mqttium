@@ -40,11 +40,16 @@ class LifecycleHooks:
         self.token = 0
         self.task: asyncio.Task[None] | None = None
         self.hook_task: asyncio.Task[None] | None = None
+        # Whether hook_task delivers on_connect (True) or on_disconnect.
+        self._hook_connected = False
         self.pending: _Notification | None = None
         # Kind of the last notification taken for delivery: True after
         # on_connect, False after on_disconnect. What the application was last
         # told is this, or the pending notification when there is one.
         self._delivered_connected = False
+        # The cause of an on_disconnect a connection replacement superseded,
+        # handed to settle() if that replacement ends without a connection.
+        self._superseded_cause: BaseException | None = None
         # The cause most recently reported to on_disconnect, for stats().
         self.last_disconnect_error: BaseException | None = None
         self._holds = 0
@@ -65,11 +70,21 @@ class LifecycleHooks:
         current = asyncio.current_task()
         direct_origin = self.hook_task if self.hook_task is current else None
         origin = self.hook_task if preserve_hook else direct_origin
+        pending = self.pending
         if replace_connection:
+            if pending is not None and not pending.connected and pending.token == self.token:
+                assert not isinstance(pending.value, ConnAckPacket)
+                self._superseded_cause = pending.value
             self.token += 1
-        self.pending = None
+            self.pending = None
+        elif pending is not None and pending.connected:
+            # disconnect() supersedes an on_connect not yet started, never the
+            # report of a loss already recorded: that one is the latest state.
+            self.pending = None
         self._reconnect_ready.set()
-        if not preserve_hook:
+        # A running on_disconnect still reports the latest state: only a
+        # connection replacement makes it obsolete, not a disconnect().
+        if not preserve_hook and (replace_connection or self._hook_connected):
             self._cancel_obsolete(direct_origin)
         return origin
 
@@ -98,6 +113,7 @@ class LifecycleHooks:
         if token != self.token or packet.reason_code != 0:
             return
         self._reconnect_ready.set()
+        self._superseded_cause = None
         self.pending = _Notification(token, True, self.owner.on_connect, packet)
         self._ensure_worker()
 
@@ -110,6 +126,7 @@ class LifecycleHooks:
         if token != self.token:
             return
         self.last_disconnect_error = error
+        self._superseded_cause = None
         self._cancel_obsolete(origin)
         self._reconnect_ready.clear()
         self.pending = _Notification(token, False, self.owner.on_disconnect, error)
@@ -130,7 +147,8 @@ class LifecycleHooks:
         ``on_connect`` as the last word.
         """
         if self.announced_connected:
-            self.disconnected(error, self.token)
+            superseded = self._superseded_cause
+            self.disconnected(superseded if superseded is not None else error, self.token)
 
     def retiring(self, token: int, origin: asyncio.Task[None] | None = None) -> None:
         """Close retry admission before resource cleanup can suspend."""
@@ -189,6 +207,7 @@ class LifecycleHooks:
                 if event.callback is not None:
                     task = asyncio.create_task(self._invoke(event), name="mqttium-lifecycle-hook")
                     self.hook_task = task
+                    self._hook_connected = event.connected
                     try:
                         await task
                     except asyncio.CancelledError:

@@ -53,6 +53,8 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
   or replaced by `connect()`: a `disconnect()` during the handshake reports
   `MQTTError("Connection cancelled by disconnect()")`, and a CONNACK that did
   not arrive reports `MQTTTimeoutError` instead of "Connection closed".
+  A `disconnect()` made after a loss, or a second `disconnect()`, no longer
+  drops or cancels the `on_disconnect` of the connection already closed.
 - `disconnect()` leaves the client disconnected when it overlaps a
   `connect()`. The `connect()` used to clear the request once it held the
   lifecycle lock, and with a reconnect policy the client reconnected by itself
