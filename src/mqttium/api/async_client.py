@@ -1497,7 +1497,11 @@ class AsyncClient:
             MQTTTimeoutError: If ``timeout`` expires before admission.
             ValueError: If ``timeout`` is not a finite positive number.
         """
-        self._check_owner_loop()
+        # Inlined fast path of _check_owner_loop(): publish() is the hot call,
+        # and a function call per publication is measurable there.
+        owner_loop = self._owner_loop
+        if owner_loop is not None and owner_loop is not asyncio.get_running_loop():
+            self._check_owner_loop()
         deadline = None
         if timeout is not None:
             _positive("timeout", timeout)
