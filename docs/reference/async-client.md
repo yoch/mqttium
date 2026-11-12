@@ -142,7 +142,11 @@ connection replaced by `connect()` (`MQTTError("Connection closed")` when it is
 reported), a failed connection attempt (`ConnectRefusedError`,
 `MQTTTimeoutError` for a CONNACK that did not arrive), and an attempt that
 `disconnect()` interrupted before its CONNACK
-(`MQTTError("Connection cancelled by disconnect()")`). Automatic retry waits until that
+(`MQTTError("Connection cancelled by disconnect()")`). A failed attempt is
+reported only once its transport was open: an explicit `connect()` that cannot
+open the network connection raises its error without calling `on_disconnect`,
+and an automatic retry that cannot open it reports nothing unless the failure
+is permanent (see [Transports and TLS](../transports-and-tls.md)). Automatic retry waits until that
 hook has started, not until it returns, then rechecks explicit user intent, so
 a hook may await work that only the replacement connection can complete. The
 replacement's `on_connect` still runs after the hook returns. Hook exceptions and a
