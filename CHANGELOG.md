@@ -45,6 +45,17 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ### Fixed
 
+- Lifecycle hooks converge on the client's state. A `connect()` that replaced
+  a connection and then failed, timed out, was cancelled or was overtaken by
+  `disconnect()` left `on_connect` as the last hook of a disconnected client;
+  it now delivers `on_disconnect`. `on_disconnect(None)` is now reserved for a
+  connection that had received its CONNACK and was closed by `disconnect()`:
+  a `disconnect()` that interrupts a handshake before its CONNACK reports
+  `MQTTError("Connection cancelled by disconnect()")`, and a CONNACK that did
+  not arrive reports `MQTTTimeoutError` instead of "Connection closed".
+  A `disconnect()` made after a loss, or a second `disconnect()`, no longer
+  drops the `on_disconnect` of the connection already closed before that
+  hook has reached its callback.
 - `disconnect()` leaves the client disconnected when it overlaps a
   `connect()`. The `connect()` used to clear the request once it held the
   lifecycle lock, and with a reconnect policy the client reconnected by itself

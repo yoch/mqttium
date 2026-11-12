@@ -112,7 +112,9 @@ A refused CONNACK is a `ConnectRefusedError` whose `reason_code` (and MQTT 5
 Lifecycle notifications describe the latest state, not a lossless transition
 log. MQTTium retains one active hook and at most one pending notification;
 newer state replaces obsolete pending state. An external connection replacement
-or disconnect cancels an obsolete active hook. A lifecycle operation awaited
+or disconnect cancels an obsolete active hook. A `disconnect()` never discards
+an `on_disconnect` that has not reached its callback yet: a loss recorded
+before it is still reported. A lifecycle operation awaited
 directly by that same hook preserves its caller, so `on_connect` can await
 `disconnect()` and `on_disconnect` can await a replacement `connect()`. An
 application-created task is a separate caller. Hooks must cooperate with
@@ -126,8 +128,25 @@ already replaced when the takeover began. A hook awaiting its own connection
 attempt receives that operation's failure normally; this caller preservation
 ends when the connection call exits.
 
+The latest state is never left out. Once lifecycle calls have returned and
+pending hooks have run, the last hook delivered matches the client: a client
+that is no longer connected, and was last told `on_connect`, has received
+`on_disconnect` after it. This holds when a `connect()` that replaced a
+connection then fails, times out, is cancelled or is overtaken by
+`disconnect()`.
+
 `on_disconnect` runs after the old connection resources are retired, with the
-original cause or `None` for clean closure. Automatic retry waits until that
+original cause, or `None` when `disconnect()` closed a connection that had
+received its CONNACK. Anything else carries an exception: a lost connection, a
+connection replaced by `connect()` (`MQTTError("Connection closed")` when it is
+reported), a failed connection attempt (`ConnectRefusedError`,
+`MQTTTimeoutError` for a CONNACK that did not arrive), and an attempt that
+`disconnect()` interrupted before its CONNACK
+(`MQTTError("Connection cancelled by disconnect()")`). A failed attempt is
+reported only once its transport was open: an explicit `connect()` that cannot
+open the network connection raises its error without calling `on_disconnect`,
+and an automatic retry that cannot open it reports nothing unless the failure
+is permanent (see [Transports and TLS](../transports-and-tls.md)). Automatic retry waits until that
 hook has started, not until it returns, then rechecks explicit user intent, so
 a hook may await work that only the replacement connection can complete. The
 replacement's `on_connect` still runs after the hook returns. Hook exceptions and a

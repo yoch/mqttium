@@ -118,7 +118,8 @@ callback returns.
 completion contract. `on_connect` and `on_disconnect` remain sync-or-async
 lifecycle hooks with separate bounded ownership. Network operations do not wait
 for hook completion, and incoming delivery does not wait for `on_connect`.
-Obsolete pending lifecycle states are coalesced. External lifecycle operations
+Obsolete pending lifecycle states are coalesced, but the last hook delivered
+matches the final state. External lifecycle operations
 cancel obsolete active hooks; direct self-reentry preserves the invoking hook.
 Automatic retry waits until the current disconnect hook has started, not until
 it returns, then rechecks intent; `on_connect` for the replacement connection
