@@ -31,13 +31,14 @@ support includes typed properties, Last Will, and enhanced authentication.
 ## Installation
 
 ```bash
-python -m pip install mqttium==1.2.1
+python -m pip install mqttium==1.3.0
 ```
 
-1.2 adds `PublishReceipt.add_done_callback()` and faster topic-filter and
-acknowledgement paths; it needs no migration from 1.1. 1.2.1 adds Python 3.15
-support with unchanged library code. When upgrading from
-1.0, review the
+1.3 makes every `timeout=` bound the whole call, adds `publish(timeout=)`,
+and fixes connection-lifecycle, keep-alive and hook-ordering defects found in
+an assurance review. A few defaults and timeouts change: read the
+[1.3 migration notes](https://mqttium.readthedocs.io/en/v1.3.0/migration/#changes-in-13)
+before upgrading from 1.2. When upgrading from 1.0, also review the
 [1.1 migration notes](https://mqttium.readthedocs.io/en/v1.1.0/migration/#changes-in-11).
 The client API and SQLite schema stay on the 1.0 contract, but 1.1 corrects
 connection, subscription, limit, and session behaviours that may require an

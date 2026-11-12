@@ -6,6 +6,13 @@ The format follows Keep a Changelog and versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-12
+
+Fixes from an assurance review of the connection lifecycle, keep-alive and
+lifecycle hooks, and timeouts that bound the whole call they are passed to.
+A few Stable behaviours change in this minor release; each is listed, with
+the code to adapt, in the [1.3 migration notes](https://mqttium.readthedocs.io/en/v1.3.0/migration/#changes-in-13).
+
 ### Added
 
 - `SECURITY.md` documents how to verify a release against the signed
@@ -1867,7 +1874,8 @@ See the [migration guide](docs/migration.md) for the breaking changes since
 - Pre-spin-out comparative analysis and generated coverage data from the
   published source tree.
 
-[Unreleased]: https://github.com/yoch/mqttium/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/yoch/mqttium/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/yoch/mqttium/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/yoch/mqttium/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/yoch/mqttium/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/yoch/mqttium/compare/v1.0.0...v1.1.0
