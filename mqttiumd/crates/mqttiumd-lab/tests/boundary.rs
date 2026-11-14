@@ -419,9 +419,16 @@ fn a_raw_identifier_does_not_hide_a_macro_or_an_attribute() {
         "#[r#path = \"other.rs\"]\nmod other;",
         "#[r#cfg(test)]\npub fn only_in_tests() {}",
         "const TEXT: &str = r#include_str!(\"/etc/hostname\");",
+        // Renaming to the raw spelling of an allowed macro: `matches!()`
+        // then expands `file!()`. Only the plain name reveals it.
+        "use core::file as r#matches;\npub const WHERE: &str = matches!();",
+        "use core::r#env as e;\npub const D: &str = e!(\"CARGO_MANIFEST_DIR\");",
     ] {
         assert!(!violations(source).is_empty(), "accepted: {source}");
     }
+    // The raw spelling of an allowed macro is that macro.
+    let allowed = "pub fn f(x: u8) -> bool { r#matches!(x, 1) }";
+    assert_eq!(violations(allowed), Vec::<String>::new());
 }
 
 #[test]
