@@ -8,6 +8,8 @@
 //! The box is volatile: a crash destroys it. Safety after a crash rests on
 //! durable facts and protocol replay, never on this memory.
 
+use core::num::NonZeroUsize;
+
 use crate::capacity::{
     AllocationFailed, BoundedQueue, BoundedVec, CapacityNeed, EffectSlots, Resource, WakeCondition,
     WorkUnits,
@@ -15,8 +17,8 @@ use crate::capacity::{
 use crate::command::Command;
 use crate::ids::{
     ConnectionGeneration, ConnectionKey, ContinuationId, DeadlineToken, EffectId, ExchangeId,
-    InboundPacketId, LogicalTime, OperationId, PublicationId, Revision, RunEpoch, SessionId,
-    StoreIncarnation,
+    InboundPacketId, LogicalOwnerId, LogicalTime, OperationId, PublicationId, Revision, RunEpoch,
+    SessionId, StoreIncarnation,
 };
 use crate::outcome::{Knowledge, StoreReply};
 use crate::packet::{InboundPacket, OutboundFrame, SharedBytes};
@@ -217,22 +219,59 @@ pub trait EffectSink {
     fn try_submit(&mut self, effect: OwnedEffect) -> SubmitResult;
 }
 
-/// Slots reserved in an effect box before the mutation that fills them.
-///
-/// It must be either filled through [`Outbox::publish`] or given back with
-/// [`Outbox::release`]; dropping it leaves its slots reserved.
-#[must_use]
-#[derive(Debug)]
-pub struct EffectReservation {
-    slots: usize,
+/// Identity of an effect box: its owner and the run epoch that created it.
+/// An owner has one box per epoch, so the pair designates one box.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OutboxId {
+    pub owner: LogicalOwnerId,
+    pub epoch: RunEpoch,
 }
 
-impl EffectReservation {
-    /// Slots not yet filled.
-    #[must_use]
-    pub fn remaining(&self) -> usize {
-        self.slots
-    }
+/// Key of the slots reserved in one effect box.
+///
+/// The key carries no authority of its own. It names a box, an entry of
+/// that box's reservation table and the generation of that entry; the box
+/// checks all three before it changes anything. A key may be kept in owner
+/// state across turns. Once its slots are all published, or released, the
+/// entry moves to the next generation and the key is stale.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EffectReservation {
+    outbox: OutboxId,
+    slot: u32,
+    generation: u64,
+}
+
+/// Why a box refuses a reservation key. Nothing changed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReservationError {
+    /// The key was issued by another box.
+    ForeignOutbox,
+    /// The key names no entry of this box's reservation table.
+    UnknownSlot,
+    /// The reservation was used up or released; the entry moved on.
+    Stale,
+    /// The box found its own accounting broken. This is a core fault.
+    Inconsistent,
+}
+
+/// A publication that was refused: the same effect and the reason.
+#[derive(PartialEq, Eq, Debug)]
+pub struct PublishRefused {
+    pub effect: OwnedEffect,
+    pub reason: ReservationError,
+}
+
+/// One entry of a reservation table.
+#[derive(Clone, Copy, Debug)]
+struct ReservationRecord {
+    /// Generation of the reservation the entry holds or will hold next.
+    generation: u64,
+    /// Slots reserved and not yet published.
+    remaining: usize,
+    /// Whether a live reservation holds the entry.
+    held: bool,
+    /// The generation counter is exhausted; the entry is never reused.
+    spent: bool,
 }
 
 /// What one dispatch pass did.
@@ -250,20 +289,49 @@ pub struct DispatchReport {
 /// reserved slots; publication cannot fail for lack of room. The dispatcher
 /// moves effects to an adapter in order and puts a refused effect back in
 /// its place without recreating it.
+///
+/// Invariant: effects held plus slots reserved never exceed the capacity,
+/// and the slots reserved equal the sum over the live reservations.
 #[derive(Debug)]
 pub struct Outbox {
+    id: OutboxId,
     queue: BoundedQueue<OwnedEffect>,
+    records: BoundedVec<ReservationRecord>,
     reserved: usize,
 }
 
 impl Outbox {
-    /// Preallocates a box of exactly `capacity` slots.
-    pub fn with_capacity(capacity: EffectSlots) -> Result<Self, AllocationFailed> {
+    /// Preallocates a box of exactly `capacity` slots that can hold up to
+    /// `max_reservations` reservations at a time.
+    pub fn with_capacity(
+        id: OutboxId,
+        capacity: EffectSlots,
+        max_reservations: u32,
+    ) -> Result<Self, AllocationFailed> {
         let capacity = usize::try_from(capacity.get()).map_err(|_| AllocationFailed)?;
+        let table = usize::try_from(max_reservations).map_err(|_| AllocationFailed)?;
+        let mut records = BoundedVec::with_capacity(table)?;
+        for _ in 0..table {
+            let free = ReservationRecord {
+                generation: 0,
+                remaining: 0,
+                held: false,
+                spent: false,
+            };
+            records.try_push(free).map_err(|_| AllocationFailed)?;
+        }
         Ok(Self {
+            id,
             queue: BoundedQueue::with_capacity(capacity)?,
+            records,
             reserved: 0,
         })
+    }
+
+    /// The identity of this box.
+    #[must_use]
+    pub fn id(&self) -> OutboxId {
+        self.id
     }
 
     /// Slots neither filled nor reserved.
@@ -291,7 +359,8 @@ impl Outbox {
 
     /// Reserves `slots` places, or states what is missing. Nothing changes
     /// on refusal.
-    pub fn reserve(&mut self, slots: usize) -> Result<EffectReservation, CapacityNeed> {
+    pub fn reserve(&mut self, slots: NonZeroUsize) -> Result<EffectReservation, CapacityNeed> {
+        let slots = slots.get();
         let free = self.free_slots();
         if slots > free {
             return Err(CapacityNeed {
@@ -300,30 +369,104 @@ impl Outbox {
                 wake: WakeCondition::EffectAccepted,
             });
         }
+        let Some(index) = self
+            .records
+            .as_slice()
+            .iter()
+            .position(|record| !record.held && !record.spent)
+        else {
+            return Err(CapacityNeed {
+                resource: Resource::Reservations,
+                amount: 1,
+                wake: WakeCondition::ResourceReleased,
+            });
+        };
+        let record = &mut self.records.as_mut_slice()[index];
+        record.held = true;
+        record.remaining = slots;
         self.reserved += slots;
-        Ok(EffectReservation { slots })
+        // The table holds at most `u32::MAX` entries by construction.
+        Ok(EffectReservation {
+            outbox: self.id,
+            slot: index as u32,
+            generation: record.generation,
+        })
     }
 
-    /// Puts an effect into a reserved slot. It only fails, returning the
-    /// effect, when the reservation is already used up, which is a fault of
-    /// the calling transition.
+    /// Finds the live entry a key designates, changing nothing.
+    fn locate(&self, key: EffectReservation) -> Result<usize, ReservationError> {
+        if key.outbox != self.id {
+            return Err(ReservationError::ForeignOutbox);
+        }
+        let index = usize::try_from(key.slot).map_err(|_| ReservationError::UnknownSlot)?;
+        let record = self
+            .records
+            .as_slice()
+            .get(index)
+            .ok_or(ReservationError::UnknownSlot)?;
+        if !record.held || record.generation != key.generation {
+            return Err(ReservationError::Stale);
+        }
+        if record.remaining == 0 || record.remaining > self.reserved {
+            return Err(ReservationError::Inconsistent);
+        }
+        Ok(index)
+    }
+
+    /// Ends the reservation held by an entry and moves it to its next
+    /// generation, so that every key of the ended reservation is stale.
+    fn retire(&mut self, index: usize) {
+        let record = &mut self.records.as_mut_slice()[index];
+        record.held = false;
+        record.remaining = 0;
+        match record.generation.checked_add(1) {
+            Some(next) => record.generation = next,
+            None => record.spent = true,
+        }
+    }
+
+    /// Slots a live reservation still holds.
+    pub fn remaining(&self, key: EffectReservation) -> Result<usize, ReservationError> {
+        self.locate(key)
+            .map(|index| self.records.as_slice()[index].remaining)
+    }
+
+    /// Puts an effect into a slot of the reservation `key`.
+    ///
+    /// The key is checked before anything changes. A refusal hands the same
+    /// effect back with the reason and leaves the box untouched.
     pub fn publish(
         &mut self,
-        reservation: &mut EffectReservation,
+        key: EffectReservation,
         effect: OwnedEffect,
-    ) -> Result<(), OwnedEffect> {
-        if reservation.slots == 0 {
-            return Err(effect);
+    ) -> Result<(), PublishRefused> {
+        let index = match self.locate(key) {
+            Ok(index) => index,
+            Err(reason) => return Err(PublishRefused { effect, reason }),
+        };
+        if let Err(effect) = self.queue.try_push_back(effect) {
+            return Err(PublishRefused {
+                effect,
+                reason: ReservationError::Inconsistent,
+            });
         }
-        self.queue.try_push_back(effect)?;
-        reservation.slots -= 1;
         self.reserved -= 1;
+        let record = &mut self.records.as_mut_slice()[index];
+        record.remaining -= 1;
+        if record.remaining == 0 {
+            self.retire(index);
+        }
         Ok(())
     }
 
-    /// Gives back the unfilled slots of a reservation.
-    pub fn release(&mut self, reservation: EffectReservation) {
-        self.reserved -= reservation.slots;
+    /// Gives back the unpublished slots of a reservation and returns how
+    /// many they were. The key is checked before anything changes.
+    pub fn release(&mut self, key: EffectReservation) -> Result<usize, ReservationError> {
+        let index = self.locate(key)?;
+        let returned = self.records.as_slice()[index].remaining;
+        self.reserved -= returned;
+        self.retire(index);
+        Ok(returned)
     }
 
     /// Moves effects to `sink` in order until one is refused. The refused
@@ -354,7 +497,7 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{EffectSeq, LogicalOwnerId};
+    use crate::ids::EffectSeq;
 
     fn effect(sequence: u64) -> OwnedEffect {
         OwnedEffect::new(
@@ -370,20 +513,56 @@ mod tests {
         )
     }
 
-    fn filled(capacity: u64, count: u64) -> Outbox {
-        let mut outbox = Outbox::with_capacity(EffectSlots::new(capacity)).expect("small");
-        let mut reservation = outbox.reserve(count as usize).expect("room");
-        for sequence in 0..count {
-            outbox
-                .publish(&mut reservation, effect(sequence))
-                .expect("reserved");
+    fn slots(count: usize) -> NonZeroUsize {
+        NonZeroUsize::new(count).expect("at least one slot")
+    }
+
+    fn outbox_of(owner: u64, capacity: u64) -> Outbox {
+        let id = OutboxId {
+            owner: LogicalOwnerId::new(owner),
+            epoch: RunEpoch::new(1),
+        };
+        Outbox::with_capacity(id, EffectSlots::new(capacity), 4).expect("small")
+    }
+
+    /// The accounting invariant, recomputed from the reservation table.
+    fn assert_invariant(outbox: &Outbox) {
+        let live: usize = outbox
+            .records
+            .as_slice()
+            .iter()
+            .filter(|record| record.held)
+            .map(|record| record.remaining)
+            .sum();
+        assert_eq!(
+            outbox.reserved, live,
+            "reserved slots drifted from the table"
+        );
+        assert!(outbox.queue.len() + outbox.reserved <= outbox.queue.capacity());
+        for record in outbox.records.as_slice() {
+            assert!(record.held || record.remaining == 0);
         }
-        outbox.release(reservation);
+    }
+
+    fn filled(capacity: u64, count: u64) -> Outbox {
+        let mut outbox = outbox_of(0, capacity);
+        if count > 0 {
+            let key = outbox.reserve(slots(count as usize)).expect("room");
+            for sequence in 0..count {
+                outbox.publish(key, effect(sequence)).expect("reserved");
+            }
+        }
+        assert_invariant(&outbox);
         outbox
     }
 
     fn sequences(outbox: &Outbox) -> Vec<u64> {
         outbox.pending().map(|e| e.id().sequence.get()).collect()
+    }
+
+    /// A snapshot of everything a refused operation must leave unchanged.
+    fn snapshot(outbox: &Outbox) -> (Vec<u64>, usize, usize) {
+        (sequences(outbox), outbox.free_slots(), outbox.reserved)
     }
 
     /// Accepts a fixed number of effects, then reports a full queue.
@@ -423,6 +602,7 @@ mod tests {
                 let sequence = owned.id().sequence.get();
                 assert_eq!(*owned, effect(sequence), "content changed");
             }
+            assert_invariant(&outbox);
         }
     }
 
@@ -457,7 +637,8 @@ mod tests {
     #[test]
     fn a_refused_reservation_changes_nothing() {
         let mut outbox = filled(3, 2);
-        let need = outbox.reserve(2).expect_err("only one slot is free");
+        let before = snapshot(&outbox);
+        let need = outbox.reserve(slots(2)).expect_err("only one slot is free");
         assert_eq!(
             need,
             CapacityNeed {
@@ -466,62 +647,218 @@ mod tests {
                 wake: WakeCondition::EffectAccepted,
             }
         );
-        assert_eq!(outbox.free_slots(), 1);
-        assert_eq!(sequences(&outbox), vec![0, 1]);
+        assert_eq!(snapshot(&outbox), before);
+        assert_invariant(&outbox);
     }
 
     #[test]
     fn reserved_slots_cannot_be_taken_by_someone_else() {
-        let mut outbox = Outbox::with_capacity(EffectSlots::new(2)).expect("small");
-        let mut first = outbox.reserve(2).expect("room");
+        let mut outbox = outbox_of(0, 2);
+        let first = outbox.reserve(slots(2)).expect("room");
         assert_eq!(outbox.free_slots(), 0);
-        assert!(outbox.reserve(1).is_err());
-        outbox.publish(&mut first, effect(0)).expect("reserved");
-        assert_eq!(first.remaining(), 1);
+        assert!(outbox.reserve(slots(1)).is_err());
+        outbox.publish(first, effect(0)).expect("reserved");
+        assert_eq!(outbox.remaining(first), Ok(1));
         assert_eq!(outbox.free_slots(), 0);
-        outbox.release(first);
+        assert_eq!(outbox.release(first), Ok(1));
         assert_eq!(outbox.free_slots(), 1);
-    }
-
-    #[test]
-    fn publishing_past_a_reservation_returns_the_effect() {
-        let mut outbox = Outbox::with_capacity(EffectSlots::new(2)).expect("small");
-        let mut reservation = outbox.reserve(1).expect("room");
-        outbox
-            .publish(&mut reservation, effect(0))
-            .expect("reserved");
-        let refused = outbox
-            .publish(&mut reservation, effect(1))
-            .expect_err("reservation is used up");
-        assert_eq!(refused, effect(1));
-        assert_eq!(sequences(&outbox), vec![0]);
-        assert_eq!(outbox.free_slots(), 1);
+        assert_invariant(&outbox);
     }
 
     #[test]
     fn a_reservation_cannot_publish_into_another_outbox() {
-        let mut first = Outbox::with_capacity(EffectSlots::new(2)).expect("small");
-        let mut second = Outbox::with_capacity(EffectSlots::new(2)).expect("small");
-        let mut foreign = first.reserve(1).expect("room");
-        let refused = second.publish(&mut foreign, effect(0));
-        assert_eq!(refused, Err(effect(0)), "the effect must come back");
-        assert!(second.is_empty(), "the other outbox was mutated");
-        assert_eq!(second.free_slots(), 2);
-        assert_eq!(first.free_slots(), 1);
+        let mut first = outbox_of(1, 2);
+        let mut second = outbox_of(2, 2);
+        // Give the second box a live reservation in the same table entry,
+        // so that only the identity of the box tells the keys apart.
+        let own = second.reserve(slots(1)).expect("room");
+        let foreign = first.reserve(slots(1)).expect("room");
+        let before = (snapshot(&first), snapshot(&second));
+
+        let refused = second.publish(foreign, effect(0)).expect_err("foreign key");
+        assert_eq!(
+            refused,
+            PublishRefused {
+                effect: effect(0),
+                reason: ReservationError::ForeignOutbox
+            }
+        );
+        assert_eq!((snapshot(&first), snapshot(&second)), before);
+        assert_eq!(second.remaining(own), Ok(1));
+        assert_invariant(&first);
+        assert_invariant(&second);
+
+        first
+            .publish(foreign, effect(0))
+            .expect("its own box accepts the key");
+        assert_eq!(sequences(&first), vec![0]);
     }
 
     #[test]
     fn a_reservation_cannot_be_released_into_another_outbox() {
-        let mut first = Outbox::with_capacity(EffectSlots::new(2)).expect("small");
-        let mut second = Outbox::with_capacity(EffectSlots::new(2)).expect("small");
-        let foreign = first.reserve(1).expect("room");
-        second.release(foreign);
+        let mut first = outbox_of(1, 2);
+        let mut second = outbox_of(2, 2);
+        let own = second.reserve(slots(2)).expect("room");
+        let foreign = first.reserve(slots(1)).expect("room");
+        let before = (snapshot(&first), snapshot(&second));
+
         assert_eq!(
-            second.free_slots(),
-            2,
-            "the other outbox gained or lost slots"
+            second.release(foreign),
+            Err(ReservationError::ForeignOutbox)
         );
-        assert_eq!(first.free_slots(), 1);
+        assert_eq!((snapshot(&first), snapshot(&second)), before);
+        assert_eq!(second.remaining(own), Ok(2));
+        assert_invariant(&first);
+        assert_invariant(&second);
+        assert_eq!(first.release(foreign), Ok(1));
+    }
+
+    #[test]
+    fn a_key_is_stale_once_its_reservation_is_released() {
+        let mut outbox = outbox_of(0, 2);
+        let key = outbox.reserve(slots(2)).expect("room");
+        assert_eq!(outbox.release(key), Ok(2));
+        let before = snapshot(&outbox);
+
+        let refused = outbox.publish(key, effect(0)).expect_err("stale key");
+        assert_eq!(
+            refused,
+            PublishRefused {
+                effect: effect(0),
+                reason: ReservationError::Stale
+            }
+        );
+        assert_eq!(
+            outbox.release(key),
+            Err(ReservationError::Stale),
+            "double release"
+        );
+        assert_eq!(outbox.remaining(key), Err(ReservationError::Stale));
+        assert_eq!(snapshot(&outbox), before);
+        assert_invariant(&outbox);
+    }
+
+    #[test]
+    fn a_stale_key_never_touches_the_reservation_that_reuses_its_entry() {
+        let mut outbox = outbox_of(0, 2);
+        let old = outbox.reserve(slots(1)).expect("room");
+        assert_eq!(outbox.release(old), Ok(1));
+        let new = outbox.reserve(slots(2)).expect("room");
+        assert_ne!(old, new, "the entry moved to its next generation");
+        let before = snapshot(&outbox);
+
+        let refused = outbox.publish(old, effect(9)).expect_err("stale key");
+        assert_eq!(refused.reason, ReservationError::Stale);
+        assert_eq!(refused.effect, effect(9));
+        assert_eq!(outbox.release(old), Err(ReservationError::Stale));
+        assert_eq!(snapshot(&outbox), before);
+        assert_eq!(outbox.remaining(new), Ok(2));
+        assert_invariant(&outbox);
+    }
+
+    #[test]
+    fn a_key_is_stale_once_its_reservation_is_used_up() {
+        let mut outbox = outbox_of(0, 2);
+        let key = outbox.reserve(slots(1)).expect("room");
+        outbox.publish(key, effect(0)).expect("reserved");
+        let before = snapshot(&outbox);
+
+        let refused = outbox.publish(key, effect(1)).expect_err("used up");
+        assert_eq!(
+            refused,
+            PublishRefused {
+                effect: effect(1),
+                reason: ReservationError::Stale
+            }
+        );
+        assert_eq!(outbox.release(key), Err(ReservationError::Stale));
+        assert_eq!(snapshot(&outbox), before);
+        assert_eq!(sequences(&outbox), vec![0]);
+        assert_eq!(outbox.free_slots(), 1);
+        assert_invariant(&outbox);
+    }
+
+    #[test]
+    fn a_key_naming_no_entry_is_refused() {
+        let mut outbox = outbox_of(0, 2);
+        let key = EffectReservation {
+            outbox: outbox.id(),
+            slot: 99,
+            generation: 0,
+        };
+        let refused = outbox.publish(key, effect(0)).expect_err("no such entry");
+        assert_eq!(
+            refused,
+            PublishRefused {
+                effect: effect(0),
+                reason: ReservationError::UnknownSlot
+            }
+        );
+        assert_eq!(outbox.release(key), Err(ReservationError::UnknownSlot));
+        assert_invariant(&outbox);
+    }
+
+    #[test]
+    fn a_full_reservation_table_is_a_stated_need() {
+        let id = OutboxId {
+            owner: LogicalOwnerId::new(0),
+            epoch: RunEpoch::new(1),
+        };
+        let mut outbox = Outbox::with_capacity(id, EffectSlots::new(8), 2).expect("small");
+        let first = outbox.reserve(slots(1)).expect("room");
+        let _second = outbox.reserve(slots(1)).expect("room");
+        let before = snapshot(&outbox);
+        assert_eq!(
+            outbox.reserve(slots(1)),
+            Err(CapacityNeed {
+                resource: Resource::Reservations,
+                amount: 1,
+                wake: WakeCondition::ResourceReleased,
+            })
+        );
+        assert_eq!(snapshot(&outbox), before);
+        assert_eq!(outbox.release(first), Ok(1));
+        assert!(
+            outbox.reserve(slots(1)).is_ok(),
+            "a released entry is reused"
+        );
+        assert_invariant(&outbox);
+    }
+
+    #[test]
+    fn an_entry_whose_generation_is_exhausted_is_never_reused() {
+        let mut outbox = outbox_of(0, 2);
+        outbox.records.as_mut_slice()[0].generation = u64::MAX;
+        let last = outbox.reserve(slots(1)).expect("room");
+        assert_eq!(last.slot, 0);
+        assert_eq!(outbox.release(last), Ok(1));
+        assert!(outbox.records.as_slice()[0].spent);
+        let next = outbox.reserve(slots(1)).expect("room");
+        assert_ne!(next.slot, 0, "the spent entry was reused");
+        assert_eq!(outbox.release(last), Err(ReservationError::Stale));
+        assert_invariant(&outbox);
+    }
+
+    #[test]
+    fn a_reservation_held_across_dispatch_keeps_its_slots() {
+        let mut outbox = filled(4, 2);
+        let held = outbox.reserve(slots(2)).expect("room");
+        let mut sink = LimitedSink {
+            room: 8,
+            taken: Vec::new(),
+        };
+        assert_eq!(
+            outbox.dispatch(&mut sink),
+            DispatchReport {
+                accepted: 2,
+                blocked: None
+            }
+        );
+        assert_eq!(outbox.free_slots(), 2, "dispatch freed the held slots");
+        outbox.publish(held, effect(7)).expect("still reserved");
+        outbox.publish(held, effect(8)).expect("still reserved");
+        assert_eq!(sequences(&outbox), vec![7, 8]);
+        assert_invariant(&outbox);
     }
 
     #[test]

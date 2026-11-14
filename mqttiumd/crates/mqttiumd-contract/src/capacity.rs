@@ -92,6 +92,8 @@ pub enum Resource {
     ResultSlots,
     ReceiptSlots,
     Continuations,
+    /// Entries of an effect box's reservation table.
+    Reservations,
     Work,
 }
 
@@ -126,6 +128,11 @@ pub struct AllocationFailed;
 /// The storage is reserved fallibly up front, and no method can push past
 /// the bound, so no later reallocation happens. The inner `Vec` is not
 /// reachable mutably.
+///
+/// Equality compares the bound as well as the items: two containers with
+/// the same items and different bounds refuse different insertions, so they
+/// are not interchangeable. A type whose value is only the list of items,
+/// such as a recipe, defines its own equality over `as_slice`.
 #[derive(PartialEq, Eq, Debug)]
 pub struct BoundedVec<T> {
     items: Vec<T>,
@@ -184,6 +191,13 @@ impl<T> BoundedVec<T> {
     #[must_use]
     pub fn as_slice(&self) -> &[T] {
         &self.items
+    }
+
+    /// Mutable view of the items held. It cannot add or remove an item, so
+    /// the bound still holds.
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.items
     }
 }
 
