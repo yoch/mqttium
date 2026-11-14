@@ -228,7 +228,67 @@ pub fn collect(root: &Path, contracts: &Path) -> Result<Value, String> {
 mod tests {
     use std::fs;
 
-    use super::{contracts_digest, describe, sha256_hex};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use super::{contracts_digest, describe, modifications_digest, sha256_hex};
+
+    fn git(root: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .args(arguments)
+            .current_dir(root)
+            .status()
+            .expect("git runs");
+        assert!(status.success(), "git {arguments:?}");
+    }
+
+    /// A repository with one commit holding `old.rs`.
+    fn repository(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("mqttiumd-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("repository directory");
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.name", "test"]);
+        git(&root, &["config", "user.email", "test@example.invalid"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        fs::write(
+            root.join("old.rs"),
+            "pub fn kept() -> u8 {\n    7\n}\n".repeat(8),
+        )
+        .expect("file");
+        git(&root, &["add", "old.rs"]);
+        git(&root, &["commit", "-q", "-m", "one file"]);
+        root
+    }
+
+    #[test]
+    fn the_modifications_digest_does_not_depend_on_rename_detection() {
+        let root = repository("renames");
+        git(&root, &["mv", "old.rs", "new.rs"]);
+        git(&root, &["config", "diff.renames", "true"]);
+        let detected = modifications_digest(&root).expect("digest");
+        git(&root, &["config", "diff.renames", "false"]);
+        let undetected = modifications_digest(&root).expect("digest");
+        fs::remove_dir_all(&root).expect("cleanup");
+        assert_eq!(detected, undetected, "one work tree, two digests");
+    }
+
+    #[test]
+    fn the_modifications_digest_does_not_depend_on_a_user_exclude_file() {
+        let root = repository("excludes");
+        fs::write(root.join("scratch.tmp"), b"untracked").expect("untracked file");
+        let listed = modifications_digest(&root).expect("digest");
+        // A user-level ignore file is configuration, not content of the tree.
+        let ignore = root.join(".git").join("user-ignore");
+        fs::write(&ignore, "*.tmp\n").expect("ignore file");
+        git(
+            &root,
+            &["config", "core.excludesFile", &ignore.to_string_lossy()],
+        );
+        let ignored = modifications_digest(&root).expect("digest");
+        fs::remove_dir_all(&root).expect("cleanup");
+        assert_eq!(listed, ignored, "one work tree, two digests");
+    }
 
     #[cfg(unix)]
     #[test]

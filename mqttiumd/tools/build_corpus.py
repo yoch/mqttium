@@ -274,6 +274,16 @@ bad(
     + "\n",
 )
 bad(
+    "scenario-negative-zero.json",
+    "number-not-integer",
+    "",
+    "The lexeme -0 is not an integer literal of version 1; zero is written 0.",
+    raw=json.dumps(scenario(lambda v: v["steps"][1].pop("packet_id")), indent=2).replace(
+        '"qos": 2', '"qos": -0'
+    )
+    + "\n",
+)
+bad(
     "scenario-two-documents.json",
     "json-syntax",
     "",

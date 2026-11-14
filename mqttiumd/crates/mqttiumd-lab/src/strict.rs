@@ -125,6 +125,10 @@ mod tests {
     #[test]
     fn refuses_numbers_that_are_not_64_bit_integers() {
         assert_eq!(code_of("7.0"), code::NUMBER_NOT_INTEGER);
+        // The lexeme `-0` is not the integer zero for this reader.
+        assert_eq!(code_of("-0"), code::NUMBER_NOT_INTEGER);
+        assert_eq!(code_of(r#"{"qos": -0}"#), code::NUMBER_NOT_INTEGER);
+        assert!(parse(b"0").is_ok());
         assert_eq!(code_of("7e0"), code::NUMBER_NOT_INTEGER);
         assert_eq!(code_of(r#"{"n": 1.5}"#), code::NUMBER_NOT_INTEGER);
         assert_eq!(code_of("18446744073709551616"), code::NUMBER_NOT_INTEGER);

@@ -282,6 +282,55 @@ fn the_set_of_sources_is_closed() {
 }
 
 #[test]
+fn a_raw_identifier_does_not_hide_a_macro_or_an_attribute() {
+    // Each of these compiles: `r#` does not change what a name designates.
+    for source in [
+        "pub fn decide() -> bool {\n    r#cfg!(debug_assertions)\n}",
+        "pub const BUILD_DIRECTORY: &str =\n    r#env!(\"CARGO_MANIFEST_DIR\");",
+        "#[r#path = \"other.rs\"]\nmod other;",
+        "#[r#cfg(test)]\npub fn only_in_tests() {}",
+        "const TEXT: &str = r#include_str!(\"/etc/hostname\");",
+    ] {
+        assert!(!violations(source).is_empty(), "accepted: {source}");
+    }
+}
+
+#[test]
+fn an_alias_does_not_hide_a_macro() {
+    for source in [
+        "use core::env as build_env;\n\npub const BUILD_DIRECTORY: &str =\n    build_env!(\"CARGO_MANIFEST_DIR\");",
+        "use core::env as matches;\npub const D: &str = matches!(\"CARGO_MANIFEST_DIR\");",
+        "use core::cfg as when;\npub fn decide() -> bool { when!(debug_assertions) }",
+        "use core::{env as e};\npub const D: &str = e!(\"HOME\");",
+        "pub const D: &str = core::env!(\"CARGO_MANIFEST_DIR\");",
+        "macro_rules! call { ($m:ident) => { $m!(\"HOME\") }; }\npub const D: &str = call!(env);",
+        "pub const WHERE: &str = file!();",
+    ] {
+        assert!(!violations(source).is_empty(), "accepted: {source}");
+    }
+}
+
+#[test]
+fn ordinary_code_is_still_accepted() {
+    for source in [
+        "fn f() { let r#async = 1; let r#unsafe = r#async; let _ = r#unsafe; }",
+        "fn f(a: bool) -> bool { if !(a) { return !(a); } a != !a }",
+        "fn never() -> ! { loop {} }",
+        "use alloc::vec::Vec;\npub fn f() -> Vec<u8> { vec![1] }",
+        "pub use mqttiumd_contract as contract;",
+        "#[derive(Clone, Debug)]\n#[must_use]\npub struct S;",
+        "fn f(x: u8) -> bool { matches!(x, 1 | 2) && { debug_assert!(x > 0); true } }",
+        "macro_rules! twice { ($x:expr) => { $x + $x }; }\nfn f() -> u8 { twice!(1) }",
+    ] {
+        assert_eq!(
+            violations(source),
+            Vec::<String>::new(),
+            "refused: {source}"
+        );
+    }
+}
+
+#[test]
 fn pure_crates_keep_their_source_rules() {
     for name in ["mqttiumd-contract", "mqttiumd-core"] {
         let directory = root().join("crates").join(name).join("src");

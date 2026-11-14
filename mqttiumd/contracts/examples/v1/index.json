@@ -138,6 +138,12 @@
       "why": "An integer literal beyond 64 bits is refused while parsing."
     },
     {
+      "file": "contracts/examples/v1/invalid/scenario-negative-zero.json",
+      "code": "number-not-integer",
+      "pointer": "",
+      "why": "The lexeme -0 is not an integer literal of version 1; zero is written 0."
+    },
+    {
       "file": "contracts/examples/v1/invalid/scenario-two-documents.json",
       "code": "json-syntax",
       "pointer": "",
