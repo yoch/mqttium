@@ -47,7 +47,7 @@
     {
       "decision": "0004",
       "path": "docs/decisions/0004-contract-revision-status.md",
-      "sha256": "8481db43f087692f12e4fe627a6d7d5c16a2fe29d7ae1a193e4e3263a5d548af"
+      "sha256": "f3b8b757dc7e7613917c04df0170615d70017ea368bff0eb1fd7ec17268d4a08"
     },
     {
       "decision": "0005",
@@ -62,7 +62,7 @@
     {
       "decision": "0007",
       "path": "docs/decisions/0007-pure-crate-boundary.md",
-      "sha256": "4e873da52c30638993d9c3ccabee1025fcb387a7cffee46ce1c6eb87b876bc97"
+      "sha256": "519b90b8259f7989cd378c0d1c7cafde1e65957f2c5d16ca160d016585bb31d1"
     },
     {
       "decision": "0008",

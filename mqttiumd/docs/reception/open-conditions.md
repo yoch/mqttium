@@ -35,6 +35,7 @@ observed in the checkout. It does not connect the two.
 | The manifest records the effective parameters: scenario, fixture, backend, failure model, scheduler version and seed, commands | L4 | Any qualifying run |
 | For SQLite: the exact engine version and compile options, and the effective `journal_mode` and `synchronous` read back after they are set (DEM-011) | L7 | S0 on SQLite |
 | The lab binary, the oracle and the generators are identified separately in the manifest (V3-002) | L4 | G0 |
+| **One snapshot of the contracts.** The contract digest is computed from one read of the contract files and the schemas and catalogues are then read again; a file that changes in between leaves a digest that names other rules than the ones loaded. Either the bytes that are hashed are the bytes that are interpreted, or the snapshot of a campaign is established as immutable | L3, L4 | Any qualifying result |
 
 ## Scenario P1-02b (ADR 0001)
 
@@ -44,11 +45,22 @@ observed in the checkout. It does not connect the two.
 | The registry rows for a replayed PUBLISH while the outcome is unknown, after a reconnect and on a live connection | L3 | P1-02b, G0 |
 | `tests/scenarios/p1/P1-02b.json` and its run on the deterministic store | L4 | S0 |
 
-## Effect boxes (ADR 0006)
+## Effect boxes and transitions (ADR 0006): reception of L1
+
+Lot L1 is not received while any of these is open. The first one is decided
+before several lots start to build owners, so that they share one authority.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| The component that creates owners gives each effect box a distinct identity (owner, run epoch) and refuses a second box with an identity it already issued. The contract crate cannot enforce this: it has no global state, and two boxes with one identity accept each other's reservation keys | L1 | L4 |
+| **Creation authority for effect boxes.** `Outbox` is a primitive with a precondition: one box per owner and run epoch. Two boxes with one identity accept each other's reservation keys. L1 provides the authority that creates boxes (an owner factory, an arena or a construction token that cannot be duplicated) and makes the precondition an invariant. Tests: two creations for one owner in one incarnation; destruction then recreation with an old key kept; no silent reuse of an identity; contexts that could exchange keys by accident are kept apart; explicit exhaustion of the identity domain | L1 | Reception of L1 |
+| **Exhausted reservation table.** When every entry of the table is spent, `reserve` still answers `CapacityNeed` with `ResourceReleased`, a wake-up that nothing can produce. L1 distinguishes a definitive exhaustion from a temporary lack and chooses explicitly between stopping and renewing; a test covers a table whose entries are all spent | L1 | Reception of L1 |
+| **Transition contract.** `PlanStamp` is a support for validation, not yet the private single-use plan of ADR 0006. L1 establishes: no mutation while planning; a plan consumed once; owner and revision checked before application; resources reserved before mutation; the exact behaviour of `NeedCapacity`. Reserving then releasing an entry advances its generation: L1 orders its acquisitions so that a refused transition restores what the contract requires, or defines which provisional metadata may differ | L1 | Reception of L1 |
+
+## Pilot proof (DEM-021): reception of L6
+
+| Condition | Closed by | Blocks |
+| - | - | - |
+| The proof that is received is on `release_if_current` as the product really executes it. Tooling may be prepared in parallel; a proof of a separate demonstration function does not receive the lot | L6, with L1 | Reception of L6 |
 
 ## Process topology (ADR 0002)
 

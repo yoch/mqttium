@@ -224,12 +224,15 @@ pub trait EffectSink {
 
 /// Identity of an effect box: its owner and the run epoch that created it.
 ///
-/// The identity is supplied by whoever creates the box, and this crate has
-/// no global state to make it unique. It tells apart the boxes of different
-/// owners and epochs; it cannot tell apart two boxes created with the same
-/// pair. The precondition is therefore on the creator: one box per owner
-/// and per epoch. The component that creates owners must refuse a second
-/// box with an identity it already issued (see the open conditions).
+/// The identity is supplied by whoever creates the box. It tells apart the
+/// boxes of different owners and epochs; it does not tell apart two boxes
+/// created with the same pair. This primitive therefore has a
+/// precondition: one box per owner and per epoch.
+///
+/// Lot L0 leaves that precondition to the creator on purpose. Lot L1 must
+/// turn it into an established invariant, with a creation authority (an
+/// owner factory, an arena or a construction token that cannot be
+/// duplicated) and its tests; see the open conditions.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OutboxId {
     pub owner: LogicalOwnerId,
@@ -724,8 +727,8 @@ mod tests {
 
     #[test]
     fn two_boxes_with_one_identity_are_not_told_apart() {
-        // The stated limit of an identity supplied by the creator: this is
-        // why one box per owner and epoch is a precondition.
+        // The stated limit of this primitive: one box per owner and epoch
+        // is a precondition until lot L1 provides a creation authority.
         let mut first = outbox_of(1, 2);
         let mut twin = outbox_of(1, 2);
         let key = first.reserve(slots(1)).expect("room");

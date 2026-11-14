@@ -38,9 +38,11 @@ python tools/check_schemas.py
 1. **The pure crates stay pure.** `mqttiumd-contract` and `mqttiumd-core`
    are `no_std + alloc`, forbid `unsafe`, have no unlisted dependency, use
    conditional compilation only as `cfg(test)` or `cfg(kani)` on a module,
-   and contain no async. The same core code runs in simulation and against
-   SQLite. `crates/mqttiumd-lab/tests/boundary.rs` enforces this and states
-   what it does not cover.
+   and contain no async. They invoke only the macros and use only the
+   attributes listed in `crates/mqttiumd-lab/tests/boundary.rs`; extending
+   a list is a decision (ADR 0007). The same core code runs in simulation
+   and against SQLite. That test enforces all of this and states what it
+   does not cover.
 2. **An input is applied or handed back intact.** A transition computes a
    single-use plan against `&State`, then applies it (ADR 0006). Reserve
    before mutating; a plan carries the owner and state revision it was

@@ -23,11 +23,28 @@ not.
 | `#![no_std]` outside tests | The compiler | No file, socket, clock, thread or randomly seeded `HashMap` |
 | `#![forbid(unsafe_code)]` | The compiler | No `unsafe` in these crates |
 | Dependencies | `cargo metadata`, in `tests/boundary.rs` | Only the listed dependencies; no build script; no feature |
-| Token rules | The lexed sources, in `tests/boundary.rs` | No `unsafe`, `async`, `await`; no `extern` but `extern crate alloc;`; conditional compilation only as the `no_std` crate attribute and as `cfg(test)` or `cfg(kani)` on a module; no `include!`, `env!` or `#[path]` |
+| Token rules | The lexed sources, in `tests/boundary.rs` | Closed lists: a macro invocation names a listed macro or one the file defines; an attribute has a listed name; conditional compilation only as the `no_std` crate attribute and as `cfg(test)` or `cfg(kani)` on a module; no `unsafe`, `async`, `await`; no `extern` but `extern crate alloc;` |
 
 The token rules apply to Rust tokens, so comments, strings and spacing do
-not matter, and `cfg!(…)` is seen. They are deliberately coarse: an
-identifier that merely starts with `cfg` is refused.
+not matter.
+
+They are closed lists rather than lists of forbidden words, because a
+forbidden word can be respelled. A raw identifier designates the same name
+as the plain one, so `r#cfg!`, `r#env!` and `#[r#path]` are the macros and
+the attribute they name. A macro can be imported under another name, so
+`use core::env as e; e!(…)` reaches `env!` without writing it at the call.
+With an allow-list the alias is refused at the call, because `e` is not
+listed; the `use` declaration is refused as well, and nothing may be
+renamed to the name of an allowed macro. An invocation through a macro
+variable (`$m!(…)`) is refused for the same reason.
+
+Only keywords are compared as written: `r#async` is an ordinary
+identifier and stays accepted.
+
+The lists are data in `tests/boundary.rs`. Adding a macro or an attribute
+is a decision, like adding a dependency. The rules are deliberately
+coarse: an identifier that merely starts with `cfg` is refused, and so is
+a macro nobody listed yet.
 
 Encoding is written by hand in these crates: canonical bytes for recipes,
 eight big-endian bytes for identities. No serialization framework enters

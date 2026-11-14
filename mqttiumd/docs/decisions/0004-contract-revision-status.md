@@ -39,7 +39,7 @@ Where the chapters were silent or a literal reading was unsafe:
 | Subject | Choice | Reason |
 | - | - | - |
 | `u64` pattern | The schema adds `not: {pattern: "[\n\r]"}` to the pattern of DEM-014 | `$` matches before a trailing line break in some validators; Python `re` accepts `"4096\n"` |
-| Number literals | `7.0`, `7e0` and integers beyond 64 bits are refused while parsing | JSON Schema treats `7.0` as an integer; readers would disagree |
+| Number literals | `7.0`, `7e0`, `-0` and integers beyond 64 bits are refused while parsing | JSON Schema treats `7.0` as an integer, and readers disagree on `-0`; one spelling per value |
 | Disposition `FAULT` | Added to the dispositions of DEM-015 | DEM-006 defines `Fatal` and DEM-010 requires a stop on contradictory terminal results |
 | Registry `status` | `seed` or `complete` | A partial registry lists its holes and cannot be mistaken for a complete one |
 | Coverage budget | At most 4 096 guard points per cell and 262 144 per registry; catalogue lists are bounded | Coverage is a product of dimensions; it is sized before it is enumerated |

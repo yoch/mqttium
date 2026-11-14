@@ -115,7 +115,7 @@
           "$ref": "primitives.schema.json#/$defs/sha256"
         }
       },
-      "description": "The work tree as observed when the binary ran. `modifications_sha256` is the digest of one `<content>  <path>` line per path that differs from the revision or is untracked, in path order; the content is the SHA-256 of a regular file, `link:<target>` for a symbolic link and `deleted` for a missing path."
+      "description": "The work tree as observed when the binary ran. `modifications_sha256` is the digest of one `<content>  <path>` line per path that differs from the revision or is untracked, in path order, with rename detection off; the content is the SHA-256 of a regular file, `link:<target>` for a symbolic link and `deleted` for a missing path."
     },
     "tools_at_execution": {
       "type": "object",

@@ -29,8 +29,8 @@ it. The examples illustrate the contract and are not part of the digest.
   unions carry a constant discriminator.
 - A 64-bit quantity is a canonical decimal string: no sign, no leading zero,
   no whitespace, no line break, at most `18446744073709551615`.
-- A number literal is a small integer. `7.0`, `7e0` and integers beyond 64
-  bits are refused while parsing.
+- A number literal is a small integer. `7.0`, `7e0`, `-0` and integers
+  beyond 64 bits are refused while parsing; zero is written `0`.
 - A Packet Identifier is an integer from 1 to 65535.
 - Duplicate keys are refused while parsing.
 - Paths are relative to the `mqttiumd/` root and stay below it. Symbolic
@@ -100,9 +100,14 @@ it ran. It does not claim that the binary was built from that checkout.
 `modifications_sha256` is the digest of one `<content>  <path>` line per
 path that differs from the revision or is untracked, in path order, where
 the content is the SHA-256 of a regular file, `link:<target>` for a
-symbolic link and `deleted` for a missing path. It depends on the work tree
-only, not on how git prints a difference. The contract files are listed
-once each, in path order, which is the order their digest is defined by.
+symbolic link and `deleted` for a missing path. The list is defined by
+paths: rename detection, external diff drivers and text conversions are
+off, so a renamed file is one path gone and one path new, and the
+user-level exclude file is ignored. What git itself considers modified
+still applies: the `.gitignore` files of the tree, the exclude file of the
+clone, and the file-mode and line-ending settings of the repository. The
+contract files are listed once each, in path order, which is the order
+their digest is defined by.
 
 ## Example corpus
 
@@ -129,5 +134,5 @@ codes. CI runs it.
 It is not the independent oracle of lot L3: it reads no trace and no store
 and repeats no semantic rule. A second reader of the semantic rules is an
 open condition. Its strict parsing matches the Rust reader on the cases the
-corpus holds, including `NaN`, a lone surrogate escape and an integer beyond
-64 bits.
+corpus holds, including `NaN`, a lone surrogate escape, an integer beyond
+64 bits and the lexeme `-0`.
