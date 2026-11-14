@@ -165,8 +165,10 @@ pub struct Report {
     /// refuses the document.
     pub omitted_diagnostics: usize,
     /// Facts worth showing that do not refuse the document, such as the
-    /// holes of a seed registry.
+    /// holes of a seed registry. At most [`MAX_DIAGNOSTICS`] are kept.
     pub notes: Vec<String>,
+    /// Notes found beyond the ones kept.
+    pub omitted_notes: usize,
 }
 
 impl Report {
@@ -179,16 +181,15 @@ impl Report {
     }
 
     /// Keeps the first [`MAX_DIAGNOSTICS`] diagnostics and notes and counts
-    /// what it drops.
+    /// what it drops. Applying it again changes nothing.
     pub fn truncate(&mut self) {
         if self.diagnostics.len() > MAX_DIAGNOSTICS {
             self.omitted_diagnostics += self.diagnostics.len() - MAX_DIAGNOSTICS;
             self.diagnostics.truncate(MAX_DIAGNOSTICS);
         }
         if self.notes.len() > MAX_DIAGNOSTICS {
-            let omitted = self.notes.len() - MAX_DIAGNOSTICS;
+            self.omitted_notes += self.notes.len() - MAX_DIAGNOSTICS;
             self.notes.truncate(MAX_DIAGNOSTICS);
-            self.notes.push(format!("{omitted} more notes omitted"));
         }
     }
 

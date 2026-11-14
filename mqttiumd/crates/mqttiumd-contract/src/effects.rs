@@ -223,7 +223,13 @@ pub trait EffectSink {
 }
 
 /// Identity of an effect box: its owner and the run epoch that created it.
-/// An owner has one box per epoch, so the pair designates one box.
+///
+/// The identity is supplied by whoever creates the box, and this crate has
+/// no global state to make it unique. It tells apart the boxes of different
+/// owners and epochs; it cannot tell apart two boxes created with the same
+/// pair. The precondition is therefore on the creator: one box per owner
+/// and per epoch. The component that creates owners must refuse a second
+/// box with an identity it already issued (see the open conditions).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OutboxId {
     pub owner: LogicalOwnerId,
@@ -714,6 +720,22 @@ mod tests {
         assert_invariant(&first);
         assert_invariant(&second);
         assert_eq!(first.release(foreign), Ok(1));
+    }
+
+    #[test]
+    fn two_boxes_with_one_identity_are_not_told_apart() {
+        // The stated limit of an identity supplied by the creator: this is
+        // why one box per owner and epoch is a precondition.
+        let mut first = outbox_of(1, 2);
+        let mut twin = outbox_of(1, 2);
+        let key = first.reserve(slots(1)).expect("room");
+        let _own = twin.reserve(slots(1)).expect("room");
+        assert_eq!(
+            twin.publish(key, effect(0)),
+            Ok(()),
+            "the twin cannot detect the foreign key"
+        );
+        assert_invariant(&twin);
     }
 
     #[test]

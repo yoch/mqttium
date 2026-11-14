@@ -3,12 +3,13 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use crate::diagnostic::{Diagnostic, Report, code};
+pub use crate::files::MAX_DOCUMENT_BYTES;
+use crate::files::{self, Loaded, Refusal};
 use crate::schemas::Schemas;
 use crate::{manifest, semantic, strict};
 
@@ -34,9 +35,6 @@ const CATALOG_FILES: [(&str, &str); 4] = [
     ("assertions.json", "mqttiumd.assertion-catalog"),
     ("requirements.json", "mqttiumd.requirement-register"),
 ];
-
-/// The largest document this reader loads.
-pub const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The longest chain of documents referring to one another.
 pub const MAX_REFERENCE_DEPTH: usize = 4;
@@ -143,12 +141,6 @@ pub struct Workspace {
     active: ReferenceStack,
 }
 
-/// Bytes of a document and the resolved path they were read from.
-struct Loaded {
-    path: PathBuf,
-    bytes: Vec<u8>,
-}
-
 fn strings(value: &Value, list: &str, key: &str) -> BTreeSet<String> {
     value
         .get(list)
@@ -167,38 +159,25 @@ impl Workspace {
     /// Opens the contract directory `contracts`, given relative to `root`.
     /// Schemas are read from the sibling `schema/<version>` directory.
     pub fn open(root: &Path, contracts: &Path) -> Result<Self, Diagnostic> {
-        let files = manifest::contract_files(root, &contracts.to_string_lossy())
-            .map_err(|message| Diagnostic::new(code::FILE_UNREADABLE, "", message))?;
+        let unreadable = |message: String| Diagnostic::new(code::FILE_UNREADABLE, "", message);
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|error| unreadable(format!("{}: {error}", root.display())))?;
+        let (contract_dir, schema_dir) =
+            files::contract_directories(contracts).map_err(unreadable)?;
+        let listed = manifest::contract_files(root, contracts).map_err(unreadable)?;
         let contracts_digest = manifest::contracts_digest(
-            files
+            listed
                 .iter()
                 .map(|file| (file.sha256.as_str(), file.path.as_str())),
         );
-        let contracts = root.join(contracts);
-        let version = contracts.file_name().ok_or_else(|| {
-            Diagnostic::new(
-                code::FILE_UNREADABLE,
-                "",
-                "the contract directory has no name",
-            )
-        })?;
-        let schema_dir = contracts
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("schema")
-            .join(version);
-        let canonical_root = root.canonicalize().map_err(|error| {
-            Diagnostic::new(
-                code::FILE_UNREADABLE,
-                "",
-                format!("{}: {error}", root.display()),
-            )
-        })?;
+        let contracts = root.join(contract_dir);
+        let schemas = Schemas::load(&canonical_root, &root.join(schema_dir))?;
         let mut workspace = Self {
             root: root.to_path_buf(),
             canonical_root,
             contracts,
-            schemas: Schemas::load(&schema_dir)?,
+            schemas,
             catalogs: Catalogs::default(),
             contracts_digest,
             active: ReferenceStack::default(),
@@ -267,61 +246,18 @@ impl Workspace {
         &self.root
     }
 
-    /// Reads one document.
-    ///
-    /// Symbolic links are followed. The resolved file must be a regular
-    /// file below the resolved root, and no larger than
-    /// [`MAX_DOCUMENT_BYTES`]; a link that leaves the root is refused like
-    /// any other path that does.
-    fn read(&self, path: &Path) -> Result<Loaded, (&'static str, String)> {
-        let shown = path.display();
-        let resolved = path
-            .canonicalize()
-            .map_err(|error| (code::FILE_UNREADABLE, format!("{shown}: {error}")))?;
-        if !resolved.starts_with(&self.canonical_root) {
-            return Err((
-                code::PATH_ESCAPE,
-                format!("{shown} resolves outside the mqttiumd root"),
-            ));
-        }
-        let metadata = fs::metadata(&resolved)
-            .map_err(|error| (code::FILE_UNREADABLE, format!("{shown}: {error}")))?;
-        if !metadata.is_file() {
-            return Err((
-                code::FILE_UNREADABLE,
-                format!("{shown} is not a regular file"),
-            ));
-        }
-        let too_large = || {
-            (
-                code::FILE_TOO_LARGE,
-                format!("{shown} is larger than {MAX_DOCUMENT_BYTES} bytes"),
-            )
-        };
-        if metadata.len() > MAX_DOCUMENT_BYTES {
-            return Err(too_large());
-        }
-        // The size is checked again while reading: the file may have grown.
-        let mut bytes = Vec::new();
-        fs::File::open(&resolved)
-            .and_then(|file| file.take(MAX_DOCUMENT_BYTES + 1).read_to_end(&mut bytes))
-            .map_err(|error| (code::FILE_UNREADABLE, format!("{shown}: {error}")))?;
-        if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
-            return Err(too_large());
-        }
-        Ok(Loaded {
-            path: resolved,
-            bytes,
-        })
+    /// Reads one document through the bounded, confined reader.
+    fn read(&self, path: &Path) -> Result<Loaded, Refusal> {
+        files::read_document(&self.canonical_root, path)
     }
 
     /// Checks a parsed document: schema first, then semantics. At most
     /// [`MAX_DIAGNOSTICS`] diagnostics are kept; the rest are counted.
     pub fn check_value(&self, document: &Value) -> Report {
-        let mut report = Report {
-            diagnostics: self.schemas.validate(document),
-            ..Report::default()
-        };
+        let mut report = Report::default();
+        report.diagnostics = self
+            .schemas
+            .validate_counted(document, &mut report.omitted_diagnostics);
         if report.is_accepted() {
             semantic::check(self, document, &mut report);
         }
@@ -365,6 +301,18 @@ impl Workspace {
     /// checked against `reference.to` before the document is validated, so
     /// a document of the wrong format is refused without being followed.
     pub fn load_reference(&self, reference: &Reference, path: &str) -> Result<Value, Diagnostic> {
+        self.load_cited(reference, path, None)
+    }
+
+    /// Loads a referenced document that is also cited as evidence with a
+    /// digest and a size. The bytes that are hashed are the bytes that are
+    /// validated: the file is read once.
+    pub fn load_cited(
+        &self,
+        reference: &Reference,
+        path: &str,
+        cited: Option<(&str, Option<u64>)>,
+    ) -> Result<Value, Diagnostic> {
         let pointer = reference.pointer;
         if !is_contained(path) {
             return Err(Diagnostic::new(
@@ -376,6 +324,19 @@ impl Workspace {
         let loaded = self
             .read(&self.root.join(path))
             .map_err(|(code, message)| Diagnostic::new(code, pointer, message))?;
+        if let Some((sha256, bytes)) = cited {
+            let digest = manifest::sha256_hex(&loaded.bytes);
+            if digest != sha256 || bytes != Some(loaded.bytes.len() as u64) {
+                return Err(Diagnostic::new(
+                    code::EVIDENCE_MISMATCH,
+                    pointer,
+                    format!(
+                        "{path} has {} bytes and the digest {digest}",
+                        loaded.bytes.len()
+                    ),
+                ));
+            }
+        }
         let invalid = |reason: String| {
             Diagnostic::new(
                 code::REFERENCE_INVALID,
@@ -407,16 +368,16 @@ impl Workspace {
         }
     }
 
-    /// Reads a file that a document cites as evidence and returns its
-    /// bytes. The same containment rules apply as for any document.
-    pub fn read_evidence(&self, path: &str) -> Result<Vec<u8>, (&'static str, String)> {
+    /// Digest and size of a file that a document cites as evidence. The
+    /// file is hashed as a stream: evidence has no size bound.
+    pub fn hash_evidence(&self, path: &str) -> Result<(String, u64), Refusal> {
         if !is_contained(path) {
             return Err((
                 code::PATH_ESCAPE,
                 format!("{path:?} is not a path below the mqttiumd root"),
             ));
         }
-        self.read(&self.root.join(path)).map(|loaded| loaded.bytes)
+        files::hash_file(&self.canonical_root, &self.root.join(path))
     }
 
     /// Checks every JSON file of the contract directory, in name order.

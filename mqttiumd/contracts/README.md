@@ -35,7 +35,8 @@ it. The examples illustrate the contract and are not part of the digest.
 - Duplicate keys are refused while parsing.
 - Paths are relative to the `mqttiumd/` root and stay below it. Symbolic
   links are followed; the resolved file must be a regular file below the
-  resolved root, at most 16 MiB.
+  resolved root. A document is at most 16 MiB. Evidence cited by digest,
+  such as a trace, has no size bound: it is hashed as a stream.
 - A document refers to another only as the table of references allows
   (scenario to fixture, registry to catalogue, qualifying result to scenario
   and manifest). The format of the referenced document is checked before it
@@ -49,7 +50,8 @@ strict parsing, known format and version, JSON Schema, semantic pass. The
 semantic pass checks numeric range, references to catalogues and files,
 binding definitions, the causal order of steps, verdicts, cited evidence,
 and the coverage of a transition registry. A report keeps at most 64
-diagnostics and counts the rest; a truncated report still refuses.
+diagnostics and 64 notes and counts the others exactly; a truncated report
+still refuses.
 
 ### Registry coverage
 
@@ -95,7 +97,20 @@ ran (its digest and the build parameters captured when it was compiled),
 from `checkout` and `tools_at_execution`, what was observed around it when
 it ran. It does not claim that the binary was built from that checkout.
 
+`modifications_sha256` is the digest of one `<content>  <path>` line per
+path that differs from the revision or is untracked, in path order, where
+the content is the SHA-256 of a regular file, `link:<target>` for a
+symbolic link and `deleted` for a missing path. It depends on the work tree
+only, not on how git prints a difference. The contract files are listed
+once each, in path order, which is the order their digest is defined by.
+
 ## Example corpus
+
+The examples and their index are derived: `../tools/build_corpus.py` writes
+them, each invalid example being one edit of a valid document, and
+`requirements.json` with them. Edit the tool, not the files; CI fails when
+they are not up to date. Schemas, catalogues, the registry, the fixture and
+scenario P1-02 are sources and are edited directly.
 
 An invalid example must be refused **for its declared reason**: every
 diagnostic carries the declared code and one sits at the declared pointer.
@@ -113,4 +128,6 @@ codes. CI runs it.
 
 It is not the independent oracle of lot L3: it reads no trace and no store
 and repeats no semantic rule. A second reader of the semantic rules is an
-open condition.
+open condition. Its strict parsing matches the Rust reader on the cases the
+corpus holds, including `NaN`, a lone surrogate escape and an integer beyond
+64 bits.

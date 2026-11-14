@@ -12,7 +12,7 @@ use jsonschema::{Registry, Validator};
 use serde_json::Value;
 
 use crate::diagnostic::{Diagnostic, MAX_DIAGNOSTICS, code};
-use crate::strict;
+use crate::{files, strict};
 
 /// The dialect every schema file declares.
 pub const DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -101,7 +101,8 @@ pub fn check_schema_document(
 
 impl Schemas {
     /// Loads and compiles every `*.schema.json` of `directory`.
-    pub fn load(directory: &Path) -> Result<Self, Diagnostic> {
+    /// `canonical_root` is the resolved root every file must stay below.
+    pub fn load(canonical_root: &Path, directory: &Path) -> Result<Self, Diagnostic> {
         let unreadable = |error: std::io::Error| {
             Diagnostic::new(
                 code::FILE_UNREADABLE,
@@ -121,7 +122,9 @@ impl Schemas {
 
         let mut documents = Vec::new();
         for file in &files {
-            let bytes = fs::read(directory.join(file)).map_err(unreadable)?;
+            let bytes = files::read_document(canonical_root, &directory.join(file))
+                .map_err(|(code, message)| Diagnostic::new(code, "", message))?
+                .bytes;
             let schema = strict::parse(&bytes)
                 .map_err(|error| not_local(file, format!("{}: {}", error.code, error.message)))?;
             check_schema_document(file, &schema, &files)?;
@@ -157,6 +160,12 @@ impl Schemas {
 
     /// Validates a parsed document: known format, known version, schema.
     pub fn validate(&self, document: &Value) -> Vec<Diagnostic> {
+        self.validate_counted(document, &mut 0)
+    }
+
+    /// Like [`Schemas::validate`], keeping at most [`MAX_DIAGNOSTICS`]
+    /// violations and adding the number of the others to `omitted`.
+    pub fn validate_counted(&self, document: &Value, omitted: &mut usize) -> Vec<Diagnostic> {
         let Some(format) = document.get("format").and_then(Value::as_str) else {
             return vec![Diagnostic::new(
                 code::FORMAT_UNKNOWN,
@@ -181,18 +190,20 @@ impl Schemas {
         let Some(validator) = self.validators.get(*file) else {
             return vec![not_local(file, "schema file is not loaded")];
         };
-        // One more than a report keeps, so that truncation is still counted.
-        validator
-            .iter_errors(document)
-            .take(MAX_DIAGNOSTICS + 1)
-            .map(|error| {
-                Diagnostic::new(
+        // Every violation is counted; only the first ones are kept.
+        let mut kept = Vec::new();
+        for error in validator.iter_errors(document) {
+            if kept.len() < MAX_DIAGNOSTICS {
+                kept.push(Diagnostic::new(
                     code::SCHEMA_VIOLATION,
                     error.instance_path().as_str(),
                     format!("{error} (schema {})", error.schema_path().as_str()),
-                )
-            })
-            .collect()
+                ));
+            } else {
+                *omitted += 1;
+            }
+        }
+        kept
     }
 }
 

@@ -256,3 +256,69 @@ fn a_report_keeps_a_bounded_number_of_diagnostics_and_counts_the_rest() {
     assert_eq!(report.omitted_diagnostics, 200 - kept);
     assert!(!report.is_accepted(), "a truncated report still refuses");
 }
+
+#[test]
+fn schema_violations_beyond_the_kept_ones_are_counted_exactly() {
+    let (directory, relative) = scratch("many-schema-violations");
+    let mut document = scenario("tests/fixtures/p1/three-persistent-sessions.json");
+    // One violation per step: an unknown kind.
+    document["steps"] = (0..300)
+        .map(|_| json!({"kind": "ClientTeleport"}))
+        .collect::<Vec<Value>>()
+        .into();
+    write(&directory, "scenario.json", &document);
+    let report = Workspace::open(&root(), Path::new("contracts/v1"))
+        .expect("the contract directory opens")
+        .check_file(Path::new(&format!("{relative}/scenario.json")));
+    let kept = mqttiumd_lab::diagnostic::MAX_DIAGNOSTICS;
+    assert_eq!(report.diagnostics.len(), kept);
+    assert_eq!(report.omitted_diagnostics, 300 - kept);
+}
+
+#[test]
+fn registry_holes_beyond_the_kept_notes_are_counted_exactly() {
+    let (directory, relative) = scratch("many-holes");
+    let states: Vec<String> = (0..32).map(|index| format!("S{index}")).collect();
+    let catalog = json!({
+        "format": "mqttiumd.transition-catalog",
+        "schema_version": 1,
+        "id": "many",
+        "guard_dimensions": [{"name": "capacity", "values": [
+            {"value": "sufficient", "meaning": "Room is available."},
+            {"value": "insufficient", "meaning": "Room is missing."},
+        ]}],
+        "event_classes": [
+            {"name": "A", "meaning": "First event.", "guard_dimensions": []},
+            {"name": "B", "meaning": "Second event.", "guard_dimensions": []},
+            {"name": "C", "meaning": "Third event.", "guard_dimensions": ["capacity"]},
+        ],
+        "effects": ["Persist"],
+        "machines": [{"name": "many", "state_classes": states, "event_classes": ["A", "B", "C"]}],
+    });
+    write(&directory, "many.catalog.json", &catalog);
+    let registry = json!({
+        "format": "mqttiumd.transition-registry",
+        "schema_version": 1,
+        "id": "many",
+        "catalog": format!("{relative}/many.catalog.json"),
+        "status": "seed",
+        "rules": [],
+    });
+    write(&directory, "many.transitions.json", &registry);
+    let report = Workspace::open(&root(), Path::new("contracts/v1"))
+        .expect("the contract directory opens")
+        .check_file(Path::new(&format!("{relative}/many.transitions.json")));
+    assert!(report.is_accepted(), "{:?}", report.diagnostics);
+    let kept = mqttiumd_lab::diagnostic::MAX_DIAGNOSTICS;
+    // 32 states x 3 events = 96 uncovered cells, and one summary note.
+    assert_eq!(report.notes.len(), kept);
+    assert_eq!(report.omitted_notes, 96 + 1 - kept);
+    assert!(
+        report.notes[0].contains("96 uncovered cells"),
+        "{}",
+        report.notes[0]
+    );
+    let mut again = report.clone();
+    again.truncate();
+    assert_eq!(again, report, "truncation is idempotent");
+}

@@ -44,6 +44,12 @@ observed in the checkout. It does not connect the two.
 | The registry rows for a replayed PUBLISH while the outcome is unknown, after a reconnect and on a live connection | L3 | P1-02b, G0 |
 | `tests/scenarios/p1/P1-02b.json` and its run on the deterministic store | L4 | S0 |
 
+## Effect boxes (ADR 0006)
+
+| Condition | Closed by | Blocks |
+| - | - | - |
+| The component that creates owners gives each effect box a distinct identity (owner, run epoch) and refuses a second box with an identity it already issued. The contract crate cannot enforce this: it has no global state, and two boxes with one identity accept each other's reservation keys | L1 | L4 |
+
 ## Process topology (ADR 0002)
 
 | Condition | Closed by | Blocks |

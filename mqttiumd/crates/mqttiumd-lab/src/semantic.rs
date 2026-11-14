@@ -10,7 +10,7 @@ use mqttiumd_contract::decimal::{DecimalError, parse_u64};
 use serde_json::Value;
 
 use crate::diagnostic::{Diagnostic, MAX_DIAGNOSTICS, Report, code};
-use crate::manifest::{contracts_digest, sha256_hex};
+use crate::manifest::contracts_digest;
 use crate::workspace::{
     REGISTRY_CATALOG, RESULT_MANIFEST, RESULT_SCENARIO, SCENARIO_FIXTURE, Workspace,
 };
@@ -840,6 +840,8 @@ fn registry(workspace: &Workspace, document: &Value, report: &mut Report) {
                 if !complete {
                     if report.notes.len() < MAX_DIAGNOSTICS {
                         report.notes.push(format!("registry hole: {summary}"));
+                    } else {
+                        report.omitted_notes += 1;
                     }
                 } else if report.diagnostics.len() > MAX_DIAGNOSTICS {
                     report.omitted_diagnostics += 1;
@@ -883,37 +885,15 @@ fn computed_verdict(statuses: &[&str], injections_reached: bool) -> &'static str
     }
 }
 
-/// Checks that the file cited at `member` exists below the root with the
-/// declared digest and size. Returns whether it does.
-fn evidence_matches(
-    workspace: &Workspace,
-    document: &Value,
+/// The path, digest and size that `document` cites at `member`.
+fn cited<'a>(
+    document: &'a Value,
     member: &str,
     out: &mut Vec<Diagnostic>,
-) -> bool {
-    let pointer = format!("/{member}");
-    let Some(cited) = document.get(member) else {
-        return false;
-    };
-    let declared_bytes = u64_at(document, &format!("{pointer}/bytes"), out);
-    let path = text(cited, "path");
-    let bytes = match workspace.read_evidence(path) {
-        Ok(bytes) => bytes,
-        Err((code, message)) => {
-            out.push(Diagnostic::new(code, pointer, message));
-            return false;
-        }
-    };
-    let digest = sha256_hex(&bytes);
-    if digest != text(cited, "sha256") || declared_bytes != Some(bytes.len() as u64) {
-        out.push(Diagnostic::new(
-            code::EVIDENCE_MISMATCH,
-            pointer,
-            format!("{path} has {} bytes and the digest {digest}", bytes.len()),
-        ));
-        return false;
-    }
-    true
+) -> (&'a str, &'a str, Option<u64>) {
+    let bytes = u64_at(document, &format!("/{member}/bytes"), out);
+    let file = &document[member];
+    (text(file, "path"), text(file, "sha256"), bytes)
 }
 
 fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) {
@@ -976,33 +956,43 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
             ),
         ));
     }
-    evidence_matches(workspace, document, "trace", out);
-    if evidence_matches(workspace, document, "manifest", out) {
-        let path = text(&document["manifest"], "path");
-        match workspace.load_reference(&RESULT_MANIFEST, path) {
-            Err(diagnostic) => out.push(diagnostic),
-            Ok(manifest) => {
-                if text(&manifest, "contracts_digest") != text(document, "contracts_digest") {
-                    out.push(Diagnostic::new(
-                        code::EVIDENCE_MISMATCH,
-                        "/manifest",
-                        "the manifest and the result name different contracts",
-                    ));
-                }
+    // The trace may be large: it is hashed as a stream, never loaded.
+    let (path, sha256, bytes) = cited(document, "trace", out);
+    match workspace.hash_evidence(path) {
+        Err((code, message)) => out.push(Diagnostic::new(code, "/trace", message)),
+        Ok((digest, length)) => {
+            if digest != sha256 || bytes != Some(length) {
+                out.push(Diagnostic::new(
+                    code::EVIDENCE_MISMATCH,
+                    "/trace",
+                    format!("{path} has {length} bytes and the digest {digest}"),
+                ));
             }
         }
     }
-    if !evidence_matches(workspace, document, "scenario", out) {
-        return;
-    }
-    let scenario =
-        match workspace.load_reference(&RESULT_SCENARIO, text(&document["scenario"], "path")) {
-            Ok(scenario) => scenario,
-            Err(diagnostic) => {
-                out.push(diagnostic);
-                return;
+    // The manifest and the scenario are documents: each is read once, and
+    // the bytes that are hashed are the bytes that are validated.
+    let (path, sha256, bytes) = cited(document, "manifest", out);
+    match workspace.load_cited(&RESULT_MANIFEST, path, Some((sha256, bytes))) {
+        Err(diagnostic) => out.push(diagnostic),
+        Ok(manifest) => {
+            if text(&manifest, "contracts_digest") != text(document, "contracts_digest") {
+                out.push(Diagnostic::new(
+                    code::EVIDENCE_MISMATCH,
+                    "/manifest",
+                    "the manifest and the result name different contracts",
+                ));
             }
-        };
+        }
+    }
+    let (path, sha256, bytes) = cited(document, "scenario", out);
+    let scenario = match workspace.load_cited(&RESULT_SCENARIO, path, Some((sha256, bytes))) {
+        Ok(scenario) => scenario,
+        Err(diagnostic) => {
+            out.push(diagnostic);
+            return;
+        }
+    };
 
     // Every assertion of the scenario is mandatory for a run of it: none
     // may be missing, added, or declared out of scope.
@@ -1060,6 +1050,18 @@ fn run_manifest(document: &Value, out: &mut Vec<Diagnostic>) {
         "/scheduler/seed",
     ] {
         u64_at(document, pointer, out);
+    }
+    // The digest is defined over the files in path order, each once.
+    let paths: Vec<&str> = items(document, "contracts")
+        .iter()
+        .map(|file| text(file, "path"))
+        .collect();
+    if let Some(index) = paths.windows(2).position(|pair| pair[0] >= pair[1]) {
+        out.push(Diagnostic::new(
+            code::EVIDENCE_MISMATCH,
+            format!("/contracts/{}", index + 1),
+            "contract files are listed once each, in path order",
+        ));
     }
     // The digest must be the digest of the files the manifest lists.
     let listed = contracts_digest(

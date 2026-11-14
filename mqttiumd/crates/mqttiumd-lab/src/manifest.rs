@@ -21,6 +21,8 @@ use std::process::Command;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::files;
+
 /// Lower-case hexadecimal SHA-256 of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -60,31 +62,34 @@ pub struct ContractFile {
 
 /// Lists the files that define a contract revision: the JSON files of the
 /// contract directory and of its schema directory, in path order. Examples
-/// illustrate the contract and are not part of it.
-pub fn contract_files(root: &Path, contracts: &str) -> Result<Vec<ContractFile>, String> {
-    let (parent, version) = contracts
-        .rsplit_once('/')
-        .ok_or_else(|| format!("{contracts}: expected <directory>/<version>"))?;
-    let mut files = Vec::new();
-    for directory in [contracts.to_owned(), format!("{parent}/schema/{version}")] {
+/// illustrate the contract and are not part of it. Each file goes through
+/// the bounded, confined reader.
+pub fn contract_files(root: &Path, contracts: &Path) -> Result<Vec<ContractFile>, String> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("{}: {error}", root.display()))?;
+    let (contract_dir, schema_dir) = files::contract_directories(contracts)?;
+    let mut listed = Vec::new();
+    for directory in [contract_dir, schema_dir] {
         let entries =
             fs::read_dir(root.join(&directory)).map_err(|error| format!("{directory}: {error}"))?;
         for entry in entries {
             let entry = entry.map_err(|error| format!("{directory}: {error}"))?;
             let path = format!("{directory}/{}", entry.file_name().to_string_lossy());
-            if !path.ends_with(".json") || !entry.path().is_file() {
+            if !path.ends_with(".json") {
                 continue;
             }
-            let bytes = fs::read(entry.path()).map_err(|error| format!("{path}: {error}"))?;
-            files.push(ContractFile {
-                sha256: sha256_hex(&bytes),
-                bytes: bytes.len() as u64,
+            let loaded = files::read_document(&canonical_root, &entry.path())
+                .map_err(|(code, message)| format!("{code}: {message}"))?;
+            listed.push(ContractFile {
+                sha256: sha256_hex(&loaded.bytes),
+                bytes: loaded.bytes.len() as u64,
                 path,
             });
         }
     }
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(files)
+    listed.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(listed)
 }
 
 /// The identity of a contract revision by exact content: the digest of one
@@ -100,11 +105,37 @@ pub fn contracts_digest<'a>(files: impl IntoIterator<Item = (&'a str, &'a str)>)
     sha256_hex(listing.as_bytes())
 }
 
-/// Digest of what differs from the revision: the tracked differences,
-/// then one `<sha256>  <path>` line per untracked file, in path order.
+/// What one path of the work tree holds, without loading it.
+fn describe(root: &Path, path: &str) -> Result<String, String> {
+    let full = root.join(path);
+    let Ok(metadata) = fs::symlink_metadata(&full) else {
+        return Ok("deleted".to_owned());
+    };
+    if metadata.is_symlink() {
+        let target = fs::read_link(&full).map_err(|error| format!("{path}: {error}"))?;
+        return Ok(format!("link:{}", target.to_string_lossy()));
+    }
+    if !metadata.is_file() {
+        return Ok("special".to_owned());
+    }
+    fs::File::open(&full)
+        .and_then(files::hash_stream)
+        .map(|(digest, _)| digest)
+        .map_err(|error| format!("{path}: {error}"))
+}
+
+/// Digest of what differs from the revision: one `<content>  <path>` line
+/// per path that differs from it or is untracked, in path order. The
+/// content is the SHA-256 of a regular file, `link:<target>` for a symbolic
+/// link, `deleted` for a missing path. It depends on the content of the
+/// work tree only, not on how git is configured to print a difference.
 fn modifications_digest(root: &Path) -> Result<String, String> {
-    let mut content = run_bytes("git", &["diff", "HEAD", "--binary", "--", "."], root)?;
-    let listing = run_bytes(
+    let mut listing = run_bytes(
+        "git",
+        &["diff", "--name-only", "--relative", "-z", "HEAD", "--", "."],
+        root,
+    )?;
+    listing.extend(run_bytes(
         "git",
         &[
             "ls-files",
@@ -115,27 +146,30 @@ fn modifications_digest(root: &Path) -> Result<String, String> {
             ".",
         ],
         root,
-    )?;
-    let mut untracked: Vec<String> = listing
+    )?);
+    let mut paths: Vec<String> = listing
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
         .map(|path| String::from_utf8_lossy(path).into_owned())
         .collect();
-    untracked.sort();
-    for path in untracked {
-        let bytes = fs::read(root.join(&path)).map_err(|error| format!("{path}: {error}"))?;
-        content.extend_from_slice(format!("{}  {path}\n", sha256_hex(&bytes)).as_bytes());
+    paths.sort();
+    paths.dedup();
+    let mut content = String::new();
+    for path in paths {
+        content.push_str(&format!("{}  {path}\n", describe(root, &path)?));
     }
-    Ok(sha256_hex(&content))
+    Ok(sha256_hex(content.as_bytes()))
 }
 
 /// Collects the content sections of a manifest for the workspace at `root`
 /// and the contract directory `contracts`, given relative to it.
-pub fn collect(root: &Path, contracts: &str) -> Result<Value, String> {
+pub fn collect(root: &Path, contracts: &Path) -> Result<Value, String> {
     let executable =
         std::env::current_exe().map_err(|error| format!("current executable: {error}"))?;
-    let binary =
-        fs::read(&executable).map_err(|error| format!("{}: {error}", executable.display()))?;
+    let (binary_digest, binary_length) =
+        fs::File::open(&executable)
+            .and_then(files::hash_stream)
+            .map_err(|error| format!("{}: {error}", executable.display()))?;
     let revision = run("git", &["rev-parse", "HEAD"], root)?;
     let status = run("git", &["status", "--porcelain", "--", "."], root)?;
     let modified: Vec<&str> = status.lines().collect();
@@ -157,8 +191,8 @@ pub fn collect(root: &Path, contracts: &str) -> Result<Value, String> {
         "format": "mqttiumd.run-manifest",
         "schema_version": 1,
         "artifact": {
-            "sha256": sha256_hex(&binary),
-            "bytes": binary.len().to_string(),
+            "sha256": binary_digest,
+            "bytes": binary_length.to_string(),
             "built_with": {
                 "rustc": env!("MQTTIUMD_LAB_BUILD_RUSTC"),
                 "target": env!("MQTTIUMD_LAB_BUILD_TARGET"),
@@ -192,7 +226,37 @@ pub fn collect(root: &Path, contracts: &str) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{contracts_digest, sha256_hex};
+    use std::fs;
+
+    use super::{contracts_digest, describe, sha256_hex};
+
+    #[cfg(unix)]
+    #[test]
+    fn every_kind_of_path_is_described_without_being_followed_or_loaded() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("mqttiumd-describe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("directory")).expect("directory");
+        fs::write(root.join("file"), b"abc").expect("file");
+        symlink("nowhere", root.join("dangling")).expect("dangling link");
+        symlink("directory", root.join("to-directory")).expect("link to a directory");
+        let described: Vec<String> = ["file", "dangling", "to-directory", "directory", "missing"]
+            .iter()
+            .map(|path| describe(&root, path).expect("described"))
+            .collect();
+        fs::remove_dir_all(&root).expect("cleanup");
+        assert_eq!(
+            described,
+            vec![
+                sha256_hex(b"abc").as_str(),
+                "link:nowhere",
+                "link:directory",
+                "special",
+                "deleted"
+            ]
+        );
+    }
 
     #[test]
     fn the_contract_digest_depends_on_content_path_and_order() {

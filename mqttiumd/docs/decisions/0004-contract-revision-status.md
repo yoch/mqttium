@@ -44,7 +44,9 @@ Where the chapters were silent or a literal reading was unsafe:
 | Registry `status` | `seed` or `complete` | A partial registry lists its holes and cannot be mistaken for a complete one |
 | Coverage budget | At most 4 096 guard points per cell and 262 144 per registry; catalogue lists are bounded | Coverage is a product of dimensions; it is sized before it is enumerated |
 | Diagnostics | A report keeps 64 and counts the rest | A hostile document must not produce an unbounded report |
-| Documents | Regular files below the root, at most 16 MiB; links are followed only while they stay below the root | The reader's input is bounded and confined |
+| Documents | Regular files below the root, at most 16 MiB; links are followed only while they stay below the root. Schema and contract files go through the same reader | The reader's input is bounded and confined |
+| Evidence | A file cited by digest is hashed as a stream and has no size bound | A trace may be larger than any document |
+| Derived files | The register and the examples are written by `tools/build_corpus.py`, checked in CI | A hand-edited corpus drifts; a decision record pinned by digest must be easy to re-pin |
 | Assertion names | They keep the spelling of DEM-017, including `same_recipe_for_op_A` | The scenario file is the text of the specification |
 | Run result | `qualification` is `provisional` or `qualifying`; the verdict equals the one its assertions determine | A PASS must not be claimable without evidence |
 | Run manifest | `artifact` is certain, `checkout` is observed at execution | A manifest must not suggest a correspondence it has not established |

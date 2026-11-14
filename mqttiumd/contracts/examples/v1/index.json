@@ -120,6 +120,24 @@
       "why": "The document ends early."
     },
     {
+      "file": "contracts/examples/v1/invalid/scenario-nan.json",
+      "code": "json-syntax",
+      "pointer": "",
+      "why": "NaN is not JSON."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-lone-surrogate.json",
+      "code": "json-syntax",
+      "pointer": "",
+      "why": "A lone surrogate escape is not a Unicode scalar value."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-integer-beyond-64-bits.json",
+      "code": "number-not-integer",
+      "pointer": "",
+      "why": "An integer literal beyond 64 bits is refused while parsing."
+    },
+    {
       "file": "contracts/examples/v1/invalid/scenario-two-documents.json",
       "code": "json-syntax",
       "pointer": "",
@@ -454,6 +472,12 @@
       "code": "schema-violation",
       "pointer": "",
       "why": "A manifest identifies the binary that ran."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-contracts-out-of-order.json",
+      "code": "evidence-mismatch",
+      "pointer": "/contracts/1",
+      "why": "Contract files are listed once each, in path order; the digest is defined over that order."
     },
     {
       "file": "contracts/examples/v1/invalid/run-manifest-digest-of-other-contracts.json",

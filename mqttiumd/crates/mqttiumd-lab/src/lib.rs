@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod diagnostic;
+pub mod files;
 pub mod manifest;
 pub mod schemas;
 pub mod semantic;

@@ -85,20 +85,41 @@ def _not_integer(text: str) -> float:
     raise Refused("number-not-integer", text)
 
 
+def _not_json(text: str) -> float:
+    # NaN and Infinity are not JSON at all.
+    raise Refused("json-syntax", text)
+
+
+def _refuse_surrogates(value: object) -> None:
+    """Refuse a lone surrogate escape: it is not a Unicode scalar value."""
+    if isinstance(value, str):
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+            raise Refused("json-syntax", "lone surrogate escape")
+    elif isinstance(value, list):
+        for item in value:
+            _refuse_surrogates(item)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _refuse_surrogates(key)
+            _refuse_surrogates(item)
+
+
 def parse_strict(data: bytes) -> object:
     """Parse one JSON value, refusing what version 1 refuses."""
     try:
-        return json.loads(
+        value = json.loads(
             data.decode("utf-8"),
             object_pairs_hook=_no_duplicates,
             parse_int=_integer,
             parse_float=_not_integer,
-            parse_constant=_not_integer,
+            parse_constant=_not_json,
         )
     except Refused:
         raise
     except (ValueError, UnicodeDecodeError) as error:
         raise Refused("json-syntax", str(error)) from error
+    _refuse_surrogates(value)
+    return value
 
 
 def load_validators() -> dict[str, Draft202012Validator]:

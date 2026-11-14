@@ -52,6 +52,13 @@ fn show(path: &Path, report: &Report) -> bool {
     for note in &report.notes {
         eprintln!("note  {}: {note}", path.display());
     }
+    if report.omitted_notes > 0 {
+        eprintln!(
+            "note  {}: {} more notes omitted",
+            path.display(),
+            report.omitted_notes
+        );
+    }
     for diagnostic in &report.diagnostics {
         eprintln!("error {}: {diagnostic}", path.display());
     }
@@ -103,7 +110,7 @@ fn main() -> ExitCode {
                 let contracts = arguments
                     .contracts
                     .unwrap_or_else(|| PathBuf::from("contracts/v1"));
-                manifest::collect(&arguments.root, &contracts.to_string_lossy())
+                manifest::collect(&arguments.root, &contracts)
             })
             .and_then(|manifest| {
                 serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())

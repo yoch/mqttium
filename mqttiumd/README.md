@@ -18,6 +18,7 @@ claim.
 | `crates/mqttiumd-contract/` | Identities, bounded quantities, the four store outcomes, the step interface, effect ownership, frozen recipes |
 | `crates/mqttiumd-core/` | Empty skeleton that carries the purity boundary; transitions arrive with lot L1 |
 | `crates/mqttiumd-lab/` | `mqttiumd-lab validate` and `mqttiumd-lab manifest` |
+| `tools/build_corpus.py` | Rebuilds the derived contract files: the requirement register and the examples |
 | `tools/check_schemas.py` | A second, independent reader of the schemas, with pinned versions |
 | `docs/reception/open-conditions.md` | What is deliberately not done yet, and which lot closes it |
 | `contracts/schema/v1/` | JSON Schema 2020-12 files of every v1 format |
@@ -38,6 +39,7 @@ cargo run -q -p mqttiumd-lab -- manifest
 ```
 
 ```bash
+python tools/build_corpus.py --check
 python -m pip install -r tools/requirements.txt
 python tools/check_schemas.py
 ```

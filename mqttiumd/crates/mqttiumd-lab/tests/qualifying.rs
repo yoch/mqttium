@@ -28,7 +28,7 @@ fn cite(path: &str) -> Value {
 /// A complete qualifying PASS for P1-02 in a fresh directory.
 fn passing(name: &str) -> (std::path::PathBuf, String, Value) {
     let (directory, relative) = scratch(name);
-    let collected = manifest::collect(&root(), "contracts/v1").expect("manifest");
+    let collected = manifest::collect(&root(), Path::new("contracts/v1")).expect("manifest");
     write(&directory, "manifest.json", &collected);
     fs::write(directory.join("trace.jsonl"), b"{}\n").expect("trace");
     let scenario: Value =
@@ -221,5 +221,27 @@ fn the_cited_scenario_must_be_a_valid_scenario() {
     assert_eq!(
         codes_of(&directory, &relative, &result),
         vec!["reference-invalid"]
+    );
+}
+
+#[test]
+fn a_trace_larger_than_a_document_can_still_be_cited() {
+    // Evidence is hashed as a stream; only documents have a size bound.
+    let (directory, relative, mut result) = passing("qualifying-large-trace");
+    let size = usize::try_from(mqttiumd_lab::workspace::MAX_DOCUMENT_BYTES).expect("fits") + 1;
+    fs::write(directory.join("trace.jsonl"), vec![b'\n'; size]).expect("large trace");
+    result["trace"] = cite(&format!("{relative}/trace.jsonl"));
+    assert_eq!(codes_of(&directory, &relative, &result), Vec::<&str>::new());
+}
+
+#[test]
+fn a_cited_manifest_larger_than_a_document_is_refused() {
+    let (directory, relative, mut result) = passing("qualifying-large-manifest");
+    let size = usize::try_from(mqttiumd_lab::workspace::MAX_DOCUMENT_BYTES).expect("fits") + 1;
+    fs::write(directory.join("manifest.json"), vec![b' '; size]).expect("large manifest");
+    result["manifest"]["bytes"] = json!(size.to_string());
+    assert_eq!(
+        codes_of(&directory, &relative, &result),
+        vec!["file-too-large"]
     );
 }

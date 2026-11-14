@@ -16,6 +16,15 @@ cargo test --workspace --locked
 cargo run -q -p mqttiumd-lab -- validate --contracts contracts/v1 --scenario tests/scenarios/p1/P1-02.json
 ```
 
+The requirement register and the example corpus are derived files. After
+changing a decision record, a chapter digest, scenario P1-02 or the fixture,
+rebuild them; CI fails when they are not up to date:
+
+```bash
+python tools/build_corpus.py          # rewrite the derived files
+python tools/build_corpus.py --check  # what CI runs
+```
+
 A change to a schema or to the example corpus also runs the second schema
 reader, with its pinned versions:
 

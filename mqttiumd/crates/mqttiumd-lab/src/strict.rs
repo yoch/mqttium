@@ -139,5 +139,13 @@ mod tests {
         assert_eq!(code_of("\u{feff}{}"), code::JSON_SYNTAX);
         assert_eq!(code_of(r#"{"a": 01}"#), code::JSON_SYNTAX);
         assert_eq!(code_of("NaN"), code::JSON_SYNTAX);
+        assert_eq!(code_of("Infinity"), code::JSON_SYNTAX);
+        // A lone surrogate escape is not a Unicode scalar value.
+        assert_eq!(code_of(r#""\ud800""#), code::JSON_SYNTAX);
+        assert_eq!(code_of(r#"{"\udc00": 1}"#), code::JSON_SYNTAX);
+        assert!(
+            parse(r#""\ud83d\ude00""#.as_bytes()).is_ok(),
+            "a surrogate pair is one scalar"
+        );
     }
 }

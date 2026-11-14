@@ -180,7 +180,8 @@ fn the_scenario_file_is_the_text_of_the_specification() {
 
 #[test]
 fn a_collected_manifest_satisfies_its_schema() {
-    let manifest = manifest::collect(&root(), "contracts/v1").expect("the manifest is collected");
+    let manifest =
+        manifest::collect(&root(), Path::new("contracts/v1")).expect("the manifest is collected");
     let report = workspace().check_value(&manifest);
     assert!(report.is_accepted(), "{:?}", report.diagnostics);
     let contracts = manifest["contracts"].as_array().expect("contracts");
@@ -236,6 +237,17 @@ fn exit_codes_follow_the_verdict_table() {
         .concat()),
         Some(2)
     );
+    // The contract directory may be spelled with a trailing separator.
+    assert_eq!(
+        lab(&[
+            "validate",
+            "--contracts",
+            "contracts/v1/",
+            "--scenario",
+            "tests/scenarios/p1/P1-02.json"
+        ]),
+        Some(0)
+    );
     assert_eq!(lab(&["validate"]), Some(2));
     assert_eq!(lab(&["validate", "--contracts", "contracts/v9"]), Some(2));
     assert_eq!(lab(&[]), Some(2));
@@ -243,4 +255,19 @@ fn exit_codes_follow_the_verdict_table() {
     for command in ["run", "replay", "minimize"] {
         assert_eq!(lab(&[command]), Some(2), "{command}");
     }
+}
+
+#[test]
+fn the_contract_digest_does_not_depend_on_how_the_directory_is_spelled() {
+    let digest = |spelling: &str| {
+        Workspace::open(&root(), Path::new(spelling))
+            .expect("the contract directory opens")
+            .contracts_digest()
+            .to_owned()
+    };
+    let reference = digest("contracts/v1");
+    assert_eq!(reference.len(), 64);
+    assert_eq!(digest("contracts/v1/"), reference);
+    assert_eq!(digest("./contracts/v1"), reference);
+    assert!(Workspace::open(&root(), Path::new("contracts/../contracts/v1")).is_err());
 }
