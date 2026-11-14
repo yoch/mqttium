@@ -5,8 +5,10 @@
 and are never edited: a decision that departs from them is recorded in
 `../decisions/` and the chapters stay as evidence of what was specified.
 `fr/SHA256SUMS` records their digests; `contracts/v1/requirements.json`
-repeats them and lists every identifier they define. A test fails when a
-chapter, a digest or the register drift apart.
+repeats them and lists every identifier they define. An identifier that an
+accepted decision record introduces, such as `P1-02b`, is listed there with
+that record as its source; it is never written into a chapter. A test fails
+when a chapter, a decision record, a digest or the register drift apart.
 
 | File | Chapter | Identifiers |
 | - | - | - |
@@ -22,7 +24,7 @@ a requirement, and every requirement lives in exactly one file above.
 ## Precedence
 
 The chapters refine each other and sometimes differ. ADR 0005 fixes the
-rule and lists the known differences:
+rule and resolves each known difference explicitly:
 
 - For what the product guarantees, chapter 1 wins.
 - For how it is realised and validated, the later chapter wins: 4, then 3,

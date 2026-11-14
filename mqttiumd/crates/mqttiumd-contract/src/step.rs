@@ -15,7 +15,7 @@
 
 use crate::capacity::{CapacityNeed, WorkUnits};
 use crate::effects::Input;
-use crate::ids::OperationId;
+use crate::ids::{LogicalOwnerId, OperationId, Revision};
 
 /// An input owned by the caller of a step.
 pub type OwnedInput = Input;
@@ -25,6 +25,26 @@ pub type OwnedInput = Input;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TurnGrant {
     pub work_limit: WorkUnits,
+}
+
+/// What a plan was computed against: the owner and the revision of its
+/// state. A plan is consumed by its application, which refuses it when the
+/// state moved in between (ADR 0006).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlanStamp {
+    pub owner: LogicalOwnerId,
+    pub state_revision: Revision,
+}
+
+impl PlanStamp {
+    /// Checks that the plan still applies to this owner at this revision.
+    pub fn check(self, owner: LogicalOwnerId, state_revision: Revision) -> Result<(), CoreFault> {
+        if self.owner == owner && self.state_revision == state_revision {
+            Ok(())
+        } else {
+            Err(CoreFault::StalePlan)
+        }
+    }
 }
 
 /// How far an applied input went.
@@ -48,6 +68,9 @@ pub enum CoreFault {
     RecipeMismatch { operation: OperationId },
     /// A transition published more effects than it reserved.
     ReservationOverrun,
+    /// A plan was applied to another owner, or after the state it was
+    /// computed against had changed.
+    StalePlan,
     /// An input that the adapters can never produce in this state.
     ImpossibleInput,
 }
@@ -76,6 +99,28 @@ mod tests {
     use super::*;
     use crate::capacity::{Resource, WakeCondition};
     use crate::ids::SessionId;
+
+    #[test]
+    fn a_plan_applies_only_to_the_state_it_was_computed_against() {
+        let stamp = PlanStamp {
+            owner: LogicalOwnerId::new(1),
+            state_revision: Revision::new(7),
+        };
+        assert_eq!(
+            stamp.check(LogicalOwnerId::new(1), Revision::new(7)),
+            Ok(())
+        );
+        assert_eq!(
+            stamp.check(LogicalOwnerId::new(1), Revision::new(8)),
+            Err(CoreFault::StalePlan),
+            "the state moved between plan and application"
+        );
+        assert_eq!(
+            stamp.check(LogicalOwnerId::new(2), Revision::new(7)),
+            Err(CoreFault::StalePlan),
+            "another owner"
+        );
+    }
 
     #[test]
     fn need_capacity_hands_the_same_input_back() {

@@ -1,6 +1,7 @@
 # 0007 — How the purity of the core is enforced
 
-Status: **Proposed**. Completes DEM-003. Lot L0 is built on it.
+Status: **Accepted with amendments** (14 November 2026, review of PR yoch/mqttium#647).
+Applied in lot L0. Completes DEM-003.
 
 ## Context
 
@@ -14,23 +15,40 @@ DEM-013 excludes from replay.
 ## Decision
 
 `mqttiumd-contract` and `mqttiumd-core` are `no_std + alloc` from the first
-commit, and:
+commit. Four layers enforce the boundary; each covers what the others do
+not.
 
-- have no external dependency; the core depends on the contract only;
-- forbid `unsafe`;
-- use no conditional compilation other than `cfg(test)` and `cfg(kani)`;
-- contain no `async` and no `.await`;
-- encode and decode by hand: canonical bytes for recipes, eight big-endian
-  bytes for identities. No serialization framework enters these crates.
+| Layer | Enforced by | Guarantees |
+| - | - | - |
+| `#![no_std]` outside tests | The compiler | No file, socket, clock, thread or randomly seeded `HashMap` |
+| `#![forbid(unsafe_code)]` | The compiler | No `unsafe` in these crates |
+| Dependencies | `cargo metadata`, in `tests/boundary.rs` | Only the listed dependencies; no build script; no feature |
+| Token rules | The lexed sources, in `tests/boundary.rs` | No `unsafe`, `async`, `await`; no `extern` but `extern crate alloc;`; conditional compilation only as the `no_std` crate attribute and as `cfg(test)` or `cfg(kani)` on a module; no `include!`, `env!` or `#[path]` |
 
-`crates/mqttiumd-lab/tests/boundary.rs` checks the dependency lists with
-`cargo metadata` and the source rules by scanning, and proves that the scan
-rejects what it must.
+The token rules apply to Rust tokens, so comments, strings and spacing do
+not matter, and `cfg!(…)` is seen. They are deliberately coarse: an
+identifier that merely starts with `cfg` is refused.
+
+Encoding is written by hand in these crates: canonical bytes for recipes,
+eight big-endian bytes for identities. No serialization framework enters
+them.
+
+### What no layer covers
+
+- `--cfg` flags passed from outside the sources. `cfg(kani)` is allowed on
+  a module, so a build with `--cfg kani` compiles proof modules; the run
+  manifest records the flags the binary was built with.
+- Global state in a `static`. Nothing in these crates uses one today; a
+  review must refuse it.
+
+### Proof dependencies
+
+A dependency needed by a proof tool may be admitted by an explicit decision
+record that names it and its scope. It is then added to the allow-list of
+`tests/boundary.rs`. DEM-021 allows discarding an unsuitable tool with
+justification; Kani needs only `cfg(kani)`.
 
 ## Consequences
 
 Files, sockets, clocks, threads and `HashMap` are unavailable by
-construction rather than by lint. JSON lives in `mqttiumd-lab`. A Verus
-trial that needs a library dependency in the core conflicts with this
-record and must say so; DEM-021 already allows discarding an unsuitable
-tool with justification, and Kani needs only `cfg(kani)`.
+construction rather than by lint. JSON lives in `mqttiumd-lab`.

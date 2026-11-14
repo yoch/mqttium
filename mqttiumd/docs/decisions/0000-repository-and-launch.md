@@ -1,6 +1,7 @@
 # 0000 — Repository, layout, language and scope of the launch
 
 Status: **Accepted** (14 November 2026, with the integration owner).
+Applied in lot L0.
 
 ## Context
 

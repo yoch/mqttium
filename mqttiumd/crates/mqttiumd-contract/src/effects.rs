@@ -17,8 +17,8 @@ use crate::capacity::{
 use crate::command::Command;
 use crate::ids::{
     ConnectionGeneration, ConnectionKey, ContinuationId, DeadlineToken, EffectId, ExchangeId,
-    InboundPacketId, LogicalOwnerId, LogicalTime, OperationId, PublicationId, Revision, RunEpoch,
-    SessionId, StoreIncarnation,
+    InboundPacketId, LogicalDuration, LogicalOwnerId, LogicalTime, OperationId, PublicationId,
+    Revision, RunEpoch, SessionId, StoreIncarnation,
 };
 use crate::outcome::{Knowledge, StoreReply};
 use crate::packet::{InboundPacket, OutboundFrame, SharedBytes};
@@ -144,10 +144,13 @@ pub enum Effect {
         connection: ConnectionGeneration,
         reason: CloseReason,
     },
-    /// Arm a deadline token.
+    /// Arm a deadline token. The delay is counted by the timer adapter from
+    /// its acceptance of this effect. Published after the `Persist` it
+    /// watches, it is dispatched only once that `Persist` was accepted, so
+    /// the delay never starts before the operation was submitted (ADR 0001).
     ArmDeadline {
         token: DeadlineToken,
-        at: LogicalTime,
+        after: LogicalDuration,
     },
     /// Run again a piece of work that is already counted.
     Continue { continuation: ContinuationId },
@@ -837,6 +840,65 @@ mod tests {
         assert_ne!(next.slot, 0, "the spent entry was reused");
         assert_eq!(outbox.release(last), Err(ReservationError::Stale));
         assert_invariant(&outbox);
+    }
+
+    #[test]
+    fn a_deadline_is_dispatched_only_after_the_persist_it_watches() {
+        use crate::ids::{DeadlineToken, OperationId, OperationSeq, StoreIncarnation};
+
+        // Refuses store effects and accepts everything else.
+        struct StoreBusy(Vec<OwnedEffect>);
+        impl EffectSink for StoreBusy {
+            fn try_submit(&mut self, effect: OwnedEffect) -> SubmitResult {
+                if matches!(effect.effect(), Effect::ResolveAndFence { .. }) {
+                    return SubmitResult::NotSubmitted {
+                        effect,
+                        reason: SubmitBlock::InFlightLimit,
+                    };
+                }
+                self.0.push(effect);
+                SubmitResult::Accepted
+            }
+        }
+        let id = |sequence| EffectId {
+            epoch: RunEpoch::new(1),
+            owner: LogicalOwnerId::new(0),
+            sequence: EffectSeq::new(sequence),
+        };
+        let operation = OperationId::new(
+            StoreIncarnation::new(1),
+            RunEpoch::new(1),
+            LogicalOwnerId::new(0),
+            OperationSeq::new(1),
+        );
+        let mut outbox = outbox_of(0, 2);
+        let key = outbox.reserve(slots(2)).expect("room");
+        // A store effect first, then the deadline that watches it.
+        let store = OwnedEffect::new(id(0), Effect::ResolveAndFence { operation });
+        let deadline = OwnedEffect::new(
+            id(1),
+            Effect::ArmDeadline {
+                token: DeadlineToken::new(1),
+                after: LogicalDuration::new(5),
+            },
+        );
+        outbox.publish(key, store).expect("reserved");
+        outbox.publish(key, deadline).expect("reserved");
+
+        let mut sink = StoreBusy(Vec::new());
+        let report = outbox.dispatch(&mut sink);
+        assert_eq!(
+            report,
+            DispatchReport {
+                accepted: 0,
+                blocked: Some(SubmitBlock::InFlightLimit)
+            }
+        );
+        assert!(
+            sink.0.is_empty(),
+            "the deadline overtook the effect it watches"
+        );
+        assert_eq!(sequences(&outbox), vec![0, 1]);
     }
 
     #[test]

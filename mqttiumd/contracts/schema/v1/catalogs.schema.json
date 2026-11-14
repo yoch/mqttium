@@ -236,7 +236,8 @@
         "required": [
           "format",
           "schema_version",
-          "sources",
+          "chapters",
+          "decisions",
           "entries"
         ],
         "properties": {
@@ -246,7 +247,7 @@
           "schema_version": {
             "const": 1
           },
-          "sources": {
+          "chapters": {
             "type": "array",
             "items": {
               "type": "object",
@@ -272,6 +273,30 @@
             },
             "minItems": 1
           },
+          "decisions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "decision",
+                "path",
+                "sha256"
+              ],
+              "properties": {
+                "decision": {
+                  "$ref": "primitives.schema.json#/$defs/decision_id"
+                },
+                "path": {
+                  "$ref": "primitives.schema.json#/$defs/relative_path"
+                },
+                "sha256": {
+                  "$ref": "primitives.schema.json#/$defs/sha256"
+                }
+              }
+            },
+            "description": "Accepted decision records. An identifier may come from one of them instead of a chapter; the archived chapters are never edited."
+          },
           "entries": {
             "type": "array",
             "items": {
@@ -280,7 +305,7 @@
               "required": [
                 "id",
                 "kind",
-                "chapter"
+                "source"
               ],
               "properties": {
                 "id": {
@@ -298,10 +323,35 @@
                     "tranche"
                   ]
                 },
-                "chapter": {
-                  "type": "integer",
-                  "minimum": 1,
-                  "maximum": 4
+                "source": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "chapter"
+                      ],
+                      "properties": {
+                        "chapter": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 4
+                        }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "decision"
+                      ],
+                      "properties": {
+                        "decision": {
+                          "$ref": "primitives.schema.json#/$defs/decision_id"
+                        }
+                      }
+                    }
+                  ]
                 }
               }
             },

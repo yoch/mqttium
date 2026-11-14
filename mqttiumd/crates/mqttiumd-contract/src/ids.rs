@@ -157,6 +157,11 @@ scalar_id!(
     /// Explicit time supplied to the core as data.
     LogicalTime
 );
+scalar_id!(
+    /// A delay in the unit of `LogicalTime`, counted by the timer adapter
+    /// from the moment it accepts the deadline.
+    LogicalDuration
+);
 
 macro_rules! scoped_id {
     ($(#[$meta:meta])* $name:ident, $sequence:ident) => {

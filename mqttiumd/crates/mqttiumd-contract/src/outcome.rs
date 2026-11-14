@@ -91,6 +91,17 @@ impl Knowledge {
         matches!(self, Self::Committed(_) | Self::RejectedCertain(_))
     }
 
+    /// Whether this identity may no longer be executed.
+    ///
+    /// Only `Unknown` leaves execution possible. `Retired` and
+    /// `RejectedCertain` both forbid it, and a committed operation is never
+    /// executed a second time. `Retired` forbids execution without saying
+    /// what the operation once did: it is not a rejection.
+    #[must_use]
+    pub const fn forbids_execution(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+
     /// Merges a newly delivered outcome into what is already known.
     ///
     /// A late `PendingOrUnknown` never replaces a terminal result, an answer
@@ -209,6 +220,24 @@ mod tests {
             Ok(Knowledge::Retired)
         );
         assert!(!Knowledge::Retired.is_terminal());
+    }
+
+    #[test]
+    fn every_knowledge_but_unknown_forbids_execution() {
+        assert!(!Knowledge::Unknown.forbids_execution());
+        assert!(Knowledge::Retired.forbids_execution());
+        assert!(Knowledge::RejectedCertain(RejectReason::Fenced).forbids_execution());
+        assert!(Knowledge::Committed(facts(1)).forbids_execution());
+        // Retired forbids execution and still is not a terminal result.
+        assert!(!Knowledge::Retired.is_terminal());
+        // Once execution is forbidden, no later outcome allows it again.
+        for knowledge in all_knowledge() {
+            for outcome in all_outcomes() {
+                if let Ok(next) = knowledge.observe(outcome) {
+                    assert!(!knowledge.forbids_execution() || next.forbids_execution());
+                }
+            }
+        }
     }
 
     #[test]

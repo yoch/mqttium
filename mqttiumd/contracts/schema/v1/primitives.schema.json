@@ -78,6 +78,12 @@
         "pattern": "[\\n\\r]"
       }
     },
+    "decision_id": {
+      "type": "string",
+      "pattern": "^[0-9]{4}$",
+      "minLength": 4,
+      "maxLength": 4
+    },
     "hex_bytes": {
       "description": "Exact bytes, two lower-case hexadecimal digits each.",
       "type": "string",
