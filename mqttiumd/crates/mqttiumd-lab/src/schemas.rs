@@ -11,7 +11,7 @@ use std::path::Path;
 use jsonschema::{Registry, Validator};
 use serde_json::Value;
 
-use crate::diagnostic::{Diagnostic, code};
+use crate::diagnostic::{Diagnostic, MAX_DIAGNOSTICS, code};
 use crate::strict;
 
 /// The dialect every schema file declares.
@@ -181,8 +181,10 @@ impl Schemas {
         let Some(validator) = self.validators.get(*file) else {
             return vec![not_local(file, "schema file is not loaded")];
         };
+        // One more than a report keeps, so that truncation is still counted.
         validator
             .iter_errors(document)
+            .take(MAX_DIAGNOSTICS + 1)
             .map(|error| {
                 Diagnostic::new(
                     code::SCHEMA_VIOLATION,

@@ -144,9 +144,16 @@ fn the_corpus_exercises_every_code_it_can() {
         .iter()
         .map(|case| case["code"].as_str().expect("code"))
         .collect();
-    // Unit-tested where they are raised: a schema file that is not local,
-    // and a decimal string that a lax schema validator would let through.
-    let elsewhere = [code::SCHEMA_NOT_LOCAL, code::U64_NOT_CANONICAL];
+    // Tested where they are raised, because no static example can carry
+    // them: a schema file that is not local, a decimal string that a lax
+    // schema validator would let through, a reference cycle that the
+    // acyclic format table already excludes, and a 16 MiB document.
+    let elsewhere = [
+        code::SCHEMA_NOT_LOCAL,
+        code::U64_NOT_CANONICAL,
+        code::REFERENCE_CYCLE,
+        code::FILE_TOO_LARGE,
+    ];
     for known in code::ALL {
         assert!(
             exercised.contains(known) || elsewhere.contains(&known),

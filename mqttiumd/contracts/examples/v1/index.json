@@ -17,7 +17,8 @@
     "contracts/examples/v1/valid/run-manifest-content-only.json",
     "contracts/examples/v1/valid/toy.catalog.json",
     "contracts/examples/v1/valid/toy.transitions.complete.json",
-    "contracts/examples/v1/valid/toy.transitions.seed-with-hole.json"
+    "contracts/examples/v1/valid/toy.transitions.seed-with-hole.json",
+    "contracts/examples/v1/valid/wide.catalog.json"
   ],
   "invalid": [
     {
@@ -457,6 +458,12 @@
       "code": "file-unreadable",
       "pointer": "/catalog",
       "why": "The catalogue file does not exist."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/wide.transitions.json",
+      "code": "coverage-budget-exceeded",
+      "pointer": "/catalog",
+      "why": "65 536 guard points in one cell exceed the coverage budget; they are counted, never built."
     }
   ]
 }

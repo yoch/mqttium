@@ -55,6 +55,13 @@ fn show(path: &Path, report: &Report) -> bool {
     for diagnostic in &report.diagnostics {
         eprintln!("error {}: {diagnostic}", path.display());
     }
+    if report.omitted_diagnostics > 0 {
+        eprintln!(
+            "error {}: {} more diagnostics omitted",
+            path.display(),
+            report.omitted_diagnostics
+        );
+    }
     report.is_accepted()
 }
 

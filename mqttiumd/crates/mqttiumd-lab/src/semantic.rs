@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use mqttiumd_contract::decimal::{DecimalError, parse_u64};
 use serde_json::Value;
 
-use crate::diagnostic::{Diagnostic, Report, code};
-use crate::workspace::Workspace;
+use crate::diagnostic::{Diagnostic, MAX_DIAGNOSTICS, Report, code};
+use crate::workspace::{REGISTRY_CATALOG, SCENARIO_FIXTURE, Workspace};
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
@@ -168,22 +168,19 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
         ));
     }
 
-    let clients: Option<BTreeSet<String>> = match workspace.load_reference(
-        text(document, "initial_fixture"),
-        "/initial_fixture",
-        "mqttiumd.fixture",
-    ) {
-        Ok(fixture) => Some(
-            items(&fixture, "sessions")
-                .iter()
-                .map(|session| text(session, "client").to_owned())
-                .collect(),
-        ),
-        Err(diagnostic) => {
-            out.push(diagnostic);
-            None
-        }
-    };
+    let clients: Option<BTreeSet<String>> =
+        match workspace.load_reference(&SCENARIO_FIXTURE, text(document, "initial_fixture")) {
+            Ok(fixture) => Some(
+                items(&fixture, "sessions")
+                    .iter()
+                    .map(|session| text(session, "client").to_owned())
+                    .collect(),
+            ),
+            Err(diagnostic) => {
+                out.push(diagnostic);
+                None
+            }
+        };
 
     let faults = items(document, "faults");
     let steps = items(document, "steps");
@@ -492,59 +489,138 @@ impl<'a> Vocabulary<'a> {
         }
     }
 
-    /// Every point of the guard domain of `event`: one value per dimension.
-    fn guard_points(&self, event: &str) -> Vec<Vec<(&'a str, &'a str)>> {
-        let mut points = vec![Vec::new()];
-        for dimension in self.events.get(event).map_or(&[][..], Vec::as_slice) {
-            let values = self
-                .dimensions
-                .get(dimension)
-                .map_or(&[][..], Vec::as_slice);
-            points = points
-                .into_iter()
-                .flat_map(|point| {
-                    values.iter().map(move |value| {
-                        let mut extended = point.clone();
-                        extended.push((*dimension, *value));
-                        extended
-                    })
-                })
-                .collect();
-        }
-        points
+    /// The guard dimensions of `event`, each with its values, in the order
+    /// the catalogue lists them.
+    fn guard_domain(&self, event: &str) -> Vec<(&'a str, &[&'a str])> {
+        self.events
+            .get(event)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .map(|dimension| {
+                let values = self
+                    .dimensions
+                    .get(dimension)
+                    .map_or(&[][..], Vec::as_slice);
+                (*dimension, values)
+            })
+            .collect()
     }
 }
 
 /// Guard points listed per uncovered cell; the count is always exact.
 const MAX_HOLES_SHOWN: usize = 3;
 
-/// Whether `rule` covers `point`. A dimension the rule does not name is
-/// covered entirely.
-fn rule_covers(rule: &Value, point: &[(&str, &str)]) -> bool {
-    point.iter().all(|(dimension, value)| {
-        match rule.pointer(&format!("/guard_partition/{dimension}")) {
-            None => true,
-            Some(values) => values
-                .as_array()
-                .is_some_and(|values| values.iter().any(|item| item.as_str() == Some(*value))),
-        }
+/// The most guard points one cell of a registry may have.
+pub const MAX_POINTS_PER_CELL: u64 = 4096;
+
+/// The most guard points a whole registry may have, over all its cells.
+pub const MAX_POINTS_PER_REGISTRY: u64 = 262_144;
+
+/// The number of points of a guard domain whose dimensions have `sizes`
+/// values, or `None` when it does not fit 64 bits. Nothing is allocated.
+fn domain_size(sizes: impl IntoIterator<Item = usize>) -> Option<u64> {
+    sizes.into_iter().try_fold(1u64, |points, size| {
+        points.checked_mul(u64::try_from(size).ok()?)
     })
 }
 
-fn describe(point: &[(&str, &str)]) -> String {
-    let parts: Vec<String> = point
+/// Why a registry is too wide for its coverage to be checked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BudgetRefusal {
+    /// One cell has this many points, or more than 64 bits can count.
+    Cell(Option<u64>),
+    /// The cells together have this many points, or more than 64 bits can
+    /// count.
+    Registry(Option<u64>),
+}
+
+/// Checks the sizes of all cells against both budgets before any point is
+/// enumerated, and returns the total number of points.
+fn check_budget(
+    cells: impl IntoIterator<Item = Option<u64>>,
+    per_cell: u64,
+    per_registry: u64,
+) -> Result<u64, BudgetRefusal> {
+    let mut total = 0u64;
+    for size in cells {
+        let size = size
+            .filter(|size| *size <= per_cell)
+            .ok_or(BudgetRefusal::Cell(size))?;
+        total = total
+            .checked_add(size)
+            .ok_or(BudgetRefusal::Registry(None))?;
+        if total > per_registry {
+            return Err(BudgetRefusal::Registry(Some(total)));
+        }
+    }
+    Ok(total)
+}
+
+/// Visits every point of a guard domain, one index per dimension, without
+/// materialising the domain. The last dimension varies fastest.
+fn for_each_point(radices: &[usize], mut visit: impl FnMut(&[usize])) {
+    if radices.contains(&0) {
+        return;
+    }
+    let mut indices = vec![0usize; radices.len()];
+    loop {
+        visit(&indices);
+        let mut position = radices.len();
+        loop {
+            if position == 0 {
+                return;
+            }
+            position -= 1;
+            indices[position] += 1;
+            if indices[position] < radices[position] {
+                break;
+            }
+            indices[position] = 0;
+        }
+    }
+}
+
+/// For each dimension of a guard domain, the value indices `rule` covers;
+/// `None` for a dimension the rule does not name, which it covers entirely.
+fn rule_coverage(rule: &Value, domain: &[(&str, &[&str])]) -> Vec<Option<Vec<usize>>> {
+    domain
         .iter()
-        .map(|(dimension, value)| format!("{dimension}={value}"))
+        .map(|(dimension, values)| {
+            let named = rule
+                .get("guard_partition")
+                .and_then(|partition| partition.get(*dimension))?
+                .as_array()?;
+            Some(
+                values
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, value)| named.iter().any(|item| item.as_str() == Some(**value)))
+                    .map(|(index, _)| index)
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn covers(coverage: &[Option<Vec<usize>>], point: &[usize]) -> bool {
+    coverage.iter().zip(point).all(|(allowed, index)| {
+        allowed
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(index))
+    })
+}
+
+fn describe(domain: &[(&str, &[&str])], point: &[usize]) -> String {
+    let parts: Vec<String> = domain
+        .iter()
+        .zip(point)
+        .map(|((dimension, values), index)| format!("{dimension}={}", values[*index]))
         .collect();
     format!("{{{}}}", parts.join(", "))
 }
 
 fn registry(workspace: &Workspace, document: &Value, report: &mut Report) {
-    let catalog = match workspace.load_reference(
-        text(document, "catalog"),
-        "/catalog",
-        "mqttiumd.transition-catalog",
-    ) {
+    let catalog = match workspace.load_reference(&REGISTRY_CATALOG, text(document, "catalog")) {
         Ok(catalog) => catalog,
         Err(diagnostic) => {
             report.diagnostics.push(diagnostic);
@@ -647,74 +723,138 @@ fn registry(workspace: &Workspace, document: &Value, report: &mut Report) {
         }
     }
 
+    // Budget first: the size of every cell is computed with checked
+    // arithmetic and compared to both budgets before any point exists.
+    let sizes: BTreeMap<&str, Option<u64>> = vocabulary
+        .events
+        .keys()
+        .map(|event| {
+            let domain = vocabulary.guard_domain(event);
+            (
+                *event,
+                domain_size(domain.iter().map(|(_, values)| values.len())),
+            )
+        })
+        .collect();
+    let cells = vocabulary.machines.values().flat_map(|(states, events)| {
+        states.iter().flat_map(|_| {
+            events
+                .iter()
+                .map(|event| sizes.get(event).copied().unwrap_or(Some(1)))
+        })
+    });
+    if let Err(refusal) = check_budget(cells, MAX_POINTS_PER_CELL, MAX_POINTS_PER_REGISTRY) {
+        let count = |points: Option<u64>| {
+            points.map_or("more than 2^64".to_owned(), |points| points.to_string())
+        };
+        let message = match refusal {
+            BudgetRefusal::Cell(points) => format!(
+                "a cell has {} guard points; the budget is {MAX_POINTS_PER_CELL}",
+                count(points)
+            ),
+            BudgetRefusal::Registry(points) => format!(
+                "the registry has {} guard points; the budget is {MAX_POINTS_PER_REGISTRY}",
+                count(points)
+            ),
+        };
+        report.diagnostics.push(Diagnostic::new(
+            code::COVERAGE_BUDGET_EXCEEDED,
+            "/catalog",
+            message,
+        ));
+        return;
+    }
+
     // Coverage: each point of each cell is covered by exactly one rule.
+    // Diagnostics and notes beyond what a report keeps are counted, not
+    // built.
     let complete = text(document, "status") == "complete";
     let mut uncovered_cells = 0usize;
     for (machine, (states, events)) in &vocabulary.machines {
         for state in states {
             for event in events {
-                let cell: Vec<&(usize, &Value)> = well_formed
+                let domain = vocabulary.guard_domain(event);
+                let radices: Vec<usize> = domain.iter().map(|(_, values)| values.len()).collect();
+                let cell: Vec<(usize, &Value, Vec<Option<Vec<usize>>>)> = well_formed
                     .iter()
                     .filter(|(_, rule)| {
                         text(rule, "machine") == *machine
                             && text(rule, "state_class") == *state
                             && text(rule, "event_class") == *event
                     })
+                    .map(|(index, rule)| (*index, *rule, rule_coverage(rule, &domain)))
                     .collect();
-                let points = vocabulary.guard_points(event);
-                let mut holes = Vec::new();
-                for point in &points {
-                    let covering: Vec<&&(usize, &Value)> = cell
+                let mut points = 0usize;
+                let mut holes = 0usize;
+                let mut shown = Vec::new();
+                for_each_point(&radices, |point| {
+                    points += 1;
+                    let mut covering = cell
                         .iter()
-                        .filter(|(_, rule)| rule_covers(rule, point))
-                        .collect();
-                    match covering.as_slice() {
-                        [] => holes.push(describe(point)),
-                        [_] => {}
-                        [first, second, ..] => report.diagnostics.push(Diagnostic::new(
-                            code::REGISTRY_OVERLAP,
-                            format!("/rules/{}", second.0),
-                            format!(
-                                "{:?} and {:?} both cover {machine} {state} x {event} {}",
-                                text(first.1, "id"),
-                                text(second.1, "id"),
-                                describe(point)
-                            ),
-                        )),
+                        .filter(|(_, _, coverage)| covers(coverage, point));
+                    match (covering.next(), covering.next()) {
+                        (None, _) => {
+                            holes += 1;
+                            if shown.len() < MAX_HOLES_SHOWN {
+                                shown.push(describe(&domain, point));
+                            }
+                        }
+                        (Some(_), None) => {}
+                        (Some(first), Some(second)) => {
+                            if report.diagnostics.len() > MAX_DIAGNOSTICS {
+                                report.omitted_diagnostics += 1;
+                            } else {
+                                report.diagnostics.push(Diagnostic::new(
+                                    code::REGISTRY_OVERLAP,
+                                    format!("/rules/{}", second.0),
+                                    format!(
+                                        "{:?} and {:?} both cover {machine} {state} x {event} {}",
+                                        text(first.1, "id"),
+                                        text(second.1, "id"),
+                                        describe(&domain, point)
+                                    ),
+                                ));
+                            }
+                        }
                     }
-                }
-                if holes.is_empty() {
+                });
+                if holes == 0 {
                     continue;
                 }
                 uncovered_cells += 1;
-                let shown = holes.len().min(MAX_HOLES_SHOWN);
-                let more = match holes.len() - shown {
+                let more = match holes - shown.len() {
                     0 => String::new(),
                     hidden => format!(" and {hidden} more"),
                 };
                 let summary = format!(
-                    "{machine} {state} x {event}: {} of {} guard points uncovered: {}{more}",
-                    holes.len(),
-                    points.len(),
-                    holes[..shown].join(" ")
+                    "{machine} {state} x {event}: {holes} of {points} guard points uncovered: {}{more}",
+                    shown.join(" ")
                 );
-                if complete {
+                if !complete {
+                    if report.notes.len() < MAX_DIAGNOSTICS {
+                        report.notes.push(format!("registry hole: {summary}"));
+                    }
+                } else if report.diagnostics.len() > MAX_DIAGNOSTICS {
+                    report.omitted_diagnostics += 1;
+                } else {
                     report.diagnostics.push(Diagnostic::new(
                         code::REGISTRY_HOLE,
                         "/rules",
                         summary,
                     ));
-                } else {
-                    report.notes.push(format!("registry hole: {summary}"));
                 }
             }
         }
     }
     if !complete {
-        report.notes.push(format!(
-            "registry {:?} is a seed with {uncovered_cells} uncovered cells; it cannot support a PASS",
-            text(document, "id")
-        ));
+        // First, so that truncation never drops it.
+        report.notes.insert(
+            0,
+            format!(
+                "registry {:?} is a seed with {uncovered_cells} uncovered cells; it cannot support a PASS",
+                text(document, "id")
+            ),
+        );
     }
 }
 
@@ -844,5 +984,78 @@ fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnosti
             Value::Object(_) => decimal_strings(Some(member), &child, out),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_size_of_a_guard_domain_is_computed_without_building_it() {
+        assert_eq!(domain_size([]), Some(1));
+        assert_eq!(domain_size([2, 4, 2]), Some(16));
+        assert_eq!(domain_size([2; 32]), Some(1 << 32));
+        assert_eq!(domain_size([2; 63]), Some(1 << 63));
+        assert_eq!(domain_size([2; 64]), None, "2^64 does not fit");
+        assert_eq!(domain_size([usize::MAX, usize::MAX]), None);
+        assert_eq!(domain_size([5, 0, 7]), Some(0));
+    }
+
+    #[test]
+    fn a_cell_is_accepted_at_the_budget_and_refused_one_point_above() {
+        assert_eq!(check_budget([Some(8)], 8, 100), Ok(8));
+        assert_eq!(
+            check_budget([Some(9)], 8, 100),
+            Err(BudgetRefusal::Cell(Some(9)))
+        );
+        assert_eq!(check_budget([None], 8, 100), Err(BudgetRefusal::Cell(None)));
+        assert_eq!(check_budget([], 8, 100), Ok(0));
+    }
+
+    #[test]
+    fn a_registry_is_accepted_at_the_budget_and_refused_one_point_above() {
+        assert_eq!(check_budget([Some(8); 3], 8, 24), Ok(24));
+        assert_eq!(
+            check_budget([Some(8), Some(8), Some(8), Some(1)], 8, 24),
+            Err(BudgetRefusal::Registry(Some(25)))
+        );
+        assert_eq!(
+            check_budget([Some(u64::MAX), Some(1)], u64::MAX, u64::MAX),
+            Err(BudgetRefusal::Registry(None))
+        );
+    }
+
+    #[test]
+    fn thirty_two_binary_guards_are_refused_before_any_point_exists() {
+        // 2^32 points per cell: enumerating them would never finish here.
+        let size = domain_size([2; 32]);
+        assert_eq!(
+            check_budget([size], MAX_POINTS_PER_CELL, MAX_POINTS_PER_REGISTRY),
+            Err(BudgetRefusal::Cell(Some(1 << 32)))
+        );
+    }
+
+    #[test]
+    fn every_point_is_visited_once_in_a_fixed_order() {
+        let mut seen = Vec::new();
+        for_each_point(&[2, 3], |point| seen.push(point.to_vec()));
+        assert_eq!(
+            seen,
+            vec![
+                vec![0, 0],
+                vec![0, 1],
+                vec![0, 2],
+                vec![1, 0],
+                vec![1, 1],
+                vec![1, 2]
+            ]
+        );
+        let mut empty_domain = 0;
+        for_each_point(&[], |_| empty_domain += 1);
+        assert_eq!(empty_domain, 1, "a domain without dimension has one point");
+        let mut no_value = 0;
+        for_each_point(&[3, 0], |_| no_value += 1);
+        assert_eq!(no_value, 0);
     }
 }

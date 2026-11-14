@@ -33,6 +33,11 @@ pub mod code {
     pub const FILE_UNREADABLE: &str = "file-unreadable";
     /// A referenced file is itself invalid.
     pub const REFERENCE_INVALID: &str = "reference-invalid";
+    /// A document refers back to a document being checked, or the chain of
+    /// references is too long.
+    pub const REFERENCE_CYCLE: &str = "reference-cycle";
+    /// A document exceeds the size this reader loads.
+    pub const FILE_TOO_LARGE: &str = "file-too-large";
     /// A binding is used but never defined, or used before its definition.
     pub const BINDING_UNDEFINED: &str = "binding-undefined";
     /// Two definitions share one binding or checkpoint name.
@@ -63,13 +68,15 @@ pub mod code {
     pub const REGISTRY_OVERLAP: &str = "registry-overlap";
     /// A registry declared complete leaves a guard point uncovered.
     pub const REGISTRY_HOLE: &str = "registry-hole";
+    /// The guard domain of a registry is larger than the coverage budget.
+    pub const COVERAGE_BUDGET_EXCEEDED: &str = "coverage-budget-exceeded";
     /// A rule both requires and forbids one effect.
     pub const REGISTRY_EFFECT_CONFLICT: &str = "registry-effect-conflict";
-    /// The verdict is better than its assertions and injections allow.
+    /// The verdict is not the one its assertions and injections determine.
     pub const VERDICT_INCONSISTENT: &str = "verdict-inconsistent";
 
     /// Every code, so that the example corpus can prove it exercises them.
-    pub const ALL: [&str; 29] = [
+    pub const ALL: [&str; 32] = [
         JSON_SYNTAX,
         DUPLICATE_KEY,
         NUMBER_NOT_INTEGER,
@@ -82,6 +89,8 @@ pub mod code {
         PATH_ESCAPE,
         FILE_UNREADABLE,
         REFERENCE_INVALID,
+        REFERENCE_CYCLE,
+        FILE_TOO_LARGE,
         BINDING_UNDEFINED,
         BINDING_DUPLICATE,
         FAULT_POINT_UNKNOWN,
@@ -97,6 +106,7 @@ pub mod code {
         REQUIREMENT_UNKNOWN,
         REGISTRY_OVERLAP,
         REGISTRY_HOLE,
+        COVERAGE_BUDGET_EXCEEDED,
         REGISTRY_EFFECT_CONFLICT,
         VERDICT_INCONSISTENT,
     ];
@@ -135,11 +145,18 @@ impl fmt::Display for Diagnostic {
     }
 }
 
+/// The most diagnostics and the most notes one report keeps.
+pub const MAX_DIAGNOSTICS: usize = 64;
+
 /// The outcome of checking one document.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Report {
-    /// Reasons the document is refused. Empty means accepted.
+    /// Reasons the document is refused. Empty means accepted. At most
+    /// [`MAX_DIAGNOSTICS`] are kept.
     pub diagnostics: Vec<Diagnostic>,
+    /// Diagnostics found beyond the ones kept. A truncated report still
+    /// refuses the document.
+    pub omitted_diagnostics: usize,
     /// Facts worth showing that do not refuse the document, such as the
     /// holes of a seed registry.
     pub notes: Vec<String>,
@@ -150,7 +167,21 @@ impl Report {
     pub fn refused(diagnostic: Diagnostic) -> Self {
         Self {
             diagnostics: vec![diagnostic],
-            notes: Vec::new(),
+            ..Self::default()
+        }
+    }
+
+    /// Keeps the first [`MAX_DIAGNOSTICS`] diagnostics and notes and counts
+    /// what it drops.
+    pub fn truncate(&mut self) {
+        if self.diagnostics.len() > MAX_DIAGNOSTICS {
+            self.omitted_diagnostics += self.diagnostics.len() - MAX_DIAGNOSTICS;
+            self.diagnostics.truncate(MAX_DIAGNOSTICS);
+        }
+        if self.notes.len() > MAX_DIAGNOSTICS {
+            let omitted = self.notes.len() - MAX_DIAGNOSTICS;
+            self.notes.truncate(MAX_DIAGNOSTICS);
+            self.notes.push(format!("{omitted} more notes omitted"));
         }
     }
 

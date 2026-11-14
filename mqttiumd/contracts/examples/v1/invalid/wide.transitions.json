@@ -1,0 +1,8 @@
+{
+  "format": "mqttiumd.transition-registry",
+  "schema_version": 1,
+  "id": "wide",
+  "catalog": "contracts/examples/v1/valid/wide.catalog.json",
+  "status": "seed",
+  "rules": []
+}

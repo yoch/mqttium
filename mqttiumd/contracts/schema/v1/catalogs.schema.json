@@ -374,11 +374,13 @@
                       }
                     }
                   },
-                  "minItems": 2
+                  "minItems": 2,
+                  "maxItems": 16
                 }
               }
             },
-            "minItems": 1
+            "minItems": 1,
+            "maxItems": 16
           },
           "event_classes": {
             "type": "array",
@@ -402,11 +404,13 @@
                   "items": {
                     "$ref": "primitives.schema.json#/$defs/name"
                   },
-                  "uniqueItems": true
+                  "uniqueItems": true,
+                  "maxItems": 8
                 }
               }
             },
-            "minItems": 1
+            "minItems": 1,
+            "maxItems": 64
           },
           "effects": {
             "type": "array",
@@ -414,6 +418,7 @@
               "$ref": "primitives.schema.json#/$defs/type_name"
             },
             "minItems": 1,
+            "maxItems": 64,
             "uniqueItems": true
           },
           "machines": {
@@ -436,6 +441,7 @@
                     "$ref": "primitives.schema.json#/$defs/type_name"
                   },
                   "minItems": 1,
+                  "maxItems": 32,
                   "uniqueItems": true
                 },
                 "event_classes": {
@@ -444,11 +450,13 @@
                     "$ref": "primitives.schema.json#/$defs/type_name"
                   },
                   "minItems": 1,
+                  "maxItems": 64,
                   "uniqueItems": true
                 }
               }
             },
-            "minItems": 1
+            "minItems": 1,
+            "maxItems": 16
           }
         }
       }
