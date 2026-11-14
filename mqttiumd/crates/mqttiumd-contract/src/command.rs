@@ -86,7 +86,12 @@ pub struct Costs {
 
 /// Commits publication, payload, obligations, inbound QoS 2 state, accounts
 /// and receipt together, or nothing.
-#[derive(PartialEq, Eq, Debug)]
+///
+/// Equality is the equality of recipes, not of their storage: two
+/// admissions are equal exactly when their canonical bytes are equal. The
+/// bound of the container that holds the targets is not part of the
+/// recipe and takes no part in the comparison.
+#[derive(Debug)]
 pub struct AdmitPublication {
     pub operation: OperationId,
     pub request: RequestId,
@@ -100,6 +105,38 @@ pub struct AdmitPublication {
     pub costs: Costs,
     pub targets: BoundedVec<Target>,
 }
+
+impl PartialEq for AdmitPublication {
+    fn eq(&self, other: &Self) -> bool {
+        // Destructured so that a new field cannot be left out silently.
+        let Self {
+            operation,
+            request,
+            publication,
+            source,
+            route_revision,
+            qos,
+            retain,
+            topic,
+            payload,
+            costs,
+            targets,
+        } = self;
+        *operation == other.operation
+            && *request == other.request
+            && *publication == other.publication
+            && *source == other.source
+            && *route_revision == other.route_revision
+            && *qos == other.qos
+            && *retain == other.retain
+            && *topic == other.topic
+            && *payload == other.payload
+            && *costs == other.costs
+            && targets.as_slice() == other.targets.as_slice()
+    }
+}
+
+impl Eq for AdmitPublication {}
 
 /// Durably terminates an inbound QoS 2 exchange after PUBREL, before PUBCOMP
 /// becomes eligible. It never creates a distribution.
@@ -556,6 +593,64 @@ mod tests {
         let decoded = Recipe::decode_canonical(&encode(&recipe), 4, 64).expect("canonical");
         assert_eq!(encode(&decoded), encode(&recipe));
         assert_eq!(decoded, recipe, "equal canonical bytes, unequal recipes");
+    }
+
+    fn admission_bounded_at(targets: &[Target], bound: usize) -> Recipe {
+        let Recipe::AdmitPublication(mut admit) = admission(targets) else {
+            panic!("kind changed");
+        };
+        admit.targets = BoundedVec::from_slice(targets, bound).expect("fits");
+        Recipe::AdmitPublication(admit)
+    }
+
+    #[test]
+    fn the_bound_of_the_target_container_is_not_part_of_the_recipe() {
+        let targets = [target(11, 0), target(12, 1)];
+        let tight = admission_bounded_at(&targets, 2);
+        let loose = admission_bounded_at(&targets, 64);
+        assert_eq!(tight, loose);
+        assert_eq!(encode(&tight), encode(&loose));
+        let frozen = FrozenRecipe::freeze(tight).expect("well formed");
+        assert_eq!(frozen, FrozenRecipe::freeze(loose).expect("well formed"));
+    }
+
+    #[test]
+    fn recipes_are_equal_exactly_when_their_canonical_bytes_are() {
+        let mut other_cause = target(12, 1);
+        other_cause.effective_qos = Qos::AtMostOnce;
+        let mut variants = vec![
+            admission(&[target(11, 0), target(12, 1)]),
+            admission_bounded_at(&[target(11, 0), target(12, 1)], 9),
+            admission(&[target(12, 1), target(11, 0)]),
+            admission(&[target(11, 0), target(13, 1)]),
+            admission(&[target(11, 0), other_cause]),
+            admission(&[target(11, 0)]),
+            admission(&[]),
+        ];
+        for edit in 0..5 {
+            let Recipe::AdmitPublication(mut admit) = admission(&[target(11, 0), target(12, 1)])
+            else {
+                panic!("kind changed");
+            };
+            match edit {
+                0 => admit.costs.references = References::new(3),
+                1 => admit.retain = true,
+                2 => admit.topic = SharedBytes::copy_from(b"p1/other", 64).expect("fits"),
+                3 => admit.payload.length = PayloadBytes::new(8),
+                _ => admit.route_revision = Revision::new(2),
+            }
+            variants.push(Recipe::AdmitPublication(admit));
+        }
+        let mut equal_pairs = 0;
+        for left in &variants {
+            for right in &variants {
+                let same_bytes = encode(left) == encode(right);
+                assert_eq!(left == right, same_bytes, "{left:?}\n{right:?}");
+                equal_pairs += usize::from(same_bytes);
+            }
+        }
+        // Every recipe equals itself, and the two bounds of the first one.
+        assert_eq!(equal_pairs, variants.len() + 2);
     }
 
     #[test]
