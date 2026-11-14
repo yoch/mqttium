@@ -75,6 +75,10 @@ def _no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _integer(text: str) -> int:
+    # `-0` is not the integer zero for version 1: zero is written `0`. The
+    # Rust reader reads the lexeme as a float and refuses it the same way.
+    if text == "-0":
+        raise Refused("number-not-integer", text)
     value = int(text)
     if not -(2**63) <= value <= U64_MAX:
         raise Refused("number-not-integer", text)
