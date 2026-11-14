@@ -9,14 +9,26 @@
 //! 2. `#![forbid(unsafe_code)]`: enforced by the compiler.
 //! 3. No dependency beyond an explicit list, no build script, no feature:
 //!    checked here through `cargo metadata`.
-//! 4. Token rules, checked here on the lexed sources: no `unsafe`, `async`
-//!    or `await`; no `extern` other than `extern crate alloc;`; conditional
-//!    compilation only in three exact forms; no macro or attribute that
-//!    pulls in a file or the build environment.
+//! 4. Token rules, checked here on the lexed sources. They are closed
+//!    lists rather than lists of forbidden words:
+//!    - a macro invocation must name a listed macro, or one the same file
+//!      defines; an invocation through a macro variable is refused;
+//!    - an attribute must have a listed name;
+//!    - conditional compilation exists in three exact forms only;
+//!    - a `use` declaration imports no macro that reads a file or the build
+//!      environment, and renames nothing to the name of an allowed macro;
+//!    - no `unsafe`, `async` or `await`; no `extern` other than
+//!      `extern crate alloc;`.
 //!
 //! The token rules work on Rust tokens, so comments, strings and spacing do
-//! not matter. They are deliberately coarse: an identifier that merely
-//! starts with `cfg` is refused.
+//! not matter. A raw identifier designates the same name as the plain one:
+//! `r#cfg!` is `cfg!` and `#[r#path]` is `#[path]`, and both are refused.
+//! Only keywords are compared as written, because `r#async` is an ordinary
+//! identifier. An alias cannot hide a macro: `use core::env as e; e!(…)`
+//! is refused at the import and at the call, since `e` is not listed.
+//!
+//! The rules are deliberately coarse: an identifier that merely starts
+//! with `cfg` is refused, and so is a macro nobody listed yet.
 //!
 //! Not covered by any layer, and recorded as such in ADR 0007: `--cfg`
 //! flags passed from outside the sources (the run manifest records the
@@ -94,8 +106,59 @@ fn precedes(tokens: &[Token], end: usize, expected: &[Token]) -> bool {
     end >= expected.len() && &tokens[end - expected.len()..end] == expected
 }
 
+/// The standard macros a pure crate may invoke. Macros that a file defines
+/// itself with `macro_rules!` are allowed as well: their bodies are scanned
+/// like any other code. Extending this list is a decision (ADR 0007).
+const ALLOWED_MACROS: [&str; 8] = [
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "matches",
+    "panic",
+    "vec",
+    "write",
+];
+
+/// The attributes a pure crate may use. `cfg` and `cfg_attr` are further
+/// restricted to three exact forms.
+const ALLOWED_ATTRIBUTES: [&str; 9] = [
+    "allow", "cfg", "cfg_attr", "derive", "doc", "expect", "forbid", "must_use", "test",
+];
+
+/// Macros that read a file or the build environment. They are refused as
+/// invocations by the allow-list; they are also refused in a `use`
+/// declaration, so that none can be imported under another name.
+const FORBIDDEN_IMPORTS: [&str; 5] = [
+    "env",
+    "option_env",
+    "include",
+    "include_str",
+    "include_bytes",
+];
+
+/// Words that may stand before `!(` without being a macro name: in
+/// `if !(a)` the `!` is a negation.
+const KEYWORDS: [&str; 38] = [
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while",
+];
+
+/// The name an identifier designates. `r#cfg` designates `cfg`: the raw
+/// prefix changes how a name is spelled, not what it names.
+fn plain(name: &str) -> &str {
+    name.strip_prefix("r#").unwrap_or(name)
+}
+
+fn is_punct(token: Option<&Token>, character: char) -> bool {
+    token == Some(&Token::Punct(character))
+}
+
 /// Whether the `cfg…` identifier at `index` is one of the three allowed
-/// forms of conditional compilation.
+/// forms of conditional compilation. The forms are matched on the tokens
+/// as written, so a raw spelling is not one of them.
 fn allowed_cfg(tokens: &[Token], index: usize) -> bool {
     let Token::Ident(name) = &tokens[index] else {
         return false;
@@ -118,6 +181,20 @@ fn allowed_cfg(tokens: &[Token], index: usize) -> bool {
     }
 }
 
+/// Names that the file defines with `macro_rules! name`.
+fn local_macros(tokens: &[Token]) -> Vec<&str> {
+    let mut defined = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if *token == Token::Ident("macro_rules".to_owned())
+            && is_punct(tokens.get(index + 1), '!')
+            && let Some(Token::Ident(name)) = tokens.get(index + 2)
+        {
+            defined.push(plain(name));
+        }
+    }
+    defined
+}
+
 /// Returns the reasons `source` breaks the token rules.
 fn violations(source: &str) -> Vec<String> {
     let Ok(stream) = TokenStream::from_str(source) else {
@@ -125,9 +202,39 @@ fn violations(source: &str) -> Vec<String> {
     };
     let mut tokens = Vec::new();
     flatten(stream, &mut tokens);
+    let local = local_macros(&tokens);
+    let allowed_macro = |name: &str| ALLOWED_MACROS.contains(&name) || local.contains(&name);
     let mut found = Vec::new();
+
     for (index, token) in tokens.iter().enumerate() {
+        // Attributes: `#[name …]` or `#![name …]`, with a listed name.
+        if *token == Token::Punct('#') {
+            let open = if is_punct(tokens.get(index + 1), '!') {
+                index + 2
+            } else {
+                index + 1
+            };
+            if tokens.get(open) != Some(&Token::Open('[')) {
+                continue;
+            }
+            match tokens.get(open + 1) {
+                // A macro passes an attribute through: `#[$meta]`. The
+                // attribute itself is checked where it is written.
+                Some(Token::Punct('$')) => {}
+                Some(Token::Ident(name)) => {
+                    let qualified = is_punct(tokens.get(open + 2), ':');
+                    if qualified || !ALLOWED_ATTRIBUTES.contains(&plain(name)) {
+                        found.push(format!("uses the attribute `{name}`, which is not listed"));
+                    }
+                }
+                _ => found.push("uses an attribute without a name".to_owned()),
+            }
+            continue;
+        }
+
         let Token::Ident(name) = token else { continue };
+
+        // Keywords are compared as written: `r#async` is an ordinary name.
         match name.as_str() {
             "unsafe" | "async" | "await" => found.push(format!("uses `{name}`")),
             "extern" => {
@@ -135,22 +242,44 @@ fn violations(source: &str) -> Vec<String> {
                     found.push("uses `extern` other than `extern crate alloc;`".to_owned());
                 }
             }
-            "include" | "include_str" | "include_bytes" | "env" | "option_env" => {
-                if follows(&tokens, index + 1, &pattern("!")) {
-                    found.push(format!("uses `{name}!`"));
+            // A `use` declaration may not import a macro that reads a file
+            // or the environment, nor rename anything to an allowed macro.
+            "use" => {
+                let end = tokens[index..]
+                    .iter()
+                    .position(|token| *token == Token::Punct(';'))
+                    .map_or(tokens.len(), |offset| index + offset);
+                for position in index + 1..end {
+                    let Token::Ident(imported) = &tokens[position] else {
+                        continue;
+                    };
+                    let imported = plain(imported);
+                    if FORBIDDEN_IMPORTS.contains(&imported) {
+                        found.push(format!("imports the macro `{imported}`"));
+                    }
+                    let renamed = tokens[position - 1] == Token::Ident("as".to_owned());
+                    if renamed && allowed_macro(imported) {
+                        found.push(format!("renames an item to the allowed macro `{imported}`"));
+                    }
                 }
-            }
-            "path" => {
-                if precedes(&tokens, index, &pattern("# ["))
-                    || precedes(&tokens, index, &pattern("# ! ["))
-                {
-                    found.push("uses `#[path]`".to_owned());
-                }
-            }
-            _ if name.starts_with("cfg") && !allowed_cfg(&tokens, index) => {
-                found.push(format!("uses `{name}` outside the allowed forms"));
             }
             _ => {}
+        }
+
+        // Conditional compilation, whatever the spelling of the name.
+        if plain(name).starts_with("cfg") && !allowed_cfg(&tokens, index) {
+            found.push(format!("uses `{name}` outside the allowed forms"));
+        }
+
+        // Macro invocations: `name!(…)`, `name![…]`, `name!{…}`. An
+        // identifier followed by `!=` is a comparison, and a keyword
+        // followed by `!(` is a negation.
+        if is_punct(tokens.get(index + 1), '!')
+            && matches!(tokens.get(index + 2), Some(Token::Open(_)))
+            && !KEYWORDS.contains(&name.as_str())
+            && !allowed_macro(plain(name))
+        {
+            found.push(format!("invokes the macro `{name}`, which is not listed"));
         }
     }
     found
