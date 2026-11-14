@@ -1,0 +1,522 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mqttiumd catalogues",
+  "description": "Closed catalogues referenced by scenarios, registries and results: injection points, profiles, assertions, requirement identifiers, transition vocabulary, example index.",
+  "type": "object",
+  "required": [
+    "format"
+  ],
+  "properties": {
+    "format": {
+      "enum": [
+        "mqttiumd.fault-catalog",
+        "mqttiumd.profile-catalog",
+        "mqttiumd.assertion-catalog",
+        "mqttiumd.requirement-register",
+        "mqttiumd.transition-catalog",
+        "mqttiumd.example-index"
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "format"
+        ],
+        "properties": {
+          "format": {
+            "const": "mqttiumd.fault-catalog"
+          }
+        }
+      },
+      "then": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "format",
+          "schema_version",
+          "command_kinds",
+          "points"
+        ],
+        "properties": {
+          "format": {
+            "const": "mqttiumd.fault-catalog"
+          },
+          "schema_version": {
+            "const": 1
+          },
+          "command_kinds": {
+            "type": "array",
+            "items": {
+              "$ref": "primitives.schema.json#/$defs/type_name"
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "points": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "point",
+                "meaning",
+                "actions"
+              ],
+              "properties": {
+                "point": {
+                  "$ref": "primitives.schema.json#/$defs/dotted_name"
+                },
+                "meaning": {
+                  "$ref": "primitives.schema.json#/$defs/text"
+                },
+                "actions": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "primitives.schema.json#/$defs/name"
+                  },
+                  "minItems": 1,
+                  "uniqueItems": true
+                }
+              }
+            },
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "format"
+        ],
+        "properties": {
+          "format": {
+            "const": "mqttiumd.profile-catalog"
+          }
+        }
+      },
+      "then": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "format",
+          "schema_version",
+          "profiles"
+        ],
+        "properties": {
+          "format": {
+            "const": "mqttiumd.profile-catalog"
+          },
+          "schema_version": {
+            "const": 1
+          },
+          "profiles": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "protocol",
+                "durability",
+                "includes",
+                "excludes"
+              ],
+              "properties": {
+                "id": {
+                  "$ref": "primitives.schema.json#/$defs/slug"
+                },
+                "protocol": {
+                  "enum": [
+                    "mqtt-5.0",
+                    "mqtt-3.1.1"
+                  ]
+                },
+                "durability": {
+                  "enum": [
+                    "durable",
+                    "volatile"
+                  ]
+                },
+                "includes": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "primitives.schema.json#/$defs/text"
+                  },
+                  "uniqueItems": true
+                },
+                "excludes": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "primitives.schema.json#/$defs/text"
+                  },
+                  "uniqueItems": true
+                }
+              }
+            },
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "format"
+        ],
+        "properties": {
+          "format": {
+            "const": "mqttiumd.assertion-catalog"
+          }
+        }
+      },
+      "then": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "format",
+          "schema_version",
+          "assertions"
+        ],
+        "properties": {
+          "format": {
+            "const": "mqttiumd.assertion-catalog"
+          },
+          "schema_version": {
+            "const": 1
+          },
+          "assertions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "meaning",
+                "requirements"
+              ],
+              "properties": {
+                "name": {
+                  "$ref": "primitives.schema.json#/$defs/binding"
+                },
+                "meaning": {
+                  "$ref": "primitives.schema.json#/$defs/text"
+                },
+                "requirements": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "primitives.schema.json#/$defs/requirement_id"
+                  },
+                  "minItems": 1,
+                  "uniqueItems": true
+                }
+              }
+            },
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "format"
+        ],
+        "properties": {
+          "format": {
+            "const": "mqttiumd.requirement-register"
+          }
+        }
+      },
+      "then": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "format",
+          "schema_version",
+          "sources",
+          "entries"
+        ],
+        "properties": {
+          "format": {
+            "const": "mqttiumd.requirement-register"
+          },
+          "schema_version": {
+            "const": 1
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "chapter",
+                "path",
+                "sha256"
+              ],
+              "properties": {
+                "chapter": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4
+                },
+                "path": {
+                  "$ref": "primitives.schema.json#/$defs/relative_path"
+                },
+                "sha256": {
+                  "$ref": "primitives.schema.json#/$defs/sha256"
+                }
+              }
+            },
+            "minItems": 1
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "kind",
+                "chapter"
+              ],
+              "properties": {
+                "id": {
+                  "$ref": "primitives.schema.json#/$defs/requirement_id"
+                },
+                "kind": {
+                  "enum": [
+                    "requirement",
+                    "scenario",
+                    "mutation",
+                    "model",
+                    "gate",
+                    "open-decision",
+                    "lot",
+                    "tranche"
+                  ]
+                },
+                "chapter": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 4
+                }
+              }
+            },
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "format"
+        ],
+        "properties": {
+          "format": {
+            "const": "mqttiumd.transition-catalog"
+          }
+        }
+      },
+      "then": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "format",
+          "schema_version",
+          "id",
+          "guard_dimensions",
+          "event_classes",
+          "effects",
+          "machines"
+        ],
+        "properties": {
+          "format": {
+            "const": "mqttiumd.transition-catalog"
+          },
+          "schema_version": {
+            "const": 1
+          },
+          "id": {
+            "$ref": "primitives.schema.json#/$defs/slug"
+          },
+          "guard_dimensions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "values"
+              ],
+              "properties": {
+                "name": {
+                  "$ref": "primitives.schema.json#/$defs/name"
+                },
+                "values": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "value",
+                      "meaning"
+                    ],
+                    "properties": {
+                      "value": {
+                        "$ref": "primitives.schema.json#/$defs/name"
+                      },
+                      "meaning": {
+                        "$ref": "primitives.schema.json#/$defs/text"
+                      }
+                    }
+                  },
+                  "minItems": 2
+                }
+              }
+            },
+            "minItems": 1
+          },
+          "event_classes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "meaning",
+                "guard_dimensions"
+              ],
+              "properties": {
+                "name": {
+                  "$ref": "primitives.schema.json#/$defs/type_name"
+                },
+                "meaning": {
+                  "$ref": "primitives.schema.json#/$defs/text"
+                },
+                "guard_dimensions": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "primitives.schema.json#/$defs/name"
+                  },
+                  "uniqueItems": true
+                }
+              }
+            },
+            "minItems": 1
+          },
+          "effects": {
+            "type": "array",
+            "items": {
+              "$ref": "primitives.schema.json#/$defs/type_name"
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "machines": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "state_classes",
+                "event_classes"
+              ],
+              "properties": {
+                "name": {
+                  "$ref": "primitives.schema.json#/$defs/name"
+                },
+                "state_classes": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "primitives.schema.json#/$defs/type_name"
+                  },
+                  "minItems": 1,
+                  "uniqueItems": true
+                },
+                "event_classes": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "primitives.schema.json#/$defs/type_name"
+                  },
+                  "minItems": 1,
+                  "uniqueItems": true
+                }
+              }
+            },
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "format"
+        ],
+        "properties": {
+          "format": {
+            "const": "mqttiumd.example-index"
+          }
+        }
+      },
+      "then": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "format",
+          "schema_version",
+          "valid",
+          "invalid"
+        ],
+        "properties": {
+          "format": {
+            "const": "mqttiumd.example-index"
+          },
+          "schema_version": {
+            "const": 1
+          },
+          "valid": {
+            "type": "array",
+            "items": {
+              "$ref": "primitives.schema.json#/$defs/relative_path"
+            },
+            "uniqueItems": true
+          },
+          "invalid": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "file",
+                "code",
+                "pointer",
+                "why"
+              ],
+              "properties": {
+                "file": {
+                  "$ref": "primitives.schema.json#/$defs/relative_path"
+                },
+                "code": {
+                  "$ref": "primitives.schema.json#/$defs/slug"
+                },
+                "pointer": {
+                  "type": "string",
+                  "maxLength": 512
+                },
+                "why": {
+                  "$ref": "primitives.schema.json#/$defs/text"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

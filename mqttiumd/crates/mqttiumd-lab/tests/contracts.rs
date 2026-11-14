@@ -1,0 +1,236 @@
+//! The example corpus is discriminating: valid documents are accepted and
+//! each invalid document is refused for its declared reason, not for any
+//! reason at all.
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use mqttiumd_lab::diagnostic::code;
+use mqttiumd_lab::manifest;
+use mqttiumd_lab::workspace::Workspace;
+use serde_json::Value;
+
+const INDEX: &str = "contracts/examples/v1/index.json";
+
+fn root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn workspace() -> Workspace {
+    Workspace::open(&root(), Path::new("contracts/v1")).expect("the contract directory opens")
+}
+
+fn index() -> Value {
+    let bytes = fs::read(root().join(INDEX)).expect("the example index is readable");
+    serde_json::from_slice(&bytes).expect("the example index is JSON")
+}
+
+#[test]
+fn the_contract_directory_is_accepted() {
+    for (path, report) in workspace().check_contracts() {
+        assert!(
+            report.is_accepted(),
+            "{}: {:?}",
+            path.display(),
+            report.diagnostics
+        );
+    }
+}
+
+#[test]
+fn the_seed_registry_lists_its_holes_instead_of_hiding_them() {
+    let report = workspace().check_file(Path::new("contracts/v1/p1.transitions.json"));
+    assert!(report.is_accepted(), "{:?}", report.diagnostics);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("registry hole"))
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("cannot support a PASS"))
+    );
+}
+
+#[test]
+fn the_example_index_is_accepted() {
+    let report = workspace().check_file(Path::new(INDEX));
+    assert!(report.is_accepted(), "{:?}", report.diagnostics);
+}
+
+#[test]
+fn every_valid_example_is_accepted() {
+    let workspace = workspace();
+    let index = index();
+    let valid = index["valid"].as_array().expect("valid list");
+    assert!(valid.len() >= 10);
+    for file in valid {
+        let file = file.as_str().expect("path");
+        let report = workspace.check_file(Path::new(file));
+        assert!(report.is_accepted(), "{file}: {:?}", report.diagnostics);
+    }
+}
+
+#[test]
+fn every_invalid_example_is_refused_for_its_declared_reason() {
+    let workspace = workspace();
+    let index = index();
+    let invalid = index["invalid"].as_array().expect("invalid list");
+    assert!(invalid.len() >= 60);
+    for case in invalid {
+        let file = case["file"].as_str().expect("path");
+        let expected = case["code"].as_str().expect("code");
+        let pointer = case["pointer"].as_str().expect("pointer");
+        let report = workspace.check_file(Path::new(file));
+        assert!(!report.is_accepted(), "{file} was accepted");
+        for diagnostic in &report.diagnostics {
+            assert_eq!(
+                diagnostic.code, expected,
+                "{file}: refused for another reason: {diagnostic}"
+            );
+        }
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.pointer == pointer),
+            "{file}: no diagnostic at {pointer:?}: {:?}",
+            report.diagnostics
+        );
+    }
+}
+
+#[test]
+fn every_example_file_is_indexed_exactly_once() {
+    let index = index();
+    let mut indexed: Vec<String> = index["valid"]
+        .as_array()
+        .expect("valid list")
+        .iter()
+        .map(|file| file.as_str().expect("path").to_owned())
+        .chain(
+            index["invalid"]
+                .as_array()
+                .expect("invalid list")
+                .iter()
+                .map(|case| case["file"].as_str().expect("path").to_owned()),
+        )
+        .filter(|file| file.starts_with("contracts/examples/"))
+        .collect();
+    indexed.sort();
+    let mut present = Vec::new();
+    for directory in ["valid", "invalid"] {
+        let relative = format!("contracts/examples/v1/{directory}");
+        for entry in fs::read_dir(root().join(&relative)).expect("example directory") {
+            let name = entry.expect("entry").file_name();
+            present.push(format!("{relative}/{}", name.to_string_lossy()));
+        }
+    }
+    present.sort();
+    assert_eq!(indexed, present);
+}
+
+#[test]
+fn the_corpus_exercises_every_code_it_can() {
+    let index = index();
+    let exercised: BTreeSet<&str> = index["invalid"]
+        .as_array()
+        .expect("invalid list")
+        .iter()
+        .map(|case| case["code"].as_str().expect("code"))
+        .collect();
+    // Unit-tested where they are raised: a schema file that is not local,
+    // and a decimal string that a lax schema validator would let through.
+    let elsewhere = [code::SCHEMA_NOT_LOCAL, code::U64_NOT_CANONICAL];
+    for known in code::ALL {
+        assert!(
+            exercised.contains(known) || elsewhere.contains(&known),
+            "no invalid example is refused with {known}"
+        );
+    }
+    for used in exercised {
+        assert!(code::ALL.contains(&used), "{used} is not a known code");
+    }
+}
+
+#[test]
+fn the_scenario_file_is_the_text_of_the_specification() {
+    let chapter = fs::read_to_string(root().join("docs/spec/fr/chapitre-4.md")).expect("chapter 4");
+    let scenario = fs::read_to_string(root().join("tests/scenarios/p1/P1-02.json")).expect("P1-02");
+    assert!(
+        chapter.contains(scenario.trim_end()),
+        "P1-02.json drifted from DEM-017"
+    );
+}
+
+#[test]
+fn a_collected_manifest_satisfies_its_schema() {
+    let manifest = manifest::collect(&root()).expect("the manifest is collected");
+    let report = workspace().check_value(&manifest);
+    assert!(report.is_accepted(), "{:?}", report.diagnostics);
+    let contracts = manifest["contracts"].as_array().expect("contracts");
+    assert!(
+        contracts
+            .iter()
+            .any(|file| file["path"] == "contracts/schema/v1/primitives.schema.json")
+    );
+    assert!(
+        contracts
+            .iter()
+            .any(|file| file["path"] == "contracts/v1/p1.transitions.json")
+    );
+}
+
+fn lab(arguments: &[&str]) -> Option<i32> {
+    Command::new(env!("CARGO_BIN_EXE_mqttiumd-lab"))
+        .args(arguments)
+        .current_dir(root())
+        .output()
+        .expect("the bench runs")
+        .status
+        .code()
+}
+
+#[test]
+fn exit_codes_follow_the_verdict_table() {
+    let contracts = ["validate", "--contracts", "contracts/v1"];
+    assert_eq!(
+        lab(&[
+            &contracts[..],
+            &["--scenario", "tests/scenarios/p1/P1-02.json"]
+        ]
+        .concat()),
+        Some(0)
+    );
+    assert_eq!(
+        lab(&[
+            &contracts[..],
+            &[
+                "--scenario",
+                "contracts/examples/v1/invalid/scenario-u64-overflow.json"
+            ]
+        ]
+        .concat()),
+        Some(2)
+    );
+    assert_eq!(
+        lab(&[
+            &contracts[..],
+            &["--scenario", "tests/scenarios/p1/absent.json"]
+        ]
+        .concat()),
+        Some(2)
+    );
+    assert_eq!(lab(&["validate"]), Some(2));
+    assert_eq!(lab(&["validate", "--contracts", "contracts/v9"]), Some(2));
+    assert_eq!(lab(&[]), Some(2));
+    // A command that does not exist yet reports no verdict at all.
+    for command in ["run", "replay", "minimize"] {
+        assert_eq!(lab(&[command]), Some(2), "{command}");
+    }
+}

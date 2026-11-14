@@ -1,0 +1,173 @@
+{
+  "format": "mqttiumd.transition-catalog",
+  "schema_version": 1,
+  "id": "p1",
+  "guard_dimensions": [
+    {
+      "name": "identity",
+      "values": [
+        {
+          "value": "current",
+          "meaning": "The event belongs to the operation and exchange generation the state waits for."
+        },
+        {
+          "value": "stale",
+          "meaning": "The event belongs to an older operation or exchange generation."
+        }
+      ]
+    },
+    {
+      "name": "outcome",
+      "values": [
+        {
+          "value": "committed",
+          "meaning": "The store reports Committed."
+        },
+        {
+          "value": "rejected_certain",
+          "meaning": "The store reports RejectedCertain."
+        },
+        {
+          "value": "unknown",
+          "meaning": "The store reports PendingOrUnknown."
+        },
+        {
+          "value": "retired",
+          "meaning": "The store reports RetiredOutcomeUnavailable."
+        }
+      ]
+    },
+    {
+      "name": "effect_capacity",
+      "values": [
+        {
+          "value": "sufficient",
+          "meaning": "The effect box and the result reserve can hold what the transition publishes."
+        },
+        {
+          "value": "insufficient",
+          "meaning": "At least one needed slot is missing."
+        }
+      ]
+    },
+    {
+      "name": "recipe",
+      "values": [
+        {
+          "value": "same",
+          "meaning": "The canonical bytes equal those stored for the OperationId."
+        },
+        {
+          "value": "different",
+          "meaning": "The canonical bytes differ."
+        }
+      ]
+    }
+  ],
+  "event_classes": [
+    {
+      "name": "PublishQos2",
+      "meaning": "A validated QoS 2 PUBLISH carrying the Packet Identifier of the slot.",
+      "guard_dimensions": [
+        "effect_capacity"
+      ]
+    },
+    {
+      "name": "Pubrel",
+      "meaning": "A validated PUBREL carrying the Packet Identifier of the slot.",
+      "guard_dimensions": [
+        "effect_capacity"
+      ]
+    },
+    {
+      "name": "AdmissionResult",
+      "meaning": "A StoreResult for an AdmitPublication of this session.",
+      "guard_dimensions": [
+        "identity",
+        "outcome",
+        "effect_capacity"
+      ]
+    },
+    {
+      "name": "ReleaseResult",
+      "meaning": "A StoreResult for a ReleaseInbound of this session.",
+      "guard_dimensions": [
+        "identity",
+        "outcome",
+        "effect_capacity"
+      ]
+    },
+    {
+      "name": "Submit",
+      "meaning": "The owner hands the frozen command to its effect box.",
+      "guard_dimensions": [
+        "effect_capacity"
+      ]
+    },
+    {
+      "name": "StoreResult",
+      "meaning": "A result is delivered for this OperationId.",
+      "guard_dimensions": [
+        "outcome"
+      ]
+    },
+    {
+      "name": "ResultTimeout",
+      "meaning": "The deadline armed for the result of this operation is reached.",
+      "guard_dimensions": []
+    },
+    {
+      "name": "Replay",
+      "meaning": "The same OperationId is presented to the store again.",
+      "guard_dimensions": [
+        "recipe"
+      ]
+    }
+  ],
+  "effects": [
+    "Persist",
+    "ResolveAndFence",
+    "LoadWork",
+    "EmitConnack",
+    "EmitPubrec",
+    "EmitPubcomp",
+    "CloseConnection",
+    "ArmDeadline",
+    "Continue"
+  ],
+  "machines": [
+    {
+      "name": "inbound_qos2",
+      "state_classes": [
+        "Absent",
+        "AdmissionPending",
+        "AwaitPubrel",
+        "ReleasePending"
+      ],
+      "event_classes": [
+        "PublishQos2",
+        "Pubrel",
+        "AdmissionResult",
+        "ReleaseResult"
+      ]
+    },
+    {
+      "name": "command",
+      "state_classes": [
+        "Prepared",
+        "Submitted",
+        "Indeterminate",
+        "Committed",
+        "RejectedCertain",
+        "Consumed",
+        "ReceiptClosed"
+      ],
+      "event_classes": [
+        "Submit",
+        "StoreResult",
+        "ResultTimeout",
+        "Replay"
+      ]
+    }
+  ]
+}

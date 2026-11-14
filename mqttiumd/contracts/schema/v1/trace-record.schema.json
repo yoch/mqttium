@@ -1,0 +1,632 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mqttiumd trace record",
+  "description": "One line of a JSON Lines trace: header, versioned record or footer (DEM-016). The digest of the trace lives in the external artifact inventory, never inside the trace.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "schema_version",
+    "run_id",
+    "record_sequence",
+    "origin_component",
+    "origin_incarnation",
+    "origin_sequence",
+    "causal_parents",
+    "time_domain",
+    "time_value",
+    "kind",
+    "payload"
+  ],
+  "properties": {
+    "format": {
+      "const": "mqttiumd.trace-record"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "run_id": {
+      "$ref": "primitives.schema.json#/$defs/slug"
+    },
+    "record_sequence": {
+      "$ref": "primitives.schema.json#/$defs/u64"
+    },
+    "origin_component": {
+      "enum": [
+        "bench-supervisor",
+        "broker-core",
+        "fault-injector",
+        "peer",
+        "store-adapter",
+        "store-evidence",
+        "transport"
+      ]
+    },
+    "origin_incarnation": {
+      "$ref": "primitives.schema.json#/$defs/u64"
+    },
+    "origin_sequence": {
+      "$ref": "primitives.schema.json#/$defs/u64"
+    },
+    "causal_parents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "origin_component",
+          "origin_incarnation",
+          "origin_sequence"
+        ],
+        "properties": {
+          "origin_component": {
+            "enum": [
+              "bench-supervisor",
+              "broker-core",
+              "fault-injector",
+              "peer",
+              "store-adapter",
+              "store-evidence",
+              "transport"
+            ]
+          },
+          "origin_incarnation": {
+            "$ref": "primitives.schema.json#/$defs/u64"
+          },
+          "origin_sequence": {
+            "$ref": "primitives.schema.json#/$defs/u64"
+          }
+        }
+      },
+      "maxItems": 16,
+      "uniqueItems": true
+    },
+    "time_domain": {
+      "enum": [
+        "logical-step",
+        "monotonic-ns"
+      ]
+    },
+    "time_value": {
+      "$ref": "primitives.schema.json#/$defs/u64"
+    },
+    "kind": {
+      "enum": [
+        "TraceHeader",
+        "TraceFooter",
+        "CommandSubmitted",
+        "StoreCommitStable",
+        "StoreResultReady",
+        "StoreResultDelivered",
+        "FrameEligible",
+        "FrameWriteProgress",
+        "PeerPacketObserved",
+        "FaultHit",
+        "BrokerCrashed",
+        "BrokerRecovered"
+      ]
+    },
+    "payload": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "TraceHeader"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/TraceHeader"
+          },
+          "origin_component": {
+            "enum": [
+              "bench-supervisor"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "TraceFooter"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/TraceFooter"
+          },
+          "origin_component": {
+            "enum": [
+              "bench-supervisor"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "CommandSubmitted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/CommandSubmitted"
+          },
+          "origin_component": {
+            "enum": [
+              "store-adapter"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "StoreCommitStable"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StoreCommitStable"
+          },
+          "origin_component": {
+            "enum": [
+              "store-evidence"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "StoreResultReady"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StoreResultReady"
+          },
+          "origin_component": {
+            "enum": [
+              "store-evidence"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "StoreResultDelivered"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StoreResultDelivered"
+          },
+          "origin_component": {
+            "enum": [
+              "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "FrameEligible"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/FrameEligible"
+          },
+          "origin_component": {
+            "enum": [
+              "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "FrameWriteProgress"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/FrameWriteProgress"
+          },
+          "origin_component": {
+            "enum": [
+              "transport"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "PeerPacketObserved"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PeerPacketObserved"
+          },
+          "origin_component": {
+            "enum": [
+              "peer"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "FaultHit"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/FaultHit"
+          },
+          "origin_component": {
+            "enum": [
+              "fault-injector"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "BrokerCrashed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/BrokerCrashed"
+          },
+          "origin_component": {
+            "enum": [
+              "bench-supervisor"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "BrokerRecovered"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/BrokerRecovered"
+          },
+          "origin_component": {
+            "enum": [
+              "bench-supervisor"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "TraceHeader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_id",
+        "backend"
+      ],
+      "properties": {
+        "scenario_id": {
+          "$ref": "primitives.schema.json#/$defs/text"
+        },
+        "backend": {
+          "enum": [
+            "sim-store",
+            "sqlite"
+          ]
+        }
+      }
+    },
+    "TraceFooter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_count",
+        "complete"
+      ],
+      "properties": {
+        "record_count": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "complete": {
+          "type": "boolean"
+        }
+      }
+    },
+    "CommandSubmitted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_id",
+        "operation_id",
+        "command_kind"
+      ],
+      "properties": {
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "command_kind": {
+          "$ref": "primitives.schema.json#/$defs/type_name"
+        }
+      }
+    },
+    "StoreCommitStable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id"
+      ],
+      "properties": {
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        }
+      }
+    },
+    "StoreResultReady": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id",
+        "outcome"
+      ],
+      "properties": {
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "outcome": {
+          "$ref": "primitives.schema.json#/$defs/store_outcome"
+        }
+      }
+    },
+    "StoreResultDelivered": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_id",
+        "operation_id",
+        "outcome"
+      ],
+      "properties": {
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "outcome": {
+          "$ref": "primitives.schema.json#/$defs/store_outcome"
+        }
+      }
+    },
+    "FrameEligible": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_id",
+        "connection",
+        "packet_kind"
+      ],
+      "properties": {
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
+        "connection": {
+          "$ref": "primitives.schema.json#/$defs/connection_key"
+        },
+        "packet_kind": {
+          "enum": [
+            "CONNACK",
+            "PUBREC",
+            "PUBCOMP"
+          ]
+        },
+        "packet_id": {
+          "$ref": "primitives.schema.json#/$defs/packet_id"
+        }
+      }
+    },
+    "FrameWriteProgress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_id",
+        "connection",
+        "bytes_confirmed",
+        "bytes_total"
+      ],
+      "properties": {
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
+        "connection": {
+          "$ref": "primitives.schema.json#/$defs/connection_key"
+        },
+        "bytes_confirmed": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "bytes_total": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "PeerPacketObserved": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client",
+        "packet_kind",
+        "bytes_hex"
+      ],
+      "properties": {
+        "client": {
+          "$ref": "primitives.schema.json#/$defs/name"
+        },
+        "packet_kind": {
+          "enum": [
+            "CONNACK",
+            "PUBREC",
+            "PUBCOMP"
+          ]
+        },
+        "packet_id": {
+          "$ref": "primitives.schema.json#/$defs/packet_id"
+        },
+        "bytes_hex": {
+          "$ref": "primitives.schema.json#/$defs/hex_bytes"
+        }
+      }
+    },
+    "FaultHit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fault_id",
+        "point",
+        "occurrence"
+      ],
+      "properties": {
+        "fault_id": {
+          "$ref": "primitives.schema.json#/$defs/name"
+        },
+        "point": {
+          "$ref": "primitives.schema.json#/$defs/dotted_name"
+        },
+        "occurrence": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "BrokerCrashed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "failure_model"
+      ],
+      "properties": {
+        "failure_model": {
+          "enum": [
+            "process"
+          ]
+        }
+      }
+    },
+    "BrokerRecovered": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_epoch"
+      ],
+      "properties": {
+        "run_epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    }
+  }
+}

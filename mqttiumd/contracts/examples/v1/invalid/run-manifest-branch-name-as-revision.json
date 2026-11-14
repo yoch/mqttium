@@ -1,0 +1,31 @@
+{
+  "format": "mqttiumd.run-manifest",
+  "schema_version": 1,
+  "product": {
+    "revision": "main",
+    "tree_state": "clean",
+    "modified_paths": []
+  },
+  "toolchain": {
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "cargo": "cargo 1.97.0 (c980f4866 2026-06-30)",
+    "host": "x86_64-unknown-linux-gnu"
+  },
+  "build": {
+    "profile": "release",
+    "target": "x86_64-unknown-linux-gnu",
+    "lockfile_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "workspace_manifest_sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "contracts": [
+    {
+      "path": "contracts/schema/v1/primitives.schema.json",
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "bytes": "5382"
+    }
+  ],
+  "platform": {
+    "os": "linux",
+    "arch": "x86_64"
+  }
+}

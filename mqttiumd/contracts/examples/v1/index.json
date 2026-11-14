@@ -1,0 +1,462 @@
+{
+  "format": "mqttiumd.example-index",
+  "schema_version": 1,
+  "valid": [
+    "tests/scenarios/p1/P1-02.json",
+    "tests/fixtures/p1/three-persistent-sessions.json",
+    "contracts/examples/v1/valid/scenario-u64-max.json",
+    "contracts/examples/v1/valid/scenario-qos0-publish.json",
+    "contracts/examples/v1/valid/trace-record-header.json",
+    "contracts/examples/v1/valid/trace-record-store-commit-stable.json",
+    "contracts/examples/v1/valid/trace-record-fault-hit.json",
+    "contracts/examples/v1/valid/trace-record-peer-packet-observed.json",
+    "contracts/examples/v1/valid/trace-record-footer.json",
+    "contracts/examples/v1/valid/run-result-pass.json",
+    "contracts/examples/v1/valid/run-result-fail-with-inconclusive.json",
+    "contracts/examples/v1/valid/run-result-inconclusive-fault-not-hit.json",
+    "contracts/examples/v1/valid/run-manifest-content-only.json",
+    "contracts/examples/v1/valid/toy.catalog.json",
+    "contracts/examples/v1/valid/toy.transitions.complete.json",
+    "contracts/examples/v1/valid/toy.transitions.seed-with-hole.json"
+  ],
+  "invalid": [
+    {
+      "file": "contracts/examples/v1/invalid/scenario-u64-leading-zero.json",
+      "code": "schema-violation",
+      "pointer": "/budgets/max_steps",
+      "why": "A canonical decimal string has no leading zero."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-u64-signed.json",
+      "code": "schema-violation",
+      "pointer": "/budgets/max_steps",
+      "why": "A canonical decimal string has no sign."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-u64-fraction.json",
+      "code": "schema-violation",
+      "pointer": "/budgets/max_steps",
+      "why": "A canonical decimal string has no fraction."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-u64-leading-space.json",
+      "code": "schema-violation",
+      "pointer": "/budgets/max_steps",
+      "why": "A canonical decimal string has no whitespace."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-u64-trailing-line-break.json",
+      "code": "schema-violation",
+      "pointer": "/budgets/max_steps",
+      "why": "The whole string is checked: `$` must not accept a trailing line break."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-u64-as-number.json",
+      "code": "schema-violation",
+      "pointer": "/budgets/max_steps",
+      "why": "64-bit quantities are strings, never JSON numbers."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-u64-empty.json",
+      "code": "schema-violation",
+      "pointer": "/budgets/max_steps",
+      "why": "The empty string is not a number."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-u64-twenty-one-digits.json",
+      "code": "schema-violation",
+      "pointer": "/budgets/max_steps",
+      "why": "At most twenty digits."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-u64-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/budgets/max_trace_bytes",
+      "why": "2^64 matches the pattern and exceeds the range; the semantic pass refuses it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-packet-id-zero.json",
+      "code": "schema-violation",
+      "pointer": "/steps/1/packet_id",
+      "why": "A Packet Identifier is never zero."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-packet-id-65536.json",
+      "code": "schema-violation",
+      "pointer": "/steps/1/packet_id",
+      "why": "A Packet Identifier fits sixteen bits."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-packet-id-negative.json",
+      "code": "schema-violation",
+      "pointer": "/steps/1/packet_id",
+      "why": "A Packet Identifier is positive."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-packet-id-as-string.json",
+      "code": "schema-violation",
+      "pointer": "/steps/1/packet_id",
+      "why": "Packet Identifiers stay JSON integers."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-packet-id-float.json",
+      "code": "number-not-integer",
+      "pointer": "",
+      "why": "7.0 is an integer for JSON Schema; the strict reader refuses the spelling."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-duplicate-key.json",
+      "code": "duplicate-key",
+      "pointer": "",
+      "why": "A duplicate key is refused while parsing, before a map overwrites a value."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-truncated.json",
+      "code": "json-syntax",
+      "pointer": "",
+      "why": "The document ends early."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-two-documents.json",
+      "code": "json-syntax",
+      "pointer": "",
+      "why": "One file holds exactly one JSON value."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-unknown-top-level-member.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "Objects are closed."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-unknown-schema-version.json",
+      "code": "schema-version-unknown",
+      "pointer": "/schema_version",
+      "why": "An unknown version is an error, not a best effort."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-schema-version-as-string.json",
+      "code": "schema-version-unknown",
+      "pointer": "/schema_version",
+      "why": "The version is the integer 1."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-unknown-format.json",
+      "code": "format-unknown",
+      "pointer": "/format",
+      "why": "The format name is closed."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-missing-format.json",
+      "code": "format-unknown",
+      "pointer": "/format",
+      "why": "Every document declares its format."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-unknown-step-kind.json",
+      "code": "schema-violation",
+      "pointer": "/steps/4/kind",
+      "why": "Step kinds are a closed union."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-unknown-step-member.json",
+      "code": "schema-violation",
+      "pointer": "/steps/4",
+      "why": "Each step variant is a closed object."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-missing-step-member.json",
+      "code": "schema-violation",
+      "pointer": "/steps/0",
+      "why": "Every member of a step is required."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-qos2-without-packet-id.json",
+      "code": "schema-violation",
+      "pointer": "/steps/1",
+      "why": "A QoS 2 PUBLISH carries a Packet Identifier."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-qos0-with-packet-id.json",
+      "code": "schema-violation",
+      "pointer": "/steps/1",
+      "why": "A QoS 0 PUBLISH carries no Packet Identifier."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-qos-3.json",
+      "code": "schema-violation",
+      "pointer": "/steps/1/qos",
+      "why": "QoS is 0, 1 or 2."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-payload-hex-odd.json",
+      "code": "schema-violation",
+      "pointer": "/steps/1/payload_hex",
+      "why": "Two hexadecimal digits per byte."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-payload-hex-upper-case.json",
+      "code": "schema-violation",
+      "pointer": "/steps/1/payload_hex",
+      "why": "Lower-case digits only."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-unknown-failure-model.json",
+      "code": "schema-violation",
+      "pointer": "/steps/4/failure_model",
+      "why": "S0 qualifies the process crash only; a power cut is another campaign."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-zero-workers.json",
+      "code": "schema-violation",
+      "pointer": "/steps/5/workers",
+      "why": "A broker has at least one worker."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-empty-steps.json",
+      "code": "schema-violation",
+      "pointer": "/steps",
+      "why": "A scenario has at least one step."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-duplicate-assertion.json",
+      "code": "schema-violation",
+      "pointer": "/assertions",
+      "why": "Assertions are listed once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-binding-undefined-exchange.json",
+      "code": "binding-undefined",
+      "pointer": "/steps/7/exchange",
+      "why": "ClientResumeExchange refers to an exchange no earlier step bound."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-binding-undefined-fault.json",
+      "code": "binding-undefined",
+      "pointer": "/steps/2/binding",
+      "why": "DriveUntil waits for a fault that is not declared."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-binding-undefined-publication.json",
+      "code": "binding-undefined",
+      "pointer": "/faults/0/match/publication_binding",
+      "why": "The fault matches a publication no step binds."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-binding-duplicate.json",
+      "code": "binding-duplicate",
+      "pointer": "/steps/1/bind_exchange_as",
+      "why": "An operation and an exchange share one binding name."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-checkpoint-duplicate.json",
+      "code": "binding-duplicate",
+      "pointer": "/steps/11/checkpoint",
+      "why": "Two inspections share one checkpoint name."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-fault-point-unknown.json",
+      "code": "fault-point-unknown",
+      "pointer": "/faults/0/point",
+      "why": "Injection points are contractual and catalogued."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-fault-action-unknown.json",
+      "code": "fault-action-unknown",
+      "pointer": "/faults/0/action",
+      "why": "The point exists and does not offer this action."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-command-kind-unknown.json",
+      "code": "command-kind-unknown",
+      "pointer": "/faults/0/match/command_kind",
+      "why": "Command kinds are a closed set."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-profile-unknown.json",
+      "code": "profile-unknown",
+      "pointer": "/profile",
+      "why": "Profiles are catalogued."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-assertion-unknown.json",
+      "code": "assertion-unknown",
+      "pointer": "/assertions/6",
+      "why": "An assertion nobody defined cannot be satisfied."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-step-budget-exceeded.json",
+      "code": "budget-exceeded",
+      "pointer": "/steps/0/max_steps",
+      "why": "A step may not run longer than the scenario budget."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-client-unknown.json",
+      "code": "client-unknown",
+      "pointer": "/steps/9/client",
+      "why": "The client is not a session of the fixture."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-fixture-missing.json",
+      "code": "file-unreadable",
+      "pointer": "/initial_fixture",
+      "why": "The fixture file does not exist."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-fixture-path-escape.json",
+      "code": "path-escape",
+      "pointer": "/initial_fixture",
+      "why": "A path may not leave the mqttiumd root."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-fixture-wrong-format.json",
+      "code": "reference-invalid",
+      "pointer": "/initial_fixture",
+      "why": "The referenced file is valid and is not a fixture."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-inspect-while-crashed.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/4",
+      "why": "Nothing reads the store between the kill and the restart (ADR 0002)."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-restart-while-running.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/4",
+      "why": "RestartBroker needs a crashed broker."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/fixture-route-target-unknown.json",
+      "code": "client-unknown",
+      "pointer": "/routes/0/targets/1/client",
+      "why": "A route targets a session the fixture does not create."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/fixture-duplicate-client-id.json",
+      "code": "duplicate-name",
+      "pointer": "/sessions/2/client_id",
+      "why": "Two sessions share one ClientID."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/fixture-capacity-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/capacities/payload_bytes",
+      "why": "Capacities are 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/fixture-session-not-persistent.json",
+      "code": "schema-violation",
+      "pointer": "/sessions/0/persistent",
+      "why": "S0 fixtures hold persistent sessions only."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-store-truth-from-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "Hidden store truth belongs to the evidence origin; the core never states it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-unknown-kind.json",
+      "code": "schema-violation",
+      "pointer": "/kind",
+      "why": "Record kinds are a closed union."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-payload-of-another-kind.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "The payload shape follows the kind."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-operation-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/operation_id/sequence",
+      "why": "Identity components are 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-exit-code-mismatch.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "PASS exits 0."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-pass-with-failed-assertion.json",
+      "code": "verdict-inconsistent",
+      "pointer": "/verdict",
+      "why": "An established FAIL stands."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-pass-with-inconclusive-assertion.json",
+      "code": "verdict-inconsistent",
+      "pointer": "/verdict",
+      "why": "A mandatory inconclusive assertion blocks the pass."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-inconclusive-hides-fail.json",
+      "code": "verdict-inconsistent",
+      "pointer": "/verdict",
+      "why": "A FAIL is not softened into INCONCLUSIVE."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-pass-with-fault-not-hit.json",
+      "code": "verdict-inconsistent",
+      "pointer": "/verdict",
+      "why": "An injection that was not reached proves nothing."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-branch-name-as-revision.json",
+      "code": "schema-violation",
+      "pointer": "/product/revision",
+      "why": "A branch name does not identify a content."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/toy.transitions.hole.json",
+      "code": "registry-hole",
+      "pointer": "/rules",
+      "why": "A registry declared complete leaves Busy x Stop without a rule."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/toy.transitions.overlap.json",
+      "code": "registry-overlap",
+      "pointer": "/rules/5",
+      "why": "Two rules cover Idle x Tick; there is no implicit priority."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/toy.transitions.unknown-state.json",
+      "code": "catalog-reference-unknown",
+      "pointer": "/rules/0/next_state_class",
+      "why": "The next state class is not in the catalogue."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/toy.transitions.unknown-guard-value.json",
+      "code": "catalog-reference-unknown",
+      "pointer": "/rules/0/guard_partition/capacity/0",
+      "why": "A guard value must be defined by the catalogue, not free text."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/toy.transitions.unknown-requirement.json",
+      "code": "requirement-unknown",
+      "pointer": "/rules/0/requirements/0",
+      "why": "A rule cites a requirement that does not exist."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/toy.transitions.effect-conflict.json",
+      "code": "registry-effect-conflict",
+      "pointer": "/rules/0/forbidden_effects/0",
+      "why": "One effect is both required and forbidden."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/toy.transitions.unreachable-without-justification.json",
+      "code": "schema-violation",
+      "pointer": "/rules/3",
+      "why": "UNREACHABLE needs a justification and a witness of the excluding precondition."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/toy.transitions.catalog-missing.json",
+      "code": "file-unreadable",
+      "pointer": "/catalog",
+      "why": "The catalogue file does not exist."
+    }
+  ]
+}

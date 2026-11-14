@@ -1,0 +1,50 @@
+{
+  "format": "mqttiumd.transition-catalog",
+  "schema_version": 1,
+  "id": "toy",
+  "guard_dimensions": [
+    {
+      "name": "capacity",
+      "values": [
+        {
+          "value": "sufficient",
+          "meaning": "Room is available."
+        },
+        {
+          "value": "insufficient",
+          "meaning": "Room is missing."
+        }
+      ]
+    }
+  ],
+  "event_classes": [
+    {
+      "name": "Tick",
+      "meaning": "Work arrives.",
+      "guard_dimensions": [
+        "capacity"
+      ]
+    },
+    {
+      "name": "Stop",
+      "meaning": "Work ends.",
+      "guard_dimensions": []
+    }
+  ],
+  "effects": [
+    "Persist"
+  ],
+  "machines": [
+    {
+      "name": "toy",
+      "state_classes": [
+        "Idle",
+        "Busy"
+      ],
+      "event_classes": [
+        "Tick",
+        "Stop"
+      ]
+    }
+  ]
+}

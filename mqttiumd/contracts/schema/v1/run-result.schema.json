@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mqttiumd run result",
+  "description": "Verdict, reasons and evidence inventory of one run (DEM-023).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "schema_version",
+    "run_id",
+    "verdict",
+    "exit_code",
+    "scope",
+    "reasons",
+    "assertions",
+    "faults",
+    "artifacts"
+  ],
+  "properties": {
+    "format": {
+      "const": "mqttiumd.run-result"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "run_id": {
+      "$ref": "primitives.schema.json#/$defs/slug"
+    },
+    "verdict": {
+      "$ref": "primitives.schema.json#/$defs/verdict"
+    },
+    "exit_code": {
+      "type": "integer",
+      "enum": [
+        0,
+        1,
+        2,
+        3
+      ]
+    },
+    "scope": {
+      "$ref": "primitives.schema.json#/$defs/text"
+    },
+    "reasons": {
+      "type": "array",
+      "items": {
+        "$ref": "primitives.schema.json#/$defs/text"
+      },
+      "maxItems": 256
+    },
+    "assertions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "status"
+        ],
+        "properties": {
+          "name": {
+            "$ref": "primitives.schema.json#/$defs/binding"
+          },
+          "status": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "INCONCLUSIVE",
+              "OUT_OF_SCOPE"
+            ]
+          },
+          "detail": {
+            "$ref": "primitives.schema.json#/$defs/text"
+          }
+        }
+      },
+      "maxItems": 256
+    },
+    "faults": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "expected_hits",
+          "hits"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "primitives.schema.json#/$defs/name"
+          },
+          "expected_hits": {
+            "$ref": "primitives.schema.json#/$defs/u64"
+          },
+          "hits": {
+            "$ref": "primitives.schema.json#/$defs/u64"
+          }
+        }
+      },
+      "maxItems": 64
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "primitives.schema.json#/$defs/artifact"
+      },
+      "maxItems": 1024
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "verdict": {
+          "const": "PASS"
+        },
+        "exit_code": {
+          "const": 0
+        }
+      }
+    },
+    {
+      "properties": {
+        "verdict": {
+          "const": "FAIL"
+        },
+        "exit_code": {
+          "const": 1
+        }
+      }
+    },
+    {
+      "properties": {
+        "verdict": {
+          "const": "INCONCLUSIVE"
+        },
+        "exit_code": {
+          "const": 2
+        }
+      }
+    },
+    {
+      "properties": {
+        "verdict": {
+          "const": "OUT_OF_SCOPE"
+        },
+        "exit_code": {
+          "const": 3
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mqttiumd fixture",
+  "description": "Declarative initial state. The bench materialises it through valid store commands; it is never copied into a store as raw rows (DEM-002).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "schema_version",
+    "id",
+    "profile",
+    "store",
+    "sessions",
+    "routes",
+    "capacities"
+  ],
+  "properties": {
+    "format": {
+      "const": "mqttiumd.fixture"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "primitives.schema.json#/$defs/slug"
+    },
+    "profile": {
+      "$ref": "primitives.schema.json#/$defs/slug"
+    },
+    "store": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "sessions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "client",
+          "client_id",
+          "persistent",
+          "connected"
+        ],
+        "properties": {
+          "client": {
+            "$ref": "primitives.schema.json#/$defs/name"
+          },
+          "client_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "persistent": {
+            "const": true
+          },
+          "connected": {
+            "const": false
+          }
+        }
+      },
+      "minItems": 1,
+      "maxItems": 64
+    },
+    "routes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "topic",
+          "targets"
+        ],
+        "properties": {
+          "topic": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65535
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "client",
+                "qos"
+              ],
+              "properties": {
+                "client": {
+                  "$ref": "primitives.schema.json#/$defs/name"
+                },
+                "qos": {
+                  "$ref": "primitives.schema.json#/$defs/qos"
+                }
+              }
+            },
+            "minItems": 1,
+            "maxItems": 64
+          }
+        }
+      },
+      "maxItems": 64
+    },
+    "capacities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_slots",
+        "result_slots",
+        "store_operations_in_flight",
+        "payload_bytes",
+        "references",
+        "exchange_slots",
+        "receipt_slots",
+        "max_targets_per_admission",
+        "max_topic_bytes",
+        "max_payload_bytes"
+      ],
+      "properties": {
+        "effect_slots": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "result_slots": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "store_operations_in_flight": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "payload_bytes": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "references": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "exchange_slots": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "receipt_slots": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "max_targets_per_admission": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "max_topic_bytes": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "max_payload_bytes": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    }
+  }
+}

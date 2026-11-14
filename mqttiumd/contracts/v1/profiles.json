@@ -1,0 +1,27 @@
+{
+  "format": "mqttiumd.profile-catalog",
+  "schema_version": 1,
+  "profiles": [
+    {
+      "id": "p1-durable-mqtt5-without-expiry",
+      "protocol": "mqtt-5.0",
+      "durability": "durable",
+      "includes": [
+        "CONNECT and CONNACK resuming a persistent session prepared by the fixture",
+        "inbound PUBLISH QoS 2, PUBREC, PUBREL and PUBCOMP",
+        "exact-topic routes initialised by the fixture",
+        "QoS 1 obligations towards offline persistent sessions"
+      ],
+      "excludes": [
+        "message expiry",
+        "Will",
+        "retained messages",
+        "wildcard filters",
+        "shared subscriptions",
+        "authorization changes",
+        "general CONNECT and SUBSCRIBE branches",
+        "emission towards recipients"
+      ]
+    }
+  ]
+}

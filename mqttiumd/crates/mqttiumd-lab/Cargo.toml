@@ -1,0 +1,20 @@
+[package]
+name = "mqttiumd-lab"
+description = "Bench of mqttiumd: contract validation now, deterministic store, scheduler and injections with later lots."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mqttiumd-contract.workspace = true
+# Offline only: no HTTP or file retriever is compiled in, so a schema can
+# never be downloaded during a run (DEM-014).
+jsonschema = { version = "0.61.2", default-features = false }
+serde = "1"
+serde_json = "1"
+sha2 = "0.11"
+
+[lints]
+workspace = true

@@ -1,0 +1,48 @@
+name: mqttiumd
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "mqttiumd/**"
+      - ".github/workflows/mqttiumd.yml"
+  pull_request:
+    paths:
+      - "mqttiumd/**"
+      - ".github/workflows/mqttiumd.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttiumd-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    working-directory: mqttiumd
+
+jobs:
+  contracts:
+    name: contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      # The toolchain is pinned by mqttiumd/rust-toolchain.toml.
+      - name: Install the pinned toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: Validate the contracts and scenario P1-02
+        run: >-
+          cargo run --quiet --locked -p mqttiumd-lab -- validate
+          --contracts contracts/v1
+          --scenario tests/scenarios/p1/P1-02.json
