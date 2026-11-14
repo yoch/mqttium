@@ -70,7 +70,10 @@ python tools/check_schemas.py
 
 ## Roles and file ownership
 
-One lot per branch. A lot touches only its own paths.
+One lot per branch. A lot touches only its own paths. The lots of the
+first wave, the paths each owns and the way contract changes are
+coordinated are in `docs/missions/README.md`; read your lot's mission
+before you start.
 
 | Role | Owns | May not change alone |
 | - | - | - |

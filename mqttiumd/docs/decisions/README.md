@@ -23,6 +23,7 @@ its source; a test fails when the register and the records drift apart.
 | [0006](0006-plan-then-apply.md) | Accepted with amendments | Shape of a core transition | L0 in part, L1, L6 |
 | [0007](0007-pure-crate-boundary.md) | Accepted with amendments | How the purity of the core is enforced | L0 |
 | [0008](0008-early-writer-measurement.md) | Accepted with amendments | An early, non-qualifying measurement of the single writer | L7 |
+| [0009](0009-owner-authority.md) | Proposed | Creation authority for owners and effect boxes | L1, once decided |
 
 What each record leaves open is tracked in
 [`../reception/open-conditions.md`](../reception/open-conditions.md).

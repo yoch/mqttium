@@ -21,6 +21,7 @@ claim.
 | `tools/build_corpus.py` | Rebuilds the derived contract files: the requirement register and the examples |
 | `tools/check_schemas.py` | A second, independent reader of the schemas, with pinned versions |
 | `docs/reception/open-conditions.md` | What is deliberately not done yet, and which lot closes it |
+| `docs/missions/` | The mission of each lot of the first wave: deliverables, reception, ownership |
 | `contracts/schema/v1/` | JSON Schema 2020-12 files of every v1 format |
 | `contracts/v1/` | Catalogues, requirement register, seed transition registry |
 | `contracts/examples/v1/` | Valid and invalid examples with the reason each invalid one must be refused for |
@@ -55,4 +56,6 @@ are refused and report no verdict.
 2. `docs/decisions/README.md` for what was decided and what is proposed.
 3. `contracts/README.md` for the formats and the example corpus.
 4. `docs/reception/open-conditions.md` for what later lots must close.
-5. `AGENTS.md` before changing anything.
+5. `docs/missions/README.md` for the lots of the first wave and how their
+   contract changes are coordinated.
+6. `AGENTS.md` before changing anything.
