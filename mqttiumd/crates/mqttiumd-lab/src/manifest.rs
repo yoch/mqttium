@@ -124,20 +124,44 @@ fn describe(root: &Path, path: &str) -> Result<String, String> {
         .map_err(|error| format!("{path}: {error}"))
 }
 
-/// Digest of what differs from the revision: one `<content>  <path>` line
-/// per path that differs from it or is untracked, in path order. The
-/// content is the SHA-256 of a regular file, `link:<target>` for a symbolic
-/// link, `deleted` for a missing path. It depends on the content of the
-/// work tree only, not on how git is configured to print a difference.
-fn modifications_digest(root: &Path) -> Result<String, String> {
+/// A path that holds no file, to stand in for the user's exclude file.
+const NO_FILE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
+/// The paths below `root` that differ from the revision or are untracked,
+/// in path order, each once.
+///
+/// The list is defined by paths, not by what git would display. Rename
+/// detection is off: a renamed file is one path that disappeared and one
+/// that appeared, whatever `diff.renames` says. External diff drivers and
+/// text conversions are off. The user-level exclude file is ignored: it is
+/// configuration of a person, not content of the tree.
+///
+/// What git itself considers modified still applies: the `.gitignore`
+/// files of the tree, the exclude file of the clone, and the file-mode and
+/// line-ending settings of the repository.
+fn modified_paths(root: &Path) -> Result<Vec<String>, String> {
     let mut listing = run_bytes(
         "git",
-        &["diff", "--name-only", "--relative", "-z", "HEAD", "--", "."],
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--relative",
+            "-z",
+            "HEAD",
+            "--",
+            ".",
+        ],
         root,
     )?;
+    let exclude = format!("core.excludesFile={NO_FILE}");
     listing.extend(run_bytes(
         "git",
         &[
+            "-c",
+            &exclude,
             "ls-files",
             "--others",
             "--exclude-standard",
@@ -154,8 +178,15 @@ fn modifications_digest(root: &Path) -> Result<String, String> {
         .collect();
     paths.sort();
     paths.dedup();
+    Ok(paths)
+}
+
+/// Digest of what differs from the revision: one `<content>  <path>` line
+/// per path of [`modified_paths`]. The content is the SHA-256 of a regular
+/// file, `link:<target>` for a symbolic link, `deleted` for a missing path.
+fn modifications_digest(root: &Path) -> Result<String, String> {
     let mut content = String::new();
-    for path in paths {
+    for path in modified_paths(root)? {
         content.push_str(&format!("{}  {path}\n", describe(root, &path)?));
     }
     Ok(sha256_hex(content.as_bytes()))
@@ -231,7 +262,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use super::{contracts_digest, describe, modifications_digest, sha256_hex};
+    use super::{contracts_digest, describe, modifications_digest, modified_paths, sha256_hex};
 
     fn git(root: &Path, arguments: &[&str]) {
         let status = Command::new("git")
@@ -267,10 +298,16 @@ mod tests {
         git(&root, &["mv", "old.rs", "new.rs"]);
         git(&root, &["config", "diff.renames", "true"]);
         let detected = modifications_digest(&root).expect("digest");
+        let paths_detected = modified_paths(&root).expect("paths");
         git(&root, &["config", "diff.renames", "false"]);
         let undetected = modifications_digest(&root).expect("digest");
+        let paths_undetected = modified_paths(&root).expect("paths");
         fs::remove_dir_all(&root).expect("cleanup");
         assert_eq!(detected, undetected, "one work tree, two digests");
+        assert_ne!(detected, sha256_hex(b""), "the rename is a modification");
+        // A rename is one path gone and one path new, under both settings.
+        assert_eq!(paths_detected, vec!["new.rs", "old.rs"]);
+        assert_eq!(paths_undetected, paths_detected);
     }
 
     #[test]
@@ -286,8 +323,10 @@ mod tests {
             &["config", "core.excludesFile", &ignore.to_string_lossy()],
         );
         let ignored = modifications_digest(&root).expect("digest");
+        let paths = modified_paths(&root).expect("paths");
         fs::remove_dir_all(&root).expect("cleanup");
         assert_eq!(listed, ignored, "one work tree, two digests");
+        assert_eq!(paths, vec!["scratch.tmp"]);
     }
 
     #[cfg(unix)]
