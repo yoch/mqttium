@@ -499,6 +499,32 @@ mod tests {
     }
 
     #[test]
+    fn a_reservation_cannot_publish_into_another_outbox() {
+        let mut first = Outbox::with_capacity(EffectSlots::new(2)).expect("small");
+        let mut second = Outbox::with_capacity(EffectSlots::new(2)).expect("small");
+        let mut foreign = first.reserve(1).expect("room");
+        let refused = second.publish(&mut foreign, effect(0));
+        assert_eq!(refused, Err(effect(0)), "the effect must come back");
+        assert!(second.is_empty(), "the other outbox was mutated");
+        assert_eq!(second.free_slots(), 2);
+        assert_eq!(first.free_slots(), 1);
+    }
+
+    #[test]
+    fn a_reservation_cannot_be_released_into_another_outbox() {
+        let mut first = Outbox::with_capacity(EffectSlots::new(2)).expect("small");
+        let mut second = Outbox::with_capacity(EffectSlots::new(2)).expect("small");
+        let foreign = first.reserve(1).expect("room");
+        second.release(foreign);
+        assert_eq!(
+            second.free_slots(),
+            2,
+            "the other outbox gained or lost slots"
+        );
+        assert_eq!(first.free_slots(), 1);
+    }
+
+    #[test]
     fn effects_survive_between_turns_while_the_sink_stays_closed() {
         struct ClosedSink;
         impl EffectSink for ClosedSink {

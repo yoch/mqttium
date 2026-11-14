@@ -550,6 +550,15 @@ mod tests {
     }
 
     #[test]
+    fn a_decoded_recipe_equals_the_recipe_that_was_encoded() {
+        // Two targets held in a container bounded at four.
+        let recipe = admission(&[target(11, 0), target(12, 1)]);
+        let decoded = Recipe::decode_canonical(&encode(&recipe), 4, 64).expect("canonical");
+        assert_eq!(encode(&decoded), encode(&recipe));
+        assert_eq!(decoded, recipe, "equal canonical bytes, unequal recipes");
+    }
+
+    #[test]
     fn layout_is_pinned() {
         let bytes = encode(&admission(&[target(11, 0)]));
         assert_eq!(&bytes[0..4], b"MQDR");

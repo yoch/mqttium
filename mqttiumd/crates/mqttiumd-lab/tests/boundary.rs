@@ -90,6 +90,33 @@ fn the_rules_reject_what_they_are_meant_to_reject() {
 }
 
 #[test]
+fn the_rules_see_the_original_spellings() {
+    for source in [
+        "fn decide() -> bool { cfg!(debug_assertions) }",
+        "fn decide() -> bool { cfg ! (feature = \"sim\") }",
+        "extern  crate std;",
+        "extern\ncrate std;",
+        "fn f() { unsafe{ core::hint::unreachable_unchecked() } }",
+        "fn step() { other() . await }",
+        "pub async\nfn step() {}",
+        "#[cfg (simulation)]\nfn decide() {}",
+    ] {
+        assert!(!violations(source).is_empty(), "accepted: {source}");
+    }
+    for source in [
+        "// unsafe code and async fn are discussed here, with cfg(simulation)\nfn f() {}",
+        "fn f() -> &'static str { \"extern crate std; .await unsafe \" }",
+        "/// See `cfg(feature)` and `async move` in the guide.\nfn f() {}",
+    ] {
+        assert_eq!(
+            violations(source),
+            Vec::<String>::new(),
+            "refused: {source}"
+        );
+    }
+}
+
+#[test]
 fn pure_crates_keep_their_source_rules() {
     for name in ["mqttiumd-contract", "mqttiumd-core"] {
         let directory = root().join("crates").join(name).join("src");
