@@ -46,3 +46,12 @@ jobs:
           cargo run --quiet --locked -p mqttiumd-lab -- validate
           --contracts contracts/v1
           --scenario tests/scenarios/p1/P1-02.json
+      # A second, unrelated JSON Schema implementation must read the schema
+      # files the same way. Versions are pinned in tools/requirements.txt.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+      - name: Second schema reader
+        run: |
+          python -m pip install --disable-pip-version-check -r tools/requirements.txt
+          python tools/check_schemas.py
