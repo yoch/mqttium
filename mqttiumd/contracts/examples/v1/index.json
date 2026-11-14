@@ -11,9 +11,11 @@
     "contracts/examples/v1/valid/trace-record-fault-hit.json",
     "contracts/examples/v1/valid/trace-record-peer-packet-observed.json",
     "contracts/examples/v1/valid/trace-record-footer.json",
-    "contracts/examples/v1/valid/run-result-pass.json",
-    "contracts/examples/v1/valid/run-result-fail-with-inconclusive.json",
-    "contracts/examples/v1/valid/run-result-inconclusive-fault-not-hit.json",
+    "contracts/examples/v1/valid/run-result-provisional-all-passing.json",
+    "contracts/examples/v1/valid/run-result-provisional-fail-with-inconclusive.json",
+    "contracts/examples/v1/valid/run-result-provisional-fault-not-hit.json",
+    "contracts/examples/v1/valid/run-result-provisional-out-of-scope.json",
+    "contracts/examples/v1/valid/run-result-provisional-nothing-evaluated.json",
     "contracts/examples/v1/valid/run-manifest-content-only.json",
     "contracts/examples/v1/valid/toy.catalog.json",
     "contracts/examples/v1/valid/toy.transitions.complete.json",
@@ -376,40 +378,88 @@
       "why": "Identity components are 64-bit."
     },
     {
+      "file": "contracts/examples/v1/invalid/run-result-provisional-pass.json",
+      "code": "schema-violation",
+      "pointer": "/verdict",
+      "why": "A provisional document lacks the evidence a PASS states."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-pass-with-only-out-of-scope.json",
+      "code": "schema-violation",
+      "pointer": "/verdict",
+      "why": "Out-of-scope assertions never add up to a PASS."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-qualifying-with-empty-lists.json",
+      "code": "schema-violation",
+      "pointer": "/assertions",
+      "why": "A qualifying result names its scenario, manifest, trace and contracts, and holds assertions."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-without-qualification.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "Every result says whether it is provisional or qualifying."
+    },
+    {
       "file": "contracts/examples/v1/invalid/run-result-exit-code-mismatch.json",
       "code": "schema-violation",
       "pointer": "",
-      "why": "PASS exits 0."
-    },
-    {
-      "file": "contracts/examples/v1/invalid/run-result-pass-with-failed-assertion.json",
-      "code": "verdict-inconsistent",
-      "pointer": "/verdict",
-      "why": "An established FAIL stands."
-    },
-    {
-      "file": "contracts/examples/v1/invalid/run-result-pass-with-inconclusive-assertion.json",
-      "code": "verdict-inconsistent",
-      "pointer": "/verdict",
-      "why": "A mandatory inconclusive assertion blocks the pass."
+      "why": "INCONCLUSIVE exits 2."
     },
     {
       "file": "contracts/examples/v1/invalid/run-result-inconclusive-hides-fail.json",
       "code": "verdict-inconsistent",
       "pointer": "/verdict",
-      "why": "A FAIL is not softened into INCONCLUSIVE."
+      "why": "An established FAIL stands; it is not softened into INCONCLUSIVE."
     },
     {
-      "file": "contracts/examples/v1/invalid/run-result-pass-with-fault-not-hit.json",
+      "file": "contracts/examples/v1/invalid/run-result-fail-without-failed-assertion.json",
+      "code": "verdict-inconsistent",
+      "pointer": "/verdict",
+      "why": "The verdict is the one the assertions determine, neither better nor worse."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-out-of-scope-with-nothing-evaluated.json",
+      "code": "verdict-inconsistent",
+      "pointer": "/verdict",
+      "why": "An empty list concludes nothing; it is inconclusive, not out of scope."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-out-of-scope-with-fault-not-hit.json",
       "code": "verdict-inconsistent",
       "pointer": "/verdict",
       "why": "An injection that was not reached proves nothing."
     },
     {
+      "file": "contracts/examples/v1/invalid/run-result-inconclusive-with-out-of-scope.json",
+      "code": "verdict-inconsistent",
+      "pointer": "/verdict",
+      "why": "Without failure or doubt, an out-of-scope assertion makes the run out of scope."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-duplicate-assertion.json",
+      "code": "duplicate-name",
+      "pointer": "/assertions/1/name",
+      "why": "An assertion is reported once."
+    },
+    {
       "file": "contracts/examples/v1/invalid/run-manifest-branch-name-as-revision.json",
       "code": "schema-violation",
-      "pointer": "/product/revision",
+      "pointer": "/checkout/revision",
       "why": "A branch name does not identify a content."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-without-artifact.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "A manifest identifies the binary that ran."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-digest-of-other-contracts.json",
+      "code": "evidence-mismatch",
+      "pointer": "/contracts_digest",
+      "why": "The contract digest is the digest of the files the manifest lists."
     },
     {
       "file": "contracts/examples/v1/invalid/toy.transitions.hole.json",

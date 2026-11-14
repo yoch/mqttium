@@ -1,6 +1,7 @@
 {
   "format": "mqttiumd.run-result",
   "schema_version": 1,
+  "qualification": "provisional",
   "run_id": "p1-02-example",
   "verdict": "INCONCLUSIVE",
   "exit_code": 2,
@@ -8,22 +9,20 @@
   "reasons": [],
   "assertions": [
     {
+      "name": "trace_complete",
+      "status": "PASS"
+    },
+    {
       "name": "all_required_faults_hit",
-      "status": "INCONCLUSIVE"
+      "status": "PASS"
     }
   ],
   "faults": [
     {
       "id": "lost_admission_result",
       "expected_hits": "1",
-      "hits": "0"
+      "hits": "1"
     }
   ],
-  "artifacts": [
-    {
-      "path": "runs/p1-02/trace.jsonl",
-      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "bytes": "4096"
-    }
-  ]
+  "artifacts": []
 }

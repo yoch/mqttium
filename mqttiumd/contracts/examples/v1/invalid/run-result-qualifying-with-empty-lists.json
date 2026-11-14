@@ -1,0 +1,13 @@
+{
+  "format": "mqttiumd.run-result",
+  "schema_version": 1,
+  "qualification": "qualifying",
+  "run_id": "p1-02-example",
+  "verdict": "PASS",
+  "exit_code": 0,
+  "scope": "P1-02 on sim-store, core perimeter without bytes",
+  "reasons": [],
+  "assertions": [],
+  "faults": [],
+  "artifacts": []
+}

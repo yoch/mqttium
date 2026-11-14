@@ -147,10 +147,8 @@ fn violations(source: &str) -> Vec<String> {
                     found.push("uses `#[path]`".to_owned());
                 }
             }
-            _ if name.starts_with("cfg") => {
-                if !allowed_cfg(&tokens, index) {
-                    found.push(format!("uses `{name}` outside the allowed forms"));
-                }
+            _ if name.starts_with("cfg") && !allowed_cfg(&tokens, index) => {
+                found.push(format!("uses `{name}` outside the allowed forms"));
             }
             _ => {}
         }

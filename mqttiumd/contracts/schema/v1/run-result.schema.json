@@ -7,6 +7,7 @@
   "required": [
     "format",
     "schema_version",
+    "qualification",
     "run_id",
     "verdict",
     "exit_code",
@@ -22,6 +23,13 @@
     },
     "schema_version": {
       "const": 1
+    },
+    "qualification": {
+      "description": "`provisional`: a development document; it never carries PASS. `qualifying`: a result offered as evidence; it names its scenario, manifest and trace by digest and covers every assertion and fault of its scenario.",
+      "enum": [
+        "provisional",
+        "qualifying"
+      ]
     },
     "run_id": {
       "$ref": "primitives.schema.json#/$defs/slug"
@@ -100,6 +108,18 @@
       },
       "maxItems": 64
     },
+    "scenario": {
+      "$ref": "primitives.schema.json#/$defs/artifact"
+    },
+    "manifest": {
+      "$ref": "primitives.schema.json#/$defs/artifact"
+    },
+    "trace": {
+      "$ref": "primitives.schema.json#/$defs/artifact"
+    },
+    "contracts_digest": {
+      "$ref": "primitives.schema.json#/$defs/sha256"
+    },
     "artifacts": {
       "type": "array",
       "items": {
@@ -108,6 +128,56 @@
       "maxItems": 1024
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "qualification"
+        ],
+        "properties": {
+          "qualification": {
+            "const": "qualifying"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "scenario",
+          "manifest",
+          "trace",
+          "contracts_digest"
+        ],
+        "properties": {
+          "assertions": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "qualification"
+        ],
+        "properties": {
+          "qualification": {
+            "const": "provisional"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "verdict": {
+            "enum": [
+              "FAIL",
+              "INCONCLUSIVE",
+              "OUT_OF_SCOPE"
+            ]
+          }
+        }
+      }
+    }
+  ],
   "oneOf": [
     {
       "properties": {

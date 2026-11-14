@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::diagnostic::{Diagnostic, Report, code};
 use crate::schemas::Schemas;
-use crate::{semantic, strict};
+use crate::{manifest, semantic, strict};
 
 /// The closed catalogues that documents refer to.
 #[derive(Default)]
@@ -139,6 +139,7 @@ pub struct Workspace {
     contracts: PathBuf,
     schemas: Schemas,
     catalogs: Catalogs,
+    contracts_digest: String,
     active: ReferenceStack,
 }
 
@@ -166,6 +167,13 @@ impl Workspace {
     /// Opens the contract directory `contracts`, given relative to `root`.
     /// Schemas are read from the sibling `schema/<version>` directory.
     pub fn open(root: &Path, contracts: &Path) -> Result<Self, Diagnostic> {
+        let files = manifest::contract_files(root, &contracts.to_string_lossy())
+            .map_err(|message| Diagnostic::new(code::FILE_UNREADABLE, "", message))?;
+        let contracts_digest = manifest::contracts_digest(
+            files
+                .iter()
+                .map(|file| (file.sha256.as_str(), file.path.as_str())),
+        );
         let contracts = root.join(contracts);
         let version = contracts.file_name().ok_or_else(|| {
             Diagnostic::new(
@@ -192,6 +200,7 @@ impl Workspace {
             contracts,
             schemas: Schemas::load(&schema_dir)?,
             catalogs: Catalogs::default(),
+            contracts_digest,
             active: ReferenceStack::default(),
         };
 
@@ -246,6 +255,11 @@ impl Workspace {
     /// The catalogues of this contract directory.
     pub fn catalogs(&self) -> &Catalogs {
         &self.catalogs
+    }
+
+    /// The identity of this contract revision by exact content.
+    pub fn contracts_digest(&self) -> &str {
+        &self.contracts_digest
     }
 
     /// The root that relative paths of documents are joined to.

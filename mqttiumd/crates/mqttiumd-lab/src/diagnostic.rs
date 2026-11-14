@@ -74,9 +74,14 @@ pub mod code {
     pub const REGISTRY_EFFECT_CONFLICT: &str = "registry-effect-conflict";
     /// The verdict is not the one its assertions and injections determine.
     pub const VERDICT_INCONSISTENT: &str = "verdict-inconsistent";
+    /// A qualifying result does not cover what its scenario requires.
+    pub const RESULT_INCOMPLETE: &str = "result-incomplete";
+    /// A file cited as evidence, or a contract digest, is not the declared
+    /// one.
+    pub const EVIDENCE_MISMATCH: &str = "evidence-mismatch";
 
     /// Every code, so that the example corpus can prove it exercises them.
-    pub const ALL: [&str; 32] = [
+    pub const ALL: [&str; 34] = [
         JSON_SYNTAX,
         DUPLICATE_KEY,
         NUMBER_NOT_INTEGER,
@@ -109,6 +114,8 @@ pub mod code {
         COVERAGE_BUDGET_EXCEEDED,
         REGISTRY_EFFECT_CONFLICT,
         VERDICT_INCONSISTENT,
+        RESULT_INCOMPLETE,
+        EVIDENCE_MISMATCH,
     ];
 }
 

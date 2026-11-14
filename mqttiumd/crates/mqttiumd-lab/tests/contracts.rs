@@ -147,12 +147,15 @@ fn the_corpus_exercises_every_code_it_can() {
     // Tested where they are raised, because no static example can carry
     // them: a schema file that is not local, a decimal string that a lax
     // schema validator would let through, a reference cycle that the
-    // acyclic format table already excludes, and a 16 MiB document.
+    // acyclic format table already excludes, a 16 MiB document, and a
+    // qualifying result, which names files and contracts by digest and is
+    // built by `tests/qualifying.rs`.
     let elsewhere = [
         code::SCHEMA_NOT_LOCAL,
         code::U64_NOT_CANONICAL,
         code::REFERENCE_CYCLE,
         code::FILE_TOO_LARGE,
+        code::RESULT_INCOMPLETE,
     ];
     for known in code::ALL {
         assert!(
@@ -177,7 +180,7 @@ fn the_scenario_file_is_the_text_of_the_specification() {
 
 #[test]
 fn a_collected_manifest_satisfies_its_schema() {
-    let manifest = manifest::collect(&root()).expect("the manifest is collected");
+    let manifest = manifest::collect(&root(), "contracts/v1").expect("the manifest is collected");
     let report = workspace().check_value(&manifest);
     assert!(report.is_accepted(), "{:?}", report.diagnostics);
     let contracts = manifest["contracts"].as_array().expect("contracts");

@@ -1,8 +1,9 @@
 {
   "format": "mqttiumd.run-result",
   "schema_version": 1,
+  "qualification": "provisional",
   "run_id": "p1-02-example",
-  "verdict": "PASS",
+  "verdict": "INCONCLUSIVE",
   "exit_code": 1,
   "scope": "P1-02 on sim-store, core perimeter without bytes",
   "reasons": [],
@@ -23,11 +24,5 @@
       "hits": "1"
     }
   ],
-  "artifacts": [
-    {
-      "path": "runs/p1-02/trace.jsonl",
-      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "bytes": "4096"
-    }
-  ]
+  "artifacts": []
 }

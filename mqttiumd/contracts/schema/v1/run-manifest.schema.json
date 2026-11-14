@@ -1,16 +1,17 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "mqttiumd run manifest",
-  "description": "Exact content and configuration of one run (DEM-003, V3-002). Lot L0 fills the content sections; the experiment sections become required with the lots that produce them.",
+  "description": "Exact content and configuration of one run (DEM-003, V3-002). It keeps apart what is certain about the running binary (`artifact`) from what was observed in the checkout when it ran (`checkout`); it does not claim that the binary was built from that checkout. The experiment sections become required with the lots that run something.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "format",
     "schema_version",
-    "product",
-    "toolchain",
-    "build",
+    "artifact",
+    "checkout",
+    "tools_at_execution",
     "contracts",
+    "contracts_digest",
     "platform"
   ],
   "properties": {
@@ -20,15 +21,73 @@
     "schema_version": {
       "const": 1
     },
-    "product": {
+    "artifact": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "revision",
-        "tree_state",
-        "modified_paths"
+        "sha256",
+        "bytes",
+        "built_with"
       ],
       "properties": {
+        "sha256": {
+          "$ref": "primitives.schema.json#/$defs/sha256"
+        },
+        "bytes": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "built_with": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rustc",
+            "target",
+            "profile",
+            "opt_level",
+            "debug_assertions",
+            "rustflags"
+          ],
+          "properties": {
+            "rustc": {
+              "$ref": "primitives.schema.json#/$defs/text"
+            },
+            "target": {
+              "$ref": "primitives.schema.json#/$defs/text"
+            },
+            "profile": {
+              "$ref": "primitives.schema.json#/$defs/text"
+            },
+            "opt_level": {
+              "$ref": "primitives.schema.json#/$defs/text"
+            },
+            "debug_assertions": {
+              "type": "boolean"
+            },
+            "rustflags": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          }
+        }
+      },
+      "description": "The binary that produced this manifest: its digest, and the build parameters captured when it was compiled."
+    },
+    "checkout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observed",
+        "revision",
+        "tree_state",
+        "modified_paths",
+        "modifications_sha256",
+        "lockfile_sha256",
+        "workspace_manifest_sha256"
+      ],
+      "properties": {
+        "observed": {
+          "const": "at-execution"
+        },
         "revision": {
           "type": "string",
           "pattern": "^[0-9a-f]{40}$"
@@ -45,47 +104,9 @@
             "$ref": "primitives.schema.json#/$defs/text"
           },
           "maxItems": 4096
-        }
-      }
-    },
-    "toolchain": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "rustc",
-        "cargo",
-        "host"
-      ],
-      "properties": {
-        "rustc": {
-          "$ref": "primitives.schema.json#/$defs/text"
         },
-        "cargo": {
-          "$ref": "primitives.schema.json#/$defs/text"
-        },
-        "host": {
-          "$ref": "primitives.schema.json#/$defs/text"
-        }
-      }
-    },
-    "build": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "profile",
-        "target",
-        "lockfile_sha256",
-        "workspace_manifest_sha256"
-      ],
-      "properties": {
-        "profile": {
-          "enum": [
-            "debug",
-            "release"
-          ]
-        },
-        "target": {
-          "$ref": "primitives.schema.json#/$defs/text"
+        "modifications_sha256": {
+          "$ref": "primitives.schema.json#/$defs/sha256"
         },
         "lockfile_sha256": {
           "$ref": "primitives.schema.json#/$defs/sha256"
@@ -93,7 +114,25 @@
         "workspace_manifest_sha256": {
           "$ref": "primitives.schema.json#/$defs/sha256"
         }
-      }
+      },
+      "description": "The work tree as observed when the binary ran. `modifications_sha256` is the digest of the tracked differences from the revision followed by the digest and path of each untracked file."
+    },
+    "tools_at_execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rustc",
+        "cargo"
+      ],
+      "properties": {
+        "rustc": {
+          "$ref": "primitives.schema.json#/$defs/text"
+        },
+        "cargo": {
+          "$ref": "primitives.schema.json#/$defs/text"
+        }
+      },
+      "description": "Tools found on the path when the binary ran. They are not necessarily the ones that built it."
     },
     "contracts": {
       "type": "array",
@@ -102,6 +141,9 @@
       },
       "minItems": 1,
       "maxItems": 1024
+    },
+    "contracts_digest": {
+      "$ref": "primitives.schema.json#/$defs/sha256"
     },
     "platform": {
       "type": "object",

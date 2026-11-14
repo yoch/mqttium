@@ -10,7 +10,10 @@ use mqttiumd_contract::decimal::{DecimalError, parse_u64};
 use serde_json::Value;
 
 use crate::diagnostic::{Diagnostic, MAX_DIAGNOSTICS, Report, code};
-use crate::workspace::{REGISTRY_CATALOG, SCENARIO_FIXTURE, Workspace};
+use crate::manifest::{contracts_digest, sha256_hex};
+use crate::workspace::{
+    REGISTRY_CATALOG, RESULT_MANIFEST, RESULT_SCENARIO, SCENARIO_FIXTURE, Workspace,
+};
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
@@ -92,7 +95,7 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
         "mqttiumd.fixture" => fixture(workspace, document, &mut report.diagnostics),
         "mqttiumd.transition-registry" => registry(workspace, document, report),
         "mqttiumd.transition-catalog" => transition_catalog(document, &mut report.diagnostics),
-        "mqttiumd.run-result" => run_result(document, &mut report.diagnostics),
+        "mqttiumd.run-result" => run_result(workspace, document, &mut report.diagnostics),
         "mqttiumd.run-manifest" => run_manifest(document, &mut report.diagnostics),
         "mqttiumd.trace-record" => trace_record(document, &mut report.diagnostics),
         "mqttiumd.requirement-register" => {
@@ -602,6 +605,10 @@ fn rule_coverage(rule: &Value, domain: &[(&str, &[&str])]) -> Vec<Option<Vec<usi
         .collect()
 }
 
+/// A well-formed rule of a cell: its index in the registry, the rule and
+/// the guard values it covers.
+type CellRule<'a> = (usize, &'a Value, Vec<Option<Vec<usize>>>);
+
 fn covers(coverage: &[Option<Vec<usize>>], point: &[usize]) -> bool {
     coverage.iter().zip(point).all(|(allowed, index)| {
         allowed
@@ -775,7 +782,7 @@ fn registry(workspace: &Workspace, document: &Value, report: &mut Report) {
             for event in events {
                 let domain = vocabulary.guard_domain(event);
                 let radices: Vec<usize> = domain.iter().map(|(_, values)| values.len()).collect();
-                let cell: Vec<(usize, &Value, Vec<Option<Vec<usize>>>)> = well_formed
+                let cell: Vec<CellRule<'_>> = well_formed
                     .iter()
                     .filter(|(_, rule)| {
                         text(rule, "machine") == *machine
@@ -860,47 +867,181 @@ fn registry(workspace: &Workspace, document: &Value, report: &mut Report) {
 
 // ---------------------------------------------------------------- run result
 
-fn run_result(document: &Value, out: &mut Vec<Diagnostic>) {
-    let mut failed = false;
-    let mut inconclusive = false;
-    for assertion in items(document, "assertions") {
-        match text(assertion, "status") {
-            "FAIL" => failed = true,
-            "INCONCLUSIVE" => inconclusive = true,
-            _ => {}
-        }
+/// The verdict that the assertions and injections of a result determine
+/// (DEM-023). An established FAIL stands; an inconclusive assertion or an
+/// injection that was not reached as announced blocks; PASS needs at least
+/// one assertion and all of them passing; an empty list concludes nothing.
+fn computed_verdict(statuses: &[&str], injections_reached: bool) -> &'static str {
+    if statuses.contains(&"FAIL") {
+        "FAIL"
+    } else if statuses.contains(&"INCONCLUSIVE") || !injections_reached || statuses.is_empty() {
+        "INCONCLUSIVE"
+    } else if statuses.iter().all(|status| *status == "PASS") {
+        "PASS"
+    } else {
+        "OUT_OF_SCOPE"
     }
+}
+
+/// Checks that the file cited at `member` exists below the root with the
+/// declared digest and size. Returns whether it does.
+fn evidence_matches(
+    workspace: &Workspace,
+    document: &Value,
+    member: &str,
+    out: &mut Vec<Diagnostic>,
+) -> bool {
+    let pointer = format!("/{member}");
+    let Some(cited) = document.get(member) else {
+        return false;
+    };
+    let declared_bytes = u64_at(document, &format!("{pointer}/bytes"), out);
+    let path = text(cited, "path");
+    let bytes = match workspace.read_evidence(path) {
+        Ok(bytes) => bytes,
+        Err((code, message)) => {
+            out.push(Diagnostic::new(code, pointer, message));
+            return false;
+        }
+    };
+    let digest = sha256_hex(&bytes);
+    if digest != text(cited, "sha256") || declared_bytes != Some(bytes.len() as u64) {
+        out.push(Diagnostic::new(
+            code::EVIDENCE_MISMATCH,
+            pointer,
+            format!("{path} has {} bytes and the digest {digest}", bytes.len()),
+        ));
+        return false;
+    }
+    true
+}
+
+fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) {
+    unique(
+        &entry_names(document, "assertions", "name"),
+        "assertion",
+        code::DUPLICATE_NAME,
+        out,
+    );
+    unique(
+        &entry_names(document, "faults", "id"),
+        "fault",
+        code::DUPLICATE_NAME,
+        out,
+    );
+    let statuses: Vec<&str> = items(document, "assertions")
+        .iter()
+        .map(|assertion| text(assertion, "status"))
+        .collect();
+    let mut injections_reached = true;
     for index in 0..items(document, "faults").len() {
         let expected = u64_at(document, &format!("/faults/{index}/expected_hits"), out);
         let hits = u64_at(document, &format!("/faults/{index}/hits"), out);
         // An injection that was not reached as announced proves nothing.
-        inconclusive |= expected != hits;
+        injections_reached &= expected.is_some() && expected == hits;
     }
     for index in 0..items(document, "artifacts").len() {
         u64_at(document, &format!("/artifacts/{index}/bytes"), out);
     }
-    let verdict = text(document, "verdict");
-    let floor = if failed {
-        Some("FAIL")
-    } else if inconclusive {
-        Some("INCONCLUSIVE")
+
+    let qualifying = text(document, "qualification") == "qualifying";
+    let computed = computed_verdict(&statuses, injections_reached);
+    // A provisional document lacks the evidence a PASS states: at best it
+    // is inconclusive.
+    let expected = if !qualifying && computed == "PASS" {
+        "INCONCLUSIVE"
     } else {
-        None
+        computed
     };
-    // An established FAIL stands; a mandatory inconclusive assertion blocks.
-    let consistent = match floor {
-        Some("FAIL") => verdict == "FAIL",
-        Some(_) => verdict == "INCONCLUSIVE" || verdict == "FAIL",
-        None => true,
-    };
-    if !consistent {
+    let verdict = text(document, "verdict");
+    if verdict != expected {
         out.push(Diagnostic::new(
             code::VERDICT_INCONSISTENT,
             "/verdict",
+            format!("the assertions and injections determine {expected}, not {verdict}"),
+        ));
+    }
+    if !qualifying {
+        return;
+    }
+
+    // A qualifying result is checked against the exact files it names.
+    if text(document, "contracts_digest") != workspace.contracts_digest() {
+        out.push(Diagnostic::new(
+            code::EVIDENCE_MISMATCH,
+            "/contracts_digest",
             format!(
-                "{verdict} is better than the evidence allows ({})",
-                floor.unwrap_or("none")
+                "the result names other contracts than the ones in use ({})",
+                workspace.contracts_digest()
             ),
+        ));
+    }
+    evidence_matches(workspace, document, "trace", out);
+    if evidence_matches(workspace, document, "manifest", out) {
+        let path = text(&document["manifest"], "path");
+        match workspace.load_reference(&RESULT_MANIFEST, path) {
+            Err(diagnostic) => out.push(diagnostic),
+            Ok(manifest) => {
+                if text(&manifest, "contracts_digest") != text(document, "contracts_digest") {
+                    out.push(Diagnostic::new(
+                        code::EVIDENCE_MISMATCH,
+                        "/manifest",
+                        "the manifest and the result name different contracts",
+                    ));
+                }
+            }
+        }
+    }
+    if !evidence_matches(workspace, document, "scenario", out) {
+        return;
+    }
+    let scenario =
+        match workspace.load_reference(&RESULT_SCENARIO, text(&document["scenario"], "path")) {
+            Ok(scenario) => scenario,
+            Err(diagnostic) => {
+                out.push(diagnostic);
+                return;
+            }
+        };
+
+    // Every assertion of the scenario is mandatory for a run of it: none
+    // may be missing, added, or declared out of scope.
+    let required: BTreeSet<&str> = names(&scenario, "assertions").into_iter().collect();
+    let reported: BTreeSet<&str> = items(document, "assertions")
+        .iter()
+        .map(|assertion| text(assertion, "name"))
+        .collect();
+    if required != reported {
+        let missing: Vec<&&str> = required.difference(&reported).collect();
+        let extra: Vec<&&str> = reported.difference(&required).collect();
+        out.push(Diagnostic::new(
+            code::RESULT_INCOMPLETE,
+            "/assertions",
+            format!("against the scenario: missing {missing:?}, not required {extra:?}"),
+        ));
+    }
+    for (index, status) in statuses.iter().enumerate() {
+        if *status == "OUT_OF_SCOPE" {
+            out.push(Diagnostic::new(
+                code::RESULT_INCOMPLETE,
+                format!("/assertions/{index}/status"),
+                "an assertion of the scenario cannot be out of scope for a run of it",
+            ));
+        }
+    }
+    let declared: BTreeMap<&str, &str> = items(&scenario, "faults")
+        .iter()
+        .map(|fault| (text(fault, "id"), text(fault, "expected_hits")))
+        .collect();
+    let observed: BTreeMap<&str, &str> = items(document, "faults")
+        .iter()
+        .map(|fault| (text(fault, "id"), text(fault, "expected_hits")))
+        .collect();
+    if declared != observed {
+        out.push(Diagnostic::new(
+            code::RESULT_INCOMPLETE,
+            "/faults",
+            format!("the scenario declares {declared:?}, the result reports {observed:?}"),
         ));
     }
 }
@@ -908,6 +1049,7 @@ fn run_result(document: &Value, out: &mut Vec<Diagnostic>) {
 // ------------------------------------------------------- manifest and trace
 
 fn run_manifest(document: &Value, out: &mut Vec<Diagnostic>) {
+    u64_at(document, "/artifact/bytes", out);
     for index in 0..items(document, "contracts").len() {
         u64_at(document, &format!("/contracts/{index}/bytes"), out);
     }
@@ -918,6 +1060,19 @@ fn run_manifest(document: &Value, out: &mut Vec<Diagnostic>) {
         "/scheduler/seed",
     ] {
         u64_at(document, pointer, out);
+    }
+    // The digest must be the digest of the files the manifest lists.
+    let listed = contracts_digest(
+        items(document, "contracts")
+            .iter()
+            .map(|file| (text(file, "sha256"), text(file, "path"))),
+    );
+    if listed != text(document, "contracts_digest") {
+        out.push(Diagnostic::new(
+            code::EVIDENCE_MISMATCH,
+            "/contracts_digest",
+            format!("the listed contract files have the digest {listed}"),
+        ));
     }
 }
 

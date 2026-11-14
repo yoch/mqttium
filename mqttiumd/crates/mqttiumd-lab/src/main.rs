@@ -14,7 +14,7 @@ use mqttiumd_lab::workspace::Workspace;
 const USAGE: &str = "\
 usage:
   mqttiumd-lab validate --contracts <dir> [--scenario <file>]... [--file <file>]... [--root <dir>]
-  mqttiumd-lab manifest [--root <dir>]
+  mqttiumd-lab manifest [--contracts <dir>] [--root <dir>]
 
 Paths are relative to --root, which defaults to the current directory.
 Exit codes: 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 3 OUT_OF_SCOPE (DEM-023).
@@ -72,6 +72,7 @@ fn validate(arguments: &Arguments) -> Result<bool, String> {
         .ok_or("validate needs --contracts")?;
     let workspace =
         Workspace::open(&arguments.root, contracts).map_err(|diagnostic| diagnostic.to_string())?;
+    println!("contracts sha256:{}", workspace.contracts_digest());
     let mut accepted = true;
     let mut checked = 0usize;
     for (path, report) in workspace.check_contracts() {
@@ -98,7 +99,12 @@ fn main() -> ExitCode {
     let outcome = match command.as_str() {
         "validate" => parse(rest).and_then(|arguments| validate(&arguments)),
         "manifest" => parse(rest)
-            .and_then(|arguments| manifest::collect(&arguments.root))
+            .and_then(|arguments| {
+                let contracts = arguments
+                    .contracts
+                    .unwrap_or_else(|| PathBuf::from("contracts/v1"));
+                manifest::collect(&arguments.root, &contracts.to_string_lossy())
+            })
             .and_then(|manifest| {
                 serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())
             })

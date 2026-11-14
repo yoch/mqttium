@@ -5,37 +5,14 @@
 //! never a crash, never an unbounded computation.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use mqttiumd_lab::workspace::Workspace;
 use serde_json::{Value, json};
 
-fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-/// Creates an empty directory for one test and returns it with its path
-/// relative to the mqttiumd root.
-fn scratch(name: &str) -> (PathBuf, String) {
-    let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = fs::remove_dir_all(&directory);
-    fs::create_dir_all(&directory).expect("scratch directory");
-    let canonical_root = root().canonicalize().expect("root");
-    let relative = directory
-        .canonicalize()
-        .expect("scratch directory")
-        .strip_prefix(&canonical_root)
-        .expect("the target directory is below the mqttiumd root")
-        .to_string_lossy()
-        .into_owned();
-    (directory, relative)
-}
-
-fn write(directory: &Path, name: &str, document: &Value) {
-    let text = serde_json::to_string_pretty(document).expect("JSON");
-    fs::write(directory.join(name), text).expect("document written");
-}
+mod support;
+use support::{root, scratch, write};
 
 fn scenario(fixture: &str) -> Value {
     let bytes = fs::read(root().join("tests/scenarios/p1/P1-02.json")).expect("P1-02");

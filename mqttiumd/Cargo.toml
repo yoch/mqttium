@@ -25,6 +25,11 @@ mqttiumd-contract = { path = "crates/mqttiumd-contract" }
 [profile.dev]
 overflow-checks = true
 
+# The bench hashes its own binary for the manifest; unoptimised SHA-256
+# makes every test that collects a manifest take seconds.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.release]
 overflow-checks = true
 debug = "line-tables-only"
