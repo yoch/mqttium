@@ -44,8 +44,16 @@ pub enum LeaseState {
 
 /// One reservation: its identity, its cost and its state.
 ///
-/// The record is neither `Clone` nor `Copy`: a second copy of a held lease
-/// would be a second right to release the same cost.
+/// **One record per held lease.** An account counts usage; it does not
+/// know its leases. [`release_if_current`] therefore cannot tell a second
+/// record of a held lease from the first: releasing both subtracts the
+/// cost twice, and the account then admits more than its limit. Whoever
+/// owns the lease table holds each record exactly once; that is a
+/// precondition of the function, not something it checks.
+///
+/// The record is neither `Clone` nor `Copy` for that reason.
+/// [`LeaseRecord::from_parts`] can still build a second record of the same
+/// lease, and must not be used to.
 #[derive(PartialEq, Eq, Debug)]
 pub struct LeaseRecord {
     key: LeaseKey,
@@ -56,10 +64,13 @@ pub struct LeaseRecord {
 impl LeaseRecord {
     /// Rebuilds a record from its parts, as recovery reads them.
     ///
-    /// Two callers have a reason to use it: recovery, which rebuilds the
-    /// records it read, and the proof crate, which must state every record,
-    /// the incoherent ones included. A transition never calls it: it gets a
-    /// held lease from [`Account::reserve`], which charges the account.
+    /// Two callers have a reason to use it: recovery, which rebuilds each
+    /// record once from the durable row that holds it, and the proof
+    /// crate, which must state every record, the incoherent ones included.
+    /// A transition never calls it: it gets a held lease from
+    /// [`Account::reserve`], which charges the account. Building a second
+    /// record of a lease that is already held breaks the precondition of
+    /// [`release_if_current`].
     ///
     /// Nothing is checked against any account: [`release_if_current`] does
     /// not rely on the record and the account agreeing, and refuses without
@@ -228,6 +239,11 @@ pub enum ReleaseError {
 /// | `lease` is already released | `Ok(AlreadyReleased)`, no mutation |
 /// | The cost exceeds a usage | `Err(CostExceedsUsage)`, no mutation |
 /// | Otherwise | Both usages reduced by the exact cost, `lease` released, `Ok(Released)` |
+///
+/// Precondition: `lease` is the only record of its reservation (see
+/// [`LeaseRecord`]). Nothing else is required of the arguments: an
+/// incoherent account, or a held lease its account never counted, is
+/// released exactly or refused whole.
 ///
 /// The conditions are examined in this order. A stale key is examined
 /// first: after a slot is reused, the old key may name another account
@@ -545,6 +561,33 @@ mod tests {
             Ok(ReleaseOutcome::Released)
         );
         assert!(charged.is_coherent());
+    }
+
+    #[test]
+    fn a_second_record_of_a_held_lease_is_not_detected() {
+        // The precondition, shown: the function cannot see that two
+        // records stand for one lease. The owner of the lease table must
+        // never build the second one.
+        let mut charged = Account::new(ACCOUNT, credits(1000, 10));
+        let _other = charged
+            .reserve(1, LeaseGeneration::new(0), credits(100, 2))
+            .expect("fits");
+        let mut first = charged
+            .reserve(3, LeaseGeneration::new(5), credits(100, 2))
+            .expect("fits");
+        let current = first.key();
+        let mut second = LeaseRecord::from_parts(first.key(), first.cost(), first.state());
+
+        assert_eq!(
+            release_if_current(&mut first, &mut charged, current),
+            Ok(ReleaseOutcome::Released)
+        );
+        assert_eq!(
+            release_if_current(&mut second, &mut charged, current),
+            Ok(ReleaseOutcome::Released)
+        );
+        // The lease still held in slot 1 is no longer counted.
+        assert_eq!(charged.used(), Credits::ZERO);
     }
 
     #[test]
