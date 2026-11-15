@@ -113,8 +113,9 @@ it can write the fence.
 command or result. Two selections on one point, for one command kind, with
 compatible publication bindings and compatible `result_of`, are refused
 when they name the same occurrence, and also when only one of them names
-`result_of`: they would count occurrences over different sets, and which
-fault acts would depend on the store.
+`result_of` or only one of them names `publication_binding`: they would
+count occurrences over different sets, and which fault acts would depend
+on the store.
 
 These steps give the broker nothing it could not know (ADR 0003): a fired
 deadline carries the token the core armed, a released command is the one
