@@ -472,6 +472,9 @@ impl EpochOpening {
         if last_opened < self.read {
             return Err(SubmitRefused::LedgerRegressed);
         }
+        if self.read_is_stale && last_opened == self.read {
+            return Err(SubmitRefused::ConditionUnchanged);
+        }
         let ticket = self
             .ticket
             .checked_next()
@@ -520,10 +523,7 @@ impl EpochOpening {
         if let OpeningStage::Faulted { .. } = self.stage {
             return Err(ReplyRefused::Faulted);
         }
-        // Reviewed behaviour: the ticket alone correlates a reply.
-        if self.in_flight.map(|command| command.attempt.ticket)
-            != Some(reply.command.attempt.ticket)
-        {
+        if self.in_flight != Some(reply.command) {
             return Err(ReplyRefused::Uncorrelated {
                 attempt: reply.command.attempt,
             });
@@ -558,13 +558,6 @@ impl EpochOpening {
                         if answers =>
                     {
                         None
-                    }
-                    // Reviewed behaviour: a commit that cannot answer
-                    // is refused and the opening goes on.
-                    _ if !answers => {
-                        return Err(ReplyRefused::Uncorrelated {
-                            attempt: reply.command.attempt,
-                        });
                     }
                     _ => return Err(self.fault(reply.outcome)),
                 }
@@ -628,7 +621,11 @@ impl EpochOpening {
         epoch: RunEpoch,
     ) -> RecoveredEpochCheck {
         match self.stage {
-            OpeningStage::Committed(opened) | OpeningStage::HandedOver(opened) => {
+            OpeningStage::Committed(opened)
+            | OpeningStage::HandedOver(opened)
+            | OpeningStage::Faulted {
+                handed_over: Some(opened),
+            } => {
                 if opened == (EpochOpened { incarnation, epoch }) {
                     RecoveredEpochCheck::Confirms
                 } else {
@@ -640,7 +637,7 @@ impl EpochOpening {
             | OpeningStage::Unknown
             | OpeningStage::Superseded
             | OpeningStage::Rejected(_)
-            | OpeningStage::Faulted { .. } => RecoveredEpochCheck::NotEstablished,
+            | OpeningStage::Faulted { handed_over: None } => RecoveredEpochCheck::NotEstablished,
         }
     }
 }

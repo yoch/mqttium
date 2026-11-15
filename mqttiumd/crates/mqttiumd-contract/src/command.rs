@@ -745,9 +745,8 @@ impl EpochLedger {
         if command.incarnation != self.incarnation {
             return LedgerOpening::Rejected(OpeningRejection::ForeignIncarnation);
         }
-        // Reviewed behaviour: any other condition is a moved predecessor.
         if command.after > self.last_opened {
-            return LedgerOpening::Rejected(OpeningRejection::PredecessorMoved);
+            return LedgerOpening::Undecided;
         }
         if command.after == self.last_opened {
             return match self.last_opened.checked_next() {
@@ -762,9 +761,18 @@ impl EpochLedger {
                 Err(Exhausted) => LedgerOpening::Rejected(OpeningRejection::EpochsExhausted),
             };
         }
-        // Reviewed behaviour: the ledger does not recognise its own
-        // committed command, nor an epoch that is already closed.
-        LedgerOpening::Rejected(OpeningRejection::PredecessorMoved)
+        // The epoch right after the condition was opened. Is it still
+        // the last one, and by whom?
+        if command.after.checked_next() != Ok(self.last_opened) {
+            return LedgerOpening::Superseded;
+        }
+        if self.opened_by == Some(command.attempt) {
+            LedgerOpening::AlreadyOpened {
+                epoch: self.last_opened,
+            }
+        } else {
+            LedgerOpening::Rejected(OpeningRejection::PredecessorMoved)
+        }
     }
 }
 
