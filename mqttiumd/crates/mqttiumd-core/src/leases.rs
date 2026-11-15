@@ -10,16 +10,18 @@
 //!
 //! One record per held lease is an invariant of this table, not a check
 //! of the function it calls: a slot holds at most one record, a record
-//! leaves its slot when it is released, and the only place that rebuilds
-//! a record from parts is [`LeaseTable::restore`], which refuses a slot
-//! that already holds one.
+//! leaves its slot when it is released, and [`LeaseTable::restore`], the
+//! one place that adds a lease read from durable data, refuses a slot that
+//! already holds one. It charges that lease through [`Account::reserve`]
+//! as well, so no record is rebuilt from its parts and no account is
+//! charged by hand.
 
 use core::num::NonZeroU32;
 
 use crate::contract::capacity::{AllocationFailed, BoundedVec, Resource};
 use crate::contract::ids::{AccountId, LeaseGeneration, LeaseKey};
 use crate::credits::{
-    Account, Credits, LeaseRecord, LeaseState, ReleaseError, ReleaseOutcome, release_if_current,
+    Account, Credits, LeaseRecord, ReleaseError, ReleaseOutcome, release_if_current,
 };
 
 /// Why a lease was not granted. Nothing changed.
@@ -249,8 +251,8 @@ impl LeaseTable {
     }
 
     /// Restores a held lease read from durable data, once per durable row.
-    /// This is the one place of the core that rebuilds a record from its
-    /// parts; it refuses a slot that already holds one.
+    /// It refuses a slot that already holds one, and charges the account
+    /// through `Account::reserve`, under the generation of the row.
     pub fn restore(&mut self, key: LeaseKey, cost: Credits) -> Result<(), RestoreRefused> {
         if key.account != self.account.id() {
             return Err(RestoreRefused::ForeignAccount);
@@ -269,26 +271,16 @@ impl LeaseTable {
         {
             return Err(RestoreRefused::GenerationReused);
         }
-        if let Some((resource, _)) = Self::shortfall(cost, self.free()) {
-            return Err(RestoreRefused::LimitExceeded(resource));
-        }
-        // The shortfall check bounds both sums by the limit.
-        let used = self.account.used();
-        let (Some(bytes), Some(slots)) = (
-            used.bytes.checked_add(cost.bytes),
-            used.slots.checked_add(cost.slots),
-        ) else {
-            return Err(RestoreRefused::LimitExceeded(Resource::PayloadBytes));
+        // Recovery charges the restored lease like a new one, through the
+        // one charge path, under the generation the durable row names.
+        let record = match self.account.reserve(key.slot, key.generation, cost) {
+            Ok(record) => record,
+            Err(crate::credits::ReserveError::LimitExceeded(resource)) => {
+                return Err(RestoreRefused::LimitExceeded(resource));
+            }
         };
-        // Recovery: the account counts the restored lease, and the record
-        // is rebuilt once, here, from the durable row that holds it.
-        self.account = Account::from_parts(
-            self.account.id(),
-            Credits::new(bytes, slots),
-            self.account.limit(),
-        );
         let entry = &mut self.slots.as_mut_slice()[index];
-        entry.record = Some(LeaseRecord::from_parts(key, cost, LeaseState::Held));
+        entry.record = Some(record);
         entry.next_generation = key.generation.checked_next().ok();
         Ok(())
     }
@@ -357,7 +349,7 @@ mod tests {
         let mut slots = 0u64;
         for (index, slot) in table.slots.as_slice().iter().enumerate() {
             let Some(record) = &slot.record else { continue };
-            assert_eq!(record.state(), LeaseState::Held);
+            assert_eq!(record.state(), crate::credits::LeaseState::Held);
             assert_eq!(record.key().account, table.account.id());
             assert_eq!(record.key().slot as usize, index);
             if let Some(next) = slot.next_generation {

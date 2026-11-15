@@ -23,15 +23,15 @@ use core::num::{NonZeroU32, NonZeroUsize};
 
 use crate::command::{CommandEvent, CommandPhase, OutcomeClass, Verdict};
 use crate::contract::capacity::{
-    AllocationFailed, BoundedVec, CapacityNeed, ExchangeSlots, PayloadBytes, ReceiptSlots,
-    References, Resource, WakeCondition, WorkUnits,
+    AllocationFailed, BoundedQueue, BoundedVec, CapacityNeed, ExchangeSlots, PayloadBytes,
+    ReceiptSlots, References, Resource, WakeCondition, WorkUnits,
 };
 use crate::contract::command::{
-    AdmitPublication, Command, Costs, DeliveryCause, FrozenRecipe, PayloadRef, Recipe,
+    AdmitPublication, Command, Costs, DeliveryCause, FrozenRecipe, PayloadRef, Recipe, RecipeError,
     ReleaseInbound, Source, Target,
 };
 use crate::contract::effects::{
-    CloseReason, Effect, EffectReservation, FrameProgress, Input, Outbox, OwnedEffect,
+    CloseReason, Effect, EffectReservation, FactRank, FrameProgress, Input, Outbox, OwnedEffect,
     RecoveredFact, RecoveryOrder,
 };
 use crate::contract::ids::{
@@ -41,7 +41,9 @@ use crate::contract::ids::{
     PublicationId, PublicationSeq, RequestId, RequestSeq, Revision, RunEpoch, SessionId,
     StoreIncarnation,
 };
-use crate::contract::outcome::{CommitFacts, StoreOutcome, StoreReply, StoreViolation};
+use crate::contract::outcome::{
+    CommitFacts, RejectReason, StoreOutcome, StoreReply, StoreViolation,
+};
 use crate::contract::packet::{AckReason, InboundPacket, OutboundFrame, Qos, SharedBytes};
 use crate::contract::step::{CoreFault, Exhaustion, PlanStamp, Progress, StepOutcome, TurnGrant};
 use crate::credits::{Credits, ReleaseOutcome};
@@ -56,6 +58,11 @@ pub const MAX_TRANSITION_SLOTS: usize = 2;
 /// the first one included, while the store refuses it because a
 /// resolution fenced the operation before it arrived.
 pub const MAX_RELEASE_PREPARATIONS: u32 = 4;
+
+/// How many resolutions of one operation the owner retains, the latest
+/// ones. The answer to an older resolution is not matched to the
+/// operation: it is absorbed, and the next resolution answers again.
+pub const RETAINED_RESOLUTIONS: usize = 4;
 
 /// The bits of an exchange generation that count the exchanges of one run
 /// epoch. The bits above them hold the epoch: see [`Counters`].
@@ -79,6 +86,16 @@ pub struct OwnerConfig {
     /// 0001). The timer adapter counts it from its acceptance of the
     /// deadline.
     pub resolution_delay: LogicalDuration,
+    /// Operations that ended which the owner retains, the latest ones, so
+    /// that a late result contradicting one of them is a fault. A result
+    /// for an operation that ended before them is no longer seen: it is
+    /// absorbed.
+    pub retained_operations: NonZeroU32,
+    /// Connections the owner ordered closed, or saw fail, which it
+    /// retains, the latest ones: what such a connection still carries is
+    /// absorbed and cannot resume a session. A connection closed before
+    /// them is no longer known as closed.
+    pub remembered_connections: NonZeroU32,
 }
 
 /// Why an owner was not constructed.
@@ -195,6 +212,39 @@ struct Limits {
     max_payload_bytes: PayloadBytes,
 }
 
+/// The effects whose results the owner applies to one operation: the
+/// command that proposed it and its latest resolutions (ADR 0001). A
+/// result that names another effect does not answer the operation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Answers {
+    persist: EffectId,
+    resolutions: [Option<EffectId>; RETAINED_RESOLUTIONS],
+    /// The place the next resolution takes; the oldest one is replaced.
+    next: usize,
+}
+
+impl Answers {
+    fn new(persist: EffectId) -> Self {
+        Self {
+            persist,
+            resolutions: [None; RETAINED_RESOLUTIONS],
+            next: 0,
+        }
+    }
+
+    fn names(&self, effect: EffectId) -> bool {
+        self.persist == effect || self.resolutions.contains(&Some(effect))
+    }
+
+    fn with(mut self, resolution: EffectId) -> Self {
+        if let Some(place) = self.resolutions.get_mut(self.next) {
+            *place = Some(resolution);
+        }
+        self.next = (self.next + 1) % RETAINED_RESOLUTIONS;
+        self
+    }
+}
+
 /// The operation an exchange waits for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct InFlight {
@@ -203,6 +253,19 @@ struct InFlight {
     phase: CommandPhase,
     /// The deadline armed for its result. Each resolution arms another.
     deadline: DeadlineToken,
+    answers: Answers,
+}
+
+/// An operation that ended, as the owner knows it: kept so that a late
+/// result that contradicts it is a fault, not a stale answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Finished {
+    operation: OperationId,
+    answers: Answers,
+    /// `Consumed` or `RejectedCertain`.
+    phase: CommandPhase,
+    /// What its commit established, when it committed.
+    facts: Option<CommitFacts>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -225,7 +288,9 @@ struct Slot {
     /// The admission of the exchange once it is known committed and its
     /// PUBREC was published: a consumed command. `None` for an exchange
     /// read from durable data, whose admission belongs to an older epoch.
-    admission: Option<OperationId>,
+    admission: Option<Finished>,
+    /// The durable terminations of the exchange prepared so far.
+    release_preparations: u32,
     state: SlotState,
 }
 
@@ -248,13 +313,11 @@ enum Stop {
     Fatal(CoreFault),
 }
 
+/// No event the core can wait for gives memory back: a failed allocation
+/// stops the owner.
 impl From<AllocationFailed> for Stop {
     fn from(_: AllocationFailed) -> Self {
-        Self::Need(CapacityNeed {
-            resource: Resource::References,
-            amount: 1,
-            wake: WakeCondition::ResourceReleased,
-        })
+        Self::Fatal(CoreFault::AllocationFailed)
     }
 }
 
@@ -293,17 +356,24 @@ enum Change {
         in_flight: InFlight,
     },
     /// The admission of the exchange is known committed.
-    Committed { slot: usize },
-    /// The exchange ends and gives its lease back.
-    End { slot: usize },
-    /// The operation in flight changes phase, and deadline if one is given.
+    Committed { slot: usize, admission: Finished },
+    /// The exchange ends with the operation it waited for, and gives its
+    /// lease back.
+    End { slot: usize, finished: Finished },
+    /// The operation in flight changes phase, and, after a resolution,
+    /// deadline and the effects that answer it.
     Await {
         slot: usize,
         phase: CommandPhase,
-        deadline: Option<DeadlineToken>,
+        resolution: Option<(DeadlineToken, EffectId)>,
     },
-    /// The durable termination of the exchange is submitted.
-    Release { slot: usize, in_flight: InFlight },
+    /// The durable termination of the exchange is submitted, after the
+    /// one the store refused if there was one.
+    Release {
+        slot: usize,
+        in_flight: InFlight,
+        refused: Option<Finished>,
+    },
 }
 
 /// The effects of a plan: at most `MAX_TRANSITION_SLOTS`, in the order of
@@ -327,6 +397,8 @@ struct Plan {
     change: Change,
     effects: Effects,
     progress: Progress,
+    /// The connection the transition closes, or saw fail.
+    closed: Option<ConnectionGeneration>,
 }
 
 /// What a plan draws and publishes while it is computed.
@@ -336,6 +408,7 @@ struct Draft {
     counters: Counters,
     effects: Effects,
     progress: Progress,
+    closed: Option<ConnectionGeneration>,
 }
 
 impl Draft {
@@ -366,8 +439,17 @@ impl Draft {
     }
 
     fn close(&mut self, connection: ConnectionGeneration, reason: CloseReason) -> Result<(), Stop> {
+        self.end(connection)?;
         self.emit(Effect::CloseConnection { connection, reason })
             .map(|_| ())
+    }
+
+    /// Records the one connection the transition ends.
+    fn end(&mut self, connection: ConnectionGeneration) -> Result<(), Stop> {
+        if self.closed.replace(connection).is_some() {
+            return Err(IMPOSSIBLE);
+        }
+        Ok(())
     }
 }
 
@@ -390,11 +472,55 @@ pub struct Owner {
     sessions: BoundedVec<Session>,
     slots: BoundedVec<Slot>,
     leases: LeaseTable,
+    /// The latest operations that ended; see `OwnerConfig`.
+    finished: BoundedQueue<Finished>,
+    /// The latest connections that were closed; see `OwnerConfig`.
+    closed: BoundedQueue<ConnectionGeneration>,
     resolution_delay: LogicalDuration,
 }
 
 fn table<T>(bound: NonZeroU32) -> Result<BoundedVec<T>, AllocationFailed> {
     BoundedVec::with_capacity(usize::try_from(bound.get()).map_err(|_| AllocationFailed)?)
+}
+
+fn ring<T>(bound: NonZeroU32) -> Result<BoundedQueue<T>, AllocationFailed> {
+    BoundedQueue::with_capacity(usize::try_from(bound.get()).map_err(|_| AllocationFailed)?)
+}
+
+/// Keeps `item` as the latest of `ring`, forgetting the oldest when the
+/// ring is full. The capacity is not zero, so it never refuses.
+fn remember<T>(ring: &mut BoundedQueue<T>, item: T) -> Result<(), CoreFault> {
+    if ring.len() == ring.capacity() {
+        let _ = ring.pop_front();
+    }
+    ring.try_push_back(item)
+        .map_err(|_| CoreFault::ReservationOverrun)
+}
+
+fn capacity_of(bound: usize) -> u64 {
+    u64::try_from(bound).unwrap_or(u64::MAX)
+}
+
+/// The facts of one kind read so far on a page, before `upto`. The order
+/// of an inventory puts the facts of one kind together: they start where
+/// the first of them was seen and end where a later kind starts.
+fn run<'a>(
+    facts: &'a [RecoveredFact],
+    starts: &[Option<usize>; 7],
+    rank: FactRank,
+    upto: usize,
+) -> &'a [RecoveredFact] {
+    let index = rank as usize;
+    let Some(start) = starts.get(index).copied().flatten() else {
+        return &[];
+    };
+    let end = starts
+        .iter()
+        .skip(index + 1)
+        .find_map(|later| *later)
+        .unwrap_or(upto)
+        .min(upto);
+    facts.get(start..end).unwrap_or(&[])
 }
 
 impl Owner {
@@ -431,6 +557,8 @@ impl Owner {
             sessions: table(config.max_sessions)?,
             slots: table(config.max_exchanges)?,
             leases: LeaseTable::new(config.account, credit, config.max_exchanges)?,
+            finished: ring(config.retained_operations)?,
+            closed: ring(config.remembered_connections)?,
             resolution_delay: config.resolution_delay,
         })
     }
@@ -533,18 +661,39 @@ impl Owner {
         }
     }
 
-    /// The work an input costs: one unit, and one per fact of a page.
-    fn cost(input: &Input) -> WorkUnits {
-        let facts = match input {
-            Input::Recovery { facts, .. } => facts.len(),
-            _ => 0,
+    /// The work an input costs: one unit, and for a recovery page a bound
+    /// of the comparisons its checks make. A fact is compared with the
+    /// table it joins: a route with the routes, a session with the
+    /// sessions, an exchange with the sessions and the exchanges. The page
+    /// that closes the inventory compares every route with every session.
+    fn cost(&self, input: &Input) -> WorkUnits {
+        let Input::Recovery { facts, last } = input else {
+            return WorkUnits::new(1);
         };
-        WorkUnits::new(u64::try_from(facts).unwrap_or(u64::MAX).saturating_add(1))
+        let routes = capacity_of(self.routes.capacity());
+        let sessions = capacity_of(self.sessions.capacity());
+        let slots = capacity_of(self.slots.capacity());
+        let mut work: u64 = 0;
+        for fact in facts.as_slice() {
+            let compared = match fact.rank() {
+                FactRank::Route => routes,
+                FactRank::Session => sessions,
+                FactRank::InboundExchange => sessions.saturating_add(slots),
+                FactRank::Epoch | FactRank::Limits | FactRank::RouteTable | FactRank::Operation => {
+                    0
+                }
+            };
+            work = work.saturating_add(compared.saturating_add(1));
+        }
+        if *last {
+            work = work.saturating_add(routes.saturating_mul(sessions).saturating_add(1));
+        }
+        WorkUnits::new(work)
     }
 
     /// Computes the transition of `input` and mutates nothing.
     fn plan(&self, input: &Input, grant: TurnGrant) -> Result<Plan, Refusal> {
-        let work = Self::cost(input);
+        let work = self.cost(input);
         if let Some(missing) = work.checked_sub(grant.work_limit)
             && missing > WorkUnits::ZERO
         {
@@ -567,6 +716,7 @@ impl Owner {
                 count: 0,
             },
             progress: Progress::Complete,
+            closed: None,
         };
         let planned = self
             .revision
@@ -585,6 +735,7 @@ impl Owner {
                 change,
                 effects: draft.effects,
                 progress: draft.progress,
+                closed: draft.closed,
             }),
             Err(stop) => Err(Refusal {
                 stop,
@@ -618,7 +769,7 @@ impl Owner {
                 connection,
                 progress,
                 ..
-            } => Ok(self.plan_frame_result(*connection, *progress)),
+            } => self.plan_frame_result(*connection, *progress, draft),
         }
     }
 
@@ -655,6 +806,11 @@ impl Owner {
         packet: &InboundPacket,
         draft: &mut Draft,
     ) -> Result<Change, Stop> {
+        // The owner ordered this connection closed, or saw it fail: what
+        // it still carries changes nothing and is not answered.
+        if self.closed.iter().any(|closed| *closed == connection) {
+            return Ok(Change::Nothing);
+        }
         let bound = self.session_of(connection);
         let protocol_error = |draft: &mut Draft| {
             Self::plan_close(connection, bound, CloseReason::ProtocolError, draft)
@@ -749,7 +905,7 @@ impl Owner {
                 match self.slots.as_slice()[slot].state {
                     // No PUBREC of this exchange was ever made eligible.
                     SlotState::AdmissionPending(_) => protocol_error(draft),
-                    SlotState::AwaitPubrel => self.plan_release(slot, draft),
+                    SlotState::AwaitPubrel => self.plan_release(slot, None, draft),
                     // No second release, and no PUBCOMP before the commit.
                     SlotState::ReleasePending(_) => Ok(Change::Nothing),
                 }
@@ -770,8 +926,11 @@ impl Owner {
         let Verdict::Transition(phase) = CommandPhase::Prepared.on(CommandEvent::Submit) else {
             return Err(IMPOSSIBLE);
         };
-        let recipe = FrozenRecipe::freeze(recipe).map_err(|_| IMPOSSIBLE)?;
-        draft.emit(Effect::Persist {
+        let recipe = FrozenRecipe::freeze(recipe).map_err(|error| match error {
+            RecipeError::AllocationFailed => Stop::from(AllocationFailed),
+            _ => IMPOSSIBLE,
+        })?;
+        let persist = draft.emit(Effect::Persist {
             command: Command { recipe, payload },
         })?;
         let deadline = draw(&mut draft.counters.deadline, DeadlineToken::checked_next)?;
@@ -783,6 +942,7 @@ impl Owner {
             operation,
             phase,
             deadline,
+            answers: Answers::new(persist),
         })
     }
 
@@ -939,7 +1099,12 @@ impl Owner {
 
     /// PUBREL, or a release the store certainly refused: the durable
     /// termination is submitted under a new operation.
-    fn plan_release(&self, slot: usize, draft: &mut Draft) -> Result<Change, Stop> {
+    fn plan_release(
+        &self,
+        slot: usize,
+        refused: Option<Finished>,
+        draft: &mut Draft,
+    ) -> Result<Change, Stop> {
         let held = &self.slots.as_slice()[slot];
         let operation = self.operation(draft)?;
         let recipe = Recipe::ReleaseInbound(ReleaseInbound {
@@ -949,7 +1114,11 @@ impl Owner {
             exchange: held.exchange,
         });
         let in_flight = self.plan_submission(operation, recipe, None, draft)?;
-        Ok(Change::Release { slot, in_flight })
+        Ok(Change::Release {
+            slot,
+            in_flight,
+            refused,
+        })
     }
 
     /// The frame that answers an exchange goes to the connection that is
@@ -994,28 +1163,18 @@ impl Owner {
                 .is_some_and(|held| held.operation == operation)
         });
         let Some(index) = waiting else {
-            // No exchange waits for this operation. It is the consumed
-            // admission of an exchange, or it is stale.
-            if !slots.iter().any(|slot| slot.admission == Some(operation)) {
-                return Ok(Change::Nothing);
-            }
-            let event = match reply {
-                StoreReply::Violation(StoreViolation::RecipeMismatch) => {
-                    return Err(Stop::Fatal(CoreFault::RecipeMismatch { operation }));
-                }
-                StoreReply::Outcome(outcome) => {
-                    CommandEvent::StoreResult(OutcomeClass::of(outcome))
-                }
-            };
-            return match CommandPhase::Consumed.on(event) {
-                Verdict::Fault => Err(contradiction),
-                _ => Ok(Change::Nothing),
-            };
+            return self.plan_late_result(effect, operation, reply);
         };
         let slot = &slots[index];
         let Some(in_flight) = slot.in_flight() else {
             return Err(IMPOSSIBLE);
         };
+        // Only the effects emitted for this operation answer it. The answer
+        // to a resolution the owner no longer retains is absorbed: the next
+        // resolution answers again (ADR 0001).
+        if !in_flight.answers.names(effect) {
+            return Ok(Change::Nothing);
+        }
         let outcome = match reply {
             StoreReply::Violation(StoreViolation::RecipeMismatch) => {
                 return Err(Stop::Fatal(CoreFault::RecipeMismatch { operation }));
@@ -1026,6 +1185,12 @@ impl Owner {
         let verdict = in_flight
             .phase
             .on(CommandEvent::StoreResult(OutcomeClass::of(&outcome)));
+        let finished = |phase, facts| Finished {
+            operation,
+            answers: in_flight.answers,
+            phase,
+            facts,
+        };
         match (verdict, outcome) {
             (Verdict::Transition(CommandPhase::Committed), StoreOutcome::Committed(facts)) => {
                 let expected = if admission {
@@ -1043,19 +1208,29 @@ impl Owner {
                 }
                 let packet_id = slot.packet_id;
                 let reason = AckReason::Success;
+                // The owner publishes what depends on the commit in this
+                // transition: the command is consumed.
+                let finished = finished(CommandPhase::Consumed, Some(facts));
                 if admission {
                     // PUBREC becomes eligible here and nowhere earlier.
                     self.plan_answer(slot, OutboundFrame::Pubrec { packet_id, reason }, draft)?;
-                    Ok(Change::Committed { slot: index })
+                    Ok(Change::Committed {
+                        slot: index,
+                        admission: finished,
+                    })
                 } else {
                     self.plan_answer(slot, OutboundFrame::Pubcomp { packet_id, reason }, draft)?;
-                    Ok(Change::End { slot: index })
+                    Ok(Change::End {
+                        slot: index,
+                        finished,
+                    })
                 }
             }
             (
                 Verdict::Transition(CommandPhase::RejectedCertain),
                 StoreOutcome::RejectedCertain(rejection),
             ) => {
+                let finished = finished(CommandPhase::RejectedCertain, None);
                 if admission {
                     // Nothing was admitted: the exchange ends and the
                     // client is told, as the protocol says.
@@ -1064,22 +1239,77 @@ impl Owner {
                         reason: AckReason::refusing(rejection),
                     };
                     self.plan_answer(slot, frame, draft)?;
-                    Ok(Change::End { slot: index })
-                } else {
-                    // The exchange is still durably open and the client
-                    // will not send PUBREL again on a live connection.
-                    self.plan_release(index, draft)
+                    return Ok(Change::End {
+                        slot: index,
+                        finished,
+                    });
+                }
+                // The exchange is still durably open and the client will
+                // not send PUBREL again on a live connection. Only a fence
+                // that a resolution of this owner set before the command
+                // arrived is ended by preparing again, and only so many
+                // times. Any other refusal would come back for the same
+                // reason: the owner stops rather than prepare it again.
+                match rejection {
+                    RejectReason::Fenced
+                        if slot.release_preparations < MAX_RELEASE_PREPARATIONS =>
+                    {
+                        self.plan_release(index, Some(finished), draft)
+                    }
+                    reason => Err(Stop::Fatal(CoreFault::ReleaseRefused { operation, reason })),
                 }
             }
             (Verdict::Transition(CommandPhase::Indeterminate), _) => Ok(Change::Await {
                 slot: index,
                 phase: CommandPhase::Indeterminate,
-                deadline: None,
+                resolution: None,
             }),
             // S0 retires no identity space: the store cannot report that
             // the detail of a result the exchange waits for is gone.
             _ => Err(IMPOSSIBLE),
         }
+    }
+
+    /// A result for an operation no exchange waits for. When the owner
+    /// retains the operation, the result must agree with what it knows;
+    /// otherwise it ended before the retained ones, the owner no longer
+    /// sees what it established, and the result is absorbed.
+    fn plan_late_result(
+        &self,
+        effect: EffectId,
+        operation: OperationId,
+        reply: &StoreReply,
+    ) -> Result<Change, Stop> {
+        let known = self
+            .slots
+            .as_slice()
+            .iter()
+            .filter_map(|slot| slot.admission)
+            .chain(self.finished.iter().copied())
+            .find(|finished| finished.operation == operation);
+        let Some(known) = known else {
+            return Ok(Change::Nothing);
+        };
+        if !known.answers.names(effect) {
+            return Ok(Change::Nothing);
+        }
+        let outcome = match reply {
+            StoreReply::Violation(StoreViolation::RecipeMismatch) => {
+                return Err(Stop::Fatal(CoreFault::RecipeMismatch { operation }));
+            }
+            StoreReply::Outcome(outcome) => *outcome,
+        };
+        let contradiction = Stop::Fatal(CoreFault::ContradictoryOutcome { operation });
+        let event = CommandEvent::StoreResult(OutcomeClass::of(&outcome));
+        if known.phase.on(event) == Verdict::Fault {
+            return Err(contradiction);
+        }
+        if let (StoreOutcome::Committed(facts), Some(established)) = (outcome, known.facts)
+            && facts != established
+        {
+            return Err(contradiction);
+        }
+        Ok(Change::Nothing)
     }
 
     fn plan_deadline(&self, token: DeadlineToken, draft: &mut Draft) -> Result<Change, Stop> {
@@ -1106,7 +1336,7 @@ impl Owner {
         // Each resolution has its own effect identity and arms the next
         // deadline, so that a resolution whose answer is held or lost is
         // followed by another.
-        draft.emit(Effect::ResolveAndFence {
+        let resolution = draft.emit(Effect::ResolveAndFence {
             operation: in_flight.operation,
         })?;
         let deadline = draw(&mut draft.counters.deadline, DeadlineToken::checked_next)?;
@@ -1117,24 +1347,34 @@ impl Owner {
         Ok(Change::Await {
             slot,
             phase,
-            deadline: Some(deadline),
+            resolution: Some((deadline, resolution)),
         })
     }
 
-    fn plan_frame_result(&self, connection: ConnectionKey, progress: FrameProgress) -> Change {
+    fn plan_frame_result(
+        &self,
+        connection: ConnectionKey,
+        progress: FrameProgress,
+        draft: &mut Draft,
+    ) -> Result<Change, Stop> {
         let failed = matches!(progress, FrameProgress::Failed);
         match self.session_of(connection.generation) {
             Some(session)
                 if failed && self.sessions.as_slice()[session].id == connection.session =>
             {
-                Change::Unbind { session }
+                draft.end(connection.generation)?;
+                Ok(Change::Unbind { session })
             }
-            _ => Change::Nothing,
+            _ => Ok(Change::Nothing),
         }
     }
 
     /// Checks a recovery page against the state and against itself. The
     /// application then cannot be refused.
+    ///
+    /// Each check compares a fact with the table it joins, held and read
+    /// so far, and the size of that table is checked first: the work of a
+    /// page is bounded by `Owner::cost`.
     fn plan_recovery(&self, facts: &[RecoveredFact], last: bool) -> Result<Change, Stop> {
         let Some(mut order) = self.recovery.clone() else {
             return Err(IMPOSSIBLE);
@@ -1142,12 +1382,23 @@ impl Owner {
         let mut epoch_recovered = self.epoch_recovered;
         let mut limits = self.limits.is_some();
         let mut route_table = self.route_revision.is_some();
-        let mut routes = self.routes.len();
-        let mut sessions = self.sessions.len();
-        let mut slots = self.slots.len();
+        let mut starts = [None; 7];
+        let session_named = |sessions: &[RecoveredFact], id: SessionId| {
+            self.sessions.as_slice().iter().any(|held| held.id == id)
+                || sessions.iter().any(
+                    |fact| matches!(fact, RecoveredFact::Session { session, .. } if *session == id),
+                )
+        };
         for (position, fact) in facts.iter().enumerate() {
             order.admit(fact).map_err(|_| IMPOSSIBLE)?;
-            let earlier = &facts[..position];
+            let rank = fact.rank();
+            if let Some(start) = starts.get_mut(rank as usize)
+                && start.is_none()
+            {
+                *start = Some(position);
+            }
+            // The earlier facts of this kind on this page.
+            let same = run(facts, &starts, rank, position);
             let valid = match fact {
                 RecoveredFact::Epoch { incarnation, epoch } => {
                     epoch_recovered = true;
@@ -1161,53 +1412,54 @@ impl Owner {
                     route_table = true;
                     true
                 }
-                RecoveredFact::Route { .. } => {
-                    routes += 1;
-                    route_table && routes <= self.routes.capacity()
+                RecoveredFact::Route { topic, target, .. } => {
+                    // A route twice would freeze a recipe with the same
+                    // target twice: one delivery would be owed twice.
+                    route_table
+                        && self.routes.len() + same.len() < self.routes.capacity()
+                        && !self
+                            .routes
+                            .as_slice()
+                            .iter()
+                            .any(|held| held.topic == *topic && held.target == *target)
+                        && !same.iter().any(|other| {
+                            matches!(other, RecoveredFact::Route { topic: name, target: to, .. }
+                                if name == topic && to == target)
+                        })
                 }
                 RecoveredFact::Session {
                     session, client_id, ..
-                } => {
-                    sessions += 1;
-                    let held = self
+                } => self.sessions.len() + same.len() < self.sessions.capacity()
+                    && !self
                         .sessions
                         .as_slice()
                         .iter()
-                        .any(|held| held.id == *session || held.client_id == *client_id);
-                    let repeated = earlier.iter().any(|other| {
+                        .any(|held| held.id == *session || held.client_id == *client_id)
+                    && !same.iter().any(|other| {
                         matches!(other, RecoveredFact::Session { session: id, client_id: name, .. }
-                            if id == session || name == client_id)
-                    });
-                    sessions <= self.sessions.capacity() && !held && !repeated
-                }
+                                if id == session || name == client_id)
+                    }),
                 RecoveredFact::InboundExchange {
                     exchange,
                     packet_id,
                     ..
                 } => {
-                    slots += 1;
-                    let known = self
-                        .sessions
-                        .as_slice()
-                        .iter()
-                        .any(|held| held.id == exchange.session)
-                        || earlier.iter().any(|other| {
-                            matches!(other, RecoveredFact::Session { session, .. }
-                                if *session == exchange.session)
-                        });
-                    let held = self.slots.as_slice().iter().any(|held| {
-                        held.exchange == *exchange
-                            || (held.session == exchange.session && held.packet_id == *packet_id)
-                    });
-                    let repeated = earlier.iter().any(|other| {
-                        matches!(other, RecoveredFact::InboundExchange { exchange: id, packet_id: packet, .. }
-                            if id == exchange
-                                || (id.session == exchange.session && packet == packet_id))
-                    });
+                    let sessions = run(facts, &starts, FactRank::Session, position);
                     // A generation of this epoch would meet one the owner
                     // is about to issue.
                     let older = generation_epoch(exchange.generation) < self.epoch.get();
-                    slots <= self.slots.capacity() && known && !held && !repeated && older
+                    self.slots.len() + same.len() < self.slots.capacity()
+                        && session_named(sessions, exchange.session)
+                        && !self.slots.as_slice().iter().any(|held| {
+                            held.exchange == *exchange
+                                || (held.session == exchange.session && held.packet_id == *packet_id)
+                        })
+                        && !same.iter().any(|other| {
+                            matches!(other, RecoveredFact::InboundExchange { exchange: id, packet_id: packet, .. }
+                                if id == exchange
+                                    || (id.session == exchange.session && packet == packet_id))
+                        })
+                        && older
                 }
                 RecoveredFact::Operation { operation, .. } => {
                     operation.incarnation() == self.incarnation && operation.epoch() < self.epoch
@@ -1217,10 +1469,29 @@ impl Owner {
                 return Err(IMPOSSIBLE);
             }
         }
-        // An inventory is closed only when it named the run epoch, the
-        // limits and the route table: an admission needs all three.
-        if last && !(epoch_recovered && limits && route_table) {
-            return Err(IMPOSSIBLE);
+        if last {
+            // An inventory is closed only when it named the run epoch, the
+            // limits and the route table: an admission needs all three.
+            if !(epoch_recovered && limits && route_table) {
+                return Err(IMPOSSIBLE);
+            }
+            // Every route leads to a session of the inventory.
+            let routes = run(facts, &starts, FactRank::Route, facts.len());
+            let sessions = run(facts, &starts, FactRank::Session, facts.len());
+            let targets = self
+                .routes
+                .as_slice()
+                .iter()
+                .map(|route| route.target)
+                .chain(routes.iter().filter_map(|fact| match fact {
+                    RecoveredFact::Route { target, .. } => Some(*target),
+                    _ => None,
+                }));
+            for target in targets {
+                if !session_named(sessions, target) {
+                    return Err(IMPOSSIBLE);
+                }
+            }
         }
         Ok(Change::Recover)
     }
@@ -1241,6 +1512,7 @@ impl Owner {
             change,
             effects,
             progress,
+            closed,
             ..
         } = plan;
         let reserved = match reservation {
@@ -1258,6 +1530,9 @@ impl Owner {
             .map_err(|_| CoreFault::StalePlan)?;
 
         self.apply_change(change, input)?;
+        if let Some(connection) = closed {
+            remember(&mut self.closed, connection)?;
+        }
         self.counters = counters;
         self.revision = revision;
 
@@ -1314,32 +1589,39 @@ impl Owner {
                     publication,
                     lease,
                     admission: None,
+                    release_preparations: 0,
                     state: SlotState::AdmissionPending(in_flight),
                 };
                 self.slots.try_push(slot).map_err(|_| STALE)?;
             }
-            Change::Committed { slot } => {
+            Change::Committed { slot, admission } => {
                 let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
-                let SlotState::AdmissionPending(in_flight) = held.state else {
+                if !matches!(held.state, SlotState::AdmissionPending(_)) {
                     return Err(STALE);
-                };
-                held.admission = Some(in_flight.operation);
+                }
+                held.admission = Some(admission);
                 held.state = SlotState::AwaitPubrel;
             }
-            Change::End { slot } => {
+            Change::End { slot, finished } => {
                 let slots = self.slots.as_mut_slice();
                 let last = slots.len().checked_sub(1).ok_or(STALE)?;
-                let lease = slots.get(slot).ok_or(STALE)?.lease;
-                if self.leases.release(lease) != Ok(ReleaseOutcome::Released) {
+                let held = *slots.get(slot).ok_or(STALE)?;
+                if self.leases.release(held.lease) != Ok(ReleaseOutcome::Released) {
                     return Err(STALE);
                 }
                 self.slots.as_mut_slice().swap(slot, last);
                 let _ = self.slots.pop();
+                // The operations of the exchange stay visible, the latest
+                // last.
+                if let Some(admission) = held.admission {
+                    remember(&mut self.finished, admission)?;
+                }
+                remember(&mut self.finished, finished)?;
             }
             Change::Await {
                 slot,
                 phase,
-                deadline,
+                resolution,
             } => {
                 let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
                 let (SlotState::AdmissionPending(in_flight) | SlotState::ReleasePending(in_flight)) =
@@ -1348,13 +1630,22 @@ impl Owner {
                     return Err(STALE);
                 };
                 in_flight.phase = phase;
-                if let Some(deadline) = deadline {
+                if let Some((deadline, effect)) = resolution {
                     in_flight.deadline = deadline;
+                    in_flight.answers = in_flight.answers.with(effect);
                 }
             }
-            Change::Release { slot, in_flight } => {
+            Change::Release {
+                slot,
+                in_flight,
+                refused,
+            } => {
                 let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
                 held.state = SlotState::ReleasePending(in_flight);
+                held.release_preparations = held.release_preparations.saturating_add(1);
+                if let Some(refused) = refused {
+                    remember(&mut self.finished, refused)?;
+                }
             }
         }
         Ok(())
@@ -1430,6 +1721,7 @@ impl Owner {
                     publication: *publication,
                     lease,
                     admission: None,
+                    release_preparations: 0,
                     state: SlotState::AwaitPubrel,
                 };
                 self.slots.try_push(slot).map_err(|_| STALE)?;
@@ -1507,6 +1799,8 @@ mod tests {
         sessions: Vec<Session>,
         slots: Vec<Slot>,
         leases: (Credits, Vec<crate::leases::LeaseSlotView>),
+        finished: Vec<Finished>,
+        closed: Vec<ConnectionGeneration>,
         waiting: Vec<EffectId>,
         free_slots: usize,
         live_reservations: bool,
@@ -1556,6 +1850,8 @@ mod tests {
             account: AccountId::new(9),
             payload_bytes: PayloadBytes::new(16),
             resolution_delay: LogicalDuration::new(5),
+            retained_operations: bound(4),
+            remembered_connections: bound(4),
         }
     }
 
@@ -1894,6 +2190,8 @@ mod tests {
                 sessions: owner.sessions.as_slice().to_vec(),
                 slots: owner.slots.as_slice().to_vec(),
                 leases: owner.leases.snapshot(),
+                finished: owner.finished.iter().copied().collect(),
+                closed: owner.closed.iter().copied().collect(),
                 waiting: self.outbox.pending().map(OwnedEffect::id).collect(),
                 free_slots: self.outbox.free_slots(),
                 live_reservations: self.outbox.has_live_reservations(),
@@ -2803,6 +3101,7 @@ mod tests {
                 operation: flight.operation,
                 phase: CommandPhase::Submitted,
                 deadline: flight.deadline,
+                answers: Answers::new(flight.effect),
             }
         );
         // The exchange is charged to the account of the owner.
@@ -3046,6 +3345,7 @@ mod tests {
                 operation: admission.operation,
                 phase: CommandPhase::Indeterminate,
                 deadline: admission.deadline,
+                answers: Answers::new(admission.effect),
             }
         );
     }
@@ -3116,8 +3416,13 @@ mod tests {
         let CommitFacts::PublicationAdmitted { exchange, .. } = admission.facts else {
             panic!("an admission")
         };
+        // A release claimed under the operation of the admission
+        // contradicts what that operation committed.
         let claim = StoreOutcome::Committed(CommitFacts::InboundReleased { exchange });
-        absorbed(&mut world, result(&admission, claim));
+        let fault = CoreFault::ContradictoryOutcome {
+            operation: admission.operation,
+        };
+        faulted(&mut world, result(&admission, claim), fault);
         assert_eq!(world.phase(7), AWAIT);
     }
 
@@ -3247,6 +3552,7 @@ mod tests {
                 operation: release.operation,
                 phase: CommandPhase::Indeterminate,
                 deadline: release.deadline,
+                answers: Answers::new(release.effect),
             }
         );
     }
@@ -3299,6 +3605,7 @@ mod tests {
                 operation: admission.operation,
                 phase: CommandPhase::Indeterminate,
                 deadline: token,
+                answers: Answers::new(admission.effect).with(first[0].0),
             }
         );
         // The deadline that was replaced is stale.
@@ -3988,5 +4295,152 @@ mod tests {
             Stop::from(AllocationFailed),
             Stop::Fatal(CoreFault::AllocationFailed)
         );
+    }
+
+    // The limits of the windows, stated: the owner retains the latest
+    // resolutions of an operation, the latest operations that ended and
+    // the latest connections it closed, and nothing before them.
+
+    #[test]
+    fn an_answer_to_a_resolution_the_owner_no_longer_retains_is_not_matched() {
+        let mut world = World::admission_pending();
+        let admission = world.flights[0];
+        let mut token = admission.deadline;
+        let mut resolutions = Vec::new();
+        for _ in 0..=RETAINED_RESOLUTIONS {
+            world.applied(deadline(token));
+            let effects = world.drain();
+            let Effect::ArmDeadline { token: next, .. } = effects[1].1 else {
+                panic!("a deadline")
+            };
+            resolutions.push(effects[0].0);
+            token = next;
+        }
+        let answer = |effect: EffectId| Input::StoreResult {
+            effect,
+            operation: admission.operation,
+            reply: StoreReply::Outcome(StoreOutcome::Committed(admission.facts)),
+        };
+        // The first resolution is no longer retained: its answer is
+        // absorbed and the next resolution answers again.
+        absorbed(&mut world, answer(resolutions[0]));
+        assert_eq!(world.phase(7), PENDING);
+        // The command and the latest resolutions are retained, the first
+        // resolution is not; the oldest one retained still answers.
+        let retained = world.in_flight(7).answers;
+        assert!(retained.names(admission.effect));
+        assert!(!retained.names(resolutions[0]));
+        assert!(
+            resolutions[1..]
+                .iter()
+                .all(|effect| retained.names(*effect))
+        );
+        assert_eq!(world.sent(answer(resolutions[1])), ["EmitPubrec"]);
+    }
+
+    #[test]
+    fn an_operation_that_ended_before_the_retained_ones_is_no_longer_seen() {
+        let config = OwnerConfig {
+            retained_operations: bound(1),
+            ..config()
+        };
+        let mut world = World::with(config, EPOCH, CAPACITY);
+        world.applied(page(&fixture(EPOCH), true));
+        assert_eq!(world.sent(connect(CONN, b"p1-producer")), ["EmitConnack"]);
+        let admission = world.submit(publish(7));
+        assert_eq!(world.sent(committed(&admission)), ["EmitPubrec"]);
+        let release = world.submit(pubrel(7));
+        assert_eq!(world.sent(committed(&release)), ["EmitPubcomp"]);
+        // The release ended last and is the one retained; the admission
+        // before it is no longer seen.
+        let fault = CoreFault::ContradictoryOutcome {
+            operation: release.operation,
+        };
+        faulted(&mut world, rejected(&release), fault);
+        absorbed(&mut world, rejected(&admission));
+    }
+
+    #[test]
+    fn a_connection_closed_before_the_remembered_ones_is_no_longer_known_as_closed() {
+        let config = OwnerConfig {
+            remembered_connections: bound(1),
+            ..config()
+        };
+        let mut world = World::with(config, EPOCH, CAPACITY);
+        world.applied(page(&fixture(EPOCH), true));
+        assert_eq!(world.sent(connect(CONN, b"p1-producer")), ["EmitConnack"]);
+        for next in [11, 12] {
+            assert_eq!(
+                world.sent(connect(next, b"p1-producer")),
+                ["CloseConnection", "EmitConnack"]
+            );
+        }
+        absorbed(&mut world, connect(11, b"p1-producer"));
+        // The connection closed first is forgotten: the adapter must not
+        // deliver what it carries after the owner closed it this long ago.
+        assert_eq!(
+            world.sent(connect(CONN, b"p1-producer")),
+            ["CloseConnection", "EmitConnack"]
+        );
+    }
+
+    // Finding 3, for an operation that ended: only its own effects answer
+    // it, so a result naming another effect is not a contradiction.
+    #[test]
+    fn a_late_result_is_matched_to_its_operation_by_the_effect_that_asked_for_it() {
+        let mut world = refused();
+        let admission = world.flights[0];
+        let foreign = Input::StoreResult {
+            effect: EffectId {
+                sequence: EffectSeq::new(1),
+                ..admission.effect
+            },
+            operation: admission.operation,
+            reply: StoreReply::Outcome(StoreOutcome::Committed(admission.facts)),
+        };
+        absorbed(&mut world, foreign);
+        let fault = CoreFault::ContradictoryOutcome {
+            operation: admission.operation,
+        };
+        faulted(&mut world, committed(&admission), fault);
+    }
+
+    // Finding 5, across pages: a route read on an earlier page counts.
+    #[test]
+    fn a_route_read_twice_across_pages_is_a_fault() {
+        let facts = fixture(EPOCH);
+        let mut world = World::cold(EPOCH, CAPACITY);
+        world.applied(page(&facts[..4], false));
+        let before = world.snapshot();
+        assert_eq!(
+            world.step(page(&[route_fact(b"p1/example", 2)], false)),
+            StepOutcome::Fatal(CoreFault::ImpossibleInput)
+        );
+        assert_eq!(world.snapshot(), before);
+        world.applied(page(&facts[4..], true));
+    }
+
+    // Finding 7: the facts a check compares with are those of one kind,
+    // the run they form on the page, and nothing of a later kind.
+    #[test]
+    fn the_facts_of_one_kind_are_the_run_they_form_on_a_page() {
+        let mut facts = fixture(EPOCH);
+        facts.push(exchange_fact(1, 7, 1));
+        let mut starts = [None; 7];
+        for (position, fact) in facts.iter().enumerate() {
+            let start = &mut starts[fact.rank() as usize];
+            if start.is_none() {
+                *start = Some(position);
+            }
+        }
+        let end = facts.len();
+        assert_eq!(run(&facts, &starts, FactRank::Route, end), &facts[3..5]);
+        assert_eq!(run(&facts, &starts, FactRank::Session, end), &facts[5..8]);
+        assert_eq!(run(&facts, &starts, FactRank::Session, 6), &facts[5..6]);
+        assert_eq!(
+            run(&facts, &starts, FactRank::InboundExchange, end),
+            &facts[8..]
+        );
+        assert!(run(&facts, &starts, FactRank::Operation, end).is_empty());
     }
 }
