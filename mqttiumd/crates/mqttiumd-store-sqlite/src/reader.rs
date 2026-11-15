@@ -200,3 +200,69 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn driver(code: i32) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some("display text is not evidence of InvalidData".to_owned()),
+        )
+    }
+
+    #[test]
+    fn a_driver_or_query_failure_does_not_invent_invalid_durable_data() {
+        for error in [
+            driver(rusqlite::ffi::SQLITE_INTERNAL),
+            driver(rusqlite::ffi::SQLITE_MISUSE),
+            driver(rusqlite::ffi::SQLITE_ERROR),
+            driver(rusqlite::ffi::SQLITE_SCHEMA),
+            driver(rusqlite::ffi::SQLITE_RANGE),
+            driver(rusqlite::ffi::SQLITE_NOTFOUND),
+            rusqlite::Error::SqliteSingleThreadedMode,
+            rusqlite::Error::InvalidQuery,
+            rusqlite::Error::InvalidParameterCount(2, 1),
+            rusqlite::Error::InvalidColumnIndex(12),
+            rusqlite::Error::InvalidColumnName("missing".to_owned()),
+        ] {
+            assert_eq!(sql_error(&error), ReadError::Unavailable, "{error:?}");
+        }
+    }
+
+    #[test]
+    fn structured_driver_codes_preserve_data_limits_io_and_allocation_causes() {
+        for (code, expected) in [
+            (rusqlite::ffi::SQLITE_CORRUPT, ReadError::InvalidData),
+            (rusqlite::ffi::SQLITE_NOTADB, ReadError::InvalidData),
+            (rusqlite::ffi::SQLITE_MISMATCH, ReadError::InvalidData),
+            (rusqlite::ffi::SQLITE_CONSTRAINT, ReadError::InvalidData),
+            (rusqlite::ffi::SQLITE_TOOBIG, ReadError::LimitExceeded),
+            (rusqlite::ffi::SQLITE_NOMEM, ReadError::AllocationFailed),
+            (rusqlite::ffi::SQLITE_IOERR_READ, ReadError::Io),
+            (rusqlite::ffi::SQLITE_FULL, ReadError::Io),
+            (rusqlite::ffi::SQLITE_CANTOPEN, ReadError::Unavailable),
+            (rusqlite::ffi::SQLITE_BUSY, ReadError::Unavailable),
+            (rusqlite::ffi::SQLITE_AUTH, ReadError::Unavailable),
+        ] {
+            assert_eq!(sql_error(&driver(code)), expected);
+        }
+    }
+
+    #[test]
+    fn a_conversion_failure_retains_a_structured_io_cause() {
+        let error = rusqlite::Error::FromSqlConversionFailure(
+            0,
+            Type::Blob,
+            Box::new(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+        );
+        assert_eq!(sql_error(&error), ReadError::Io);
+        let error = rusqlite::Error::FromSqlConversionFailure(
+            0,
+            Type::Blob,
+            Box::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        );
+        assert_eq!(sql_error(&error), ReadError::Unavailable);
+    }
+}
