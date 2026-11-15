@@ -19,11 +19,6 @@
 //! so the holder of the creation authority may replace a box (ADR 0009)
 //! and no counter of the owner starts again.
 
-#![allow(
-    dead_code,
-    reason = "the transitions arrive with the next commit; this one holds their tests"
-)]
-
 use core::num::{NonZeroU32, NonZeroUsize};
 
 use crate::command::{CommandEvent, CommandPhase, OutcomeClass, Verdict};
@@ -584,11 +579,6 @@ impl Owner {
     }
 
     fn plan_change(&self, input: &Input, draft: &mut Draft) -> Result<Change, Stop> {
-        // The transitions arrive with the next commit: every input stops
-        // the owner here, and the tests of this module fail.
-        if self.revision >= Revision::new(0) {
-            return Err(IMPOSSIBLE);
-        }
         if self.recovery.is_some() {
             return match input {
                 Input::Recovery { facts, last } => self.plan_recovery(facts.as_slice(), *last),
@@ -837,6 +827,9 @@ impl Owner {
                 wake: WakeCondition::ResourceReleased,
             })
         };
+        // The lease table has one slot per entry of the exchange table and
+        // every exchange holds a lease: an account that grants the lease
+        // leaves room for the exchange.
         match self.leases.check(cost) {
             Ok(()) => {}
             Err(LeaseRefused::LargerThanAccount(_)) => return never(draft),
@@ -847,9 +840,6 @@ impl Owner {
                 return Err(lacking(resource, missing));
             }
             Err(LeaseRefused::TableFull) => return Err(lacking(Resource::ExchangeSlots, 1)),
-        }
-        if self.slots.is_full() {
-            return Err(lacking(Resource::ExchangeSlots, 1));
         }
         let references = u64::try_from(targets).unwrap_or(u64::MAX);
         let mut list = BoundedVec::with_capacity(targets)
@@ -2472,6 +2462,15 @@ mod tests {
             );
             assert_eq!(world.snapshot(), before, "{case}");
         }
+        // A route without its table is refused on a page that does not
+        // close the inventory, before the inventory could miss the table.
+        let mut world = World::cold(EPOCH, CAPACITY);
+        let before = world.snapshot();
+        assert_eq!(
+            world.step(page(&without(2)[..3], false)),
+            StepOutcome::Fatal(CoreFault::ImpossibleInput)
+        );
+        assert_eq!(world.snapshot(), before);
         // The same checks hold across pages.
         let mut world = World::cold(EPOCH, CAPACITY);
         world.applied(page(&with(&[exchange_fact(1, 7, 1)]), false));
