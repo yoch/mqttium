@@ -1054,6 +1054,9 @@
         },
         "reject_reason": {
           "$ref": "primitives.schema.json#/$defs/reject_reason"
+        },
+        "violation": {
+          "$ref": "primitives.schema.json#/$defs/store_violation"
         }
       },
       "allOf": [
@@ -1080,6 +1083,30 @@
               ]
             }
           }
+        },
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "Violation"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "violation"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "violation"
+              ]
+            }
+          }
         }
       ]
     },
@@ -1103,6 +1130,9 @@
         },
         "reject_reason": {
           "$ref": "primitives.schema.json#/$defs/reject_reason"
+        },
+        "violation": {
+          "$ref": "primitives.schema.json#/$defs/store_violation"
         }
       },
       "allOf": [
@@ -1126,6 +1156,30 @@
             "not": {
               "required": [
                 "reject_reason"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "Violation"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "violation"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "violation"
               ]
             }
           }
@@ -2006,6 +2060,9 @@
         },
         "reject_reason": {
           "$ref": "primitives.schema.json#/$defs/reject_reason"
+        },
+        "violation": {
+          "$ref": "primitives.schema.json#/$defs/store_violation"
         }
       },
       "allOf": [
@@ -2029,6 +2086,30 @@
             "not": {
               "required": [
                 "reject_reason"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "Violation"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "violation"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "violation"
               ]
             }
           }

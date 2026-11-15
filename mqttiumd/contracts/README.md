@@ -197,6 +197,15 @@ contract crate, and the assertion
 rejection a refusing frame answers is the latest certain rejection among
 its causes, delivered to the same incarnation of the core.
 
+A store may answer with no outcome at all: a contract violation
+(`StoreReply::Violation`), today only `RecipeMismatch`, for an
+`OperationId` presented again with a different recipe. The three result
+records then carry the outcome `Violation` and name it in `violation`,
+which no other outcome has. A violation is not a commit: an
+acknowledgement that follows from it fails
+`no_positive_ack_before_confirmed_commit`, and it is no terminal
+knowledge. The store adapter hands it over unchanged, as any result.
+
 A `CommandSubmitted` or `ResolveSubmitted` has as a parent the record of
 the core, in the same incarnation, that consumed the input the effect
 comes from (`PacketDelivered` for an admission or a release,
