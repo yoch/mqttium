@@ -205,9 +205,13 @@ establish it (`results.unmet`): the manifest is valid and names the
 contracts in use; it names the scenario and its fixture with the digests
 of the files given; it records the backend, the failure model, the
 scheduler and the commands; it identifies the oracle and the generators,
-and the oracle files it lists are the ones that judged; the tree was
-clean; and something establishes that the binary was built from the
-recorded content. No member of `run-manifest` v1 says the last (an open
+and the oracle files it lists are the ones that judged: every module of
+the oracle that runs, read from where it runs and not from the campaign,
+is listed with its digest; every modified path the manifest records is
+kept in the campaign as the bench keeps it, a tracked one by its diff in
+`modified/tracked.patch` and an untracked one as
+`modified/untracked/<path>`; and something establishes that the binary
+was built from the recorded content. No member of `run-manifest` v1 says the last (an open
 condition of lot L4), so today the command always writes a provisional
 result. A provisional result never carries PASS: a run whose checks all
 pass is written INCONCLUSIVE, with one reason `not qualifying: …` per

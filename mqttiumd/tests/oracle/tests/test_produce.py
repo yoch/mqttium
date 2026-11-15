@@ -277,9 +277,12 @@ class Campaign(unittest.TestCase):
 
     def test_a_modified_tree_whose_content_is_kept_qualifies_on_that_count(self):
         self.keep("modified/untracked/tools/probe.txt", b"probe\n")
+        # A long binary line before a diff does not hide that diff.
         self.keep(
             "modified/tracked.patch",
-            b"diff --git a/crates/x.rs b/crates/x.rs\n--- a/crates/x.rs\n+++ b/crates/x.rs\n",
+            b"diff --git a/assets/blob b/assets/blob\nGIT binary patch\n"
+            + b"z" * (results.MAX_HEADER_BYTES * 3)
+            + b"\ndiff --git a/crates/x.rs b/crates/x.rs\n--- a/crates/x.rs\n+++ b/crates/x.rs\n",
         )
         unmet = self.produce(
             tree_state="modified", modified_paths=["crates/x.rs", "tools/probe.txt"]
