@@ -8,7 +8,8 @@
 //! The box is volatile: a crash destroys it. Safety after a crash rests on
 //! durable facts and protocol replay, never on this memory.
 
-use core::num::NonZeroUsize;
+use core::mem::size_of;
+use core::num::{NonZeroU32, NonZeroUsize};
 
 use crate::capacity::{
     AllocationFailed, BoundedQueue, BoundedVec, CapacityNeed, EffectSlots, Resource, WakeCondition,
@@ -296,11 +297,18 @@ pub enum ReservationError {
 
 /// Why a box refuses a reservation. Nothing changed.
 ///
-/// A temporary lack names a wake-up that can happen. The two other
-/// refusals are definitive for this box and name none: waiting cannot end
-/// them. When several refusals hold at once the first of this order is
-/// reported: `LargerThanBox`, `TableExhausted`, then the needs, effect
-/// slots before table entries.
+/// A temporary lack names a wake-up that can happen and after which a
+/// retry is useful. The two other refusals are definitive for this box
+/// and name none: waiting cannot end them. When several refusals hold at
+/// once the first of this order is reported: `LargerThanBox`,
+/// `TableExhausted`, then the needs, effect slots before table entries.
+///
+/// Wake-up of a lack of effect slots: `EffectAccepted` when the effects
+/// that wait for an adapter cover what is missing, and
+/// `EffectAcceptedOrResourceReleased` when live reservations hold part of
+/// it. Wake-up of a lack of table entries: `ResourceReleased`, which is
+/// the end of a reservation, by [`Outbox::release`] or by the publication
+/// of its last slot ([`Outbox::publish`] returning zero).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReserveRefused {
     /// A temporary lack: retry after the wake-up it names.
@@ -309,8 +317,9 @@ pub enum ReserveRefused {
     /// make room for it.
     LargerThanBox { requested: usize, capacity: usize },
     /// No entry of the reservation table can ever be taken again: every
-    /// entry is spent, or the table has none. Only a new box, created by
-    /// the authority after this one is retired, reserves again.
+    /// entry is spent, or is held at its last generation and will be spent
+    /// when its reservation ends. Only a new box, created by the authority
+    /// after this one is retired, reserves again.
     TableExhausted,
 }
 
@@ -419,7 +428,7 @@ impl Outbox {
     /// or released.
     #[must_use]
     pub fn has_live_reservations(&self) -> bool {
-        self.reserved > 0 || self.records.as_slice().iter().any(|record| record.held)
+        self.reserved > 0
     }
 
     /// The waiting effects, oldest first.
@@ -428,11 +437,8 @@ impl Outbox {
     }
 
     /// Reserves `slots` places, or says why not. Nothing changes on
-    /// refusal.
-    ///
-    /// A held entry counts as one that a release can free, even at its
-    /// last generation: the wake-up happens, and the retry is then told
-    /// that the table is exhausted.
+    /// refusal. The refusals and their wake-ups are those of
+    /// [`ReserveRefused`].
     pub fn reserve(&mut self, slots: NonZeroUsize) -> Result<EffectReservation, ReserveRefused> {
         let slots = slots.get();
         let capacity = self.queue.capacity();
@@ -446,15 +452,28 @@ impl Outbox {
         let entry = records
             .iter()
             .position(|record| !record.held && !record.spent);
-        if entry.is_none() && !records.iter().any(|record| record.held) {
+        // An entry held at its last generation is spent when its
+        // reservation ends: no end of it frees an entry.
+        let freed_later = records
+            .iter()
+            .any(|record| record.held && record.generation != u64::MAX);
+        if entry.is_none() && !freed_later {
             return Err(ReserveRefused::TableExhausted);
         }
         let free = self.free_slots();
         if slots > free {
+            let missing = slots - free;
+            // Acceptances free the slots of waiting effects only; the rest
+            // is held by live reservations.
+            let wake = if self.queue.len() >= missing {
+                WakeCondition::EffectAccepted
+            } else {
+                WakeCondition::EffectAcceptedOrResourceReleased
+            };
             return Err(ReserveRefused::Need(CapacityNeed {
                 resource: Resource::EffectSlots,
-                amount: (slots - free) as u64,
-                wake: WakeCondition::EffectAccepted,
+                amount: missing as u64,
+                wake,
             }));
         }
         let Some(index) = entry else {
@@ -518,11 +537,15 @@ impl Outbox {
     ///
     /// The key is checked before anything changes. A refusal hands the same
     /// effect back with the reason and leaves the box untouched.
+    ///
+    /// Returns the slots the reservation still holds. Zero means that the
+    /// reservation ended: its table entry is released, which is the
+    /// `ResourceReleased` wake-up of a lack of table entries.
     pub fn publish(
         &mut self,
         key: EffectReservation,
         effect: OwnedEffect,
-    ) -> Result<(), PublishRefused> {
+    ) -> Result<usize, PublishRefused> {
         let index = match self.locate(key) {
             Ok(index) => index,
             Err(reason) => return Err(PublishRefused { effect, reason }),
@@ -536,10 +559,11 @@ impl Outbox {
         self.reserved -= 1;
         let record = &mut self.records.as_mut_slice()[index];
         record.remaining -= 1;
-        if record.remaining == 0 {
+        let remaining = record.remaining;
+        if remaining == 0 {
             self.retire(index);
         }
-        Ok(())
+        Ok(remaining)
     }
 
     /// Gives back the unpublished slots of a reservation and returns how
@@ -581,21 +605,36 @@ impl Outbox {
 /// active owners, the boxes that exist and the next serial are as before.
 ///
 /// When several refusals hold at once the first of this order is reported:
-/// `SerialsExhausted`, `OwnerAlreadyActive`, `TableFull`,
-/// `AllocationFailed`. The definitive one comes first so that it is never
-/// reported as a wait that a retirement could end.
+/// `EmptyBox`, `TooLarge`, `SerialsExhausted`, `OwnerAlreadyActive`,
+/// `TableFull`, `AllocationFailed`. The definitive ones come first so that
+/// none is reported as a wait that a retirement or a retry could end.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CreateRefused {
+    /// The box would have no slot, or no reservation entry: it could never
+    /// take an effect. Definitive for these dimensions.
+    EmptyBox,
+    /// The dimensions exceed what any allocation can hold on this
+    /// platform, whatever memory is free. Definitive for these dimensions.
+    TooLarge,
     /// The serial counter reached its end. Definitive: nothing wraps, no
     /// retirement frees a serial, and this authority creates no box again.
     SerialsExhausted,
     /// The owner holds a live box. Retiring that box lifts the refusal.
     OwnerAlreadyActive,
-    /// The bounded table of the authority has no free entry. Retiring a
-    /// box lifts the refusal.
+    /// The bounded table of the authority has no free entry. The table
+    /// has at least one entry, so a box exists whose retirement lifts the
+    /// refusal.
     TableFull,
-    /// Memory could not be obtained. Recoverable: the caller may try again.
+    /// Memory could not be obtained for dimensions that an allocation can
+    /// hold. Recoverable: the caller may try again.
     AllocationFailed,
+}
+
+/// Whether `count` items of `T` fit the largest allocation there is.
+fn fits_an_allocation<T>(count: usize) -> bool {
+    count
+        .checked_mul(size_of::<T>())
+        .is_some_and(|bytes| bytes <= isize::MAX as usize)
 }
 
 /// Why an authority refuses to retire a box.
@@ -649,7 +688,8 @@ pub struct OwnerAuthority {
 
 impl OwnerAuthority {
     /// Issues the authority of one opened run epoch, able to keep up to
-    /// `max_owners` owners active at a time.
+    /// `max_owners` owners active at a time. The table has at least one
+    /// entry: an authority that could create no box is not issued.
     ///
     /// This is the trusted entry point of ADR 0009: the one function that
     /// constructs an authority. The type cannot count its own
@@ -665,9 +705,9 @@ impl OwnerAuthority {
     pub fn issue_for_opened_epoch(
         incarnation: StoreIncarnation,
         epoch: RunEpoch,
-        max_owners: u32,
+        max_owners: NonZeroU32,
     ) -> Result<Self, AllocationFailed> {
-        let table = usize::try_from(max_owners).map_err(|_| AllocationFailed)?;
+        let table = usize::try_from(max_owners.get()).map_err(|_| AllocationFailed)?;
         Ok(Self {
             incarnation,
             epoch,
@@ -720,6 +760,15 @@ impl OwnerAuthority {
     ) -> Result<Outbox, CreateRefused> {
         // Every check and every allocation comes before the entry is
         // published; nothing below the last `?` can fail.
+        if capacity == EffectSlots::ZERO || max_reservations == 0 {
+            return Err(CreateRefused::EmptyBox);
+        }
+        let realizable = usize::try_from(capacity.get())
+            .is_ok_and(fits_an_allocation::<OwnedEffect>)
+            && usize::try_from(max_reservations).is_ok_and(fits_an_allocation::<ReservationRecord>);
+        if !realizable {
+            return Err(CreateRefused::TooLarge);
+        }
         let serial = self.next_serial.ok_or(CreateRefused::SerialsExhausted)?;
         if self.active.as_slice().iter().any(|e| e.owner == owner) {
             return Err(CreateRefused::OwnerAlreadyActive);
@@ -783,7 +832,7 @@ mod tests {
     use super::*;
     use crate::ids::EffectSeq;
 
-    fn effect(sequence: u64) -> OwnedEffect {
+    pub(super) fn effect(sequence: u64) -> OwnedEffect {
         OwnedEffect::new(
             EffectId {
                 epoch: RunEpoch::new(1),
@@ -797,7 +846,7 @@ mod tests {
         )
     }
 
-    fn slots(count: usize) -> NonZeroUsize {
+    pub(super) fn slots(count: usize) -> NonZeroUsize {
         NonZeroUsize::new(count).expect("at least one slot")
     }
 
@@ -856,9 +905,9 @@ mod tests {
     }
 
     /// Accepts a fixed number of effects, then reports a full queue.
-    struct LimitedSink {
-        room: usize,
-        taken: Vec<OwnedEffect>,
+    pub(super) struct LimitedSink {
+        pub(super) room: usize,
+        pub(super) taken: Vec<OwnedEffect>,
     }
 
     impl EffectSink for LimitedSink {
@@ -1191,34 +1240,39 @@ mod tests {
     }
 
     #[test]
-    fn a_table_with_a_held_entry_left_is_a_wait_until_that_entry_is_spent() {
-        let mut outbox = Outbox::with_capacity(box_id(0), EffectSlots::new(4), 2).expect("small");
-        for record in outbox.records.as_mut_slice() {
-            record.generation = u64::MAX;
+    fn a_lack_of_entries_ends_when_a_reservation_ends_by_release_or_by_publication() {
+        let need = Err(ReserveRefused::Need(CapacityNeed {
+            resource: Resource::Reservations,
+            amount: 1,
+            wake: WakeCondition::ResourceReleased,
+        }));
+        for by_publication in [false, true] {
+            let mut outbox =
+                Outbox::with_capacity(box_id(0), EffectSlots::new(4), 2).expect("small");
+            // One entry is spent; the other is held and has generations left.
+            outbox.records.as_mut_slice()[0].spent = true;
+            let held = outbox.reserve(slots(2)).expect("an entry is left");
+            assert_eq!(held.slot, 1);
+            let before = snapshot(&outbox);
+            assert_eq!(outbox.reserve(slots(1)), need);
+            assert_eq!(snapshot(&outbox), before);
+
+            if by_publication {
+                assert_eq!(outbox.publish(held, effect(0)), Ok(1));
+                assert_eq!(outbox.reserve(slots(1)), need, "the reservation is live");
+                assert_eq!(
+                    outbox.publish(held, effect(1)),
+                    Ok(0),
+                    "the last slot ends the reservation"
+                );
+            } else {
+                assert_eq!(outbox.release(held), Ok(2));
+            }
+            let next = outbox.reserve(slots(1)).expect("the entry was released");
+            assert_eq!(next.slot, 1);
+            assert_ne!(next.generation, held.generation);
+            assert_invariant(&outbox);
         }
-        let spent = outbox.reserve(slots(1)).expect("an entry is left");
-        let held = outbox.reserve(slots(1)).expect("an entry is left");
-        assert_eq!(outbox.release(spent), Ok(1));
-
-        // One entry is spent and the other is held: a release can happen.
-        let before = snapshot(&outbox);
-        assert_eq!(
-            outbox.reserve(slots(1)),
-            Err(ReserveRefused::Need(CapacityNeed {
-                resource: Resource::Reservations,
-                amount: 1,
-                wake: WakeCondition::ResourceReleased,
-            }))
-        );
-        assert_eq!(snapshot(&outbox), before);
-
-        // The release happens; the held entry was at its last generation.
-        assert_eq!(outbox.release(held), Ok(1));
-        assert_eq!(
-            outbox.reserve(slots(1)),
-            Err(ReserveRefused::TableExhausted)
-        );
-        assert_invariant(&outbox);
     }
 
     #[test]
@@ -1263,38 +1317,57 @@ mod tests {
     // effects alone cannot cover must not name `EffectAccepted` alone.
     #[test]
     fn a_lack_of_slots_held_by_reservations_does_not_wait_for_an_acceptance_alone() {
+        let lack = |amount, wake| {
+            Err(ReserveRefused::Need(CapacityNeed {
+                resource: Resource::EffectSlots,
+                amount,
+                wake,
+            }))
+        };
         // Capacity 4: one effect queued, three slots reserved.
         let mut outbox = filled(4, 1);
         let held = outbox.reserve(slots(3)).expect("room");
         let before = snapshot(&outbox);
-        let refusal = outbox.reserve(slots(2)).expect_err("no slot is free");
-        assert!(
-            !matches!(
-                refusal,
-                ReserveRefused::Need(CapacityNeed {
-                    wake: WakeCondition::EffectAccepted,
-                    ..
-                })
-            ),
-            "one acceptance cannot free two slots: {refusal:?}"
+        // One acceptance covers one missing slot, not two.
+        assert_eq!(
+            outbox.reserve(slots(1)),
+            lack(1, WakeCondition::EffectAccepted)
+        );
+        assert_eq!(
+            outbox.reserve(slots(2)),
+            lack(2, WakeCondition::EffectAcceptedOrResourceReleased)
         );
         assert_eq!(snapshot(&outbox), before);
-        assert_eq!(outbox.release(held), Ok(3));
 
-        // An empty queue, every slot reserved: no acceptance can happen.
-        let mut outbox = outbox_of(0, 2);
-        let _held = outbox.reserve(slots(2)).expect("room");
-        let refusal = outbox.reserve(slots(1)).expect_err("no slot is free");
-        assert!(
-            !matches!(
-                refusal,
-                ReserveRefused::Need(CapacityNeed {
-                    wake: WakeCondition::EffectAccepted,
-                    ..
-                })
-            ),
-            "no effect waits for an adapter: {refusal:?}"
+        // Each named event can happen, and after both the retry succeeds.
+        let mut sink = LimitedSink {
+            room: 1,
+            taken: Vec::new(),
+        };
+        assert_eq!(outbox.dispatch(&mut sink).accepted, 1);
+        assert_eq!(
+            outbox.reserve(slots(2)),
+            lack(1, WakeCondition::EffectAcceptedOrResourceReleased),
+            "no effect waits any more; a reservation holds the rest"
         );
+        assert_eq!(outbox.release(held), Ok(3));
+        assert!(outbox.reserve(slots(2)).is_ok());
+
+        // An empty queue, every slot reserved: no acceptance can happen
+        // until a reservation publishes or is released.
+        let mut outbox = outbox_of(0, 2);
+        let held = outbox.reserve(slots(2)).expect("room");
+        assert_eq!(
+            outbox.reserve(slots(1)),
+            lack(1, WakeCondition::EffectAcceptedOrResourceReleased)
+        );
+        // The reservation publishes: its slot now waits for an adapter.
+        assert_eq!(outbox.publish(held, effect(0)), Ok(1));
+        assert_eq!(
+            outbox.reserve(slots(1)),
+            lack(1, WakeCondition::EffectAccepted)
+        );
+        assert_invariant(&outbox);
     }
 
     // Review of 437edc2, finding 6: an entry held at its last generation
@@ -1429,8 +1502,8 @@ mod tests {
 /// The tests named by ADR 0009 for the creation authority.
 #[cfg(test)]
 mod authority_tests {
+    use super::tests::{LimitedSink, effect, slots};
     use super::*;
-    use crate::ids::EffectSeq;
 
     const INCARNATION: u64 = 7;
     const EPOCH: u64 = 3;
@@ -1439,7 +1512,7 @@ mod authority_tests {
         OwnerAuthority::issue_for_opened_epoch(
             StoreIncarnation::new(incarnation),
             RunEpoch::new(epoch),
-            max_owners,
+            NonZeroU32::new(max_owners).expect("at least one owner"),
         )
         .expect("small")
     }
@@ -1456,22 +1529,18 @@ mod authority_tests {
         authority.create_outbox(owner(raw), EffectSlots::new(4), 2)
     }
 
-    fn slots(count: usize) -> NonZeroUsize {
-        NonZeroUsize::new(count).expect("at least one slot")
+    /// Accepts every effect.
+    fn taking() -> LimitedSink {
+        LimitedSink {
+            room: usize::MAX,
+            taken: Vec::new(),
+        }
     }
 
-    fn effect(sequence: u64) -> OwnedEffect {
-        OwnedEffect::new(
-            EffectId {
-                epoch: RunEpoch::new(EPOCH),
-                owner: owner(0),
-                sequence: EffectSeq::new(sequence),
-            },
-            Effect::LoadWork {
-                session: SessionId::new(sequence),
-                limit: 8,
-            },
-        )
+    /// The largest capacity an allocation can express. No allocator
+    /// provides it, so creating such a box fails for lack of memory.
+    fn unobtainable() -> EffectSlots {
+        EffectSlots::new((isize::MAX as usize / size_of::<OwnedEffect>()) as u64)
     }
 
     /// Everything a refusal must leave unchanged in an authority: the
@@ -1692,26 +1761,13 @@ mod authority_tests {
     }
 
     #[test]
-    fn a_table_of_no_entry_refuses_every_creation() {
-        let mut authority = authority(0);
-        assert_eq!(
-            create(&mut authority, 1).map(|outbox| outbox.id()),
-            Err(CreateRefused::TableFull)
-        );
-        assert_eq!(
-            authority_state(&authority),
-            (Vec::new(), Some(OutboxSerial::new(0)))
-        );
-    }
-
-    #[test]
     fn a_failed_allocation_is_recoverable_and_consumes_no_serial() {
         let mut authority = authority(2);
         let before = authority_state(&authority);
-        // More slots than any allocation can hold.
+        // Dimensions an allocation can express and no allocator provides.
         assert_eq!(
             authority
-                .create_outbox(owner(1), EffectSlots::new(u64::MAX), 2)
+                .create_outbox(owner(1), unobtainable(), 2)
                 .map(|outbox| outbox.id()),
             Err(CreateRefused::AllocationFailed)
         );
@@ -1728,27 +1784,25 @@ mod authority_tests {
     fn a_size_that_can_never_be_allocated_is_not_reported_as_recoverable() {
         let mut authority = authority(2);
         let before = authority_state(&authority);
-        let refusal = authority
-            .create_outbox(owner(1), EffectSlots::new(u64::MAX), 2)
-            .map(|outbox| outbox.id())
-            .expect_err("no such box");
-        assert_ne!(
-            refusal,
-            CreateRefused::AllocationFailed,
-            "trying again cannot succeed"
+        let one_more = EffectSlots::new(unobtainable().get() + 1);
+        for capacity in [one_more, EffectSlots::new(u64::MAX)] {
+            assert_eq!(
+                authority
+                    .create_outbox(owner(1), capacity, 2)
+                    .map(|outbox| outbox.id()),
+                Err(CreateRefused::TooLarge),
+                "trying again cannot succeed"
+            );
+            assert_eq!(authority_state(&authority), before);
+        }
+        // The largest expressible size is a matter of memory, not of size.
+        assert_eq!(
+            authority
+                .create_outbox(owner(1), unobtainable(), 2)
+                .map(|outbox| outbox.id()),
+            Err(CreateRefused::AllocationFailed)
         );
         assert_eq!(authority_state(&authority), before);
-    }
-
-    // Review of 437edc2, finding 2: with no entry at all there is no box
-    // whose retirement could lift `TableFull`.
-    #[test]
-    fn an_authority_without_any_entry_is_not_reported_as_a_full_table() {
-        let mut authority = authority(0);
-        let refusal = create(&mut authority, 1)
-            .map(|outbox| outbox.id())
-            .expect_err("no entry");
-        assert_ne!(refusal, CreateRefused::TableFull, "nothing can be retired");
     }
 
     // Review of 437edc2, finding 3: a box that can hold no effect, or no
@@ -1762,9 +1816,10 @@ mod authority_tests {
             let created = authority
                 .create_outbox(owner(1), EffectSlots::new(capacity), max_reservations)
                 .map(|outbox| outbox.id());
-            assert!(
-                created.is_err(),
-                "a dead box was created: capacity {capacity}, {max_reservations} reservations"
+            assert_eq!(
+                created,
+                Err(CreateRefused::EmptyBox),
+                "capacity {capacity}, {max_reservations} reservations"
             );
             assert_eq!(authority_state(&authority), before);
             assert_eq!(authority.active_box(owner(1)), None);
@@ -1791,10 +1846,14 @@ mod authority_tests {
         };
         let before = unchanged(&authority, &first, &second);
 
-        let attempts: [(u64, u64, CreateRefused); 3] = [
+        let attempts: [(u64, u64, CreateRefused); 6] = [
             (1, 4, CreateRefused::OwnerAlreadyActive),
             (3, 4, CreateRefused::TableFull),
-            (2, u64::MAX, CreateRefused::OwnerAlreadyActive),
+            (2, unobtainable().get(), CreateRefused::OwnerAlreadyActive),
+            // The refusals that depend on the dimensions alone come first.
+            (1, 0, CreateRefused::EmptyBox),
+            (3, 0, CreateRefused::EmptyBox),
+            (3, u64::MAX, CreateRefused::TooLarge),
         ];
         for (raw, capacity, expected) in attempts {
             assert_eq!(
@@ -1813,14 +1872,14 @@ mod authority_tests {
 
         // Allocation failure, with a free entry so that it is reached.
         first.release(key).expect("live");
-        let mut sink = Taking(Vec::new());
+        let mut sink = taking();
         assert_eq!(first.dispatch(&mut sink).accepted, 1);
         let first_id = first.id();
         authority.retire(first).expect("empty and unreserved");
         let before = (authority_state(&authority), box_state(&second));
         assert_eq!(
             authority
-                .create_outbox(owner(3), EffectSlots::new(u64::MAX), 2)
+                .create_outbox(owner(3), unobtainable(), 2)
                 .map(|outbox| outbox.id()),
             Err(CreateRefused::AllocationFailed)
         );
@@ -1832,16 +1891,6 @@ mod authority_tests {
         let third = create(&mut authority, 3).expect("an entry is free");
         assert_eq!(Some(third.id().serial()), before.0.1);
         assert_ne!(third.id().serial(), first_id.serial());
-    }
-
-    /// Accepts every effect.
-    struct Taking(Vec<OwnedEffect>);
-
-    impl EffectSink for Taking {
-        fn try_submit(&mut self, effect: OwnedEffect) -> SubmitResult {
-            self.0.push(effect);
-            SubmitResult::Accepted
-        }
     }
 
     // ADR 0009: on a refusal the same box comes back and the authority is
@@ -1862,9 +1911,9 @@ mod authority_tests {
         assert_eq!(pending, vec![&effect(4)], "the effect changed");
 
         // Once an adapter accepted the effect the same box is retired.
-        let mut sink = Taking(Vec::new());
+        let mut sink = taking();
         assert_eq!(outbox.dispatch(&mut sink).accepted, 1);
-        assert_eq!(sink.0, vec![effect(4)]);
+        assert_eq!(sink.taken, vec![effect(4)]);
         authority.retire(outbox).expect("empty and unreserved");
         assert_eq!(authority.active_box(owner(1)), None);
     }
