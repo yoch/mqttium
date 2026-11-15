@@ -18,7 +18,7 @@ const USAGE: &str = "\
 usage:
   mqttiumd-lab validate --contracts <dir> [--scenario <file>]... [--file <file>]... [--root <dir>]
   mqttiumd-lab manifest [--contracts <dir>] [--root <dir>]
-  mqttiumd-lab run --contracts <dir> --scenario <file> --out <dir> [--seed <n>] [--run-id <slug>] [--root <dir>]
+  mqttiumd-lab run --contracts <dir> --scenario <file> --out <dir> [--seed <n>] [--run-id <slug>] [--backend sim-store|sqlite] [--root <dir>]
 
 Paths are relative to --root, which defaults to the current directory.
 Exit codes: 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 3 OUT_OF_SCOPE (DEM-023).
@@ -37,6 +37,7 @@ struct Arguments {
     out: Option<PathBuf>,
     seed: Option<u64>,
     run_id: Option<String>,
+    backend: Option<String>,
 }
 
 fn parse(arguments: &[String]) -> Result<Arguments, String> {
@@ -47,6 +48,7 @@ fn parse(arguments: &[String]) -> Result<Arguments, String> {
         out: None,
         seed: None,
         run_id: None,
+        backend: None,
     };
     let mut rest = arguments.iter();
     while let Some(flag) = rest.next() {
@@ -63,6 +65,7 @@ fn parse(arguments: &[String]) -> Result<Arguments, String> {
                 );
             }
             "--run-id" => parsed.run_id = Some(value.clone()),
+            "--backend" => parsed.backend = Some(value.clone()),
             _ => return Err(format!("unknown option {flag}")),
         }
     }
@@ -129,6 +132,10 @@ fn run(arguments: &Arguments) -> Result<bool, String> {
         out: arguments.out.clone().ok_or("run needs --out")?,
         seed: arguments.seed.unwrap_or(1),
         run_id: arguments.run_id.clone(),
+        backend: arguments
+            .backend
+            .clone()
+            .unwrap_or_else(|| "sim-store".to_owned()),
     };
     let report = campaign::execute(&request)?;
     println!("contracts sha256:{}", report.contracts_digest);

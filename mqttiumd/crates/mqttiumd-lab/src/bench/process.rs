@@ -50,7 +50,7 @@ use crate::store::adapter::{
     AdapterLimits, Delivery, FaultAction, FaultId, FaultSpec, Performed, SimStore, StoreAction,
     StoreEvent, WorkId, startup_nonce,
 };
-use crate::store::durable::{DurableStore, MemoryStore};
+use crate::store::durable::DurableStore;
 use crate::store::evidence::{Cause as EvidenceCause, TraceWriter, recovered_fact, store_outcome};
 
 /// Why the run cannot go on. The trace is then declared incomplete.
@@ -313,11 +313,11 @@ impl Choice {
 }
 
 /// The process under test.
-pub struct Process {
+pub struct Process<S: DurableStore> {
     settings: Settings,
     opening: EpochOpening,
     epoch: RunEpoch,
-    store: SimStore<MemoryStore>,
+    store: SimStore<S>,
     /// Kept for the life of the process: the one creator of boxes.
     authority: OwnerAuthority,
     owner: Owner,
@@ -374,8 +374,8 @@ fn event_name(event: &StoreEvent) -> &'static str {
 /// Writes what the store adapter recorded, event by event, each on the
 /// channel of its component. Returns the cause of the last
 /// `RecoveryPageRead`, when one was written.
-fn flush(
-    store: &mut SimStore<MemoryStore>,
+fn flush<S: DurableStore>(
+    store: &mut SimStore<S>,
     writer: &mut TraceWriter<'static>,
     collector: &mut Collector,
     books: &mut Books,
@@ -454,8 +454,8 @@ fn flush(
 }
 
 /// The sink of the effect box: one entry point for the three adapters.
-struct Sink<'a> {
-    store: &'a mut SimStore<MemoryStore>,
+struct Sink<'a, S: DurableStore> {
+    store: &'a mut SimStore<S>,
     writer: &'a mut TraceWriter<'static>,
     timer: &'a mut Timer,
     transport: &'a mut Transport,
@@ -464,7 +464,7 @@ struct Sink<'a> {
     stop: Option<Stop>,
 }
 
-impl Sink<'_> {
+impl<S: DurableStore> Sink<'_, S> {
     fn record(
         &mut self,
         channel: Origin,
@@ -484,7 +484,7 @@ impl Sink<'_> {
     }
 }
 
-impl EffectSink for Sink<'_> {
+impl<S: DurableStore> EffectSink for Sink<'_, S> {
     fn try_submit(&mut self, effect: OwnedEffect) -> SubmitResult {
         if self.stop.is_some() {
             return SubmitResult::NotSubmitted {
@@ -621,14 +621,14 @@ impl Books {
     }
 }
 
-impl Process {
+impl<S: DurableStore> Process<S> {
     /// Starts the process on `store` by the real path, arms the faults
     /// `faults` (scenario index and specification), and recovers.
     ///
     /// `rank` counts the start-ups before this one: the nonce of the
     /// opening is drawn from the seed and the rank.
     pub fn start(
-        store: MemoryStore,
+        store: S,
         rank: u64,
         settings: Settings,
         faults: &[(usize, FaultSpec, &'static str)],
@@ -1236,19 +1236,19 @@ impl Process {
         Ok(Some(()))
     }
 
-    /// The durable state, read from the store without the broker.
+    /// The store behind the adapter, for the inspector of the backend.
     #[must_use]
-    pub fn durable(&self) -> crate::store::durable::DurableState {
-        self.store.store().snapshot()
+    pub fn store(&self) -> &S {
+        self.store.store()
     }
 
-    /// Crashes the process. What it recorded is written; the durable
-    /// state is reopened from what survived, and nothing else.
+    /// Crashes the process. What it recorded is written; the store comes
+    /// back for the backend to reopen from what survived.
     pub fn crash(
         self,
         collector: &mut Collector,
         books: &mut Books,
-    ) -> Result<(MemoryStore, Vec<String>), Stop> {
+    ) -> Result<(S, Vec<String>), Stop> {
         let Self {
             mut store,
             mut writer,
@@ -1263,6 +1263,6 @@ impl Process {
             .map(|connection| connection.client)
             .collect();
         let crashed = store.crash();
-        Ok((MemoryStore::reopen(crashed.store.snapshot()), open))
+        Ok((crashed.store, open))
     }
 }

@@ -9,9 +9,11 @@ mod bench_support;
 use std::fs;
 
 use mqttiumd_contract::ids::{LogicalOwnerId, RunEpoch};
+use mqttiumd_lab::bench::backend::Memory;
 use mqttiumd_lab::bench::campaign::Setup;
 use mqttiumd_lab::bench::collector::{Collector, KindTable};
 use mqttiumd_lab::bench::process::{Books, OWNER, Process};
+use mqttiumd_lab::store::durable::MemoryStore;
 
 use bench_support::root;
 
@@ -27,12 +29,12 @@ fn collector() -> Collector {
     )
 }
 
-fn setup() -> Setup {
+fn setup() -> Setup<MemoryStore> {
     let fixture = mqttiumd_lab::strict::parse(
         &fs::read(root().join("tests/fixtures/p1/three-persistent-sessions.json")).unwrap(),
     )
     .unwrap();
-    Setup::from_fixture(&fixture, "bench-f4", 1, 1).unwrap()
+    Setup::from_fixture(&mut Memory, &fixture, "bench-f4", 1, 1).unwrap()
 }
 
 #[test]

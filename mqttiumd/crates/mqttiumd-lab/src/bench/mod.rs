@@ -3,6 +3,7 @@
 //! `run` plays one scenario through the real components and leaves a
 //! campaign directory that the independent oracle judges:
 //!
+//! - `backend`: the durable store a campaign runs on;
 //! - `scenario`: the scenario as the runner plays it;
 //! - `mqtt`: the bytes of the subset, for the peers and the transport;
 //! - `collector`: the one writer of the trace, origin by channel;
@@ -13,6 +14,7 @@
 //!
 //! Nothing here computes a verdict.
 
+pub mod backend;
 pub mod campaign;
 pub mod collector;
 pub mod mqtt;

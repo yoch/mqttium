@@ -124,6 +124,7 @@ fn not_played(scenario: &str, name: &str) -> String {
         out: out.clone(),
         seed: 1,
         run_id: Some("bench-test".to_owned()),
+        backend: "sim-store".to_owned(),
     };
     let outcome = match mqttiumd_lab::bench::campaign::execute(&request) {
         Err(refused) => refused,
