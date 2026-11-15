@@ -4,33 +4,58 @@ Run from ``mqttiumd/``::
 
     python models/check_models.py
 
-Every directory under ``models/`` that holds a sidecar is checked. The
-script exits with 1 and one line per defect when:
+Every directory under ``models/`` that holds a ``.tla``, ``.cfg`` or
+``.json`` file is checked. The script exits with 1 and one line per defect
+when:
 
 * a ``.tla``, ``.cfg`` or ``.json`` file belongs to no sidecar, or a sidecar
   names a file that does not exist;
-* a sidecar is not well formed: module name, status, summary, issues, tests,
-  configurations and their declared outcomes;
+* the TLC runner would refuse the sidecar (``tools/formal/run_tlc.py``):
+  the reading of a sidecar and the refusals are the runner's own code;
+* a sidecar is not well formed beyond that: module name, status, issues,
+  tests;
 * a path listed in ``tests`` does not exist. The list holds only files that
   replay a counterexample of the model; a ``refinement`` model has at least
   one, a ``specification`` model may have none yet;
-* a configuration does not check what its sidecar entry declares: the
-  invariant of a ``violation``, the single ``PROPERTY`` of a temporal check,
-  deadlock checking, a specification that states fairness, operators that
-  the module defines;
+* a configuration does not check what its sidecar entry declares. A passing
+  entry states its ``invariants`` or its ``property``, and the list is the
+  one of the ``.cfg``; a ``violation`` checks its invariant; a temporal
+  check has exactly one property, whether it is written under ``PROPERTY``
+  or ``PROPERTIES``; deadlock checking; a specification that states
+  fairness; operators that the module defines;
 * a property violated by a ``liveness`` configuration has no configuration
   that must satisfy it;
 * the README of the directory has no correspondence table, or the table
   does not name every action of ``Next``, or a row does not say where the
   action is replayed.
 
-It uses the standard library only. TLC itself is run by
-``tools/formal/run_tlc.py --models-dir``.
+``invariants`` is a member of the sidecar entries of mqttiumd; the runner
+ignores it.
+
+What is shared with the client, and how. Imported from the runner:
+``EXPECTATIONS``, ``load_sidecars``, ``validated_checks``, ``SidecarError``.
+Copied from ``tests/project/test_formal_models.py``, which is a pytest file
+and cannot be imported here: the module header pattern, the operator
+pattern, and the rules on ``CHECK_DEADLOCK``, on the single property and on
+its repaired configuration. A change to one of them there is made here too.
+Two differences are deliberate:
+
+* statuses. The client knows ``refinement`` and ``legacy-flag``
+  (``docs/formal-models.md``). Here: ``refinement``, with the same meaning
+  and at least one test, and ``specification``: the actions encode the
+  predicates of the specification and of the decision records, and no
+  implementation exists yet to refine. ``legacy-flag`` is not accepted;
+* fairness. The client's test looks for ``WF_``, ``SF_`` or ``Fairness`` in
+  the specification; here a conjunct whose name starts with ``Fair`` counts
+  too, since the specifications name their fairness (``FairBroker``).
+
+It uses the standard library only. TLC itself is run by the runner with
+``--models-dir``.
 """
 
 from __future__ import annotations
 
-import json
+import importlib.util
 import re
 import sys
 from pathlib import Path
@@ -38,13 +63,48 @@ from pathlib import Path
 MODELS = Path(__file__).resolve().parent
 REPOSITORY = MODELS.parents[1]
 
-EXPECTATIONS = frozenset({"pass", "violation", "deadlock", "liveness"})
-# ``specification``: the actions encode the predicates of the specification
-# and of the decision records; no implementation exists yet to refine.
-# ``refinement``: the actions encode the predicates of the implementation,
-# and deterministic tests replay the counterexamples.
+_SPEC = importlib.util.spec_from_file_location(
+    "run_tlc", REPOSITORY / "tools" / "formal" / "run_tlc.py"
+)
+assert _SPEC is not None and _SPEC.loader is not None
+run_tlc = importlib.util.module_from_spec(_SPEC)
+sys.modules["run_tlc"] = run_tlc
+_SPEC.loader.exec_module(run_tlc)
+
 STATUSES = frozenset({"specification", "refinement"})
 MODEL_SUFFIXES = frozenset({".tla", ".cfg", ".json"})
+
+# Every keyword of a TLC configuration file. The names that follow one, up
+# to the next keyword, belong to it, on the same line or on later ones.
+_CFG_KEYWORDS = frozenset(
+    {
+        "SPECIFICATION",
+        "INIT",
+        "NEXT",
+        "INVARIANT",
+        "INVARIANTS",
+        "PROPERTY",
+        "PROPERTIES",
+        "CONSTANT",
+        "CONSTANTS",
+        "CONSTRAINT",
+        "CONSTRAINTS",
+        "ACTION_CONSTRAINT",
+        "ACTION_CONSTRAINTS",
+        "SYMMETRY",
+        "VIEW",
+        "ALIAS",
+        "POSTCONDITION",
+        "CHECK_DEADLOCK",
+    }
+)
+_SAME_SECTION = {
+    "INVARIANTS": "INVARIANT",
+    "PROPERTIES": "PROPERTY",
+    "CONSTRAINTS": "CONSTRAINT",
+    "CONSTANTS": "CONSTANT",
+    "ACTION_CONSTRAINTS": "ACTION_CONSTRAINT",
+}
 
 _MODULE_HEADER = re.compile(r"^-{4,}\s*MODULE\s+(\w+)\s*-{4,}", re.MULTILINE)
 _OPERATOR = r"^{name}\s*(?:\([^)]*\))?\s*=="
@@ -52,8 +112,18 @@ _DEFINITION = r"^{name}\s*==(.*?)(?=^\S|\Z)"
 _CORRESPONDENCE = re.compile(r"^## Correspondence\b.*?$(.*?)(?=^## |\Z)", re.MULTILINE | re.DOTALL)
 
 
-def _directive(text: str, name: str) -> list[str]:
-    return re.findall(rf"^{name}\s+(\w+)", text, re.MULTILINE)
+def read_config(text: str) -> dict[str, list[str]]:
+    """The tokens of each section of a TLC configuration, plurals merged."""
+    text = re.sub(r"\(\*.*?\*\)", " ", text, flags=re.DOTALL)
+    text = re.sub(r"\\\*.*", " ", text)
+    sections: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    for token in re.findall(r"[A-Za-z_]\w*|\S", text):
+        if token in _CFG_KEYWORDS:
+            current = sections.setdefault(_SAME_SECTION.get(token, token), [])
+        elif current is not None:
+            current.append(token)
+    return sections
 
 
 def _defines(module_text: str, operator: str) -> bool:
@@ -117,33 +187,52 @@ def check_correspondence(directory: Path, module_text: str) -> list[str]:
 def check_config(
     name: str, entry: dict[str, object], directory: Path, module_text: str
 ) -> list[str]:
-    config = str(entry.get("config"))
+    """One entry the runner accepts, against its configuration file."""
+    config = str(entry["config"])
     where = f"{name}/{config}"
-    expect = entry.get("expect")
-    if expect not in EXPECTATIONS:
-        return [f"{where}: unknown expectation {expect!r}"]
+    expect = entry["expect"]
     defects = []
     if ("invariant" in entry) != (expect == "violation"):
         defects.append(f"{where}: 'invariant' is named by a violation and by nothing else")
     if "property" in entry and expect not in ("liveness", "pass"):
         defects.append(f"{where}: 'property' is named by a temporal check only")
-    if expect == "liveness" and "property" not in entry:
-        defects.append(f"{where}: a liveness violation names its property")
-    path = directory / config
-    if not path.is_file():
-        return [*defects, f"{where}: the configuration file does not exist"]
-    text = path.read_text(encoding="utf-8")
-    specification = _directive(text, "SPECIFICATION")
+    stated = entry.get("invariants")
+    if stated is not None and (
+        not isinstance(stated, list) or not all(isinstance(item, str) for item in stated)
+    ):
+        return [*defects, f"{where}: 'invariants' is a list of names"]
+    sections = read_config((directory / config).read_text(encoding="utf-8"))
+    specification = sections.get("SPECIFICATION", [])
     if len(specification) != 1:
         return [*defects, f"{where}: exactly one SPECIFICATION is required"]
-    invariants = _directive(text, "INVARIANT")
-    properties = _directive(text, "PROPERTY")
+    invariants = sections.get("INVARIANT", [])
+    properties = sections.get("PROPERTY", [])
+    if expect == "pass" and not stated and "property" not in entry:
+        defects.append(f"{where}: a passing configuration states its invariants or its property")
+    if expect == "pass" or stated is not None:
+        # What the configuration checks is what the entry states, no less.
+        if sorted(invariants) != sorted(stated or []):
+            defects.append(
+                f"{where}: INVARIANT {sorted(invariants)} differs from the sidecar's "
+                f"{sorted(stated or [])}"
+            )
     if expect == "violation" and entry.get("invariant") not in invariants:
         defects.append(f"{where}: the declared invariant is not checked by the configuration")
     declared = [entry["property"]] if "property" in entry else []
     if properties != declared:
         defects.append(f"{where}: PROPERTY {properties} differs from the sidecar's {declared}")
-    no_deadlock = re.search(r"^CHECK_DEADLOCK\s+FALSE", text, re.MULTILINE) is not None
+    defects.extend(check_running(where, str(expect), sections, module_text))
+    return defects
+
+
+def check_running(
+    where: str, expect: str, sections: dict[str, list[str]], module_text: str
+) -> list[str]:
+    """Deadlock checking, fairness and the operators a configuration names."""
+    defects = []
+    specification = sections["SPECIFICATION"]
+    properties = sections.get("PROPERTY", [])
+    no_deadlock = sections.get("CHECK_DEADLOCK") == ["FALSE"]
     if expect == "liveness" and not no_deadlock:
         defects.append(f"{where}: a liveness violation sets CHECK_DEADLOCK FALSE")
     if expect == "pass" and no_deadlock:
@@ -152,37 +241,32 @@ def check_config(
         body = _definition(module_text, specification[0])
         if body is None or not re.search(r"\b[WS]F_|Fair", body):
             defects.append(f"{where}: {specification[0]} states no fairness")
-    for operator in [*specification, *invariants, *properties, *_directive(text, "CONSTRAINT")]:
+    named = [*specification, *sections.get("INVARIANT", []), *properties]
+    for operator in [*named, *sections.get("CONSTRAINT", [])]:
         if not _defines(module_text, operator):
             defects.append(f"{where}: {operator} is not defined in the module")
     return defects
 
 
-def check_sidecar(path: Path) -> list[str]:
+def check_sidecar(sidecar: dict[str, object]) -> list[str]:
+    path = sidecar["_path"]
+    assert isinstance(path, Path)
     name = path.stem
     try:
-        sidecar = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        return [f"{name}: unreadable sidecar: {error}"]
-    if not isinstance(sidecar, dict):
-        return [f"{name}: the sidecar is not an object"]
+        run_tlc.validated_checks(sidecar)
+    except run_tlc.SidecarError as refusal:
+        return [str(refusal)]
     defects = check_metadata(name, sidecar)
-    configs = sidecar.get("configs")
-    if not isinstance(configs, list) or not configs:
-        return [*defects, f"{name}: no configuration"]
-    if not all(isinstance(entry, dict) for entry in configs):
-        return [*defects, f"{name}: a configuration entry is an object"]
-    module = path.with_suffix(".tla")
-    if not module.is_file():
-        return [*defects, f"{name}: {module.name} does not exist"]
-    module_text = module.read_text(encoding="utf-8")
+    configs = sidecar["configs"]
+    assert isinstance(configs, list)
+    module_text = path.with_suffix(".tla").read_text(encoding="utf-8")
     header = _MODULE_HEADER.search(module_text)
     if header is None or header.group(1) != name:
         defects.append(f"{name}: the module header does not name {name}")
     for entry in configs:
         defects.extend(check_config(name, entry, path.parent, module_text))
-    violated = {e.get("property") for e in configs if e.get("expect") == "liveness"}
-    satisfied = {e.get("property") for e in configs if e.get("expect") == "pass"}
+    violated = {e.get("property") for e in configs if e["expect"] == "liveness"}
+    satisfied = {e.get("property") for e in configs if e["expect"] == "pass"}
     for missing in sorted(str(item) for item in violated - satisfied):
         defects.append(f"{name}: no configuration must satisfy the property {missing}")
     defects.extend(check_correspondence(path.parent, module_text))
@@ -191,13 +275,12 @@ def check_sidecar(path: Path) -> list[str]:
 
 def check_metadata(name: str, sidecar: dict[str, object]) -> list[str]:
     defects = []
-    if sidecar.get("module") != f"{name}.tla":
+    if sidecar["module"] != f"{name}.tla":
         defects.append(f"{name}: 'module' is {name}.tla")
-    status = sidecar.get("status")
+    status = sidecar["status"]
     if status not in STATUSES:
         defects.append(f"{name}: unknown status {status!r}")
-    summary = sidecar.get("summary")
-    if not isinstance(summary, str) or not summary.strip():
+    if not str(sidecar["summary"]).strip():
         defects.append(f"{name}: 'summary' is a sentence")
     issues = sidecar.get("issues")
     if (
@@ -219,20 +302,21 @@ def check_metadata(name: str, sidecar: dict[str, object]) -> list[str]:
 
 
 def check_directory(directory: Path) -> list[str]:
+    try:
+        sidecars = run_tlc.load_sidecars(directory)
+    except run_tlc.SidecarError as refusal:
+        return [f"{directory.name}/{refusal}"]
     defects = []
     claimed: set[str] = set()
-    for path in sorted(directory.glob("*.json")):
-        defects.extend(check_sidecar(path))
+    for sidecar in sidecars:
+        path = sidecar["_path"]
+        assert isinstance(path, Path)
+        defects.extend(check_sidecar(sidecar))
         claimed.add(path.name)
-        try:
-            sidecar = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if isinstance(sidecar, dict):
-            claimed.add(str(sidecar.get("module")))
-            configs = sidecar.get("configs")
-            if isinstance(configs, list):
-                claimed.update(str(e.get("config")) for e in configs if isinstance(e, dict))
+        claimed.add(str(sidecar.get("module")))
+        configs = sidecar.get("configs")
+        if isinstance(configs, list):
+            claimed.update(str(e.get("config")) for e in configs if isinstance(e, dict))
     present = {path.name for path in directory.iterdir() if path.suffix in MODEL_SUFFIXES}
     for name in sorted(present - claimed):
         defects.append(f"{directory.name}/{name}: belongs to no sidecar")
@@ -242,7 +326,12 @@ def check_directory(directory: Path) -> list[str]:
 
 
 def model_directories(root: Path) -> list[Path]:
-    return sorted(path for path in root.iterdir() if path.is_dir() and any(path.glob("*.json")))
+    """Every directory that holds a model file, with or without a sidecar."""
+    return sorted(
+        path
+        for path in root.iterdir()
+        if path.is_dir() and any(item.suffix in MODEL_SUFFIXES for item in path.iterdir())
+    )
 
 
 def main(root: Path = MODELS) -> int:

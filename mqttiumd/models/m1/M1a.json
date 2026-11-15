@@ -5,7 +5,7 @@
   "issues": [647],
   "tests": [],
   "configs": [
-    {"config": "M1a-safety.cfg", "expect": "pass"},
+    {"config": "M1a-safety.cfg", "expect": "pass", "invariants": ["TypeOK", "OneAdmissionPerExchange", "AtomicObligations", "AnswerOnKnowledge", "OneRecipePerIdentity", "FenceForbidsExecution", "AccountsMatch", "KnowledgeSound", "TerminalKnowledgeStable", "DelayedCommandKept"]},
     {"config": "M1a-reach-commit.cfg", "expect": "violation", "invariant": "NoCommit"},
     {"config": "M1a-reach-lost-result.cfg", "expect": "violation", "invariant": "NoLostResult"},
     {"config": "M1a-reach-unknown.cfg", "expect": "violation", "invariant": "NoUnknown"},
@@ -22,7 +22,7 @@
     {"config": "M1a-mut-late-unknown.cfg", "expect": "violation", "invariant": "TerminalKnowledgeStable"},
     {"config": "M1a-live-path.cfg", "expect": "pass", "property": "LivePathResolves"},
     {"config": "M1a-live-path-no-rearm.cfg", "expect": "liveness", "property": "LivePathResolves"},
-    {"config": "M1a-recovery.cfg", "expect": "pass", "property": "RecoveryCompletes"},
+    {"config": "M1a-recovery.cfg", "expect": "pass", "property": "RecoveryCompletes", "invariants": ["NoSuspension"]},
     {"config": "M1a-recovery-silent-client.cfg", "expect": "liveness", "property": "RecoveryCompletes"}
   ]
 }
