@@ -28,6 +28,18 @@ python tests/oracle/build_traces.py --check
 python -m unittest discover -t tests/oracle -s tests/oracle/tests
 ```
 
+A campaign runs one scenario through the real core, the deterministic
+store and their adapters (`crates/mqttiumd-lab/src/bench/`), then has the
+oracle judge the directory the runner wrote. The runner computes no
+verdict, and its `run-result` is provisional. The exit status is the
+oracle's: 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 3 OUT_OF_SCOPE. Campaign
+directories are generated and never committed.
+
+```bash
+tools/run_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02        # seed 1
+tools/run_campaign.sh tests/scenarios/qabs/QABS-B.json /tmp/qabs-b 7  # another seed
+```
+
 `proofs/` is a workspace of its own, so the four commands above do not see
 it. Its scripts are its only verification, and CI runs them in the job
 `pilot proof`; they need Kani (`tools/install-tools.sh kani`):

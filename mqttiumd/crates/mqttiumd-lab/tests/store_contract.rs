@@ -139,6 +139,21 @@ fn what_is_established_in_epoch_zero_is_never_collected() {
 }
 
 #[test]
+fn a_release_holds_the_slot_of_its_receipt() {
+    conformance::a_release_holds_the_slot_of_its_receipt(&memory);
+}
+
+#[test]
+fn a_release_without_a_receipt_slot_changes_nothing() {
+    conformance::a_release_without_a_receipt_slot_changes_nothing(&memory);
+}
+
+#[test]
+fn collecting_an_epoch_gives_back_the_slots_of_its_releases() {
+    conformance::collecting_an_epoch_gives_back_the_slots_of_its_releases(&memory);
+}
+
+#[test]
 fn every_receipt_and_fence_holds_a_receipt_slot() {
     conformance::every_receipt_and_fence_holds_a_receipt_slot(&memory);
 }

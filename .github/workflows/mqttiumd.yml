@@ -69,6 +69,24 @@ jobs:
           python -m pip install --disable-pip-version-check -r tests/oracle/requirements.txt
           python tests/oracle/build_traces.py --check
           python -m unittest discover -t tests/oracle -s tests/oracle/tests
+      # A campaign runs a scenario through the real core, the deterministic
+      # store and their adapters, and the oracle judges the directory the
+      # runner wrote. The step fails unless the oracle's verdict is PASS.
+      # P1-02b is not listed until its scenario lists only assertions that
+      # apply to it (open conditions): today the oracle answers OUT_OF_SCOPE.
+      - name: Campaigns on the deterministic store
+        run: |
+          for scenario in p1/P1-02 qabs/QABS-A qabs/QABS-B qabs/QABS-C; do
+            tools/run_campaign.sh "tests/scenarios/$scenario.json" \
+              "$RUNNER_TEMP/campaigns/$(basename "$scenario")"
+          done
+      - name: Keep the campaign directories
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-campaigns
+          path: ${{ runner.temp }}/campaigns
+          if-no-files-found: warn
 
   models:
     name: models

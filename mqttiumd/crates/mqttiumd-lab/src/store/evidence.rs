@@ -327,7 +327,11 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
     })
 }
 
-fn recovered_fact(fact: &RecoveredFact) -> Value {
+/// One recovered fact as a `RecoveryPageRead` record writes it. The
+/// record of the core that delivers a page (`RecoveryPageDelivered`)
+/// writes its facts with this same function.
+#[must_use]
+pub fn recovered_fact(fact: &RecoveredFact) -> Value {
     match fact {
         RecoveredFact::Epoch { incarnation, epoch } => json!({
             "kind": "Epoch",
@@ -440,7 +444,12 @@ fn kind_name(kind: WorkKind) -> &'static str {
     kind.name()
 }
 
-fn store_outcome(reply: StoreReply) -> Option<(&'static str, Option<&'static str>)> {
+/// The `outcome` and, for a certain rejection, the `reject_reason` of a
+/// store result, as `StoreResultReady` writes them; the record of the
+/// core that consumes the result (`StoreResultDelivered`) writes them
+/// with this same function. A violation has no outcome: `None`.
+#[must_use]
+pub fn store_outcome(reply: StoreReply) -> Option<(&'static str, Option<&'static str>)> {
     match reply {
         StoreReply::Outcome(StoreOutcome::Committed(_)) => Some(("Committed", None)),
         StoreReply::Outcome(StoreOutcome::RejectedCertain(rejected)) => {

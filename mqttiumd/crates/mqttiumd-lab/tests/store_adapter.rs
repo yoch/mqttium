@@ -903,6 +903,13 @@ fn two_faults_that_may_select_one_passage_are_refused() {
             source: Some((bench.producer, packet(7))),
             ..fault(FaultPoint::ResultReady, FaultAction::DropResult)
         },
+        // Another occurrence, but counted over the passages of one
+        // source only: which fault acts would depend on the store.
+        FaultSpec {
+            source: Some((bench.producer, packet(7))),
+            occurrence: 2,
+            ..fault(FaultPoint::ResultReady, FaultAction::DropResult)
+        },
     ];
     for spec in overlapping {
         assert_eq!(
@@ -1074,4 +1081,260 @@ fn nothing_is_handed_over_while_a_barrier_holds() {
 
 fn fresh_bench() -> Bench {
     bench_with(LIMITS)
+}
+
+/// The bench with `result_slots` results owed at most, and more room
+/// for commands in flight, so that the result budget is the bound.
+fn bench_with_results(result_slots: usize) -> Bench {
+    bench_with(AdapterLimits {
+        operations_in_flight: result_slots + 2,
+        result_slots,
+        ..LIMITS
+    })
+}
+
+fn queue_full(bench: &mut Bench, sequence: u64, command: &Command) {
+    assert_eq!(
+        bench
+            .store
+            .try_submit(persist_effect(bench, sequence, command)),
+        SubmitResult::NotSubmitted {
+            effect: persist_effect(bench, sequence, command),
+            reason: SubmitBlock::QueueFull
+        }
+    );
+}
+
+/// The counterexample of the audit (F6): with one result slot, a
+/// duplicated result would make two results owed. Its fault cannot be
+/// armed, and a run then never owes two results.
+#[test]
+fn a_duplicate_that_cannot_fit_is_not_armed() {
+    let mut bench = bench_with_results(1);
+    assert_eq!(
+        bench
+            .store
+            .arm(fault(FaultPoint::ResultReady, FaultAction::DuplicateResult)),
+        Err(FaultRefused::NoResultSlot)
+    );
+    let command = bench.admission(1, 7, b"payload", &[bench.b]);
+    let id = persist(&mut bench, 1, &command);
+    assert_eq!(bench.store.results_owed(), 1);
+    assert_eq!(enter(&mut bench, id), Performed::Executed);
+    assert_eq!(bench.store.results_owed(), 1);
+    assert!(matches!(
+        deliver(&mut bench, id),
+        Performed::Delivered { .. }
+    ));
+    assert_eq!(bench.store.results_owed(), 0);
+    assert!(bench.store.eligible().is_empty());
+}
+
+/// With two result slots the duplicate fits: its slot is reserved from
+/// arming until both copies are delivered, and no more than two results
+/// are ever owed. Then both slots are free again.
+#[test]
+fn a_duplicate_holds_the_slot_it_reserved_until_it_is_delivered() {
+    let mut bench = bench_with_results(2);
+    let duplicate = arm(
+        &mut bench,
+        FaultPoint::ResultReady,
+        FaultAction::DuplicateResult,
+    );
+    let commands: Vec<_> = (1..=4)
+        .map(|sequence| bench.admission(sequence, 7 + sequence as u16, b"p", &[bench.b]))
+        .collect();
+    let first = persist(&mut bench, 1, &commands[0]);
+    // The reserved slot is taken: no second command.
+    queue_full(&mut bench, 2, &commands[1]);
+    assert_eq!(enter(&mut bench, first), Performed::Executed);
+    assert_eq!(bench.store.hits(duplicate), 1);
+    assert_eq!(bench.store.results_owed(), 2);
+    queue_full(&mut bench, 2, &commands[1]);
+    assert!(matches!(
+        deliver(&mut bench, first),
+        Performed::Delivered { .. }
+    ));
+    // One copy is still owed, in the slot the fault reserved.
+    assert_eq!(bench.store.results_owed(), 1);
+    assert_eq!(deliver(&mut bench, first), Performed::Uncorrelated);
+    assert_eq!(bench.store.results_owed(), 0);
+    // The fault fired and its copies were delivered: both slots are free.
+    let second = persist(&mut bench, 2, &commands[1]);
+    let third = persist(&mut bench, 3, &commands[2]);
+    queue_full(&mut bench, 4, &commands[3]);
+    for id in [second, third] {
+        assert_eq!(enter(&mut bench, id), Performed::Executed);
+        assert!(bench.store.results_owed() <= 2);
+    }
+}
+
+/// A crash loses the armed faults and what they reserved: the adapter
+/// that starts again owes nothing and has every slot.
+#[test]
+fn a_crash_gives_back_the_slot_a_duplicate_reserved() {
+    let mut bench = bench_with_results(2);
+    arm(
+        &mut bench,
+        FaultPoint::ResultReady,
+        FaultAction::DuplicateResult,
+    );
+    let command = bench.admission(1, 7, b"p", &[bench.b]);
+    persist(&mut bench, 1, &command);
+    let other = bench.admission(2, 8, b"p", &[bench.b]);
+    queue_full(&mut bench, 2, &other);
+    let mut bench = bench.wrap(|adapter| {
+        SimStore::new(
+            adapter.crash().store,
+            AdapterLimits {
+                operations_in_flight: 4,
+                result_slots: 2,
+                ..LIMITS
+            },
+        )
+    });
+    assert_eq!(bench.store.results_owed(), 0);
+    persist(&mut bench, 2, &other);
+    let last = bench.admission(3, 9, b"p", &[bench.b]);
+    persist(&mut bench, 3, &last);
+}
+
+/// Only a duplicate makes a result more than its command did: any other
+/// armed fault reserves nothing, and a command takes the single slot.
+#[test]
+fn only_a_duplicate_reserves_a_result_slot() {
+    let mut bench = bench_with_results(1);
+    arm(
+        &mut bench,
+        FaultPoint::CommandTransit,
+        FaultAction::HoldCommand,
+    );
+    arm(
+        &mut bench,
+        FaultPoint::ResultReady,
+        FaultAction::DelayResult,
+    );
+    let command = bench.admission(1, 7, b"p", &[bench.b]);
+    persist(&mut bench, 1, &command);
+    assert_eq!(bench.store.results_owed(), 1);
+}
+
+fn on_resolutions(point: FaultPoint, action: FaultAction, occurrence: u64) -> FaultSpec {
+    FaultSpec {
+        kind: Some(WorkKind::ResolveAndFence),
+        occurrence,
+        ..fault(point, action)
+    }
+}
+
+fn hits_of(events: &[StoreEvent], fault: FaultId) -> Vec<(u64, WorkId)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            StoreEvent::FaultHit {
+                fault: reached,
+                occurrence,
+                id,
+                ..
+            } if *reached == fault => Some((*occurrence, *id)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Faults on one point, for one kind, at different occurrences select
+/// different passages (`contracts/README.md`, "One fault per item"):
+/// they are armed, and each fires at its own passage.
+#[test]
+fn faults_of_different_occurrences_each_fire_at_their_passage() {
+    let mut bench = bench_with(AdapterLimits {
+        operations_in_flight: 4,
+        result_slots: 8,
+        ..LIMITS
+    });
+    let faults: Vec<FaultId> = (1..=3)
+        .map(|occurrence| {
+            bench
+                .store
+                .arm(on_resolutions(
+                    FaultPoint::ResultReady,
+                    FaultAction::DelayResult,
+                    occurrence,
+                ))
+                .expect("another occurrence")
+        })
+        .collect();
+    let mut ids = Vec::new();
+    for sequence in 1..=3 {
+        let operation = operation_id(bench.epoch, 10 + sequence);
+        let id = resolve(&mut bench, sequence, operation);
+        assert_eq!(enter(&mut bench, id), Performed::Executed);
+        ids.push(id);
+    }
+    let events = bench.store.take_events();
+    for (index, fault) in faults.iter().enumerate() {
+        let occurrence = index as u64 + 1;
+        assert_eq!(hits_of(&events, *fault), [(occurrence, ids[index])]);
+    }
+    // Each result is delayed: none is handed over before it is released.
+    for id in ids {
+        assert!(
+            bench
+                .store
+                .eligible()
+                .contains(&StoreAction::ReleaseResult(id))
+        );
+    }
+}
+
+/// A fence held at its point passes it again when it enters the writer
+/// again. That second passage is the same item: it is not counted, and
+/// it takes no occurrence of another fault. The next resolution is the
+/// second passage, and the fault of occurrence 2 fires there.
+#[test]
+fn a_held_fence_passing_again_takes_no_occurrence_of_another_fault() {
+    let mut bench = fresh_bench();
+    let hold = bench
+        .store
+        .arm(on_resolutions(
+            FaultPoint::FenceTransit,
+            FaultAction::HoldCommand,
+            1,
+        ))
+        .expect("allowed");
+    let refuse = bench
+        .store
+        .arm(on_resolutions(
+            FaultPoint::FenceTransit,
+            FaultAction::RefuseFence,
+            2,
+        ))
+        .expect("another occurrence");
+    let absent = operation_id(bench.epoch, 21);
+    let first = resolve(&mut bench, 1, absent);
+    assert_eq!(
+        enter(&mut bench, first),
+        Performed::Held(FaultPoint::FenceTransit)
+    );
+    assert_eq!(
+        bench.store.perform(StoreAction::ReleaseCommand(first)),
+        Ok(Performed::Released)
+    );
+    assert_eq!(enter(&mut bench, first), Performed::Executed);
+    assert_eq!(
+        delivered_reply(deliver(&mut bench, first)),
+        StoreReply::Outcome(StoreOutcome::RejectedCertain(RejectReason::Fenced))
+    );
+    assert_eq!(bench.store.hits(refuse), 0);
+
+    let absent = operation_id(bench.epoch, 22);
+    let second = resolve(&mut bench, 2, absent);
+    assert_eq!(enter(&mut bench, second), Performed::Executed);
+    assert_eq!(
+        delivered_reply(deliver(&mut bench, second)),
+        StoreReply::Outcome(StoreOutcome::PendingOrUnknown)
+    );
+    let events = bench.store.take_events();
+    assert_eq!(hits_of(&events, hold), [(1, first)]);
+    assert_eq!(hits_of(&events, refuse), [(2, second)]);
 }
