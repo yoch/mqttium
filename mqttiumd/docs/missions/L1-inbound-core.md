@@ -18,9 +18,11 @@ ACK-001; ID-001 to ID-004; IO-001 to IO-004. Decision records 0001, 0006,
 
 1. **Creation authority** of record 0009: the bounded authority, the
    serial, uniqueness, atomic creation with its four refusals, retirement
-   with its conditions. Its interface comes first, as a contract change,
-   so that L2 and L4 build on it; then creation, retirement and their
-   tests. Issuing the authority from an opened epoch is defined with L2.
+   with its conditions. Creation, retirement and their tests come first.
+   The authority has one public constructor, which consumes the permit
+   that the epoch opening of L2 hands over (`EpochGrant`) and gives it
+   back when it fails: this part is a contract change that follows the
+   one of L2 on the integration branch.
 2. **Transitions in the shape of record 0006.** A private plan, consumed
    once; owner and state revision checked before application; resources
    reserved before any mutation; an application that cannot fail for lack
