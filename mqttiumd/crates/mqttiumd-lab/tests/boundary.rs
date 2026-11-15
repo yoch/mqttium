@@ -456,7 +456,88 @@ fn ordinary_code_is_still_accepted() {
         "pub use mqttiumd_contract as contract;",
         "#[derive(Clone, Debug)]\n#[must_use]\npub struct S;",
         "fn f(x: u8) -> bool { matches!(x, 1 | 2) && { debug_assert!(x > 0); true } }",
-        "macro_rules! twice { ($x:expr) => { $x + $x }; }\nfn f() -> u8 { twice!(1) }",
+    ] {
+        assert_eq!(
+            violations(source),
+            Vec::<String>::new(),
+            "refused: {source}"
+        );
+    }
+}
+
+/// The sources of `sources` that break no rule.
+fn accepted<'a>(sources: &[&'a str]) -> Vec<&'a str> {
+    sources
+        .iter()
+        .copied()
+        .filter(|source| violations(source).is_empty())
+        .collect()
+}
+
+#[test]
+fn a_macro_variable_does_not_carry_a_macro_name() {
+    // The first source compiles: `forward!(env)` expands to
+    // `env!("CARGO_MANIFEST_DIR")`. The variable is named after an allowed
+    // macro, and the name it carries is written where no rule looks.
+    let sources = [
+        "macro_rules! forward {\n    ($write:ident) => {\n        $write!(\"CARGO_MANIFEST_DIR\")\n    };\n}\n\npub const BUILD_DIRECTORY: &str = forward!(env);",
+        "macro_rules! check { ($assert:ident) => { $assert!(\"HOME\") }; }\npub const D: &str = check!(env);",
+        "macro_rules! list { ($vec:ident) => { $vec![\"x.rs\"] }; }\nlist!(include);",
+    ];
+    assert_eq!(accepted(&sources), Vec::<&str>::new());
+}
+
+#[test]
+fn a_macro_variable_does_not_carry_an_attribute() {
+    // The first source is honoured by the compiler: it looks for
+    // `src/../outside.rs`.
+    let sources = [
+        "macro_rules! load {\n    ($attr:meta) => {\n        #[$attr]\n        mod outside;\n    };\n}\n\nload!(path = \"../outside.rs\");",
+        "macro_rules! crate_level { ($attr:meta) => { #![$attr] }; }",
+        "macro_rules! named { ($name:ident) => { #[$name = \"../outside.rs\"] mod outside; }; }\nnamed!(path);",
+        "macro_rules! many { ($(#[$meta:meta])* $name:ident) => { $(#[$meta])* pub struct $name; }; }",
+    ];
+    assert_eq!(accepted(&sources), Vec::<&str>::new());
+}
+
+#[test]
+fn macro_fragments_are_identifiers_and_literals() {
+    // The first source compiles: the `!` of the invocation arrives through
+    // a token-tree variable, so no `name!` is ever written.
+    let sources = [
+        "macro_rules! glue {\n    ($name:ident, $bang:tt) => {\n        $name $bang (\"CARGO_MANIFEST_DIR\")\n    };\n}\n\npub const BUILD_DIRECTORY: &str = glue!(env, !);",
+        "macro_rules! group { ($g:tt) => { # $g mod outside; }; }\ngroup!([path = \"../outside.rs\"]);",
+        "macro_rules! pass { ($($t:tt)*) => { $($t)* }; }",
+        "macro_rules! via { ($p:path) => { $p }; }",
+        "macro_rules! item { ($i:item) => { $i }; }",
+        "macro_rules! nested { ($a:ident) => {}; ($a:ident, $($b:tt),*) => {}; }",
+        "macro_rules! spaced { ($a : tt) => {}; }",
+    ];
+    assert_eq!(accepted(&sources), Vec::<&str>::new());
+}
+
+#[test]
+fn a_use_declaration_holds_no_macro_variable() {
+    let sources = [
+        "macro_rules! import { ($source:ident) => { use core::$source as build; }; }\nimport!(env);",
+        "macro_rules! import { ($source:ident, $alias:ident) => { use core::$source as $alias; }; }",
+    ];
+    assert_eq!(accepted(&sources), Vec::<&str>::new());
+}
+
+#[test]
+fn ordinary_macros_are_still_accepted() {
+    for source in [
+        // An ordinary invocation of a listed macro.
+        "use core::fmt;\npub fn f(out: &mut fmt::Formatter<'_>) -> fmt::Result { write!(out, \"{}\", 1) }",
+        // A simple local macro.
+        "macro_rules! unit { ($name:ident) => { pub struct $name; }; }\nunit!(Thing);",
+        // The documented form the contract macros use: the attribute name
+        // is written in the macro, only its text comes from the call.
+        "macro_rules! id {\n    ($(#[doc = $doc:literal])* $name:ident) => {\n        $(#[doc = $doc])*\n        pub struct $name(u64);\n    };\n}\nid!(\n    /// One line.\n    /// Another line.\n    Thing\n);",
+        // A variable beside a type annotation in a body is not a fragment.
+        "macro_rules! field { ($name:ident) => { pub struct S { pub $name: u64 } }; }\nfield!(value);",
+        "macro_rules! twice { ($x:literal) => { $x + $x }; }\nfn f() -> u8 { twice!(1) }",
     ] {
         assert_eq!(
             violations(source),
