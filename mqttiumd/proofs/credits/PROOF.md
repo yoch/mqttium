@@ -136,7 +136,7 @@ A result belongs to an exact content.
 
 | | |
 | - | - |
-| Revision | `2607c07a` on branch `claude/mqttiumd-l6-pilot-proof` (base `874f298b` of `main`); this file was added after it and changes no code |
+| Revision | `2607c073` on branch `claude/mqttiumd-l6-pilot-proof` (base `874f298b` of `main`); this file was added after it and changes no code |
 | Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb`, unchanged by the lot |
 | Where | A cloud container, local run. Not CI |
 | Tool | `/root/.cargo/bin/cargo-kani`, as `PATH` selects it: Kani Rust Verifier 0.68.0 (cargo plugin), CBMC 6.11.0 |
