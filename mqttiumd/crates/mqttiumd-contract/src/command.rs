@@ -5,6 +5,12 @@
 //! command is presented again; a digest may speed up a lookup but never
 //! replaces that comparison.
 //!
+//! `OpenEpoch` is the one command that is not a recipe: it opens the run
+//! epoch every `OperationId` is scoped by. Its durable state and the
+//! decision the writer takes on it are the `EpochLedger`; what start-up
+//! does with the reply, and the hand-over of the creation authority, are
+//! in `outcome` (ADR 0009).
+//!
 //! Canonical layout, format 1. All integers are big-endian.
 //!
 //! ```text
@@ -28,8 +34,9 @@ use alloc::vec::Vec;
 
 use crate::capacity::{BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References};
 use crate::ids::{
-    DeliveryId, ExchangeGeneration, ExchangeId, InboundPacketId, OperationId, PayloadId,
-    PublicationId, RequestId, Revision, SessionId,
+    DeliveryId, ExchangeGeneration, ExchangeId, Exhausted, IdDecodeError, InboundPacketId,
+    OperationId, PayloadId, PublicationId, RequestId, Revision, RunEpoch, SessionId,
+    StoreIncarnation,
 };
 use crate::packet::{Qos, SharedBytes};
 
@@ -498,6 +505,314 @@ pub struct Command {
     pub payload: Option<SharedBytes>,
 }
 
+/// A value drawn once by each start-up of a process, outside this crate.
+///
+/// It makes the attempts of one start-up different from those of every
+/// other, including a predecessor that died with the same counters. The
+/// store adapter draws it (in the deterministic store, from the seed) and
+/// that it is not reused is a precondition of that trusted code: this
+/// crate draws nothing.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct StartupNonce([u8; 16]);
+
+impl StartupNonce {
+    /// Length of the durable encoding.
+    pub const ENCODED_LEN: usize = 16;
+
+    /// Wraps the sixteen bytes that were drawn.
+    #[must_use]
+    pub const fn new(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The durable encoding.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+/// The number of one attempt within one start-up: a checked counter.
+/// It is durable only as part of an `OpeningAttempt`, which has the
+/// encoding; alone it identifies nothing, which is why it is not one of
+/// the identities of `ids`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct OpeningTicket(u64);
+
+impl OpeningTicket {
+    /// Builds the ticket from its numeric value.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The numeric value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// The next ticket, or `Exhausted`; never wraps.
+    pub fn checked_next(self) -> Result<Self, Exhausted> {
+        self.0.checked_add(1).map(Self).ok_or(Exhausted)
+    }
+}
+
+/// The identity of one attempt to open an epoch: the start-up that made
+/// it and its number there. No two attempts share one, across processes
+/// and restarts, so the store can tell its own committed command from
+/// any other and a reply can name the attempt it answers.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct OpeningAttempt {
+    pub startup: StartupNonce,
+    pub ticket: OpeningTicket,
+}
+
+impl OpeningAttempt {
+    /// Length of the durable encoding: the sixteen bytes of the nonce,
+    /// then the ticket as eight big-endian bytes.
+    pub const ENCODED_LEN: usize = 24;
+
+    /// The durable encoding, as the ledger keeps the attempt that
+    /// opened the last epoch.
+    #[must_use]
+    pub fn to_be_bytes(self) -> [u8; 24] {
+        let mut bytes = [0u8; 24];
+        bytes[..16].copy_from_slice(&self.startup.to_bytes());
+        bytes[16..].copy_from_slice(&self.ticket.get().to_be_bytes());
+        bytes
+    }
+
+    /// Decodes the durable encoding, checking its exact length.
+    pub fn from_be_slice(bytes: &[u8]) -> Result<Self, IdDecodeError> {
+        let wrong_length = IdDecodeError::WrongLength {
+            expected: Self::ENCODED_LEN,
+            actual: bytes.len(),
+        };
+        let (nonce, ticket) = bytes.split_at_checked(16).ok_or(wrong_length)?;
+        let nonce: [u8; 16] = nonce.try_into().map_err(|_| wrong_length)?;
+        let ticket: [u8; 8] = ticket.try_into().map_err(|_| wrong_length)?;
+        Ok(Self {
+            startup: StartupNonce::new(nonce),
+            ticket: OpeningTicket::new(u64::from_be_bytes(ticket)),
+        })
+    }
+}
+
+/// The start-up command that opens a run epoch (DEM-012, ADR 0009).
+///
+/// It is not a `Recipe`: it precedes every `OperationId`, which needs the
+/// epoch this command establishes. The store applies it in the order of
+/// authority of every other command, as one transaction that closes every
+/// older epoch for execution and opens the next one, or changes nothing.
+/// There is no instant at which two epochs are open, and none at which an
+/// older epoch could be entered again.
+///
+/// The opening is conditional. Start-up reads the data set it verified
+/// and the last epoch opened in it, and the command carries both: the
+/// store opens `after + 1` only while `after` is still the last opened
+/// epoch. Of two commands that carry the same condition at most one
+/// commits, and a command that arrives after any later opening was
+/// committed opens nothing, however long it was held on its way.
+///
+/// Like a recipe, the command is idempotent: presented again while the
+/// epoch it opened is still the last one, it gets the same result.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OpenEpoch {
+    pub attempt: OpeningAttempt,
+    /// The data set start-up verified before it asked.
+    pub incarnation: StoreIncarnation,
+    /// The last opened epoch start-up read before it asked; zero when
+    /// the data set had none.
+    pub after: RunEpoch,
+}
+
+/// Why an opening was certainly not committed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpeningRejection {
+    /// The epoch counter of the data set reached its end. Nothing wraps,
+    /// and no later attempt can succeed.
+    EpochsExhausted,
+    /// The command names another data set than the one the store holds.
+    ForeignIncarnation,
+    /// Another attempt opened the epoch this one asked for. This attempt
+    /// never commits; a new one on the value read again may.
+    PredecessorMoved,
+}
+
+impl OpeningRejection {
+    /// Whether no later attempt of the same opening can succeed. It is a
+    /// property of the reason, not of having been rejected.
+    #[must_use]
+    pub const fn is_definitive(self) -> bool {
+        match self {
+            Self::EpochsExhausted | Self::ForeignIncarnation => true,
+            Self::PredecessorMoved => false,
+        }
+    }
+}
+
+/// What the ledger establishes about one `OpenEpoch`. Only `Rejected`
+/// says that the attempt opened nothing and never will.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LedgerOpening {
+    /// The attempt opens this epoch now. The ledger to commit is given.
+    Opens {
+        ledger: EpochLedger,
+        epoch: RunEpoch,
+    },
+    /// The attempt already opened this epoch, which is still the last
+    /// one: the same command presented again. Nothing is to be written.
+    AlreadyOpened { epoch: RunEpoch },
+    /// The attempt opened nothing and never will.
+    Rejected(OpeningRejection),
+    /// The epoch this attempt asked for was opened and is closed. The
+    /// ledger keeps the opener of the last epoch only, so it does not
+    /// know whether this attempt was the one: it does not call that a
+    /// rejection. The attempt can never open an epoch any more.
+    Superseded,
+    /// The condition is ahead of the ledger: nothing is opened, and the
+    /// condition could still come true, so nothing certain is said. A
+    /// certain rejection would be contradicted if a held copy of the
+    /// command were applied later. No start-up that read this data set
+    /// forms such a condition; it arises when a data set was restored to
+    /// an earlier state without a new incarnation, which is a failure to
+    /// renew the identity spaces and not a case this contract repairs.
+    Undecided,
+}
+
+/// Durable phase of one run epoch of a data set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EpochPhase {
+    /// No committed opening established this epoch. Epoch 0 is never
+    /// opened: it stays here whatever the data set went through.
+    Unopened,
+    /// The one epoch in which commands may execute.
+    Open,
+    /// It was open and is definitively closed for execution. Closing
+    /// forbids execution; it does not turn the unknown results of the
+    /// epoch into rejections (V3-006), and its durable effects are still
+    /// reconciled (DEM-012).
+    Closed,
+}
+
+/// The durable state of the epochs of one data set: its incarnation, the
+/// last epoch a committed opening established, and the attempt that
+/// opened it.
+///
+/// Epochs open in increasing order, one at a time. The last opened epoch
+/// is the only open one and every epoch opened before it is closed;
+/// epoch 0 is never opened and encodes "no epoch yet". The same pure
+/// decision is used by the deterministic store and by SQLite, which
+/// reads the three values, calls `open` with the command and, when it
+/// opens, writes the ledger it is given in the same transaction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EpochLedger {
+    incarnation: StoreIncarnation,
+    last_opened: RunEpoch,
+    opened_by: Option<OpeningAttempt>,
+}
+
+impl EpochLedger {
+    /// The ledger of a data set in which no epoch was opened yet.
+    #[must_use]
+    pub const fn fresh(incarnation: StoreIncarnation) -> Self {
+        Self {
+            incarnation,
+            last_opened: RunEpoch::new(0),
+            opened_by: None,
+        }
+    }
+
+    /// Rebuilds the ledger from its durable values. `last_opened` is
+    /// zero, and `opened_by` absent, when no epoch was opened.
+    #[must_use]
+    pub const fn from_durable(
+        incarnation: StoreIncarnation,
+        last_opened: RunEpoch,
+        opened_by: Option<OpeningAttempt>,
+    ) -> Self {
+        Self {
+            incarnation,
+            last_opened,
+            opened_by,
+        }
+    }
+
+    /// The data set these epochs belong to.
+    #[must_use]
+    pub const fn incarnation(&self) -> StoreIncarnation {
+        self.incarnation
+    }
+
+    /// The durable value: the last opened epoch, zero when there is none.
+    #[must_use]
+    pub const fn last_opened(&self) -> RunEpoch {
+        self.last_opened
+    }
+
+    /// The durable value: the attempt that opened the last epoch.
+    #[must_use]
+    pub const fn opened_by(&self) -> Option<OpeningAttempt> {
+        self.opened_by
+    }
+
+    /// The one epoch open for execution, if an opening was committed.
+    #[must_use]
+    pub fn open_epoch(&self) -> Option<RunEpoch> {
+        (self.last_opened.get() != 0).then_some(self.last_opened)
+    }
+
+    /// The durable phase of `epoch`.
+    #[must_use]
+    pub fn phase_of(&self, epoch: RunEpoch) -> EpochPhase {
+        if epoch.get() == 0 || epoch > self.last_opened {
+            EpochPhase::Unopened
+        } else if epoch == self.last_opened {
+            EpochPhase::Open
+        } else {
+            EpochPhase::Closed
+        }
+    }
+
+    /// Decides what `command` does to this ledger. Pure: the ledger it
+    /// is asked of does not move, and nothing wraps.
+    #[must_use]
+    pub fn open(&self, command: &OpenEpoch) -> LedgerOpening {
+        if command.incarnation != self.incarnation {
+            return LedgerOpening::Rejected(OpeningRejection::ForeignIncarnation);
+        }
+        if command.after > self.last_opened {
+            return LedgerOpening::Undecided;
+        }
+        if command.after == self.last_opened {
+            return match self.last_opened.checked_next() {
+                Ok(epoch) => LedgerOpening::Opens {
+                    ledger: Self {
+                        incarnation: self.incarnation,
+                        last_opened: epoch,
+                        opened_by: Some(command.attempt),
+                    },
+                    epoch,
+                },
+                Err(Exhausted) => LedgerOpening::Rejected(OpeningRejection::EpochsExhausted),
+            };
+        }
+        // The epoch right after the condition was opened. Is it still
+        // the last one, and by whom?
+        if command.after.checked_next() != Ok(self.last_opened) {
+            return LedgerOpening::Superseded;
+        }
+        if self.opened_by == Some(command.attempt) {
+            LedgerOpening::AlreadyOpened {
+                epoch: self.last_opened,
+            }
+        } else {
+            LedgerOpening::Rejected(OpeningRejection::PredecessorMoved)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,5 +1131,305 @@ mod tests {
         assert_eq!(kept, frozen);
         assert_eq!(kept.operation(), frozen.get().operation());
         assert_eq!(encode(kept.get()), encode(frozen.get()));
+    }
+
+    const FIRST_START: StartupNonce = StartupNonce::new([1; 16]);
+    const RESTART: StartupNonce = StartupNonce::new([2; 16]);
+
+    fn attempt(startup: StartupNonce, ticket: u64) -> OpeningAttempt {
+        OpeningAttempt {
+            startup,
+            ticket: OpeningTicket::new(ticket),
+        }
+    }
+
+    /// The command a start-up that just read `ledger` would send.
+    fn opening(ledger: &EpochLedger, ticket: u64) -> OpenEpoch {
+        OpenEpoch {
+            attempt: attempt(FIRST_START, ticket),
+            incarnation: ledger.incarnation(),
+            after: ledger.last_opened(),
+        }
+    }
+
+    fn opened_by(ledger: &EpochLedger, command: &OpenEpoch) -> EpochLedger {
+        match ledger.open(command) {
+            LedgerOpening::Opens {
+                ledger: next,
+                epoch,
+            } => {
+                assert_eq!(next.last_opened(), epoch);
+                next
+            }
+            other => panic!("not opened: {other:?}"),
+        }
+    }
+
+    fn opened(ledger: &EpochLedger) -> EpochLedger {
+        opened_by(ledger, &opening(ledger, 1))
+    }
+
+    const MOVED: LedgerOpening = LedgerOpening::Rejected(OpeningRejection::PredecessorMoved);
+
+    #[test]
+    fn a_fresh_ledger_has_no_open_epoch() {
+        let ledger = EpochLedger::fresh(StoreIncarnation::new(7));
+        assert_eq!(ledger.incarnation(), StoreIncarnation::new(7));
+        assert_eq!(ledger.open_epoch(), None);
+        assert_eq!(ledger.last_opened(), RunEpoch::new(0));
+        assert_eq!(ledger.opened_by(), None);
+        for epoch in [0, 1, 2, u64::MAX] {
+            assert_eq!(ledger.phase_of(RunEpoch::new(epoch)), EpochPhase::Unopened);
+        }
+    }
+
+    #[test]
+    fn an_opening_opens_the_next_epoch_and_closes_every_older_one() {
+        let fresh = EpochLedger::fresh(StoreIncarnation::new(7));
+        let first = opened(&fresh);
+        assert_eq!(first.open_epoch(), Some(RunEpoch::new(1)));
+        assert_eq!(first.incarnation(), StoreIncarnation::new(7));
+        assert_eq!(first.opened_by(), Some(attempt(FIRST_START, 1)));
+        // The decision is pure: the ledger it was asked of did not move.
+        assert_eq!(fresh.open_epoch(), None);
+
+        let third = opened(&opened(&first));
+        assert_eq!(third.open_epoch(), Some(RunEpoch::new(3)));
+        assert_eq!(third.phase_of(RunEpoch::new(1)), EpochPhase::Closed);
+        assert_eq!(third.phase_of(RunEpoch::new(2)), EpochPhase::Closed);
+        assert_eq!(third.phase_of(RunEpoch::new(3)), EpochPhase::Open);
+        assert_eq!(third.phase_of(RunEpoch::new(4)), EpochPhase::Unopened);
+    }
+
+    #[test]
+    fn epoch_zero_is_never_open_and_never_closed() {
+        let mut ledger = EpochLedger::fresh(StoreIncarnation::new(7));
+        for _ in 0..4 {
+            assert_eq!(ledger.phase_of(RunEpoch::new(0)), EpochPhase::Unopened);
+            ledger = opened(&ledger);
+        }
+        assert_eq!(ledger.phase_of(RunEpoch::new(0)), EpochPhase::Unopened);
+        let last =
+            EpochLedger::from_durable(StoreIncarnation::new(7), RunEpoch::new(u64::MAX), None);
+        assert_eq!(last.phase_of(RunEpoch::new(0)), EpochPhase::Unopened);
+    }
+
+    #[test]
+    fn exactly_one_epoch_is_open_and_none_opens_twice() {
+        let mut ledger = EpochLedger::fresh(StoreIncarnation::new(1));
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            ledger = opened(&ledger);
+            let open = ledger.open_epoch().expect("an opening was committed");
+            assert!(!seen.contains(&open), "epoch {open} opened twice");
+            seen.push(open);
+            let open_now = (0..10)
+                .filter(|epoch| ledger.phase_of(RunEpoch::new(*epoch)) == EpochPhase::Open)
+                .count();
+            assert_eq!(open_now, 1);
+            // An epoch that was open before is closed and stays closed.
+            for older in &seen[..seen.len() - 1] {
+                assert_eq!(ledger.phase_of(*older), EpochPhase::Closed);
+            }
+        }
+    }
+
+    /// Two attempts read the same ledger. Whichever the writer applies
+    /// first commits; the other one is certainly rejected, in both
+    /// orders, and so never closes the epoch the first one opened.
+    #[test]
+    fn of_two_openings_with_one_condition_at_most_one_commits() {
+        let read = opened(&EpochLedger::fresh(StoreIncarnation::new(1)));
+        let older = opening(&read, 2);
+        let newer = opening(&read, 3);
+        for (first, second) in [(older, newer), (newer, older)] {
+            let committed = opened_by(&read, &first);
+            assert_eq!(committed.open_epoch(), Some(RunEpoch::new(2)));
+            assert_eq!(committed.open(&second), MOVED);
+        }
+    }
+
+    /// The command that opened the last epoch, presented again, gets
+    /// its own result and changes nothing: "rejected" would say that it
+    /// opened nothing.
+    #[test]
+    fn the_command_that_opened_the_last_epoch_is_recognised_again() {
+        let read = opened(&EpochLedger::fresh(StoreIncarnation::new(1)));
+        let command = opening(&read, 2);
+        let committed = opened_by(&read, &command);
+        for _delivery in 0..3 {
+            assert_eq!(
+                committed.open(&command),
+                LedgerOpening::AlreadyOpened {
+                    epoch: RunEpoch::new(2)
+                }
+            );
+        }
+        // Its durable values are enough to recognise it after a reopen.
+        let reopened = EpochLedger::from_durable(
+            committed.incarnation(),
+            committed.last_opened(),
+            committed.opened_by(),
+        );
+        assert_eq!(reopened, committed);
+        assert_eq!(
+            reopened.open(&command),
+            LedgerOpening::AlreadyOpened {
+                epoch: RunEpoch::new(2)
+            }
+        );
+    }
+
+    /// A restarted process starts its tickets again at one and reads the
+    /// same condition as its dead predecessor. Their commands differ by
+    /// the start-up that made them, and the ledger tells them apart.
+    #[test]
+    fn the_same_ticket_of_another_start_up_is_another_attempt() {
+        let read = opened(&EpochLedger::fresh(StoreIncarnation::new(1)));
+        let predecessor = opening(&read, 1);
+        let successor = OpenEpoch {
+            attempt: attempt(RESTART, 1),
+            ..predecessor
+        };
+        assert_ne!(predecessor, successor);
+        for (first, second) in [(predecessor, successor), (successor, predecessor)] {
+            let committed = opened_by(&read, &first);
+            assert_eq!(committed.opened_by(), Some(first.attempt));
+            assert_eq!(committed.open(&second), MOVED);
+            assert!(matches!(
+                committed.open(&first),
+                LedgerOpening::AlreadyOpened { .. }
+            ));
+        }
+    }
+
+    /// Once a later opening was committed the ledger no longer knows
+    /// who opened the older epoch. It says that the attempt is
+    /// superseded, never that it opened nothing.
+    #[test]
+    fn an_attempt_for_an_epoch_already_closed_is_superseded_not_rejected() {
+        let read = opened(&EpochLedger::fresh(StoreIncarnation::new(1)));
+        let opener = opening(&read, 2);
+        let rival = opening(&read, 3);
+        let later = opened(&opened_by(&read, &opener));
+        assert_eq!(later.last_opened(), RunEpoch::new(3));
+        for command in [opener, rival] {
+            assert_eq!(later.open(&command), LedgerOpening::Superseded);
+        }
+        assert_eq!(later.last_opened(), RunEpoch::new(3));
+    }
+
+    #[test]
+    fn a_command_for_another_data_set_or_ahead_of_the_ledger_opens_nothing() {
+        let at_three = opened(&opened(&opened(&EpochLedger::fresh(
+            StoreIncarnation::new(1),
+        ))));
+        let other_data_set = OpenEpoch {
+            incarnation: StoreIncarnation::new(2),
+            ..opening(&at_three, 1)
+        };
+        assert_eq!(
+            at_three.open(&other_data_set),
+            LedgerOpening::Rejected(OpeningRejection::ForeignIncarnation)
+        );
+        // A condition the ledger has not reached could still come true:
+        // nothing certain is said about it.
+        for ahead in [4, u64::MAX] {
+            let command = OpenEpoch {
+                after: RunEpoch::new(ahead),
+                ..opening(&at_three, 1)
+            };
+            assert_eq!(at_three.open(&command), LedgerOpening::Undecided);
+        }
+        assert_eq!(opened(&at_three).open_epoch(), Some(RunEpoch::new(4)));
+    }
+
+    #[test]
+    fn the_last_epoch_opens_and_the_next_opening_is_exhausted() {
+        let before_last =
+            EpochLedger::from_durable(StoreIncarnation::new(1), RunEpoch::new(u64::MAX - 1), None);
+        let last = opened(&before_last);
+        assert_eq!(last.open_epoch(), Some(RunEpoch::new(u64::MAX)));
+        assert_eq!(
+            last.open(&opening(&last, 2)),
+            LedgerOpening::Rejected(OpeningRejection::EpochsExhausted)
+        );
+        // The refusal changed nothing and nothing wrapped.
+        assert_eq!(last.open_epoch(), Some(RunEpoch::new(u64::MAX)));
+        assert_eq!(last.phase_of(RunEpoch::new(1)), EpochPhase::Closed);
+    }
+
+    #[test]
+    fn only_a_moved_predecessor_leaves_room_for_a_new_attempt() {
+        assert!(OpeningRejection::EpochsExhausted.is_definitive());
+        assert!(OpeningRejection::ForeignIncarnation.is_definitive());
+        assert!(!OpeningRejection::PredecessorMoved.is_definitive());
+    }
+
+    #[test]
+    fn an_attempt_round_trips_through_its_durable_encoding() {
+        let nonce: [u8; 16] = core::array::from_fn(|index| index as u8 + 1);
+        let attempts = [
+            OpeningAttempt {
+                startup: StartupNonce::new(nonce),
+                ticket: OpeningTicket::new(0x0102_0304_0506_0708),
+            },
+            attempt(FIRST_START, 1),
+            attempt(RESTART, u64::MAX),
+            attempt(StartupNonce::new([0; 16]), 0),
+        ];
+        for attempt in attempts {
+            let bytes = attempt.to_be_bytes();
+            assert_eq!(bytes.len(), OpeningAttempt::ENCODED_LEN);
+            assert_eq!(OpeningAttempt::from_be_slice(&bytes), Ok(attempt));
+        }
+        // The layout is pinned: the nonce as drawn, then the ticket.
+        let bytes = attempts[0].to_be_bytes();
+        assert_eq!(&bytes[..16], &nonce);
+        assert_eq!(&bytes[16..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        // Two attempts differ exactly when their encodings do.
+        for left in attempts {
+            for right in attempts {
+                assert_eq!(left == right, left.to_be_bytes() == right.to_be_bytes());
+            }
+        }
+        for length in [0, 23, 25] {
+            assert_eq!(
+                OpeningAttempt::from_be_slice(&vec![0; length]),
+                Err(IdDecodeError::WrongLength {
+                    expected: 24,
+                    actual: length
+                })
+            );
+        }
+    }
+
+    /// The ledger is three durable values, and the attempt among them
+    /// survives its encoding: the command that opened the last epoch is
+    /// still recognised after the store was closed and reopened.
+    #[test]
+    fn the_opener_is_recognised_from_its_encoded_form() {
+        let read = opened(&EpochLedger::fresh(StoreIncarnation::new(1)));
+        let command = opening(&read, 2);
+        let committed = opened_by(&read, &command);
+        let stored = committed.opened_by().map(OpeningAttempt::to_be_bytes);
+        let decoded = stored.map(|bytes| OpeningAttempt::from_be_slice(&bytes).expect("stored"));
+        let reopened =
+            EpochLedger::from_durable(committed.incarnation(), committed.last_opened(), decoded);
+        assert_eq!(reopened, committed);
+        assert!(matches!(
+            reopened.open(&command),
+            LedgerOpening::AlreadyOpened { .. }
+        ));
+    }
+
+    #[test]
+    fn opening_tickets_never_wrap() {
+        assert_eq!(
+            OpeningTicket::new(1).checked_next(),
+            Ok(OpeningTicket::new(2))
+        );
+        assert_eq!(OpeningTicket::new(u64::MAX).checked_next(), Err(Exhausted));
+        assert_eq!(StartupNonce::new([9; 16]).to_bytes(), [9; 16]);
     }
 }
