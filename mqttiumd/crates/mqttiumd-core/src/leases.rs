@@ -294,6 +294,34 @@ impl LeaseTable {
     }
 }
 
+/// For the tests of the crate: what a refusal must leave unchanged.
+#[cfg(test)]
+mod snapshot {
+    use super::*;
+
+    /// The generation the next lease of a slot takes, and the lease the
+    /// slot holds.
+    pub(crate) type LeaseSlotView = (Option<u64>, Option<LeaseKey>);
+
+    impl LeaseTable {
+        /// The usage of the account and the view of each slot.
+        pub(crate) fn snapshot(&self) -> (Credits, Vec<LeaseSlotView>) {
+            let slots = self
+                .slots
+                .as_slice()
+                .iter()
+                .map(|slot| {
+                    (
+                        slot.next_generation.map(LeaseGeneration::get),
+                        slot.record.as_ref().map(LeaseRecord::key),
+                    )
+                })
+                .collect();
+            (self.account.used(), slots)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

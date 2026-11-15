@@ -19,3 +19,4 @@ pub use mqttiumd_contract as contract;
 pub mod command;
 pub mod credits;
 pub mod leases;
+pub mod owner;
