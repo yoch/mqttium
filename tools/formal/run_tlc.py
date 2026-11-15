@@ -1,6 +1,7 @@
 """Model-check every formal model against its declared expected outcome.
 
-Each ``formal/models/<Model>.json`` sidecar names one TLA+ module, the issues
+Each ``<Model>.json`` sidecar of the models directory (``formal/models/``
+unless ``--models-dir`` selects another one) names one TLA+ module, the issues
 and executable tests it is tied to, and one or more TLC configurations with the
 outcome TLC must produce:
 
@@ -24,6 +25,12 @@ Usage::
     python tools/formal/run_tlc.py            # check every model
     python tools/formal/run_tlc.py Foo Bar    # check selected models
     python tools/formal/run_tlc.py --list     # print the model index
+    python tools/formal/run_tlc.py --models-dir mqttiumd/models/m1
+
+A campaign is refused, before TLC is looked up, when the models directory
+does not exist or holds no sidecar, when a selected model holds no
+configuration, or when a sidecar entry cannot be checked. A campaign that ran
+no configuration is never a success.
 """
 
 from __future__ import annotations
@@ -49,6 +56,8 @@ TLA2TOOLS_URL = (
     f"https://github.com/tlaplus/tlaplus/releases/download/v{TLA2TOOLS_VERSION}/tla2tools.jar"
 )
 TLA2TOOLS_SHA256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+
+TIMEOUT_SECONDS = 900
 
 EXPECTATIONS = frozenset({"pass", "violation", "deadlock", "liveness"})
 STATUSES = frozenset({"refinement", "legacy-flag"})
@@ -80,10 +89,19 @@ class Outcome:
     output: str
 
 
+class SidecarError(ValueError):
+    """A sidecar that cannot be read, or an entry that cannot be checked."""
+
+
 def load_sidecars(root: Path = MODELS) -> list[dict[str, object]]:
     sidecars = []
     for path in sorted(root.glob("*.json")):
-        data = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError as error:
+            raise SidecarError(f"{path.name}: not JSON: {error}") from error
+        if not isinstance(data, dict):
+            raise SidecarError(f"{path.name}: a sidecar is an object")
         data["_path"] = path
         sidecars.append(data)
     return sidecars
@@ -106,6 +124,56 @@ def checks_for(sidecar: dict[str, object]) -> list[Check]:
         )
         for entry in configs
     ]
+
+
+def _require_strings(where: str, holder: dict[str, object], keys: tuple[str, ...]) -> None:
+    for key in keys:
+        if key not in holder:
+            raise SidecarError(f"{where}: names no {key!r}")
+        if not isinstance(holder[key], str):
+            raise SidecarError(f"{where}: {key!r} is not a string")
+
+
+def validated_checks(sidecar: dict[str, object]) -> list[Check]:
+    """Return the checks of a sidecar, or refuse it.
+
+    Only what would make a campaign run nothing, or accept an outcome nobody
+    declared, is refused here. The well-formedness of the project's own
+    sidecars stays with ``tests/project/test_formal_models.py``.
+    """
+    path = sidecar["_path"]
+    assert isinstance(path, Path)
+    name = path.stem
+    # The index prints the status and the summary: what a campaign accepts,
+    # the index can print.
+    _require_strings(name, sidecar, ("module", "status", "summary"))
+    if not isinstance(sidecar.get("issues", []), list):
+        raise SidecarError(f"{name}: 'issues' is not a list")
+    if "configs" not in sidecar:
+        raise SidecarError(f"{name}: names no 'configs'")
+    configs = sidecar["configs"]
+    if not isinstance(configs, list) or not all(isinstance(entry, dict) for entry in configs):
+        raise SidecarError(f"{name}: 'configs' is not a list of entries")
+    for entry in configs:
+        _require_strings(name, entry, ("config", "expect"))
+        for key in ("invariant", "property"):
+            if key in entry and not isinstance(entry[key], str):
+                raise SidecarError(f"{name}/{entry['config']}: {key!r} is not a string")
+    checks = checks_for(sidecar)
+    if not checks:
+        raise SidecarError(f"{path.stem}: no configuration")
+    for check in checks:
+        where = f"{check.model}/{check.config.name}"
+        if check.expect not in EXPECTATIONS:
+            raise SidecarError(f"{where}: unknown expectation {check.expect!r}")
+        if check.expect == "violation" and not check.invariant:
+            raise SidecarError(f"{where}: a violation names no invariant")
+        if check.expect == "liveness" and not check.property:
+            raise SidecarError(f"{where}: a liveness violation names no property")
+        for needed in (check.module, check.config):
+            if not needed.is_file():
+                raise SidecarError(f"{where}: {needed.name} does not exist")
+    return checks
 
 
 def _cache_dir() -> Path:
@@ -177,14 +245,20 @@ def run_check(check: Check, jar: Path, java: str) -> Outcome:
             str(check.config),
             str(check.module),
         ]
-        completed = subprocess.run(  # nosec B603 - fixed argv, no shell
-            command,
-            cwd=check.module.parent,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=900,
-        )
+        try:
+            completed = subprocess.run(  # nosec B603 - fixed argv, no shell
+                command,
+                cwd=check.module.parent,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as expired:
+            # An interrupted exploration is inconclusive: it matches no
+            # declared outcome, and the other configurations still run.
+            output = expired.output if isinstance(expired.output, str) else ""
+            return Outcome("timeout", None, None, output)
     return classify(completed.stdout + completed.stderr)
 
 
@@ -219,20 +293,62 @@ def print_index(sidecars: list[dict[str, object]]) -> None:
             print(f"    {check.config.name}: expect {_expected(check)}")
 
 
+def run_campaign(checks: list[Check], jar: Path, java: str, *, verbose: bool) -> int:
+    """Run the checks; succeed only if every one gave its declared outcome."""
+    failures = 0
+    for check in checks:
+        outcome = run_check(check, jar, java)
+        ok = matches(check, outcome)
+        failures += not ok
+        expected = _expected(check)
+        status = "ok  " if ok else "FAIL"
+        print(
+            f"{status} {check.model}/{check.config.name}: "
+            f"expected {expected}, got {_describe(outcome)}"
+        )
+        if not ok and (verbose or outcome.kind == "error"):
+            print(outcome.output, file=sys.stderr)
+    if not checks:
+        print("no configuration was run", file=sys.stderr)
+        return 1
+    return 1 if failures else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("models", nargs="*", help="model names (default: all)")
     parser.add_argument("--list", action="store_true", help="print the model index and exit")
     parser.add_argument("--verbose", action="store_true", help="print TLC output on mismatch")
+    parser.add_argument(
+        "--models-dir",
+        type=Path,
+        default=MODELS,
+        metavar="DIR",
+        help="directory holding the sidecars (default: formal/models)",
+    )
     args = parser.parse_args(argv)
 
-    sidecars = load_sidecars()
+    # Resolved: TLC runs from the module's directory, so a relative path
+    # would no longer name the files once the working directory changed.
+    root = args.models_dir.resolve()
+    if not root.is_dir():
+        parser.error(f"--models-dir is not a directory: {args.models_dir}")
+    try:
+        sidecars = load_sidecars(root)
+    except SidecarError as refusal:
+        parser.error(str(refusal))
+    if not sidecars:
+        parser.error(f"no model sidecar (*.json) in {root}")
     if args.models:
         wanted = set(args.models)
         sidecars = [s for s in sidecars if s["_path"].stem in wanted]  # type: ignore[union-attr]
         missing = wanted - {s["_path"].stem for s in sidecars}  # type: ignore[union-attr]
         if missing:
             parser.error(f"unknown models: {', '.join(sorted(missing))}")
+    try:
+        checks = [check for sidecar in sidecars for check in validated_checks(sidecar)]
+    except SidecarError as refusal:
+        parser.error(str(refusal))
     if args.list:
         print_index(sidecars)
         return 0
@@ -241,22 +357,7 @@ def main(argv: list[str] | None = None) -> int:
     if java is None:
         print("java is required to run TLC", file=sys.stderr)
         return 2
-    jar = tla2tools_jar()
-    failures = 0
-    for sidecar in sidecars:
-        for check in checks_for(sidecar):
-            outcome = run_check(check, jar, java)
-            ok = matches(check, outcome)
-            failures += not ok
-            expected = _expected(check)
-            status = "ok  " if ok else "FAIL"
-            print(
-                f"{status} {check.model}/{check.config.name}: "
-                f"expected {expected}, got {_describe(outcome)}"
-            )
-            if not ok and (args.verbose or outcome.kind == "error"):
-                print(outcome.output, file=sys.stderr)
-    return 1 if failures else 0
+    return run_campaign(checks, tla2tools_jar(), java, verbose=args.verbose)
 
 
 if __name__ == "__main__":

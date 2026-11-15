@@ -1,0 +1,20 @@
+{
+  "format": "mqttiumd.trace-record",
+  "schema_version": 1,
+  "run_id": "p1-02-example",
+  "record_sequence": "20",
+  "origin_component": "transport",
+  "origin_incarnation": "1",
+  "origin_sequence": "3",
+  "causal_parents": [],
+  "time_domain": "logical-step",
+  "time_value": "20",
+  "kind": "PeerPacketObserved",
+  "payload": {
+    "client": "producer",
+    "packet_kind": "PUBREC",
+    "packet_id": 7,
+    "reason_code": 0,
+    "bytes_hex": "50020007"
+  }
+}

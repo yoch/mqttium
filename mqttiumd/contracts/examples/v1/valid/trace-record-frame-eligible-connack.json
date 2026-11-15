@@ -1,0 +1,26 @@
+{
+  "format": "mqttiumd.trace-record",
+  "schema_version": 1,
+  "run_id": "p1-02-example",
+  "record_sequence": "2",
+  "origin_component": "broker-core",
+  "origin_incarnation": "1",
+  "origin_sequence": "0",
+  "causal_parents": [],
+  "time_domain": "logical-step",
+  "time_value": "2",
+  "kind": "FrameEligible",
+  "payload": {
+    "effect_id": {
+      "epoch": "1",
+      "owner": "0",
+      "sequence": "0"
+    },
+    "connection": {
+      "session": "1",
+      "generation": "1"
+    },
+    "packet_kind": "CONNACK",
+    "session_present": true
+  }
+}

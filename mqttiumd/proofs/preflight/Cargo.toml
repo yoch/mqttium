@@ -1,0 +1,13 @@
+[package]
+name = "mqttiumd-proof-preflight"
+description = "Preflight of the proof tooling: one true and one false property on the production dependency."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mqttiumd-core.workspace = true
+
+[lints]
+workspace = true
