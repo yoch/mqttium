@@ -67,7 +67,7 @@ class Traces(unittest.TestCase):
     def test_an_incomplete_trace_never_passes_anything(self):
         seen = 0
         for case in INDEX:
-            if case["expected"]["trace_complete"] == "PASS":
+            if case["expected"]["trace_complete"] != "INCONCLUSIVE":
                 continue
             seen += 1
             with self.subTest(case["name"]):

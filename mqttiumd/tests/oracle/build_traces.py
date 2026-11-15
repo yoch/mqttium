@@ -68,6 +68,19 @@ P1_02_DUPLICATE["faults"].append(
     }
 )
 OUTPUTS["scenarios/p1-02-duplicate.json"] = dump(P1_02_DUPLICATE)
+# P1-02 for a run that drives the core with validated packets: it requires
+# that perimeter and lists what it can decide without peers.
+PEER_ASSERTIONS = (
+    "one_admission_per_observed_inbound_exchange",
+    "no_pubrec_observed_before_crash",
+)
+CORE_ASSERTIONS = [name for name in ASSERTIONS if name not in PEER_ASSERTIONS]
+P1_02_CORE = copy.deepcopy(P1_02)
+P1_02_CORE.update(perimeter="core-without-bytes", assertions=CORE_ASSERTIONS)
+P1_02_CORE_WITH_PEER = copy.deepcopy(P1_02_CORE)
+P1_02_CORE_WITH_PEER["assertions"] = [*CORE_ASSERTIONS, "no_pubrec_observed_before_crash"]
+OUTPUTS["scenarios/p1-02-core.json"] = dump(P1_02_CORE)
+OUTPUTS["scenarios/p1-02-core-with-a-peer-assertion.json"] = dump(P1_02_CORE_WITH_PEER)
 OUTPUTS["scenarios/p1-02.json"] = dump(P1_02)
 OUTPUTS["scenarios/p1-02b.json"] = dump(P1_02B)
 
@@ -473,7 +486,7 @@ def header(scenario):
         "header",
         "bench-supervisor",
         "TraceHeader",
-        {"scenario_id": scenario, "backend": "sim-store"},
+        {"scenario_id": scenario, "backend": "sim-store", "perimeter": "full"},
     )
 
 
@@ -759,6 +772,7 @@ def case(
     raw=lambda records: None,
     data=None,
     files=lambda files: None,
+    assertions=ASSERTIONS,
 ):
     """One trace of the corpus.
 
@@ -780,7 +794,7 @@ def case(
     }
     files(written)
     OUTPUTS.update(written)
-    statuses = dict.fromkeys(ASSERTIONS, "PASS")
+    statuses = dict.fromkeys(assertions, "PASS")
     if base is p1_02b:
         statuses["no_pubrec_observed_before_crash"] = "OUT_OF_SCOPE"
     statuses.update(expected or {})
@@ -1435,6 +1449,64 @@ case(
             )
         ],
     ),
+)
+
+# -------------------------------------------------------------------- perimeter
+
+
+def without_bytes(events):
+    """The same history when the core is driven with validated packets."""
+    gone = {event["label"] for event in events if event["origin"] in ("peer", "transport")}
+    events[:] = [event for event in events if event["label"] not in gone]
+    for event in events:
+        event["parents"] = [label for label in event["parents"] if label not in gone]
+        if event["kind"] == "TraceHeader":
+            event["payload"] = dict(event["payload"], perimeter="core-without-bytes")
+
+
+case(
+    "core-without-bytes-good",
+    "A run without bytes, judged against the scenario of that perimeter.",
+    scenario="p1-02-core",
+    events=without_bytes,
+    assertions=CORE_ASSERTIONS,
+)
+case(
+    "core-without-bytes-against-the-full-scenario",
+    "A run without bytes is offered for the full scenario: it never passes it.",
+    dict.fromkeys(ASSERTIONS, "OUT_OF_SCOPE"),
+    events=without_bytes,
+)
+case(
+    "full-run-against-a-scenario-without-bytes",
+    "A full run is offered for the scenario of another perimeter.",
+    dict.fromkeys(CORE_ASSERTIONS, "OUT_OF_SCOPE"),
+    scenario="p1-02-core",
+    assertions=CORE_ASSERTIONS,
+)
+case(
+    "core-without-bytes-lists-a-peer-assertion",
+    "A scenario without bytes lists an assertion only peers can decide: it stays out of scope.",
+    {"no_pubrec_observed_before_crash": "OUT_OF_SCOPE"},
+    scenario="p1-02-core-with-a-peer-assertion",
+    events=without_bytes,
+    assertions=P1_02_CORE_WITH_PEER["assertions"],
+)
+
+
+def provenance_without_bytes(events):
+    without_bytes(events)
+    corpus_insert = [delivered("injected", 2, 1, OP_ADMIT, cause="recovery.in", label="injected")]
+    insert_after(events, "recovery.in", corpus_insert)
+
+
+case(
+    "core-without-bytes-result-answers-no-effect",
+    "Without bytes the provenance of results is still checked.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    scenario="p1-02-core",
+    events=provenance_without_bytes,
+    assertions=CORE_ASSERTIONS,
 )
 
 OUTPUTS["index.json"] = dump({"traces": INDEX})

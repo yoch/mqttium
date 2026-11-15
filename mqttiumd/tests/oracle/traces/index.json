@@ -671,6 +671,79 @@
         "trace_complete": "PASS"
       },
       "why": "An input is refused after an injection that duplicates nothing: the refusal is not excused."
+    },
+    {
+      "name": "core-without-bytes-good",
+      "scenario": "tests/oracle/traces/scenarios/p1-02-core.json",
+      "trace": "tests/oracle/traces/core-without-bytes-good/trace.jsonl",
+      "expected": {
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "A run without bytes, judged against the scenario of that perimeter."
+    },
+    {
+      "name": "core-without-bytes-against-the-full-scenario",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/core-without-bytes-against-the-full-scenario/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "OUT_OF_SCOPE",
+        "same_required_obligations_at_both_checkpoints": "OUT_OF_SCOPE",
+        "same_recipe_for_op_A": "OUT_OF_SCOPE",
+        "no_positive_ack_before_confirmed_commit": "OUT_OF_SCOPE",
+        "no_pubrec_observed_before_crash": "OUT_OF_SCOPE",
+        "broker_inputs_have_provenance": "OUT_OF_SCOPE",
+        "all_required_faults_hit": "OUT_OF_SCOPE",
+        "trace_complete": "OUT_OF_SCOPE"
+      },
+      "why": "A run without bytes is offered for the full scenario: it never passes it."
+    },
+    {
+      "name": "full-run-against-a-scenario-without-bytes",
+      "scenario": "tests/oracle/traces/scenarios/p1-02-core.json",
+      "trace": "tests/oracle/traces/full-run-against-a-scenario-without-bytes/trace.jsonl",
+      "expected": {
+        "same_required_obligations_at_both_checkpoints": "OUT_OF_SCOPE",
+        "same_recipe_for_op_A": "OUT_OF_SCOPE",
+        "no_positive_ack_before_confirmed_commit": "OUT_OF_SCOPE",
+        "broker_inputs_have_provenance": "OUT_OF_SCOPE",
+        "all_required_faults_hit": "OUT_OF_SCOPE",
+        "trace_complete": "OUT_OF_SCOPE"
+      },
+      "why": "A full run is offered for the scenario of another perimeter."
+    },
+    {
+      "name": "core-without-bytes-lists-a-peer-assertion",
+      "scenario": "tests/oracle/traces/scenarios/p1-02-core-with-a-peer-assertion.json",
+      "trace": "tests/oracle/traces/core-without-bytes-lists-a-peer-assertion/trace.jsonl",
+      "expected": {
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "no_pubrec_observed_before_crash": "OUT_OF_SCOPE"
+      },
+      "why": "A scenario without bytes lists an assertion only peers can decide: it stays out of scope."
+    },
+    {
+      "name": "core-without-bytes-result-answers-no-effect",
+      "scenario": "tests/oracle/traces/scenarios/p1-02-core.json",
+      "trace": "tests/oracle/traces/core-without-bytes-result-answers-no-effect/trace.jsonl",
+      "expected": {
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "Without bytes the provenance of results is still checked."
     }
   ]
 }
