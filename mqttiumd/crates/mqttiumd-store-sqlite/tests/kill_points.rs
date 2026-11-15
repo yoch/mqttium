@@ -131,7 +131,12 @@ fn kill_point_child() {
     let Some(path) = std::env::var_os(CHILD) else {
         return;
     };
-    let point = named(&std::env::var(POINT).expect("a point"));
+    let point = std::env::var(POINT).expect("a point");
+    let store_point = if point == "store.commit.applied" {
+        None
+    } else {
+        Some(named(&point))
+    };
     let mut world = store_world(Path::new(&path));
     assert!(world.store.effective_settings().kill_points);
     for n in 1..=BEFORE {
@@ -139,25 +144,36 @@ fn kill_point_child() {
     }
     let index = Arc::new(AtomicU64::new(0));
     let current = Arc::clone(&index);
-    world
-        .store
-        .set_kill_hook(Some(Box::new(move |passed| {
-            if passed == point {
-                let mut out = std::io::stdout().lock();
-                let at = current.load(Ordering::SeqCst);
-                writeln!(out, "{AT}{} {at}", point_name(point)).expect("said");
-                out.flush().expect("flushed");
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(60));
+    if let Some(point) = store_point {
+        world
+            .store
+            .set_kill_hook(Some(Box::new(move |passed| {
+                if passed == point {
+                    park_at(point_name(point), current.load(Ordering::SeqCst));
                 }
-            }
-        })))
-        .expect("armed");
+            })))
+            .expect("armed");
+    }
     for (at, command) in commands(&world).iter().enumerate() {
         index.store(u64::try_from(at).expect("fits"), Ordering::SeqCst);
-        let _ = world.store.apply(command);
+        let applied = world.store.apply(command);
+        if point == "store.commit.applied" {
+            // The transaction has returned to this adapter, but this test
+            // has no core and hands no result over before parking.
+            assert!(applied.committed_now);
+            park_at(&point, u64::try_from(at).expect("fits"));
+        }
     }
     println!("{NO_POINT}");
+}
+
+fn park_at(point: &str, index: u64) -> ! {
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{AT}{point} {index}").expect("said");
+    out.flush().expect("flushed");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
 }
 
 struct Holder {
@@ -168,7 +184,7 @@ impl Holder {
     /// The test binary itself, run again on `kill_point_child` only; it
     /// returns once the child stands at `point`, with the index of the
     /// command it stands in.
-    fn spawn(path: &Path, point: KillPoint) -> (Self, usize) {
+    fn spawn(path: &Path, point: &str) -> (Self, usize) {
         let mut child = Command::new(std::env::current_exe().expect("the test binary"))
             .args([
                 "--exact",
@@ -177,7 +193,7 @@ impl Holder {
                 "--test-threads=1",
             ])
             .env(CHILD, path)
-            .env(POINT, point_name(point))
+            .env(POINT, point)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -199,13 +215,13 @@ impl Holder {
             .recv_timeout(std::time::Duration::from_secs(15))
             .expect("kill point reported within 15 seconds");
         reader.join().expect("the bounded reader ended");
-        let prefix = format!("{AT}{} ", point_name(point));
+        let prefix = format!("{AT}{point} ");
         let index = said
             .as_deref()
             .and_then(|line| line.split_once(&prefix))
             .and_then(|(_, index)| index.parse().ok());
         let Some(index) = index else {
-            panic!("the child did not stop at {}: {said:?}", point_name(point));
+            panic!("the child did not stop at {point}: {said:?}");
         };
         (holder, index)
     }
@@ -229,7 +245,7 @@ impl Drop for Holder {
 /// equals the reference after the commands before the one cut, and that
 /// one too when `durable`. The command cut, submitted again, gets the
 /// answer of the reference.
-fn killed_at(point: KillPoint, durable: bool) -> usize {
+fn killed_at(point: &str, durable: bool) -> usize {
     let path = fresh_path();
     let mut reference = reference();
     let commands = commands(&reference);
@@ -272,12 +288,12 @@ fn killed_at(point: KillPoint, durable: bool) -> usize {
 
 #[test]
 fn a_kill_before_commit_recovers_the_state_before_the_command() {
-    assert_eq!(killed_at(KillPoint::CommitPrepared, false), 0);
+    assert_eq!(killed_at("store.commit.prepared", false), 0);
 }
 
 #[test]
 fn a_kill_once_the_commit_is_logged_recovers_the_command() {
-    assert_eq!(killed_at(KillPoint::CommitLogged, true), 0);
+    assert_eq!(killed_at("store.commit.logged", true), 0);
 }
 
 /// The installed callback actually runs, with checkpoint disabled while
@@ -330,4 +346,86 @@ fn the_wal_hook_runs_with_checkpoint_disabled_then_restores_the_threshold() {
         20,
         "no kill callback after removal"
     );
+}
+
+/// An autocheckpoint PRAGMA replaces SQLite's single WAL callback. An
+/// armed store must refuse that reconfiguration, preserving the kill point.
+#[test]
+fn changing_the_autocheckpoint_cannot_replace_an_armed_kill_hook() {
+    let path = fresh_path();
+    let mut world = store_world(&path);
+    let hits = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&hits);
+    world
+        .store
+        .set_kill_hook(Some(Box::new(move |point| {
+            if point == KillPoint::CommitLogged {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        })))
+        .expect("armed");
+    assert!(
+        world
+            .store
+            .set_wal_autocheckpoint_for_measurement(16)
+            .is_err(),
+        "changing the autocheckpoint would remove the armed WAL callback"
+    );
+    assert_eq!(world.store.effective_settings().wal_autocheckpoint, 0);
+    assert!(world.store.apply(&commands(&world)[0]).committed_now);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the WAL callback still runs"
+    );
+}
+
+/// A physical SQLite consistency check alone misses an incomplete business
+/// transaction. The full comparison used by the kill tests rejects it.
+#[test]
+fn full_state_equality_detects_a_missing_obligation_in_a_sound_sqlite_file() {
+    let path = fresh_path();
+    let mut world = store_world(&path);
+    let mut expected = reference();
+    for n in 1..=BEFORE {
+        exchange(&mut world, n);
+    }
+    let command = commands(&world)[0].clone();
+    assert!(world.store.apply(&command).committed_now);
+    assert!(expected.store.apply(&command).committed_now);
+    let complete = expected.store.snapshot();
+    assert_eq!(
+        world.store.try_snapshot().expect("complete state"),
+        complete
+    );
+    drop(world);
+    let connection = rusqlite::Connection::open(&path).expect("isolated mutation connection");
+    assert_eq!(connection.execute(
+        "DELETE FROM obligations WHERE (publication, idx) IN (SELECT publication, idx FROM obligations LIMIT 1)", [],
+    ).expect("one obligation omitted"), 1);
+    let checked: String = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .expect("checked");
+    assert_eq!(
+        checked, "ok",
+        "the physical check passes the partial business state"
+    );
+    drop(connection);
+    let store = SqliteStore::open(&path).expect("physically sound file opens");
+    let partial = store.try_snapshot().expect("partial state decodes");
+    assert_ne!(
+        partial, complete,
+        "whole-state comparison rejects the missing obligation"
+    );
+    assert!(
+        accounts_match_what_is_held(&partial).is_err(),
+        "business accounts detect the omitted obligation"
+    );
+}
+
+/// K3 at the adapter boundary: apply returned, no result was delivered to
+/// a core, and the reopened state and replay agree with the full reference.
+#[test]
+fn a_kill_after_apply_before_result_delivery_recovers_the_whole_command() {
+    assert_eq!(killed_at("store.commit.applied", true), 0);
 }

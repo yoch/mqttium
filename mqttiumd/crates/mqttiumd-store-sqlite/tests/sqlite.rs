@@ -267,3 +267,58 @@ fn a_value_that_does_not_decode_is_an_error_of_the_snapshot() {
         Err(OpenError::Corrupt)
     ));
 }
+
+/// A threshold readback is not proof of an installed autocheckpoint.
+/// With no kill hook, a transaction exceeding sixteen pages must put its
+/// entire state in the main database file before the writer is dropped.
+#[test]
+fn a_sixteen_page_autocheckpoint_reaches_the_main_database_while_the_writer_lives() {
+    let path = fresh_path();
+    let limits = Limits {
+        payload_bytes: mqttiumd_contract::capacity::PayloadBytes::new(1 << 20),
+        max_payload_bytes: 1 << 20,
+        ..fixture_limits()
+    };
+    let mut world = World::with_limits(
+        &|incarnation, limits| SqliteStore::create(&path, incarnation, limits).expect("created"),
+        limits,
+    );
+    let mut reference = World::with_limits(&MemoryStore::create, limits);
+    assert_eq!(
+        world
+            .store
+            .set_wal_autocheckpoint_for_measurement(16)
+            .expect("set"),
+        16
+    );
+    assert_eq!(
+        world.store.effective_settings().checkpoint_policy,
+        "sqlite-autocheckpoint"
+    );
+    let mut command = mqttiumd_lab::store::conformance::altered(
+        &reference.admission(1, 7, b"", &[reference.b, reference.c]),
+        |admit| {
+            let length = mqttiumd_contract::capacity::PayloadBytes::new(65_536);
+            admit.payload.length = length;
+            admit.costs.payload_bytes = length;
+        },
+    );
+    command.payload = Some(
+        mqttiumd_contract::packet::SharedBytes::copy_from(&vec![42; 65_536], 65_536)
+            .expect("large payload"),
+    );
+    assert!(reference.store.apply(&command).committed_now);
+    assert!(world.store.apply(&command).committed_now);
+    let expected = reference.store.snapshot();
+    assert_eq!(world.store.try_snapshot().expect("live state"), expected);
+    // An isolated image deliberately omits the WAL. Unlike a crash run,
+    // this is only an observation of a checkpoint while the writer is idle.
+    let copy = fresh_path();
+    std::fs::copy(&path, &copy).expect("database image copied while writer lives");
+    let image = SqliteStore::open(&copy).expect("main database image opens");
+    assert_eq!(
+        image.try_snapshot().expect("checkpointed state"),
+        expected,
+        "actual checkpoint copied the whole transaction into the database"
+    );
+}
