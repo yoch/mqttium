@@ -667,6 +667,177 @@ bad(
     qabs_a(setter(["steps", LEAVE, "fault"], "applied")),
 )
 
+# A permanent delay (record 0018): every answer of a resolution of op_A is
+# delayed, each delivered once six newer ones are held, and the bench fires
+# the deadlines while it waits. The scenario does not fix at which
+# delivery the core progresses.
+F3 = json.loads((ROOT / "tests/scenarios/audit/F3-steady-lag.json").read_text())
+LATE = {
+    "id": "late_answers",
+    "point": "store.result.ready",
+    "match": {
+        "command_kind": "AdmitPublication",
+        "publication_binding": "pub_A",
+        "result_of": "ResolveAndFence",
+    },
+    "from_occurrence": "1",
+    "action": "delay_result",
+    "lag": 6,
+    "expected_hits_at_least": "1",
+}
+PERMANENT = copy.deepcopy(F3)
+PERMANENT.update(
+    id="F3-PERMANENT",
+    faults=[F3["faults"][0], LATE],
+    steps=[
+        *F3["steps"][:4],
+        {
+            "kind": "DriveUntil",
+            "event": "PeerPacketObserved",
+            "client": "producer",
+            "packet_kind": "PUBREC",
+            "packet_id": 7,
+            "fire_deadlines": True,
+            "max_steps": "65536",
+        },
+        *F3["steps"][-3:],
+    ],
+)
+LATE_AT = "/faults/1"
+FIRE_AT = 4
+
+
+def permanent(edit):
+    return scenario(edit, PERMANENT)
+
+
+def late(**changes):
+    def edit(value):
+        for key, new in changes.items():
+            if new is None:
+                value["faults"][1].pop(key, None)
+            else:
+                value["faults"][1][key] = new
+
+    return edit
+
+
+ok("scenario-permanent-delay.json", PERMANENT)
+for name, changes, pointer, why in [
+    (
+        "repeated-fault-with-one-occurrence",
+        {"occurrence": "1"},
+        LATE_AT,
+        "A fault names one occurrence or every occurrence from one on, not both.",
+    ),
+    (
+        "fault-without-occurrence",
+        {"from_occurrence": None},
+        LATE_AT,
+        "A fault names one occurrence or every occurrence from one on.",
+    ),
+    (
+        "repeated-fault-with-exact-hits",
+        {"expected_hits": "3"},
+        LATE_AT,
+        "How often a repeated fault is reached depends on the product: only a minimum is expected.",
+    ),
+    (
+        "repeated-fault-without-expected-hits",
+        {"expected_hits_at_least": None},
+        LATE_AT,
+        "A repeated fault says how often it must at least be reached.",
+    ),
+    (
+        "repeated-fault-expected-zero-times",
+        {"expected_hits_at_least": "0"},
+        f"{LATE_AT}/expected_hits_at_least",
+        "A repeated fault is expected at least once.",
+    ),
+    (
+        "repeated-fault-binding-an-operation",
+        {"bind_operation_as": "op_B"},
+        LATE_AT,
+        "A repeated fault selects many items: it binds no operation.",
+    ),
+    (
+        "lag-of-zero",
+        {"lag": 0},
+        f"{LATE_AT}/lag",
+        "A delayed answer is delivered once at least one newer one is held.",
+    ),
+    ("lag-beyond-its-bound", {"lag": 65}, f"{LATE_AT}/lag", "The lag is bounded."),
+    (
+        "repeated-delay-without-lag",
+        {"lag": None},
+        LATE_AT,
+        "Answers delayed without end and never delivered: a repeated delay has a lag.",
+    ),
+    (
+        "lag-on-another-action",
+        {"action": "drop_result"},
+        LATE_AT,
+        "Only a delayed answer has a lag.",
+    ),
+]:
+    bad(f"scenario-{name}.json", "schema-violation", pointer, why, permanent(late(**changes)))
+bad(
+    "scenario-lag-on-one-occurrence.json",
+    "schema-violation",
+    "/faults/0",
+    "A lag counts newer answers of the same selection: a fault of one occurrence has none.",
+    permanent(lambda v: v["faults"][0].update(action="delay_result", lag=2)),
+)
+bad(
+    "scenario-fire-deadlines-not-a-boolean.json",
+    "schema-violation",
+    f"/steps/{FIRE_AT}/fire_deadlines",
+    "Whether the bench fires the deadlines while it waits is true or false.",
+    permanent(setter(["steps", FIRE_AT, "fire_deadlines"], "yes")),
+)
+bad(
+    "scenario-repeated-fault-from-beyond-64-bits.json",
+    "u64-out-of-range",
+    f"{LATE_AT}/from_occurrence",
+    "The first occurrence of a repeated fault is 64-bit.",
+    permanent(late(from_occurrence="18446744073709551616")),
+)
+bad(
+    "scenario-repeated-fault-expected-beyond-64-bits.json",
+    "u64-out-of-range",
+    f"{LATE_AT}/expected_hits_at_least",
+    "The minimum of a repeated fault is 64-bit.",
+    permanent(late(expected_hits_at_least="18446744073709551616")),
+)
+bad(
+    "scenario-held-result-of-a-repeated-fault.json",
+    "held-item-mismatch",
+    f"/steps/{FIRE_AT + 1}/fault",
+    "A repeated delay holds many answers and delivers each by its lag: no step delivers one.",
+    permanent(
+        lambda v: v["steps"].insert(
+            FIRE_AT + 1, {"kind": "DeliverHeldResult", "fault": "late_answers", "max_steps": "512"}
+        )
+    ),
+)
+bad(
+    "scenario-repeated-fault-overlapping-one-occurrence.json",
+    "fault-match-invalid",
+    "/faults/2/match",
+    "A repeated fault from the first occurrence on selects the third too.",
+    permanent(
+        lambda v: v["faults"].append(
+            {
+                **{k: v["faults"][1][k] for k in ("point", "match")},
+                "id": "third",
+                "occurrence": "3",
+                "action": "drop_result",
+                "expected_hits": "1",
+            }
+        )
+    ),
+)
+
 RELEASE, DELIVER = 6, 11
 
 
@@ -2291,6 +2462,39 @@ def result(verdict, exit_code, statuses, hits="1", qualification="provisional", 
 
 
 PASSING = [("trace_complete", "PASS"), ("all_required_faults_hit", "PASS")]
+
+
+def at_least(minimum, hits):
+    """A result of a repeated fault: reached ``hits`` times, ``minimum`` expected."""
+
+    def edit(value):
+        value["faults"] = [{"id": "late_answers", "expected_hits_at_least": minimum, "hits": hits}]
+
+    return edit
+
+
+SCOPED = [("trace_complete", "PASS"), ("no_pubrec_observed_before_crash", "OUT_OF_SCOPE")]
+ok(
+    "run-result-provisional-repeated-fault-reached-more-than-its-minimum.json",
+    edited(result("OUT_OF_SCOPE", 3, SCOPED), at_least("1", "3")),
+)
+bad(
+    "run-result-repeated-fault-below-its-minimum.json",
+    "verdict-inconsistent",
+    "/verdict",
+    "A repeated fault reached fewer times than its minimum leaves the run inconclusive.",
+    edited(result("OUT_OF_SCOPE", 3, SCOPED), at_least("2", "1")),
+)
+bad(
+    "run-result-fault-with-both-expectations.json",
+    "schema-violation",
+    "/faults/0",
+    "A fault is expected an exact number of times or at least a number of times.",
+    edited(
+        result("INCONCLUSIVE", 2, PASSING),
+        lambda v: v["faults"][0].update(expected_hits_at_least="1"),
+    ),
+)
 ok("run-result-provisional-all-passing.json", result("INCONCLUSIVE", 2, PASSING))
 ok(
     "run-result-provisional-fail-with-inconclusive.json",

@@ -93,6 +93,15 @@ P1_02_DUPLICATE["faults"].append(
     }
 )
 OUTPUTS["scenarios/p1-02-duplicate.json"] = dump(P1_02_DUPLICATE)
+# The same injection repeated (record 0018): every result of the release
+# from the first one on is duplicated, and the scenario expects at least
+# one duplication, not an exact count.
+P1_02_REPEATED = copy.deepcopy(P1_02_DUPLICATE)
+REPEATED = P1_02_REPEATED["faults"][-1]
+REPEATED.pop("occurrence")
+REPEATED.pop("expected_hits")
+REPEATED.update(from_occurrence="1", expected_hits_at_least="1")
+OUTPUTS["scenarios/p1-02-repeated.json"] = dump(P1_02_REPEATED)
 # P1-02 for a run that drives the core with validated packets: it requires
 # that perimeter and lists what it can decide without peers.
 PEER_ASSERTIONS = (
@@ -1663,6 +1672,7 @@ case(
     ),
 )
 
+
 # ------------------------------------------------------------------- provenance
 case(
     "provenance-result-answers-no-effect",
@@ -2454,6 +2464,57 @@ case(
     "K1: the handover follows the store's result only through a record of a peer: the store did not produce it.",
     {"broker_inputs_have_provenance": "FAIL"},
     events=handed_after_the_bench,
+)
+
+
+def duplicated_twice(events):
+    duplicate_refused(events)
+    insert_after(
+        events,
+        "copy.refused",
+        [
+            fault_hit(
+                "duplicated_release_result",
+                "store.result.ready",
+                "release.ready",
+                operation=OP_RELEASE,
+                effect_id=effect(2, 2),
+                occurrence=2,
+            ),
+            ev(
+                "copy.refused.again",
+                "dispatcher",
+                "InputRefused",
+                {
+                    "input": "StoreResult",
+                    "effect_id": effect(2, 2),
+                    "operation_id": OP_RELEASE,
+                    "reason": "no-effect-in-flight",
+                },
+                ["hit.duplicated_release_result.2"],
+                2,
+            ),
+        ],
+    )
+
+
+case(
+    "repeated-fault-reached-once",
+    "A repeated injection expected at least once is reached once.",
+    scenario="p1-02-repeated",
+    events=duplicate_refused,
+)
+case(
+    "repeated-fault-reached-more-than-its-minimum",
+    "A repeated injection expected at least once is reached twice: that is no shortfall.",
+    scenario="p1-02-repeated",
+    events=duplicated_twice,
+)
+case(
+    "repeated-fault-never-reached",
+    "A repeated injection expected at least once is never reached.",
+    {"all_required_faults_hit": "INCONCLUSIVE"},
+    scenario="p1-02-repeated",
 )
 
 
