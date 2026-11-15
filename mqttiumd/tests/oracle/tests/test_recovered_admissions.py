@@ -56,7 +56,7 @@ class RecoveredAdmissions(unittest.TestCase):
                         "facts": {
                             "kind": "PublicationAdmitted",
                             "publication_id": other,
-                            "exchange": corpus.exchange(1),
+                            "exchange": {"session": "1", "generation": "1"},
                         },
                     },
                 }

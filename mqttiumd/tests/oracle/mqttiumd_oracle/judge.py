@@ -420,6 +420,11 @@ def one_admission_per_observed_inbound_exchange(run):
     # evidence of the store is never killed: a commit without it did not
     # happen, whatever a recovery says.
     kills = run.trace.of_kind("BrokerKilled") if run.trace.broker == "child-process" else []
+    reads = run.trace.of_kind("RecoveryPageRead")
+    decisions = {}
+    for _, snapshot in run.snapshots.values():
+        for row in snapshot["operations"]:
+            decisions.setdefault(_key(row["operation_id"]), set()).add(row["decision"]["kind"])
     found = set()
     for page in run.trace.of_kind("RecoveryPageDelivered"):
         if not any(run.trace.before(kill, page) for kill in kills):
@@ -430,13 +435,40 @@ def one_admission_per_observed_inbound_exchange(run):
             operation = _key(fact["operation_id"])
             if operation in found or slots.get(operation, (None,))[0] != "AdmitPublication":
                 continue
-            found.add(operation)
             if any(
                 _key(commit.payload["operation_id"]) == operation
                 and run.trace.before(commit, page) is not False
                 for commit in stable
             ):
                 continue
+            # A core-delivered page is an observation of the store only when
+            # its read exists in the same incarnation and precedes delivery.
+            # Missing evidence can still belong to the acknowledged exchange;
+            # it makes that conclusion unknown rather than inventing absence.
+            source = next(
+                (
+                    read for read in reads
+                    if read.origin[1] == page.origin[1]
+                    and read.payload == page.payload
+                    and run.trace.before(read, page) is True
+                ),
+                None,
+            )
+            if source is None:
+                statuses.append(INCONCLUSIVE)
+                reasons.append(f"the recovered admission {operation} has no matching page read")
+                _, session, packet_id = slots[operation]
+                placeable.update(
+                    id(exchange) for exchange in exchanges
+                    if (exchange.client, exchange.packet_id) == (clients.get(session), packet_id)
+                )
+                continue
+            if decisions.get(operation, set()) - {"Committed"}:
+                statuses.append(FAIL)
+                reasons.append(f"the recovered admission {operation} contradicts its durable decision")
+                stands = True
+                continue
+            found.add(operation)
             attribute(operation, page)
     for exchange in exchanges:
         admissions = counts[id(exchange)]
