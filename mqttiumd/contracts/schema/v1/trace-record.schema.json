@@ -128,7 +128,8 @@
         "StoreEpochOpened",
         "OpeningReplyDelivered",
         "OpeningAbandoned",
-        "EpochGrantHandedOver"
+        "EpochGrantHandedOver",
+        "StepBlocked"
       ]
     },
     "payload": {
@@ -923,6 +924,30 @@
           "origin_component": {
             "enum": [
               "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "StepBlocked"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StepBlocked"
+          },
+          "origin_component": {
+            "enum": [
+              "bench-supervisor"
             ]
           }
         }
@@ -2171,6 +2196,30 @@
         },
         "epoch": {
           "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "StepBlocked": {
+      "description": "The bench stopped the run before its last step: at `step`, of kind `step_kind`, because no action was eligible and the awaited event had not happened (`quiescent`), or because the budget of steps ran out (`budget`).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "step_kind",
+        "cause"
+      ],
+      "properties": {
+        "step": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "step_kind": {
+          "$ref": "primitives.schema.json#/$defs/type_name"
+        },
+        "cause": {
+          "enum": [
+            "quiescent",
+            "budget"
+          ]
         }
       }
     }

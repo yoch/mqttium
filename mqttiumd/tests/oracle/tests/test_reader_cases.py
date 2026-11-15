@@ -16,7 +16,12 @@ from mqttiumd_oracle.documents import MAX_DOCUMENT_BYTES, Contracts, ContractsUn
 
 from .support import ROOT
 
-EVERY_RUN = ("trace_complete", "broker_inputs_have_provenance", "one_grant_per_opened_epoch")
+EVERY_RUN = (
+    "trace_complete",
+    "broker_inputs_have_provenance",
+    "one_grant_per_opened_epoch",
+    "scenario_reaches_its_end",
+)
 
 SCENARIO = "tests/scenarios/p1/P1-02.json"
 SCRATCH = "target/oracle-tests"

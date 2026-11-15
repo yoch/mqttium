@@ -13,7 +13,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The history of P1-02 the specification describes."
     },
@@ -30,7 +31,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The same history with independent records interleaved differently: also accepted."
     },
@@ -47,7 +49,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "P1-02b: an old unknown answer arrives after the commit is known, and nothing follows it."
     },
@@ -64,7 +67,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "The trace was cut: no footer. Nothing is concluded from it."
     },
@@ -81,7 +85,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "The last line was cut in the middle of a record."
     },
@@ -98,7 +103,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "A record is missing: the collector sequence and one origin sequence have a gap."
     },
@@ -115,7 +121,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "The missing record is the commit: an acknowledgement without admission is not concluded."
     },
@@ -132,7 +139,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "The missing record is the PUBLISH: an admission outside any exchange is not concluded."
     },
@@ -149,7 +157,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "The collector sequence is gapless and the footer agrees, yet one origin skips a number."
     },
@@ -166,7 +175,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "The collector sequence skips a number: a record did not reach the file."
     },
@@ -183,7 +193,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "One line is not a valid record: its sequences are in order, its payload is not of its kind."
     },
@@ -200,7 +211,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "A record names a cause that is not in the trace."
     },
@@ -217,7 +229,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "The footer counts more records than the trace holds."
     },
@@ -234,7 +247,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "The collector itself says the trace is not complete."
     },
@@ -251,7 +265,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "In a simulated run the core consumes a packet before the transport received its bytes."
     },
@@ -268,7 +283,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "A recovery page is stated by the bench: the record breaks the origin rule and the trace is unreadable."
     },
@@ -285,7 +301,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "A complete trace of P1-02b is offered for P1-02: a run is judged only against its own scenario."
     },
@@ -302,7 +319,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "DEM-MU-04: the replay is admitted again under a new ExchangeId; one client exchange has two admissions."
     },
@@ -319,7 +337,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "The trace is cut, and what it holds already shows two admissions: no missing record undoes that."
     },
@@ -336,7 +355,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The store commits an admission of Packet Identifier 7 before the client sent any PUBLISH."
     },
@@ -353,7 +373,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The client observes a positive PUBREC for an exchange the store never admitted."
     },
@@ -370,7 +391,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "DEM-MU-06: two obligations at both checkpoints, but one now targets another session."
     },
@@ -387,7 +409,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "An obligation held at the first checkpoint is absent at the second."
     },
@@ -404,7 +427,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The same two obligations at both checkpoints, and one is not towards a target of the route."
     },
@@ -421,7 +445,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The obligations keep their identities and destinations; the payload they refer to changed."
     },
@@ -438,7 +463,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "Both checkpoints agree, on nothing: the store holds no publication and no obligation."
     },
@@ -455,7 +481,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The second checkpoint holds one obligation more for the same publication: not the same obligations."
     },
@@ -472,7 +499,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The store holds no session for a target of the route: a finding, not a crash of the judge."
     },
@@ -489,7 +517,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The recipe stored for op_A has other targets at the second checkpoint."
     },
@@ -506,7 +535,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "op_A was committed before the second inspection, which holds no recipe for it."
     },
@@ -523,7 +553,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "On a backend with no total order, the trace does not say whether op_A was committed before the inspection that lost its recipe."
     },
@@ -540,7 +571,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "F2: the store lost every payload; the obligations still name a payload nobody holds."
     },
@@ -557,7 +589,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "F2: the store lost publications and payloads, and kept their obligations as orphans."
     },
@@ -574,7 +607,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "F2: the payload the store holds is not the one the client published and was acknowledged for."
     },
@@ -591,7 +625,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "F2: an obligation, the same at both checkpoints, names a publication the store does not hold."
     },
@@ -608,7 +643,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "F2: a publication, the same at both checkpoints, names a payload the store does not hold."
     },
@@ -625,7 +661,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The client's PUBLISH carries a property; the payload the store holds is still what it sent."
     },
@@ -642,7 +679,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "F2: publications and payloads are held and equal at both checkpoints, and no obligation is."
     },
@@ -659,7 +697,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "F2: the acknowledged publication carries one obligation of the two its routes require, at both checkpoints."
     },
@@ -676,7 +715,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "F2: the client was acknowledged, and the store holds no publication, payload or obligation for it."
     },
@@ -693,7 +733,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The store had committed and the core had not been told: the PUBREC is premature."
     },
@@ -710,7 +751,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "PUBCOMP is made eligible before the core received the result of the release."
     },
@@ -727,7 +769,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The result was not lost: the client observed PUBREC before the crash."
     },
@@ -744,7 +787,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The injection was reached twice; once was announced."
     },
@@ -761,7 +805,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "DEM-MU-03: after the restart the core receives a result for op_A that answers no effect of this incarnation."
     },
@@ -778,7 +823,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "DEM-MU-03: the page the core consumed holds a fact the store adapter did not read."
     },
@@ -795,7 +841,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The inventory of a recovery is cut inside its routes and inside its sessions: still one ordered inventory."
     },
@@ -812,7 +859,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "Each page is in order, and the first route of the second page sorts before the last of the first."
     },
@@ -829,7 +877,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "Each page is in order, and the limits come in a page after the routes they bound."
     },
@@ -846,7 +895,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "Each page is in order, and the second page states the route table a second time."
     },
@@ -863,7 +913,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "Routes belong to the table that precedes them: an inventory with routes and no table is not one."
     },
@@ -880,7 +931,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The same route, topic and target, is in two pages of one inventory."
     },
@@ -897,7 +949,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "A route targets a session that no fact of the inventory recovers."
     },
@@ -914,7 +967,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "Read in an order that is an inventory, delivered in one that is not: the core got the sessions before the epoch."
     },
@@ -931,7 +985,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "A page read twice by the adapter and delivered once is one inventory, not a second epoch."
     },
@@ -948,7 +1003,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The reason a peer says it decoded is not the reason in the bytes it observed."
     },
@@ -965,7 +1021,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The bytes a peer observed hold more than the one packet it says it decoded."
     },
@@ -982,7 +1039,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "K1: the store produced an unknown outcome, and the core consumed a commit for it."
     },
@@ -999,7 +1057,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "K1: the adapter handed over a refusal, and the core consumed a commit."
     },
@@ -1016,7 +1075,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "K1: the core consumed a result the store adapter never handed over."
     },
@@ -1033,7 +1093,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "K1: one result the store produced is handed over twice, and no injection duplicates it."
     },
@@ -1050,7 +1111,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "K1: the adapter handed over the commit the store produced, and the core consumed an unknown."
     },
@@ -1067,7 +1129,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "K1: the adapter hands over a result that no result of the store precedes."
     },
@@ -1084,7 +1147,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "DEM-MU-05: an unknown answer arriving after the commit makes the core resolve again."
     },
@@ -1101,7 +1165,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "DEM-MU-05: an unknown answer arriving after the commit makes the core acknowledge again."
     },
@@ -1118,7 +1183,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "DEM-MU-05: after the commit is known, the operation is resolved again."
     },
@@ -1135,7 +1201,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "An unknown answer consumed before any terminal one may be followed: nothing regressed."
     },
@@ -1152,7 +1219,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "K1: the adapter submits a command that no record of the core causes."
     },
@@ -1169,7 +1237,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "K1: the adapter submits a resolution caused by the bench, not by the core."
     },
@@ -1240,7 +1309,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "FAIL"
+        "one_grant_per_opened_epoch": "FAIL",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "One opened epoch, two grants handed over."
     },
@@ -1257,7 +1327,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "FAIL"
+        "one_grant_per_opened_epoch": "FAIL",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The opening's outcome is unknown, and a grant is handed over all the same."
     },
@@ -1274,7 +1345,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The core consumes an opening reply that answers no command the adapter submitted."
     },
@@ -1291,7 +1363,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "FAIL"
+        "one_grant_per_opened_epoch": "FAIL",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The core is told its command opened epoch 5; the store opened epoch 1 for that attempt."
     },
@@ -1308,7 +1381,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The start-up abandons its opening, then receives its committed reply; the grant follows it."
     },
@@ -1325,7 +1399,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The dispatcher refused a result that answered no effect in flight."
     },
@@ -1342,7 +1417,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The core consumes a deadline whose token no timer armed."
     },
@@ -1359,7 +1435,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The first deadline of P1-02b is delivered a second time."
     },
@@ -1376,7 +1453,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The core consumes a PUBLISH that follows no bytes of the transport."
     },
@@ -1393,7 +1471,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "One effect is answered twice."
     },
@@ -1410,7 +1489,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "A declared injection duplicates a result; the dispatcher refuses the copy, and that is the expected outcome."
     },
@@ -1427,7 +1507,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "A declared injection duplicates a result: handed over twice, the copy refused; that is expected."
     },
@@ -1444,7 +1525,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The duplicated result is not refused: the core consumes a second answer to one effect."
     },
@@ -1461,7 +1543,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The final snapshot is not the file the trace cites: what depends on it is not concluded."
     },
@@ -1478,7 +1561,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "An identity is its named components, in whatever order a writer puts the members."
     },
@@ -1495,7 +1579,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The final snapshot is a valid snapshot of another run: it is not evidence for this one."
     },
@@ -1512,7 +1597,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The final snapshot was read from another backend than the run declares."
     },
@@ -1529,7 +1615,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The transport records bytes no peer sent, and they are not the packets the core consumed."
     },
@@ -1546,7 +1633,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The transport records other bytes than the peer sent for the packet the core consumed."
     },
@@ -1563,7 +1651,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The bytes the transport received name as their cause a record that is not a packet a peer sent."
     },
@@ -1580,7 +1669,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The peer sent a PUBLISH, the transport received it, and the core consumed a PUBREL."
     },
@@ -1597,7 +1687,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The bytes received carry another Packet Identifier than the packet the core consumed."
     },
@@ -1614,7 +1705,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The bytes received are more than the one packet the core consumed."
     },
@@ -1631,7 +1723,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The file cited for the final checkpoint is the snapshot of another checkpoint."
     },
@@ -1648,7 +1741,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The first checkpoint is inspected twice: neither inspection is the one the scenario asks for."
     },
@@ -1665,7 +1759,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "An input is refused after an injection that duplicates nothing: the refusal is not excused."
     },
@@ -1680,7 +1775,8 @@
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "A run without bytes, judged against the scenario of that perimeter."
     },
@@ -1697,7 +1793,8 @@
         "broker_inputs_have_provenance": "OUT_OF_SCOPE",
         "all_required_faults_hit": "OUT_OF_SCOPE",
         "trace_complete": "OUT_OF_SCOPE",
-        "one_grant_per_opened_epoch": "OUT_OF_SCOPE"
+        "one_grant_per_opened_epoch": "OUT_OF_SCOPE",
+        "scenario_reaches_its_end": "OUT_OF_SCOPE"
       },
       "why": "A run without bytes is offered for the full scenario: it never passes it."
     },
@@ -1712,7 +1809,8 @@
         "broker_inputs_have_provenance": "OUT_OF_SCOPE",
         "all_required_faults_hit": "OUT_OF_SCOPE",
         "trace_complete": "OUT_OF_SCOPE",
-        "one_grant_per_opened_epoch": "OUT_OF_SCOPE"
+        "one_grant_per_opened_epoch": "OUT_OF_SCOPE",
+        "scenario_reaches_its_end": "OUT_OF_SCOPE"
       },
       "why": "A full run is offered for the scenario of another perimeter."
     },
@@ -1728,7 +1826,8 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "no_pubrec_observed_before_crash": "OUT_OF_SCOPE",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "A scenario without bytes lists an assertion only peers can decide: it stays out of scope."
     },
@@ -1743,7 +1842,8 @@
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "Without bytes the provenance of results is still checked."
     },
@@ -1761,7 +1861,8 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "QABS-A: the command commits before the fence; one effect."
     },
@@ -1778,7 +1879,8 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "QABS-B: the fence commits first; the old command is refused."
     },
@@ -1794,7 +1896,8 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "QABS-C: no fence can be written; the outcome stays unknown."
     },
@@ -1811,7 +1914,8 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "A command is committed after the fence that made it definitively not executable."
     },
@@ -1828,7 +1932,8 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "No commit is in the trace, yet the store holds the operation both fenced and committed."
     },
@@ -1844,7 +1949,8 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "DEM-MU-01: the store answers a certain refusal though its fence was refused."
     },
@@ -1861,7 +1967,8 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The admission is refused because it was fenced, and the PUBREC says a quota is the cause."
     },
@@ -1878,7 +1985,8 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The admission is refused for lack of capacity: the PUBREC says a quota is the cause."
     },
@@ -1895,7 +2003,8 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The admission is refused for lack of capacity, and the PUBREC hides that a quota is the cause."
     },
@@ -1912,7 +2021,8 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The PUBREC refuses before the core received any certain rejection."
     },
@@ -1929,7 +2039,8 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The PUBREC refuses, and the result among its causes is an unknown outcome, not a rejection."
     },
@@ -1945,7 +2056,8 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "DEM-MU-01: the store refuses on an absence it read, and the fence a later snapshot lists came after."
     },
@@ -1963,7 +2075,8 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS",
-        "one_grant_per_opened_epoch": "PASS"
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
       },
       "why": "The operation is committed, and the store then writes a fence for the same identity."
     },
@@ -1979,7 +2092,8 @@
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
         "broker_inputs_have_provenance": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "The trace is cut: the fence that closes the refusal may be the record that is missing."
     },
@@ -1996,7 +2110,8 @@
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
         "broker_inputs_have_provenance": "INCONCLUSIVE",
-        "one_grant_per_opened_epoch": "INCONCLUSIVE"
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
       },
       "why": "The trace is cut, and it already holds a commit after its fence: no missing record undoes that."
     }

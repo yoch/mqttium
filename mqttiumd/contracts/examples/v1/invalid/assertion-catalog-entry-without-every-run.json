@@ -122,6 +122,14 @@
       "requirements": [
         "DEM-010"
       ]
+    },
+    {
+      "name": "scenario_reaches_its_end",
+      "meaning": "The run reached the last step of its scenario. A run the bench stopped because no action was eligible and the awaited event had not happened shows the product stuck and fails; one stopped by its budget of steps concludes nothing.",
+      "every_run": true,
+      "requirements": [
+        "DEM-017"
+      ]
     }
   ]
 }

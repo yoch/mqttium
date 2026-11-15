@@ -220,6 +220,14 @@ creation authority. `one_grant_per_opened_epoch`, owed by every run,
 holds when each epoch is granted at most once, after a committed reply
 the ledger confirms.
 
+A run the bench stops before the last step of its scenario ends with
+`StepBlocked {step, step_kind, cause}` of the bench supervisor, before
+the footer: `quiescent` when no action was eligible and the awaited event
+had not happened, `budget` when the steps ran out. The assertion
+`scenario_reaches_its_end`, owed by every run, fails on `quiescent` (the
+product is stuck, and no missing record undoes that) and is
+inconclusive on `budget`.
+
 `InputRefused` is what the dispatcher records when it refuses a result
 that answers no effect in flight. `StoreCommitStable`, `StoreFenceStable`,
 `StoreFenceRefused` and `StoreResultReady` are hidden truth of the store: they judge a run and
