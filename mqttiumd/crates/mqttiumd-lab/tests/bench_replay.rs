@@ -64,6 +64,14 @@ fn the_recorded_command_replays_the_campaign_on(backend: &str) {
         replayed["commands"]["replay"],
         recorded["commands"]["replay"]
     );
+    // An ordinary replay says what it is: no rebuilt binary, a
+    // provisional result.
+    assert!(!command.contains("--rebuild"), "{command}");
+    let scope = recorded["commands"]["replay_scope"]
+        .as_str()
+        .expect("a scope");
+    assert!(scope.contains("ordinary replay"), "{scope}");
+    assert!(scope.contains("provisional"), "{scope}");
 }
 
 #[test]

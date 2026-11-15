@@ -28,6 +28,15 @@ fn a_rebuilt_campaign_holds_the_source_of_its_binary_and_that_source_builds_it_a
         campaign["built_from"]["source"]["sha256"],
         mqttiumd_lab::manifest::sha256_hex(&tar).as_str()
     );
+    // The recorded command replays a rebuilt run as a rebuilt run, and
+    // says what such a replay establishes.
+    let replay = campaign["commands"]["replay"].as_str().expect("a command");
+    assert!(replay.contains(" --rebuild "), "{replay}");
+    assert!(replay.contains(" --backend sim-store "), "{replay}");
+    let scope = campaign["commands"]["replay_scope"]
+        .as_str()
+        .expect("a scope");
+    assert!(scope.contains("check_campaign_binary.sh"), "{scope}");
     // The manifest ties the binary to that source (decision 0017): the
     // archive as a file of the campaign, and the command that built it.
     let manifest: serde_json::Value =
