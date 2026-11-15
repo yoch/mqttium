@@ -1227,6 +1227,26 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
     for index in 0..items(document, "artifacts").len() {
         u64_at(document, &format!("/artifacts/{index}/bytes"), out);
     }
+    if document.get("failure_count").is_some() {
+        let count = u64_at(document, "/failure_count", out);
+        let failures = items(document, "failures");
+        for (index, failure) in failures.iter().enumerate() {
+            for member in ["process_incarnation", "record_sequence", "page"] {
+                if failure.get(member).is_some() {
+                    u64_at(document, &format!("/failures/{index}/{member}"), out);
+                }
+            }
+        }
+        if count.is_some_and(|total| {
+            u64::try_from(failures.len()).map_or(true, |length| length != total.min(64))
+        }) {
+            out.push(Diagnostic::new(
+                code::RESULT_INCOMPLETE,
+                "/failures",
+                "the failure list must contain exactly min(failure_count, 64) contexts",
+            ));
+        }
+    }
 
     let qualifying = text(document, "qualification") == "qualifying";
     let computed = computed_verdict(&statuses, injections_reached);
@@ -1696,8 +1716,9 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
 /// Names of the members that hold a 64-bit decimal string, in a trace
 /// payload or a snapshot. A test walks the schemas and fails when one of
 /// their 64-bit members is missing here.
-const COMPONENTS: [&str; 40] = [
+const COMPONENTS: [&str; 41] = [
     "incarnation",
+    "process_incarnation",
     "epoch",
     "owner",
     "sequence",

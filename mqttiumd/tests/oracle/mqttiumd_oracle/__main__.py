@@ -92,6 +92,7 @@ def _main(arguments) -> int:
             for name, status in statuses.items()
         },
         "faults": faults,
+        **results.failures_of(run),
     }
     print(json.dumps(report, indent=2))
     return results.EXIT_CODES[verdict]

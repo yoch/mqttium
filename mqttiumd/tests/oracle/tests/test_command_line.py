@@ -48,6 +48,21 @@ class CommandLine(unittest.TestCase):
     def test_a_trace_that_does_not_exist_concludes_nothing(self):
         self.assertEqual(self.judge("absent")[0], 2)
 
+    def test_judge_preserves_stable_failure_codes_and_context(self):
+        for name, kind, code, phase in [
+            ("durable-read-failure", "DurableReadFailed", "InvalidData", "Recovery"),
+            ("process-control-failure", "ProcessControlFailed", "TruncatedFrame", "KillDrain"),
+        ]:
+            with self.subTest(name):
+                found, output = self.judge(name)
+                report = json.loads(output)
+                self.assertEqual((found, report["verdict"]), (2, "INCONCLUSIVE"))
+                self.assertEqual(report["failure_count"], "1")
+                failure = report["failures"][0]
+                self.assertEqual({key: failure[key] for key in ("kind", "code", "phase", "process_incarnation")}, {
+                    "kind": kind, "code": code, "phase": phase, "process_incarnation": "2",
+                })
+
     # A defect of the oracle has a code of its own: the exit status 1 means
     # FAIL, and a run that was never judged must not be recorded as one.
 

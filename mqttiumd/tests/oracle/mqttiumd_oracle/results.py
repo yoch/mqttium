@@ -22,6 +22,7 @@ from .strict import Diagnostic, Refused, parse
 EXIT_CODES = {"PASS": 0, "FAIL": 1, "INCONCLUSIVE": 2, "OUT_OF_SCOPE": 3}
 MAX_TEXT = 1024
 MAX_REASONS = 256
+MAX_FAILURES = 64
 
 
 def _cite(contracts, path):
@@ -52,6 +53,24 @@ def _observed(run):
     return statuses, faults
 
 
+def failures_of(run):
+    """Bounded typed context, retained independently of the business verdict.
+
+    The count describes every failure in this trace; the list keeps only
+    its first contexts. Codes and phases come from closed schema unions,
+    never from parsing diagnostic text.
+    """
+    total, first = 0, []
+    for record in run.trace.records:
+        if record.kind not in {"DurableReadFailed", "ProcessControlFailed"}:
+            continue
+        total += 1
+        if len(first) < MAX_FAILURES:
+            first.append({"kind": record.kind, "record_sequence": str(record.sequence),
+                          **record.payload})
+    return {"failures": first, "failure_count": str(total)} if total else {}
+
+
 def produce(contracts, scenario_path, trace_path, manifest_path, scope):
     """A qualifying result for the run a trace records."""
     run = judge.Run.load(contracts, scenario_path, trace_path)
@@ -77,6 +96,7 @@ def produce(contracts, scenario_path, trace_path, manifest_path, scope):
             {"name": name, "status": status.status} for name, status in statuses.items()
         ],
         "faults": faults,
+        **failures_of(run),
         "scenario": _cite(contracts, scenario_path),
         "manifest": _cite(contracts, manifest_path),
         "trace": _cite(contracts, trace_path),
@@ -398,6 +418,12 @@ def recompute(contracts, result_path):
             )
         )
     statuses, faults = _observed(run)
+    typed = {key: result[key] for key in ("failures", "failure_count") if key in result}
+    if typed != failures_of(run):
+        out.append(Diagnostic(
+            "result-not-recomputed", "/failures",
+            "the result's typed failure context or total differs from the cited trace",
+        ))
     for index, entry in enumerate(result["assertions"]):
         found = statuses.get(entry["name"])
         if found is None or found.status != entry["status"]:

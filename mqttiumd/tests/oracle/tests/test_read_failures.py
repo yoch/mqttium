@@ -1,11 +1,14 @@
 """Typed read/control observations stay inspectable without becoming business PASS."""
 
 import copy
+import contextlib
 import hashlib
+import io
 import json
 import unittest
 
 from mqttiumd_oracle import judge, results
+from mqttiumd_oracle.__main__ import main
 
 from . import test_judge_rules as rules
 from . import test_results as existing_results
@@ -26,10 +29,14 @@ class ReadFailures(unittest.TestCase):
     refusals = existing_results.Results.refusals
 
     def trace_with_failures(self, kind="DurableReadFailed", *, early_ack=False,
-                            incomplete=False, count=1, missing_core_record=False):
-        events = corpus.p1_02()
+                            incomplete=False, count=1, missing_core_record=False,
+                            partial_recovery=False, before_started=False):
+        events = [corpus.header("P1-02")] if before_started else corpus.p1_02()
         if early_ack:
             corpus.early_pubrec(events)
+        if partial_recovery:
+            for label in ("recovery.read", "recovery.in"):
+                events[corpus.at(events, label)]["payload"]["last"] = False
         for index in range(count):
             payload = {
                 "code": "InvalidData" if kind == "DurableReadFailed" else "TruncatedFrame",
@@ -38,6 +45,9 @@ class ReadFailures(unittest.TestCase):
             }
             if kind == "DurableReadFailed":
                 payload["page"] = "1"
+            if before_started:
+                payload.update(phase="Open", process_incarnation="1")
+                payload.pop("page", None)
             events.append(corpus.ev(f"failure.{index}", "bench-supervisor", kind, payload))
         states = corpus.p1_02_snapshots("in-memory")
         records = corpus.render("in-memory", events, states)
@@ -102,6 +112,26 @@ class ReadFailures(unittest.TestCase):
     def test_a_missing_core_record_does_not_establish_an_unjustified_ack(self):
         _, run = self.run_of(early_ack=True, incomplete=True, missing_core_record=True)
         self.assertEqual(judge.judge(run)[ACK].status, "INCONCLUSIVE")
+
+    def test_a_partial_recovery_does_not_authorize_a_positive_ack(self):
+        _, run = self.run_of(partial_recovery=True, incomplete=True)
+        self.assertEqual(judge.no_positive_ack_before_confirmed_commit(run).status, "FAIL")
+        self.assertEqual(judge.judge(run)[ACK].status, "FAIL")
+
+    def test_a_read_failure_before_started_keeps_its_phase_and_incarnation(self):
+        path, run = self.run_of(before_started=True, incomplete=True)
+        self.assertEqual(run.trace.of_kind("BrokerRecovered"), [])
+        self.assertEqual(judge.judge(run)[READS].status, "INCONCLUSIVE")
+        scenario = self.write("scenario.json", corpus.P1_02)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = main(["--root", str(ROOT), "judge", "--scenario", scenario, "--trace", path])
+        report = json.loads(output.getvalue())
+        self.assertEqual((code, report["verdict"]), (2, "INCONCLUSIVE"))
+        self.assertEqual(report["failures"], [{
+            "kind": "DurableReadFailed", "record_sequence": "1", "code": "InvalidData",
+            "phase": "Open", "process_incarnation": "1",
+        }])
 
     def test_produce_preserves_the_typed_failure_context(self):
         produced = self.produce(incomplete=True)

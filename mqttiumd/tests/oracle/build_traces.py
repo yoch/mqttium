@@ -1071,6 +1071,20 @@ case(
     scenario="p1-02b",
 )
 
+for name, kind, code, phase in [
+    ("durable-read-failure", "DurableReadFailed", "InvalidData", "Recovery"),
+    ("process-control-failure", "ProcessControlFailed", "TruncatedFrame", "KillDrain"),
+]:
+    case(
+        name,
+        "Synthetic typed failure context: even an incorrectly complete footer cannot qualify an exchange without complete evidence.",
+        {"durable_reads_complete": "INCONCLUSIVE"},
+        events=lambda events, kind=kind, code=code, phase=phase: events.append(ev(
+            "typed.failure", "bench-supervisor", kind,
+            {"code": code, "phase": phase, "process_incarnation": "2"},
+        )),
+    )
+
 # ------------------------------------------------------------ incomplete traces
 case(
     "trace-cut-before-footer",
@@ -1705,7 +1719,7 @@ def remembered(events):
 case(
     "provenance-page-holds-a-fact-nobody-read",
     "DEM-MU-03: the page the core consumed holds a fact the store adapter did not read.",
-    {"broker_inputs_have_provenance": "FAIL"},
+    {"broker_inputs_have_provenance": "FAIL", "no_positive_ack_before_confirmed_commit": "INCONCLUSIVE"},
     events=remembered,
 )
 
@@ -1761,19 +1775,19 @@ case(
 case(
     "recovery-routes-unsorted-across-pages",
     "Each page is in order, and the first route of the second page sorts before the last of the first.",
-    {"broker_inputs_have_provenance": "FAIL"},
+    {"broker_inputs_have_provenance": "FAIL", "no_positive_ack_before_confirmed_commit": "FAIL"},
     events=in_pages(lambda facts: facts.__setitem__(4, route_fact(b"p1/a", C)), [4]),
 )
 case(
     "recovery-limits-after-the-routes-of-an-earlier-page",
     "Each page is in order, and the limits come in a page after the routes they bound.",
-    {"broker_inputs_have_provenance": "FAIL"},
+    {"broker_inputs_have_provenance": "FAIL", "no_positive_ack_before_confirmed_commit": "FAIL"},
     events=in_pages(lambda facts: facts.insert(4, facts.pop(1)), [4]),
 )
 case(
     "recovery-route-table-again-in-a-later-page",
     "Each page is in order, and the second page states the route table a second time.",
-    {"broker_inputs_have_provenance": "FAIL"},
+    {"broker_inputs_have_provenance": "FAIL", "no_positive_ack_before_confirmed_commit": "FAIL"},
     events=in_pages(lambda facts: facts.insert(3, dict(facts[2])), [3]),
 )
 case(
@@ -1837,7 +1851,7 @@ def read_out_of_order(events):
 case(
     "recovery-delivered-out-of-inventory-order",
     "Read in an order that is an inventory, delivered in one that is not: the core got the sessions before the epoch.",
-    {"broker_inputs_have_provenance": "FAIL"},
+    {"broker_inputs_have_provenance": "FAIL", "no_positive_ack_before_confirmed_commit": "FAIL"},
     events=read_out_of_order,
 )
 
