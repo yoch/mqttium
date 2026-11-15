@@ -16,6 +16,7 @@ close.
 | Base branch | `main` |
 | Integrated revision | `874f298b4de7c3a13006cb1ff767dfb09e4031ac`, the merge of PR yoch/mqttium#647 (lot L0, with the amended record 0009) |
 | Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb`, as `validate` prints it on that revision |
+| Contract digest on the integration branch | `sha256:29dd01788a05e141d204a826aba8bcbb3db837a4b49e73e43263f7e2a2d4b4d8` since the contract stack of lot L3 was merged (15 November 2026). The digest above is the one every lot started from |
 
 Every lot starts from the integrated revision. The commit that records it
 here differs from it by this file only, and changes no contract. Every lot

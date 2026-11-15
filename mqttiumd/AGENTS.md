@@ -16,6 +16,18 @@ cargo test --workspace --locked
 cargo run -q -p mqttiumd-lab -- validate --contracts contracts/v1 --scenario tests/scenarios/p1/P1-02.json
 ```
 
+The oracle under `tests/oracle/` is a second reader of the semantic level
+and the judge of a run. A change to a contract, to the corpus or to the
+oracle also runs it, with its pinned versions; CI runs it in the job
+`contracts`:
+
+```bash
+python -m pip install -r tests/oracle/requirements.txt
+python tests/oracle/build_traces.py          # rewrite the derived traces
+python tests/oracle/build_traces.py --check
+python -m unittest discover -t tests/oracle -s tests/oracle/tests
+```
+
 `proofs/` is a workspace of its own, so the four commands above do not see
 it. Its scripts are its only verification, and CI runs them in the job
 `pilot proof`; they need Kani (`tools/install-tools.sh kani`):

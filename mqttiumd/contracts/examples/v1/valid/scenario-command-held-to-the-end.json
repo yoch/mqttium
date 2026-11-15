@@ -1,0 +1,61 @@
+{
+  "format": "mqttiumd.scenario",
+  "schema_version": 1,
+  "id": "P1-02b",
+  "profile": "p1-durable-mqtt5-without-expiry",
+  "initial_fixture": "tests/fixtures/p1/three-persistent-sessions.json",
+  "budgets": {
+    "max_steps": "4096",
+    "max_trace_bytes": "16777216"
+  },
+  "faults": [
+    {
+      "id": "held_admission",
+      "point": "store.command.transit",
+      "match": {
+        "command_kind": "AdmitPublication",
+        "publication_binding": "pub_A"
+      },
+      "occurrence": "1",
+      "action": "hold_command",
+      "bind_operation_as": "op_A",
+      "expected_hits": "1"
+    }
+  ],
+  "steps": [
+    {
+      "kind": "ClientResumeSession",
+      "client": "producer",
+      "expect_session_present": true,
+      "max_steps": "512"
+    },
+    {
+      "kind": "ClientPublish",
+      "client": "producer",
+      "topic": "p1/example",
+      "qos": 2,
+      "retain": false,
+      "packet_id": 7,
+      "payload_hex": "7061796c6f6164",
+      "bind_exchange_as": "pub_A"
+    },
+    {
+      "kind": "DriveUntil",
+      "event": "FaultHit",
+      "binding": "held_admission",
+      "max_steps": "512"
+    },
+    {
+      "kind": "InspectDurableState",
+      "checkpoint": "held"
+    }
+  ],
+  "assertions": [
+    "one_admission_per_observed_inbound_exchange",
+    "same_required_obligations_at_both_checkpoints",
+    "same_recipe_for_op_A",
+    "no_positive_ack_before_confirmed_commit",
+    "all_required_faults_hit",
+    "trace_complete"
+  ]
+}

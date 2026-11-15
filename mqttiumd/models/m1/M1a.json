@@ -1,0 +1,28 @@
+{
+  "module": "M1a.tla",
+  "status": "specification",
+  "summary": "Admission of an inbound QoS 2 publication and authorisation of PUBREC: one admission per exchange, both obligations or none, an answer only on known commit, across a lost result, an unknown outcome and one crash.",
+  "issues": [647],
+  "tests": [],
+  "configs": [
+    {"config": "M1a-safety.cfg", "expect": "pass", "invariants": ["TypeOK", "OneAdmissionPerExchange", "AtomicObligations", "AnswerOnKnowledge", "OneRecipePerIdentity", "FenceForbidsExecution", "AccountsMatch", "KnowledgeSound", "TerminalKnowledgeStable", "DelayedCommandKept"]},
+    {"config": "M1a-reach-commit.cfg", "expect": "violation", "invariant": "NoCommit"},
+    {"config": "M1a-reach-lost-result.cfg", "expect": "violation", "invariant": "NoLostResult"},
+    {"config": "M1a-reach-unknown.cfg", "expect": "violation", "invariant": "NoUnknown"},
+    {"config": "M1a-reach-rejection.cfg", "expect": "violation", "invariant": "NoRejection"},
+    {"config": "M1a-reach-crash-after-commit.cfg", "expect": "violation", "invariant": "NoCrashAfterCommit"},
+    {"config": "M1a-reach-recovery.cfg", "expect": "violation", "invariant": "NoRecovery"},
+    {"config": "M1a-reach-live-path.cfg", "expect": "violation", "invariant": "NoLivePath"},
+    {"config": "M1a-reach-exhaustion.cfg", "expect": "violation", "invariant": "NoExhaustion"},
+    {"config": "M1a-reach-fence-while-held.cfg", "expect": "violation", "invariant": "NoFenceWhileHeld"},
+    {"config": "M1a-mut-ack-before-commit.cfg", "expect": "violation", "invariant": "AnswerOnKnowledge"},
+    {"config": "M1a-mut-unknown-as-rejection.cfg", "expect": "violation", "invariant": "FenceForbidsExecution"},
+    {"config": "M1a-mut-recipe-change.cfg", "expect": "violation", "invariant": "OneRecipePerIdentity"},
+    {"config": "M1a-mut-second-admission.cfg", "expect": "violation", "invariant": "OneAdmissionPerExchange"},
+    {"config": "M1a-mut-late-unknown.cfg", "expect": "violation", "invariant": "TerminalKnowledgeStable"},
+    {"config": "M1a-live-path.cfg", "expect": "pass", "property": "LivePathResolves"},
+    {"config": "M1a-live-path-no-rearm.cfg", "expect": "liveness", "property": "LivePathResolves"},
+    {"config": "M1a-recovery.cfg", "expect": "pass", "property": "RecoveryCompletes", "invariants": ["NoSuspension"]},
+    {"config": "M1a-recovery-silent-client.cfg", "expect": "liveness", "property": "RecoveryCompletes"}
+  ]
+}

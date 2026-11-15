@@ -1,0 +1,28 @@
+{
+  "module": "M1b.tla",
+  "status": "specification",
+  "summary": "Admission under connection and session resets, capacity refusals, a fence racing an application and the change of epoch: no stale target, no execution in a closed epoch, a refusal that stays refused, obligations kept.",
+  "issues": [647],
+  "tests": [],
+  "configs": [
+    {"config": "M1b-safety-epoch.cfg", "expect": "pass", "invariants": ["TypeOK", "OneAdmissionPerExchange", "AtomicObligations", "DecisionExclusive", "RefusalNeverExecutes", "AckedIsAdmitted", "RefusedIsNotAdmitted", "NoExecutionInClosedEpoch", "NoStaleTarget", "ObligationsConserved", "AccountsMatch", "WithinCapacity", "KnowledgeSound"]},
+    {"config": "M1b-safety-source.cfg", "expect": "pass", "invariants": ["TypeOK", "OneAdmissionPerExchange", "AtomicObligations", "DecisionExclusive", "RefusalNeverExecutes", "AckedIsAdmitted", "RefusedIsNotAdmitted", "NoExecutionInClosedEpoch", "NoStaleTarget", "ObligationsConserved", "AccountsMatch", "WithinCapacity", "KnowledgeSound"]},
+    {"config": "M1b-safety-connection.cfg", "expect": "pass", "invariants": ["TypeOK", "OneAdmissionPerExchange", "AtomicObligations", "DecisionExclusive", "RefusalNeverExecutes", "AckedIsAdmitted", "RefusedIsNotAdmitted", "NoExecutionInClosedEpoch", "NoStaleTarget", "ObligationsConserved", "AccountsMatch", "WithinCapacity", "KnowledgeSound"]},
+    {"config": "M1b-safety-destination.cfg", "expect": "pass", "invariants": ["TypeOK", "OneAdmissionPerExchange", "AtomicObligations", "DecisionExclusive", "RefusalNeverExecutes", "AckedIsAdmitted", "RefusedIsNotAdmitted", "NoExecutionInClosedEpoch", "NoStaleTarget", "ObligationsConserved", "AccountsMatch", "WithinCapacity", "KnowledgeSound"]},
+    {"config": "M1b-safety-capacity.cfg", "expect": "pass", "invariants": ["TypeOK", "OneAdmissionPerExchange", "AtomicObligations", "DecisionExclusive", "RefusalNeverExecutes", "AckedIsAdmitted", "RefusedIsNotAdmitted", "NoExecutionInClosedEpoch", "NoStaleTarget", "ObligationsConserved", "AccountsMatch", "WithinCapacity", "KnowledgeSound"]},
+    {"config": "M1b-reach-replay-while-unknown.cfg", "expect": "violation", "invariant": "NoReplayWhileUnknown"},
+    {"config": "M1b-reach-commit-before-fence.cfg", "expect": "violation", "invariant": "NoCommitBeforeFence"},
+    {"config": "M1b-reach-fence-before-command.cfg", "expect": "violation", "invariant": "NoFenceBeforeCommand"},
+    {"config": "M1b-reach-capacity-refusal.cfg", "expect": "violation", "invariant": "NoCapacityRefusal"},
+    {"config": "M1b-reach-stale-target-refusal.cfg", "expect": "violation", "invariant": "NoStaleTargetRefusal"},
+    {"config": "M1b-reach-epoch-closed-refusal.cfg", "expect": "violation", "invariant": "NoEpochClosedRefusal"},
+    {"config": "M1b-reach-second-exchange.cfg", "expect": "violation", "invariant": "NoSecondExchange"},
+    {"config": "M1b-mut-fence-on-stale-read.cfg", "expect": "violation", "invariant": "DecisionExclusive"},
+    {"config": "M1b-mut-old-epoch-executes.cfg", "expect": "violation", "invariant": "NoExecutionInClosedEpoch"},
+    {"config": "M1b-mut-stale-target.cfg", "expect": "violation", "invariant": "NoStaleTarget"},
+    {"config": "M1b-mut-refusal-not-durable.cfg", "expect": "violation", "invariant": "RefusalNeverExecutes"},
+    {"config": "M1b-mut-source-reset-drops.cfg", "expect": "violation", "invariant": "ObligationsConserved"},
+    {"config": "M1b-mut-reset-keeps-attachment.cfg", "expect": "violation", "invariant": "AckedIsAdmitted"},
+    {"config": "M1b-mut-replay-readmits.cfg", "expect": "violation", "invariant": "RefusedIsNotAdmitted"}
+  ]
+}
