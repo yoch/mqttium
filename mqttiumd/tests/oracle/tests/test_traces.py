@@ -57,6 +57,7 @@ class Traces(unittest.TestCase):
                         "broker_inputs_have_provenance",
                         "one_grant_per_opened_epoch",
                         "scenario_reaches_its_end",
+                        "broker_killed_for_real",
                     },
                 )
 

@@ -1209,6 +1209,87 @@ def terminal_knowledge_never_regresses(run):
     return Status(FAIL if reasons else PASS, reasons)
 
 
+# The origins that run in the child process of a broker (record 0019). The
+# evidence of the store outlives the broker and is not one of them.
+CHILD = frozenset(
+    {"broker-core", "transport", "timer", "store-adapter", "dispatcher", "fault-injector"}
+)
+
+
+def broker_killed_for_real(run):
+    """A run that claims its broker runs as a child process shows its kill (record 0019).
+
+    Every BrokerCrashed follows a BrokerKilled of that crash with the
+    status of signal 9, and no record of the killed incarnation of the
+    child comes after the kill. A missing kill is missing evidence. A run
+    in-process has nothing to show, and records no kill.
+    """
+    trace = run.trace
+    kills = trace.of_kind("BrokerKilled")
+    if trace.broker != "child-process":
+        if kills:
+            return Status(
+                FAIL,
+                [
+                    f"record {record.sequence}: a kill recorded by a run whose broker "
+                    "runs in the process of the bench"
+                    for record in kills
+                ],
+            )
+        return Status(PASS)
+    statuses, reasons = [], []
+    supervisor = sorted(
+        (
+            record
+            for record in trace.records
+            if record.origin[0] == "bench-supervisor"
+            and record.kind in ("BrokerKilled", "BrokerCrashed")
+        ),
+        key=lambda record: (record.origin[1], record.origin_sequence),
+    )
+    pending = None
+    for record in supervisor:
+        if record.kind == "BrokerKilled":
+            pending = record
+        elif pending is None:
+            statuses.append(INCONCLUSIVE)
+            reasons.append(
+                f"record {record.sequence}: a crash of a broker run as a child process "
+                "follows no recorded kill"
+            )
+        else:
+            pending = None
+    child = [record for record in trace.records if record.origin[0] in CHILD]
+    for kill in kills:
+        signal = kill.payload["wait_status"]["signal"]
+        if signal != 9:
+            statuses.append(FAIL)
+            reasons.append(
+                f"record {kill.sequence}: the child ended by signal {signal}, not by SIGKILL (9)"
+            )
+        killed = [record.origin[1] for record in child if trace.before(record, kill)]
+        if not killed:
+            continue
+        incarnation = max(killed)
+        for record in child:
+            if record.origin[1] > incarnation:
+                continue
+            order = trace.before(kill, record)
+            if order:
+                statuses.append(FAIL)
+                reasons.append(
+                    f"record {record.sequence} ({record.kind}) of the killed incarnation "
+                    f"{incarnation} comes after the kill of record {kill.sequence}"
+                )
+            elif order is None and not trace.before(record, kill):
+                statuses.append(INCONCLUSIVE)
+                reasons.append(
+                    f"record {record.sequence} ({record.kind}) of the killed incarnation "
+                    f"{incarnation} is not ordered with the kill of record {kill.sequence}"
+                )
+    return Status(_worst(statuses), reasons)
+
+
 def one_grant_per_opened_epoch(run):
     """At most one creation authority per opened epoch (DEM-012, record 0011).
 
@@ -1268,6 +1349,7 @@ ASSERTIONS = {
     "one_grant_per_opened_epoch": one_grant_per_opened_epoch,
     "terminal_knowledge_never_regresses": terminal_knowledge_never_regresses,
     "scenario_reaches_its_end": scenario_reaches_its_end,
+    "broker_killed_for_real": broker_killed_for_real,
     "all_required_faults_hit": all_required_faults_hit,
     "trace_complete": trace_complete,
 }

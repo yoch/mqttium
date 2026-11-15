@@ -78,6 +78,15 @@ refused input, the rejection a refusing PUBREC answers, the committed
 reply a grant follows. Those that ask only what came first read `before`:
 the closure before a refusal, the commit before an inspection, the crash
 before an observed PUBREC, a resolution after a terminal result.
+`broker_killed_for_real` (record 0019), owed by every run, reads the
+claim of the trace header. A run in-process has nothing to show, and a
+kill it records fails. A run whose broker is a child process shows, for
+each crash, a `BrokerKilled` before it and after the previous crash
+(missing: inconclusive), with the status of signal 9 (another: FAIL), and
+no record of an origin of the child (the core, the transport, the timer,
+the store adapter, the dispatcher, the fault injector; not the evidence
+of the store, which outlives the broker) of the killed incarnation after
+the kill (FAIL; unordered with it: inconclusive).
 `terminal_knowledge_never_regresses` counts as a reaction to a late
 unknown answer only a record of the product that names it among its
 parents: an inspection, a crash or a packet the bench orders after it is
@@ -232,7 +241,9 @@ the oracle that runs, read from where it runs and not from the campaign,
 is listed with its digest; every modified path the manifest records is
 kept in the campaign as the bench keeps it, a tracked one by its diff in
 `modified/tracked.patch` and an untracked one as
-`modified/untracked/<path>`; and the manifest ties the binary to its
+`modified/untracked/<path>`; the manifest and the trace header say the
+same of where the broker ran (`broker`, in-process when absent, record
+0019); and the manifest ties the binary to its
 source (`artifact.built_from`, record 0017): the campaign holds it with
 the digest and size the member names, the binary was built with its
 paths remapped (`--remap-path-prefix=<dir>=/mqttiumd-source`), and the
