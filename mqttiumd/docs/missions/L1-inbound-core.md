@@ -16,8 +16,11 @@ ACK-001; ID-001 to ID-004; IO-001 to IO-004. Decision records 0001, 0006,
 
 ## Deliverables
 
-1. **Creation authority** of record 0009, with its tests. First, as a
-   contract change.
+1. **Creation authority** of record 0009: the bounded authority, the
+   serial, uniqueness, atomic creation with its four refusals, retirement
+   with its conditions. Its interface comes first, as a contract change,
+   so that L2 and L4 build on it; then creation, retirement and their
+   tests. Issuing the authority from an opened epoch is defined with L2.
 2. **Transitions in the shape of record 0006.** A private plan, consumed
    once; owner and state revision checked before application; resources
    reserved before any mutation; an application that cannot fail for lack
@@ -46,14 +49,24 @@ ACK-001; ID-001 to ID-004; IO-001 to IO-004. Decision records 0001, 0006,
 - For every transition, a test at each boundary of capacity (effect slots,
   reservation table, work limit): the same input comes back; state,
   identity counters, accounts, held reservations and the effect box are
-  unchanged, or the mission states exactly which provisional metadata may
-  differ and why (P1-19, MU-25).
-- The five tests of the creation authority listed in record 0009.
+  unchanged (P1-19, MU-25). An explanation in a report does not relax
+  this: a transition that cannot meet it needs an explicit amendment of
+  the contract, by a decision record, before it is written.
+- The tests of the creation authority named in record 0009: the five of
+  its context, the refusals of creation at the last serial and after it,
+  no change after a refused creation, no serial used again after
+  retirement, each refusal of retirement giving the same box back, a box
+  dropped without retirement leaving its owner active.
+- Replacing the box of an owner resets none of its counters: the
+  sequences of `OperationId` and `EffectId` continue.
 - A test for a reservation table whose entries are all spent.
 - A plan cannot be applied twice, to another owner, or after the state
   moved.
 - One named test per registry rule of the two machines, by rule identifier.
-- `release_if_current` of L6 is the only code that releases a reservation.
+- The credit reservations that `release_if_current` of L6 covers are
+  released by that function and by no second variant (DEM-024). Other
+  releases, such as an effect reservation of a box, keep their own
+  primitive.
 - Control mutations seen to fail: acknowledgement before commit (MU-01),
   recipe changed under an operation (MU-03), mutation despite insufficient
   capacity (MU-25), second admission behind a new exchange (DEM-MU-04),
@@ -67,5 +80,6 @@ expiry, Will, retained messages, wildcards, shared subscriptions.
 
 ## Closes
 
-In `../reception/open-conditions.md`: the three conditions of "Effect boxes
-and transitions".
+In `../reception/open-conditions.md`: its part of "Creation authority",
+and the two other conditions of "Effect boxes and transitions". The parts
+of the authority that belong to L2, L4 and L7 stay open.

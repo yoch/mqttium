@@ -68,6 +68,11 @@
       "decision": "0008",
       "path": "docs/decisions/0008-early-writer-measurement.md",
       "sha256": "4933ed7c9f27773610f5d45f0e750516d375c61d4d8e5d5d3c3e5d321cfa31f4"
+    },
+    {
+      "decision": "0009",
+      "path": "docs/decisions/0009-owner-authority.md",
+      "sha256": "dd18779c821498d8f657be3faaf4d8ccfcd003bd01bce41fff6df64caaa80dfb"
     }
   ],
   "entries": [

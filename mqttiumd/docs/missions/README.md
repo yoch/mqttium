@@ -13,19 +13,37 @@ close.
 
 | | |
 | - | - |
-| Revision | The revision of lot L0 as received by the integration owner. At preparation: `5f9b458eb2f4cd3cf49f791b9157ab43e276f042`, plus this directory and decision record 0009, which change no code and no contract file |
-| Contract digest | `sha256:4e6cef127db777022f68c21b686b1b1ff4f2f2dfdc1526ef1e0b0b014940896b` at preparation. Accepting record 0009 adds it to the requirement register and changes this digest; the wave starts from the revision that holds that change |
-| Base branch | `main` once L0 is merged; decided by the integration owner |
+| Base branch | `main`, after PR yoch/mqttium#647 (lot L0) is merged |
+| Integrated revision | Not fixed yet. A commit cannot hold its own identifier: once L0 is merged, a change to this table alone records the revision of `main` that holds it |
+| Contract digest | `sha256:eed8c20e1587c2efc13465efc272b80b740a7634255a056ce938f7279046b93e`. It depends on the content of the contract files only, so it is exact before the merge; the record of the revision repeats what `validate` prints on it |
 
-Every lot starts from the same revision and names it, with the contract
-digest it was verified against, in its report.
+The wave starts from the commit of `main` that records the integrated
+revision. It differs from that revision by this table only. Every lot
+names the revision it started from, and the contract digest it was
+verified against, in its report.
 
 ## Before the wave starts
 
-1. Lot L0 is received.
-2. Decision record 0009 (creation authority for owners and effect boxes) is
-   decided. Several lots build on what it fixes.
-3. The integration owner chooses the base branch.
+1. Lot L0 is received and merged into `main`.
+2. Decision record 0009 (creation authority for owners and effect boxes)
+   is accepted. Done, with amendments.
+3. The integrated revision and the contract digest are recorded above.
+
+## Organisation
+
+One session and one branch per lot, and an integrator. The integrator
+writes no lot: it merges contract changes one at a time, keeps the shared
+files, and receives each lot on the revision actually proposed.
+
+Each session starts with the interface the others wait for:
+
+| Lot | First deliverable |
+| - | - |
+| L1 | The interface of `OwnerAuthority`, then creation, retirement and their tests |
+| L2 | The contract of opening an epoch: durable states and results |
+| L3 | The store snapshot and trace formats, the steps of P1-02b, the first registry rules L1 needs |
+| L5 | The extension of the TLC runner, then M1a |
+| L6 | The preflight, the credits types and the real `release_if_current` with its tests |
 
 ## Tools
 
@@ -33,7 +51,10 @@ digest it was verified against, in its report.
 pinned versions: Kani and Verus for L6, the TLC jar for L5, cargo-fuzz for
 L8, cargo-deny. A session that starts a lot runs it for the tools it needs
 and names the versions in its report. Changing a pinned version changes the
-evidence the tool produces and goes through the integration owner.
+evidence the tool produces and goes through the integration owner. The
+installer has two known defects in how it recognises a tool that is
+already present; lot L6 has them corrected when it starts (see its
+mission). No tool needed a change of network settings.
 
 ## Lots and what each owns
 
@@ -63,6 +84,7 @@ for lot L4.
 | - | - | - |
 | L1 and L6 | `release_if_current` and its types, in `credits.rs` | L6 delivers the function and its unit tests first; L1 calls it and writes no second variant (DEM-024) |
 | L1 and L2 | `Command`, `Recipe`, `StoreReply`, `Input`, `Effect`, `EffectSink` | Neither changes them alone; a change is a contract change |
+| L1 and L2 | Opening an epoch and issuing the creation authority (record 0009) | L2 owns the contract of the opening, L1 the authority; the hand-over between them is written by both and changed by neither alone |
 | L1 and L3 | The transition registry | L3 writes the rules, L1 implements them. A disagreement becomes a decision with a counterexample, never a quiet edit on either side (DEM-025) |
 | L2 and L3 | Store snapshots, trace records, injection points | L3 owns the formats; L2 produces them and asks for what it needs |
 | L5 and L1, L3 | Model actions against registry rules and scenario steps | L5 drafts the correspondence table; it is completed with L4 |
@@ -70,8 +92,9 @@ for lot L4.
 ## Contract changes
 
 A contract change is a change to a public type of `mqttiumd-contract`, a
-schema, a catalogue, the registry, the scenario or trace format, an
-injection point, or a list of `tests/boundary.rs`.
+public interface of `crates/mqttiumd-core/src/credits.rs`, a schema, a
+catalogue, the registry, the scenario or trace format, an injection point,
+or a list of `tests/boundary.rs`.
 
 1. The lot that needs it asks the owner of the file. The owner makes the
    change, on its own small branch, apart from the rest of its lot.
@@ -88,7 +111,8 @@ Contract changes already known:
 
 | Change | Needed by | Made by |
 | - | - | - |
-| Creation authority, private `Outbox` constructor (record 0009) | L1, L4 | L1, first |
+| Creation authority, private `Outbox` constructor (record 0009) | L1, L2, L4, L7 | L1, first, with L2 for the opening of an epoch |
+| Contract of opening an epoch: durable states, results, hand-over of the authority (record 0009) | L1, L4, L7 | L2, first, with L1 |
 | A refusal of `reserve` that says a table is definitively exhausted | L1 | L1 |
 | Credits types for `release_if_current` | L1, L6 | L6, first |
 | Routes and capacities among the recovered facts | L1, L2 | L1, with L2 |

@@ -31,20 +31,30 @@ allocate and does no IO.
 
 ## Deliverables
 
-1. **The function, its types and its unit tests.** First, as a contract
+In this order: the preflight, then the types and the real function with
+its tests, delivered early to L1, then the proof.
+
+0. **A preflight**, versioned in the repository and run by one command. On
+   the real production dependency (the proof crate depending on
+   `mqttiumd-core` as the workspace builds it) a true property passes and
+   a deliberately false one fails. It checks the tool that `PATH` actually
+   selects, and its version.
+1. **The function, its types and its unit tests.** Early, as a contract
    change for the types, so that L1 can call it. L1 writes no second
    variant.
 2. **A Kani harness** that calls the production body with symbolic values,
    integer limits included. Assumptions must not exclude the error paths;
    separate harnesses cover incoherent accounts and check that their branch
-   mutates nothing.
+   mutates nothing. Witnesses of non-vacuity show that each branch of the
+   table is reached under the assumptions.
 3. **Where the harness lives.** Prefer a separate crate under `proofs/`
    that depends on the core and calls the public function: the pure crates
    then need no proof attribute. If a proof tool needs an attribute, a
    macro or a dependency inside a pure crate, that is a decision that
    extends a list of the boundary (record 0007).
-4. **A Verus trial** on the same executable definition, or its documented
-   dismissal. A hand-made "equivalent" copy does not meet the requirement.
+4. **A Verus trial**, limited: on the same executable definition, or its
+   documented dismissal. A hand-made "equivalent" copy does not meet the
+   requirement. The reception of the lot rests on the Kani proof.
 5. **Mutants** of the function, each caught by the proof or by a test for
    its own reason: a guard dropped, one dimension subtracted before the
    other is checked, the generation ignored, a release repeated.
@@ -66,14 +76,29 @@ one, and a Kani harness in a separate crate verified functions of
 
 Each tool brings its own compiler: Kani a pinned nightly, Verus the
 toolchain 1.99.1. Neither builds the product, which stays on the toolchain
-of `rust-toolchain.toml`. The file of the proof records the versions used.
-A proof that was not run is not reported as run.
+of `rust-toolchain.toml`. The file of the proof records, for each run, the
+tool and its version, the compiler the tool brings, the target, the
+options and the bounds. A proof that was not run is not reported as run.
+A compilation failure or a timeout is not a detection.
+
+Two defects of `tools/install-tools.sh` are corrected when this lot
+starts, through the integration owner: `present()` ignores the exit code
+of the command it runs and accepts the pinned version as a substring of
+any output; and nothing checks that the tool found is the one `PATH`
+selects for the proof.
+
+No change of network settings is needed.
 
 ## Reception
 
 - The proof is on `release_if_current` as the product executes it, with the
   call site of L1 named. A proof of a separate demonstration function does
-  not receive the lot.
+  not receive the lot. The final reception comes after that call site
+  exists.
+- The proof runs in CI, reproducibly, on the production function: the
+  same command gives the same verdict on the proposed revision.
+- The error cases and the integer limits are among the proved cases, and
+  the witnesses of non-vacuity are reached.
 - Every row of the table above has a property that the harness checks.
 - Every mutant is caught for its own reason.
 - The report lists every assumption, bound and excluded function.

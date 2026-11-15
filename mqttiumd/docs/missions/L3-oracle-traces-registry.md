@@ -22,6 +22,10 @@ answer.
 
 ## Deliverables
 
+First: the store snapshot and trace formats, the scenario steps of
+P1-02b, and the registry rules lot L1 needs to start. The other lots wait
+for them.
+
 1. **A complete registry.** The 39 uncovered cells of
    `contracts/v1/p1.transitions.json` are written and its status becomes
    `complete`. The rules of record 0001 are included: a replayed PUBLISH
@@ -70,5 +74,15 @@ Running scenarios (L4), the packet decoder of the peer (L8).
 
 ## Closes
 
-In `../reception/open-conditions.md`: the conditions of "Before a result may
-be used as evidence", and the first two of "Scenario P1-02b".
+In `../reception/open-conditions.md`.
+
+Alone: in "Before a result may be used as evidence", the conditions whose
+only closer is L3, and the first two of "Scenario P1-02b".
+
+Its part only, of conditions shared with L4: the origin of a trace record
+(L3 defines the rule and refuses a record that breaks it in a trace; L4
+makes the collector assign the origin from the channel), and the single
+snapshot of the contracts (L3 makes the readers interpret the bytes that
+were hashed; L4 establishes the snapshot of a campaign). A shared
+condition is not removed when the part of L3 is done: its row is reduced
+to what L4 still owes.

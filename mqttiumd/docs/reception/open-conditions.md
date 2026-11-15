@@ -18,7 +18,7 @@ the assertions are true.
 | The oracle recomputes every assertion from the trace, the snapshots and the decoded packets, and a result whose statuses differ is refused | L3 | G0 |
 | The obligations of a run are derived from its exact scenario and perimeter; a run on a sub-perimeter (core without bytes) has its own declared obligations and never passes the full scenario | L3 | G0 |
 | A trace is checked as a whole: header first, gapless sequence per origin, causal parents present, footer count and completeness | L3 | G0 |
-| The collector assigns the origin of a record from its channel and refuses a record that claims another (ADR 0003) | L3, L4 | G0 |
+| The collector assigns the origin of a record from its channel and refuses a record that claims another (ADR 0003). L3: the rule, and the refusal of a trace that breaks it. L4: the collector that assigns the origin. The row stays until both parts are done | L3, L4 | G0 |
 | A PASS requires a registry whose status is `complete`; the 39 uncovered cells of `p1.transitions.json` are written by the oracle role | L3 | G0 |
 | The assertion `broker_inputs_have_provenance` and the trace records it needs join the contracts (ADR 0003) | L3 | S0, DEM-MU-03 |
 | A permanent second reader of the semantic rules exists; today only the schema level has one (`tools/check_schemas.py`) | L3 | G0 |
@@ -35,7 +35,7 @@ observed in the checkout. It does not connect the two.
 | The manifest records the effective parameters: scenario, fixture, backend, failure model, scheduler version and seed, commands | L4 | Any qualifying run |
 | For SQLite: the exact engine version and compile options, and the effective `journal_mode` and `synchronous` read back after they are set (DEM-011) | L7 | S0 on SQLite |
 | The lab binary, the oracle and the generators are identified separately in the manifest (V3-002) | L4 | G0 |
-| **One snapshot of the contracts.** The contract digest is computed from one read of the contract files and the schemas and catalogues are then read again; a file that changes in between leaves a digest that names other rules than the ones loaded. Either the bytes that are hashed are the bytes that are interpreted, or the snapshot of a campaign is established as immutable | L3, L4 | Any qualifying result |
+| **One snapshot of the contracts.** The contract digest is computed from one read of the contract files and the schemas and catalogues are then read again; a file that changes in between leaves a digest that names other rules than the ones loaded. Either the bytes that are hashed are the bytes that are interpreted, or the snapshot of a campaign is established as immutable. L3: the readers interpret the bytes they hashed. L4: the snapshot of a campaign. The row stays until both parts are done | L3, L4 | Any qualifying result |
 
 ## Scenario P1-02b (ADR 0001)
 
@@ -47,20 +47,26 @@ observed in the checkout. It does not connect the two.
 
 ## Effect boxes and transitions (ADR 0006): reception of L1
 
-Lot L1 is not received while any of these is open. The first one is decided
-before several lots start to build owners, so that they share one authority.
+Lot L1 is not received while a condition it closes is open. The creation
+authority is decided by record 0009 and split by lot: no part is closed by
+another lot's part.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| **Creation authority for effect boxes.** `Outbox` is a primitive with a precondition: one box per owner and run epoch. Two boxes with one identity accept each other's reservation keys. L1 provides the authority that creates boxes (an owner factory, an arena or a construction token that cannot be duplicated) and makes the precondition an invariant. Tests: two creations for one owner in one incarnation; destruction then recreation with an old key kept; no silent reuse of an identity; contexts that could exchange keys by accident are kept apart; explicit exhaustion of the identity domain | L1 | Reception of L1 |
+| **Creation authority, the type** (ADR 0009). `Outbox` is a primitive with a precondition: one box per owner and run epoch. Two boxes with one identity accept each other's reservation keys. L1 delivers the bounded `OwnerAuthority`, the serial, uniqueness, atomic creation with its four refusals, and retirement with its conditions; the constructor of `Outbox` becomes private. Tests: those named in the record | L1 | Reception of L1 |
+| **Creation authority, its issuance** (ADR 0009). A durable fact is not an authorisation to construct. The contract of opening an epoch and the hand-over give at most one authority per live opening: none for a duplicated reply, a replayed fact or a further recovery page, none usable for an unknown outcome | L2, with L1 | Reception of L2 |
+| **Creation authority, the real path** (ADR 0009). The trusted entry point that constructs an authority is stated; start-up is wired through it, and composition tests go through that path, not through a helper that builds an authority directly | L4 | S0 |
+| **Creation authority on SQLite** (ADR 0009). The opening of an epoch and its results realised on the SQLite store, with the same contract tests | L7 | S0 on SQLite |
 | **Exhausted reservation table.** When every entry of the table is spent, `reserve` still answers `CapacityNeed` with `ResourceReleased`, a wake-up that nothing can produce. L1 distinguishes a definitive exhaustion from a temporary lack and chooses explicitly between stopping and renewing; a test covers a table whose entries are all spent | L1 | Reception of L1 |
-| **Transition contract.** `PlanStamp` is a support for validation, not yet the private single-use plan of ADR 0006. L1 establishes: no mutation while planning; a plan consumed once; owner and revision checked before application; resources reserved before mutation; the exact behaviour of `NeedCapacity`. Reserving then releasing an entry advances its generation: L1 orders its acquisitions so that a refused transition restores what the contract requires, or defines which provisional metadata may differ | L1 | Reception of L1 |
+| **Transition contract.** `PlanStamp` is a support for validation, not yet the private single-use plan of ADR 0006. L1 establishes: no mutation while planning; a plan consumed once; owner and revision checked before application; resources reserved before mutation; the exact behaviour of `NeedCapacity`. Reserving then releasing an entry advances its generation: L1 orders its acquisitions so that a refused transition restores what the contract requires. Any provisional metadata allowed to differ needs an explicit amendment of the contract, by a decision record; a report cannot grant it | L1 | Reception of L1 |
 
 ## Pilot proof (DEM-021): reception of L6
 
 | Condition | Closed by | Blocks |
 | - | - | - |
 | The proof that is received is on `release_if_current` as the product really executes it. Tooling may be prepared in parallel; a proof of a separate demonstration function does not receive the lot | L6, with L1 | Reception of L6 |
+| The proof runs in CI, reproducibly, on the production function, after a versioned preflight in which a true property passes and a false one fails on the real production dependency | L6 | Reception of L6 |
+| `tools/install-tools.sh`: `present()` ignores the exit code of the command it runs and accepts the pinned version as a substring of any output; nothing checks that the tool found is the one `PATH` selects | L6, through the integration owner | Start of L6 |
 
 ## Process topology (ADR 0002)
 

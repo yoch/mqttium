@@ -30,8 +30,14 @@ DEM-020; V3-018; ARC-027. Decision records 0001, 0005.
    both obligations; an answer only on available knowledge; one recipe per
    identity; a fence implies no later execution; accounts match their
    objects. No fairness assumption is added to make a safety property hold.
-3. **Liveness** as a separate property with its assumptions stated: no more
-   crashes, the store available, a fair scheduler, a useful client replay.
+3. **Liveness**, as two separate properties, each with its assumptions
+   stated.
+   - After a crash and a recovery: no more crashes, the store available,
+     a fair scheduler. This one may assume that the client usefully sends
+     its PUBLISH again.
+   - On the live path of P1-02b (record 0001): the unknown outcome is
+     resolved and the exchange progresses with no new packet from the
+     client. A client retransmission is not among its assumptions.
 4. **Non-vacuity**: configurations that are expected to reach a commit, a
    lost result, an unknown outcome, a rejection, a crash after commit and a
    recovery.
@@ -53,10 +59,23 @@ DEM-020; V3-018; ARC-027. Decision records 0001, 0005.
 required. The repository already pins and hash-checks TLC in
 `tools/formal/run_tlc.py`, with sidecar files that declare the outcome each
 configuration must give (`pass` or `violation`). Use that runner and that
-sidecar format. The runner reads `formal/models/` only: the first
-deliverable of this lot is a small change that lets it read another
-directory, with the client's own tests updated. It is a change to the
-client's tools and is proposed apart from the model.
+sidecar format.
+
+The runner reads `formal/models/` only. The first deliverable of this lot
+is an option `--models-dir` that selects another directory and keeps
+`formal/models/` as the default. It is a change to the client's tools and
+is proposed apart from the model. It is received when:
+
+- the client's models run unchanged, with the same outcomes, when the
+  option is absent;
+- the option selects the models of `mqttiumd/models/` and no other;
+- a directory that does not exist, and a selection that holds no model,
+  are refused;
+- a configuration declared as a violation fails for the exact invariant
+  its sidecar names, not for any failure;
+- a campaign that ran no configuration is not a success.
+
+M1a comes after that.
 
 ## Reception
 
