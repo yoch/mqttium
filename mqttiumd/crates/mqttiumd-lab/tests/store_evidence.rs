@@ -19,7 +19,7 @@ use mqttiumd_lab::store::adapter::{
 use mqttiumd_lab::store::conformance::{World, altered, fixture_limits, operation_id};
 use mqttiumd_lab::store::durable::{AdminCommand, DurableStore, Limits, MemoryStore};
 use mqttiumd_lab::store::evidence::{
-    SnapshotContext, TraceWriter, recovered_fact, snapshot, store_outcome,
+    Cause, CauseRefused, SnapshotContext, TraceWriter, recovered_fact, snapshot, store_outcome,
 };
 use mqttiumd_lab::workspace::Workspace;
 
@@ -662,4 +662,87 @@ fn an_opening_is_written_as_submitted_then_opened_once() {
         event,
         StoreEvent::ResultReady { .. } | StoreEvent::ResultDelivered { .. }
     )));
+}
+
+/// A submission takes its causal parents from the caller, who knows the
+/// record of the core that consumed the input the effect comes from: the
+/// writer never guesses them. Causes are given for a submission only.
+#[test]
+fn a_submission_has_the_causes_the_caller_gives() {
+    let mut bench = adapter_bench();
+    let command = bench.admission(1, 7, b"payload", &[bench.b]);
+    let admitted = submit(&mut bench, 1, Effect::Persist { command });
+    let absent = operation_id(bench.epoch, 9);
+    let fenced = resolve(&mut bench, 2, absent);
+    let mut opening = bench.store.begin_opening(startup_nonce(7, 1));
+    let open = opening
+        .submit(bench.store.store().ledger().last_opened())
+        .expect("an attempt");
+    bench.store.submit_opening(open).expect("room");
+    perform(&mut bench, StoreAction::EnterWriter(admitted));
+    let _ = fenced;
+    let events = bench.store.take_events();
+
+    let packet = Cause {
+        component: "broker-core",
+        incarnation: 1,
+        sequence: 4,
+    };
+    let deadline = Cause {
+        component: "broker-core",
+        incarnation: 1,
+        sequence: 9,
+    };
+    let names: [&str; 0] = [];
+    let mut writer = TraceWriter::new("caused", 1, 1, &names);
+    let workspace = workspace();
+    let mut written = Vec::new();
+    for event in &events {
+        let causes: &[Cause] = match event {
+            StoreEvent::CommandSubmitted {
+                kind: WorkKind::AdmitPublication,
+                ..
+            } => &[packet],
+            StoreEvent::CommandSubmitted {
+                kind: WorkKind::ResolveAndFence,
+                ..
+            } => &[deadline],
+            StoreEvent::CommandSubmitted { .. } => &[],
+            _ => {
+                assert_eq!(
+                    writer.write_caused(event, &[packet]),
+                    Err(CauseRefused::NotASubmission),
+                    "{event:?}"
+                );
+                continue;
+            }
+        };
+        let record = writer
+            .write_caused(event, causes)
+            .expect("a submission")
+            .expect("a record");
+        accepted(&workspace, &record);
+        written.push(record);
+    }
+    let parent = |cause: Cause| {
+        serde_json::json!([{
+            "origin_component": cause.component,
+            "origin_incarnation": cause.incarnation.to_string(),
+            "origin_sequence": cause.sequence.to_string(),
+        }])
+    };
+    let kinds: Vec<_> = written
+        .iter()
+        .map(|record| record["kind"].clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["CommandSubmitted", "ResolveSubmitted", "OpeningSubmitted"]
+    );
+    assert_eq!(written[0]["causal_parents"], parent(packet));
+    assert_eq!(written[1]["causal_parents"], parent(deadline));
+    assert_eq!(written[2]["causal_parents"], serde_json::json!([]));
+    // Without causes, `write` writes no parent: nothing is guessed.
+    let plain = TraceWriter::new("plain", 1, 1, &names).write(&events[..1]);
+    assert_eq!(plain.records[0]["causal_parents"], serde_json::json!([]));
 }

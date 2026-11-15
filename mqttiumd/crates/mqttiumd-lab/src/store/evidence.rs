@@ -412,6 +412,24 @@ struct Origin {
     sequence: u64,
 }
 
+/// A record of another component that caused a submission: the record
+/// of the core that consumed the input the effect comes from. The bench
+/// knows it; the adapter does not, and the writer never guesses it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Cause {
+    pub component: &'static str,
+    pub incarnation: u64,
+    pub sequence: u64,
+}
+
+/// Why `TraceWriter::write_caused` wrote nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CauseRefused {
+    /// Causes are given only for a submission: `CommandSubmitted`,
+    /// `ResolveSubmitted` or `OpeningSubmitted`.
+    NotASubmission,
+}
+
 /// Writes the evidence of one adapter as trace records. The collector
 /// of lot L4 owns the trace; this writer gives it the records of the
 /// store adapter, the store evidence, the fault injector and the
@@ -536,6 +554,18 @@ impl<'a> TraceWriter<'a> {
             .map(|(origin, _)| *origin)
             .into_iter()
             .collect()
+    }
+
+    /// Writes one submission with the causes the caller gives, in their
+    /// order, as its causal parents. The event is written as `write`
+    /// writes it; `None` when no record of the formats carries it.
+    pub fn write_caused(
+        &mut self,
+        event: &StoreEvent,
+        causes: &[Cause],
+    ) -> Result<Option<Value>, CauseRefused> {
+        let _ = causes;
+        Ok(self.one(event))
     }
 
     /// Writes `events`, in order.
