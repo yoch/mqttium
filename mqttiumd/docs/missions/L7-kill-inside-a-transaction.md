@@ -1,7 +1,11 @@
-# Plan — a kill inside a transaction of the SQLite store
+# Transaction crash validation of the SQLite store
 
-Lot L7, the increment after the first real crash. A plan: nothing here is
-implemented. Read `L7-sqlite-store.md` ("Later"), `L4-process-topology.md`
+Lot L7 with L4 and L3, the increment after the first real crash. The store
+points, multiprocess comparisons, command-in-flight protocol and scenarios
+are implemented. Reception is recorded in
+`../reports/0004-transactional-crash-reception.md`; the finite K2a exploration
+has its own `../reports/0005-k2a-sampled-process-kills.md`. Read
+`L7-sqlite-store.md` ("Later"), `L4-process-topology.md`
 (the allowed states of a kill) and the open condition of model M1 in
 `docs/reception/open-conditions.md`.
 
@@ -24,31 +28,39 @@ the guards and writes of the command, the meta row one revision later,
 | Point | Where | Owner | Deterministic |
 | - | - | - | - |
 | K1 `store.commit.prepared` | in `transact`, after the meta row is written, before `tx.commit()` | store (L7) | yes |
-| K2a during `COMMIT`, before its commit frame is durable | inside the engine | nobody: no safe hook | no: random kills, and a WAL-cut emulation |
-| K2b `store.commit.logged` | the engine's WAL hook: the commit frame is written and synced, `COMMIT` has not returned | store (L7) | yes, with a cost below |
+| K2a variable-delay process kills | command released; its position within the store/engine is generally unknown | exploratory tool | no: sampled delays do not locate a kill inside `COMMIT` |
+| K2b `store.commit.logged` | the WAL hook after commit and release of SQLite's write lock; `COMMIT` has not returned to the adapter | store (L7) | yes, with a cost below |
 | K3 `store.commit.applied` | the existing barrier of the adapter: `COMMIT` returned, no result exists | adapter (L2), exists | yes |
 
 Out of the production binary. K1 and K2b live behind a cargo feature
 `kill-points` of `mqttiumd-store-sqlite`, off by default, enabled only by
 the child build of the bench. The hook is a plain callback set on the
-store (`fn(KillPoint)`), compiled out without the feature; no `unsafe`:
+store (`Box<dyn FnMut(KillPoint) + Send>`), compiled out without the feature; no `unsafe`:
 K2b uses rusqlite's safe `Connection::wal_hook` (feature `hooks`). The
-store records `kill_points: bool` in its effective settings, so the
-campaign manifest shows which build ran; a check fails a build of the
+store records `kill_points: bool` in its effective settings. The campaign
+records `build_features` and `backend_settings.kill_points`; the manifest's
+reconstruction command includes the same feature option. The lab rejects
+dependency feature unification that instruments the store without enabling
+its own forwarding feature, before any campaign write. A check fails a build of the
 product in which the feature is on (`cargo tree -e features`).
 
 Cost of K2b. A WAL hook replaces the engine's autocheckpoint
-(`sqlite3_wal_autocheckpoint` is itself a WAL hook). A run armed at K2b
-has no automatic checkpoint, and says so; the checkpoint inside `COMMIT`
-is covered by K2a, not by K2b.
+(`sqlite3_wal_autocheckpoint` is itself a WAL hook). A run armed at K1 or
+K2b disables autocheckpoint, reads back zero, then installs its hook last.
+Removing the hook restores the saved threshold. The settings at the actual
+point are recorded. Tests observe callbacks and their replacement by a later
+autocheckpoint setting. K2a uses the normal callback with threshold 16; its
+position inside `COMMIT` is not established by the sampled delays.
 
 ## What the child writes before the kill
 
 A kill is allowed only at a declared point after the decisive record is
-acknowledged (L4). At K1, K2b and K3 the child writes `FaultHit` with the
+acknowledged (L4). At K1 and K2b the callback emits `FaultHit` with the
 point, the command, its operation and the occurrence, waits for the
-collector's acknowledgement, then parks inside the hook; the supervisor
-kills it there. At K1 the child holds the open transaction; at K2b the
+surviving collector's acknowledgement, then reports `Parked` and blocks
+inside the hook. K3 is the adapter's existing halted barrier after
+`StoreCommitStable`, with no result yet; that action can finish and drain.
+The supervisor kills at each boundary. At K1 the child holds the open transaction; at K2b the
 engine has already released its write lock (the WAL hook runs after
 it), and the child holds only the writer's lock of the store. At K2a
 there is no point: before each command the child writes
@@ -80,12 +92,14 @@ one publication.
   whole `DurableState`, so a mix of two states fails.
 - K1, K2b, K3: one scenario each, judged PASS by the oracle, `recompute`
   standing, the kill witnessed as in the first crash.
-- K2a: N = 1000 kills at a uniform random delay within a step, on a loop
-  of admissions and releases, `wal_autocheckpoint` lowered to 16 pages so
-  that a checkpoint runs inside most commits. The run counts only if at
-  least 100 kills recovered the command in flight and 100 did not: a
-  sweep that never cut a commit shows nothing. The report gives the
-  counts, the seed and the delays.
+- K2a: 64 bounded calibration trials followed by one frozen campaign of
+  1000 kills, alternating an admission and a release after committed
+  prefixes; `wal_autocheckpoint` is 16 pages. Its normal callback is
+  separately observed to checkpoint a multirow admission. The report gives
+  every requested delay, seed, signal/wait, last observation and full-state
+  outcome. At least 100 found and 100 absent results measure diversity;
+  neither quota establishes interruption inside `COMMIT`. Trials with an
+  already observed return are counted separately.
 - What N does not prove: a cut that was not drawn. 1000 draws without a
   mixed state is evidence, not a proof of atomicity; the report says so.
   It is complemented, inside the store, by a WAL-cut emulation: the WAL
@@ -105,11 +119,12 @@ one publication.
   a scenario: it is a campaign of its own, written by a tool, whose
   report is not an oracle verdict.
 
-## What it discharges, and what stays out
+## What it supports, and what stays out
 
-It discharges, for a process killed at any instant, the assumption of M1
-that `ApplyCommit` is atomic, with the force stated above: deterministic
-at K1, K2b and K3, sampled at K2a. Outside its perimeter, unchanged: fsync
+The tests support the concrete implementation of M1's atomic `Commit`
+(called `ApplyCommit` in the M1a comment): deterministic boundaries at
+K1, K2b and K3, sampled execution timings at K2a. A finite campaign is not
+a proof for every instant and every failure. Outside its perimeter: fsync
 and a power loss (the page cache survives a process kill), torn writes on
 the medium, a crash of the kernel, a network file system, and another
 program writing the file while ignoring the writer's lock.

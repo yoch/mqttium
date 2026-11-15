@@ -61,11 +61,11 @@ measurement of its writer.
 
 ## Later
 
-- A kill in the middle of a transaction. SQLite in WAL is atomic against
-  a process killed at any instant; S0 kills only at declared points, a
-  restriction of the bench for deterministic runs. That test is what
-  discharges the assumption of model M1 that `ApplyCommit` is atomic
-  (open condition, lot L7). Not before the bench's real kill exists.
+- Transaction crash validation is implemented in the next increment:
+  `L7-kill-inside-a-transaction.md`. K1/K2b/K3 are deterministic process
+  boundaries; K2a samples timings, and WAL prefixes are separate artificial
+  images. Their finite evidence supports M1's atomic `Commit` assumption
+  without proving it for every instant, kernel failure or storage device.
 
 ## Paths
 

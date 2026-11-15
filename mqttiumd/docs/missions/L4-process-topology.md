@@ -127,12 +127,20 @@ the supervisor takes it with `accept`, checks the origin against the
 socket and the sequence against the origin, and numbers it in the
 trace. At the end of each action the child waits until every frame is
 acknowledged before it reads the next action, so that between two
-actions it is drained. "Acknowledged" means received by the supervisor:
-it acknowledges a frame as soon as it reads it, and keeps the frames of
-an action in the trace when the action ends, in emission order. A kill
-is allowed only after that, and `Child::kill` checks it: the last action
-ended, the sequencer is empty and nothing waits unread on a descriptor,
-or the run stops. Every read of the supervisor has a deadline (30
+actions it is drained. "Acknowledged" means accepted in emission order by
+the surviving collector, including its origin and local-sequence checks.
+The sequencer releases contiguous prefixes while an action is still in
+flight; their records are retained before the acknowledgement is sent.
+The evidence window is 64, the shared receive queue is bounded to 512
+frames, and an action accepts at most 64 control reports.
+
+With `--features kill-points`, the SQLite callback can emit its staged
+`FaultHit` at K1/K2b, wait for its acknowledgement, then send `Parked`
+(wire tag 11). It names the last emission, fault and point, and the
+effective settings. The callback still owns the open SQLite call. Only
+SIGKILL may follow; the supervisor does not wait for that call to return.
+`Child::kill` requires either a completed action or this explicitly parked
+state, an empty sequencer and no unread frame. Every read of the supervisor has a deadline (30
 seconds): a child that writes nothing stops the run. The settings the
 child's engine read back are compared by the supervisor to those the
 manifest records. The child computes its settings and its faults from
@@ -140,8 +148,8 @@ the campaign directory, the sessions and the faults still armed that the
 supervisor passes on its command line.
 
 `CrashBroker` in a child is a real kill. The child is drained between two
-actions, so the kill happens at the point its last decisive record
-describes, after that record is acknowledged. The supervisor sends
+actions or parked in flight after its decisive record was retained and
+acknowledged. The supervisor sends
 `SIGKILL` to the process identifier `spawn` gave
 (`std::process::Child::kill`), waits for the wait status and accepts only
 the end by signal 9 with no exit code, reads the descriptors of the child
@@ -188,7 +196,7 @@ the order of arrival between two origins is not a causality. A peer sees
 bytes only; it never names an internal record of the child, and what it
 observed it names through its own `PeerPacketObserved`. The header and
 the footer name nothing. The collector adds these parents; the in-process
-runner writes them today, the child protocol will keep them.
+runner and the child protocol keep them.
 
 ## Failure model
 
@@ -199,10 +207,11 @@ and in `failure_model`:
 > acknowledged. The kernel and its page cache survive; nothing is shown
 > about fsync, power loss or torn writes.
 
-A kill of the process does not exercise `fsync`: what the process wrote
-is in the page cache, which survives it. "Never inside a transaction" is
-a restriction of the bench (a kill is allowed only in the states below),
-not a property of the store.
+A kill of the process does not test persistence after loss of the page
+cache, which survives it. The transaction may be open at K1, committed
+inside the WAL callback at K2b, or returned without an adapter result at
+K3. The system witness of a run belongs only to that execution, even when
+another run has an equal application trace.
 
 | Backend | Crash |
 | - | - |

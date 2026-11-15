@@ -375,8 +375,16 @@ not properties of the core. They are raised as an open condition.
 - In M1a `RejectCommand` stands for every refusal of the store; M1b
   details the refusals for capacity, stale source, stale target and
   closed epoch.
-- The atomicity of `ApplyCommand` is an assumption. The SQLite tests must
-  discharge it.
+- The atomic `Commit(o, r)` update used by `ApplyCommand` is an assumption
+  (`ApplyCommit` in the M1a comment). The SQLite implementation maps it to
+  one `BEGIN IMMEDIATE` transaction through guards, all durable writes and
+  the meta revision, followed by `COMMIT`. Full-state reference tests at
+  K1/K2b/K3, sampled K2a process kills and separate artificial WAL-prefix
+  images support that implementation. A finite test family does not prove
+  atomicity for every instant or failure; the kernel/page cache survive
+  process kills, and storage, power-loss and torn-write assumptions remain.
+  See `../../docs/reports/0004-transactional-crash-reception.md` and the
+  distinct K2a report `0005-k2a-sampled-process-kills.md` in that directory.
 - PUBREL and PUBCOMP belong to M2. M1a does not cover the whole S0 path.
 - The refusal sent to the peer (`NACK`) is abstract: the model does not
   choose its reason code.
