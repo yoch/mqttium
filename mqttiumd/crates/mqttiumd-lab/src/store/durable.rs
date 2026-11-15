@@ -25,7 +25,7 @@ use mqttiumd_contract::ids::{
 };
 use mqttiumd_contract::outcome::{
     CommitFacts, EpochOpened, Knowledge, OpeningOutcome, OpeningRejection, RejectReason,
-    StoreOutcome, StoreReply,
+    StoreOutcome, StoreReply, StoreViolation,
 };
 use mqttiumd_contract::packet::{Qos, SharedBytes};
 
@@ -346,7 +346,6 @@ impl MemoryStore {
         true
     }
 
-    #[expect(dead_code, reason = "used once the rules are written")]
     /// Commits a receipt that records a certain rejection, so that the
     /// operation stays rejected whatever changes later.
     fn commit_rejection(
@@ -377,7 +376,7 @@ impl MemoryStore {
 enum Established {
     Outcome(StoreOutcome),
     /// Nothing is recorded, in a space that may still execute.
-    Absent(#[expect(dead_code, reason = "used once the rules are written")] EpochPhase),
+    Absent(EpochPhase),
 }
 
 impl DurableState {
@@ -849,32 +848,96 @@ impl DurableStore for MemoryStore {
         }
     }
 
-    /// Skeleton: runs the command on the committed state, with no
-    /// staging, no receipt and no recognition of a repetition.
     fn apply(&mut self, command: &Command) -> Applied {
-        let facts = match command.recipe.get() {
-            Recipe::AdmitPublication(admit) => self
-                .committed
-                .stage_admission(admit, command.payload.as_ref()),
-            Recipe::ReleaseInbound(release) => self.committed.stage_release(release),
+        let settled = |outcome| Applied {
+            reply: StoreReply::Outcome(outcome),
+            committed_now: false,
+        };
+        let recipe = command.recipe.get();
+        let operation = recipe.operation();
+        let mut canonical = Vec::new();
+        if recipe.encode_canonical(&mut canonical).is_err() {
+            // A frozen recipe is well formed; one that is not never ran.
+            return settled(StoreOutcome::RejectedCertain(
+                RejectReason::PreconditionFailed,
+            ));
+        }
+
+        // 1. Recognise an operation that was already decided.
+        if let Some(record) = self.committed.operations.get(&operation) {
+            let same_payload = match (recipe, &command.payload, record.decision) {
+                (Recipe::AdmitPublication(admit), Some(bytes), Decision::Committed(_)) => self
+                    .committed
+                    .payloads
+                    .get(&admit.payload.id)
+                    .is_none_or(|stored| stored.bytes == bytes.as_slice()),
+                _ => true,
+            };
+            if record.recipe != canonical || !same_payload {
+                return Applied {
+                    reply: StoreReply::Violation(StoreViolation::RecipeMismatch),
+                    committed_now: false,
+                };
+            }
+        }
+        let phase = match self.committed.established(operation) {
+            Established::Outcome(outcome) => return settled(outcome),
+            Established::Absent(phase) => phase,
+        };
+        if phase != EpochPhase::Open {
+            // Its epoch is not open yet. It must not become executable
+            // when that epoch opens: the rejection is recorded.
+            return settled(self.commit_rejection(
+                operation,
+                canonical,
+                RejectReason::PreconditionFailed,
+            ));
+        }
+
+        // 2 to 5. Guards, capacities and every row, on a staged copy.
+        let mut staged = self.committed.clone();
+        let facts = match recipe {
+            Recipe::AdmitPublication(admit) => {
+                staged.stage_admission(admit, command.payload.as_ref())
+            }
+            Recipe::ReleaseInbound(release) => staged.stage_release(release),
         };
         match facts {
-            Ok(facts) => Applied {
-                reply: StoreReply::Outcome(StoreOutcome::Committed(facts)),
-                committed_now: true,
-            },
-            Err(reason) => Applied {
-                reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(reason)),
-                committed_now: false,
-            },
+            Ok(facts) => {
+                staged.operations.insert(
+                    operation,
+                    OperationRecord {
+                        recipe: canonical,
+                        decision: Decision::Committed(facts),
+                    },
+                );
+                if self.commit(staged) {
+                    Applied {
+                        reply: StoreReply::Outcome(StoreOutcome::Committed(facts)),
+                        committed_now: true,
+                    }
+                } else {
+                    settled(StoreOutcome::PendingOrUnknown)
+                }
+            }
+            // The staged copy, with whatever rows it already held, is
+            // dropped here.
+            Err(reason) => settled(self.commit_rejection(operation, canonical, reason)),
         }
     }
 
-    /// Skeleton: reads, and calls an absence a rejection.
     fn resolve_and_fence(&mut self, operation: OperationId) -> StoreOutcome {
         match self.committed.established(operation) {
             Established::Outcome(outcome) => outcome,
-            Established::Absent(_) => StoreOutcome::RejectedCertain(RejectReason::Fenced),
+            Established::Absent(_) => {
+                let mut staged = self.committed.clone();
+                staged.fences.insert(operation);
+                if self.commit(staged) {
+                    StoreOutcome::RejectedCertain(RejectReason::Fenced)
+                } else {
+                    StoreOutcome::PendingOrUnknown
+                }
+            }
         }
     }
 

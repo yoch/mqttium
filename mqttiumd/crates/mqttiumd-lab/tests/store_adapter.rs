@@ -342,6 +342,18 @@ fn a_dropped_result_never_reaches_the_core_and_the_commit_is_reconciled() {
     );
     assert!(bench.store.eligible().is_empty(), "nothing to deliver");
     assert_eq!(bench.store.store().snapshot().publications.len(), 1);
+    // Nothing answers the lost result's effect any more.
+    let WorkId::Effect(lost) = id else {
+        panic!("an effect");
+    };
+    assert_eq!(
+        bench.store.present_result(
+            lost,
+            operation,
+            StoreReply::Outcome(StoreOutcome::PendingOrUnknown)
+        ),
+        Performed::Uncorrelated
+    );
 
     // The owner reconciles by `ResolveAndFence`, under a new effect.
     let resolve = effect_id(&bench, 2);

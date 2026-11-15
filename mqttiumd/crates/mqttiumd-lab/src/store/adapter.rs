@@ -288,7 +288,6 @@ struct Ready {
     delayed: bool,
 }
 
-#[expect(dead_code, reason = "used once the rules are written")]
 struct ArmedFault {
     spec: FaultSpec,
     seen: u64,
@@ -440,9 +439,33 @@ impl<S: DurableStore> SimStore<S> {
         operation: Option<OperationId>,
         source: Source,
     ) -> Option<FaultAction> {
-        // Skeleton: no fault is ever reached.
-        let _ = (point, id, kind, operation, source);
-        None
+        let mut reached = None;
+        for index in 0..self.faults.len() {
+            let armed = &mut self.faults[index];
+            let spec = armed.spec;
+            let matches = spec.point == point
+                && spec.kind.is_none_or(|wanted| wanted == kind)
+                && spec.source.is_none_or(|wanted| Some(wanted) == source);
+            if !matches {
+                continue;
+            }
+            let Some(seen) = armed.seen.checked_add(1) else {
+                continue;
+            };
+            armed.seen = seen;
+            if seen == spec.occurrence && reached.is_none() {
+                armed.hits = armed.hits.saturating_add(1);
+                reached = Some(spec.action);
+                self.record(StoreEvent::FaultHit {
+                    fault: FaultId(index),
+                    point,
+                    action: spec.action,
+                    id,
+                    operation,
+                });
+            }
+        }
+        reached
     }
 
     fn room(&self) -> Result<(), SubmitBlock> {
@@ -661,7 +684,7 @@ impl<S: DurableStore> SimStore<S> {
             (WorkId::Effect(_), Answer::Opening(_))
             | (WorkId::Opening(_), Answer::Operation { .. }) => None,
         };
-        let (Some(delivery), true) = (delivery, true) else {
+        let (Some(delivery), true) = (delivery, self.awaited.get(&id) == Some(&operation)) else {
             self.record(StoreEvent::UncorrelatedResult { id, operation });
             return Performed::Uncorrelated;
         };
