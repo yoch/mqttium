@@ -4,9 +4,10 @@
 #
 #   tools/run_loop_mutants.sh
 #
-# Each patch of tests/mutants/loop/ is applied to a temporary worktree of
-# the repository, never to the current tree, and built with a build
-# directory of its own. The runner of the mutated tree plays the scenario
+# Each mutation of tests/mutants/loop/ is a unified diff named *.mutant
+# (the root .gitignore ignores *.patch and *.diff as review artefacts). It
+# is applied to a temporary worktree of the repository, never to the
+# current tree, and built with a build directory of its own. The runner of the mutated tree plays the scenario
 # of the entry; the oracle of the current, unmodified tree judges it.
 #
 # The exit status is not zero when a patch no longer applies, when a

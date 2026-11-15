@@ -5,7 +5,7 @@
   "mutants": [
     {
       "id": "m1-payload-owed-lost",
-      "patch": "m1-payload-owed-lost.patch",
+      "patch": "m1-payload-owed-lost.mutant",
       "mutation": "the store loses the payload its obligations still owe when the exchange is released",
       "scenario": "tests/scenarios/p1/P1-02.json",
       "expect": "rejected",
@@ -15,7 +15,7 @@
     },
     {
       "id": "m2-result-altered-before-the-core",
-      "patch": "m2-result-altered-before-the-core.patch",
+      "patch": "m2-result-altered-before-the-core.mutant",
       "mutation": "the dispatcher hands the core a certain rejection for lack of capacity where the store rejected for a fence",
       "scenario": "tests/scenarios/qabs/QABS-B.json",
       "expect": "survives-known",
@@ -25,7 +25,7 @@
     },
     {
       "id": "m3-positive-ack-too-early",
-      "patch": "m3-positive-ack-too-early.patch",
+      "patch": "m3-positive-ack-too-early.mutant",
       "mutation": "the core makes PUBREC Success eligible with the submission of the admission, before any commit is known",
       "scenario": "tests/scenarios/p1/P1-02.json",
       "expect": "rejected",
