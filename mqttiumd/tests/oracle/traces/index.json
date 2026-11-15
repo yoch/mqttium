@@ -15,7 +15,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The history of P1-02 the specification describes."
     },
@@ -34,7 +35,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The same history with independent records interleaved differently: also accepted."
     },
@@ -53,7 +55,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "P1-02b: an old unknown answer arrives after the commit is known, and nothing follows it."
     },
@@ -72,7 +75,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "The trace was cut: no footer. Nothing is concluded from it."
     },
@@ -91,7 +95,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "The last line was cut in the middle of a record."
     },
@@ -110,7 +115,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "A record is missing: the collector sequence and one origin sequence have a gap."
     },
@@ -129,7 +135,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "The missing record is the commit: an acknowledgement without admission is not concluded."
     },
@@ -148,7 +155,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "The missing record is the PUBLISH: an admission outside any exchange is not concluded."
     },
@@ -167,7 +175,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "The collector sequence is gapless and the footer agrees, yet one origin skips a number."
     },
@@ -186,7 +195,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "The collector sequence skips a number: a record did not reach the file."
     },
@@ -205,7 +215,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "One line is not a valid record: its sequences are in order, its payload is not of its kind."
     },
@@ -224,7 +235,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "A record names a cause that is not in the trace."
     },
@@ -243,7 +255,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "The footer counts more records than the trace holds."
     },
@@ -262,7 +275,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "The collector itself says the trace is not complete."
     },
@@ -281,7 +295,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "In a simulated run the core consumes a packet before the transport received its bytes."
     },
@@ -300,7 +315,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "A recovery page is stated by the bench: the record breaks the origin rule and the trace is unreadable."
     },
@@ -319,7 +335,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "A complete trace of P1-02b is offered for P1-02: a run is judged only against its own scenario."
     },
@@ -338,7 +355,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "DEM-MU-04: the replay is admitted again under a new ExchangeId; one client exchange has two admissions."
     },
@@ -357,7 +375,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "The trace is cut, and what it holds already shows two admissions: no missing record undoes that."
     },
@@ -376,7 +395,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The store commits an admission of Packet Identifier 7 before the client sent any PUBLISH."
     },
@@ -395,7 +415,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The client observes a positive PUBREC for an exchange the store never admitted."
     },
@@ -414,7 +435,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "DEM-MU-06: two obligations at both checkpoints, but one now targets another session."
     },
@@ -433,7 +455,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "An obligation held at the first checkpoint is absent at the second."
     },
@@ -452,7 +475,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The same two obligations at both checkpoints, and one is not towards a target of the route."
     },
@@ -471,7 +495,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The obligations keep their identities and destinations; the payload they refer to changed."
     },
@@ -490,7 +515,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "Both checkpoints agree, on nothing: the store holds no publication and no obligation."
     },
@@ -509,7 +535,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The second checkpoint holds one obligation more for the same publication: not the same obligations."
     },
@@ -528,7 +555,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The store holds no session for a target of the route: a finding, not a crash of the judge."
     },
@@ -547,7 +575,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The recipe stored for op_A has other targets at the second checkpoint."
     },
@@ -566,7 +595,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "op_A was committed before the second inspection, which holds no recipe for it."
     },
@@ -585,7 +615,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "On a backend with no total order, the trace does not say whether op_A was committed before the inspection that lost its recipe."
     },
@@ -604,7 +635,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "F2: the store lost every payload; the obligations still name a payload nobody holds."
     },
@@ -623,7 +655,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "F2: the store lost publications and payloads, and kept their obligations as orphans."
     },
@@ -642,7 +675,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "F2: the payload the store holds is not the one the client published and was acknowledged for."
     },
@@ -661,7 +695,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "F2: an obligation, the same at both checkpoints, names a publication the store does not hold."
     },
@@ -680,7 +715,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "F2: a publication, the same at both checkpoints, names a payload the store does not hold."
     },
@@ -699,7 +735,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The client's PUBLISH carries a property; the payload the store holds is still what it sent."
     },
@@ -718,7 +755,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "F2: publications and payloads are held and equal at both checkpoints, and no obligation is."
     },
@@ -737,7 +775,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "F2: the acknowledged publication carries one obligation of the two its routes require, at both checkpoints."
     },
@@ -756,7 +795,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "F2: the client was acknowledged, and the store holds no publication, payload or obligation for it."
     },
@@ -775,7 +815,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The store had committed and the core had not been told: the PUBREC is premature."
     },
@@ -794,7 +835,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "PUBCOMP is made eligible before the core received the result of the release."
     },
@@ -813,7 +855,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The result was not lost: the client observed PUBREC before the crash."
     },
@@ -832,7 +875,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The injection was reached twice; once was announced."
     },
@@ -851,7 +895,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "DEM-MU-03: after the restart the core receives a result for op_A that answers no effect of this incarnation."
     },
@@ -870,7 +915,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "DEM-MU-03: the page the core consumed holds a fact the store adapter did not read."
     },
@@ -889,7 +935,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The inventory of a recovery is cut inside its routes and inside its sessions: still one ordered inventory."
     },
@@ -908,7 +955,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "Each page is in order, and the first route of the second page sorts before the last of the first."
     },
@@ -927,7 +975,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "Each page is in order, and the limits come in a page after the routes they bound."
     },
@@ -946,7 +995,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "Each page is in order, and the second page states the route table a second time."
     },
@@ -965,7 +1015,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "Routes belong to the table that precedes them: an inventory with routes and no table is not one."
     },
@@ -984,7 +1035,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The same route, topic and target, is in two pages of one inventory."
     },
@@ -1003,7 +1055,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "A route targets a session that no fact of the inventory recovers."
     },
@@ -1022,7 +1075,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "Read in an order that is an inventory, delivered in one that is not: the core got the sessions before the epoch."
     },
@@ -1041,7 +1095,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "A page read twice by the adapter and delivered once is one inventory, not a second epoch."
     },
@@ -1060,7 +1115,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The reason a peer says it decoded is not the reason in the bytes it observed."
     },
@@ -1079,7 +1135,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The bytes a peer observed hold more than the one packet it says it decoded."
     },
@@ -1098,7 +1155,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "K1: the store produced an unknown outcome, and the core consumed a commit for it."
     },
@@ -1117,7 +1175,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "K1: the adapter handed over a refusal, and the core consumed a commit."
     },
@@ -1136,7 +1195,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "K1: the core consumed a result the store adapter never handed over."
     },
@@ -1155,7 +1215,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "K1: one result the store produced is handed over twice, and no injection duplicates it."
     },
@@ -1174,7 +1235,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "K1: the adapter handed over the commit the store produced, and the core consumed an unknown."
     },
@@ -1193,7 +1255,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "K1: the adapter hands over a result that no result of the store precedes."
     },
@@ -1212,7 +1275,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "DEM-MU-05: an unknown answer arriving after the commit makes the core resolve again."
     },
@@ -1231,7 +1295,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "DEM-MU-05: an unknown answer arriving after the commit makes the core acknowledge again."
     },
@@ -1250,7 +1315,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The bench acts after it read the late unknown answer: an order, not a regression of the product."
     },
@@ -1269,7 +1335,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "DEM-MU-05: after the commit is known, the operation is resolved again."
     },
@@ -1288,7 +1355,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "An unknown answer consumed before any terminal one may be followed: nothing regressed."
     },
@@ -1307,7 +1375,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "K1: the adapter submits a command that no record of the core causes."
     },
@@ -1326,7 +1395,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "K1: the adapter submits a resolution caused by the bench, not by the core."
     },
@@ -1345,7 +1415,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The broker runs as a child process; the supervisor kills it with SIGKILL and records the status before the crash."
     },
@@ -1364,7 +1435,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "PASS"
       },
       "why": "The run claims a child process and records no kill before its crash: the evidence is missing."
     },
@@ -1383,7 +1455,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "FAIL"
+        "broker_killed_for_real": "FAIL",
+        "durable_reads_complete": "PASS"
       },
       "why": "The run claims a kill and the status says the child ended by signal 15, not 9."
     },
@@ -1402,7 +1475,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "FAIL"
+        "broker_killed_for_real": "FAIL",
+        "durable_reads_complete": "PASS"
       },
       "why": "A run that claims no child process records a kill."
     },
@@ -1421,7 +1495,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "FAIL"
+        "broker_killed_for_real": "FAIL",
+        "durable_reads_complete": "PASS"
       },
       "why": "The evidence of the store, which runs in the child, writes for the killed incarnation after the kill."
     },
@@ -1440,7 +1515,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "FAIL"
+        "broker_killed_for_real": "FAIL",
+        "durable_reads_complete": "PASS"
       },
       "why": "A record of the killed incarnation of the child comes after the kill."
     },
@@ -1459,7 +1535,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "K2b: the commit is durable and the store wrote no StoreCommitStable before the kill; the recovery shows it, and the replay is answered from it: one admission."
     },
@@ -1478,7 +1555,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "K3: StoreCommitStable is written, the child is killed before the result; one admission."
     },
@@ -1497,7 +1575,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The recovery shows the admission, and the replay is committed a second time: two admissions."
     },
@@ -1516,7 +1595,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "In-process, no kill: a recovered commit without its StoreCommitStable is no admission."
     },
@@ -1535,7 +1615,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The store reports a violation for the release, not a commit, and the core acknowledges it."
     },
@@ -1554,7 +1635,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "FAIL",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The bench stopped: nothing was eligible and the awaited event had not happened, which refutes what the DriveUntil step asserted."
     },
@@ -1573,7 +1655,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The bench stopped because the steps ran out: nothing is established about the product."
     },
@@ -1592,7 +1675,8 @@
         "trace_complete": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "FAIL",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "The product was stuck and the trace is incomplete: the block stands, nothing else is concluded."
     },
@@ -1611,7 +1695,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "FAIL",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "One opened epoch, two grants handed over."
     },
@@ -1630,7 +1715,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "FAIL",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The opening's outcome is unknown, and a grant is handed over all the same."
     },
@@ -1649,7 +1735,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The core consumes an opening reply that answers no command the adapter submitted."
     },
@@ -1668,7 +1755,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "FAIL",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The core is told its command opened epoch 5; the store opened epoch 1 for that attempt."
     },
@@ -1687,7 +1775,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The start-up abandons its opening, then receives its committed reply; the grant follows it."
     },
@@ -1706,7 +1795,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The dispatcher refused a result that answered no effect in flight."
     },
@@ -1725,7 +1815,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The core consumes a deadline whose token no timer armed."
     },
@@ -1744,7 +1835,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The first deadline of P1-02b is delivered a second time."
     },
@@ -1763,7 +1855,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The core consumes a PUBLISH that follows no bytes of the transport."
     },
@@ -1782,7 +1875,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "One effect is answered twice."
     },
@@ -1801,7 +1895,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "A declared injection duplicates a result; the dispatcher refuses the copy, and that is the expected outcome."
     },
@@ -1820,7 +1915,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "A declared injection duplicates a result: handed over twice, the copy refused; that is expected."
     },
@@ -1839,7 +1935,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The refusal follows the injection only through the supervisor's inspection: no cause excuses it."
     },
@@ -1858,7 +1955,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "K1: the handover follows the store's result only through a record of a peer: the store did not produce it."
     },
@@ -1877,7 +1975,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "A repeated injection expected at least once is reached once."
     },
@@ -1896,7 +1995,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "A repeated injection expected at least once is reached twice: that is no shortfall."
     },
@@ -1915,7 +2015,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "A repeated injection expected at least once is never reached."
     },
@@ -1934,7 +2035,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The duplicated result is not refused: the core consumes a second answer to one effect."
     },
@@ -1953,7 +2055,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The final snapshot is not the file the trace cites: what depends on it is not concluded."
     },
@@ -1972,7 +2075,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "An identity is its named components, in whatever order a writer puts the members."
     },
@@ -1991,7 +2095,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The final snapshot is a valid snapshot of another run: it is not evidence for this one."
     },
@@ -2010,7 +2115,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The final snapshot was read from another backend than the run declares."
     },
@@ -2029,7 +2135,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The transport records bytes no peer sent, and they are not the packets the core consumed."
     },
@@ -2048,7 +2155,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The transport records other bytes than the peer sent for the packet the core consumed."
     },
@@ -2067,7 +2175,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The bytes the transport received name as their cause a record that is not a packet a peer sent."
     },
@@ -2086,7 +2195,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The peer sent a PUBLISH, the transport received it, and the core consumed a PUBREL."
     },
@@ -2105,7 +2215,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The bytes received carry another Packet Identifier than the packet the core consumed."
     },
@@ -2124,7 +2235,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The bytes received are more than the one packet the core consumed."
     },
@@ -2143,7 +2255,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The file cited for the final checkpoint is the snapshot of another checkpoint."
     },
@@ -2162,7 +2275,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The first checkpoint is inspected twice: neither inspection is the one the scenario asks for."
     },
@@ -2181,7 +2295,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "An input is refused after an injection that duplicates nothing: the refusal is not excused."
     },
@@ -2198,7 +2313,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "A run without bytes, judged against the scenario of that perimeter."
     },
@@ -2217,7 +2333,8 @@
         "trace_complete": "OUT_OF_SCOPE",
         "one_grant_per_opened_epoch": "OUT_OF_SCOPE",
         "scenario_reaches_its_end": "OUT_OF_SCOPE",
-        "broker_killed_for_real": "OUT_OF_SCOPE"
+        "broker_killed_for_real": "OUT_OF_SCOPE",
+        "durable_reads_complete": "OUT_OF_SCOPE"
       },
       "why": "A run without bytes is offered for the full scenario: it never passes it."
     },
@@ -2234,7 +2351,8 @@
         "trace_complete": "OUT_OF_SCOPE",
         "one_grant_per_opened_epoch": "OUT_OF_SCOPE",
         "scenario_reaches_its_end": "OUT_OF_SCOPE",
-        "broker_killed_for_real": "OUT_OF_SCOPE"
+        "broker_killed_for_real": "OUT_OF_SCOPE",
+        "durable_reads_complete": "OUT_OF_SCOPE"
       },
       "why": "A full run is offered for the scenario of another perimeter."
     },
@@ -2252,7 +2370,8 @@
         "no_pubrec_observed_before_crash": "OUT_OF_SCOPE",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "A scenario without bytes lists an assertion only peers can decide: it stays out of scope."
     },
@@ -2269,7 +2388,8 @@
         "trace_complete": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "Without bytes the provenance of results is still checked."
     },
@@ -2289,7 +2409,8 @@
         "broker_inputs_have_provenance": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "QABS-A: the command commits before the fence; one effect."
     },
@@ -2308,7 +2429,8 @@
         "broker_inputs_have_provenance": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "QABS-B: the fence commits first; the old command is refused."
     },
@@ -2326,7 +2448,8 @@
         "broker_inputs_have_provenance": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "QABS-C: no fence can be written; the outcome stays unknown."
     },
@@ -2345,7 +2468,8 @@
         "broker_inputs_have_provenance": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "A command is committed after the fence that made it definitively not executable."
     },
@@ -2364,7 +2488,8 @@
         "broker_inputs_have_provenance": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "No commit is in the trace, yet the store holds the operation both fenced and committed."
     },
@@ -2382,7 +2507,8 @@
         "broker_inputs_have_provenance": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "DEM-MU-01: the store answers a certain refusal though its fence was refused."
     },
@@ -2401,7 +2527,8 @@
         "broker_inputs_have_provenance": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The admission is refused because it was fenced, and the PUBREC says a quota is the cause."
     },
@@ -2420,7 +2547,8 @@
         "broker_inputs_have_provenance": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The admission is refused for lack of capacity: the PUBREC says a quota is the cause."
     },
@@ -2439,7 +2567,8 @@
         "broker_inputs_have_provenance": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The admission is refused for lack of capacity, and the PUBREC hides that a quota is the cause."
     },
@@ -2458,7 +2587,8 @@
         "broker_inputs_have_provenance": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The PUBREC refuses before the core received any certain rejection."
     },
@@ -2477,7 +2607,8 @@
         "broker_inputs_have_provenance": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The PUBREC refuses, and the result among its causes is an unknown outcome, not a rejection."
     },
@@ -2495,7 +2626,8 @@
         "broker_inputs_have_provenance": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "DEM-MU-01: the store refuses on an absence it read, and the fence a later snapshot lists came after."
     },
@@ -2515,7 +2647,8 @@
         "broker_inputs_have_provenance": "PASS",
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
+        "broker_killed_for_real": "PASS",
+        "durable_reads_complete": "PASS"
       },
       "why": "The operation is committed, and the store then writes a fence for the same identity."
     },
@@ -2533,7 +2666,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "The trace is cut: the fence that closes the refusal may be the record that is missing."
     },
@@ -2552,7 +2686,8 @@
         "broker_inputs_have_provenance": "INCONCLUSIVE",
         "one_grant_per_opened_epoch": "INCONCLUSIVE",
         "scenario_reaches_its_end": "INCONCLUSIVE",
-        "broker_killed_for_real": "INCONCLUSIVE"
+        "broker_killed_for_real": "INCONCLUSIVE",
+        "durable_reads_complete": "INCONCLUSIVE"
       },
       "why": "The trace is cut, and it already holds a commit after its fence: no missing record undoes that."
     }

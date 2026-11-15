@@ -148,6 +148,16 @@
         "DEM-017",
         "DEM-019"
       ]
+    },
+    {
+      "name": "durable_reads_complete",
+      "meaning": "No typed durable-reader refusal or process-control failure prevented establishment of complete evidence. Such a failure is INCONCLUSIVE for the business campaign, including a failure before Started; an independently established safety violation still fails. Failure-reception tests may require this result but do not qualify the interrupted exchange.",
+      "every_run": true,
+      "requirements": [
+        "DUR-003",
+        "DEM-016",
+        "DEM-019"
+      ]
     }
   ]
 }

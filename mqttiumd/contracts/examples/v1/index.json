@@ -60,6 +60,9 @@
     "contracts/examples/v1/valid/trace-record-frame-eligible-connack.json",
     "contracts/examples/v1/valid/trace-record-store-fence-refused.json",
     "contracts/examples/v1/valid/trace-record-durable-state-inspected.json",
+    "contracts/examples/v1/valid/trace-record-durable-read-failed.json",
+    "contracts/examples/v1/valid/trace-record-process-control-failed.json",
+    "contracts/examples/v1/valid/trace-record-durable-lookup-failed.json",
     "contracts/examples/v1/valid/trace-record-header-core-without-bytes.json",
     "contracts/examples/v1/valid/store-snapshot-after-commit.json",
     "contracts/examples/v1/valid/store-snapshot-empty.json",
@@ -67,6 +70,7 @@
     "contracts/examples/v1/valid/store-snapshot-refused-and-fenced.json",
     "contracts/examples/v1/valid/store-snapshot-routes-in-byte-order.json",
     "contracts/examples/v1/valid/store-snapshot-long-digit-topics.json",
+    "contracts/examples/v1/valid/run-result-provisional-typed-read-failure.json",
     "contracts/examples/v1/valid/run-result-provisional-repeated-fault-reached-more-than-its-minimum.json",
     "contracts/examples/v1/valid/run-result-provisional-all-passing.json",
     "contracts/examples/v1/valid/run-result-provisional-fail-with-inconclusive.json",
@@ -1044,6 +1048,54 @@
       "why": "Every 64-bit member of a payload is range-checked, whatever its name."
     },
     {
+      "file": "contracts/examples/v1/invalid/trace-record-read-failure-unknown-code.json",
+      "code": "schema-violation",
+      "pointer": "/payload/code",
+      "why": "Failures have bounded, stable codes and phase-specific typed context (record 0021)."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-read-failure-wrong-phase.json",
+      "code": "schema-violation",
+      "pointer": "/payload/phase",
+      "why": "Failures have bounded, stable codes and phase-specific typed context (record 0021)."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-read-failure-numeric-incarnation.json",
+      "code": "schema-violation",
+      "pointer": "/payload/process_incarnation",
+      "why": "Failures have bounded, stable codes and phase-specific typed context (record 0021)."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-read-failure-numeric-page.json",
+      "code": "schema-violation",
+      "pointer": "/payload/page",
+      "why": "Failures have bounded, stable codes and phase-specific typed context (record 0021)."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-read-failure-unbounded-message.json",
+      "code": "schema-violation",
+      "pointer": "/payload/message",
+      "why": "Failures have bounded, stable codes and phase-specific typed context (record 0021)."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-read-failure-by-the-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "Failures have bounded, stable codes and phase-specific typed context (record 0021)."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-control-failure-read-code.json",
+      "code": "schema-violation",
+      "pointer": "/payload/code",
+      "why": "Failures have bounded, stable codes and phase-specific typed context (record 0021)."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-control-failure-with-page.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "Failures have bounded, stable codes and phase-specific typed context (record 0021)."
+    },
+    {
       "file": "contracts/examples/v1/invalid/trace-record-durable-state-inspected-by-the-core.json",
       "code": "schema-violation",
       "pointer": "/origin_component",
@@ -1366,6 +1418,18 @@
       "code": "u64-out-of-range",
       "pointer": "/account/limits/max_route_targets",
       "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-failure-without-count.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "A bounded typed failure list declares its untruncated total (record 0021)."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-unbounded-failure-list.json",
+      "code": "schema-violation",
+      "pointer": "/failures",
+      "why": "At most the first 64 failure contexts are kept in a result (record 0021)."
     },
     {
       "file": "contracts/examples/v1/invalid/run-result-repeated-fault-below-its-minimum.json",

@@ -68,12 +68,28 @@ distinct from a truncated frame. One action has one coherent termination;
 duplicates, contradictions and activity without progress consume finite
 control/deadline budgets.
 
+EndOfAction and Parked identify their non-acknowledgement action with a
+monotonic action sequence. Parent and child advance that sequence once per
+command; evidence acknowledgements do not advance it. A valid empty end
+cannot be replayed as the end of a subsequent command. The bounded report
+counter includes terminal reports, and an action has an absolute deadline
+which incoming activity cannot extend.
+
 The independent oracle selects the first relevant lifecycle recovery before
 requiring its complete corroborated inventory; a later incarnation cannot
 supply missing proof for it. A business campaign missing durable evidence is
 INCONCLUSIVE, while an already established safety violation remains FAIL.
 Successful reception of that failure is not a qualifying PASS of the exchange.
 Result formats preserve the structured failure as well as human explanations.
+
+Normal judge output and produced results may retain at most 64 structured
+failure observations, paired with a decimal total failure_count. Each has
+kind, stable code, phase, process incarnation and record sequence, plus a
+bounded optional page/message. Recompute compares these observations with
+the trace; dropping or altering their cause is not allowed to stand. Healthy
+results omit these optional members. The every-run durable_reads_complete
+assertion requires no read/control failure; missing durable proof is
+inconclusive while an established safety failure is retained.
 
 ## Reception and limits
 
