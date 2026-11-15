@@ -104,6 +104,14 @@ jobs:
             tools/run_qualifying_campaign.sh tests/scenarios/p1/P1-02.json \
               "$RUNNER_TEMP/campaigns/qualifying/$backend" 1 "$backend"
           done
+      # A qualifying result must not outlive its conditions (finding R1 of
+      # the second audit): on campaigns produced here, with this oracle,
+      # `recompute` lets the intact one stand and refuses each degraded
+      # copy for its own reason: the source archive missing or altered,
+      # another oracle than the one the manifest identifies, a kept
+      # modification missing.
+      - name: Recompute refuses a degraded qualifying campaign
+        run: tools/run_recompute_reception.sh "$RUNNER_TEMP/campaigns/recompute" sqlite
       - name: Keep the campaign directories
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
