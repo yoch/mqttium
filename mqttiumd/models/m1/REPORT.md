@@ -206,3 +206,59 @@ atomicity of the commit is assumed; M1a erases the internal transport at
 a crash and M1b keeps the store side of it; M1b combines its fault kinds
 in groups; PUBREL and PUBCOMP belong to M2; no test replays a
 counterexample yet.
+
+## M1Answers, campaign of 15 November 2026
+
+| | |
+| - | - |
+| Model | `M1Answers.tla`, sidecar `M1Answers.json`, 14 configurations, status `refinement` |
+| Revision | `7c227e9`, replayed from a clean checkout |
+| Base | Integration branch at `70e48d3` merged into the lot |
+| Contract digest | `sha256:99640db77d6519b0db8e1213bcdf0eb49042560e75f49efd80ff7461d53c36f7` |
+| TLC, Java, search | TLC 2.19, OpenJDK 21.0.12, breadth-first, one worker, no symmetry |
+| Command | `python tools/formal/run_tlc.py --models-dir mqttiumd/models/m1`: 52 of 52 (M1a 19, M1b 19, M1Answers 14), exit 0, 6 min 39 s |
+| Result | 14 of 14 configurations of M1Answers gave the outcome their sidecar declares |
+
+M1a and M1b did not change; their 38 configurations gave the same
+outcomes on this revision.
+
+| Configuration | Specification | Lag and constants | Mutation | Declared | Outcome | States generated | Distinct states | Depth | Time |
+| - | - | - | - | - | - | - | - | - | - |
+| `M1Answers-i3.cfg` | Spec | uniform; R 2, L 4, K 4; loss 1, unknown 1, dup 1; MaxRank 21 | none | pass | pass | 46918 | 14986 | 18 | 1.2s |
+| `M1Answers-i3-reduced.cfg` | Spec | uniform; R 1, L 2, K 2; loss 1, unknown 1, dup 1; MaxRank 11 | none | pass | pass | 2219 | 1050 | 14 | 0.9s |
+| `M1Answers-i3-pair.cfg` | Spec | uniform; R 2, L 4, K 4; loss 0, unknown 0, dup 1; MaxRank 9 | none | pass | pass | 2090 | 848 | 12 | 0.9s |
+| `M1Answers-i3-pair-reduced.cfg` | Spec | uniform; R 1, L 2, K 2; loss 0, unknown 0, dup 1; MaxRank 5 | none | pass | pass | 130 | 78 | 8 | 0.9s |
+| `M1Answers-i3-liveness.cfg` | FairSpec | uniform; R 2, L 4, K 4; loss 1, unknown 1, dup 1; MaxRank 21 | none | pass LeavesAdmissionPending | pass | 46918 | 14986 | 18 | 2.2s |
+| `M1Answers-unbounded.cfg` | Spec | unbounded; R 2, L 4, K 4; loss 0, unknown 0, dup 1; MaxRank 9 | none | violation NoStarvationWithEveryEvictedAnswerDelivered | violation NoStarvationWithEveryEvictedAnswerDelivered | 34802 | 14080 | 14 | 1.2s |
+| `M1Answers-unbounded-reduced.cfg` | Spec | unbounded; R 1, L 2, K 2; loss 0, unknown 0, dup 1; MaxRank 5 | none | violation NoStarvationWithEveryEvictedAnswerDelivered | violation NoStarvationWithEveryEvictedAnswerDelivered | 168 | 137 | 8 | 0.9s |
+| `M1Answers-reach-landmark-commit.cfg` | Spec | uniform; R 2, L 4, K 4; loss 1, unknown 1, dup 1; MaxRank 21 | none | violation NoLandmarkCommit | violation NoLandmarkCommit | 1112 | 720 | 8 | 0.9s |
+| `M1Answers-reach-next-landmark-after-loss.cfg` | Spec | uniform; R 2, L 4, K 4; loss 1, unknown 1, dup 1; MaxRank 21 | none | violation NoNextLandmarkAfterLoss | violation NoNextLandmarkAfterLoss | 66 | 57 | 5 | 0.8s |
+| `M1Answers-reach-out-of-order.cfg` | Spec | uniform; R 2, L 4, K 4; loss 1, unknown 1, dup 1; MaxRank 21 | none | violation NoOutOfOrder | violation NoOutOfOrder | 70 | 61 | 5 | 0.8s |
+| `M1Answers-mut-no-landmarks.cfg` | Spec | uniform; R 2, L 4, K 4; loss 1, unknown 1, dup 1; MaxRank 21 | NoLandmarks | violation ProgressWithinBound | violation ProgressWithinBound | 4203134 | 1594707 | 38 | 21.1s |
+| `M1Answers-mut-landmark-slot-by-rank.cfg` | Spec | uniform; R 2, L 4, K 4; loss 1, unknown 1, dup 1; MaxRank 21 | LandmarkSlotByRank | violation RetentionMatchesSpec | violation RetentionMatchesSpec | 27495 | 9507 | 12 | 1.0s |
+| `M1Answers-mut-apply-any.cfg` | Spec | uniform; R 2, L 4, K 4; loss 1, unknown 1, dup 1; MaxRank 21 | ApplyAny | violation NothingForged | violation NothingForged | 320 | 219 | 7 | 0.8s |
+| `M1Answers-mut-keep-evicted.cfg` | Spec | uniform; R 2, L 4, K 4; loss 1, unknown 1, dup 1; MaxRank 21 | KeepEvicted | violation BoundedRetention | violation BoundedRetention | 8426 | 3796 | 10 | 0.9s |
+
+`Bound` is `P0 * 2^(MaxLoss + MaxUnknown) + K`: 20 for `i3.cfg` (MaxRank
+21), 10 for `i3-reduced.cfg`, 8 and 4 for the two pairs.
+
+Traces read:
+
+- `M1Answers-unbounded.cfg`: nine resolutions are emitted before any
+  answer arrives; the answers of 3, 5, 6 and 7 then arrive after their
+  eviction and are absorbed; those of 1, 2, 4, 8 and 9, still retained,
+  are in transit. Nothing was lost or applied, and the rank is past 8.
+  The answer of 3 arrived six resolutions after its own, more than
+  `K = 4`: I3 does not hold. Its pair `M1Answers-i3-pair.cfg`, with the
+  same constants under I3, passes.
+- `M1Answers-reach-landmark-commit.cfg`: the answer of 3 is absorbed at
+  rank 5; the answer of 1 arrives four resolutions after its own and is
+  applied through its landmark.
+- `M1Answers-mut-no-landmarks.cfg`: without landmarks, each answer
+  arrives exactly four resolutions after its own and is absorbed; at
+  rank 21, past the bound 20, the operation is unresolved.
+
+Not run: a larger `MaxRank`, more losses than above; a temporal property
+without I3 (with emission stopping at `MaxRank` it would pass
+artificially, so the counterexample is the safety one); the saturation
+of `emitted` at `u64::MAX`.
