@@ -1,7 +1,7 @@
 {
   "format": "mqttiumd-lab.loop-mutants",
   "version": 1,
-  "description": "Mutations of the real loop of lot L4: each patch, applied to a temporary worktree of the repository, is played by the runner and judged by the oracle of the unmodified tree. A rejected mutation must get the verdict, the failing assertion and a reason holding the fragment below. A known survivor is reported and does not fail the run until the finding it names is merged.",
+  "description": "Mutations of the real loop of lot L4: each patch, applied to a temporary worktree of the repository, is played by the runner and judged by the oracle of the unmodified tree. A rejected mutation must get the verdict, the assertion with its status (FAIL unless `assertion_status` says otherwise) and a reason holding the fragment below; when `stopped` is given, the campaign must also say that the run stopped, with that fragment. A known survivor is reported and does not fail the run until the finding it names is merged.",
   "mutants": [
     {
       "id": "m1-payload-owed-lost",
@@ -32,6 +32,19 @@
       "verdict": "FAIL",
       "assertion": "no_positive_ack_before_confirmed_commit",
       "reason": "eligible before the core knew of a commit"
+    },
+    {
+      "id": "m4-landmarks-ignored",
+      "patch": "m4-landmarks-ignored.mutant",
+      "mutation": "the core no longer matches the answers of its landmark resolutions, so an answer that arrives after more newer resolutions than it keeps recent is absorbed (finding F3)",
+      "scenario": "tests/scenarios/audit/F3-steady-lag.json",
+      "expect": "rejected",
+      "verdict": "INCONCLUSIVE",
+      "assertion": "trace_complete",
+      "assertion_status": "INCONCLUSIVE",
+      "reason": "the footer does not declare the trace complete",
+      "stopped": "step 19 (DriveUntil): nothing is eligible and the awaited event did not happen",
+      "note": "Step 19 waits for the PUBREC that answers the late answer: the run stops there. An interrupted run is never a PASS; whether a wait that can no longer be met is a FAIL is lot L3's to decide."
     }
   ]
 }

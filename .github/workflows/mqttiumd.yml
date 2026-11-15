@@ -76,7 +76,7 @@ jobs:
       # apply to it (open conditions): today the oracle answers OUT_OF_SCOPE.
       - name: Campaigns on the deterministic store
         run: |
-          for scenario in p1/P1-02 qabs/QABS-A qabs/QABS-B qabs/QABS-C; do
+          for scenario in p1/P1-02 qabs/QABS-A qabs/QABS-B qabs/QABS-C audit/F3-steady-lag; do
             tools/run_campaign.sh "tests/scenarios/$scenario.json" \
               "$RUNNER_TEMP/campaigns/$(basename "$scenario")"
           done
