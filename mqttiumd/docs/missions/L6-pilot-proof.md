@@ -56,11 +56,18 @@ allocate and does no IO.
 
 ## Tooling
 
-Kani and Verus are not installed in the cloud environment used so far, and
-its network policy refuses their release downloads from `github.com`. Two
-ways forward: the integration owner allows the host for the session of
-this lot, or the proof runs in the workflow, where the network is open. Say
-which was used; a proof that was not run is not reported as run.
+`tools/install-tools.sh kani verus` installs both at pinned versions:
+Kani 0.68.0 (CBMC 6.11.0) and Verus 0.2026.11.02.8bf68ee, whose release
+archive is checked against a pinned digest. Both were installed and tried
+in the cloud environment used so far, with no change to its network
+settings: each verified a true property and refuted a deliberately false
+one, and a Kani harness in a separate crate verified functions of
+`mqttiumd-contract` as that crate is written.
+
+Each tool brings its own compiler: Kani a pinned nightly, Verus the
+toolchain 1.99.1. Neither builds the product, which stays on the toolchain
+of `rust-toolchain.toml`. The file of the proof records the versions used.
+A proof that was not run is not reported as run.
 
 ## Reception
 

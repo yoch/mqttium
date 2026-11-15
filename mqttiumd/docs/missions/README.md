@@ -27,6 +27,14 @@ digest it was verified against, in its report.
    decided. Several lots build on what it fixes.
 3. The integration owner chooses the base branch.
 
+## Tools
+
+`tools/install-tools.sh` installs the proof, model and fuzzing tools at
+pinned versions: Kani and Verus for L6, the TLC jar for L5, cargo-fuzz for
+L8, cargo-deny. A session that starts a lot runs it for the tools it needs
+and names the versions in its report. Changing a pinned version changes the
+evidence the tool produces and goes through the integration owner.
+
 ## Lots and what each owns
 
 One lot per branch and per session. A lot changes only the paths it owns.
@@ -41,6 +49,7 @@ One lot per branch and per session. A lot changes only the paths it owns.
 
 Shared by all, changed only through the integration owner:
 `Cargo.toml`, `Cargo.lock`, `.github/workflows/mqttiumd.yml`, `AGENTS.md`,
+`tools/install-tools.sh`,
 `docs/decisions/`, `docs/reception/open-conditions.md`,
 `crates/mqttiumd-lab/tests/boundary.rs`. In
 `crates/mqttiumd-lab/src/lib.rs` and `crates/mqttiumd-core/src/lib.rs` a

@@ -20,6 +20,7 @@ claim.
 | `crates/mqttiumd-lab/` | `mqttiumd-lab validate` and `mqttiumd-lab manifest` |
 | `tools/build_corpus.py` | Rebuilds the derived contract files: the requirement register and the examples |
 | `tools/check_schemas.py` | A second, independent reader of the schemas, with pinned versions |
+| `tools/install-tools.sh` | Installs the proof, model and fuzzing tools at pinned versions |
 | `docs/reception/open-conditions.md` | What is deliberately not done yet, and which lot closes it |
 | `docs/missions/` | The mission of each lot of the first wave: deliverables, reception, ownership |
 | `contracts/schema/v1/` | JSON Schema 2020-12 files of every v1 format |

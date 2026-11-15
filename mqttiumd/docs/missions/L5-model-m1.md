@@ -49,7 +49,8 @@ DEM-020; V3-018; ARC-027. Decision records 0001, 0005.
 
 ## Tooling
 
-The repository already pins and hash-checks TLC in
+`tools/install-tools.sh tlc` fetches the pinned TLC jar; a Java runtime is
+required. The repository already pins and hash-checks TLC in
 `tools/formal/run_tlc.py`, with sidecar files that declare the outcome each
 configuration must give (`pass` or `violation`). Use that runner and that
 sidecar format. The runner reads `formal/models/` only: the first
