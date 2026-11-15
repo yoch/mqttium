@@ -20,15 +20,19 @@ with its failing test first.
 
 Defects found by the review of the second wave, each with a reproduction.
 A row is removed by the change that closes it, with its failing test
-first. Findings R3 (the replay command of a campaign did not name its
-store) and R4 (the binary check followed the build directory and the
-flags of its caller) are closed, with `tests/bench_replay.rs` and
-`tests/bench_rebuild.rs`.
+first. The four findings are closed: R1 (`recompute` did not check the
+conditions of a qualifying result again; lot L3, `d9eef542`,
+`tools/run_recompute_reception.sh`), R2 (a refused `renew_box` reopened
+the identity of the owner; lot L1, `bb00da1`, `replace_outbox`), R3 (the
+replay command of a campaign did not name its store;
+`tests/bench_replay.rs`) and R4 (the binary check followed the build
+directory and the flags of its caller; `tests/bench_rebuild.rs`). What
+they leave is below.
 
 | Finding | Reception | Closed by | Blocks |
 | - | - | - | - |
-| **R1, `recompute` does not check the conditions of a qualifying result again.** `produce` checks them (`results.unmet`); `recompute` recomputes the assertions and the faults only, so a qualifying result still stands after `source.tar` is removed or altered, where a new `produce` answers provisional and INCONCLUSIVE | On a qualifying campaign produced with the corrected oracle, and degraded on independent copies: the intact one stands; the archive missing, the archive altered, the oracle not the one the manifest identifies, and a kept modification missing are each refused, exit 2, for their own reason. A refusal caused only by the changed identity of the oracle proves nothing | L3 | Any qualifying run |
-| **R2, a refused `renew_box` reopens the identity of the owner.** The renewal retires the old box from the authority before the new one exists; after a refusal another box can be created for the same owner, and a second owner issues an `OperationId` the first already issued, while the first still holds a pending admission | After `TooLarge` and after a failed allocation the owner and the authority are as before; no second owner of the identity can be built; a later valid renewal succeeds and keeps the counters; the refusals already expected remain. An identity made unusable for ever is not the correction | L1 | G1 |
+| **`validate` accepts a qualifying result whose conditions no longer hold.** It checks the document: schema, digests and sizes of the files cited, contracts, assertions and faults of the scenario, coherence of the verdict. It does not judge the trace and does not check the conditions of a qualifying run, so a qualifying result without its `source.tar` is still accepted by it. Only `recompute` says that a result is evidence, which the guide of the oracle and record 0017 state | Either `validate` refuses to be read as that check, by its name or its output, or it runs the conditions too | L3 | A reader who takes `validate` for the check |
+| **The public addition of finding R2 is not in a decision record.** `OwnerAuthority::replace_outbox` and `ReplaceRefusal` are new public items of the contract crate; record 0009 describes `create_outbox` and `retire` only. `Owner::outbox()` still returns an `Option` that is now always `Some` | Record 0009 is amended; the bench stops treating the absence of a box | L1 for the record; L4 for the bench | G1 |
 | **What the rebuild of a binary depends on.** The path of the directory the source is unpacked in reaches the binary in spite of the remapped prefix: a check in a directory of another name builds another binary. The check and the run therefore use the directory the archive names under `TMPDIR`; two checks of one archive take turns on a lock, but `run --rebuild` does not take that lock, so a run and a check of the same source must not be started together | The run takes the lock; what in the build carries the path is found, or the dependence is stated in record 0017 with the other limits of a rebuild on another machine | L4; L9 for a build elsewhere | Agents rebuilding side by side |
 
 ## Before a result may be used as evidence (L3, gate G0)

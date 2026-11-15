@@ -82,3 +82,12 @@ The bounded check of the archive that the first version of this record
 left open is part of the decision above, both parts: the contract and
 oracle files, and the untracked files kept. The check of tracked files is
 limited as said: the campaign keeps their patch, not the files.
+
+## Recomputation (R1 of the audit of `a4aea95f`)
+
+`recompute` checks the conditions above again, from the scenario and the
+manifest the result cites, and refuses a qualifying result when one no
+longer holds (`result-not-qualifying`, naming the condition). Until then
+a result whose source was removed or changed after it was produced still
+stood. `mqttiumd-lab validate` checks the result as a document and does
+not check these conditions: it does not say that a result is evidence.
