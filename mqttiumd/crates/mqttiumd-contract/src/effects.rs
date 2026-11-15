@@ -21,7 +21,7 @@ use crate::ids::{
     InboundPacketId, LogicalDuration, LogicalOwnerId, LogicalTime, OperationId, OutboxSerial,
     PublicationId, Revision, RunEpoch, SessionId, StoreIncarnation,
 };
-use crate::outcome::{Knowledge, StoreReply};
+use crate::outcome::{EpochGrant, Knowledge, StoreReply};
 use crate::packet::{InboundPacket, OutboundFrame, SharedBytes};
 
 /// Durable phase of an inbound QoS 2 exchange.
@@ -658,6 +658,15 @@ pub struct RetireRefused {
     pub reason: RetireRefusal,
 }
 
+/// An authority that was not issued: the same grant comes back intact, so
+/// that trying again needs neither a second hand-over nor a new epoch.
+/// The one cause is that the table of active owners could not be
+/// allocated.
+#[derive(Debug)]
+pub struct GrantRefused {
+    pub grant: EpochGrant,
+}
+
 /// One entry of the table of active owners.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ActiveBox {
@@ -714,6 +723,27 @@ impl OwnerAuthority {
             active: BoundedVec::with_capacity(table)?,
             next_serial: Some(OutboxSerial::new(0)),
         })
+    }
+
+    /// Issues the authority of the opened epoch `grant` belongs to, able to
+    /// keep up to `max_owners` owners active at a time.
+    ///
+    /// The grant is consumed: an `EpochGrant` comes out of one transition
+    /// of one `EpochOpening`, taken once, so one committed opening gives
+    /// one authority. When the table cannot be allocated the same grant
+    /// comes back and may be presented again.
+    pub fn from_grant(grant: EpochGrant, max_owners: NonZeroU32) -> Result<Self, GrantRefused> {
+        match usize::try_from(max_owners.get()) {
+            Ok(table) => Self::with_table(grant, table),
+            Err(_) => Err(GrantRefused { grant }),
+        }
+    }
+
+    /// `from_grant`, with the bound of the table as the platform counts it.
+    fn with_table(grant: EpochGrant, table: usize) -> Result<Self, GrantRefused> {
+        // Interface only: no authority is issued yet.
+        let _ = table;
+        Err(GrantRefused { grant })
     }
 
     /// The data set this authority was issued for.
@@ -1504,6 +1534,10 @@ mod tests {
 mod authority_tests {
     use super::tests::{LimitedSink, effect, slots};
     use super::*;
+    use crate::command::StartupNonce;
+    use crate::outcome::{
+        EpochOpened, EpochOpening, HandOverRefused, OpeningOutcome, OpeningReply,
+    };
 
     const INCARNATION: u64 = 7;
     const EPOCH: u64 = 3;
@@ -1557,6 +1591,73 @@ mod authority_tests {
             outbox.free_slots(),
             outbox.reserved,
         )
+    }
+
+    /// The grant of a committed opening of `epoch`, obtained the way the
+    /// product obtains it: submit, observe the committed reply, hand over.
+    fn opened(incarnation: u64, epoch: u64) -> (EpochOpening, EpochGrant) {
+        let incarnation = StoreIncarnation::new(incarnation);
+        let last_opened = RunEpoch::new(epoch - 1);
+        let mut opening = EpochOpening::new(incarnation, StartupNonce::new([1; 16]));
+        let command = opening.submit(last_opened).expect("nothing in flight");
+        let reply = OpeningReply {
+            command,
+            outcome: OpeningOutcome::Committed(EpochOpened {
+                incarnation,
+                epoch: RunEpoch::new(epoch),
+            }),
+        };
+        opening.observe(reply).expect("the reply of this attempt");
+        let grant = opening.hand_over().expect("committed");
+        (opening, grant)
+    }
+
+    fn owners(count: u32) -> NonZeroU32 {
+        NonZeroU32::new(count).expect("at least one owner")
+    }
+
+    // ADR 0009: the one constructor of an authority consumes the grant of
+    // a committed opening, and takes its identity from it.
+    #[test]
+    fn an_authority_is_issued_from_the_grant_of_a_committed_opening() {
+        let (mut opening, grant) = opened(INCARNATION, EPOCH);
+        let mut authority = OwnerAuthority::from_grant(grant, owners(2)).expect("small");
+        assert_eq!(authority.incarnation(), StoreIncarnation::new(INCARNATION));
+        assert_eq!(authority.epoch(), RunEpoch::new(EPOCH));
+        assert_eq!(authority.active_owners(), 0);
+        let outbox = create(&mut authority, 1).expect("first box of the owner");
+        assert_eq!(outbox.id().epoch(), RunEpoch::new(EPOCH));
+
+        // The grant moved into the authority, and the opening gives no
+        // second one: there is no way to a second authority.
+        assert_eq!(
+            opening.hand_over().map(|grant| grant.opened()),
+            Err(HandOverRefused::AlreadyHandedOver)
+        );
+    }
+
+    // Review of 437edc2, finding 4: a failed allocation hands the same
+    // grant back, and the same grant then issues the authority.
+    #[test]
+    fn a_failed_allocation_hands_the_grant_back_and_the_same_grant_then_succeeds() {
+        let (mut opening, grant) = opened(INCARNATION, EPOCH);
+        let before = grant.opened();
+        // The public bound is thirty-two bits wide and cannot ask for more
+        // than an allocator may provide; the function `from_grant`
+        // delegates to takes the largest table an allocation can express.
+        let unobtainable = isize::MAX as usize / size_of::<ActiveBox>();
+        let refused = OwnerAuthority::with_table(grant, unobtainable).expect_err("no memory");
+        assert_eq!(refused.grant.opened(), before, "another grant came back");
+
+        let authority = OwnerAuthority::from_grant(refused.grant, owners(2))
+            .expect("the same grant, a table that fits");
+        assert_eq!(authority.incarnation(), before.incarnation);
+        assert_eq!(authority.epoch(), before.epoch);
+        // The failure issued nothing and the retry asked for no new grant.
+        assert_eq!(
+            opening.hand_over().map(|grant| grant.opened()),
+            Err(HandOverRefused::AlreadyHandedOver)
+        );
     }
 
     #[test]
