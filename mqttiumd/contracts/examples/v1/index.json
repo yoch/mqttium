@@ -13,6 +13,22 @@
     "contracts/examples/v1/valid/trace-record-fault-hit.json",
     "contracts/examples/v1/valid/trace-record-peer-packet-observed.json",
     "contracts/examples/v1/valid/trace-record-footer.json",
+    "contracts/examples/v1/valid/trace-record-peer-connection-opened.json",
+    "contracts/examples/v1/valid/trace-record-peer-packet-sent.json",
+    "contracts/examples/v1/valid/trace-record-peer-connection-closed.json",
+    "contracts/examples/v1/valid/trace-record-client-bytes-received.json",
+    "contracts/examples/v1/valid/trace-record-packet-delivered.json",
+    "contracts/examples/v1/valid/trace-record-resolve-submitted.json",
+    "contracts/examples/v1/valid/trace-record-store-result-ready.json",
+    "contracts/examples/v1/valid/trace-record-store-fence-stable.json",
+    "contracts/examples/v1/valid/trace-record-deadline-armed.json",
+    "contracts/examples/v1/valid/trace-record-deadline-delivered.json",
+    "contracts/examples/v1/valid/trace-record-recovery-page-read.json",
+    "contracts/examples/v1/valid/trace-record-recovery-page-delivered.json",
+    "contracts/examples/v1/valid/trace-record-input-refused.json",
+    "contracts/examples/v1/valid/trace-record-held-item-released.json",
+    "contracts/examples/v1/valid/trace-record-frame-eligible.json",
+    "contracts/examples/v1/valid/trace-record-frame-eligible-connack.json",
     "contracts/examples/v1/valid/run-result-provisional-all-passing.json",
     "contracts/examples/v1/valid/run-result-provisional-fail-with-inconclusive.json",
     "contracts/examples/v1/valid/run-result-provisional-fault-not-hit.json",
@@ -446,6 +462,66 @@
       "why": "S0 fixtures hold persistent sessions only."
     },
     {
+      "file": "contracts/examples/v1/invalid/trace-record-recovery-page-from-the-bench.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A recovery page is read by the store adapter; no other origin may state one (ADR 0003)."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-input-refused-by-the-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "The dispatcher refuses an input before the core sees it; the core cannot record it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-fact-unknown-kind.json",
+      "code": "schema-violation",
+      "pointer": "/payload/facts/3",
+      "why": "Recovered facts are a closed union: a remembered binding is not one of them."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-operation-without-knowledge.json",
+      "code": "schema-violation",
+      "pointer": "/payload/facts/3",
+      "why": "A recovered operation states what the store knows of it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-peer-publish-without-dup.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A PUBLISH that a client sent says whether it is a retransmission."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-peer-packet-sent-of-a-broker-kind.json",
+      "code": "schema-violation",
+      "pointer": "/payload/packet_kind",
+      "why": "A client of the subset sends CONNECT, PUBLISH and PUBREL; PUBREC comes from the broker."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-frame-eligible-pubrec-without-reason.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A PUBREC is positive or not: the record carries its reason."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-deadline-token-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/token",
+      "why": "A deadline token is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-packet-delivered-ingress-order-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/ingress_order",
+      "why": "The ingress order is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovery-page-fact-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/facts/1/revision",
+      "why": "Identity components inside a recovered fact are 64-bit as well."
+    },
+    {
       "file": "contracts/examples/v1/invalid/trace-record-store-truth-from-core.json",
       "code": "schema-violation",
       "pointer": "/origin_component",
@@ -462,6 +538,12 @@
       "code": "schema-violation",
       "pointer": "/payload",
       "why": "The payload shape follows the kind."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-store-commit-without-command-kind.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "Hidden truth says what was committed, not only that something was."
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-operation-overflow.json",

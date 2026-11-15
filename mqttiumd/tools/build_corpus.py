@@ -723,6 +723,10 @@ bad(
 
 # trace records
 OP = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "1"}
+EFFECT = {"epoch": "1", "owner": "0", "sequence": "1"}
+RESOLVE = {"epoch": "1", "owner": "0", "sequence": "3"}
+PUBLICATION = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "1"}
+PUBLISH_HEX = "3416000a70312f6578616d706c650007007061796c6f6164"
 
 
 def record(sequence, origin, origin_sequence, kind, payload, parents=()):
@@ -751,7 +755,12 @@ ok(
     ),
 )
 commit = record(
-    5, "store-evidence", 0, "StoreCommitStable", {"operation_id": OP}, [("store-adapter", 0)]
+    5,
+    "store-evidence",
+    0,
+    "StoreCommitStable",
+    {"operation_id": OP, "command_kind": "AdmitPublication"},
+    [("store-adapter", 0)],
 )
 ok("trace-record-store-commit-stable.json", commit)
 ok(
@@ -761,8 +770,14 @@ ok(
         "fault-injector",
         0,
         "FaultHit",
-        {"fault_id": "lost_admission_result", "point": "store.result.ready", "occurrence": "1"},
-        [("store-evidence", 0)],
+        {
+            "fault_id": "lost_admission_result",
+            "point": "store.result.ready",
+            "occurrence": "1",
+            "operation_id": OP,
+            "effect_id": EFFECT,
+        },
+        [("store-evidence", 1)],
     ),
 )
 ok(
@@ -772,12 +787,277 @@ ok(
         "peer",
         3,
         "PeerPacketObserved",
-        {"client": "producer", "packet_kind": "PUBREC", "packet_id": 7, "bytes_hex": "5004000700"},
+        {
+            "client": "producer",
+            "packet_kind": "PUBREC",
+            "packet_id": 7,
+            "reason_code": 0,
+            "bytes_hex": "50020007",
+        },
     ),
 )
 ok(
     "trace-record-footer.json",
     record(31, "bench-supervisor", 4, "TraceFooter", {"record_count": "32", "complete": True}),
+)
+
+# What a client sent, what the transport received and what the core consumed:
+# the oracle builds its own identity of an exchange from the first, and the
+# provenance of broker inputs (ADR 0003) from the chain.
+PEER_PUBLISH = record(
+    3,
+    "peer",
+    2,
+    "PeerPacketSent",
+    {
+        "client": "producer",
+        "packet_kind": "PUBLISH",
+        "packet_id": 7,
+        "dup": False,
+        "bytes_hex": PUBLISH_HEX,
+    },
+)
+ok(
+    "trace-record-peer-connection-opened.json",
+    record(1, "peer", 0, "PeerConnectionOpened", {"client": "producer"}),
+)
+ok("trace-record-peer-packet-sent.json", PEER_PUBLISH)
+ok(
+    "trace-record-peer-connection-closed.json",
+    record(30, "peer", 5, "PeerConnectionClosed", {"client": "producer"}),
+)
+ok(
+    "trace-record-client-bytes-received.json",
+    record(
+        4,
+        "transport",
+        1,
+        "ClientBytesReceived",
+        {"connection_generation": "1", "bytes_hex": PUBLISH_HEX},
+        [("peer", 2)],
+    ),
+)
+DELIVERED_PACKET = record(
+    5,
+    "broker-core",
+    1,
+    "PacketDelivered",
+    {"connection_generation": "1", "ingress_order": "1", "packet_kind": "PUBLISH", "packet_id": 7},
+    [("transport", 1)],
+)
+ok("trace-record-packet-delivered.json", DELIVERED_PACKET)
+ok(
+    "trace-record-resolve-submitted.json",
+    record(
+        9,
+        "store-adapter",
+        1,
+        "ResolveSubmitted",
+        {"effect_id": RESOLVE, "operation_id": OP},
+    ),
+)
+ok(
+    "trace-record-store-result-ready.json",
+    record(
+        7,
+        "store-evidence",
+        1,
+        "StoreResultReady",
+        {
+            "effect_id": EFFECT,
+            "operation_id": OP,
+            "outcome": "Committed",
+        },
+        [("store-evidence", 0)],
+    ),
+)
+ok(
+    "trace-record-store-fence-stable.json",
+    record(10, "store-evidence", 2, "StoreFenceStable", {"operation_id": OP}, [("store-adapter", 1)]),
+)
+ARMED = record(
+    8,
+    "timer",
+    0,
+    "DeadlineArmed",
+    {"effect_id": {"epoch": "1", "owner": "0", "sequence": "2"}, "token": "1", "after": "30"},
+)
+ok("trace-record-deadline-armed.json", ARMED)
+ok(
+    "trace-record-deadline-delivered.json",
+    record(11, "broker-core", 2, "DeadlineDelivered", {"token": "1", "now": "30"}, [("timer", 0)]),
+)
+PAGE = {
+    "run_epoch": "2",
+    "page": "0",
+    "last": True,
+    "facts": [
+        {"kind": "Epoch", "incarnation": "1", "epoch": "2"},
+        {"kind": "Session", "session": "1", "client_id_hex": "70312d70726f6475636572", "revision": "1"},
+        {
+            "kind": "InboundExchange",
+            "exchange": {"session": "1", "generation": "1"},
+            "packet_id": 7,
+            "publication": PUBLICATION,
+            "phase": "AwaitPubrel",
+        },
+        {"kind": "Operation", "operation_id": OP, "knowledge": "Committed"},
+    ],
+}
+PAGE_READ = record(14, "store-adapter", 2, "RecoveryPageRead", PAGE)
+ok("trace-record-recovery-page-read.json", PAGE_READ)
+ok(
+    "trace-record-recovery-page-delivered.json",
+    record(15, "broker-core", 3, "RecoveryPageDelivered", PAGE, [("store-adapter", 2)]),
+)
+REFUSED = record(
+    16,
+    "dispatcher",
+    0,
+    "InputRefused",
+    {
+        "input": "StoreResult",
+        "effect_id": EFFECT,
+        "operation_id": OP,
+        "reason": "no-effect-in-flight",
+    },
+)
+ok("trace-record-input-refused.json", REFUSED)
+ok(
+    "trace-record-held-item-released.json",
+    record(
+        12,
+        "fault-injector",
+        1,
+        "HeldItemReleased",
+        {"fault_id": "held_admission"},
+        [("fault-injector", 0)],
+    ),
+)
+ELIGIBLE = record(
+    18,
+    "broker-core",
+    4,
+    "FrameEligible",
+    {
+        "effect_id": {"epoch": "1", "owner": "0", "sequence": "4"},
+        "connection": {"session": "1", "generation": "1"},
+        "packet_kind": "PUBREC",
+        "packet_id": 7,
+        "reason": "Success",
+    },
+    [("broker-core", 3)],
+)
+ok("trace-record-frame-eligible.json", ELIGIBLE)
+ok(
+    "trace-record-frame-eligible-connack.json",
+    record(
+        2,
+        "broker-core",
+        0,
+        "FrameEligible",
+        {
+            "effect_id": {"epoch": "1", "owner": "0", "sequence": "0"},
+            "connection": {"session": "1", "generation": "1"},
+            "packet_kind": "CONNACK",
+            "session_present": True,
+        },
+    ),
+)
+
+
+def edited(base, edit):
+    value = copy.deepcopy(base)
+    edit(value)
+    return value
+
+
+def dropped(*path):
+    def edit(value):
+        *parents, last = path
+        for key in parents:
+            value = value[key]
+        del value[last]
+
+    return edit
+
+
+def trace_case(name, base, pointer, why, edit, code="schema-violation"):
+    bad(f"trace-record-{name}.json", code, pointer, why, edited(base, edit))
+
+
+trace_case(
+    "recovery-page-from-the-bench",
+    PAGE_READ,
+    "/origin_component",
+    "A recovery page is read by the store adapter; no other origin may state one (ADR 0003).",
+    setter(["origin_component"], "bench-supervisor"),
+)
+trace_case(
+    "input-refused-by-the-core",
+    REFUSED,
+    "/origin_component",
+    "The dispatcher refuses an input before the core sees it; the core cannot record it.",
+    setter(["origin_component"], "broker-core"),
+)
+trace_case(
+    "recovered-fact-unknown-kind",
+    PAGE_READ,
+    "/payload/facts/3",
+    "Recovered facts are a closed union: a remembered binding is not one of them.",
+    setter(["payload", "facts", 3], {"kind": "RememberedOperation", "operation_id": OP}),
+)
+trace_case(
+    "recovered-operation-without-knowledge",
+    PAGE_READ,
+    "/payload/facts/3",
+    "A recovered operation states what the store knows of it.",
+    dropped("payload", "facts", 3, "knowledge"),
+)
+trace_case(
+    "peer-publish-without-dup",
+    PEER_PUBLISH,
+    "/payload",
+    "A PUBLISH that a client sent says whether it is a retransmission.",
+    dropped("payload", "dup"),
+)
+trace_case(
+    "peer-packet-sent-of-a-broker-kind",
+    PEER_PUBLISH,
+    "/payload/packet_kind",
+    "A client of the subset sends CONNECT, PUBLISH and PUBREL; PUBREC comes from the broker.",
+    setter(["payload", "packet_kind"], "PUBREC"),
+)
+trace_case(
+    "frame-eligible-pubrec-without-reason",
+    ELIGIBLE,
+    "/payload",
+    "A PUBREC is positive or not: the record carries its reason.",
+    dropped("payload", "reason"),
+)
+trace_case(
+    "deadline-token-overflow",
+    ARMED,
+    "/payload/token",
+    "A deadline token is 64-bit.",
+    setter(["payload", "token"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "packet-delivered-ingress-order-overflow",
+    DELIVERED_PACKET,
+    "/payload/ingress_order",
+    "The ingress order is 64-bit.",
+    setter(["payload", "ingress_order"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "recovery-page-fact-overflow",
+    PAGE_READ,
+    "/payload/facts/1/revision",
+    "Identity components inside a recovered fact are 64-bit as well.",
+    setter(["payload", "facts", 1, "revision"], "18446744073709551616"),
+    code="u64-out-of-range",
 )
 
 
@@ -807,6 +1087,13 @@ bad(
     "/payload",
     "The payload shape follows the kind.",
     rec(setter(["payload"], {"record_count": "1", "complete": True})),
+)
+bad(
+    "trace-record-store-commit-without-command-kind.json",
+    "schema-violation",
+    "/payload",
+    "Hidden truth says what was committed, not only that something was.",
+    rec(dropped("payload", "command_kind")),
 )
 bad(
     "trace-record-operation-overflow.json",
