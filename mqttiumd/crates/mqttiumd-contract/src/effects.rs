@@ -232,8 +232,8 @@ pub trait EffectSink {
 ///
 /// Only an [`OwnerAuthority`] builds an identity. Two authorities issued
 /// for the same incarnation and epoch would give equal identities: what
-/// prevents that is the rule of issuance stated on
-/// [`OwnerAuthority::issue_for_opened_epoch`], not this type.
+/// prevents that is the issuance of the grant an authority consumes
+/// ([`OwnerAuthority::from_grant`]), not this type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OutboxId {
     incarnation: StoreIncarnation,
@@ -681,10 +681,16 @@ struct ActiveBox {
 /// checked counter that is never reused, and keeps, in a bounded table,
 /// which owner holds which live box.
 ///
-/// Invariant, under the precondition of
-/// [`OwnerAuthority::issue_for_opened_epoch`]: at any time an owner has at
-/// most one live box, and no two boxes ever created share an identity, so
-/// a reservation key is accepted by the box that issued it and by no other.
+/// Invariant: at any time an owner has at most one live box, and no two
+/// boxes ever created by this authority share an identity, so a
+/// reservation key is accepted by the box that issued it and by no other.
+///
+/// Start-up precondition, which this type cannot check: no two grants
+/// exist for one incarnation and epoch. One `EpochOpening` gives one
+/// grant; that a process drives one opening per store it opened, and
+/// that each committed opening names an epoch no earlier one named, is
+/// established by the contract of opening an epoch and by the wiring of
+/// start-up.
 #[derive(Debug)]
 pub struct OwnerAuthority {
     incarnation: StoreIncarnation,
@@ -696,38 +702,12 @@ pub struct OwnerAuthority {
 }
 
 impl OwnerAuthority {
-    /// Issues the authority of one opened run epoch, able to keep up to
-    /// `max_owners` owners active at a time. The table has at least one
-    /// entry: an authority that could create no box is not issued.
-    ///
-    /// This is the trusted entry point of ADR 0009: the one function that
-    /// constructs an authority. The type cannot count its own
-    /// constructions, so the guarantee rests on this precondition:
-    ///
-    /// > It is called at most once per live opening of the epoch
-    /// > `(incarnation, epoch)`, by the component that submitted the
-    /// > opening and received its committed result in this process.
-    ///
-    /// A replayed fact, a duplicated reply, a further recovery page or an
-    /// opening whose outcome is unknown gives no call. The state that
-    /// controls the hand-over belongs to the contract of opening an epoch.
-    pub fn issue_for_opened_epoch(
-        incarnation: StoreIncarnation,
-        epoch: RunEpoch,
-        max_owners: NonZeroU32,
-    ) -> Result<Self, AllocationFailed> {
-        let table = usize::try_from(max_owners.get()).map_err(|_| AllocationFailed)?;
-        Ok(Self {
-            incarnation,
-            epoch,
-            active: BoundedVec::with_capacity(table)?,
-            next_serial: Some(OutboxSerial::new(0)),
-        })
-    }
-
     /// Issues the authority of the opened epoch `grant` belongs to, able to
-    /// keep up to `max_owners` owners active at a time.
+    /// keep up to `max_owners` owners active at a time. The table has at
+    /// least one entry: an authority that could create no box is not
+    /// issued.
     ///
+    /// This is the one function that constructs an authority (ADR 0009).
     /// The grant is consumed: an `EpochGrant` comes out of one transition
     /// of one `EpochOpening`, taken once, so one committed opening gives
     /// one authority. When the table cannot be allocated the same grant
@@ -741,9 +721,15 @@ impl OwnerAuthority {
 
     /// `from_grant`, with the bound of the table as the platform counts it.
     fn with_table(grant: EpochGrant, table: usize) -> Result<Self, GrantRefused> {
-        // Interface only: no authority is issued yet.
-        let _ = table;
-        Err(GrantRefused { grant })
+        match BoundedVec::with_capacity(table) {
+            Ok(active) => Ok(Self {
+                incarnation: grant.incarnation(),
+                epoch: grant.epoch(),
+                active,
+                next_serial: Some(OutboxSerial::new(0)),
+            }),
+            Err(AllocationFailed) => Err(GrantRefused { grant }),
+        }
     }
 
     /// The data set this authority was issued for.
@@ -1543,12 +1529,8 @@ mod authority_tests {
     const EPOCH: u64 = 3;
 
     fn authority_of(incarnation: u64, epoch: u64, max_owners: u32) -> OwnerAuthority {
-        OwnerAuthority::issue_for_opened_epoch(
-            StoreIncarnation::new(incarnation),
-            RunEpoch::new(epoch),
-            NonZeroU32::new(max_owners).expect("at least one owner"),
-        )
-        .expect("small")
+        let (_opening, grant) = opened(incarnation, epoch);
+        OwnerAuthority::from_grant(grant, owners(max_owners)).expect("small")
     }
 
     fn authority(max_owners: u32) -> OwnerAuthority {
