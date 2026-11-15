@@ -196,6 +196,13 @@ contract crate, and the assertion
 rejection a refusing frame answers is the latest certain rejection among
 its causes, delivered to the same incarnation of the core.
 
+A `CommandSubmitted` or `ResolveSubmitted` has as a parent the record of
+the core, in the same incarnation, that consumed the input the effect
+comes from (`PacketDelivered` for an admission or a release,
+`DeadlineDelivered` for a resolution). The other links have their
+parents already: commit, fence and ready result their cause in the
+store, the handover its ready result, the consumed result its handover.
+
 The result chain is closed on content (finding K1 of the audit): what the
 core consumed is what the adapter handed over, and that is what the store
 produced, effect, operation, outcome and reason of a rejection alike. A
