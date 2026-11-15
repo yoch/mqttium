@@ -62,10 +62,12 @@ pub const MAX_TRANSITION_SLOTS: usize = 2;
 /// resolution fenced the operation before it arrived.
 pub const MAX_RELEASE_PREPARATIONS: u32 = 4;
 
-/// How many resolutions of one operation the owner retains, the latest
-/// ones. The answer to an older resolution is not matched to the
-/// operation: it is absorbed, and the next resolution answers again.
-pub const RETAINED_RESOLUTIONS: usize = 4;
+/// The latest resolutions of one operation the owner retains.
+pub const RECENT_RESOLUTIONS: usize = 2;
+
+/// The latest landmark resolutions of one operation the owner retains: those
+/// whose rank among the resolutions of the operation is a power of two.
+pub const LANDMARK_RESOLUTIONS: usize = 4;
 
 /// The bits of an exchange generation that count the exchanges of one run
 /// epoch. The bits above them hold the epoch: see [`Counters`].
@@ -232,35 +234,64 @@ struct Limits {
     max_payload_bytes: PayloadBytes,
 }
 
-/// The effects whose results the owner applies to one operation: the
-/// command that proposed it and its latest resolutions (ADR 0001). A
-/// result that names another effect does not answer the operation.
+/// The effects whose results the owner applies to one operation (ADR 0001,
+/// audit F3). A result that names another effect does not answer it.
+///
+/// - Bound: the command that proposed the operation, its
+///   `RECENT_RESOLUTIONS` latest resolutions and its `LANDMARK_RESOLUTIONS`
+///   latest landmarks, the resolutions whose rank is a power of two.
+/// - Progress: a resolution is emitted at each deadline, whatever is
+///   retained. If the answer of every resolution arrives at most `k`
+///   resolutions later, `k` finite and unknown, and finitely many answers
+///   are lost, the first landmark `p >= k` whose answer is not lost is
+///   still retained when it arrives: it arrives by rank `p + k <= 2p`, and
+///   a landmark is retained up to rank `p * 2^LANDMARK_RESOLUTIONS`.
+/// - The answer of a resolution no longer retained is absorbed; a later
+///   one answers again.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Answers {
     persist: EffectId,
-    resolutions: [Option<EffectId>; RETAINED_RESOLUTIONS],
-    /// The place the next resolution takes; the oldest one is replaced.
-    next: usize,
+    recent: [Option<EffectId>; RECENT_RESOLUTIONS],
+    landmarks: [Option<EffectId>; LANDMARK_RESOLUTIONS],
+    /// Resolutions emitted for the operation so far.
+    emitted: u64,
 }
 
 impl Answers {
     fn new(persist: EffectId) -> Self {
         Self {
             persist,
-            resolutions: [None; RETAINED_RESOLUTIONS],
-            next: 0,
+            recent: [None; RECENT_RESOLUTIONS],
+            landmarks: [None; LANDMARK_RESOLUTIONS],
+            emitted: 0,
         }
     }
 
     fn names(&self, effect: EffectId) -> bool {
-        self.persist == effect || self.resolutions.contains(&Some(effect))
+        self.persist == effect
+            || self.recent.contains(&Some(effect))
+            || self.landmarks.contains(&Some(effect))
     }
 
+    /// Retains the next resolution of the operation.
     fn with(mut self, resolution: EffectId) -> Self {
-        if let Some(place) = self.resolutions.get_mut(self.next) {
-            *place = Some(resolution);
+        self.emitted = self.emitted.saturating_add(1);
+        let rank = self.emitted;
+        let place = |rank: u64, len: usize| {
+            usize::try_from(rank % u64::try_from(len).unwrap_or(1)).unwrap_or(0)
+        };
+        if let Some(slot) = self.recent.get_mut(place(rank, RECENT_RESOLUTIONS)) {
+            *slot = Some(resolution);
         }
-        self.next = (self.next + 1) % RETAINED_RESOLUTIONS;
+        if rank.is_power_of_two() {
+            let landmark = u64::from(rank.trailing_zeros());
+            if let Some(slot) = self
+                .landmarks
+                .get_mut(place(landmark, LANDMARK_RESOLUTIONS))
+            {
+                *slot = Some(resolution);
+            }
+        }
         self
     }
 }
@@ -353,6 +384,10 @@ struct Refusal {
 
 /// The change of state of a transition. Indices name entries of the
 /// tables at the revision the plan was computed against.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a plan lives once on the stack of a step; boxing would allocate while planning"
+)]
 #[derive(Debug)]
 enum Change {
     /// The input is absorbed: late, repeated, or answered by effects only.
@@ -4500,7 +4535,7 @@ mod tests {
         let admission = world.flights[0];
         let mut token = admission.deadline;
         let mut resolutions = Vec::new();
-        for _ in 0..=RETAINED_RESOLUTIONS {
+        for _ in 0..5 {
             world.applied(deadline(token));
             let effects = world.drain();
             let Effect::ArmDeadline { token: next, .. } = effects[1].1 else {
@@ -4514,21 +4549,52 @@ mod tests {
             operation: admission.operation,
             reply: StoreReply::Outcome(StoreOutcome::Committed(admission.facts)),
         };
-        // The first resolution is no longer retained: its answer is
-        // absorbed and the next resolution answers again.
-        absorbed(&mut world, answer(resolutions[0]));
-        assert_eq!(world.phase(7), PENDING);
-        // The command and the latest resolutions are retained, the first
-        // resolution is not; the oldest one retained still answers.
+        // Ranks 1 to 5: the command, the two latest (4, 5) and the
+        // landmarks (1, 2, 4) are retained; rank 3 is not.
         let retained = world.in_flight(7).answers;
         assert!(retained.names(admission.effect));
-        assert!(!retained.names(resolutions[0]));
-        assert!(
-            resolutions[1..]
-                .iter()
-                .all(|effect| retained.names(*effect))
-        );
-        assert_eq!(world.sent(answer(resolutions[1])), ["EmitPubrec"]);
+        for (rank, effect) in (1..).zip(&resolutions) {
+            assert_eq!(retained.names(*effect), rank != 3, "rank {rank}");
+        }
+        // Its answer is absorbed, and a retained one answers.
+        absorbed(&mut world, answer(resolutions[2]));
+        assert_eq!(world.phase(7), PENDING);
+        assert_eq!(world.sent(answer(resolutions[0])), ["EmitPubrec"]);
+    }
+
+    // F3, the bound: an operation never retains more than the command, the
+    // recent resolutions and the landmarks, and the landmarks are the
+    // latest resolutions whose rank is a power of two.
+    #[test]
+    fn an_operation_retains_a_bounded_number_of_answers() {
+        let effect = |sequence: u64| EffectId {
+            epoch: RunEpoch::new(EPOCH),
+            owner: LogicalOwnerId::new(4),
+            sequence: EffectSeq::new(sequence),
+        };
+        let mut answers = Answers::new(effect(0));
+        for rank in 1..=1000u64 {
+            answers = answers.with(effect(rank));
+            let held = (1..=rank).filter(|r| answers.names(effect(*r))).count();
+            assert!(
+                held <= RECENT_RESOLUTIONS + LANDMARK_RESOLUTIONS,
+                "rank {rank}"
+            );
+            assert!(answers.names(effect(0)));
+            assert!(answers.names(effect(rank)));
+            let powers: Vec<u64> = (0..64)
+                .map(|bit| 1u64 << bit)
+                .filter(|power| *power <= rank)
+                .collect();
+            for (index, power) in powers.iter().rev().enumerate() {
+                let recent = rank - *power < u64::try_from(RECENT_RESOLUTIONS).expect("small");
+                assert_eq!(
+                    answers.names(effect(*power)),
+                    index < LANDMARK_RESOLUTIONS || recent,
+                    "rank {rank}, landmark {power}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4694,5 +4760,100 @@ mod tests {
         }
         assert_eq!(operations.len(), 2);
         assert_ne!(operations[0], operations[1], "one identity, two recipes");
+    }
+
+    /// Drives one admission whose first `Persist` committed and whose
+    /// result was lost. Each deadline emits one resolution, every
+    /// resolution answers Committed, and the answer of a resolution is
+    /// delivered once `lag` newer resolutions were emitted, in order. The
+    /// answers whose rank is in `lost` are never delivered, those in
+    /// `doubled` are delivered twice. Returns the number of resolutions
+    /// emitted when PUBREC was published, or `None` after `limit`.
+    fn resolve_with_lag(
+        lag: usize,
+        lost: &[usize],
+        doubled: &[usize],
+        limit: usize,
+    ) -> Option<usize> {
+        let mut world = World::admission_pending();
+        let admission = world.flights[0];
+        let mut token = admission.deadline;
+        let mut pending: std::collections::VecDeque<(usize, EffectId)> = Default::default();
+        for emitted in 1..=limit {
+            world.applied(deadline(token));
+            let effects = world.drain();
+            assert_eq!(kinds(&effects), ["ResolveAndFence", "ArmDeadline"]);
+            let Effect::ArmDeadline { token: next, .. } = effects[1].1 else {
+                panic!("a deadline")
+            };
+            token = next;
+            pending.push_back((emitted, effects[0].0));
+            while pending.len() > lag {
+                let (rank, effect) = pending.pop_front().expect("one");
+                if lost.contains(&rank) {
+                    continue;
+                }
+                let times = if doubled.contains(&rank) { 2 } else { 1 };
+                for _ in 0..times {
+                    world.applied(Input::StoreResult {
+                        effect,
+                        operation: admission.operation,
+                        reply: StoreReply::Outcome(StoreOutcome::Committed(admission.facts)),
+                    });
+                    let answer = world.drain();
+                    if world.phase(7) == AWAIT {
+                        assert_eq!(kinds(&answer), ["EmitPubrec"]);
+                        return Some(emitted);
+                    }
+                    assert!(answer.is_empty());
+                }
+            }
+            assert_eq!(world.phase(7), PENDING);
+        }
+        None
+    }
+
+    // F3, the counterexample of the audit: every answer arrives after four
+    // newer resolutions. The exchange must leave AdmissionPending.
+    #[test]
+    fn resolutions_whose_answers_arrive_after_four_newer_ones_still_commit() {
+        assert!(resolve_with_lag(4, &[], &[], 24).is_some());
+    }
+
+    // F3: progress under any finite lag, with losses and duplicates.
+    #[test]
+    fn resolutions_progress_under_a_finite_lag_with_losses_and_duplicates() {
+        for lag in [0, 1, 3, 4, 5, 7, 20, 100] {
+            assert!(
+                resolve_with_lag(lag, &[], &[], 4 * (lag + 2)).is_some(),
+                "lag {lag}"
+            );
+            let lost: Vec<usize> = (1..=lag.max(2) + 2).collect();
+            assert!(
+                resolve_with_lag(lag, &lost, &[1, 2, 3], 8 * (lag + 4)).is_some(),
+                "lag {lag}, losses {lost:?}"
+            );
+        }
+    }
+
+    // F3: a resolution answers only its own operation. The answer of a
+    // resolution of another exchange, named with this operation, is not
+    // applied to it.
+    #[test]
+    fn a_resolution_of_another_operation_does_not_answer_this_one() {
+        let mut world = World::connected();
+        let first = world.submit(publish(7));
+        let second = world.submit(publish_with(CONN, 8, Qos::ExactlyOnce, b"abc"));
+        world.applied(deadline(second.deadline));
+        let effects = world.drain();
+        assert_eq!(kinds(&effects), ["ResolveAndFence", "ArmDeadline"]);
+        let foreign = Input::StoreResult {
+            effect: effects[0].0,
+            operation: first.operation,
+            reply: StoreReply::Outcome(StoreOutcome::Committed(first.facts)),
+        };
+        absorbed(&mut world, foreign);
+        assert_eq!(world.phase(7), PENDING);
+        assert_eq!(world.sent(committed(&first)), ["EmitPubrec"]);
     }
 }
