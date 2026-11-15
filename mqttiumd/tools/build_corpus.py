@@ -156,9 +156,13 @@ valid = [
 invalid = []
 
 
+VALID = {}
+
+
 def ok(name, value):
     dump(EX / "valid" / name, value)
     valid.append(f"contracts/examples/v1/valid/{name}")
+    VALID[name] = value
 
 
 def bad(name, code, pointer, why, value=None, raw=None):
@@ -1048,6 +1052,36 @@ ok(
         [("store-evidence", 0)],
     ),
 )
+REJECTED = record(
+    7,
+    "store-evidence",
+    1,
+    "StoreResultReady",
+    {
+        "effect_id": EFFECT,
+        "operation_id": OP,
+        "outcome": "RejectedCertain",
+        "reject_reason": "Fenced",
+    },
+    [("store-evidence", 0)],
+)
+ok("trace-record-store-result-rejected.json", REJECTED)
+ok(
+    "trace-record-store-result-delivered-rejected.json",
+    record(
+        8,
+        "broker-core",
+        2,
+        "StoreResultDelivered",
+        {
+            "effect_id": EFFECT,
+            "operation_id": OP,
+            "outcome": "RejectedCertain",
+            "reject_reason": "CapacityExceeded",
+        },
+        [("store-evidence", 1)],
+    ),
+)
 ok(
     "trace-record-store-fence-stable.json",
     record(
@@ -1293,6 +1327,27 @@ trace_case(
     "Identity components inside a recovered fact are 64-bit as well.",
     setter(["payload", "facts", 1, "revision"], "18446744073709551616"),
     code="u64-out-of-range",
+)
+trace_case(
+    "rejection-without-its-reason",
+    REJECTED,
+    "/payload",
+    "A certain rejection says why: the reason of the refusing PUBREC follows from it.",
+    dropped("payload", "reject_reason"),
+)
+trace_case(
+    "commit-with-a-rejection-reason",
+    REJECTED,
+    "/payload",
+    "Only a certain rejection has a reason.",
+    setter(["payload", "outcome"], "Committed"),
+)
+trace_case(
+    "rejection-of-an-unknown-reason",
+    REJECTED,
+    "/payload/reject_reason",
+    "The reasons of a rejection are those of the contract.",
+    setter(["payload", "reject_reason"], "Busy"),
 )
 trace_case(
     "recovered-facts-rank-decreases",
@@ -2344,6 +2399,27 @@ bad(
     ),
 )
 
+# Every kind of record is stated by one origin (ADR 0003): for each kind
+# the audit added, a valid record stated by another origin is refused.
+for kind_name, origin in [
+    ("peer-connection-opened", "transport"),
+    ("peer-connection-closed", "broker-core"),
+    ("client-bytes-received", "peer"),
+    ("resolve-submitted", "broker-core"),
+    ("store-fence-stable", "store-adapter"),
+    ("store-fence-refused", "broker-core"),
+    ("recovery-page-delivered", "store-adapter"),
+    ("held-item-released", "bench-supervisor"),
+    ("fault-hit", "broker-core"),
+    ("peer-packet-observed", "transport"),
+]:
+    trace_case(
+        f"{kind_name}-stated-by-{origin}",
+        VALID[f"trace-record-{kind_name}.json"],
+        "/origin_component",
+        "A kind of record is stated by its one origin; another may not state it.",
+        setter(["origin_component"], origin),
+    )
 dump(EX / "index.json", env("mqttiumd.example-index", valid=valid, invalid=invalid))
 
 

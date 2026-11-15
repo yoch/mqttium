@@ -267,6 +267,15 @@
           "$ref": "primitives.schema.json#/$defs/u64"
         }
       }
+    },
+    "reject_reason": {
+      "description": "Why the store rejected an operation for certain, in the vocabulary of RejectReason.",
+      "enum": [
+        "PreconditionFailed",
+        "CapacityExceeded",
+        "Fenced",
+        "EpochClosed"
+      ]
     }
   }
 }

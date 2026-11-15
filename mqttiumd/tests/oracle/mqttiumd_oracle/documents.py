@@ -131,6 +131,23 @@ class Contracts:
         contracts._bytes = {
             path.relative_to(root).as_posix(): data for path, data in content.items()
         }
+        # The reasons EmitPubrecRefusal carries, from the transition
+        # catalogues of the directory; two that state them must agree.
+        refusal_reasons = None
+        for path, data in content.items():
+            if path.parent != directory:
+                continue
+            try:
+                document = parse(data)
+            except Refused:
+                continue
+            if not isinstance(document, dict) or "refusal_reasons" not in document:
+                continue
+            if document.get("format") != "mqttiumd.transition-catalog":
+                continue
+            if refusal_reasons not in (None, document["refusal_reasons"]):
+                raise ContractsUnreadable(f"{path.name}: another table of refusal reasons")
+            refusal_reasons = document["refusal_reasons"]
         faults = loaded["mqttiumd.fault-catalog"]
         contracts.catalogs = {
             "fault_points": {
@@ -152,6 +169,7 @@ class Contracts:
             "requirements": {
                 entry["id"] for entry in loaded["mqttiumd.requirement-register"]["entries"]
             },
+            "refusal_reasons": refusal_reasons,
         }
         return contracts
 

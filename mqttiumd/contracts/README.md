@@ -162,9 +162,18 @@ A reader of documents sees one page. That the pages of one recovery form
 one inventory, and that a route has its table before it, is checked by
 the oracle on the whole trace.
 
-`FrameEligible` carries the reason of an acknowledgement. A PUBREC that
-refuses an admission carries `QuotaExceeded` when a capacity is the cause
-and `ImplementationSpecificError` (0x83) otherwise.
+`FrameEligible` carries the reason of an acknowledgement. A certain
+rejection in `StoreResultReady` and `StoreResultDelivered` names its
+`reject_reason`, and no other outcome has one. The reason a refusing
+PUBREC carries is a function of it, stated once by the transition
+catalogue as the `refusal_reasons` of the effect `EmitPubrecRefusal`:
+`QuotaExceeded` for `CapacityExceeded`, `ImplementationSpecificError`
+(0x83) for `Fenced`, `PreconditionFailed` and `EpochClosed` (record 0013,
+line 10). A test holds that table to `AckReason::refusing` of the
+contract crate, and the assertion
+`refusal_carries_the_reason_of_its_rejection` holds a run to it: the
+rejection a refusing frame answers is the latest certain rejection among
+its causes, delivered to the same incarnation of the core.
 
 `InputRefused` is what the dispatcher records when it refuses a result
 that answers no effect in flight. `StoreCommitStable`, `StoreFenceStable`,

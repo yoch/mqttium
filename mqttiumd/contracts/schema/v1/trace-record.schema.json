@@ -876,8 +876,37 @@
         },
         "outcome": {
           "$ref": "primitives.schema.json#/$defs/store_outcome"
+        },
+        "reject_reason": {
+          "$ref": "primitives.schema.json#/$defs/reject_reason"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "RejectedCertain"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reject_reason"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "reject_reason"
+              ]
+            }
+          }
+        }
+      ]
     },
     "StoreResultDelivered": {
       "type": "object",
@@ -896,8 +925,37 @@
         },
         "outcome": {
           "$ref": "primitives.schema.json#/$defs/store_outcome"
+        },
+        "reject_reason": {
+          "$ref": "primitives.schema.json#/$defs/reject_reason"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "RejectedCertain"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reject_reason"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "reject_reason"
+              ]
+            }
+          }
+        }
+      ]
     },
     "FrameEligible": {
       "type": "object",
