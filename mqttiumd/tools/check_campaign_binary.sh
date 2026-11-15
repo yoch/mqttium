@@ -2,7 +2,11 @@
 # Rebuilds the binary of a campaign written by `run --rebuild` from the
 # source.tar the campaign holds, and compares its digest with the binary
 # the run manifest names (lot L4). Needs only the campaign directory and
-# a toolchain with the locked dependencies available offline:
+# a toolchain with the locked dependencies available offline. The build
+# directory and the flags are the check's own: CARGO_TARGET_DIR,
+# CARGO_BUILD_TARGET and CARGO_ENCODED_RUSTFLAGS of the caller are not
+# followed, so that agents with build directories of their own can run
+# it side by side on campaigns of different sources:
 #
 #   tools/check_campaign_binary.sh <campaign directory>
 #
@@ -20,17 +24,35 @@ if [[ ! -f $campaign/source.tar ]]; then
     exit 2
 fi
 digest=$(sha256sum "$campaign/source.tar" | cut -c1-64)
+# The directory is named by the archive, as the run named it: its path
+# reaches the binary in spite of the remapped prefix, so a check in
+# another directory builds another binary. Two checks of one archive
+# therefore share it, and take turns: the lock is held until this script
+# ends, and released by the kernel if it is killed.
 dir="${TMPDIR:-/tmp}/mqttiumd-source-${digest:0:16}"
+exec 9> "$dir.lock"
+if ! flock 9; then
+    echo "no lock on $dir.lock: two checks of one archive could not be told apart" >&2
+    exit 2
+fi
 rm -rf "${dir:?}"
 mkdir -p "$dir"
 trap 'rm -rf "${dir:?}"' EXIT
 tar -x -f "$campaign/source.tar" -C "$dir"
-if ! (cd "$dir" && RUSTFLAGS="--remap-path-prefix=$dir=/mqttiumd-source" \
+# The build is the one the run recorded, whatever the caller exported: it
+# goes to a directory of its own under the unpacked source, where the
+# binary is then read, and it takes the recorded flags. An inherited
+# CARGO_ENCODED_RUSTFLAGS would replace RUSTFLAGS, and an inherited target
+# would move the binary. These settings reach this build only.
+target="$dir/target"
+if ! (cd "$dir" && env -u CARGO_ENCODED_RUSTFLAGS -u CARGO_BUILD_TARGET \
+    CARGO_TARGET_DIR="$target" \
+    RUSTFLAGS="--remap-path-prefix=$dir=/mqttiumd-source" \
     cargo build -q --locked --offline -p mqttiumd-lab --bin mqttiumd-lab); then
     echo "the source of the campaign does not build" >&2
     exit 2
 fi
-built=$(sha256sum "$dir/target/debug/mqttiumd-lab" | cut -c1-64)
+built=$(sha256sum "$target/debug/mqttiumd-lab" | cut -c1-64)
 named=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['artifact']['sha256'])" "$campaign/run-manifest.json")
 echo "built from source.tar: $built"
 echo "named by the manifest: $named"

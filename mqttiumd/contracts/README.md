@@ -81,6 +81,23 @@ scenario:
 
 A scenario does not wait for a fault whose `expected_hits` is 0.
 
+**A permanent delay** (record 0018, proposed). A fault names one
+`occurrence`, or every occurrence `from_occurrence` on: a repeated fault.
+How often a repeated fault is reached depends on the product, so it
+states `expected_hits_at_least` (at least 1) instead of `expected_hits`,
+and it binds no operation. A repeated `delay_result` has a `lag`, from 1
+to 64, and only it has one: each delayed answer is delivered to the core
+once `lag` newer answers of the same selection are held. It holds no one
+item, so no step hands one over (`held-item-mismatch`). Two faults of one
+selection overlap when the occurrences they select meet: a repeated one
+from n meets every occurrence from n on (`fault-match-invalid`).
+`DriveUntil` may set `fire_deadlines`: while the awaited event has not
+happened and nothing else is eligible, the bench fires the armed
+deadline due first, within the step's `max_steps`. A run result reports
+each fault with the expectation of its scenario, `expected_hits` or
+`expected_hits_at_least`; a fault expected at least so often is reached
+when its hits are at least that.
+
 QABS-A inspects at the barrier of the applied commit and then leaves
 it: `after_commit` sees the commit and no result, and the result becomes
 ready only after `LeaveBarrier`. A barrier no step leaves holds the

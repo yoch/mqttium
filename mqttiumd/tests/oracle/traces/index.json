@@ -1585,6 +1585,60 @@
       "why": "K1: the handover follows the store's result only through a record of a peer: the store did not produce it."
     },
     {
+      "name": "repeated-fault-reached-once",
+      "scenario": "tests/oracle/traces/scenarios/p1-02-repeated.json",
+      "trace": "tests/oracle/traces/repeated-fault-reached-once/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
+      },
+      "why": "A repeated injection expected at least once is reached once."
+    },
+    {
+      "name": "repeated-fault-reached-more-than-its-minimum",
+      "scenario": "tests/oracle/traces/scenarios/p1-02-repeated.json",
+      "trace": "tests/oracle/traces/repeated-fault-reached-more-than-its-minimum/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
+      },
+      "why": "A repeated injection expected at least once is reached twice: that is no shortfall."
+    },
+    {
+      "name": "repeated-fault-never-reached",
+      "scenario": "tests/oracle/traces/scenarios/p1-02-repeated.json",
+      "trace": "tests/oracle/traces/repeated-fault-never-reached/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "INCONCLUSIVE",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
+      },
+      "why": "A repeated injection expected at least once is never reached."
+    },
+    {
       "name": "provenance-duplicate-reaches-the-core",
       "scenario": "tests/oracle/traces/scenarios/p1-02-duplicate.json",
       "trace": "tests/oracle/traces/provenance-duplicate-reaches-the-core/trace.jsonl",

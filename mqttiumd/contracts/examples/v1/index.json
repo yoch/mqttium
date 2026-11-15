@@ -10,6 +10,8 @@
     "contracts/examples/v1/valid/scenario-u64-max.json",
     "contracts/examples/v1/valid/scenario-core-without-bytes.json",
     "contracts/examples/v1/valid/scenario-qos0-publish.json",
+    "contracts/examples/v1/valid/scenario-permanent-delay.json",
+    "contracts/examples/v1/valid/scenario-repeated-fault-after-the-occurrence-of-another.json",
     "contracts/examples/v1/valid/scenario-held-command-and-result.json",
     "contracts/examples/v1/valid/scenario-hold-reached-after-a-restart.json",
     "contracts/examples/v1/valid/scenario-command-held-to-the-end.json",
@@ -58,6 +60,7 @@
     "contracts/examples/v1/valid/store-snapshot-refused-and-fenced.json",
     "contracts/examples/v1/valid/store-snapshot-routes-in-byte-order.json",
     "contracts/examples/v1/valid/store-snapshot-long-digit-topics.json",
+    "contracts/examples/v1/valid/run-result-provisional-repeated-fault-reached-more-than-its-minimum.json",
     "contracts/examples/v1/valid/run-result-provisional-all-passing.json",
     "contracts/examples/v1/valid/run-result-provisional-fail-with-inconclusive.json",
     "contracts/examples/v1/valid/run-result-provisional-fault-not-hit.json",
@@ -443,6 +446,114 @@
       "code": "binding-undefined",
       "pointer": "/steps/8/fault",
       "why": "LeaveBarrier names a fault that is not declared."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-repeated-fault-with-one-occurrence.json",
+      "code": "schema-violation",
+      "pointer": "/faults/1",
+      "why": "A fault names one occurrence or every occurrence from one on, not both."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-fault-without-occurrence.json",
+      "code": "schema-violation",
+      "pointer": "/faults/1",
+      "why": "A fault names one occurrence or every occurrence from one on."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-repeated-fault-with-exact-hits.json",
+      "code": "schema-violation",
+      "pointer": "/faults/1",
+      "why": "How often a repeated fault is reached depends on the product: only a minimum is expected."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-repeated-fault-without-expected-hits.json",
+      "code": "schema-violation",
+      "pointer": "/faults/1",
+      "why": "A repeated fault says how often it must at least be reached."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-repeated-fault-expected-zero-times.json",
+      "code": "schema-violation",
+      "pointer": "/faults/1/expected_hits_at_least",
+      "why": "A repeated fault is expected at least once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-repeated-fault-binding-an-operation.json",
+      "code": "schema-violation",
+      "pointer": "/faults/1",
+      "why": "A repeated fault selects many items: it binds no operation."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-lag-of-zero.json",
+      "code": "schema-violation",
+      "pointer": "/faults/1/lag",
+      "why": "A delayed answer is delivered once at least one newer one is held."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-lag-beyond-its-bound.json",
+      "code": "schema-violation",
+      "pointer": "/faults/1/lag",
+      "why": "The lag is bounded."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-repeated-delay-without-lag.json",
+      "code": "schema-violation",
+      "pointer": "/faults/1",
+      "why": "Answers delayed without end and never delivered: a repeated delay has a lag."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-lag-on-another-action.json",
+      "code": "schema-violation",
+      "pointer": "/faults/1",
+      "why": "Only a delayed answer has a lag."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-lag-on-one-occurrence.json",
+      "code": "schema-violation",
+      "pointer": "/faults/0",
+      "why": "A lag counts newer answers of the same selection: a fault of one occurrence has none."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-fire-deadlines-not-a-boolean.json",
+      "code": "schema-violation",
+      "pointer": "/steps/4/fire_deadlines",
+      "why": "Whether the bench fires the deadlines while it waits is true or false."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-repeated-fault-from-beyond-64-bits.json",
+      "code": "u64-out-of-range",
+      "pointer": "/faults/1/from_occurrence",
+      "why": "The first occurrence of a repeated fault is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-repeated-fault-expected-beyond-64-bits.json",
+      "code": "u64-out-of-range",
+      "pointer": "/faults/1/expected_hits_at_least",
+      "why": "The minimum of a repeated fault is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-held-result-of-a-repeated-fault.json",
+      "code": "held-item-mismatch",
+      "pointer": "/steps/5/fault",
+      "why": "A repeated delay holds many answers and delivers each by its lag: no step delivers one."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-one-occurrence-overlapped-by-a-later-repeated-fault.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/2/match",
+      "why": "A repeated fault from the third occurrence on selects the seventh, which another fault selects."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-two-repeated-faults-of-one-selection.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/2/match",
+      "why": "Two repeated faults of one selection both select every occurrence beyond the later start."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-repeated-fault-overlapping-one-occurrence.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/2/match",
+      "why": "A repeated fault from the first occurrence on selects the third too."
     },
     {
       "file": "contracts/examples/v1/invalid/scenario-release-before-hold.json",
@@ -1175,6 +1286,18 @@
       "code": "u64-out-of-range",
       "pointer": "/account/limits/max_route_targets",
       "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-repeated-fault-below-its-minimum.json",
+      "code": "verdict-inconsistent",
+      "pointer": "/verdict",
+      "why": "A repeated fault reached fewer times than its minimum leaves the run inconclusive."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-fault-with-both-expectations.json",
+      "code": "schema-violation",
+      "pointer": "/faults/0",
+      "why": "A fault is expected an exact number of times or at least a number of times."
     },
     {
       "file": "contracts/examples/v1/invalid/run-result-provisional-pass.json",
