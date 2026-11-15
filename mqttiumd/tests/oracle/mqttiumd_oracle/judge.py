@@ -445,6 +445,103 @@ def _obligations(snapshot):
     }
 
 
+def _published(data: bytes):
+    """``(topic, payload)`` of the bytes of one MQTT 5 PUBLISH, or ``None``."""
+    try:
+        length, shift, at = 0, 0, 1
+        while True:
+            byte = data[at]
+            length |= (byte & 0x7F) << shift
+            shift, at = shift + 7, at + 1
+            if not byte & 0x80:
+                break
+        end = at + length
+        if data[0] >> 4 != 3 or end != len(data):
+            return None
+        topic_length = int.from_bytes(data[at : at + 2], "big")
+        topic = data[at + 2 : at + 2 + topic_length]
+        at += 2 + topic_length
+        if (data[0] >> 1) & 3:
+            at += 2
+        properties, shift = 0, 0
+        while True:
+            byte = data[at]
+            properties |= (byte & 0x7F) << shift
+            shift, at = shift + 7, at + 1
+            if not byte & 0x80:
+                break
+        at += properties
+        return (topic, data[at:end]) if at <= end else None
+    except IndexError:
+        return None
+
+
+def _broken_references(name, snapshot):
+    """What a snapshot names and does not hold: the store lost it, or never had it."""
+    publications = {_key(row["publication_id"]): row for row in snapshot["publications"]}
+    payloads = {_key(row["payload_id"]) for row in snapshot["payloads"]}
+    reasons = []
+    for row in snapshot["obligations"]:
+        if _key(row["publication_id"]) not in publications:
+            reasons.append(
+                f"{name}: the obligation {_key(row['publication_id'])}/{row['index']} "
+                "names a publication the store does not hold"
+            )
+    for publication, row in publications.items():
+        if _key(row["payload_id"]) not in payloads:
+            reasons.append(
+                f"{name}: the publication {publication} names a payload the store does not hold"
+            )
+    return reasons
+
+
+def _acknowledged_publications(run, names):
+    """Reasons a checkpoint lacks what a client was acknowledged for, and where order is unknown.
+
+    An exchange whose positive PUBREC a peer observed before an inspection
+    was committed: the snapshot of that inspection holds a publication of
+    the topic the client sent, whose payload has the length and digest of
+    the bytes the client sent. The expectation comes from what the client
+    did, not from what survives in the snapshot.
+    """
+    exchanges, _ = run.exchanges()
+    missing, unknown = [], []
+    for exchange in exchanges:
+        if exchange.positive_pubrec is None:
+            continue
+        sent = _published(bytes.fromhex(exchange.opened.payload["bytes_hex"]))
+        if sent is None:
+            unknown.append(f"record {exchange.opened.sequence}: the PUBLISH cannot be read")
+            continue
+        topic, payload = sent
+        digest = hashlib.sha256(payload).hexdigest()
+        for name in names:
+            inspection, snapshot = run.snapshots[name]
+            order = run.trace.before(exchange.positive_pubrec, inspection)
+            if order is None:
+                unknown.append(
+                    f"{name}: not ordered with the PUBREC of record {exchange.positive_pubrec.sequence}"
+                )
+                continue
+            if not order:
+                continue
+            payloads = {
+                _key(row["payload_id"]): (row["length"], row["sha256"])
+                for row in snapshot["payloads"]
+            }
+            held = [
+                payloads.get(_key(row["payload_id"]))
+                for row in snapshot["publications"]
+                if row["topic_hex"] == topic.hex()
+            ]
+            if (str(len(payload)), digest) not in held:
+                missing.append(
+                    f"{name}: no publication holds the payload the client published on "
+                    f"{topic!r} and was acknowledged for (record {exchange.positive_pubrec.sequence})"
+                )
+    return missing, unknown
+
+
 def same_required_obligations_at_both_checkpoints(run):
     names = run.checkpoints()
     if len(names) < 2:
@@ -461,6 +558,14 @@ def same_required_obligations_at_both_checkpoints(run):
     if not lot:
         return Status(FAIL, [f"{names[0]} holds no obligation"])
     reasons = []
+    # Every checkpoint hangs together: an obligation names a publication the
+    # store holds, a publication a payload it holds. A missing reference is
+    # never a value that compares equal to another missing one.
+    for name in names:
+        reasons += _broken_references(name, run.snapshots[name][1])
+    # What a client was acknowledged for is held, whatever else survives.
+    acknowledged, unordered = _acknowledged_publications(run, names)
+    reasons += acknowledged
     # What the fixture requires of each publication, computed here: the
     # exact-topic route and the lower of the two QoS.
     sessions = {client: session for session, client in run.client_of_session().items()}
@@ -504,7 +609,11 @@ def same_required_obligations_at_both_checkpoints(run):
         for delivery in sorted(later.keys() - lot.keys()):
             if delivery[0] in known:
                 reasons.append(f"{name}: the obligation {delivery} appeared")
-    return Status(FAIL if reasons else PASS, reasons)
+    if reasons:
+        return Status(FAIL, reasons)
+    if unordered:
+        return Status(INCONCLUSIVE, unordered)
+    return Status(PASS)
 
 
 def same_recipe_for_op_A(run):
