@@ -698,7 +698,7 @@ PERMANENT.update(
             "packet_kind": "PUBREC",
             "packet_id": 7,
             "fire_deadlines": True,
-            "max_steps": "65536",
+            "max_steps": "4096",
         },
         *F3["steps"][-3:],
     ],
@@ -817,6 +817,56 @@ bad(
     permanent(
         lambda v: v["steps"].insert(
             FIRE_AT + 1, {"kind": "DeliverHeldResult", "fault": "late_answers", "max_steps": "512"}
+        )
+    ),
+)
+
+
+def single_before(occurrence, start):
+    """A fault of one occurrence, declared before the repeated one from ``start``."""
+
+    def edit(value):
+        late = value["faults"][1]
+        late["from_occurrence"] = start
+        value["faults"].insert(
+            1,
+            {
+                **{key: late[key] for key in ("point", "match")},
+                "id": "single",
+                "occurrence": occurrence,
+                "action": "drop_result",
+                "expected_hits": "1",
+            },
+        )
+
+    return edit
+
+
+ok(
+    "scenario-repeated-fault-after-the-occurrence-of-another.json",
+    permanent(single_before("3", "5")),
+)
+bad(
+    "scenario-one-occurrence-overlapped-by-a-later-repeated-fault.json",
+    "fault-match-invalid",
+    "/faults/2/match",
+    "A repeated fault from the third occurrence on selects the seventh, which another fault selects.",
+    permanent(single_before("7", "3")),
+)
+bad(
+    "scenario-two-repeated-faults-of-one-selection.json",
+    "fault-match-invalid",
+    "/faults/2/match",
+    "Two repeated faults of one selection both select every occurrence beyond the later start.",
+    permanent(
+        lambda v: v["faults"].append(
+            {
+                **{key: v["faults"][1][key] for key in ("point", "match")},
+                "id": "later",
+                "from_occurrence": "40",
+                "action": "drop_result",
+                "expected_hits_at_least": "1",
+            }
         )
     ),
 )

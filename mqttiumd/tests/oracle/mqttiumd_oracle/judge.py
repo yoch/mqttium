@@ -22,6 +22,7 @@ import hashlib
 from dataclasses import dataclass, field
 
 from . import recipe as recipes
+from . import semantic
 from .semantic import InventoryOrder
 from .strict import Refused, parse
 from .trace import BENCH, Trace
@@ -335,10 +336,13 @@ def trace_complete(run):
 def all_required_faults_hit(run):
     reasons = []
     hits = fault_hits(run)
-    declared = {fault["id"]: int(fault["expected_hits"]) for fault in run.scenario["faults"]}
-    for fault, expected in declared.items():
-        if hits.get(fault, 0) != expected:
-            reasons.append(f"{fault} was reached {hits.get(fault, 0)} times, {expected} expected")
+    declared = {fault["id"]: fault for fault in run.scenario["faults"]}
+    for name, fault in declared.items():
+        count = hits.get(name, 0)
+        if not semantic.reached(fault, count):
+            kind, expected = semantic.expectation(fault)
+            wanted = f"at least {expected}" if kind == "at_least" else expected
+            reasons.append(f"{name} was reached {count} times, {wanted} expected")
     for fault in hits.keys() - declared.keys():
         reasons.append(f"{fault} was reached and is not declared")
     return Status(INCONCLUSIVE if reasons else PASS, reasons)

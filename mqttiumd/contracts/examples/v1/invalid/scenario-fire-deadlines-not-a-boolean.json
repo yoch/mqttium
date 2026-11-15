@@ -70,7 +70,7 @@
       "packet_kind": "PUBREC",
       "packet_id": 7,
       "fire_deadlines": "yes",
-      "max_steps": "65536"
+      "max_steps": "4096"
     },
     {
       "kind": "ClientSendPubrel",

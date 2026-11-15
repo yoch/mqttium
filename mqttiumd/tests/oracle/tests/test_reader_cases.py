@@ -135,6 +135,10 @@ class QualifyingResult(Scratch):
         result = self.passing()
         result["faults"][0]["expected_hits"] = result["faults"][0]["hits"] = "2"
         self.assertEqual(self.check(result), ["result-incomplete"])
+        # Record 0018: at least once is not exactly once.
+        result = self.passing()
+        result["faults"][0]["expected_hits_at_least"] = result["faults"][0].pop("expected_hits")
+        self.assertEqual(self.check(result), ["result-incomplete"])
 
     def test_a_missed_injection_blocks_the_pass(self):
         result = self.passing()
