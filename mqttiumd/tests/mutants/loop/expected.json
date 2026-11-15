@@ -45,6 +45,16 @@
       "reason": "the footer does not declare the trace complete",
       "stopped": "step 19 (DriveUntil): nothing is eligible and the awaited event did not happen",
       "note": "Step 19 waits for the PUBREC that answers the late answer: the run stops there. An interrupted run is never a PASS; whether a wait that can no longer be met is a FAIL is lot L3's to decide."
+    },
+    {
+      "id": "m5-late-unknown-acknowledged",
+      "patch": "m5-late-unknown-acknowledged.mutant",
+      "mutation": "the core answers an unknown result that arrives after the commit of its operation is known with a second PUBREC",
+      "scenario": "tests/scenarios/p1/P1-02b.json",
+      "expect": "rejected",
+      "verdict": "FAIL",
+      "assertion": "terminal_knowledge_never_regresses",
+      "reason": "follows from the unknown answer of record"
     }
   ]
 }
