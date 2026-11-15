@@ -27,7 +27,7 @@ use mqttiumd_lab::bench::process::{Books, Choice, Process};
 use mqttiumd_lab::store::adapter::StoreAction;
 use mqttiumd_lab::store::durable::{
     AdminCommand, AdminDone, AdminRefused, Applied, DurableState, DurableStore, MemoryStore,
-    RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved,
+    ReadBudget, ReadError, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved,
 };
 use serde_json::{Value, json};
 
@@ -41,11 +41,11 @@ struct TwoRecipes {
 }
 
 impl DurableStore for TwoRecipes {
-    fn ledger(&self) -> EpochLedger {
+    fn ledger(&self) -> Result<EpochLedger, ReadError> {
         self.inner.ledger()
     }
 
-    fn open_epoch(&mut self, command: &OpenEpoch) -> OpeningOutcome {
+    fn open_epoch(&mut self, command: &OpenEpoch) -> Result<OpeningOutcome, ReadError> {
         self.inner.open_epoch(command)
     }
 
@@ -76,7 +76,7 @@ impl DurableStore for TwoRecipes {
         self.inner.apply(command)
     }
 
-    fn established(&self, operation: OperationId) -> Option<StoreOutcome> {
+    fn established(&self, operation: OperationId) -> Result<Option<StoreOutcome>, ReadError> {
         self.inner.established(operation)
     }
 
@@ -88,16 +88,17 @@ impl DurableStore for TwoRecipes {
         self.inner.admin(command)
     }
 
-    fn recover(
+    fn recover_with_budget(
         &self,
         cursor: Option<RecoveryCursor>,
         limit: usize,
+        budget: ReadBudget,
     ) -> Result<RecoveryPage, RecoveryRefused> {
-        self.inner.recover(cursor, limit)
+        self.inner.recover_with_budget(cursor, limit, budget)
     }
 
-    fn snapshot(&self) -> DurableState {
-        self.inner.snapshot()
+    fn snapshot_with_budget(&self, budget: ReadBudget) -> Result<DurableState, ReadError> {
+        self.inner.snapshot_with_budget(budget)
     }
 }
 

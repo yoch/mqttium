@@ -7,8 +7,8 @@ use mqttiumd_contract::ids::{Revision, RunEpoch, SessionId, StoreIncarnation};
 use mqttiumd_contract::packet::Qos;
 use mqttiumd_lab::store::durable::{
     Accounts, AdminCommand, AdminDone, AdminRefused, Applied, DurableState, DurableStore, Limits,
-    MemoryStore, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved, RouteTarget,
-    SessionState,
+    MemoryStore, ReadBudget, ReadError, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved,
+    RouteTarget, SessionState,
 };
 use mqttiumd_lab::store::fixture::{FixtureError, FixturePlan, install, plan};
 use serde_json::{Value, json};
@@ -75,7 +75,7 @@ fn the_fixture_is_installed_and_opens_no_epoch() {
     let mut store = MemoryStore::create(plan.incarnation, plan.limits);
     let installed = install(&mut store, &plan).expect("installed");
 
-    let state = store.snapshot();
+    let state = store.snapshot().expect("healthy durable snapshot");
     let session = |client: &str| installed.sessions[client];
     assert_eq!(installed.sessions.len(), 3);
     for (client, client_id) in [
@@ -116,16 +116,17 @@ fn the_fixture_is_installed_and_opens_no_epoch() {
 struct CommandsOnly {
     inner: MemoryStore,
     commands: Vec<AdminCommand>,
+    snapshot_error: Option<ReadError>,
 }
 
 impl DurableStore for CommandsOnly {
-    fn ledger(&self) -> mqttiumd_contract::command::EpochLedger {
+    fn ledger(&self) -> Result<mqttiumd_contract::command::EpochLedger, ReadError> {
         self.inner.ledger()
     }
     fn open_epoch(
         &mut self,
         _: &mqttiumd_contract::command::OpenEpoch,
-    ) -> mqttiumd_contract::outcome::OpeningOutcome {
+    ) -> Result<mqttiumd_contract::outcome::OpeningOutcome, ReadError> {
         panic!("a fixture opens no epoch");
     }
     fn apply(&mut self, _: &mqttiumd_contract::command::Command) -> Applied {
@@ -134,7 +135,7 @@ impl DurableStore for CommandsOnly {
     fn established(
         &self,
         _: mqttiumd_contract::ids::OperationId,
-    ) -> Option<mqttiumd_contract::outcome::StoreOutcome> {
+    ) -> Result<Option<mqttiumd_contract::outcome::StoreOutcome>, ReadError> {
         panic!("a fixture reads no operation");
     }
     fn resolve_and_fence(&mut self, _: mqttiumd_contract::ids::OperationId) -> Resolved {
@@ -144,15 +145,19 @@ impl DurableStore for CommandsOnly {
         self.commands.push(command.clone());
         self.inner.admin(command)
     }
-    fn recover(
+    fn recover_with_budget(
         &self,
         cursor: Option<RecoveryCursor>,
         limit: usize,
+        budget: ReadBudget,
     ) -> Result<RecoveryPage, RecoveryRefused> {
-        self.inner.recover(cursor, limit)
+        self.inner.recover_with_budget(cursor, limit, budget)
     }
-    fn snapshot(&self) -> DurableState {
-        self.inner.snapshot()
+    fn snapshot_with_budget(&self, budget: ReadBudget) -> Result<DurableState, ReadError> {
+        if let Some(error) = self.snapshot_error {
+            return Err(error);
+        }
+        self.inner.snapshot_with_budget(budget)
     }
 }
 
@@ -162,6 +167,7 @@ fn the_fixture_reaches_the_store_as_commands_in_its_own_order() {
     let mut store = CommandsOnly {
         inner: MemoryStore::create(plan.incarnation, plan.limits),
         commands: Vec::new(),
+        snapshot_error: None,
     };
     let installed = install(&mut store, &plan).expect("installed");
     let session = |client: &str| installed.sessions[client];
@@ -191,6 +197,38 @@ fn the_fixture_reaches_the_store_as_commands_in_its_own_order() {
     );
     // Session identities come from the store, not from the fixture.
     assert_eq!(session("producer"), SessionId::new(1));
+}
+
+#[test]
+fn a_fixture_preserves_read_causes_and_stops_before_route_commands() {
+    let plan = planned();
+    for cause in [
+        ReadError::InvalidData,
+        ReadError::LimitExceeded,
+        ReadError::Unavailable,
+        ReadError::Io,
+        ReadError::AllocationFailed,
+    ] {
+        let mut store = CommandsOnly {
+            inner: MemoryStore::create(plan.incarnation, plan.limits),
+            commands: Vec::new(),
+            snapshot_error: Some(cause),
+        };
+        assert_eq!(install(&mut store, &plan), Err(FixtureError::Read(cause)));
+        assert_eq!(store.commands.len(), plan.sessions.len());
+        assert!(
+            store
+                .commands
+                .iter()
+                .all(|command| matches!(command, AdminCommand::CreateSession { .. }))
+        );
+        // Each preceding administration command remains committed as a
+        // whole; the read failure neither resets the store nor adds routes.
+        let state = store.inner.snapshot().expect("healthy underlying snapshot");
+        assert_eq!(state.sessions.len(), plan.sessions.len());
+        assert!(state.routes.is_empty());
+        assert!(state.operations.is_empty());
+    }
 }
 
 fn edited(edit: impl FnOnce(&mut Value)) -> Value {
@@ -254,5 +292,12 @@ fn a_command_the_store_refuses_stops_the_installation() {
     );
     // The commands before the refused one were committed, each as a
     // whole: two sessions, and no half of the third.
-    assert_eq!(store.snapshot().sessions.len(), 2);
+    assert_eq!(
+        store
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .sessions
+            .len(),
+        2
+    );
 }
