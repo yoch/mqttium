@@ -22,6 +22,7 @@ EVERY_RUN = (
     "one_grant_per_opened_epoch",
     "scenario_reaches_its_end",
     "broker_killed_for_real",
+    "durable_reads_complete",
 )
 
 SCENARIO = "tests/scenarios/p1/P1-02.json"

@@ -58,6 +58,7 @@ class Traces(unittest.TestCase):
                         "one_grant_per_opened_epoch",
                         "scenario_reaches_its_end",
                         "broker_killed_for_real",
+                        "durable_reads_complete",
                     },
                 )
 
