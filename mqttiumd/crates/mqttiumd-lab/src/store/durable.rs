@@ -937,22 +937,24 @@ impl DurableStore for MemoryStore {
     }
 
     fn resolve_and_fence(&mut self, operation: OperationId) -> Resolved {
-        let outcome = match self.committed.established(operation) {
-            Established::Outcome(outcome) => outcome,
+        let settled = |outcome| Resolved {
+            outcome,
+            fenced_now: false,
+        };
+        match self.committed.established(operation) {
+            Established::Outcome(outcome) => settled(outcome),
             Established::Absent(_) => {
                 let mut staged = self.committed.clone();
                 staged.fences.insert(operation);
                 if self.commit(staged) {
-                    StoreOutcome::RejectedCertain(RejectReason::Fenced)
+                    Resolved {
+                        outcome: StoreOutcome::RejectedCertain(RejectReason::Fenced),
+                        fenced_now: true,
+                    }
                 } else {
-                    StoreOutcome::PendingOrUnknown
+                    settled(StoreOutcome::PendingOrUnknown)
                 }
             }
-        };
-        // Skeleton: never says that it fenced.
-        Resolved {
-            outcome,
-            fenced_now: false,
         }
     }
 

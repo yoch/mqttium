@@ -321,6 +321,8 @@ pub struct SimStore<S> {
     halt: Option<Halt>,
     events: Vec<StoreEvent>,
     evidence_lost: bool,
+    /// The number the next page of the current inventory will carry.
+    recovery_page: u64,
 }
 
 /// What a crash leaves: the store and the evidence already recorded.
@@ -370,6 +372,7 @@ impl<S: DurableStore> SimStore<S> {
             halt: None,
             events: Vec::new(),
             evidence_lost: false,
+            recovery_page: 0,
         }
     }
 
@@ -611,13 +614,22 @@ impl<S: DurableStore> SimStore<S> {
                     applied.committed_now,
                 )
             }
-            Work::Resolve(operation) => (
-                Answer::Operation {
-                    operation: *operation,
-                    reply: StoreReply::Outcome(self.store.resolve_and_fence(*operation).outcome),
-                },
-                false,
-            ),
+            Work::Resolve(operation) => {
+                let resolved = self.store.resolve_and_fence(*operation);
+                if resolved.fenced_now {
+                    self.record(StoreEvent::FenceStable {
+                        id,
+                        operation: *operation,
+                    });
+                }
+                (
+                    Answer::Operation {
+                        operation: *operation,
+                        reply: StoreReply::Outcome(resolved.outcome),
+                    },
+                    false,
+                )
+            }
             Work::Open => {
                 let outcome = self.store.open_epoch();
                 (
@@ -736,8 +748,18 @@ impl<S: DurableStore> SimStore<S> {
         cursor: Option<RecoveryCursor>,
         limit: usize,
     ) -> Result<RecoveryPage, RecoveryRefused> {
-        // Skeleton: the read leaves no evidence.
-        self.store.recover(cursor, limit)
+        let page = self.store.recover(cursor, limit)?;
+        let number = match cursor {
+            None => 0,
+            Some(_) => self.recovery_page,
+        };
+        self.recovery_page = number.saturating_add(1);
+        self.record(StoreEvent::RecoveryPageRead {
+            page: number,
+            last: page.next.is_none(),
+            facts: page.facts.as_slice().to_vec(),
+        });
+        Ok(page)
     }
 
     /// Leaves a barrier and goes on from the point it stopped at.
