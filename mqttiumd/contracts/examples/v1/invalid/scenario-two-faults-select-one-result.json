@@ -28,7 +28,7 @@
         "command_kind": "AdmitPublication",
         "publication_binding": "pub_A"
       },
-      "occurrence": "1",
+      "occurrence": "2",
       "action": "delay_result",
       "expected_hits": "1"
     },

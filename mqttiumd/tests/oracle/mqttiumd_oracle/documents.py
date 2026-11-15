@@ -133,9 +133,9 @@ class Contracts:
         }
         faults = loaded["mqttiumd.fault-catalog"]
         contracts.catalogs = {
-            "fault_points": {point["point"]: set(point["actions"]) for point in faults["points"]},
-            "result_points": {
-                point["point"] for point in faults["points"] if point["carries"] == "result"
+            "fault_points": {
+                point["point"]: (point["carries"], set(point["actions"]))
+                for point in faults["points"]
             },
             "command_kinds": set(faults["command_kinds"]),
             "profiles": {

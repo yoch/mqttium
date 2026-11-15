@@ -425,7 +425,13 @@
       "file": "contracts/examples/v1/invalid/scenario-two-faults-select-one-result.json",
       "code": "fault-match-invalid",
       "pointer": "/faults/2/match",
-      "why": "Without result_of the delay also selects the first result of the Persist that another fault drops."
+      "why": "Without result_of the delay counts over every result of the operation: its second may be the first of the Persist, which another fault drops."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-two-faults-select-one-occurrence.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/3/match",
+      "why": "Two faults name the same occurrence of the same result: only one could act."
     },
     {
       "file": "contracts/examples/v1/invalid/scenario-deliver-while-crashed.json",

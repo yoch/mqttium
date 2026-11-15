@@ -680,8 +680,25 @@ bad(
     "scenario-two-faults-select-one-result.json",
     "fault-match-invalid",
     "/faults/2/match",
-    "Without result_of the delay also selects the first result of the Persist that another fault drops.",
-    held(lambda v: v["faults"][1]["match"].pop("result_of")),
+    "Without result_of the delay counts over every result of the operation: its second may be the "
+    "first of the Persist, which another fault drops.",
+    held(
+        lambda v: (
+            v["faults"][1]["match"].pop("result_of"),
+            v["faults"][1].update(occurrence="2"),
+        )
+    ),
+)
+bad(
+    "scenario-two-faults-select-one-occurrence.json",
+    "fault-match-invalid",
+    "/faults/3/match",
+    "Two faults name the same occurrence of the same result: only one could act.",
+    held(
+        lambda v: v["faults"].append(
+            {**copy.deepcopy(v["faults"][2]), "id": "duplicated", "action": "duplicate_result"}
+        )
+    ),
 )
 bad(
     "scenario-deliver-while-crashed.json",

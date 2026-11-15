@@ -60,19 +60,39 @@ Three steps let a scenario order a race without a crash (ADR 0001):
 
 | Step | What the bench does |
 | - | - |
-| `FireDeadline` | Lets the timer adapter deliver the armed deadline that is due first, and drives the broker, within `max_steps`, until the core has consumed it. Logical time advances in no other way: a deadline never fires by itself between two steps |
-| `ReleaseHeldCommand` | Lets the command that the named fault holds (action `hold_command`) enter the writer |
-| `DeliverHeldResult` | Hands the result that the named fault delays (action `delay_result`) to the core, and drives, within `max_steps`, until the core has consumed it |
+| `FireDeadline` | Drives the broker, within `max_steps`, until no effect waits in an effect box; then lets the timer adapter deliver the armed deadline that is due first, and drives until the core has consumed it. Two deadlines due at the same logical time fire in the order they were armed. If no deadline is armed the step fails and the run is inconclusive: it is never a no-op. Logical time advances in no other way: a deadline never fires by itself between two steps |
+| `ReleaseHeldCommand` | Lets the command that the named fault holds enter the writer |
+| `DeliverHeldResult` | Hands the result that the named fault delays to the core, and drives, within `max_steps`, until the core has consumed it |
 
-A fault holds something only once a `DriveUntil` step has waited for its
-hit. What is held is handed over at most once, and a crash of the broker
-destroys it. A `delay_result` that no step delivers stays held to the end
-of the run.
+**What a fault holds.** The action `hold_command` holds a command and
+`delay_result` holds a result. Such a fault holds one item in the life of a
+scenario:
 
-Each injection point `carries` a command or a result. On a point that
-carries a result, `match.result_of` selects the result of a `Persist` or
-of a `ResolveAndFence` about a matching operation; without it, any result
-about a matching operation counts, in the order they become ready.
+- it holds it once a `DriveUntil` step has waited for its hit, and a
+  scenario waits for it once, so its `expected_hits` is at most 1;
+- what is held is handed over at most once, by the step of its kind;
+- a crash of the broker destroys it, and the fault holds nothing again. A
+  fault that no step waited for before a crash may still be reached, and
+  waited for, after the restart;
+- a held command or result that no step hands over stays held to the end
+  of the run (QABS-C keeps its command held).
+
+A scenario does not wait for a fault whose `expected_hits` is 0.
+
+**What a point carries.** Each injection point `carries` a command or a
+result, and offers only actions that act on it: `hold_command` on a
+command; `drop_result`, `delay_result` and `duplicate_result` on a result;
+`barrier` on either. On a point that carries a result, `match.result_of`
+selects the result of a `Persist` or of a `ResolveAndFence` about a
+matching operation; without it, every result about a matching operation
+counts, in the order they become ready.
+
+**One fault per item.** Two faults of a scenario never select the same
+command or result. Two selections on one point, for one command kind, with
+compatible publication bindings and compatible `result_of`, are refused
+when they name the same occurrence, and also when only one of them names
+`result_of`: they would count occurrences over different sets, and which
+fault acts would depend on the store.
 
 These steps give the broker nothing it could not know (ADR 0003): a fired
 deadline carries the token the core armed, a released command is the one

@@ -134,6 +134,25 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
                 code::DUPLICATE_NAME,
                 &mut report.diagnostics,
             );
+            // A point offers only actions that act on what it carries.
+            for (index, point) in items(document, "points").iter().enumerate() {
+                for (action_index, action) in names(point, "actions").into_iter().enumerate() {
+                    let fits = match acts_on(action) {
+                        None => false,
+                        Some(subject) => subject.is_none_or(|item| item == text(point, "carries")),
+                    };
+                    if !fits {
+                        report.diagnostics.push(Diagnostic::new(
+                            code::FAULT_ACTION_UNKNOWN,
+                            format!("/points/{index}/actions/{action_index}"),
+                            format!(
+                                "{action:?} is not an action on a {}",
+                                text(point, "carries")
+                            ),
+                        ));
+                    }
+                }
+            }
         }
         "mqttiumd.profile-catalog" => {
             let entries = entry_names(document, "profiles", "id");
@@ -157,6 +176,27 @@ fn entry_names<'a>(document: &'a Value, list: &str, key: &str) -> Vec<(String, &
 }
 
 // ------------------------------------------------------------------ scenario
+
+/// What an action of an injection point acts on: `Some(None)` for an action
+/// that fits any point, `None` for a name outside the vocabulary.
+fn acts_on(action: &str) -> Option<Option<&'static str>> {
+    match action {
+        "barrier" => Some(None),
+        "hold_command" => Some(Some("command")),
+        "drop_result" | "delay_result" | "duplicate_result" => Some(Some("result")),
+        _ => None,
+    }
+}
+
+/// What a fault keeps until a step hands it over, if its action holds
+/// anything.
+fn held_item(action: &str) -> Option<&'static str> {
+    match action {
+        "hold_command" => Some("command"),
+        "delay_result" => Some("result"),
+        _ => None,
+    }
+}
 
 /// Whether a fault holds the command or result it stopped, as the steps
 /// read so far establish it.
@@ -206,20 +246,32 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
     // One namespace for everything a scenario binds.
     let mut definitions: Vec<(String, &str)> = Vec::new();
     let mut fault_ids = BTreeSet::new();
-    // What each fault holds once it is hit, and whether it still holds it.
-    let mut holds: BTreeMap<&str, (&str, Held)> = BTreeMap::new();
+    // What each fault keeps once a step waited for its hit (a command, a
+    // result, or nothing), whether it still keeps it, and whether the
+    // scenario expects it to be reached at all.
+    let mut holds: BTreeMap<&str, (Option<&str>, Held, bool)> = BTreeMap::new();
     for (index, fault) in faults.iter().enumerate() {
         let base = format!("/faults/{index}");
         u64_at(document, &format!("{base}/occurrence"), out);
-        u64_at(document, &format!("{base}/expected_hits"), out);
+        let expected = u64_at(document, &format!("{base}/expected_hits"), out);
         definitions.push((format!("{base}/id"), text(fault, "id")));
         fault_ids.insert(text(fault, "id"));
+        let item = held_item(text(fault, "action"));
         holds
             .entry(text(fault, "id"))
-            .or_insert((text(fault, "action"), Held::NotYet));
+            .or_insert((item, Held::NotYet, expected != Some(0)));
+        if item.is_some() && expected.is_some_and(|hits| hits > 1) {
+            out.push(Diagnostic::new(
+                code::HELD_ITEM_MISMATCH,
+                format!("{base}/expected_hits"),
+                "a fault that holds something holds one item: it is reached at most once",
+            ));
+        }
         if fault.pointer("/match/result_of").is_some()
-            && catalogs.fault_points.contains_key(text(fault, "point"))
-            && !catalogs.result_points.contains(text(fault, "point"))
+            && catalogs
+                .fault_points
+                .get(text(fault, "point"))
+                .is_some_and(|point| point.carries != "result")
         {
             out.push(Diagnostic::new(
                 code::FAULT_MATCH_INVALID,
@@ -240,9 +292,9 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
                 format!("{base}/point"),
                 format!("{point:?} is not a contractual injection point"),
             )),
-            Some(actions) => {
+            Some(offered) => {
                 let action = text(fault, "action");
-                if !actions.contains(action) {
+                if !offered.actions.contains(action) {
                     out.push(Diagnostic::new(
                         code::FAULT_ACTION_UNKNOWN,
                         format!("{base}/action"),
@@ -258,6 +310,48 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
                 format!("{base}/match/command_kind"),
                 format!("{kind:?} is not a command kind"),
             ));
+        }
+    }
+    // Two faults must not select the same command or result: which of them
+    // acts would depend on the store. Selections of one point, one command
+    // kind and compatible bindings overlap when they name the same
+    // occurrence, or when only one of them names the effect, because the
+    // two then count occurrences over different sets.
+    let member = |fault: &'_ Value, pointer: &str| -> Option<String> {
+        fault
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let compatible = |left: &Option<String>, right: &Option<String>| {
+        left.is_none() || right.is_none() || left == right
+    };
+    for (index, fault) in faults.iter().enumerate() {
+        for earlier in &faults[..index] {
+            let same = |pointer: &str| member(fault, pointer) == member(earlier, pointer);
+            let effects = (
+                member(fault, "/match/result_of"),
+                member(earlier, "/match/result_of"),
+            );
+            if same("/point")
+                && same("/match/command_kind")
+                && compatible(
+                    &member(fault, "/match/publication_binding"),
+                    &member(earlier, "/match/publication_binding"),
+                )
+                && compatible(&effects.0, &effects.1)
+                && (same("/occurrence") || effects.0.is_some() != effects.1.is_some())
+            {
+                out.push(Diagnostic::new(
+                    code::FAULT_MATCH_INVALID,
+                    format!("/faults/{index}/match"),
+                    format!(
+                        "{:?} and {:?} can select the same item",
+                        text(earlier, "id"),
+                        text(fault, "id")
+                    ),
+                ));
+            }
         }
     }
     let exchanges: BTreeSet<&str> = steps
@@ -297,11 +391,14 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
                 reason,
             ));
         }
+        // A step that is already refused where it stands is not judged
+        // further: one misplaced step is one diagnostic.
         match kind {
+            _ if order_error.is_some() => {}
             "CrashBroker" => {
                 broker_up = false;
                 // A held command or result lives in the broker process.
-                for (_, state) in holds.values_mut() {
+                for (_, state, _) in holds.values_mut() {
                     if *state == Held::Yes {
                         *state = Held::Destroyed;
                     }
@@ -310,16 +407,30 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
             "RestartBroker" => broker_up = true,
             "DriveUntil" => {
                 let binding = step.get("binding").and_then(Value::as_str);
-                if let Some((_, state)) = binding.and_then(|binding| holds.get_mut(binding))
-                    && *state == Held::NotYet
+                if let Some((item, state, expected)) =
+                    binding.and_then(|binding| holds.get_mut(binding))
                 {
-                    *state = Held::Yes;
+                    if !*expected {
+                        out.push(Diagnostic::new(
+                            code::STEP_ORDER_INVALID,
+                            base.clone(),
+                            "the scenario waits for a fault it expects never to reach",
+                        ));
+                    } else if item.is_some() && *state != Held::NotYet {
+                        out.push(Diagnostic::new(
+                            code::STEP_ORDER_INVALID,
+                            base.clone(),
+                            "a fault that holds something is waited for once",
+                        ));
+                    } else if item.is_some() {
+                        *state = Held::Yes;
+                    }
                 }
             }
             "ReleaseHeldCommand" | "DeliverHeldResult" => {
-                let (needed, item) = match kind {
-                    "ReleaseHeldCommand" => ("hold_command", "command"),
-                    _ => ("delay_result", "result"),
+                let wanted = match kind {
+                    "ReleaseHeldCommand" => "command",
+                    _ => "result",
                 };
                 let name = text(step, "fault");
                 let pointer = format!("{base}/fault");
@@ -329,12 +440,12 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
                         pointer,
                         format!("no fault is declared as {name:?}"),
                     )),
-                    Some((action, _)) if *action != needed => out.push(Diagnostic::new(
+                    Some((item, _, _)) if *item != Some(wanted) => out.push(Diagnostic::new(
                         code::HELD_ITEM_MISMATCH,
                         pointer,
-                        format!("{name:?} has the action {action:?}; it holds no {item}"),
+                        format!("{name:?} holds no {wanted}"),
                     )),
-                    Some((_, state)) => {
+                    Some((_, state, _)) => {
                         let reason = match *state {
                             Held::Yes => None,
                             Held::NotYet => Some("no earlier step drives until this fault is hit"),
@@ -346,7 +457,7 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
                             Some(reason) => out.push(Diagnostic::new(
                                 code::STEP_ORDER_INVALID,
                                 base.clone(),
-                                format!("the {item} of {name:?} cannot be handed over: {reason}"),
+                                format!("the {wanted} of {name:?} cannot be handed over: {reason}"),
                             )),
                         }
                     }

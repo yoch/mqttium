@@ -13,14 +13,20 @@ use crate::files::{self, Loaded, Refusal};
 use crate::schemas::Schemas;
 use crate::{manifest, semantic, strict};
 
+/// One contractual injection point.
+#[derive(Default)]
+pub struct FaultPoint {
+    /// What passes through the point: `command` or `result`.
+    pub carries: String,
+    /// The actions the point offers.
+    pub actions: BTreeSet<String>,
+}
+
 /// The closed catalogues that documents refer to.
 #[derive(Default)]
 pub struct Catalogs {
     /// Injection point to the actions it offers.
-    pub fault_points: BTreeMap<String, BTreeSet<String>>,
-    /// Injection points through which a store result passes; a command
-    /// passes through the others.
-    pub result_points: BTreeSet<String>,
+    pub fault_points: BTreeMap<String, FaultPoint>,
     /// Command kinds a fault may match.
     pub command_kinds: BTreeSet<String>,
     /// Profile identifiers.
@@ -263,17 +269,12 @@ impl Workspace {
                 .map(|point| {
                     (
                         point["point"].as_str().unwrap_or_default().to_owned(),
-                        strings(point, "actions", ""),
+                        FaultPoint {
+                            carries: point["carries"].as_str().unwrap_or_default().to_owned(),
+                            actions: strings(point, "actions", ""),
+                        },
                     )
                 })
-                .collect(),
-            result_points: faults
-                .get("points")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter(|point| point["carries"].as_str() == Some("result"))
-                .map(|point| point["point"].as_str().unwrap_or_default().to_owned())
                 .collect(),
             command_kinds: strings(faults, "command_kinds", ""),
             profiles: strings(profiles, "profiles", "id"),

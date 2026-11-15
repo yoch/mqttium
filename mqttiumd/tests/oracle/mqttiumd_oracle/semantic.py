@@ -82,12 +82,47 @@ def _requirements(contracts, holder, base, keys, out):
 
 # ----------------------------------------------------------------- scenario
 
+# What each action of an injection point acts on; None fits any point.
+_ACTS_ON = {
+    "barrier": None,
+    "hold_command": "command",
+    "drop_result": "result",
+    "delay_result": "result",
+    "duplicate_result": "result",
+}
+# What a fault keeps until a step hands it over.
+_HOLDS = {"hold_command": "command", "delay_result": "result"}
+
 _NOT_YET, _HELD, _HANDED, _DESTROYED = range(4)
 _WHY_NOT = {
     _NOT_YET: "no earlier step drives until this fault is hit",
     _HANDED: "an earlier step already handed it over",
     _DESTROYED: "a crash destroyed what the fault held",
 }
+
+
+def _overlap(fault, earlier):
+    """Whether two faults can select the same command or result.
+
+    Selections of one point, one command kind and compatible bindings
+    overlap when they name the same occurrence, or when only one of them
+    names the effect: the two then count occurrences over different sets.
+    """
+    mine, theirs = fault["match"], earlier["match"]
+
+    def compatible(key):
+        return key not in mine or key not in theirs or mine[key] == theirs[key]
+
+    return (
+        fault["point"] == earlier["point"]
+        and mine["command_kind"] == theirs["command_kind"]
+        and compatible("publication_binding")
+        and compatible("result_of")
+        and (
+            fault["occurrence"] == earlier["occurrence"]
+            or ("result_of" in mine) != ("result_of" in theirs)
+        )
+    )
 
 
 def _scenario(contracts, document, out):
@@ -107,17 +142,27 @@ def _scenario(contracts, document, out):
         out.append(refusal.diagnostic)
 
     definitions = []
+    # fault -> [what it keeps, whether it still keeps it, expected at all]
     holds = {}
     for index, fault in enumerate(document["faults"]):
         base = f"/faults/{index}"
         _u64(document, f"{base}/occurrence", out)
-        _u64(document, f"{base}/expected_hits", out)
+        expected = _u64(document, f"{base}/expected_hits", out)
         definitions.append((f"{base}/id", fault["id"]))
-        holds.setdefault(fault["id"], [fault["action"], _NOT_YET])
+        item = _HOLDS.get(fault["action"])
+        holds.setdefault(fault["id"], [item, _NOT_YET, expected != 0])
+        if item is not None and expected is not None and expected > 1:
+            out.append(
+                Diagnostic(
+                    "held-item-mismatch",
+                    f"{base}/expected_hits",
+                    "a fault that holds something holds one item: it is reached at most once",
+                )
+            )
         if "bind_operation_as" in fault:
             definitions.append((f"{base}/bind_operation_as", fault["bind_operation_as"]))
-        actions = catalogs["fault_points"].get(fault["point"])
-        if actions is None:
+        point = catalogs["fault_points"].get(fault["point"])
+        if point is None:
             out.append(
                 Diagnostic(
                     "fault-point-unknown",
@@ -126,6 +171,7 @@ def _scenario(contracts, document, out):
                 )
             )
         else:
+            carries, actions = point
             if fault["action"] not in actions:
                 out.append(
                     Diagnostic(
@@ -134,7 +180,7 @@ def _scenario(contracts, document, out):
                         f"{fault['point']!r} does not offer {fault['action']!r}",
                     )
                 )
-            if "result_of" in fault["match"] and fault["point"] not in catalogs["result_points"]:
+            if "result_of" in fault["match"] and carries != "result":
                 out.append(
                     Diagnostic(
                         "fault-match-invalid",
@@ -150,6 +196,17 @@ def _scenario(contracts, document, out):
                     f"{fault['match']['command_kind']!r} is not a command kind",
                 )
             )
+        # Two faults must not select the same item: which of them acts
+        # would depend on the store.
+        for earlier in document["faults"][:index]:
+            if _overlap(fault, earlier):
+                out.append(
+                    Diagnostic(
+                        "fault-match-invalid",
+                        f"{base}/match",
+                        f"{earlier['id']!r} and {fault['id']!r} can select the same item",
+                    )
+                )
 
     exchanges = {
         step["bind_exchange_as"] for step in document["steps"] if "bind_exchange_as" in step
@@ -171,6 +228,8 @@ def _scenario(contracts, document, out):
     for index, step in enumerate(document["steps"]):
         base = f"/steps/{index}"
         kind = step["kind"]
+        # A step refused where it stands is not judged further: one
+        # misplaced step is one diagnostic.
         if kind == "RestartBroker":
             if broker_up:
                 out.append(Diagnostic("step-order-invalid", base, "the broker is already running"))
@@ -188,10 +247,28 @@ def _scenario(contracts, document, out):
                     hold[1] = _DESTROYED
         elif kind == "DriveUntil" and step["event"] == "FaultHit":
             hold = holds.get(step["binding"])
-            if hold is not None and hold[1] == _NOT_YET:
+            if hold is None:
+                pass
+            elif not hold[2]:
+                out.append(
+                    Diagnostic(
+                        "step-order-invalid",
+                        base,
+                        "the scenario waits for a fault it expects never to reach",
+                    )
+                )
+            elif hold[0] is not None and hold[1] != _NOT_YET:
+                out.append(
+                    Diagnostic(
+                        "step-order-invalid",
+                        base,
+                        "a fault that holds something is waited for once",
+                    )
+                )
+            elif hold[0] is not None:
                 hold[1] = _HELD
         elif kind in ("ReleaseHeldCommand", "DeliverHeldResult"):
-            needed = "hold_command" if kind == "ReleaseHeldCommand" else "delay_result"
+            wanted = "command" if kind == "ReleaseHeldCommand" else "result"
             hold = holds.get(step["fault"])
             if hold is None:
                 out.append(
@@ -201,12 +278,12 @@ def _scenario(contracts, document, out):
                         f"no fault is declared as {step['fault']!r}",
                     )
                 )
-            elif hold[0] != needed:
+            elif hold[0] != wanted:
                 out.append(
                     Diagnostic(
                         "held-item-mismatch",
                         f"{base}/fault",
-                        f"{step['fault']!r} has the action {hold[0]!r}, not {needed!r}",
+                        f"{step['fault']!r} holds no {wanted}",
                     )
                 )
             elif hold[1] != _HELD:
@@ -334,6 +411,21 @@ def _names_once(table, key):
         _unique(_named(document, table, key), table, "duplicate-name", out)
 
     return rule
+
+
+def _fault_catalog(contracts, document, out):
+    _unique(_named(document, "points", "point"), "injection point", "duplicate-name", out)
+    # A point offers only actions that act on what it carries.
+    for index, point in enumerate(document["points"]):
+        for at, action in enumerate(point["actions"]):
+            if action not in _ACTS_ON or _ACTS_ON[action] not in (None, point["carries"]):
+                out.append(
+                    Diagnostic(
+                        "fault-action-unknown",
+                        f"/points/{index}/actions/{at}",
+                        f"{action!r} is not an action on a {point['carries']}",
+                    )
+                )
 
 
 def _assertion_catalog(contracts, document, out):
@@ -753,6 +845,6 @@ _RULES = {
     "mqttiumd.store-snapshot": _store_snapshot,
     "mqttiumd.requirement-register": _names_once("entries", "id"),
     "mqttiumd.assertion-catalog": _assertion_catalog,
-    "mqttiumd.fault-catalog": _names_once("points", "point"),
+    "mqttiumd.fault-catalog": _fault_catalog,
     "mqttiumd.profile-catalog": _names_once("profiles", "id"),
 }
