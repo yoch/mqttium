@@ -347,36 +347,36 @@ fn read_meta(conn: &Connection) -> Result<Meta, Fault> {
     let opened_by = if b[2].is_empty() {
         None
     } else {
-        Some(blob_attempt(&b[2])?)
+        Some(blob_attempt(b[2])?)
     };
     let ledger = EpochLedger::from_durable(
-        StoreIncarnation::new(blob_u64(&b[0])?),
-        RunEpoch::new(blob_u64(&b[1])?),
+        StoreIncarnation::new(blob_u64(b[0])?),
+        RunEpoch::new(blob_u64(b[1])?),
         opened_by,
     )
     .map_err(|_| Fault::Corrupt)?;
     Ok(Meta {
         ledger,
-        collected_through: RunEpoch::new(blob_u64(&b[3])?),
-        revision: blob_u64(&b[4])?,
-        next_session: SessionId::new(blob_u64(&b[5])?),
-        route_revision: Revision::new(blob_u64(&b[6])?),
+        collected_through: RunEpoch::new(blob_u64(b[3])?),
+        revision: blob_u64(b[4])?,
+        next_session: SessionId::new(blob_u64(b[5])?),
+        route_revision: Revision::new(blob_u64(b[6])?),
         limits: Limits {
-            payload_bytes: PayloadBytes::new(blob_u64(&b[7])?),
-            references: References::new(blob_u64(&b[8])?),
-            exchange_slots: ExchangeSlots::new(blob_u64(&b[9])?),
-            receipt_slots: ReceiptSlots::new(blob_u64(&b[10])?),
-            max_targets_per_admission: blob_usize(&b[11])?,
-            max_topic_bytes: blob_usize(&b[12])?,
-            max_payload_bytes: blob_usize(&b[13])?,
-            max_sessions: blob_usize(&b[14])?,
-            max_route_targets: blob_usize(&b[15])?,
+            payload_bytes: PayloadBytes::new(blob_u64(b[7])?),
+            references: References::new(blob_u64(b[8])?),
+            exchange_slots: ExchangeSlots::new(blob_u64(b[9])?),
+            receipt_slots: ReceiptSlots::new(blob_u64(b[10])?),
+            max_targets_per_admission: blob_usize(b[11])?,
+            max_topic_bytes: blob_usize(b[12])?,
+            max_payload_bytes: blob_usize(b[13])?,
+            max_sessions: blob_usize(b[14])?,
+            max_route_targets: blob_usize(b[15])?,
         },
         accounts: Accounts {
-            payload_bytes: PayloadBytes::new(blob_u64(&b[16])?),
-            references: References::new(blob_u64(&b[17])?),
-            exchange_slots: ExchangeSlots::new(blob_u64(&b[18])?),
-            receipt_slots: ReceiptSlots::new(blob_u64(&b[19])?),
+            payload_bytes: PayloadBytes::new(blob_u64(b[16])?),
+            references: References::new(blob_u64(b[17])?),
+            exchange_slots: ExchangeSlots::new(blob_u64(b[18])?),
+            receipt_slots: ReceiptSlots::new(blob_u64(b[19])?),
         },
     })
 }
@@ -1702,10 +1702,14 @@ impl SqliteStore {
             },
         )?;
         section(
-            "SELECT id, client_id, revision FROM sessions WHERE state = ?1 AND ?2 = ?2 ORDER BY id",
+            "SELECT id, client_id, revision, state FROM sessions
+              WHERE (state = ?1 OR state NOT IN (1, 2)) AND ?2 = ?2 ORDER BY id",
             &mut out,
             &mut position,
             &mut |row| {
+                if code_session_state(row.get(3)?)? != SessionState::Active {
+                    return Err(Fault::Corrupt);
+                }
                 let session = SessionId::from_be_slice(reader::borrow_blob(row, 0, 8)?)
                     .map_err(|_| Fault::Corrupt)?;
                 let bytes =
@@ -1732,6 +1736,7 @@ impl SqliteStore {
             &mut out,
             &mut position,
             &mut |row| {
+                budget.check_field(32)?;
                 meter.charge(128)?;
                 let packet: i64 = row.get(0)?;
                 let packet_id = u16::try_from(packet)
@@ -1755,6 +1760,7 @@ impl SqliteStore {
             &mut out,
             &mut position,
             &mut |row| {
+                budget.check_field(32)?;
                 meter.charge(128)?;
                 let operation = OperationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
                     .map_err(|_| Fault::Corrupt)?;
@@ -1773,6 +1779,7 @@ impl SqliteStore {
             &mut out,
             &mut position,
             &mut |row| {
+                budget.check_field(32)?;
                 meter.charge(128)?;
                 let operation = OperationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
                     .map_err(|_| Fault::Corrupt)?;
@@ -1817,7 +1824,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                     SessionId::from_be_slice(reader::borrow_blob(row, 0, 8)?)
                         .map_err(|_| Fault::Corrupt)?,
                     SessionRecord {
-                        client_id: blob(row, 1)?,
+                        client_id: reader::copy_blob(row, 1, budget.max_field_bytes)?,
                         revision: Revision::new(blob_u64(reader::borrow_blob(row, 2, 8)?)?),
                         state: code_session_state(row.get(3)?)?,
                     },
@@ -1830,11 +1837,14 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                 conn.prepare("SELECT topic, session, qos FROM routes ORDER BY topic, position")?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
-                routes.entry(blob(row, 0)?).or_default().push(RouteTarget {
-                    session: SessionId::from_be_slice(reader::borrow_blob(row, 1, 8)?)
-                        .map_err(|_| Fault::Corrupt)?,
-                    qos: code_qos(row.get(2)?)?,
-                });
+                routes
+                    .entry(reader::copy_blob(row, 0, budget.max_field_bytes)?)
+                    .or_default()
+                    .push(RouteTarget {
+                        session: SessionId::from_be_slice(reader::borrow_blob(row, 1, 8)?)
+                            .map_err(|_| Fault::Corrupt)?,
+                        qos: code_qos(row.get(2)?)?,
+                    });
             }
         }
         let mut operations = BTreeMap::new();
@@ -1848,7 +1858,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                     OperationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
                         .map_err(|_| Fault::Corrupt)?,
                     OperationRecord {
-                        recipe: blob(row, 1)?,
+                        recipe: reader::copy_blob(row, 1, budget.max_field_bytes)?,
                         decision: decision_of(row, 2)?.decode()?,
                     },
                 );
@@ -1880,7 +1890,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                             .map_err(|_| Fault::Corrupt)?,
                         source: SessionId::from_be_slice(reader::borrow_blob(row, 2, 8)?)
                             .map_err(|_| Fault::Corrupt)?,
-                        topic: blob(row, 3)?,
+                        topic: reader::copy_blob(row, 3, budget.max_field_bytes)?,
                         qos: code_qos(row.get(4)?)?,
                         retain: row.get::<_, i64>(5)? == 1,
                         payload: PayloadId::from_be_slice(reader::borrow_blob(row, 6, 32)?)
@@ -1898,7 +1908,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                     PayloadId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
                         .map_err(|_| Fault::Corrupt)?,
                     PayloadRecord {
-                        bytes: blob(row, 1)?,
+                        bytes: reader::copy_blob(row, 1, budget.max_field_bytes)?,
                         references: blob_u64(reader::borrow_blob(row, 2, 8)?)?,
                     },
                 );
@@ -2136,6 +2146,7 @@ impl DurableStore for SqliteStore {
         if limit == 0 {
             return Err(RecoveryRefused::EmptyPage);
         }
+        budget.check_field(8).map_err(refused)?;
         let minimum = limit
             .checked_mul(128)
             .ok_or_else(|| refused(ReadError::LimitExceeded))?;

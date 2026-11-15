@@ -150,6 +150,9 @@ impl Meter {
 pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Result<(), Fault> {
     let mut meter = Meter::new(budget);
     budget.check_field(8)?;
+    if meta.ledger.opened_by().is_some() {
+        budget.check_field(24)?;
+    }
     meter.charge(256)?;
     let tables: [(&str, &[(usize, usize)]); 8] = [
         (
