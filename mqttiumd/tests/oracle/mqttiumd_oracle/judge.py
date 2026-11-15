@@ -73,6 +73,28 @@ def _key(identity: dict) -> tuple:
 
 
 _PACKET_KINDS = {1: "CONNECT", 3: "PUBLISH", 6: "PUBREL"}
+_OBSERVED_KINDS = {2: "CONNACK", 5: "PUBREC", 7: "PUBCOMP"}
+
+
+def _observed(data: bytes):
+    """``(kind, Packet Identifier, reason code)`` of one whole packet a client receives.
+
+    Decoded from the MQTT 5 fixed and variable headers; a PUBREC or PUBCOMP
+    of remaining length 2 omits its reason, which is then 0 (section
+    3.5.2.1). ``None`` when the bytes are not one such packet.
+    """
+    if len(data) < 2:
+        return None
+    kind = _OBSERVED_KINDS.get(data[0] >> 4)
+    length = data[1]
+    if kind is None or length & 0x80 or len(data) != 2 + length:
+        return None
+    if kind == "CONNACK":
+        return (kind, None, data[3]) if length >= 2 else None
+    if length < 2:
+        return None
+    packet_id = int.from_bytes(data[2:4], "big")
+    return kind, packet_id, data[4] if length > 2 else 0
 
 
 def _packet(data: bytes):
@@ -268,7 +290,15 @@ class Run:
                     )
                     open_now[slot] = Exchange(slot[0], slot[1], ordinal, record)
                     found.append(open_now[slot])
-            elif record.kind == "PeerPacketObserved" and slot in open_now:
+            elif record.kind == "PeerPacketObserved":
+                # What the peer says it decoded must be what its bytes hold.
+                decoded = _observed(bytes.fromhex(payload["bytes_hex"]))
+                stated = (payload["packet_kind"], payload.get("packet_id"), payload["reason_code"])
+                if decoded != stated:
+                    notes.append(f"record {record.sequence}: the bytes are not the packet stated")
+                    continue
+                if slot not in open_now:
+                    continue
                 if payload["packet_kind"] == "PUBREC":
                     if payload["reason_code"] >= 0x80:
                         open_now.pop(slot).closed = record
@@ -333,6 +363,7 @@ def one_admission_per_observed_inbound_exchange(run):
     clients = run.client_of_session()
     slots = run.slots()
     counts = {id(exchange): [] for exchange in exchanges}
+    placeable = set()
     statuses, reasons = [], []
     # Two admissions of one exchange stay two whatever record is added. An
     # admission that is missing, or an exchange that is, may be the very
@@ -348,19 +379,21 @@ def one_admission_per_observed_inbound_exchange(run):
             reasons.append(f"the admission {operation} cannot be attributed: no readable recipe")
             continue
         slot = (clients[session], packet_id)
-        owner, unknown = None, False
+        owner, unknown = None, []
         for exchange in exchanges:
             if (exchange.client, exchange.packet_id) != slot:
                 continue
             opened = run.trace.before(exchange.opened, commit)
             ended = exchange.closed is not None and run.trace.before(exchange.closed, commit)
             if opened is None or ended is None:
-                unknown = True
+                unknown.append(exchange)
             elif opened and not ended:
                 owner = exchange
         if owner is not None:
             counts[id(owner)].append(operation)
         elif unknown:
+            # The admission may belong to any of these exchanges.
+            placeable.update(id(exchange) for exchange in unknown)
             statuses.append(INCONCLUSIVE)
             reasons.append(f"the trace does not order the admission {operation} with its exchange")
         else:
@@ -374,8 +407,13 @@ def one_admission_per_observed_inbound_exchange(run):
             statuses.append(FAIL)
             reasons.append(f"{name} has {len(admissions)} admissions: {admissions}")
         elif not admissions and exchange.positive_pubrec is not None:
-            statuses.append(FAIL)
-            reasons.append(f"{name} was acknowledged and has no admission")
+            if id(exchange) in placeable:
+                # An admission the trace cannot place may be this one.
+                statuses.append(INCONCLUSIVE)
+                reasons.append(f"{name} was acknowledged; its admission cannot be placed")
+            else:
+                statuses.append(FAIL)
+                reasons.append(f"{name} was acknowledged and has no admission")
     return Status(_worst(statuses), reasons, stands)
 
 
@@ -498,14 +536,23 @@ def same_recipe_for_op_A(run):
         for record in run.trace.of_kind("StoreCommitStable")
         if _key(record.payload["operation_id"]) == operation
     ]
-    reasons, observed = [], 0
+    reasons, unknown, observed = [], [], 0
     for name, (inspection, snapshot) in run.snapshots.items():
         present = any(_key(row["operation_id"]) == operation for row in snapshot["operations"])
         observed += present
-        if not present and any(run.trace.before(commit, inspection) for commit in commits):
+        if present:
+            continue
+        orders = [run.trace.before(commit, inspection) for commit in commits]
+        if any(orders):
             reasons.append(f"{name}: the committed operation {operation} has no recipe")
+        elif None in orders:
+            # The trace does not say whether the commit precedes this
+            # inspection: the absence of the recipe proves nothing either way.
+            unknown.append(f"{name}: the trace does not order the commit of {operation} with it")
     if reasons:
         return Status(FAIL, reasons)
+    if unknown:
+        return Status(INCONCLUSIVE, unknown)
     if observed == 0:
         return Status(INCONCLUSIVE, [f"no snapshot holds the recipe of {operation}"])
     return Status(PASS)
@@ -659,12 +706,12 @@ def broker_inputs_have_provenance(run):
             fired.add(token)
 
         pages = side("store-adapter", incarnation, "RecoveryPageRead")
-        # The pages the adapter read are one inventory (record 0014): the
-        # order holds from page to page, and a route belongs to the table
-        # that precedes it. A page of another kind of store is not an input
-        # a core may be given.
+        # The pages the core received are one inventory (record 0014), in
+        # the order it received them: the order holds from page to page,
+        # and a route belongs to the table that precedes it. How often and
+        # in what order the adapter read them is not what the core was given.
         inventory, table = InventoryOrder(), False
-        for page in pages:
+        for page in side("broker-core", incarnation, "RecoveryPageDelivered"):
             for index, fact in enumerate(page.payload["facts"]):
                 refusal = inventory.admit(fact)
                 if refusal is not None:
@@ -746,16 +793,17 @@ def broker_inputs_have_provenance(run):
 
 
 def _closures(run):
-    """OperationId -> the snapshots' word that it is closed: fenced, or refused by receipt."""
-    closed = set()
-    for _, snapshot in run.snapshots.values():
-        closed.update(_key(row["operation_id"]) for row in snapshot["fences"])
+    """(inspection, OperationIds) per snapshot: what it shows closed, fenced or refused by receipt."""
+    found = []
+    for inspection, snapshot in run.snapshots.values():
+        closed = {_key(row["operation_id"]) for row in snapshot["fences"]}
         closed.update(
             _key(row["operation_id"])
             for row in snapshot["operations"]
             if row["decision"]["kind"] == "RejectedCertain"
         )
-    return closed
+        found.append((inspection, closed))
+    return found
 
 
 def fenced_operation_never_executed(run):
@@ -766,18 +814,16 @@ def fenced_operation_never_executed(run):
         commits.setdefault(_key(record.payload["operation_id"]), []).append(record)
     for fence in run.trace.of_kind("StoreFenceStable"):
         operation = _key(fence.payload["operation_id"])
+        # One identity is fenced or committed, never both: whichever came
+        # first, the second is a violation, and the order is not needed.
         for commit in commits.get(operation, []):
             order = run.trace.before(fence, commit)
-            if order is None:
-                statuses.append(INCONCLUSIVE)
-                reasons.append(
-                    f"record {commit.sequence}: not ordered with the fence of {operation}"
-                )
-            elif order:
-                statuses.append(FAIL)
-                reasons.append(
-                    f"record {commit.sequence}: {operation} is committed after its fence"
-                )
+            when = {True: "after", False: "before", None: "unordered with"}[order]
+            statuses.append(FAIL)
+            reasons.append(
+                f"record {commit.sequence}: {operation} is committed {when} its fence, "
+                f"record {fence.sequence}"
+            )
     for name, (_, snapshot) in run.snapshots.items():
         closed = {_key(row["operation_id"]) for row in snapshot["fences"]}
         for row in snapshot["operations"]:
@@ -802,12 +848,19 @@ def certain_rejection_has_a_closure(run):
         if record.payload["outcome"] != "RejectedCertain":
             continue
         operation = _key(record.payload["operation_id"])
+        # A closure justifies the refusal only if it was established before
+        # it: a fence recorded earlier, or a snapshot inspected earlier that
+        # holds it. One that appears afterwards is what DEM-MU-01 catches.
         fenced_before = [
             run.trace.before(fence, record)
             for fence in fences
             if _key(fence.payload["operation_id"]) == operation
+        ] + [
+            run.trace.before(inspection, record)
+            for inspection, operations in closed
+            if operation in operations
         ]
-        if any(fenced_before) or operation in closed:
+        if any(fenced_before):
             continue
         if None in fenced_before or unusable:
             statuses.append(INCONCLUSIVE)

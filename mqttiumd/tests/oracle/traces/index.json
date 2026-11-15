@@ -721,6 +721,22 @@
       "why": "The reason a peer says it decoded is not the reason in the bytes it observed."
     },
     {
+      "name": "observed-bytes-are-more-than-the-packet",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/observed-bytes-are-more-than-the-packet/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "INCONCLUSIVE",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "The bytes a peer observed hold more than the one packet it says it decoded."
+    },
+    {
       "name": "provenance-input-refused",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/provenance-input-refused/trace.jsonl",

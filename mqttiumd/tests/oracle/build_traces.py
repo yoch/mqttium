@@ -1613,6 +1613,22 @@ case(
 )
 
 
+def trailing_byte(events):
+    # The bytes the peer observed are more than the one PUBREC it states.
+    deepcopy_payloads(events)
+    for event in events:
+        if event["kind"] == "PeerPacketObserved" and event["payload"]["packet_kind"] == "PUBREC":
+            event["payload"]["bytes_hex"] += "00"
+
+
+case(
+    "observed-bytes-are-more-than-the-packet",
+    "The bytes a peer observed hold more than the one packet it says it decoded.",
+    {"one_admission_per_observed_inbound_exchange": "INCONCLUSIVE"},
+    events=trailing_byte,
+)
+
+
 case(
     "provenance-input-refused",
     "The dispatcher refused a result that answered no effect in flight.",
