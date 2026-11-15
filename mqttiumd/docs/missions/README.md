@@ -16,7 +16,7 @@ close.
 | Base branch | `main` |
 | Integrated revision | `874f298b4de7c3a13006cb1ff767dfb09e4031ac`, the merge of PR yoch/mqttium#647 (lot L0, with the amended record 0009) |
 | Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb`, as `validate` prints it on that revision |
-| Contract digest on the integration branch | `sha256:4b216f228eb2cbe8130d44856dd3875d45ce0f4c1b9a49a481853d5691246e08` since the manifest gained the optional identities of the oracle and of the generators (second wave, 15 November 2026). Before it in the second wave: `sha256:54975bb0…e652` with the corrections of findings K1 and F5 and the scenario P1-02b (records of the hand-over of a result and of the opening of an epoch, the assertions `one_grant_per_opened_epoch` and `terminal_knowledge_never_regresses`, the step `LeaveBarrier`). It was `sha256:5fe5d83f…cca2` at the end of the first wave. The digest above is the one every lot started from |
+| Contract digest on the integration branch | `sha256:7ded2dfbcbf1dd6c70e926202b3531973790736360cb4538bdb0c3b7b9ca11a7` since the record `StepBlocked`, the assertion `scenario_reaches_its_end`, the outcome `Violation` and the refusal of a fence fault that names an unselected command were merged (second wave, 15 November 2026). Before it in the second wave: `sha256:671b03c3…f85a` when the description of `refusal_carries_the_reason_of_its_rejection` said what it compares; `sha256:4b216f22…6e08` when the manifest gained the optional identities of the oracle and of the generators; `sha256:54975bb0…e652` with the corrections of findings K1 and F5 and the scenario P1-02b (records of the hand-over of a result and of the opening of an epoch, the assertions `one_grant_per_opened_epoch` and `terminal_knowledge_never_regresses`, the step `LeaveBarrier`). It was `sha256:5fe5d83f…cca2` at the end of the first wave. The digest above is the one every lot started from |
 
 Every lot starts from the integrated revision. The commit that records it
 here differs from it by this file only, and changes no contract. Every lot
@@ -101,6 +101,7 @@ One lot per branch and per session. A lot changes only the paths it owns.
 | L4 Bench runner (second wave) | `crates/mqttiumd-lab/src/bench/`, the `run` command of `crates/mqttiumd-lab/src/main.rs`, `crates/mqttiumd-lab/tests/bench_*.rs`, `tests/scenarios/p1/P1-02b.json` (the vocabulary stays with L3) | [L4](L4-bench-runner.md) |
 | L5 Model M1 | `models/`, the model step of the workflow | [L5](L5-model-m1.md) |
 | L6 Pilot proof | `crates/mqttiumd-core/src/credits.rs`, `proofs/` | [L6](L6-pilot-proof.md) |
+| L7 SQLite store (second wave) | `crates/mqttiumd-store-api/`, `crates/mqttiumd-store-sqlite/`, `tools/measure_writer.*` and its reports under `docs/reports/` | [L7](L7-sqlite-store.md) |
 
 Shared by all, changed only through the integration owner:
 `Cargo.toml`, `Cargo.lock`, `.github/workflows/mqttiumd.yml`, `AGENTS.md`,
