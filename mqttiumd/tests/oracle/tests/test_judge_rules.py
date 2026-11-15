@@ -213,7 +213,11 @@ class Rules(unittest.TestCase):
                 page = events[corpus.at(events, label)]
                 page["payload"] = dict(page["payload"], page="1")
 
-        self.only(PROVENANCE, "FAIL", edit)
+        found = self.statuses(edit)
+        self.assertEqual(found[PROVENANCE], "FAIL")
+        # Without page zero no complete recovery can authorize the later
+        # positive PUBREC, even though its one fact describes AwaitPubrel.
+        self.assertEqual(found[ACK], "FAIL")
 
     def test_write_progress_belongs_to_a_frame_the_core_made_eligible(self):
         def edit(events):

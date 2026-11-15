@@ -2661,6 +2661,23 @@ bad(
     "At most the first 64 failure contexts are kept in a result (record 0021).",
     edited(FAILED_READ_RESULT, lambda v: v.update(failure_count="65", failures=v["failures"] * 65)),
 )
+for count in ("0", "2", "65"):
+    bad(
+        f"run-result-failure-count-{count}-with-one-context.json", "result-incomplete", "/failures",
+        "The retained inventory contains exactly min(failure_count, 64) contexts, without concealing discarded ones.",
+        edited(FAILED_READ_RESULT, lambda v, count=count: v.update(failure_count=count)),
+    )
+for path in (["failure_count"], ["failures", 0, "process_incarnation"], ["failures", 0, "record_sequence"]):
+    bad(
+        "run-result-failure-overflow-" + "-".join(map(str, path)) + ".json", "u64-out-of-range",
+        "".join(f"/{part}" for part in path), "Failure totals and identities remain unsigned 64-bit decimal strings.",
+        edited(FAILED_READ_RESULT, setter(path, OVER)),
+    )
+trace_case(
+    "read-failure-process-incarnation-overflow", READ_FAILED, "/payload/process_incarnation",
+    "The failed process is a 64-bit identity even before Started.",
+    setter(["payload", "process_incarnation"], OVER), code="u64-out-of-range",
+)
 
 
 def at_least(minimum, hits):

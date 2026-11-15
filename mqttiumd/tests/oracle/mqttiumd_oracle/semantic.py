@@ -672,6 +672,18 @@ def _run_result(contracts, document, out):
             reached = reached and expected is not None and expected == hits
     for index in range(len(document["artifacts"])):
         _u64(document, f"/artifacts/{index}/bytes", out)
+    if "failure_count" in document:
+        count = _u64(document, "/failure_count", out)
+        failures = document["failures"]
+        for index, failure in enumerate(failures):
+            for member in ("process_incarnation", "record_sequence", "page"):
+                if member in failure:
+                    _u64(document, f"/failures/{index}/{member}", out)
+        if count is not None and len(failures) != min(count, 64):
+            out.append(Diagnostic(
+                "result-incomplete", "/failures",
+                "the failure list must contain exactly min(failure_count, 64) contexts",
+            ))
 
     qualifying = document["qualification"] == "qualifying"
     expected = verdict_of(statuses, reached)

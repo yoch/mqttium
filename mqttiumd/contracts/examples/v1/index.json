@@ -1432,6 +1432,48 @@
       "why": "At most the first 64 failure contexts are kept in a result (record 0021)."
     },
     {
+      "file": "contracts/examples/v1/invalid/run-result-failure-count-0-with-one-context.json",
+      "code": "result-incomplete",
+      "pointer": "/failures",
+      "why": "The retained inventory contains exactly min(failure_count, 64) contexts, without concealing discarded ones."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-failure-count-2-with-one-context.json",
+      "code": "result-incomplete",
+      "pointer": "/failures",
+      "why": "The retained inventory contains exactly min(failure_count, 64) contexts, without concealing discarded ones."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-failure-count-65-with-one-context.json",
+      "code": "result-incomplete",
+      "pointer": "/failures",
+      "why": "The retained inventory contains exactly min(failure_count, 64) contexts, without concealing discarded ones."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-failure-overflow-failure_count.json",
+      "code": "u64-out-of-range",
+      "pointer": "/failure_count",
+      "why": "Failure totals and identities remain unsigned 64-bit decimal strings."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-failure-overflow-failures-0-process_incarnation.json",
+      "code": "u64-out-of-range",
+      "pointer": "/failures/0/process_incarnation",
+      "why": "Failure totals and identities remain unsigned 64-bit decimal strings."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-result-failure-overflow-failures-0-record_sequence.json",
+      "code": "u64-out-of-range",
+      "pointer": "/failures/0/record_sequence",
+      "why": "Failure totals and identities remain unsigned 64-bit decimal strings."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-read-failure-process-incarnation-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/process_incarnation",
+      "why": "The failed process is a 64-bit identity even before Started."
+    },
+    {
       "file": "contracts/examples/v1/invalid/run-result-repeated-fault-below-its-minimum.json",
       "code": "verdict-inconsistent",
       "pointer": "/verdict",
