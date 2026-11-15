@@ -1346,9 +1346,125 @@ case(
         # whose admission cannot be placed does not lack one.
         "one_admission_per_observed_inbound_exchange": "INCONCLUSIVE",
         "no_pubrec_observed_before_crash": "INCONCLUSIVE",
+        # Nor whether the acknowledgement precedes an inspection, so
+        # whether that snapshot must hold the publication.
+        "same_required_obligations_at_both_checkpoints": "INCONCLUSIVE",
     },
     events=sqlite_header,
     snapshots=on_sqlite(lambda states: states["final"]["operations"].pop(0)),
+)
+
+# ---------------------------------------------- second wave, finding F2
+
+
+def without(*tables):
+    """The snapshots of every checkpoint lose these tables' rows."""
+
+    def apply(states):
+        for state in states.values():
+            for table in tables:
+                state[table] = []
+
+    return apply
+
+
+case(
+    "payloads-gone-at-both-checkpoints",
+    "F2: the store lost every payload; the obligations still name a payload nobody holds.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=without("payloads"),
+)
+case(
+    "publications-and-payloads-gone",
+    "F2: the store lost publications and payloads, and kept their obligations as orphans.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=without("publications", "payloads"),
+)
+
+
+def other_payload(states):
+    for state in states.values():
+        for row in state["payloads"]:
+            row["sha256"] = "0" * 64
+
+
+case(
+    "payload-is-not-what-the-client-sent",
+    "F2: the payload the store holds is not the one the client published and was acknowledged for.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=other_payload,
+)
+
+
+def orphan_obligation(states):
+    # One more obligation, the same at both checkpoints, for a publication
+    # the store does not hold.
+    for state in states.values():
+        extra = dict(state["obligations"][-1], publication_id=scoped(1, 9), index=0)
+        state["obligations"].append(extra)
+
+
+case(
+    "obligation-of-a-publication-nobody-holds",
+    "F2: an obligation, the same at both checkpoints, names a publication the store does not hold.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=orphan_obligation,
+)
+
+
+def publication_without_payload(states):
+    # One more publication, on a topic nobody routes, whose payload the
+    # store does not hold.
+    for state in states.values():
+        extra = dict(
+            state["publications"][0],
+            publication_id=scoped(1, 9),
+            operation_id=scoped(1, 9),
+            payload_id=scoped(1, 9),
+            topic_hex=b"p1/other".hex(),
+        )
+        state["publications"].append(extra)
+
+
+case(
+    "publication-of-a-payload-nobody-holds",
+    "F2: a publication, the same at both checkpoints, names a payload the store does not hold.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=publication_without_payload,
+)
+
+WITH_PROPERTIES = "3418000a" + TOPIC.hex() + "0007" + "02" + "0101" + PAYLOAD.hex()
+
+
+def publish_with_properties(events):
+    # The client's PUBLISH carries a property (payload format indicator):
+    # its payload is still the same bytes.
+    for event in events:
+        event["payload"] = copy.deepcopy(event["payload"])
+        if event["payload"].get("bytes_hex") == PUBLISH_HEX:
+            event["payload"]["bytes_hex"] = WITH_PROPERTIES
+        elif event["payload"].get("bytes_hex") == PUBLISH_DUP_HEX:
+            event["payload"]["bytes_hex"] = "3c" + WITH_PROPERTIES[2:]
+
+
+case(
+    "p1-02-good-publish-with-a-property",
+    "The client's PUBLISH carries a property; the payload the store holds is still what it sent.",
+    events=publish_with_properties,
+)
+
+
+def everything_gone(states):
+    for state in states.values():
+        for table in ("publications", "payloads", "obligations"):
+            state[table] = []
+
+
+case(
+    "acknowledged-publication-gone",
+    "F2: the client was acknowledged, and the store holds no publication, payload or obligation for it.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=everything_gone,
 )
 
 # ------------------------------------------------------- positive acknowledgement

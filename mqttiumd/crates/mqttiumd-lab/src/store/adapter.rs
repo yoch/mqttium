@@ -205,6 +205,10 @@ pub enum FaultRefused {
     /// passage. Only one fault fires at a passage, and the other would
     /// count it without firing: two faults never select one element.
     Overlaps(FaultId),
+    /// A duplicated result takes one more result slot than its command
+    /// did. The slot is reserved when the fault is armed; this one would
+    /// leave no slot for a command.
+    NoResultSlot,
 }
 
 /// Evidence recorded by the adapter, in order. Lot L3 owns the trace
@@ -328,6 +332,8 @@ pub struct AdapterLimits {
     /// Commands accepted and not in the writer yet.
     pub operations_in_flight: usize,
     /// Results owed: commands in transit plus results not delivered.
+    /// An armed `DuplicateResult` reserves one more until its copies are
+    /// delivered; a fault that is never reached keeps it for the run.
     pub result_slots: usize,
     pub faults: usize,
     /// Events kept until they are taken. Past it, evidence is lost and
@@ -498,12 +504,26 @@ impl<S: DurableStore> SimStore<S> {
         if let Some(index) = overlap {
             return Err(FaultRefused::Overlaps(FaultId(index)));
         }
+        // A duplicate makes one more result than its command: that slot
+        // is reserved now, and one is left for a command to reach it.
+        if spec.action == FaultAction::DuplicateResult
+            && self.owed().saturating_add(2) > self.limits.result_slots
+        {
+            return Err(FaultRefused::NoResultSlot);
+        }
         self.faults.push(ArmedFault {
             spec,
             seen: 0,
             hits: 0,
         });
         Ok(FaultId(self.faults.len() - 1))
+    }
+
+    /// The results owed now: commands in transit plus results ready and
+    /// not delivered, copies included. Never more than `result_slots`.
+    #[must_use]
+    pub fn results_owed(&self) -> usize {
+        self.transit.len().saturating_add(self.ready.len())
     }
 
     /// How many times a fault was reached.
@@ -579,6 +599,18 @@ impl<S: DurableStore> SimStore<S> {
         reached
     }
 
+    /// The result slots taken: results owed, and one for each armed
+    /// duplicate that has not fired. A duplicate that fired puts its copy
+    /// in the slot it reserved, so `result_slots` bounds what is owed.
+    fn owed(&self) -> usize {
+        let reserved = self
+            .faults
+            .iter()
+            .filter(|armed| armed.spec.action == FaultAction::DuplicateResult && armed.hits == 0)
+            .count();
+        self.results_owed().saturating_add(reserved)
+    }
+
     fn room(&self) -> Result<(), SubmitBlock> {
         if self.halt.is_some() {
             return Err(SubmitBlock::Closed);
@@ -586,8 +618,7 @@ impl<S: DurableStore> SimStore<S> {
         if self.transit.len() >= self.limits.operations_in_flight {
             return Err(SubmitBlock::InFlightLimit);
         }
-        let owed = self.transit.len().saturating_add(self.ready.len());
-        if owed >= self.limits.result_slots {
+        if self.owed() >= self.limits.result_slots {
             return Err(SubmitBlock::QueueFull);
         }
         Ok(())

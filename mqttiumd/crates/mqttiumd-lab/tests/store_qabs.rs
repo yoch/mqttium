@@ -13,7 +13,9 @@ use mqttiumd_lab::store::adapter::{
     AdapterLimits, Delivery, FaultAction, FaultId, FaultPoint, FaultSpec, Performed, SimStore,
     StoreAction, StoreEvent, WorkId, WorkKind,
 };
-use mqttiumd_lab::store::conformance::{World, opening_command, operation_id};
+use mqttiumd_lab::store::conformance::{
+    World, accounts_match_what_is_held, opening_command, operation_id,
+};
 use mqttiumd_lab::store::durable::{AdminCommand, Durability, DurableStore, Limits, MemoryStore};
 
 type Bench = World<SimStore<MemoryStore>>;
@@ -303,6 +305,7 @@ enum Step {
     OpenEpoch,
     Collect,
     DeleteTarget,
+    Release,
 }
 
 /// Whatever the order of commands, fences, epoch openings, collections
@@ -321,6 +324,7 @@ fn the_store_never_contradicts_a_terminal_result() {
         Step::OpenEpoch,
         Step::Collect,
         Step::DeleteTarget,
+        Step::Release,
     ];
     const DEPTH: u32 = 5;
     let base = steps.len();
@@ -336,6 +340,7 @@ fn the_store_never_contradicts_a_terminal_result() {
             world.admission(2, 7, b"payload", &[world.b]),
         ];
         let mut knowledge = [Knowledge::Unknown; 2];
+        let mut released = false;
         let mut observe = |index: usize, reply: StoreOutcome| {
             let before = knowledge[index];
             let after = before
@@ -373,13 +378,28 @@ fn the_store_never_contradicts_a_terminal_result() {
                         .store
                         .admin(AdminCommand::DeleteSession { session: world.c });
                 }
+                Step::Release => {
+                    // Ends the exchange of whichever admission took the
+                    // slot: the other may then take it.
+                    let release = world.release(3, 7, 1);
+                    let reply = outcome(world.store.apply(&release).reply);
+                    released |= matches!(reply, StoreOutcome::Committed(_));
+                }
             }
+            assert_eq!(
+                accounts_match_what_is_held(&world.store.snapshot()),
+                Ok(()),
+                "run {run}"
+            );
         }
         let committed = knowledge
             .iter()
             .filter(|known| matches!(known, Knowledge::Committed(_)))
             .count();
-        assert!(committed <= 1, "two admissions of one inbound exchange");
+        assert!(
+            committed <= 1 + usize::from(released),
+            "two admissions of one inbound exchange"
+        );
         assert_eq!(
             world.store.snapshot().publications.len(),
             committed,

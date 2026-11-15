@@ -15,9 +15,11 @@
 //! for all the slots of the plan. When the box refuses, nothing was taken
 //! and the input goes back as it came.
 //!
-//! The owner holds no effect box. The box of each step is handed to it,
-//! so the holder of the creation authority may replace a box (ADR 0009)
-//! and no counter of the owner starts again.
+//! An owner is built from its effect box, which it takes and keeps: a box
+//! exists once, and the creation authority creates no second box for an
+//! identity that is active (ADR 0009), so no path builds two owners of one
+//! identity. The box is replaced through the owner, [`Owner::renew_box`],
+//! and no counter or state of the owner starts again.
 
 use core::num::{NonZeroU32, NonZeroUsize};
 
@@ -31,8 +33,9 @@ use crate::contract::command::{
     ReleaseInbound, Source, Target,
 };
 use crate::contract::effects::{
-    CloseReason, Effect, EffectReservation, FactRank, FrameProgress, Input, Outbox, OwnedEffect,
-    RecoveredFact, RecoveryOrder,
+    CloseReason, CreateRefused, DispatchReport, Effect, EffectReservation, EffectSink, FactRank,
+    FrameProgress, Input, Outbox, OwnedEffect, OwnerAuthority, RecoveredFact, RecoveryOrder,
+    RetireRefusal,
 };
 use crate::contract::ids::{
     AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, DeliveryId, EffectId, EffectSeq,
@@ -59,10 +62,12 @@ pub const MAX_TRANSITION_SLOTS: usize = 2;
 /// resolution fenced the operation before it arrived.
 pub const MAX_RELEASE_PREPARATIONS: u32 = 4;
 
-/// How many resolutions of one operation the owner retains, the latest
-/// ones. The answer to an older resolution is not matched to the
-/// operation: it is absorbed, and the next resolution answers again.
-pub const RETAINED_RESOLUTIONS: usize = 4;
+/// The latest resolutions of one operation the owner retains.
+pub const RECENT_RESOLUTIONS: usize = 2;
+
+/// The latest landmark resolutions of one operation the owner retains: those
+/// whose rank among the resolutions of the operation is a power of two.
+pub const LANDMARK_RESOLUTIONS: usize = 4;
 
 /// The bits of an exchange generation that count the exchanges of one run
 /// epoch. The bits above them hold the epoch: see [`Counters`].
@@ -100,17 +105,34 @@ pub struct OwnerConfig {
 
 /// Why an owner was not constructed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum OwnerRefused {
+pub enum OwnerRefusal {
     /// The box cannot hold the largest reservation of a transition.
     BoxTooSmall { capacity: usize, needed: usize },
     /// The tables could not be allocated.
     AllocationFailed,
 }
 
-impl From<AllocationFailed> for OwnerRefused {
-    fn from(_: AllocationFailed) -> Self {
-        Self::AllocationFailed
-    }
+/// An owner that was not constructed, and the box it was given back.
+#[derive(Debug)]
+pub struct OwnerRefused {
+    pub outbox: Outbox,
+    pub reason: OwnerRefusal,
+}
+
+/// Why a box was not renewed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RenewRefused {
+    /// The authority is not the one of the owner's run epoch. Nothing
+    /// changed.
+    ForeignAuthority,
+    /// The new box could not hold the largest reservation of a transition.
+    /// Nothing changed.
+    BoxTooSmall { capacity: usize, needed: usize },
+    /// The box could not be retired; the owner keeps it. Nothing changed.
+    Retire(RetireRefusal),
+    /// The box was retired and the new one was not created: the owner has
+    /// no box until a renewal succeeds. Its counters and state are kept.
+    Create(CreateRefused),
 }
 
 /// The state of an inbound QoS 2 exchange the owner holds. A Packet
@@ -212,35 +234,78 @@ struct Limits {
     max_payload_bytes: PayloadBytes,
 }
 
-/// The effects whose results the owner applies to one operation: the
-/// command that proposed it and its latest resolutions (ADR 0001). A
-/// result that names another effect does not answer the operation.
+/// The effects whose results the owner applies to one operation (ADR 0001,
+/// audit F3). The invariants, for the correspondence with model M1:
+///
+/// - I1, bound. An operation in flight, and a terminated operation the
+///   owner retains, keep at most `1 + RECENT_RESOLUTIONS +
+///   LANDMARK_RESOLUTIONS` effect identifiers: the `Persist` that proposed
+///   it, its `RECENT_RESOLUTIONS` latest resolutions, and its
+///   `LANDMARK_RESOLUTIONS` latest landmarks, the resolutions whose rank
+///   among those of the operation is a power of two.
+/// - I2, nothing forged. A result is applied to an operation only when its
+///   `EffectId` is of the owner and of its run epoch, was issued, and is
+///   one the operation retains. Another effect (a frame, a deadline, a
+///   resolution of another operation, a resolution no longer retained) is
+///   absorbed and changes nothing; an effect of another epoch, or never
+///   issued, is a fault.
+/// - I3, progress. One resolution is emitted at each deadline of an
+///   unresolved operation, whatever is retained. If the answer of each
+///   resolution arrives at most `k` resolutions later, `k` finite and
+///   unknown, in any order, and finitely many answers are lost, the first
+///   landmark `p >= k` whose answer is not lost is still retained when it
+///   arrives: it arrives by rank `p + k <= 2p`, and a landmark is retained
+///   up to rank `p * 2^LANDMARK_RESOLUTIONS`.
+/// - I4, monotonic knowledge. A repeated result changes nothing. A result
+///   that contradicts what the operation established is a fault while the
+///   operation is retained; beyond the retained terminated operations it
+///   is absorbed (`OwnerConfig::retained_operations`).
+/// - I5, consumed. A terminated operation never goes through the
+///   application path again; its late results only meet the check of I4.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Answers {
     persist: EffectId,
-    resolutions: [Option<EffectId>; RETAINED_RESOLUTIONS],
-    /// The place the next resolution takes; the oldest one is replaced.
-    next: usize,
+    recent: [Option<EffectId>; RECENT_RESOLUTIONS],
+    landmarks: [Option<EffectId>; LANDMARK_RESOLUTIONS],
+    /// Resolutions emitted for the operation so far.
+    emitted: u64,
 }
 
 impl Answers {
     fn new(persist: EffectId) -> Self {
         Self {
             persist,
-            resolutions: [None; RETAINED_RESOLUTIONS],
-            next: 0,
+            recent: [None; RECENT_RESOLUTIONS],
+            landmarks: [None; LANDMARK_RESOLUTIONS],
+            emitted: 0,
         }
     }
 
     fn names(&self, effect: EffectId) -> bool {
-        self.persist == effect || self.resolutions.contains(&Some(effect))
+        self.persist == effect
+            || self.recent.contains(&Some(effect))
+            || self.landmarks.contains(&Some(effect))
     }
 
+    /// Retains the next resolution of the operation.
     fn with(mut self, resolution: EffectId) -> Self {
-        if let Some(place) = self.resolutions.get_mut(self.next) {
-            *place = Some(resolution);
+        self.emitted = self.emitted.saturating_add(1);
+        let rank = self.emitted;
+        let place = |rank: u64, len: usize| {
+            usize::try_from(rank % u64::try_from(len).unwrap_or(1)).unwrap_or(0)
+        };
+        if let Some(slot) = self.recent.get_mut(place(rank, RECENT_RESOLUTIONS)) {
+            *slot = Some(resolution);
         }
-        self.next = (self.next + 1) % RETAINED_RESOLUTIONS;
+        if rank.is_power_of_two() {
+            let landmark = u64::from(rank.trailing_zeros());
+            if let Some(slot) = self
+                .landmarks
+                .get_mut(place(landmark, LANDMARK_RESOLUTIONS))
+            {
+                *slot = Some(resolution);
+            }
+        }
         self
     }
 }
@@ -333,6 +398,10 @@ struct Refusal {
 
 /// The change of state of a transition. Indices name entries of the
 /// tables at the revision the plan was computed against.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a plan lives once on the stack of a step; boxing would allocate while planning"
+)]
 #[derive(Debug)]
 enum Change {
     /// The input is absorbed: late, repeated, or answered by effects only.
@@ -455,6 +524,86 @@ impl Draft {
 
 /// One logical owner: its sessions, its routes, its inbound exchanges and
 /// the counters of the identities it issues.
+///
+/// The start-up path builds an owner from the authority of its run epoch
+/// and the one box it creates for that owner:
+///
+/// ```
+/// # use core::num::{NonZeroU32, NonZeroUsize};
+/// # use mqttiumd_core::contract::capacity::PayloadBytes;
+/// # use mqttiumd_core::contract::command::StartupNonce;
+/// # use mqttiumd_core::contract::effects::OwnerAuthority;
+/// # use mqttiumd_core::contract::ids::{
+/// #     AccountId, LogicalDuration, LogicalOwnerId, RunEpoch, StoreIncarnation,
+/// # };
+/// # use mqttiumd_core::contract::outcome::{
+/// #     EpochOpened, EpochOpening, OpeningOutcome, OpeningReply,
+/// # };
+/// # use mqttiumd_core::owner::{Owner, OwnerConfig};
+/// # let one = NonZeroU32::new(1).unwrap();
+/// # let incarnation = StoreIncarnation::new(1);
+/// # let mut opening = EpochOpening::new(incarnation, StartupNonce::new([1; 16]));
+/// # let command = opening.submit(RunEpoch::new(1)).unwrap();
+/// # let committed = EpochOpened { incarnation, epoch: RunEpoch::new(2) };
+/// # let outcome = OpeningOutcome::Committed(committed);
+/// # let _ = opening.observe(OpeningReply { command, outcome }).unwrap();
+/// # let grant = opening.hand_over().unwrap();
+/// # let config = OwnerConfig {
+/// #     max_sessions: one,
+/// #     max_routes: one,
+/// #     max_exchanges: one,
+/// #     account: AccountId::new(1),
+/// #     payload_bytes: PayloadBytes::new(16),
+/// #     resolution_delay: LogicalDuration::new(5),
+/// #     retained_operations: one,
+/// #     remembered_connections: one,
+/// # };
+/// let mut authority = OwnerAuthority::from_grant(grant, one).unwrap();
+/// let slots = NonZeroUsize::new(8).unwrap();
+/// let outbox = authority.create_outbox(LogicalOwnerId::new(4), slots, one).unwrap();
+/// let owner = Owner::new(config, outbox).unwrap();
+/// # let _ = owner;
+/// ```
+///
+/// The owner takes its box: no second owner can be built from it (audit
+/// F4). This does not compile:
+///
+/// ```compile_fail,E0382
+/// # use core::num::{NonZeroU32, NonZeroUsize};
+/// # use mqttiumd_core::contract::capacity::PayloadBytes;
+/// # use mqttiumd_core::contract::command::StartupNonce;
+/// # use mqttiumd_core::contract::effects::OwnerAuthority;
+/// # use mqttiumd_core::contract::ids::{
+/// #     AccountId, LogicalDuration, LogicalOwnerId, RunEpoch, StoreIncarnation,
+/// # };
+/// # use mqttiumd_core::contract::outcome::{
+/// #     EpochOpened, EpochOpening, OpeningOutcome, OpeningReply,
+/// # };
+/// # use mqttiumd_core::owner::{Owner, OwnerConfig};
+/// # let one = NonZeroU32::new(1).unwrap();
+/// # let incarnation = StoreIncarnation::new(1);
+/// # let mut opening = EpochOpening::new(incarnation, StartupNonce::new([1; 16]));
+/// # let command = opening.submit(RunEpoch::new(1)).unwrap();
+/// # let committed = EpochOpened { incarnation, epoch: RunEpoch::new(2) };
+/// # let outcome = OpeningOutcome::Committed(committed);
+/// # let _ = opening.observe(OpeningReply { command, outcome }).unwrap();
+/// # let grant = opening.hand_over().unwrap();
+/// # let config = OwnerConfig {
+/// #     max_sessions: one,
+/// #     max_routes: one,
+/// #     max_exchanges: one,
+/// #     account: AccountId::new(1),
+/// #     payload_bytes: PayloadBytes::new(16),
+/// #     resolution_delay: LogicalDuration::new(5),
+/// #     retained_operations: one,
+/// #     remembered_connections: one,
+/// # };
+/// let mut authority = OwnerAuthority::from_grant(grant, one).unwrap();
+/// let slots = NonZeroUsize::new(8).unwrap();
+/// let outbox = authority.create_outbox(LogicalOwnerId::new(4), slots, one).unwrap();
+/// let owner = Owner::new(config, outbox).unwrap();
+/// let twin = Owner::new(config, outbox).unwrap();
+/// ```
 #[derive(Debug)]
 pub struct Owner {
     id: LogicalOwnerId,
@@ -477,6 +626,9 @@ pub struct Owner {
     /// The latest connections that were closed; see `OwnerConfig`.
     closed: BoundedQueue<ConnectionGeneration>,
     resolution_delay: LogicalDuration,
+    /// The one box of this owner; `None` after a renewal whose creation
+    /// failed.
+    outbox: Option<Outbox>,
 }
 
 fn table<T>(bound: NonZeroU32) -> Result<BoundedVec<T>, AllocationFailed> {
@@ -528,21 +680,39 @@ impl Owner {
     /// until the page that closes the inventory.
     ///
     /// The owner, the data set and the run epoch are those of `outbox`,
-    /// which only a creation authority builds (ADR 0009). The box is not
-    /// kept: every step is handed the box to publish into, and it must be
-    /// a box of the same owner under the same authority.
-    pub fn new(config: OwnerConfig, outbox: &Outbox) -> Result<Self, OwnerRefused> {
+    /// which only a creation authority builds (ADR 0009). The owner takes
+    /// the box and keeps it; a refusal gives it back.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a refusal hands the box back by value, as the retirement of a box does"
+    )]
+    pub fn new(config: OwnerConfig, outbox: Outbox) -> Result<Self, OwnerRefused> {
         if outbox.capacity() < MAX_TRANSITION_SLOTS {
-            return Err(OwnerRefused::BoxTooSmall {
+            let reason = OwnerRefusal::BoxTooSmall {
                 capacity: outbox.capacity(),
                 needed: MAX_TRANSITION_SLOTS,
-            });
+            };
+            return Err(OwnerRefused { outbox, reason });
         }
         let id = outbox.id();
         let credit = Credits::new(
             config.payload_bytes,
             ExchangeSlots::new(u64::from(config.max_exchanges.get())),
         );
+        let tables = (|| {
+            Ok::<_, AllocationFailed>((
+                table(config.max_routes)?,
+                table(config.max_sessions)?,
+                table(config.max_exchanges)?,
+                LeaseTable::new(config.account, credit, config.max_exchanges)?,
+                ring(config.retained_operations)?,
+                ring(config.remembered_connections)?,
+            ))
+        })();
+        let Ok((routes, sessions, slots, leases, finished, closed)) = tables else {
+            let reason = OwnerRefusal::AllocationFailed;
+            return Err(OwnerRefused { outbox, reason });
+        };
         Ok(Self {
             id: id.owner(),
             incarnation: id.incarnation(),
@@ -553,14 +723,66 @@ impl Owner {
             epoch_recovered: false,
             limits: None,
             route_revision: None,
-            routes: table(config.max_routes)?,
-            sessions: table(config.max_sessions)?,
-            slots: table(config.max_exchanges)?,
-            leases: LeaseTable::new(config.account, credit, config.max_exchanges)?,
-            finished: ring(config.retained_operations)?,
-            closed: ring(config.remembered_connections)?,
+            routes,
+            sessions,
+            slots,
+            leases,
+            finished,
+            closed,
             resolution_delay: config.resolution_delay,
+            outbox: Some(outbox),
         })
+    }
+
+    /// The box of the owner, if it has one.
+    #[must_use]
+    pub fn outbox(&self) -> Option<&Outbox> {
+        self.outbox.as_ref()
+    }
+
+    /// Hands the effects of the box to `sink`, in order (an owner without
+    /// a box has none).
+    pub fn dispatch(&mut self, sink: &mut dyn EffectSink) -> DispatchReport {
+        match self.outbox.as_mut() {
+            Some(outbox) => outbox.dispatch(sink),
+            None => DispatchReport {
+                accepted: 0,
+                blocked: None,
+            },
+        }
+    }
+
+    /// Replaces the box of the owner: retires it under `authority`, then
+    /// creates one for the same identity (ADR 0009). The counters and the
+    /// state of the owner are kept. The retirement is refused while an
+    /// effect waits or a reservation lives, and the owner keeps its box.
+    pub fn renew_box(
+        &mut self,
+        authority: &mut OwnerAuthority,
+        capacity: NonZeroUsize,
+        max_reservations: NonZeroU32,
+    ) -> Result<(), RenewRefused> {
+        if authority.incarnation() != self.incarnation || authority.epoch() != self.epoch {
+            return Err(RenewRefused::ForeignAuthority);
+        }
+        if capacity.get() < MAX_TRANSITION_SLOTS {
+            return Err(RenewRefused::BoxTooSmall {
+                capacity: capacity.get(),
+                needed: MAX_TRANSITION_SLOTS,
+            });
+        }
+        if let Some(outbox) = self.outbox.take()
+            && let Err(refused) = authority.retire(outbox)
+        {
+            let reason = refused.reason;
+            self.outbox = Some(refused.outbox);
+            return Err(RenewRefused::Retire(reason));
+        }
+        let outbox = authority
+            .create_outbox(self.id, capacity, max_reservations)
+            .map_err(RenewRefused::Create)?;
+        self.outbox = Some(outbox);
+        Ok(())
     }
 
     /// The owner.
@@ -614,16 +836,25 @@ impl Owner {
 
     /// Applies `input` entirely, or hands it back intact (DEM-006).
     ///
-    /// `outbox` is the box of this owner under the authority of its run
-    /// epoch; anything else is a fault. A refusal keeps the input, the
-    /// state, the identity counters, the account, the reservations held
-    /// and the content of the box as they were.
-    pub fn step(&mut self, input: Input, grant: TurnGrant, outbox: &mut Outbox) -> StepOutcome {
-        let id = outbox.id();
-        if id.owner() != self.id || id.incarnation() != self.incarnation || id.epoch() != self.epoch
-        {
-            return StepOutcome::Fatal(CoreFault::ImpossibleInput);
-        }
+    /// A refusal keeps the input, the state, the identity counters, the
+    /// account, the reservations held and the content of the box as they
+    /// were. An owner without a box, after a renewal that could not create
+    /// one, hands every input back as `Exhausted(ReservationTable)` until
+    /// a renewal succeeds.
+    pub fn step(&mut self, input: Input, grant: TurnGrant) -> StepOutcome {
+        let Some(mut outbox) = self.outbox.take() else {
+            return StepOutcome::Exhausted {
+                input,
+                exhaustion: Exhaustion::ReservationTable,
+                work_used: WorkUnits::ZERO,
+            };
+        };
+        let outcome = self.step_into(input, grant, &mut outbox);
+        self.outbox = Some(outbox);
+        outcome
+    }
+
+    fn step_into(&mut self, input: Input, grant: TurnGrant, outbox: &mut Outbox) -> StepOutcome {
         let plan = match self.plan(&input, grant) {
             Ok(plan) => plan,
             Err(Refusal { stop, work_used }) => {
@@ -1779,7 +2010,6 @@ mod tests {
 
     struct World {
         authority: OwnerAuthority,
-        outbox: Outbox,
         owner: Owner,
         /// The commands submitted so far, in order.
         flights: Vec<Flight>,
@@ -1820,6 +2050,25 @@ mod tests {
 
     fn packet_id(raw: u16) -> InboundPacketId {
         InboundPacketId::new(raw).expect("non-zero")
+    }
+
+    /// An authority for `owners` owners, of the same run epoch.
+    fn authority_of_owners(owners: u32) -> OwnerAuthority {
+        let incarnation = StoreIncarnation::new(INCARNATION);
+        let mut opening = EpochOpening::new(incarnation, StartupNonce::new([2; 16]));
+        let command = opening
+            .submit(RunEpoch::new(EPOCH - 1))
+            .expect("nothing in flight");
+        let reply = OpeningReply {
+            command,
+            outcome: OpeningOutcome::Committed(EpochOpened {
+                incarnation,
+                epoch: RunEpoch::new(EPOCH),
+            }),
+        };
+        assert!(opening.observe(reply).is_ok(), "the reply of this attempt");
+        let grant = opening.hand_over().expect("committed");
+        OwnerAuthority::from_grant(grant, bound(owners)).expect("small")
     }
 
     /// An authority obtained the way the product obtains it: the opening
@@ -2024,10 +2273,9 @@ mod tests {
             let outbox = authority
                 .create_outbox(LogicalOwnerId::new(4), nonzero(capacity), bound(ENTRIES))
                 .expect("first box");
-            let owner = Owner::new(config, &outbox).expect("large enough");
+            let owner = Owner::new(config, outbox).expect("large enough");
             Self {
                 authority,
-                outbox,
                 owner,
                 flights: Vec::new(),
             }
@@ -2078,8 +2326,18 @@ mod tests {
             world
         }
 
+        /// The box of the owner.
+        fn held(&self) -> &Outbox {
+            self.owner.outbox().expect("a box")
+        }
+
+        /// The box of the owner, to squeeze it in a test.
+        fn outbox(&mut self) -> &mut Outbox {
+            self.owner.outbox.as_mut().expect("a box")
+        }
+
         fn step(&mut self, input: Input) -> StepOutcome {
-            self.owner.step(input, GRANT, &mut self.outbox)
+            self.owner.step(input, GRANT)
         }
 
         fn applied(&mut self, input: Input) {
@@ -2099,7 +2357,7 @@ mod tests {
         /// Hands every waiting effect to an adapter that takes it.
         fn drain(&mut self) -> Vec<(EffectId, Effect)> {
             let mut sink = Taking(Vec::new());
-            let _ = self.outbox.dispatch(&mut sink);
+            let _ = self.owner.dispatch(&mut sink);
             sink.0.into_iter().map(OwnedEffect::into_parts).collect()
         }
 
@@ -2192,9 +2450,9 @@ mod tests {
                 leases: owner.leases.snapshot(),
                 finished: owner.finished.iter().copied().collect(),
                 closed: owner.closed.iter().copied().collect(),
-                waiting: self.outbox.pending().map(OwnedEffect::id).collect(),
-                free_slots: self.outbox.free_slots(),
-                live_reservations: self.outbox.has_live_reservations(),
+                waiting: self.held().pending().map(OwnedEffect::id).collect(),
+                free_slots: self.held().free_slots(),
+                live_reservations: self.held().has_live_reservations(),
             }
         }
     }
@@ -2212,7 +2470,7 @@ mod tests {
         let short = TurnGrant {
             work_limit: WorkUnits::ZERO,
         };
-        let outcome = world.owner.step(input(&world), short, &mut world.outbox);
+        let outcome = world.owner.step(input(&world), short);
         assert_eq!(
             outcome,
             StepOutcome::NeedCapacity {
@@ -2229,8 +2487,8 @@ mod tests {
         if slots == 0 {
             // Nothing to reserve: a full box does not refuse it.
             let mut world = build();
-            let all = nonzero(world.outbox.free_slots());
-            let _held = world.outbox.reserve(all).expect("free");
+            let all = nonzero(world.outbox().free_slots());
+            let _held = world.outbox().reserve(all).expect("free");
             world.applied(input(&world));
             return;
         }
@@ -2239,9 +2497,9 @@ mod tests {
         // same way and not stepped.
         let mut world = build();
         let mut twin = build();
-        let hold = nonzero(world.outbox.free_slots() - (slots - 1));
-        let held = world.outbox.reserve(hold).expect("free");
-        let twin_held = twin.outbox.reserve(hold).expect("free");
+        let hold = nonzero(world.outbox().free_slots() - (slots - 1));
+        let held = world.outbox().reserve(hold).expect("free");
+        let twin_held = twin.outbox().reserve(hold).expect("free");
         let before = world.snapshot();
         let outcome = world.step(input(&world));
         assert_eq!(
@@ -2259,18 +2517,18 @@ mod tests {
         assert_eq!(world.snapshot(), before);
         // No entry of the reservation table was taken and given back: the
         // next reservation is the one the twin gets.
-        assert_eq!(world.outbox.release(held), Ok(hold.get()));
-        assert_eq!(twin.outbox.release(twin_held), Ok(hold.get()));
-        let next = world.outbox.reserve(nonzero(1)).expect("free");
-        assert_eq!(Ok(next), twin.outbox.reserve(nonzero(1)));
-        assert_eq!(world.outbox.release(next), Ok(1));
+        assert_eq!(world.outbox().release(held), Ok(hold.get()));
+        assert_eq!(twin.outbox().release(twin_held), Ok(hold.get()));
+        let next = world.outbox().reserve(nonzero(1)).expect("free");
+        assert_eq!(Ok(next), twin.outbox().reserve(nonzero(1)));
+        assert_eq!(world.outbox().release(next), Ok(1));
         // With room, the input that came back is applied.
         world.applied(input(&world));
 
         // The reservation table: every entry is held.
         let mut world = build();
         for _ in 0..ENTRIES {
-            let _held = world.outbox.reserve(nonzero(1)).expect("free");
+            let _held = world.outbox().reserve(nonzero(1)).expect("free");
         }
         let before = world.snapshot();
         let outcome = world.step(input(&world));
@@ -2304,6 +2562,21 @@ mod tests {
         assert_eq!(world.snapshot(), before);
     }
 
+    impl Owner {
+        /// Applies a plan with the box the owner holds, as `step` does.
+        fn apply_held(
+            &mut self,
+            plan: Plan,
+            input: Input,
+            reservation: Option<EffectReservation>,
+        ) -> Result<Progress, CoreFault> {
+            let mut outbox = self.outbox.take().expect("a box");
+            let applied = self.apply(plan, input, reservation, &mut outbox);
+            self.outbox = Some(outbox);
+            applied
+        }
+    }
+
     // ----- Construction and the box of a step -----
 
     // ADR 0006, amendment: the constructor refuses a box smaller than the
@@ -2318,22 +2591,27 @@ mod tests {
                 bound(1),
             )
             .expect("first box");
+        let serial = small.id().serial();
+        let refused = Owner::new(config(), small).expect_err("too small");
         assert_eq!(
-            Owner::new(config(), &small).err(),
-            Some(OwnerRefused::BoxTooSmall {
+            refused.reason,
+            OwnerRefusal::BoxTooSmall {
                 capacity: 1,
                 needed: 2,
-            })
+            }
         );
+        // The box comes back, and it can still be retired.
+        assert_eq!(refused.outbox.id().serial(), serial);
+        assert_eq!(authority.retire(refused.outbox).map_err(|_| ()), Ok(()));
         let exact = authority
             .create_outbox(
-                LogicalOwnerId::new(5),
+                LogicalOwnerId::new(4),
                 nonzero(MAX_TRANSITION_SLOTS),
                 bound(1),
             )
-            .expect("second box");
-        let owner = Owner::new(config(), &exact).expect("large enough");
-        assert_eq!(owner.id(), LogicalOwnerId::new(5));
+            .expect("a box for the same owner, once the first is retired");
+        let owner = Owner::new(config(), exact).expect("large enough");
+        assert_eq!(owner.id(), LogicalOwnerId::new(4));
         assert!(owner.is_recovering());
     }
 
@@ -2345,67 +2623,70 @@ mod tests {
         world.applied(page(&fixture(EPOCH), true));
         assert_eq!(world.sent(connect(CONN, b"p1-producer")), ["EmitConnack"]);
         let _ = world.submit(publish(7));
-        assert_eq!(world.outbox.capacity(), MAX_TRANSITION_SLOTS);
+        assert_eq!(world.outbox().capacity(), MAX_TRANSITION_SLOTS);
     }
 
     #[test]
-    fn a_box_of_another_owner_or_another_authority_is_a_fault() {
+    fn a_box_is_renewed_only_under_the_authority_of_its_owner_and_with_room() {
         let mut world = World::connected();
         let before = world.snapshot();
-        let mut other = world
-            .authority
-            .create_outbox(LogicalOwnerId::new(5), nonzero(CAPACITY), bound(ENTRIES))
-            .expect("second box");
-        assert_eq!(
-            world.owner.step(publish(7), GRANT, &mut other),
-            StepOutcome::Fatal(CoreFault::ImpossibleInput)
-        );
         let mut later = authority(INCARNATION, EPOCH + 1);
-        let mut foreign = later
-            .create_outbox(LogicalOwnerId::new(4), nonzero(CAPACITY), bound(ENTRIES))
-            .expect("first box");
         assert_eq!(
-            world.owner.step(publish(7), GRANT, &mut foreign),
-            StepOutcome::Fatal(CoreFault::ImpossibleInput)
+            world
+                .owner
+                .renew_box(&mut later, nonzero(CAPACITY), bound(ENTRIES)),
+            Err(RenewRefused::ForeignAuthority)
         );
-        assert!(other.is_empty() && foreign.is_empty());
+        assert_eq!(
+            world.owner.renew_box(
+                &mut world.authority,
+                nonzero(MAX_TRANSITION_SLOTS - 1),
+                bound(ENTRIES)
+            ),
+            Err(RenewRefused::BoxTooSmall {
+                capacity: 1,
+                needed: 2,
+            })
+        );
         assert_eq!(world.snapshot(), before);
+        // A box that holds a waiting effect or a live reservation is kept.
+        let _ = world.submit(publish(7));
+        let key = world.outbox().reserve(nonzero(1)).expect("free");
+        let serial = world.held().id().serial();
+        assert_eq!(
+            world
+                .owner
+                .renew_box(&mut world.authority, nonzero(CAPACITY), bound(ENTRIES)),
+            Err(RenewRefused::Retire(RetireRefusal::LiveReservations))
+        );
+        assert_eq!(world.held().id().serial(), serial);
+        assert_eq!(world.outbox().release(key), Ok(1));
     }
 
-    // ADR 0009: replacing the box of an owner resets none of its counters.
+    // ADR 0009, audit F4: replacing the box of an owner resets none of its
+    // counters and none of its state.
     #[test]
     fn replacing_the_box_resets_no_counter_of_the_owner() {
         let mut world = World::connected();
         let first = world.submit(publish(7));
-        let counters = world.owner.counters;
-        let serial = world.outbox.id().serial();
-
-        let World {
-            mut authority,
-            outbox,
-            mut owner,
-            ..
-        } = world;
-        assert_eq!(authority.retire(outbox).map_err(|_| ()), Ok(()));
-        let mut outbox = authority
-            .create_outbox(LogicalOwnerId::new(4), nonzero(CAPACITY), bound(ENTRIES))
-            .expect("the box that replaces it");
-        assert_ne!(outbox.id().serial(), serial);
-        assert_eq!(owner.counters, counters);
-
-        let outcome = owner.step(committed(&first), GRANT, &mut outbox);
-        assert!(
-            matches!(outcome, StepOutcome::Applied { .. }),
-            "{outcome:?}"
+        let mut before = world.snapshot();
+        let serial = world.held().id().serial();
+        assert_eq!(
+            world
+                .owner
+                .renew_box(&mut world.authority, nonzero(CAPACITY), bound(ENTRIES)),
+            Ok(())
         );
-        let outcome = owner.step(publish(8), GRANT, &mut outbox);
-        assert!(
-            matches!(outcome, StepOutcome::Applied { .. }),
-            "{outcome:?}"
-        );
-        let mut sink = Taking(Vec::new());
-        let _ = outbox.dispatch(&mut sink);
-        let effects: Vec<_> = sink.0.into_iter().map(OwnedEffect::into_parts).collect();
+        assert_ne!(world.held().id().serial(), serial);
+        assert_eq!(world.held().id().owner(), LogicalOwnerId::new(4));
+        // Nothing but the box changed.
+        let after = world.snapshot();
+        before.free_slots = after.free_slots;
+        assert_eq!(after, before);
+
+        world.applied(committed(&first));
+        world.applied(publish(8));
+        let effects = world.drain();
         assert_eq!(kinds(&effects), ["EmitPubrec", "Persist", "ArmDeadline"]);
         // The sequences of `EffectId` and `OperationId` continue.
         let sequences: Vec<u64> = effects.iter().map(|(id, _)| id.sequence.get()).collect();
@@ -2418,6 +2699,50 @@ mod tests {
             command.recipe.operation().sequence().get(),
             first.operation.sequence().get() + 1
         );
+    }
+
+    // A renewal whose creation fails leaves the owner without a box: every
+    // input is handed back, nothing changes, and a later renewal resumes.
+    #[test]
+    fn an_owner_without_a_box_hands_every_input_back_until_a_renewal() {
+        let mut world = World::connected();
+        // No allocator provides a box this large.
+        let unobtainable = nonzero(isize::MAX as usize / core::mem::size_of::<OwnedEffect>());
+        assert_eq!(
+            world
+                .owner
+                .renew_box(&mut world.authority, unobtainable, bound(1)),
+            Err(RenewRefused::Create(CreateRefused::AllocationFailed))
+        );
+        assert!(world.owner.outbox().is_none());
+        let counters = world.owner.counters;
+        let revision = world.owner.revision();
+        assert_eq!(
+            world.owner.step(publish(7), GRANT),
+            StepOutcome::Exhausted {
+                input: publish(7),
+                exhaustion: Exhaustion::ReservationTable,
+                work_used: WorkUnits::ZERO,
+            }
+        );
+        let mut sink = Taking(Vec::new());
+        assert_eq!(
+            world.owner.dispatch(&mut sink),
+            DispatchReport {
+                accepted: 0,
+                blocked: None,
+            }
+        );
+        assert_eq!(world.owner.counters, counters);
+        assert_eq!(world.owner.revision(), revision);
+        assert_eq!(world.phase(7), None);
+        assert_eq!(
+            world
+                .owner
+                .renew_box(&mut world.authority, nonzero(CAPACITY), bound(ENTRIES)),
+            Ok(())
+        );
+        let _ = world.submit(publish(7));
     }
 
     // ----- The plan of ADR 0006 -----
@@ -2459,30 +2784,24 @@ mod tests {
         let first = world.owner.plan(&publish(7), GRANT).expect("a plan");
         let second = world.owner.plan(&publish(7), GRANT).expect("the same plan");
         let other = world.owner.plan(&pubrel(9), GRANT).expect("another plan");
-        let key = world.outbox.reserve(nonzero(2)).expect("free");
+        let key = world.outbox().reserve(nonzero(2)).expect("free");
         assert_eq!(
-            world
-                .owner
-                .apply(first, publish(7), Some(key), &mut world.outbox),
+            world.owner.apply_held(first, publish(7), Some(key)),
             Ok(Progress::WaitingForEffects)
         );
         let before = world.snapshot();
-        let key = world.outbox.reserve(nonzero(2)).expect("free");
+        let key = world.outbox().reserve(nonzero(2)).expect("free");
         assert_eq!(
-            world
-                .owner
-                .apply(second, publish(7), Some(key), &mut world.outbox),
+            world.owner.apply_held(second, publish(7), Some(key)),
             Err(CoreFault::StalePlan)
         );
-        assert_eq!(world.outbox.release(key), Ok(2));
-        let key = world.outbox.reserve(nonzero(1)).expect("free");
+        assert_eq!(world.outbox().release(key), Ok(2));
+        let key = world.outbox().reserve(nonzero(1)).expect("free");
         assert_eq!(
-            world
-                .owner
-                .apply(other, pubrel(9), Some(key), &mut world.outbox),
+            world.owner.apply_held(other, pubrel(9), Some(key)),
             Err(CoreFault::StalePlan)
         );
-        assert_eq!(world.outbox.release(key), Ok(1));
+        assert_eq!(world.outbox().release(key), Ok(1));
         assert_eq!(world.snapshot(), before);
     }
 
@@ -2492,21 +2811,26 @@ mod tests {
         let plan = world.owner.plan(&publish(7), GRANT).expect("a plan");
         // Another owner at the same revision, with its own box.
         let mut authority = authority(INCARNATION, EPOCH);
-        let mut outbox = authority
+        let outbox = authority
             .create_outbox(LogicalOwnerId::new(5), nonzero(CAPACITY), bound(ENTRIES))
             .expect("first box");
-        let mut owner = Owner::new(config(), &outbox).expect("large enough");
+        let mut owner = Owner::new(config(), outbox).expect("large enough");
         for input in [page(&fixture(EPOCH), true), connect(CONN, b"p1-producer")] {
-            let outcome = owner.step(input, GRANT, &mut outbox);
+            let outcome = owner.step(input, GRANT);
             assert!(
                 matches!(outcome, StepOutcome::Applied { .. }),
                 "{outcome:?}"
             );
         }
         assert_eq!(owner.revision(), world.owner.revision());
-        let key = outbox.reserve(nonzero(2)).expect("free");
+        let key = owner
+            .outbox
+            .as_mut()
+            .expect("a box")
+            .reserve(nonzero(2))
+            .expect("free");
         assert_eq!(
-            owner.apply(plan, publish(7), Some(key), &mut outbox),
+            owner.apply_held(plan, publish(7), Some(key)),
             Err(CoreFault::StalePlan)
         );
         assert_eq!(owner.exchange(SessionId::new(PRODUCER), packet_id(7)), None);
@@ -2519,18 +2843,16 @@ mod tests {
         let before = world.snapshot();
         for wrong in [1, 3] {
             let plan = world.owner.plan(&publish(7), GRANT).expect("a plan");
-            let key = world.outbox.reserve(nonzero(wrong)).expect("free");
+            let key = world.outbox().reserve(nonzero(wrong)).expect("free");
             assert_eq!(
-                world
-                    .owner
-                    .apply(plan, publish(7), Some(key), &mut world.outbox),
+                world.owner.apply_held(plan, publish(7), Some(key)),
                 Err(CoreFault::ReservationOverrun)
             );
-            assert_eq!(world.outbox.release(key), Ok(wrong));
+            assert_eq!(world.outbox().release(key), Ok(wrong));
         }
         let plan = world.owner.plan(&publish(7), GRANT).expect("a plan");
         assert_eq!(
-            world.owner.apply(plan, publish(7), None, &mut world.outbox),
+            world.owner.apply_held(plan, publish(7), None),
             Err(CoreFault::ReservationOverrun)
         );
         assert_eq!(world.snapshot(), before);
@@ -2636,7 +2958,7 @@ mod tests {
             let mut expected = whole.snapshot();
             expected.revision = Revision::new(2);
             assert_eq!(world.snapshot(), expected, "cut at {cut}");
-            assert!(world.outbox.is_empty());
+            assert!(world.outbox().is_empty());
         }
     }
 
@@ -3010,7 +3332,7 @@ mod tests {
         }
         world.applied(frame(PRODUCER, CONN, FrameProgress::Failed));
         assert_eq!(world.owner.connection_of(SessionId::new(PRODUCER)), None);
-        assert!(world.outbox.is_empty());
+        assert!(world.outbox().is_empty());
         // The connection is gone: what it still carries is absorbed.
         absorbed(&mut world, publish(7));
         absorbed(&mut world, connect(CONN, b"p1-producer"));
@@ -3337,7 +3659,7 @@ mod tests {
         let mut world = World::admission_pending();
         let admission = world.flights[0];
         world.applied(unknown(&admission));
-        assert!(world.outbox.is_empty());
+        assert!(world.outbox().is_empty());
         assert_eq!(world.phase(7), PENDING);
         assert_eq!(
             world.in_flight(7),
@@ -3544,7 +3866,7 @@ mod tests {
         let mut world = World::release_pending();
         let release = world.flights[1];
         world.applied(unknown(&release));
-        assert!(world.outbox.is_empty());
+        assert!(world.outbox().is_empty());
         assert_eq!(world.phase(7), RELEASING);
         assert_eq!(
             world.in_flight(7),
@@ -3727,7 +4049,7 @@ mod tests {
         let mut before = World::connected();
         let admission = before.submit(publish(7));
         // No PUBREC before the crash: the commit was never reported.
-        assert!(before.outbox.is_empty());
+        assert!(before.outbox().is_empty());
         assert_eq!(before.phase(7), PENDING);
         let CommitFacts::PublicationAdmitted {
             publication,
@@ -4071,7 +4393,7 @@ mod tests {
         assert_eq!(world.sent(pubrel(7)), ["CloseConnection"]);
         let admission = world.flights[0];
         world.applied(committed(&admission));
-        assert!(world.outbox.is_empty());
+        assert!(world.outbox().is_empty());
         assert_eq!(world.phase(7), AWAIT);
         assert_eq!(world.sent(connect(11, b"p1-producer")), ["EmitConnack"]);
         world.applied(publish_with(11, 7, Qos::ExactlyOnce, b"payload"));
@@ -4080,7 +4402,7 @@ mod tests {
         let mut world = World::release_pending();
         assert_eq!(world.sent(publish(7)), ["CloseConnection"]);
         world.applied(committed(&world.flights[1]));
-        assert!(world.outbox.is_empty());
+        assert!(world.outbox().is_empty());
         assert_eq!(world.phase(7), None);
         assert_eq!(used(&world), (0, 0));
     }
@@ -4109,9 +4431,7 @@ mod tests {
             work_limit: WorkUnits::new(FIXTURE_WORK - 1),
         };
         assert_eq!(
-            world
-                .owner
-                .step(page(&fixture(EPOCH), true), short, &mut world.outbox),
+            world.owner.step(page(&fixture(EPOCH), true), short),
             StepOutcome::NeedCapacity {
                 input: page(&fixture(EPOCH), true),
                 need: CapacityNeed {
@@ -4126,9 +4446,7 @@ mod tests {
         let exact = TurnGrant {
             work_limit: WorkUnits::new(FIXTURE_WORK),
         };
-        let outcome = world
-            .owner
-            .step(page(&fixture(EPOCH), true), exact, &mut world.outbox);
+        let outcome = world.owner.step(page(&fixture(EPOCH), true), exact);
         assert!(
             matches!(outcome, StepOutcome::Applied { .. }),
             "{outcome:?}"
@@ -4311,7 +4629,7 @@ mod tests {
         let admission = world.flights[0];
         let mut token = admission.deadline;
         let mut resolutions = Vec::new();
-        for _ in 0..=RETAINED_RESOLUTIONS {
+        for _ in 0..5 {
             world.applied(deadline(token));
             let effects = world.drain();
             let Effect::ArmDeadline { token: next, .. } = effects[1].1 else {
@@ -4325,21 +4643,52 @@ mod tests {
             operation: admission.operation,
             reply: StoreReply::Outcome(StoreOutcome::Committed(admission.facts)),
         };
-        // The first resolution is no longer retained: its answer is
-        // absorbed and the next resolution answers again.
-        absorbed(&mut world, answer(resolutions[0]));
-        assert_eq!(world.phase(7), PENDING);
-        // The command and the latest resolutions are retained, the first
-        // resolution is not; the oldest one retained still answers.
+        // Ranks 1 to 5: the command, the two latest (4, 5) and the
+        // landmarks (1, 2, 4) are retained; rank 3 is not.
         let retained = world.in_flight(7).answers;
         assert!(retained.names(admission.effect));
-        assert!(!retained.names(resolutions[0]));
-        assert!(
-            resolutions[1..]
-                .iter()
-                .all(|effect| retained.names(*effect))
-        );
-        assert_eq!(world.sent(answer(resolutions[1])), ["EmitPubrec"]);
+        for (rank, effect) in (1..).zip(&resolutions) {
+            assert_eq!(retained.names(*effect), rank != 3, "rank {rank}");
+        }
+        // Its answer is absorbed, and a retained one answers.
+        absorbed(&mut world, answer(resolutions[2]));
+        assert_eq!(world.phase(7), PENDING);
+        assert_eq!(world.sent(answer(resolutions[0])), ["EmitPubrec"]);
+    }
+
+    // F3, the bound: an operation never retains more than the command, the
+    // recent resolutions and the landmarks, and the landmarks are the
+    // latest resolutions whose rank is a power of two.
+    #[test]
+    fn an_operation_retains_a_bounded_number_of_answers() {
+        let effect = |sequence: u64| EffectId {
+            epoch: RunEpoch::new(EPOCH),
+            owner: LogicalOwnerId::new(4),
+            sequence: EffectSeq::new(sequence),
+        };
+        let mut answers = Answers::new(effect(0));
+        for rank in 1..=1000u64 {
+            answers = answers.with(effect(rank));
+            let held = (1..=rank).filter(|r| answers.names(effect(*r))).count();
+            assert!(
+                held <= RECENT_RESOLUTIONS + LANDMARK_RESOLUTIONS,
+                "rank {rank}"
+            );
+            assert!(answers.names(effect(0)));
+            assert!(answers.names(effect(rank)));
+            let powers: Vec<u64> = (0..64)
+                .map(|bit| 1u64 << bit)
+                .filter(|power| *power <= rank)
+                .collect();
+            for (index, power) in powers.iter().rev().enumerate() {
+                let recent = rank - *power < u64::try_from(RECENT_RESOLUTIONS).expect("small");
+                assert_eq!(
+                    answers.names(effect(*power)),
+                    index < LANDMARK_RESOLUTIONS || recent,
+                    "rank {rank}, landmark {power}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4446,5 +4795,264 @@ mod tests {
             &facts[8..]
         );
         assert!(run(&facts, &starts, FactRank::Operation, end).is_empty());
+    }
+
+    // ----- Audit of the first wave -----
+
+    // F4: no path builds two owners of one identity. Two owners of one
+    // identity would issue the same identities from fresh counters, so two
+    // different publications could receive the same `OperationId`. An
+    // owner takes its box, and the authority creates no second box for an
+    // identity that is active, also once the first box was dropped without
+    // being retired (ADR 0009).
+    #[test]
+    fn two_owners_of_one_identity_never_issue_one_operation_id() {
+        let mut authority = authority(INCARNATION, EPOCH);
+        let create = |authority: &mut OwnerAuthority, owner: u64| {
+            authority.create_outbox(
+                LogicalOwnerId::new(owner),
+                nonzero(CAPACITY),
+                bound(ENTRIES),
+            )
+        };
+        let outbox = create(&mut authority, 4).expect("first box");
+        let first = Owner::new(config(), outbox).expect("large enough");
+        assert_eq!(
+            create(&mut authority, 4).err(),
+            Some(CreateRefused::OwnerAlreadyActive)
+        );
+        drop(first);
+        assert_eq!(
+            create(&mut authority, 4).err(),
+            Some(CreateRefused::OwnerAlreadyActive),
+            "a box dropped without retirement leaves its owner active"
+        );
+        // Owners of two identities issue two identity spaces.
+        let mut authority = authority_of_owners(2);
+        let mut operations = Vec::new();
+        for (raw, payload) in [(5, &b"one"[..]), (6, &b"two"[..])] {
+            let outbox = create(&mut authority, raw).expect("a box");
+            let mut owner = Owner::new(config(), outbox).expect("large enough");
+            for input in [
+                page(&fixture(EPOCH), true),
+                connect(CONN, b"p1-producer"),
+                publish_with(CONN, 7, Qos::ExactlyOnce, payload),
+            ] {
+                let outcome = owner.step(input, GRANT);
+                assert!(
+                    matches!(outcome, StepOutcome::Applied { .. }),
+                    "{outcome:?}"
+                );
+            }
+            let mut sink = Taking(Vec::new());
+            let _ = owner.dispatch(&mut sink);
+            for effect in sink.0 {
+                if let (_, Effect::Persist { command }) = effect.into_parts() {
+                    operations.push(command.recipe.operation());
+                }
+            }
+        }
+        assert_eq!(operations.len(), 2);
+        assert_ne!(operations[0], operations[1], "one identity, two recipes");
+    }
+
+    /// Drives one admission whose first `Persist` committed and whose
+    /// result was lost. Each deadline emits one resolution, every
+    /// resolution answers Committed, and the answer of a resolution is
+    /// delivered once `lag` newer resolutions were emitted, in order. The
+    /// answers whose rank is in `lost` are never delivered, those in
+    /// `doubled` are delivered twice. Returns the number of resolutions
+    /// emitted when PUBREC was published, or `None` after `limit`.
+    fn resolve_with_lag(
+        lag: usize,
+        lost: &[usize],
+        doubled: &[usize],
+        limit: usize,
+    ) -> Option<usize> {
+        let mut world = World::admission_pending();
+        let admission = world.flights[0];
+        let mut token = admission.deadline;
+        let mut pending: std::collections::VecDeque<(usize, EffectId)> = Default::default();
+        for emitted in 1..=limit {
+            world.applied(deadline(token));
+            let effects = world.drain();
+            assert_eq!(kinds(&effects), ["ResolveAndFence", "ArmDeadline"]);
+            let Effect::ArmDeadline { token: next, .. } = effects[1].1 else {
+                panic!("a deadline")
+            };
+            token = next;
+            pending.push_back((emitted, effects[0].0));
+            while pending.len() > lag {
+                let (rank, effect) = pending.pop_front().expect("one");
+                if lost.contains(&rank) {
+                    continue;
+                }
+                let times = if doubled.contains(&rank) { 2 } else { 1 };
+                for _ in 0..times {
+                    world.applied(Input::StoreResult {
+                        effect,
+                        operation: admission.operation,
+                        reply: StoreReply::Outcome(StoreOutcome::Committed(admission.facts)),
+                    });
+                    let answer = world.drain();
+                    if world.phase(7) == AWAIT {
+                        assert_eq!(kinds(&answer), ["EmitPubrec"]);
+                        return Some(emitted);
+                    }
+                    assert!(answer.is_empty());
+                }
+            }
+            assert_eq!(world.phase(7), PENDING);
+        }
+        None
+    }
+
+    // F3, the counterexample of the audit: every answer arrives after four
+    // newer resolutions. The exchange must leave AdmissionPending.
+    #[test]
+    fn resolutions_whose_answers_arrive_after_four_newer_ones_still_commit() {
+        assert!(resolve_with_lag(4, &[], &[], 24).is_some());
+    }
+
+    // F3: progress under any finite lag, with losses and duplicates.
+    #[test]
+    fn resolutions_progress_under_a_finite_lag_with_losses_and_duplicates() {
+        for lag in [0, 1, 3, 4, 5, 7, 20, 100] {
+            assert!(
+                resolve_with_lag(lag, &[], &[], 4 * (lag + 2)).is_some(),
+                "lag {lag}"
+            );
+            let lost: Vec<usize> = (1..=lag.max(2) + 2).collect();
+            assert!(
+                resolve_with_lag(lag, &lost, &[1, 2, 3], 8 * (lag + 4)).is_some(),
+                "lag {lag}, losses {lost:?}"
+            );
+        }
+    }
+
+    // F3: a resolution answers only its own operation. The answer of a
+    // resolution of another exchange, named with this operation, is not
+    // applied to it.
+    #[test]
+    fn a_resolution_of_another_operation_does_not_answer_this_one() {
+        let mut world = World::connected();
+        let first = world.submit(publish(7));
+        let second = world.submit(publish_with(CONN, 8, Qos::ExactlyOnce, b"abc"));
+        world.applied(deadline(second.deadline));
+        let effects = world.drain();
+        assert_eq!(kinds(&effects), ["ResolveAndFence", "ArmDeadline"]);
+        let foreign = Input::StoreResult {
+            effect: effects[0].0,
+            operation: first.operation,
+            reply: StoreReply::Outcome(StoreOutcome::Committed(first.facts)),
+        };
+        absorbed(&mut world, foreign);
+        assert_eq!(world.phase(7), PENDING);
+        assert_eq!(world.sent(committed(&first)), ["EmitPubrec"]);
+    }
+
+    // F3, I3: the answer of the first landmark p >= k is lost; the next
+    // landmark, 2p, makes the exchange progress. With a lag of 4 and every
+    // answer below rank 8 lost, the landmark 8 answers by rank 12; with
+    // every answer below rank 16 lost, the landmark 16 answers by rank 20.
+    #[test]
+    fn the_next_landmark_progresses_when_the_answer_of_one_is_lost() {
+        let below = |rank: usize| (1..rank).collect::<Vec<_>>();
+        assert_eq!(resolve_with_lag(4, &below(8), &[], 64), Some(12));
+        assert_eq!(resolve_with_lag(4, &below(16), &[], 64), Some(20));
+        // And with the lag of the counterexample, nothing lost, the first
+        // landmark answers as soon as its answer arrives.
+        assert_eq!(resolve_with_lag(4, &[], &[], 24), Some(5));
+    }
+
+    /// Like `resolve_with_lag`, with every answer delivered, but in an
+    /// order that is not the order of the resolutions: once more than `lag`
+    /// answers wait, one of the older half of them, chosen by `seed`, is
+    /// delivered. The answers delivered are rarely among the latest, so the
+    /// recent resolutions alone do not make progress.
+    fn resolve_out_of_order(lag: usize, seed: u64, limit: usize) -> Option<usize> {
+        let mut world = World::admission_pending();
+        let admission = world.flights[0];
+        let mut token = admission.deadline;
+        let mut waiting: Vec<EffectId> = Vec::new();
+        let mut state = seed;
+        for emitted in 1..=limit {
+            world.applied(deadline(token));
+            let effects = world.drain();
+            let Effect::ArmDeadline { token: next, .. } = effects[1].1 else {
+                panic!("a deadline")
+            };
+            token = next;
+            waiting.push(effects[0].0);
+            while waiting.len() > lag {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let older = waiting.len().div_ceil(2);
+                let pick = usize::try_from(state >> 33).expect("small") % older;
+                let effect = waiting.remove(pick);
+                world.applied(Input::StoreResult {
+                    effect,
+                    operation: admission.operation,
+                    reply: StoreReply::Outcome(StoreOutcome::Committed(admission.facts)),
+                });
+                if world.phase(7) == AWAIT {
+                    assert_eq!(kinds(&world.drain()), ["EmitPubrec"]);
+                    return Some(emitted);
+                }
+                assert!(world.drain().is_empty());
+            }
+        }
+        None
+    }
+
+    // F3: every answer arrives, out of order, each after a finite number of
+    // newer resolutions.
+    #[test]
+    fn resolutions_progress_when_their_answers_arrive_out_of_order() {
+        for lag in [1, 4, 7, 20] {
+            for seed in 0..16 {
+                assert!(
+                    resolve_out_of_order(lag, seed, 8 * (lag + 2)).is_some(),
+                    "lag {lag}, seed {seed}"
+                );
+            }
+        }
+    }
+
+    // F3, I4: a resolution answers RejectedCertain(Fenced), the admission
+    // ends refused, then an earlier resolution still retained answers
+    // Committed. Two terminal results disagree: the owner stops.
+    #[test]
+    fn a_late_commit_after_a_refusal_of_one_admission_is_a_fault() {
+        let mut world = World::admission_pending();
+        let admission = world.flights[0];
+        let mut token = admission.deadline;
+        let mut resolutions = Vec::new();
+        for _ in 0..2 {
+            world.applied(deadline(token));
+            let effects = world.drain();
+            let Effect::ArmDeadline { token: next, .. } = effects[1].1 else {
+                panic!("a deadline")
+            };
+            resolutions.push(effects[0].0);
+            token = next;
+        }
+        let answer = |effect: EffectId, outcome: StoreOutcome| Input::StoreResult {
+            effect,
+            operation: admission.operation,
+            reply: StoreReply::Outcome(outcome),
+        };
+        let fenced = StoreOutcome::RejectedCertain(RejectReason::Fenced);
+        assert_eq!(
+            world.sent(answer(resolutions[1], fenced)),
+            ["EmitPubrecRefusal"]
+        );
+        assert_eq!(world.phase(7), None);
+        let late = answer(resolutions[0], StoreOutcome::Committed(admission.facts));
+        let fault = CoreFault::ContradictoryOutcome {
+            operation: admission.operation,
+        };
+        faulted(&mut world, late, fault);
     }
 }

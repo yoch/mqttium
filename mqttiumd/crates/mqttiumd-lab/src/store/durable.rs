@@ -668,6 +668,10 @@ impl DurableState {
             .exchange_slots
             .checked_sub(ExchangeSlots::new(1))
             .ok_or(failed)?;
+        // The receipt of the release holds a slot like every receipt.
+        // Short of one, the guard fails in the staged copy, and the
+        // rejection finds no slot either: nothing is written.
+        self.charge(Accounts::receipt())?;
         Ok(CommitFacts::InboundReleased {
             exchange: release.exchange,
         })
