@@ -1075,3 +1075,119 @@ fn nothing_is_handed_over_while_a_barrier_holds() {
 fn fresh_bench() -> Bench {
     bench_with(LIMITS)
 }
+
+/// The bench with `result_slots` results owed at most, and more room
+/// for commands in flight, so that the result budget is the bound.
+fn bench_with_results(result_slots: usize) -> Bench {
+    bench_with(AdapterLimits {
+        operations_in_flight: result_slots + 2,
+        result_slots,
+        ..LIMITS
+    })
+}
+
+fn queue_full(bench: &mut Bench, sequence: u64, command: &Command) {
+    assert_eq!(
+        bench
+            .store
+            .try_submit(persist_effect(bench, sequence, command)),
+        SubmitResult::NotSubmitted {
+            effect: persist_effect(bench, sequence, command),
+            reason: SubmitBlock::QueueFull
+        }
+    );
+}
+
+/// The counterexample of the audit (F6): with one result slot, a
+/// duplicated result would make two results owed. Its fault cannot be
+/// armed, and a run then never owes two results.
+#[test]
+fn a_duplicate_that_cannot_fit_is_not_armed() {
+    let mut bench = bench_with_results(1);
+    assert_eq!(
+        bench
+            .store
+            .arm(fault(FaultPoint::ResultReady, FaultAction::DuplicateResult)),
+        Err(FaultRefused::NoResultSlot)
+    );
+    let command = bench.admission(1, 7, b"payload", &[bench.b]);
+    let id = persist(&mut bench, 1, &command);
+    assert_eq!(bench.store.results_owed(), 1);
+    assert_eq!(enter(&mut bench, id), Performed::Executed);
+    assert_eq!(bench.store.results_owed(), 1);
+    assert!(matches!(
+        deliver(&mut bench, id),
+        Performed::Delivered { .. }
+    ));
+    assert_eq!(bench.store.results_owed(), 0);
+    assert!(bench.store.eligible().is_empty());
+}
+
+/// With two result slots the duplicate fits: its slot is reserved from
+/// arming until both copies are delivered, and no more than two results
+/// are ever owed. Then both slots are free again.
+#[test]
+fn a_duplicate_holds_the_slot_it_reserved_until_it_is_delivered() {
+    let mut bench = bench_with_results(2);
+    let duplicate = arm(
+        &mut bench,
+        FaultPoint::ResultReady,
+        FaultAction::DuplicateResult,
+    );
+    let commands: Vec<_> = (1..=4)
+        .map(|sequence| bench.admission(sequence, 7 + sequence as u16, b"p", &[bench.b]))
+        .collect();
+    let first = persist(&mut bench, 1, &commands[0]);
+    // The reserved slot is taken: no second command.
+    queue_full(&mut bench, 2, &commands[1]);
+    assert_eq!(enter(&mut bench, first), Performed::Executed);
+    assert_eq!(bench.store.hits(duplicate), 1);
+    assert_eq!(bench.store.results_owed(), 2);
+    queue_full(&mut bench, 2, &commands[1]);
+    assert!(matches!(
+        deliver(&mut bench, first),
+        Performed::Delivered { .. }
+    ));
+    // One copy is still owed, in the slot the fault reserved.
+    assert_eq!(bench.store.results_owed(), 1);
+    assert_eq!(deliver(&mut bench, first), Performed::Uncorrelated);
+    assert_eq!(bench.store.results_owed(), 0);
+    // The fault fired and its copies were delivered: both slots are free.
+    let second = persist(&mut bench, 2, &commands[1]);
+    let third = persist(&mut bench, 3, &commands[2]);
+    queue_full(&mut bench, 4, &commands[3]);
+    for id in [second, third] {
+        assert_eq!(enter(&mut bench, id), Performed::Executed);
+        assert!(bench.store.results_owed() <= 2);
+    }
+}
+
+/// A crash loses the armed faults and what they reserved: the adapter
+/// that starts again owes nothing and has every slot.
+#[test]
+fn a_crash_gives_back_the_slot_a_duplicate_reserved() {
+    let mut bench = bench_with_results(2);
+    arm(
+        &mut bench,
+        FaultPoint::ResultReady,
+        FaultAction::DuplicateResult,
+    );
+    let command = bench.admission(1, 7, b"p", &[bench.b]);
+    persist(&mut bench, 1, &command);
+    let other = bench.admission(2, 8, b"p", &[bench.b]);
+    queue_full(&mut bench, 2, &other);
+    let mut bench = bench.wrap(|adapter| {
+        SimStore::new(
+            adapter.crash().store,
+            AdapterLimits {
+                operations_in_flight: 4,
+                result_slots: 2,
+                ..LIMITS
+            },
+        )
+    });
+    assert_eq!(bench.store.results_owed(), 0);
+    persist(&mut bench, 2, &other);
+    let last = bench.admission(3, 9, b"p", &[bench.b]);
+    persist(&mut bench, 3, &last);
+}

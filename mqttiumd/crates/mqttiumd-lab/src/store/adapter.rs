@@ -205,6 +205,10 @@ pub enum FaultRefused {
     /// passage. Only one fault fires at a passage, and the other would
     /// count it without firing: two faults never select one element.
     Overlaps(FaultId),
+    /// A duplicated result takes one more result slot than its command
+    /// did. The slot is reserved when the fault is armed; this one would
+    /// leave no slot for a command.
+    NoResultSlot,
 }
 
 /// Evidence recorded by the adapter, in order. Lot L3 owns the trace
@@ -504,6 +508,13 @@ impl<S: DurableStore> SimStore<S> {
             hits: 0,
         });
         Ok(FaultId(self.faults.len() - 1))
+    }
+
+    /// The results owed now: commands in transit plus results ready and
+    /// not delivered, copies included. Never more than `result_slots`.
+    #[must_use]
+    pub fn results_owed(&self) -> usize {
+        self.transit.len().saturating_add(self.ready.len())
     }
 
     /// How many times a fault was reached.
