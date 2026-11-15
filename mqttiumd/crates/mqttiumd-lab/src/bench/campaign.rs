@@ -409,6 +409,33 @@ pub fn execute(request: &Request) -> Result<Report, String> {
     }
 }
 
+/// The failure model of S0 with a child process, as the topology plan
+/// states it: a limit of the bench, not a property of the product.
+pub const FAILURE_MODEL: &str = "Kill of the process at a declared point, after the decisive record is acknowledged. The kernel and its page cache survive; nothing is shown about fsync, power loss or torn writes. Never inside a transaction: a restriction of the bench.";
+
+/// What `covers.crash` of `campaign.json` says of the crashes of a run.
+fn crash_statement(in_child: bool, kills: &[super::child::Killed], in_process: &str) -> String {
+    if !in_child {
+        return in_process.to_owned();
+    }
+    if kills.is_empty() {
+        return "no crash: the child process stopped cleanly at the end of the run".to_owned();
+    }
+    let each: Vec<String> = kills
+        .iter()
+        .map(|killed| {
+            format!(
+                "{} to pid {} (start-up {}), wait status signal {}",
+                killed.signal_sent, killed.pid, killed.rank, killed.wait_signal
+            )
+        })
+        .collect();
+    format!(
+        "process killed: {}; the supervisor and its collector stayed alive, waited for the end of the child before starting the next one on the same file, and nothing opened, copied or moved the database or its -wal and -shm files in between",
+        each.join("; ")
+    )
+}
+
 /// A campaign is generated: it is never written inside the work tree of
 /// the repository that holds `root`, where it would be a modification of
 /// the checkout it describes. Nothing is created before the refusal. A
@@ -564,11 +591,8 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
             })
         })
         .transpose()?;
-    let backend_crash = if child.is_some() {
-        "simulated in a child process: the child drops the store adapter and the connection of the writer, writes what it recorded and exits on its own; a new child opens the same file; no process is killed"
-    } else {
-        backend.crash()
-    };
+    let in_child = child.is_some();
+    let backend_crash = backend.crash();
     let outcome: Outcome = run(Plan {
         scenario: &scenario,
         backend,
@@ -744,11 +768,22 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         "covers": {
             "backend": backend_name,
             "process": request.process,
-            "crash": backend_crash,
+            "crash": crash_statement(in_child, &outcome.kills, backend_crash),
             "perimeter": "full: client bytes through the transport of the bench, decoded by independent peers",
             "start_up": "the real path: EpochOpening through the store adapter, EpochGrant, OwnerAuthority::from_grant, one box for owner 0, Owner::new",
         },
         "backend_settings": backend_settings,
+        "kills": outcome.kills.iter().map(|killed| json!({
+            "pid": killed.pid,
+            "rank": killed.rank.to_string(),
+            "signal_sent": killed.signal_sent,
+            "wait_status": {"signal": killed.wait_signal, "exit_code": null},
+        })).collect::<Vec<_>>(),
+        "failure_model": if in_child {
+            json!({"kind": scenario.failure_model(), "statement": FAILURE_MODEL})
+        } else {
+            json!({"kind": scenario.failure_model()})
+        },
         "built_from": built_from.unwrap_or(Value::Null),
         "lab": run_manifest["artifact"].clone(),
         "contracts_digest": workspace.contracts_digest(),

@@ -27,7 +27,7 @@ use mqttiumd_contract::ids::{ConnectionGeneration, InboundPacketId, SessionId};
 
 use super::backend::Backend;
 use super::broker::Broker;
-use super::child::{Child, Config as ChildConfig};
+use super::child::{Child, Config as ChildConfig, Killed};
 use super::collector::{Cause, Collector, Origin};
 use super::mqtt::{Kind, peer};
 use super::process::{Books, Process, Settings, Stop, Written};
@@ -107,6 +107,8 @@ pub struct Outcome {
     pub steps_played: usize,
     /// Elementary choices made.
     pub elementary: u64,
+    /// The kills of child processes, as the supervisor observed them.
+    pub kills: Vec<Killed>,
 }
 
 /// The fixture as the runner needs it: clients and their sessions.
@@ -141,6 +143,8 @@ struct Runner<'a, B: Backend> {
     process: Option<Broker<B::Store>>,
     /// The child process mode, when the process under test runs apart.
     child: Option<ChildConfig>,
+    /// The kills of child processes, in order.
+    kills: Vec<Killed>,
     /// The durable state while no process runs.
     dormant: Option<B::Store>,
     restarts: u64,
@@ -801,7 +805,25 @@ impl<B: Backend> Runner<'_, B> {
                         (Some(store), open)
                     }
                     Broker::Child(child) => {
-                        (None, child.crash(&mut self.collector, &mut self.books)?)
+                        // The child is drained between two actions: the kill
+                        // happens at the point its last decisive record
+                        // describes, after that record is acknowledged.
+                        // The peers know which connections were open, in the
+                        // order they were opened.
+                        let mut open: Vec<(ConnectionGeneration, String)> = self
+                            .clients
+                            .iter()
+                            .filter_map(|(name, client)| {
+                                client
+                                    .connection
+                                    .map(|generation| (generation, name.clone()))
+                            })
+                            .collect();
+                        open.sort_by_key(|(generation, _)| generation.get());
+                        let open = open.into_iter().map(|(_, name)| name).collect();
+                        let killed = child.kill()?;
+                        self.kills.push(killed);
+                        (None, open)
                     }
                 };
                 self.books.held.clear();
@@ -881,6 +903,7 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         books: Books::new(scenario.faults.len()),
         process: None,
         child,
+        kills: Vec::new(),
         dormant: Some(store),
         restarts: 0,
         generator: Generator::new(settings.seed),
@@ -953,6 +976,7 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
     let Runner {
         collector,
         books,
+        kills,
         choices,
         snapshots,
         elementary,
@@ -970,5 +994,6 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         unwritten: books.unwritten,
         steps_played: played,
         elementary,
+        kills,
     }
 }

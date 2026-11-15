@@ -79,11 +79,16 @@ fn the_child_gives_the_same_evidence_as_the_in_process_runner() {
         let campaign: serde_json::Value =
             serde_json::from_slice(&read(&child_out, "campaign.json")).unwrap();
         assert_eq!(campaign["covers"]["process"], "child");
-        assert!(
-            campaign["covers"]["crash"]
-                .as_str()
-                .unwrap()
-                .contains("no process is killed")
+        // A scenario that crashes the broker kills the child; one that does
+        // not stops it cleanly.
+        let crashes = std::fs::read_to_string(bench_support::root().join(scenario))
+            .unwrap()
+            .matches("\"CrashBroker\"")
+            .count();
+        assert_eq!(
+            campaign["kills"].as_array().unwrap().len(),
+            crashes,
+            "{scenario}"
         );
         let _ = std::fs::remove_dir_all(&child_out);
         let _ = std::fs::remove_dir_all(&local_out);
@@ -168,4 +173,71 @@ fn a_child_that_never_speaks_stops_the_run_at_its_deadline() {
         "no endless wait"
     );
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// The crash of P1-02 in a child: a real `SIGKILL` to the child that runs
+/// the core and the store, its end by signal 9 observed by the supervisor
+/// before the next child starts on the same file, and the restart by the
+/// real path. The supervisor and its collector stay alive: they write the
+/// rest of the trace, and the oracle judges it like the in-process one.
+#[test]
+fn the_crash_of_a_child_is_a_real_sigkill_and_the_next_child_reads_the_same_file() {
+    let out = bench_support::fresh("killed");
+    let report = execute_with_lab(&request(SCENARIOS[0], out.clone(), "sqlite", "child"));
+    assert_eq!(report.stopped, None);
+    let campaign: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("campaign.json")).unwrap()).unwrap();
+    let kills = campaign["kills"].as_array().unwrap();
+    assert_eq!(kills.len(), 1, "{campaign}");
+    let killed = &kills[0];
+    assert_eq!(killed["signal_sent"], "SIGKILL");
+    assert_eq!(killed["wait_status"]["signal"], 9);
+    assert!(killed["wait_status"]["exit_code"].is_null());
+    assert_eq!(killed["rank"], "0");
+    let pid = killed["pid"].as_u64().unwrap();
+    assert_ne!(pid, u64::from(std::process::id()));
+    // Its end was waited for: no such process remains.
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the killed child {pid} is still there"
+    );
+    let crash = campaign["covers"]["crash"].as_str().unwrap();
+    assert!(
+        crash.starts_with(&format!("process killed: SIGKILL to pid {pid}")),
+        "{crash}"
+    );
+    assert!(crash.contains("wait status signal 9"), "{crash}");
+    assert_eq!(
+        campaign["failure_model"]["statement"],
+        mqttiumd_lab::bench::campaign::FAILURE_MODEL
+    );
+    assert!(
+        campaign["failure_model"]["statement"]
+            .as_str()
+            .unwrap()
+            .contains("after the decisive record is acknowledged")
+    );
+    // The records after the kill were written by the supervisor that
+    // survived it: the crash, the closed connection, the restart.
+    let trace = std::fs::read_to_string(out.join("trace.jsonl")).unwrap();
+    let kinds: Vec<String> = trace
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    let crashed = kinds
+        .iter()
+        .position(|kind| kind == "BrokerCrashed")
+        .unwrap();
+    assert!(
+        kinds[crashed..]
+            .iter()
+            .any(|kind| kind == "BrokerRecovered")
+    );
+    assert_eq!(kinds.last().unwrap(), "TraceFooter");
+    let _ = std::fs::remove_dir_all(&out);
 }

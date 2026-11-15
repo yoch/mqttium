@@ -23,6 +23,7 @@ use std::collections::BTreeSet;
 use std::io::{BufReader, BufWriter, Read};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -98,6 +99,19 @@ enum Arrival {
     Broken(String),
 }
 
+/// What the supervisor observed of a kill.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Killed {
+    /// The process identifier `spawn` gave.
+    pub pid: u32,
+    /// The rank of the start-up of the child.
+    pub rank: u64,
+    /// The signal sent: `SIGKILL`, through `std::process::Child::kill`.
+    pub signal_sent: &'static str,
+    /// The signal the wait status reports: 9.
+    pub wait_signal: i32,
+}
+
 /// The private directory of the sockets of one child, removed when it is
 /// dropped, whether the child started or not.
 struct SocketDirectory(PathBuf);
@@ -121,6 +135,7 @@ pub struct Child {
     /// Hits of each scenario fault before this child started.
     base_hits: Vec<u64>,
     epoch: u64,
+    rank: u64,
     settings: Value,
     /// Kept for the life of the child, removed with it.
     _sockets: SocketDirectory,
@@ -262,6 +277,7 @@ impl Child {
             state: State::default(),
             base_hits: books.hits.clone(),
             epoch: 0,
+            rank,
             settings: Value::Null,
             _sockets: sockets,
             silence: config.silence,
@@ -601,6 +617,61 @@ impl Child {
             )));
         }
         Ok(())
+    }
+
+    /// Kills the child with `SIGKILL` and waits until the operating system
+    /// reports its end by that signal.
+    ///
+    /// A child is killed only between two actions: each action ends with
+    /// every frame acknowledged, so the child is drained and stands at the
+    /// point its last decisive record describes. Its end is confirmed by
+    /// the wait status (signal 9, no exit code) before this returns; a
+    /// frame that arrives after the kill can only describe what was not
+    /// allowed, and stops the run.
+    pub fn kill(mut self) -> Result<Killed, Stop> {
+        if self.actions.is_none() {
+            return Err(stop("the child is not driven any more"));
+        }
+        self.process
+            .kill()
+            .map_err(|error| stop(format!("SIGKILL to the child {}: {error}", self.pid)))?;
+        let status = self.wait(self.silence)?;
+        let killed = Killed {
+            pid: self.pid,
+            rank: self.rank,
+            signal_sent: "SIGKILL",
+            wait_signal: status.signal().unwrap_or(0),
+        };
+        if status.signal() != Some(9) || status.code().is_some() {
+            return Err(stop(format!(
+                "the child {} ended with {status}, not by SIGKILL",
+                self.pid
+            )));
+        }
+        // Its descriptors close with it: what is left is read to the end.
+        let mut late = Vec::new();
+        loop {
+            match self.received.recv_timeout(self.silence) {
+                Ok(Arrival::Evidence(origin, _)) => late.push(origin.name()),
+                Ok(Arrival::Report(_) | Arrival::Broken(_)) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(stop(format!(
+                        "the descriptors of the killed child {} did not close",
+                        self.pid
+                    )));
+                }
+            }
+        }
+        if !late.is_empty() {
+            return Err(stop(format!(
+                "{} records arrived after the kill of the child {}: {}",
+                late.len(),
+                self.pid,
+                late.join(", ")
+            )));
+        }
+        Ok(killed)
     }
 
     /// Waits for the exit of the child before `limit`.
