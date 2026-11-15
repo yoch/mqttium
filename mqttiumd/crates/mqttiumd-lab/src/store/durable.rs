@@ -851,15 +851,10 @@ impl DurableStore for MemoryStore {
         self.committed.ledger
     }
 
-    /// Skeleton: the command is applied whatever it expected.
     fn open_epoch(&mut self, command: &OpenEpoch) -> OpeningOutcome {
-        let read = self.committed.ledger;
-        let unconditional = OpenEpoch {
-            incarnation: read.incarnation(),
-            after: read.last_opened(),
-            ..*command
-        };
-        let ledger = match read.open(&unconditional) {
+        // The condition and the transition are the contract's: the
+        // same function decides for every store.
+        let ledger = match self.committed.ledger.open(command) {
             Ok(ledger) => ledger,
             Err(reason) => return OpeningOutcome::RejectedCertain(reason),
         };
