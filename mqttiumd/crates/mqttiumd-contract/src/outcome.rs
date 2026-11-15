@@ -284,11 +284,7 @@ impl OpeningOutcome {
                 incarnation: ledger.incarnation(),
                 epoch,
             }),
-            LedgerOpening::Opens { ledger: next } => Self::Committed(EpochOpened {
-                incarnation: ledger.incarnation(),
-                epoch: next.last_opened(),
-            }),
-            LedgerOpening::Undecided => Self::Unknown,
+            LedgerOpening::Opens { .. } | LedgerOpening::Undecided => Self::Unknown,
             LedgerOpening::Rejected(reason) => Self::RejectedCertain(reason),
             LedgerOpening::Superseded => Self::Superseded,
         }
@@ -603,13 +599,15 @@ impl EpochOpening {
                 _ => None,
             },
             OpeningOutcome::Superseded => {
-                said = after.checked_next();
+                said = after.checked_next().and_then(RunEpoch::checked_next);
                 match stage {
-                    OpeningStage::Submitted
-                    | OpeningStage::Unknown
-                    | OpeningStage::Committed(_) => {
+                    OpeningStage::Submitted | OpeningStage::Unknown => {
                         Some(OpeningStage::Superseded { commit_seen: false })
                     }
+                    OpeningStage::Committed(_) => {
+                        Some(OpeningStage::Superseded { commit_seen: true })
+                    }
+                    OpeningStage::HandedOver(opened) => Some(OpeningStage::GrantSuperseded(opened)),
                     _ => None,
                 }
             }
@@ -622,7 +620,10 @@ impl EpochOpening {
                     OpeningStage::Submitted | OpeningStage::Unknown if answers => {
                         Some(OpeningStage::Committed(opened))
                     }
-                    OpeningStage::Superseded { .. }
+                    OpeningStage::Superseded { commit_seen: false } if answers => {
+                        Some(OpeningStage::Superseded { commit_seen: true })
+                    }
+                    OpeningStage::Superseded { commit_seen: true }
                     | OpeningStage::Committed(_)
                     | OpeningStage::HandedOver(_)
                     | OpeningStage::GrantSuperseded(_)

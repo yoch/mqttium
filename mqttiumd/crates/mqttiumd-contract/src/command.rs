@@ -671,15 +671,18 @@ impl OpeningRejection {
 }
 
 /// What the ledger establishes about one `OpenEpoch`. Only `Rejected`
-/// says that the attempt opened nothing and never will.
+/// says that the command opened nothing and never will.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LedgerOpening {
-    /// The attempt opens this epoch now. The ledger to commit is given.
+    /// The command opens the next epoch once this ledger is durable.
+    /// Until then nothing is opened: the epoch a store reports is read
+    /// from the ledger it wrote (`OpeningOutcome::read`), never from
+    /// this decision.
     Opens { ledger: EpochLedger },
-    /// The attempt already opened this epoch, which is still the last
+    /// The command already opened this epoch, which is still the last
     /// one: the same command presented again. Nothing is to be written.
     AlreadyOpened { epoch: RunEpoch },
-    /// The attempt opened nothing and never will.
+    /// The command opened nothing and never will.
     Rejected(OpeningRejection),
     /// The epoch this attempt asked for was opened and is closed. The
     /// ledger keeps the opener of the last epoch only, so it does not
@@ -711,10 +714,15 @@ pub enum EpochPhase {
     Closed,
 }
 
-/// Why three durable values are not the ledger of a data set.
+/// Why three durable values are not the ledger of a data set. A store
+/// that reads them is corrupt or is not this format: it opens nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LedgerIncoherent {
+    /// An epoch is recorded as opened and no attempt as its opener. The
+    /// command that did open it could not be recognised: it would be
+    /// told that it opened nothing.
     EpochWithoutOpener,
+    /// An opener is recorded and no epoch was opened.
     OpenerWithoutEpoch,
 }
 
@@ -724,15 +732,17 @@ pub enum LedgerIncoherent {
 ///
 /// Epochs open in increasing order, one at a time. The last opened epoch
 /// is the only open one and every epoch opened before it is closed;
-/// epoch 0 is never opened and encodes "no epoch yet". The same pure
+/// epoch 0 is never opened and encodes "no epoch yet". An opened epoch
+/// always has its opener: the two are one value here, and durable values
+/// that separate them are refused by `from_durable`. The same pure
 /// decision is used by the deterministic store and by SQLite, which
 /// reads the three values, calls `open` with the command and, when it
 /// opens, writes the ledger it is given in the same transaction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EpochLedger {
     incarnation: StoreIncarnation,
-    last_opened: RunEpoch,
-    opened_by: Option<OpeningAttempt>,
+    /// The last opened epoch, never zero, and the attempt that opened it.
+    opened: Option<(RunEpoch, OpeningAttempt)>,
 }
 
 impl EpochLedger {
@@ -741,22 +751,27 @@ impl EpochLedger {
     pub const fn fresh(incarnation: StoreIncarnation) -> Self {
         Self {
             incarnation,
-            last_opened: RunEpoch::new(0),
-            opened_by: None,
+            opened: None,
         }
     }
 
-    /// Rebuilds the ledger from its durable values. `last_opened` is
-    /// zero, and `opened_by` absent, when no epoch was opened.
+    /// Rebuilds the ledger from its durable values: `last_opened` is
+    /// zero and `opened_by` absent when no epoch was opened, and both
+    /// are present otherwise. Any other pair is refused.
     pub fn from_durable(
         incarnation: StoreIncarnation,
         last_opened: RunEpoch,
         opened_by: Option<OpeningAttempt>,
     ) -> Result<Self, LedgerIncoherent> {
+        let opened = match (last_opened.get(), opened_by) {
+            (0, None) => None,
+            (0, Some(_)) => return Err(LedgerIncoherent::OpenerWithoutEpoch),
+            (_, None) => return Err(LedgerIncoherent::EpochWithoutOpener),
+            (_, Some(attempt)) => Some((last_opened, attempt)),
+        };
         Ok(Self {
             incarnation,
-            last_opened,
-            opened_by,
+            opened,
         })
     }
 
@@ -769,27 +784,37 @@ impl EpochLedger {
     /// The durable value: the last opened epoch, zero when there is none.
     #[must_use]
     pub const fn last_opened(&self) -> RunEpoch {
-        self.last_opened
+        match self.opened {
+            Some((epoch, _)) => epoch,
+            None => RunEpoch::new(0),
+        }
     }
 
     /// The durable value: the attempt that opened the last epoch.
     #[must_use]
     pub const fn opened_by(&self) -> Option<OpeningAttempt> {
-        self.opened_by
+        match self.opened {
+            Some((_, attempt)) => Some(attempt),
+            None => None,
+        }
     }
 
     /// The one epoch open for execution, if an opening was committed.
     #[must_use]
-    pub fn open_epoch(&self) -> Option<RunEpoch> {
-        (self.last_opened.get() != 0).then_some(self.last_opened)
+    pub const fn open_epoch(&self) -> Option<RunEpoch> {
+        match self.opened {
+            Some((epoch, _)) => Some(epoch),
+            None => None,
+        }
     }
 
     /// The durable phase of `epoch`.
     #[must_use]
     pub fn phase_of(&self, epoch: RunEpoch) -> EpochPhase {
-        if epoch.get() == 0 || epoch > self.last_opened {
+        let last_opened = self.last_opened();
+        if epoch.get() == 0 || epoch > last_opened {
             EpochPhase::Unopened
-        } else if epoch == self.last_opened {
+        } else if epoch == last_opened {
             EpochPhase::Open
         } else {
             EpochPhase::Closed
@@ -803,16 +828,22 @@ impl EpochLedger {
         if command.incarnation != self.incarnation {
             return LedgerOpening::Rejected(OpeningRejection::ForeignIncarnation);
         }
-        if command.after > self.last_opened {
+        let last_opened = self.last_opened();
+        if command.after > last_opened {
             return LedgerOpening::Undecided;
         }
-        if command.after == self.last_opened {
-            return match self.last_opened.checked_next() {
+        let by_the_last_opener = self.opened_by() == Some(command.attempt);
+        if command.after == last_opened {
+            if by_the_last_opener {
+                // One identity, two commands: it opened the last epoch
+                // and now asks for the next.
+                return LedgerOpening::Rejected(OpeningRejection::AttemptReused);
+            }
+            return match last_opened.checked_next() {
                 Ok(epoch) => LedgerOpening::Opens {
                     ledger: Self {
                         incarnation: self.incarnation,
-                        last_opened: epoch,
-                        opened_by: Some(command.attempt),
+                        opened: Some((epoch, command.attempt)),
                     },
                 },
                 Err(Exhausted) => LedgerOpening::Rejected(OpeningRejection::EpochsExhausted),
@@ -820,13 +851,11 @@ impl EpochLedger {
         }
         // The epoch right after the condition was opened. Is it still
         // the last one, and by whom?
-        if command.after.checked_next() != Ok(self.last_opened) {
+        if command.after.checked_next() != Ok(last_opened) {
             return LedgerOpening::Superseded;
         }
-        if self.opened_by == Some(command.attempt) {
-            LedgerOpening::AlreadyOpened {
-                epoch: self.last_opened,
-            }
+        if by_the_last_opener {
+            LedgerOpening::AlreadyOpened { epoch: last_opened }
         } else {
             LedgerOpening::Rejected(OpeningRejection::PredecessorMoved)
         }
