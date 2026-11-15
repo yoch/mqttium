@@ -282,6 +282,8 @@ enum Txn<T, E> {
     Committed(T),
     /// A guard refused it; it was rolled back.
     Refused(E),
+    /// A metadata read failed before the transaction could be prepared.
+    ReadFailed(ReadError),
     /// It was not written: rolled back, or its commit failed.
     NotWritten,
 }
@@ -1500,7 +1502,7 @@ impl SqliteStore {
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| None)?;
-            let mut meta = read_meta(&tx).map_err(|_| None)?;
+            let mut meta = read_meta(&tx).map_err(|fault| Some(fault.read_error()))?;
             let value = match prepare(&tx, &mut meta) {
                 Ok(value) => value,
                 // Dropping the transaction rolls it back.
@@ -1522,7 +1524,8 @@ impl SqliteStore {
         match result {
             Ok(Ok(value)) => Txn::Committed(value),
             Ok(Err(refusal)) => Txn::Refused(refusal),
-            Err(None::<()>) | Err(Some(())) => Txn::NotWritten,
+            Err(Some(error)) => Txn::ReadFailed(error),
+            Err(None) => Txn::NotWritten,
         }
     }
 
@@ -1541,7 +1544,9 @@ impl SqliteStore {
         });
         match written {
             Txn::Committed(()) => (StoreOutcome::RejectedCertain(reason), true),
-            Txn::Refused(()) | Txn::NotWritten => (StoreOutcome::PendingOrUnknown, false),
+            Txn::Refused(()) | Txn::ReadFailed(_) | Txn::NotWritten => {
+                (StoreOutcome::PendingOrUnknown, false)
+            }
         }
     }
 
@@ -1991,11 +1996,13 @@ impl DurableStore for SqliteStore {
 
     fn open_epoch(&mut self, command: &OpenEpoch) -> Result<OpeningOutcome, ReadError> {
         // The decision is the contract's; only an opening writes.
-        if let LedgerOpening::Opens { ledger } = self.read_ledger()?.open(command) {
-            let _written = self.transact(|_, meta| {
+        if let LedgerOpening::Opens { ledger } = self.read_ledger()?.open(command)
+            && let Txn::ReadFailed(error) = self.transact(|_, meta| {
                 meta.ledger = ledger;
                 Ok::<(), Abort<()>>(())
-            });
+            })
+        {
+            return Err(error);
         }
         // The answer comes from what is durable now.
         Ok(OpeningOutcome::read(&self.read_ledger()?, command))
@@ -2087,7 +2094,7 @@ impl DurableStore for SqliteStore {
                 wrote: true,
             },
             Txn::Refused(reason) => rejected(self.commit_rejection(operation, &canonical, reason)),
-            Txn::NotWritten => unknown,
+            Txn::ReadFailed(_) | Txn::NotWritten => unknown,
         }
     }
 
@@ -2124,7 +2131,9 @@ impl DurableStore for SqliteStore {
                 fenced_now: true,
             },
             Txn::Refused(Some(outcome)) => settled(outcome),
-            Txn::Refused(None) | Txn::NotWritten => settled(StoreOutcome::PendingOrUnknown),
+            Txn::Refused(None) | Txn::ReadFailed(_) | Txn::NotWritten => {
+                settled(StoreOutcome::PendingOrUnknown)
+            }
         }
     }
 
@@ -2132,7 +2141,7 @@ impl DurableStore for SqliteStore {
         match self.transact(|conn, meta| stage_admin(conn, meta, command)) {
             Txn::Committed(done) => Ok(done),
             Txn::Refused(refusal) => Err(refusal),
-            Txn::NotWritten => Err(AdminRefused::WriteFailed),
+            Txn::ReadFailed(_) | Txn::NotWritten => Err(AdminRefused::WriteFailed),
         }
     }
 
