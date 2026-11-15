@@ -157,9 +157,10 @@ fn a_fact_that_cannot_be_built_is_not_the_end_of_the_inventory() {
     record.client_id = vec![b'x'; MAX_CLIENT_ID_BYTES + 1];
     let reopened = MemoryStore::reopen(durable);
 
-    // The epoch and `producer` come before `b`.
-    let first = reopened.recover(None, 2).expect("two facts that fit");
-    assert_eq!(first.facts.as_slice().len(), 2);
+    // The epoch, the limits, the route table, its two targets and the
+    // session `producer` come before `b`.
+    let first = reopened.recover(None, 6).expect("six facts that fit");
+    assert_eq!(first.facts.as_slice().len(), 6);
     let next = first.next.expect("the inventory goes on");
     assert_eq!(
         reopened.recover(Some(next), 4),

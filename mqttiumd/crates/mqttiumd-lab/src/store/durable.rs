@@ -840,15 +840,51 @@ impl DurableState {
         }
     }
 
-    /// The recovery inventory, in a fixed order: the epoch, the active
-    /// sessions, the inbound markers, then what is established about the
-    /// operations of older epochs. A fact that cannot be built within its
-    /// budget is an error in its place, never the end of the inventory.
+    /// The recovery inventory, in the order of record 0014: the epoch,
+    /// the limits, the route table, its routes sorted by the bytes of
+    /// their topic with the targets of one topic in the order they were
+    /// added, the active sessions, the inbound markers, then what is
+    /// established about the operations of older epochs. A fact that
+    /// cannot be built within its budget is an error in its place, never
+    /// the end of the inventory.
     fn inventory(&self) -> impl Iterator<Item = Result<RecoveredFact, RecoveryRefused>> + '_ {
         let incarnation = self.ledger.incarnation();
         let open = self.ledger.open_epoch();
         let older = move |operation: &OperationId| Some(operation.epoch()) != open;
         let epoch = open.map(|epoch| Ok(RecoveredFact::Epoch { incarnation, epoch }));
+        let refused = |_| RecoveryRefused::AllocationFailed;
+        let bound = |value: usize| u32::try_from(value).map_err(refused);
+        let limits = (|| {
+            Ok(RecoveredFact::Limits {
+                max_targets_per_admission: bound(self.limits.max_targets_per_admission)?,
+                max_topic_bytes: bound(self.limits.max_topic_bytes)?,
+                max_payload_bytes: PayloadBytes::new(
+                    u64::try_from(self.limits.max_payload_bytes).map_err(refused)?,
+                ),
+            })
+        })();
+        let table = Ok(RecoveredFact::RouteTable {
+            revision: self.route_revision,
+        });
+        let max_topic_bytes = self.limits.max_topic_bytes;
+        let routes = self.routes.iter().flat_map(move |(topic, targets)| {
+            targets.iter().map(move |target| {
+                // A route names an active session; its revision is the
+                // one an admission must carry.
+                let session = self
+                    .sessions
+                    .get(&target.session)
+                    .filter(|record| record.state == SessionState::Active)
+                    .ok_or(RecoveryRefused::AllocationFailed)?;
+                Ok(RecoveredFact::Route {
+                    topic: SharedBytes::copy_from(topic, max_topic_bytes)
+                        .map_err(|_| RecoveryRefused::AllocationFailed)?,
+                    target: target.session,
+                    target_revision: session.revision,
+                    max_qos: target.qos,
+                })
+            })
+        });
         let sessions = self
             .sessions
             .iter()
@@ -895,6 +931,8 @@ impl DurableState {
             });
         epoch
             .into_iter()
+            .chain([limits, table])
+            .chain(routes)
             .chain(sessions)
             .chain(inbound)
             .chain(receipts)
