@@ -34,6 +34,7 @@ use super::process::{Books, Process, Settings, Stop, Written};
 use super::scenario::{Event, Fault, Scenario, Step};
 use crate::store::adapter::{FaultSpec, WorkKind};
 use crate::store::evidence::{SnapshotContext, snapshot};
+use mqttiumd_store_api::ReadPhase;
 
 /// The version of the scheduler. A change of its choices is a new one.
 pub const SCHEDULER_VERSION: u64 = 1;
@@ -94,6 +95,9 @@ pub struct Outcome {
     pub choices: Vec<String>,
     /// Why the run stopped before its last step, if it did.
     pub stopped: Option<String>,
+    /// Typed causes retained by the surviving supervisor.
+    pub failures: Vec<Value>,
+    pub failure_count: u64,
     /// Hits of each fault of the scenario, in its order.
     pub hits: Vec<u64>,
     /// Faults the scenario declares and the run did not reach as often
@@ -145,6 +149,8 @@ struct Runner<'a, B: Backend> {
     child: Option<ChildConfig>,
     /// The kills of child processes, in order.
     kills: Vec<Killed>,
+    failures: Vec<Value>,
+    failure_count: u64,
     /// The durable state while no process runs.
     dormant: Option<B::Store>,
     restarts: u64,
@@ -277,6 +283,35 @@ impl<B: Backend> Runner<'_, B> {
             armed.push((index, specification(fault, &bound)?, name));
         }
         Ok(armed)
+    }
+
+    /// Record the stable type independently of the optional human diagnostic.
+    fn retain_failure(&mut self, error: &Stop) {
+        let Some(failure) = error.failure else {
+            return;
+        };
+        let mut payload = failure.payload();
+        if !error.message.is_empty() {
+            payload["message"] = json!(&error.message);
+        }
+        let record_sequence = self.collector.count();
+        if self
+            .collector
+            .emit(
+                Origin::BenchSupervisor,
+                failure.record_kind(),
+                &[],
+                payload.clone(),
+            )
+            .is_ok()
+        {
+            self.failure_count = self.failure_count.saturating_add(1);
+            if self.failures.len() < 64 {
+                payload["kind"] = json!(failure.record_kind());
+                payload["record_sequence"] = json!(record_sequence.to_string());
+                self.failures.push(payload);
+            }
+        }
     }
 
     fn start(&mut self) -> Result<(), Stop> {
@@ -770,7 +805,7 @@ impl<B: Backend> Runner<'_, B> {
                     }
                     (None, None) => return Err(Stop::new("no data set to inspect")),
                 }
-                .map_err(Stop::new)?;
+                .map_err(|error| Stop::read(error, ReadPhase::Inspect, self.restarts + 1, None))?;
                 let document = snapshot(
                     &durable,
                     SnapshotContext {
@@ -866,7 +901,10 @@ impl<B: Backend> Runner<'_, B> {
                     }
                 }
                 if let Some(store) = store {
-                    self.dormant = Some(self.backend.reopen_after_crash(store).map_err(Stop::new)?);
+                    self.dormant =
+                        Some(self.backend.reopen_after_crash(store).map_err(|error| {
+                            Stop::read(error, ReadPhase::Open, self.restarts + 1, None)
+                        })?);
                 }
                 Ok(())
             }
@@ -930,6 +968,8 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         process: None,
         child,
         kills: Vec::new(),
+        failures: Vec::new(),
+        failure_count: 0,
         dormant: Some(store),
         restarts: 0,
         generator: Generator::new(settings.seed),
@@ -948,16 +988,18 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         .err()
         .map(|refusal| format!("the header was refused: {refusal}"));
     if stopped.is_none()
-        && let Err(Stop(reason)) = runner.start()
+        && let Err(error) = runner.start()
     {
-        stopped = Some(format!("start-up: {reason}"));
+        runner.retain_failure(&error);
+        stopped = Some(format!("start-up: {error}"));
     }
     let mut played = 0;
     if stopped.is_none() {
         for (index, step) in scenario.steps.iter().enumerate() {
             runner.step_index = index;
-            if let Err(Stop(reason)) = runner.play(step) {
-                stopped = Some(format!("step {index} ({}): {reason}", step.kind()));
+            if let Err(error) = runner.play(step) {
+                runner.retain_failure(&error);
+                stopped = Some(format!("step {index} ({}): {error}", step.kind()));
                 break;
             }
             runner.blocked = None;
@@ -984,25 +1026,29 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
     {
         match runner.write_blocked(cause) {
             Ok(()) => complete = true,
-            Err(Stop(reason)) => {
-                stopped = stopped.map(|stopped| format!("{stopped}; StepBlocked: {reason}"));
+            Err(error) => {
+                runner.retain_failure(&error);
+                stopped = stopped.map(|stopped| format!("{stopped}; StepBlocked: {error}"));
             }
         }
     }
     // A child still running is asked to stop, and must exit on its own.
     if let Some(Broker::Child(child)) = runner.process.take()
-        && let Err(Stop(reason)) = child.stop(&mut runner.collector, &mut runner.books)
+        && let Err(error) = child.stop(&mut runner.collector, &mut runner.books)
     {
+        runner.retain_failure(&error);
         complete = false;
         stopped = Some(match stopped {
-            Some(stopped) => format!("{stopped}; the child: {reason}"),
-            None => format!("the child: {reason}"),
+            Some(stopped) => format!("{stopped}; the child: {error}"),
+            None => format!("the child: {error}"),
         });
     }
     let Runner {
         collector,
         books,
         kills,
+        failures,
+        failure_count,
         choices,
         snapshots,
         elementary,
@@ -1014,6 +1060,8 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         snapshots,
         choices,
         stopped,
+        failures,
+        failure_count,
         hits: books.hits,
         not_reached,
         refused: refusals.iter().map(ToString::to_string).collect(),

@@ -235,7 +235,11 @@ fn a_child_that_never_speaks_stops_the_run_at_its_deadline() {
     let Err(stopped) = Child::spawn(&config, 0, &[], &mut collector, &mut books) else {
         panic!("a silent child started");
     };
-    assert!(stopped.0.contains("did not connect"), "{}", stopped.0);
+    assert!(
+        stopped.message.contains("did not connect"),
+        "{}",
+        stopped.message
+    );
     assert!(
         started.elapsed() < Duration::from_secs(15),
         "no endless wait"
@@ -382,7 +386,7 @@ fn a_second_child_on_the_same_file_while_the_first_lives_is_refused() {
     let Err(refused) = Child::spawn(&config, 8, &[], &mut second_collector, &mut books) else {
         panic!("a second writer started on the same file");
     };
-    assert!(refused.0.contains("WriterAlive"), "{}", refused.0);
+    assert!(refused.failure.is_some(), "{}", refused.message);
     first
         .stop(&mut first_collector, &mut books)
         .expect("the first child stops");
