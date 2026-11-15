@@ -181,6 +181,27 @@ fn pack(source: &Path, tar: &Path) -> Result<(), String> {
     .map(|_| ())
 }
 
+/// Takes the turn of the tree `tree` on its lock, `<tree>.lock`, and
+/// holds it as long as the returned file lives. The tree is named by the
+/// digest of the archive and its path enters the binary, so two builds of
+/// one archive share it: they take turns, with `run --rebuild` and
+/// `tools/check_campaign_binary.sh` (`flock` on the same file) alike.
+pub fn take_turn(tree: &Path) -> Result<fs::File, String> {
+    let name = tree
+        .file_name()
+        .ok_or_else(|| format!("{} names no directory", tree.display()))?;
+    let lock = tree.with_file_name(format!("{}.lock", name.to_string_lossy()));
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock)
+        .map_err(|error| format!("{}: {error}", lock.display()))?;
+    file.lock()
+        .map_err(|error| format!("no lock on {}: {error}", lock.display()))?;
+    Ok(file)
+}
+
 /// Builds `mqttiumd-lab` from the unpacked tar `tar`, in `work`.
 fn build(tar: &Path, work: &Path) -> Result<(PathBuf, String), String> {
     // The tree is named by the digest of the tar: its path enters the
@@ -191,6 +212,8 @@ fn build(tar: &Path, work: &Path) -> Result<(PathBuf, String), String> {
         .map_err(|error| format!("{}: {error}", tar.display()))?
         .0;
     let tree = std::env::temp_dir().join(format!("mqttiumd-source-{}", &digest[..16]));
+    // Held until the tree is removed, at the end of this function.
+    let _turn = take_turn(&tree)?;
     let _ = fs::remove_dir_all(&tree);
     fs::create_dir_all(&tree).map_err(|error| format!("{}: {error}", tree.display()))?;
     run(
@@ -244,4 +267,31 @@ pub fn rebuild(root: &Path, work: &Path, exclude: &[PathBuf]) -> Result<Rebuilt,
         revision,
         build,
     })
+}
+
+#[cfg(test)]
+mod turn_tests {
+    use super::take_turn;
+
+    #[test]
+    fn two_builds_of_one_archive_take_turns_on_the_lock_of_its_tree() {
+        let tree =
+            std::env::temp_dir().join(format!("mqttiumd-source-turn-{}", std::process::id()));
+        let held = take_turn(&tree).expect("the first takes its turn");
+        let lock = tree.with_file_name(format!(
+            "{}.lock",
+            tree.file_name().unwrap().to_string_lossy()
+        ));
+        let other = std::fs::File::open(&lock).expect("the lock file");
+        assert!(
+            other.try_lock().is_err(),
+            "a second build of the same archive waits for its turn"
+        );
+        drop(held);
+        assert!(
+            other.try_lock().is_ok(),
+            "the turn passes when the first ends"
+        );
+        let _ = std::fs::remove_file(&lock);
+    }
 }
