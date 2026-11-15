@@ -1,0 +1,37 @@
+{
+  "format": "mqttiumd-lab.loop-mutants",
+  "version": 1,
+  "description": "Mutations of the real loop of lot L4: each patch, applied to a temporary worktree of the repository, is played by the runner and judged by the oracle of the unmodified tree. A rejected mutation must get the verdict, the failing assertion and a reason holding the fragment below. A known survivor is reported and does not fail the run until the finding it names is merged.",
+  "mutants": [
+    {
+      "id": "m1-payload-owed-lost",
+      "patch": "m1-payload-owed-lost.patch",
+      "mutation": "the store loses the payload its obligations still owe when the exchange is released",
+      "scenario": "tests/scenarios/p1/P1-02.json",
+      "expect": "rejected",
+      "verdict": "FAIL",
+      "assertion": "same_required_obligations_at_both_checkpoints",
+      "reason": "names a payload the store does not hold"
+    },
+    {
+      "id": "m2-result-altered-before-the-core",
+      "patch": "m2-result-altered-before-the-core.patch",
+      "mutation": "the dispatcher hands the core a certain rejection for lack of capacity where the store rejected for a fence",
+      "scenario": "tests/scenarios/qabs/QABS-B.json",
+      "expect": "survives-known",
+      "finding": "K1",
+      "note": "Known survivor: the oracle does not yet close the chain from the result the store produced to the result the core consumed (finding K1, lot L3). Once K1 is merged this entry becomes rejected, with its assertion and reason.",
+      "verdict": "PASS"
+    },
+    {
+      "id": "m3-positive-ack-too-early",
+      "patch": "m3-positive-ack-too-early.patch",
+      "mutation": "the core makes PUBREC Success eligible with the submission of the admission, before any commit is known",
+      "scenario": "tests/scenarios/p1/P1-02.json",
+      "expect": "rejected",
+      "verdict": "FAIL",
+      "assertion": "no_positive_ack_before_confirmed_commit",
+      "reason": "eligible before the core knew of a commit"
+    }
+  ]
+}
