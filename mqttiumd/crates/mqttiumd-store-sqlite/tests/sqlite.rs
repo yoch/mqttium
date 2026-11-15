@@ -236,3 +236,31 @@ fn sqlite_answers_as_the_deterministic_store() {
         }
     }
 }
+
+/// A durable value the store cannot decode is an error of the snapshot,
+/// of the same kind as for `inspect`, never a panic.
+#[test]
+fn a_value_that_does_not_decode_is_an_error_of_the_snapshot() {
+    let path = fresh_path();
+    let mut world = World::new(&|incarnation, limits| {
+        SqliteStore::create(&path, incarnation, limits).expect("created")
+    });
+    let command = world.admission(1, 7, b"payload", &[world.b]);
+    assert!(world.store.apply(&command).committed_now);
+    drop(world);
+    // A decision code no version of this store writes.
+    rusqlite::Connection::open(&path)
+        .expect("raw")
+        .execute("UPDATE operations SET decision = 99", [])
+        .expect("damaged");
+    let store = SqliteStore::open(&path).expect("the file is sound, a value is not");
+    let snapshot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.try_snapshot()));
+    assert!(
+        matches!(snapshot, Ok(Err(OpenError::Corrupt))),
+        "{snapshot:?}"
+    );
+    assert!(matches!(
+        SqliteStore::inspect(&path),
+        Err(OpenError::Corrupt)
+    ));
+}
