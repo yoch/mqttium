@@ -131,7 +131,8 @@ def admit_recipe(operation, publication, payload, generation, targets=((B, 1), (
             b"MQDR".hex() + be(1, 2) + be(1, 1),
             scoped_hex(operation) + scoped_hex(operation) + scoped_hex(publication),
             be(PRODUCER) + be(1) + be(7, 2) + be(generation),
-            be(1) + be(2, 1) + be(0, 1),
+            # The fixture's table is at revision 2: one per AddRoute.
+            be(2) + be(2, 1) + be(0, 1),
             be(len(TOPIC), 2) + TOPIC.hex(),
             scoped_hex(payload) + be(len(PAYLOAD)),
             be(len(PAYLOAD)) + be(len(targets)) + be(1) + be(1),
@@ -184,7 +185,7 @@ def snapshot(run, checkpoint, admissions, releases=(), open_exchange=True, epoch
             for session, name in CLIENT_IDS.items()
         ],
         "route_table": {
-            "revision": "1",
+            "revision": "2",
             "routes": [
                 {
                     "topic_hex": TOPIC.hex(),
@@ -594,7 +595,7 @@ ROUTE_FACTS = [
         "max_topic_bytes": "256",
         "max_payload_bytes": "1024",
     },
-    {"kind": "RouteTable", "revision": "1"},
+    {"kind": "RouteTable", "revision": "2"},
     route_fact(TOPIC, B),
     route_fact(TOPIC, C),
 ]
@@ -1535,6 +1536,22 @@ case(
     "Routes belong to the table that precedes them: an inventory with routes and no table is not one.",
     {"broker_inputs_have_provenance": "FAIL"},
     events=in_pages(lambda facts: facts.pop(2), []),
+)
+
+
+# Rules the core applies to a whole inventory (lot L1): a route is listed
+# once, and every route targets a session of the inventory.
+case(
+    "recovery-route-listed-twice-across-pages",
+    "The same route, topic and target, is in two pages of one inventory.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=in_pages(lambda facts: facts.insert(4, dict(facts[3])), [4]),
+)
+case(
+    "recovery-route-to-a-session-the-inventory-lacks",
+    "A route targets a session that no fact of the inventory recovers.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=in_pages(lambda facts: facts.insert(5, route_fact(TOPIC, 9)), []),
 )
 
 

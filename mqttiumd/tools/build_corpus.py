@@ -1162,7 +1162,7 @@ PAGE_FULL = {
             "max_topic_bytes": "256",
             "max_payload_bytes": "1024",
         },
-        {"kind": "RouteTable", "revision": "1"},
+        {"kind": "RouteTable", "revision": "2"},
         route(b"p1", 2),
         route(b"p1/example", 2),
         route(b"p1/example", 3, qos=2),
@@ -1588,7 +1588,7 @@ RECIPE_HEX = "".join(
         b"MQDR".hex() + be(1, 2) + be(1, 1),
         scoped(1) + scoped(1) + scoped(1),  # operation, request, publication
         be(1) + be(1) + be(7, 2) + be(1),  # source: session, revision, packet, generation
-        be(1) + be(2, 1) + be(0, 1),  # route revision, QoS, retain
+        be(2) + be(2, 1) + be(0, 1),  # route revision, QoS, retain
         be(10, 2) + b"p1/example".hex(),
         scoped(1) + be(7),  # payload identity and length
         be(7) + be(2) + be(1) + be(1),  # costs
@@ -1629,7 +1629,7 @@ snapshot = env(
         for number, client_id in SESSIONS
     ],
     route_table={
-        "revision": "1",
+        "revision": "2",
         "routes": [
             {
                 "topic_hex": b"p1/example".hex(),

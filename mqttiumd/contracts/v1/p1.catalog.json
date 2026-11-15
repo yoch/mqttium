@@ -75,6 +75,23 @@
           "meaning": "The packet arrives on the connection that already carried a PUBLISH of the exchange, or no earlier PUBLISH of the exchange exists."
         }
       ]
+    },
+    {
+      "name": "refusal",
+      "values": [
+        {
+          "value": "fenced",
+          "meaning": "The store refused the release because a resolution of its owner fenced the operation before the command arrived, and fewer preparations of the exchange than the bound were made."
+        },
+        {
+          "value": "fenced_at_bound",
+          "meaning": "The same reason, and the bound of preparations of the exchange is reached."
+        },
+        {
+          "value": "definitive",
+          "meaning": "Any other reason of a certain refusal: a new preparation could not change it."
+        }
+      ]
     }
   ],
   "event_classes": [
@@ -108,7 +125,8 @@
       "guard_dimensions": [
         "identity",
         "outcome",
-        "effect_capacity"
+        "effect_capacity",
+        "refusal"
       ]
     },
     {

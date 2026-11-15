@@ -448,3 +448,61 @@ fn a_file_of_the_schema_directory_that_is_not_a_schema_is_refused() {
         .expect("a foreign file in the schema directory is refused");
     assert_eq!(diagnostic.code, code::SCHEMA_NOT_LOCAL, "{diagnostic:?}");
 }
+
+/// A release the store refused for certain is prepared again only when it
+/// was fenced and the bound of preparations is not reached; any other
+/// refusal stops the owner, and nothing is persisted or acknowledged
+/// (record 0013, line 4). Without the reason the registry prepared again
+/// whatever the refusal, which loops for ever on a definitive one.
+#[test]
+fn a_release_refused_for_good_is_never_prepared_again() {
+    let bytes = fs::read(root().join("contracts/v1/p1.transitions.json")).expect("registry");
+    let registry: Value = serde_json::from_slice(&bytes).expect("JSON");
+    let rules = registry["rules"].as_array().expect("rules");
+    let rule = |id: &str| {
+        rules
+            .iter()
+            .find(|rule| rule["id"] == id)
+            .unwrap_or_else(|| panic!("no rule {id}"))
+    };
+    let again = rule("inbound_qos2.release_pending.rejected.prepare_again");
+    assert_eq!(
+        again["guard_partition"]["refusal"],
+        serde_json::json!(["fenced"])
+    );
+    let defer = rule("inbound_qos2.release_pending.rejected.defer");
+    assert_eq!(
+        defer["guard_partition"]["refusal"],
+        serde_json::json!(["fenced"])
+    );
+    for (id, refusal) in [
+        (
+            "inbound_qos2.release_pending.rejected.fenced_at_bound.stop",
+            "fenced_at_bound",
+        ),
+        (
+            "inbound_qos2.release_pending.rejected.definitive.stop",
+            "definitive",
+        ),
+    ] {
+        let stop = rule(id);
+        assert_eq!(stop["disposition"], "FAULT", "{id}");
+        assert_eq!(
+            stop["guard_partition"]["refusal"],
+            serde_json::json!([refusal]),
+            "{id}"
+        );
+        assert_eq!(stop["next_state_class"], "ReleasePending", "{id}");
+        assert_eq!(stop["required_effects"], serde_json::json!([]), "{id}");
+        for effect in ["Persist", "EmitPubcomp", "EmitPubcompNotFound"] {
+            assert!(
+                stop["forbidden_effects"]
+                    .as_array()
+                    .expect("effects")
+                    .iter()
+                    .any(|forbidden| forbidden == effect),
+                "{id} must forbid {effect}"
+            );
+        }
+    }
+}

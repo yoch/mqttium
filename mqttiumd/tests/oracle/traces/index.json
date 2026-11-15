@@ -673,6 +673,38 @@
       "why": "Routes belong to the table that precedes them: an inventory with routes and no table is not one."
     },
     {
+      "name": "recovery-route-listed-twice-across-pages",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/recovery-route-listed-twice-across-pages/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "The same route, topic and target, is in two pages of one inventory."
+    },
+    {
+      "name": "recovery-route-to-a-session-the-inventory-lacks",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/recovery-route-to-a-session-the-inventory-lacks/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "A route targets a session that no fact of the inventory recovers."
+    },
+    {
       "name": "recovery-delivered-out-of-inventory-order",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/recovery-delivered-out-of-inventory-order/trace.jsonl",

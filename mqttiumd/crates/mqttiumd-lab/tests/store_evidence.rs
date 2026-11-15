@@ -85,33 +85,11 @@ fn a_snapshot_after_a_commit_is_the_example_of_the_corpus() {
     ] {
         assert_eq!(written[member], expected[member], "{member}");
     }
-    // One difference, stated: the example gives the fixture's route the
-    // table revision 1, and this store advances the revision once per
-    // target added, so the route table and the recipe that carries it
-    // say 2. Everything else of them is the example's.
-    assert_eq!(
-        written["route_table"]["routes"],
-        expected["route_table"]["routes"]
-    );
-    assert_eq!(written["route_table"]["revision"], "2");
-    assert_eq!(expected["route_table"]["revision"], "1");
-    let (ours, theirs) = (&written["operations"][0], &expected["operations"][0]);
-    assert_eq!(ours["operation_id"], theirs["operation_id"]);
-    assert_eq!(ours["decision"], theirs["decision"]);
-    let (ours, theirs) = (
-        ours["recipe_hex"].as_str().expect("hex"),
-        theirs["recipe_hex"].as_str().expect("hex"),
-    );
-    let differing: Vec<usize> = ours
-        .bytes()
-        .zip(theirs.bytes())
-        .enumerate()
-        .filter(|(_, (left, right))| left != right)
-        .map(|(index, _)| index)
-        .collect();
-    assert_eq!(ours.len(), theirs.len());
-    assert_eq!(differing.len(), 1, "{differing:?}");
-    assert_eq!(&ours[differing[0]..=differing[0]], "2");
+    // The example gives the fixture's table the revision this store writes,
+    // one per target added: 2. The route table and the operation, recipe
+    // included, are the example's.
+    assert_eq!(written["route_table"], expected["route_table"]);
+    assert_eq!(written["operations"], expected["operations"]);
     assert_eq!(written["operations"].as_array().map(Vec::len), Some(1));
     for member in [
         "incarnation",
