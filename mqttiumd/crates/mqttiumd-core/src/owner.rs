@@ -4695,4 +4695,78 @@ mod tests {
         assert_eq!(operations.len(), 2);
         assert_ne!(operations[0], operations[1], "one identity, two recipes");
     }
+
+    /// Drives one admission whose first `Persist` committed and whose
+    /// result was lost. Each deadline emits one resolution, every
+    /// resolution answers Committed, and the answer of a resolution is
+    /// delivered once `lag` newer resolutions were emitted, in order. The
+    /// answers whose rank is in `lost` are never delivered, those in
+    /// `doubled` are delivered twice. Returns the number of resolutions
+    /// emitted when PUBREC was published, or `None` after `limit`.
+    fn resolve_with_lag(
+        lag: usize,
+        lost: &[usize],
+        doubled: &[usize],
+        limit: usize,
+    ) -> Option<usize> {
+        let mut world = World::admission_pending();
+        let admission = world.flights[0];
+        let mut token = admission.deadline;
+        let mut pending: std::collections::VecDeque<(usize, EffectId)> = Default::default();
+        for emitted in 1..=limit {
+            world.applied(deadline(token));
+            let effects = world.drain();
+            assert_eq!(kinds(&effects), ["ResolveAndFence", "ArmDeadline"]);
+            let Effect::ArmDeadline { token: next, .. } = effects[1].1 else {
+                panic!("a deadline")
+            };
+            token = next;
+            pending.push_back((emitted, effects[0].0));
+            while pending.len() > lag {
+                let (rank, effect) = pending.pop_front().expect("one");
+                if lost.contains(&rank) {
+                    continue;
+                }
+                let times = if doubled.contains(&rank) { 2 } else { 1 };
+                for _ in 0..times {
+                    world.applied(Input::StoreResult {
+                        effect,
+                        operation: admission.operation,
+                        reply: StoreReply::Outcome(StoreOutcome::Committed(admission.facts)),
+                    });
+                    let answer = world.drain();
+                    if world.phase(7) == AWAIT {
+                        assert_eq!(kinds(&answer), ["EmitPubrec"]);
+                        return Some(emitted);
+                    }
+                    assert!(answer.is_empty());
+                }
+            }
+            assert_eq!(world.phase(7), PENDING);
+        }
+        None
+    }
+
+    // F3, the counterexample of the audit: every answer arrives after four
+    // newer resolutions. The exchange must leave AdmissionPending.
+    #[test]
+    fn resolutions_whose_answers_arrive_after_four_newer_ones_still_commit() {
+        assert!(resolve_with_lag(4, &[], &[], 24).is_some());
+    }
+
+    // F3: progress under any finite lag, with losses and duplicates.
+    #[test]
+    fn resolutions_progress_under_a_finite_lag_with_losses_and_duplicates() {
+        for lag in [0, 1, 3, 4, 5, 7, 20, 100] {
+            assert!(
+                resolve_with_lag(lag, &[], &[], 4 * (lag + 2)).is_some(),
+                "lag {lag}"
+            );
+            let lost: Vec<usize> = (1..=lag.max(2) + 2).collect();
+            assert!(
+                resolve_with_lag(lag, &lost, &[1, 2, 3], 8 * (lag + 4)).is_some(),
+                "lag {lag}, losses {lost:?}"
+            );
+        }
+    }
 }
