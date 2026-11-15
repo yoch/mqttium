@@ -1386,6 +1386,41 @@ mod tests {
         assert_invariant(&outbox);
     }
 
+    // Review of 6d603d0, finding 1: a wake-up must name every event that
+    // can end the lack. While a live reservation holds a slot, its release
+    // can end a lack of slots even when no adapter accepts anything.
+    #[test]
+    fn a_lack_of_slots_names_the_release_of_a_live_reservation() {
+        // Capacity 4: one effect queued, three slots reserved.
+        let mut outbox = filled(4, 1);
+        let held = outbox.reserve(slots(3)).expect("room");
+        let refusal = outbox.reserve(slots(1)).expect_err("no slot is free");
+        assert_eq!(
+            refusal,
+            ReserveRefused::Need(CapacityNeed {
+                resource: Resource::EffectSlots,
+                amount: 1,
+                wake: WakeCondition::EffectAcceptedOrResourceReleased,
+            }),
+            "the release of the reservation was not named"
+        );
+
+        // The adapter is closed for good; the release alone makes room.
+        struct Closed;
+        impl EffectSink for Closed {
+            fn try_submit(&mut self, effect: OwnedEffect) -> SubmitResult {
+                SubmitResult::NotSubmitted {
+                    effect,
+                    reason: SubmitBlock::Closed,
+                }
+            }
+        }
+        assert_eq!(outbox.dispatch(&mut Closed).accepted, 0);
+        assert_eq!(outbox.release(held), Ok(3));
+        assert!(outbox.reserve(slots(1)).is_ok(), "the box has room");
+        assert_invariant(&outbox);
+    }
+
     // Review of 437edc2, finding 6: an entry held at its last generation
     // is spent when its reservation ends, however it ends. A table that
     // has nothing else is exhausted already.
