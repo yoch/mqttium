@@ -34,8 +34,9 @@ use alloc::vec::Vec;
 
 use crate::capacity::{BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References};
 use crate::ids::{
-    DeliveryId, ExchangeGeneration, ExchangeId, Exhausted, InboundPacketId, OperationId, PayloadId,
-    PublicationId, RequestId, Revision, RunEpoch, SessionId, StoreIncarnation,
+    DeliveryId, ExchangeGeneration, ExchangeId, Exhausted, IdDecodeError, InboundPacketId,
+    OperationId, PayloadId, PublicationId, RequestId, Revision, RunEpoch, SessionId,
+    StoreIncarnation,
 };
 use crate::packet::{Qos, SharedBytes};
 
@@ -531,9 +532,10 @@ impl StartupNonce {
     }
 }
 
-/// The number of one attempt within one start-up. It is a plain checked
-/// counter with no durable encoding of its own, which is why it is not
-/// one of the identities of `ids`.
+/// The number of one attempt within one start-up: a checked counter.
+/// It is durable only as part of an `OpeningAttempt`, which has the
+/// encoding; alone it identifies nothing, which is why it is not one of
+/// the identities of `ids`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct OpeningTicket(u64);
 
@@ -564,6 +566,29 @@ impl OpeningTicket {
 pub struct OpeningAttempt {
     pub startup: StartupNonce,
     pub ticket: OpeningTicket,
+}
+
+impl OpeningAttempt {
+    /// Length of the durable encoding: the sixteen bytes of the nonce,
+    /// then the ticket as eight big-endian bytes.
+    pub const ENCODED_LEN: usize = 24;
+
+    /// The durable encoding, as the ledger keeps the attempt that
+    /// opened the last epoch.
+    #[must_use]
+    pub fn to_be_bytes(self) -> [u8; 24] {
+        // Skeleton: the encoding is not written yet.
+        [0; 24]
+    }
+
+    /// Decodes the durable encoding, checking its exact length.
+    pub fn from_be_slice(bytes: &[u8]) -> Result<Self, IdDecodeError> {
+        // Skeleton: the encoding is not written yet.
+        Err(IdDecodeError::WrongLength {
+            expected: Self::ENCODED_LEN,
+            actual: bytes.len(),
+        })
+    }
 }
 
 /// The start-up command that opens a run epoch (DEM-012, ADR 0009).
@@ -639,8 +664,12 @@ pub enum LedgerOpening {
     /// rejection. The attempt can never open an epoch any more.
     Superseded,
     /// The condition is ahead of the ledger: nothing is opened, and the
-    /// condition could still come true, so nothing certain is said. No
-    /// start-up that read this data set forms such a condition.
+    /// condition could still come true, so nothing certain is said. A
+    /// certain rejection would be contradicted if a held copy of the
+    /// command were applied later. No start-up that read this data set
+    /// forms such a condition; it arises when a data set was restored to
+    /// an earlier state without a new incarnation, which is a failure to
+    /// renew the identity spaces and not a case this contract repairs.
     Undecided,
 }
 
@@ -1327,6 +1356,63 @@ mod tests {
         assert!(OpeningRejection::EpochsExhausted.is_definitive());
         assert!(OpeningRejection::ForeignIncarnation.is_definitive());
         assert!(!OpeningRejection::PredecessorMoved.is_definitive());
+    }
+
+    #[test]
+    fn an_attempt_round_trips_through_its_durable_encoding() {
+        let nonce: [u8; 16] = core::array::from_fn(|index| index as u8 + 1);
+        let attempts = [
+            OpeningAttempt {
+                startup: StartupNonce::new(nonce),
+                ticket: OpeningTicket::new(0x0102_0304_0506_0708),
+            },
+            attempt(FIRST_START, 1),
+            attempt(RESTART, u64::MAX),
+            attempt(StartupNonce::new([0; 16]), 0),
+        ];
+        for attempt in attempts {
+            let bytes = attempt.to_be_bytes();
+            assert_eq!(bytes.len(), OpeningAttempt::ENCODED_LEN);
+            assert_eq!(OpeningAttempt::from_be_slice(&bytes), Ok(attempt));
+        }
+        // The layout is pinned: the nonce as drawn, then the ticket.
+        let bytes = attempts[0].to_be_bytes();
+        assert_eq!(&bytes[..16], &nonce);
+        assert_eq!(&bytes[16..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        // Two attempts differ exactly when their encodings do.
+        for left in attempts {
+            for right in attempts {
+                assert_eq!(left == right, left.to_be_bytes() == right.to_be_bytes());
+            }
+        }
+        for length in [0, 23, 25] {
+            assert_eq!(
+                OpeningAttempt::from_be_slice(&vec![0; length]),
+                Err(IdDecodeError::WrongLength {
+                    expected: 24,
+                    actual: length
+                })
+            );
+        }
+    }
+
+    /// The ledger is three durable values, and the attempt among them
+    /// survives its encoding: the command that opened the last epoch is
+    /// still recognised after the store was closed and reopened.
+    #[test]
+    fn the_opener_is_recognised_from_its_encoded_form() {
+        let read = opened(&EpochLedger::fresh(StoreIncarnation::new(1)));
+        let command = opening(&read, 2);
+        let committed = opened_by(&read, &command);
+        let stored = committed.opened_by().map(OpeningAttempt::to_be_bytes);
+        let decoded = stored.map(|bytes| OpeningAttempt::from_be_slice(&bytes).expect("stored"));
+        let reopened =
+            EpochLedger::from_durable(committed.incarnation(), committed.last_opened(), decoded);
+        assert_eq!(reopened, committed);
+        assert!(matches!(
+            reopened.open(&command),
+            LedgerOpening::AlreadyOpened { .. }
+        ));
     }
 
     #[test]

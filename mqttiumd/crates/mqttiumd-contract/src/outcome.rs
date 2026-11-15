@@ -24,6 +24,23 @@
 //! of one attempt --> Faulted
 //! ```
 //!
+//! What a reply to the command in flight does, stage by reply. "same"
+//! leaves the stage as it is; "fault" moves to `Faulted`.
+//!
+//! | Stage \\ reply | `Unknown` | `Superseded` | `Committed`, the answer | `Committed`, any other | `RejectedCertain` |
+//! | - | - | - | - | - | - |
+//! | `Submitted` | `Unknown` | `Superseded` | `Committed` | fault | `Rejected` |
+//! | `Unknown` | same | `Superseded` | `Committed` | fault | `Rejected` |
+//! | `Superseded` | same | same | same, no grant | fault | `Rejected` |
+//! | `Rejected` | same | same | fault | fault | same, first reason kept |
+//! | `Committed` | same | `Superseded` | same | fault | fault |
+//! | `HandedOver` | same | same, reported to the caller | same | fault | fault |
+//! | `Faulted` | refused | refused | refused | refused | refused |
+//!
+//! "The answer" is the commit for this data set and the epoch right
+//! after the command's condition. A reply to any other command is
+//! refused at every stage and changes nothing.
+//!
 //! - An attempt has an identity: the nonce its start-up drew and its
 //!   number there. The store records the attempt that opened the last
 //!   epoch, and every reply carries the whole command it answers. A
@@ -1596,6 +1613,216 @@ mod tests {
             opening.check_recovered(StoreIncarnation::new(2), RunEpoch::new(4)),
             RecoveredEpochCheck::Foreign
         );
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Expect {
+        Advance(OpeningStage),
+        Same,
+        Fault,
+        GrantSuperseded,
+    }
+
+    /// The table of the module documentation, cell by cell.
+    #[test]
+    fn every_stage_takes_every_reply_as_the_table_says() {
+        use Expect::{Advance, Fault, GrantSuperseded, Same};
+        let moved = OpeningStage::Rejected(OpeningRejection::PredecessorMoved);
+        let exhausted = OpeningStage::Rejected(OpeningRejection::EpochsExhausted);
+        let held = OpeningStage::Committed(opened(4));
+        let replies = [
+            OpeningOutcome::Unknown,
+            OpeningOutcome::Superseded,
+            COMMITTED_4,
+            OpeningOutcome::Committed(opened(5)),
+            EXHAUSTED,
+        ];
+        let table = [
+            (
+                OpeningStage::Submitted,
+                [
+                    Advance(OpeningStage::Unknown),
+                    Advance(OpeningStage::Superseded),
+                    Advance(held),
+                    Fault,
+                    Advance(exhausted),
+                ],
+            ),
+            (
+                OpeningStage::Unknown,
+                [
+                    Same,
+                    Advance(OpeningStage::Superseded),
+                    Advance(held),
+                    Fault,
+                    Advance(exhausted),
+                ],
+            ),
+            (
+                OpeningStage::Superseded,
+                [Same, Same, Same, Fault, Advance(exhausted)],
+            ),
+            (moved, [Same, Same, Fault, Fault, Same]),
+            (
+                held,
+                [Same, Advance(OpeningStage::Superseded), Same, Fault, Fault],
+            ),
+            (
+                OpeningStage::HandedOver(opened(4)),
+                [Same, GrantSuperseded, Same, Fault, Fault],
+            ),
+        ];
+        for (stage, row) in table {
+            for (outcome, expected) in replies.into_iter().zip(row) {
+                // Reach the stage by the replies that lead to it.
+                let (mut opening, command) = submitted();
+                match stage {
+                    OpeningStage::Submitted => {}
+                    OpeningStage::Unknown => opening.abandon().expect("awaiting"),
+                    OpeningStage::Superseded => {
+                        opening
+                            .observe(reply(command, OpeningOutcome::Superseded))
+                            .expect("correlated");
+                    }
+                    OpeningStage::Rejected(_) => {
+                        opening.observe(reply(command, MOVED)).expect("correlated");
+                    }
+                    OpeningStage::Committed(_) | OpeningStage::HandedOver(_) => {
+                        opening
+                            .observe(reply(command, COMMITTED_4))
+                            .expect("the answer");
+                        if let OpeningStage::HandedOver(_) = stage {
+                            let _grant = opening.hand_over().expect("committed");
+                        }
+                    }
+                    OpeningStage::Idle | OpeningStage::Faulted { .. } => {
+                        panic!("not a row of the table")
+                    }
+                }
+                assert_eq!(opening.stage(), stage);
+
+                let result = opening.observe(reply(command, outcome));
+                match expected {
+                    Advance(next) => {
+                        assert_eq!(
+                            result,
+                            Ok(Observed::Advanced(next)),
+                            "{stage:?} x {outcome:?}"
+                        );
+                        assert_eq!(opening.stage(), next, "{stage:?} x {outcome:?}");
+                    }
+                    Same => {
+                        assert_eq!(result, Ok(Observed::Unchanged), "{stage:?} x {outcome:?}");
+                        assert_eq!(opening.stage(), stage, "{stage:?} x {outcome:?}");
+                    }
+                    GrantSuperseded => {
+                        assert_eq!(
+                            result,
+                            Ok(Observed::GrantedEpochSuperseded(opened(4))),
+                            "{stage:?} x {outcome:?}"
+                        );
+                        assert_eq!(opening.stage(), stage, "{stage:?} x {outcome:?}");
+                    }
+                    Fault => {
+                        assert_eq!(
+                            result,
+                            Err(ReplyRefused::Contradictory {
+                                established: stage,
+                                reported: outcome,
+                            }),
+                            "{stage:?} x {outcome:?}"
+                        );
+                        assert!(
+                            matches!(opening.stage(), OpeningStage::Faulted { .. }),
+                            "{stage:?} x {outcome:?}"
+                        );
+                        // The last row: a faulted opening refuses all.
+                        for again in replies {
+                            assert_eq!(
+                                opening.observe(reply(command, again)),
+                                Err(ReplyRefused::Faulted),
+                                "{stage:?} x {outcome:?}"
+                            );
+                        }
+                    }
+                }
+                // A grant exists exactly when a commit is held.
+                let grantable = matches!(opening.stage(), OpeningStage::Committed(_));
+                assert_eq!(
+                    opening.hand_over().is_ok(),
+                    grantable,
+                    "{stage:?} x {outcome:?}"
+                );
+            }
+        }
+    }
+
+    /// Why the nonce is needed. Two processes are alive on one data set:
+    /// the older one was only presumed dead. Both read epoch 3 and both
+    /// issue ticket 1. The ledger commits one and rejects the other, in
+    /// either order and however often each command is delivered:
+    /// exactly one of them obtains a grant.
+    #[test]
+    fn two_live_openings_on_one_condition_yield_one_grant() {
+        use crate::command::EpochLedger;
+        for ours_first in [true, false] {
+            let read = EpochLedger::from_durable(DATA_SET, RunEpoch::new(3), None);
+            let mut openings = [fresh(), EpochOpening::new(DATA_SET, OTHER_START)];
+            let commands = openings
+                .each_mut()
+                .map(|opening| opening.submit(read.last_opened()).expect("idle"));
+            assert_eq!(commands[0].attempt.ticket, commands[1].attempt.ticket);
+            assert_ne!(commands[0], commands[1]);
+
+            let order = if ours_first { [0, 1] } else { [1, 0] };
+            let LedgerOpening::Opens { ledger, .. } = read.open(&commands[order[0]]) else {
+                panic!("the first command to arrive does not open");
+            };
+            let mut grants = Vec::new();
+            // Each command is delivered twice, the loser first.
+            for index in [order[1], order[0], order[1], order[0]] {
+                let outcome = OpeningOutcome::of(DATA_SET, ledger.open(&commands[index]));
+                let _ = openings[index].observe(reply(commands[index], outcome));
+                if let Ok(grant) = openings[index].hand_over() {
+                    grants.push((index, grant));
+                }
+            }
+            assert_eq!(grants.len(), 1, "one epoch, one authority");
+            assert_eq!(grants[0].0, order[0]);
+            assert_eq!(grants[0].1.opened(), opened(4));
+            assert_eq!(
+                openings[order[1]].stage(),
+                OpeningStage::Rejected(OpeningRejection::PredecessorMoved)
+            );
+        }
+    }
+
+    /// The precondition, made visible: that no two start-ups share a
+    /// nonce is what the adapter owes. If two do, their first commands
+    /// are one command, the ledger answers both the same commit, and
+    /// two grants exist for one epoch. Nothing here can detect it.
+    #[test]
+    fn two_start_ups_with_one_nonce_obtain_two_grants() {
+        use crate::command::EpochLedger;
+        let read = EpochLedger::from_durable(DATA_SET, RunEpoch::new(3), None);
+        let mut openings = [fresh(), fresh()];
+        let commands = openings
+            .each_mut()
+            .map(|opening| opening.submit(read.last_opened()).expect("idle"));
+        assert_eq!(commands[0], commands[1], "the commands are told apart");
+
+        let LedgerOpening::Opens { ledger, .. } = read.open(&commands[0]) else {
+            panic!("not opened");
+        };
+        let mut grants = Vec::new();
+        for (opening, command) in openings.iter_mut().zip(commands) {
+            let outcome = OpeningOutcome::of(DATA_SET, ledger.open(&command));
+            opening
+                .observe(reply(command, outcome))
+                .expect("correlated");
+            grants.push(opening.hand_over().expect("committed"));
+        }
+        assert_eq!(grants[0].opened(), grants[1].opened());
     }
 
     #[test]
