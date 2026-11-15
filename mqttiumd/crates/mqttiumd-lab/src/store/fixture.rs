@@ -18,7 +18,7 @@ use mqttiumd_contract::ids::{Revision, SessionId, StoreIncarnation};
 use mqttiumd_contract::packet::Qos;
 use serde_json::Value;
 
-use super::durable::{AdminCommand, AdminDone, AdminRefused, DurableStore, Limits};
+use super::durable::{AdminCommand, AdminDone, AdminRefused, DurableStore, Limits, ReadError};
 
 /// One session of a fixture: the name scenarios use, and its ClientID.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -63,6 +63,8 @@ pub enum FixtureError {
     UnknownClient(String),
     /// The store refused a command.
     Refused(AdminRefused),
+    /// A durable read failed; this says nothing about absence or rejection.
+    Read(ReadError),
 }
 
 /// The most sessions, routes and targets a fixture may declare: the
@@ -173,7 +175,7 @@ pub fn install<S: DurableStore>(
             return Err(FixtureError::Malformed("client"));
         }
     }
-    let mut route_revision = store.snapshot().route_revision;
+    let mut route_revision = store.snapshot().map_err(FixtureError::Read)?.route_revision;
     for route in &plan.routes {
         for (client, qos) in &route.targets {
             let session = *sessions

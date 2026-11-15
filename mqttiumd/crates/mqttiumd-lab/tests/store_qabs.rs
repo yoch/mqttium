@@ -121,7 +121,11 @@ fn held_command_and_absent_read() -> (Bench, Command, WorkId) {
         "the command is held before the writer"
     );
     // The absent read: no receipt, no publication, nothing.
-    let read = bench.store.store().snapshot();
+    let read = bench
+        .store
+        .store()
+        .snapshot()
+        .expect("healthy durable snapshot");
     assert!(read.operations.is_empty());
     assert!(read.publications.is_empty());
     assert!(read.fences.is_empty());
@@ -175,7 +179,11 @@ fn qabs_a_the_command_commits_before_the_fence() {
     );
 
     // One effect, and only one.
-    let state = bench.store.store().snapshot();
+    let state = bench
+        .store
+        .store()
+        .snapshot()
+        .expect("healthy durable snapshot");
     assert_eq!(state.publications.len(), 1);
     assert_eq!(state.obligations.len(), 2);
     assert!(state.fences.is_empty());
@@ -194,7 +202,11 @@ fn qabs_b_the_fence_commits_before_the_command_is_delivered() {
     enter(&mut bench, fence);
     let fenced = StoreOutcome::RejectedCertain(RejectReason::Fenced);
     assert_eq!(outcome(deliver(&mut bench, fence)), fenced);
-    let after_fence = bench.store.store().snapshot();
+    let after_fence = bench
+        .store
+        .store()
+        .snapshot()
+        .expect("healthy durable snapshot");
     assert!(after_fence.fences.contains(&operation));
 
     // The held command is really delivered to the writer afterwards,
@@ -202,7 +214,14 @@ fn qabs_b_the_fence_commits_before_the_command_is_delivered() {
     release(&mut bench, held);
     enter(&mut bench, held);
     assert_eq!(outcome(deliver(&mut bench, held)), fenced);
-    assert_eq!(bench.store.store().snapshot(), after_fence);
+    assert_eq!(
+        bench
+            .store
+            .store()
+            .snapshot()
+            .expect("healthy durable snapshot"),
+        after_fence
+    );
     assert!(after_fence.publications.is_empty());
     assert!(after_fence.obligations.is_empty());
     let events = bench.store.take_events();
@@ -234,7 +253,15 @@ fn qabs_c_no_fence_can_be_established_and_no_rejection_is_invented() {
         StoreOutcome::PendingOrUnknown,
         "no certain rejection without a fence"
     );
-    assert!(bench.store.store().snapshot().fences.is_empty());
+    assert!(
+        bench
+            .store
+            .store()
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .fences
+            .is_empty()
+    );
     assert_eq!(fences(&bench.store.take_events()), []);
 
     // Why it had to stay unknown: the command is still held, and once
@@ -249,7 +276,16 @@ fn qabs_c_no_fence_can_be_established_and_no_rejection_is_invented() {
         outcome(deliver(&mut bench, held)),
         StoreOutcome::Committed(_)
     ));
-    assert_eq!(bench.store.store().snapshot().publications.len(), 1);
+    assert_eq!(
+        bench
+            .store
+            .store()
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .publications
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -366,7 +402,10 @@ fn the_store_never_contradicts_a_terminal_result() {
                 Step::Restore => world.store.set_durability(Durability::Available),
                 Step::OpenEpoch => {
                     let command = opening_command(&world.store);
-                    world.store.open_epoch(&command);
+                    world
+                        .store
+                        .open_epoch(&command)
+                        .expect("healthy epoch read");
                 }
                 Step::Collect => {
                     let _ = world.store.admin(AdminCommand::CollectClosedEpochs {
@@ -387,7 +426,9 @@ fn the_store_never_contradicts_a_terminal_result() {
                 }
             }
             assert_eq!(
-                accounts_match_what_is_held(&world.store.snapshot()),
+                accounts_match_what_is_held(
+                    &world.store.snapshot().expect("healthy durable snapshot")
+                ),
                 Ok(()),
                 "run {run}"
             );
@@ -401,7 +442,12 @@ fn the_store_never_contradicts_a_terminal_result() {
             "two admissions of one inbound exchange"
         );
         assert_eq!(
-            world.store.snapshot().publications.len(),
+            world
+                .store
+                .snapshot()
+                .expect("healthy durable snapshot")
+                .publications
+                .len(),
             committed,
             "an effect without a committed result, or the reverse"
         );
@@ -437,7 +483,15 @@ fn fence_held(bench: &mut Bench, operation: OperationId) -> (WorkId, FaultId) {
         Ok(Performed::Held(FaultPoint::FenceTransit))
     );
     assert_eq!(bench.store.hits(hold), 1, "the fence point was not reached");
-    assert!(bench.store.store().snapshot().fences.is_empty());
+    assert!(
+        bench
+            .store
+            .store()
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .fences
+            .is_empty()
+    );
     assert!(
         bench
             .store
@@ -466,7 +520,11 @@ fn qabs_a_through_the_fence_point_reads_again_before_it_writes() {
         "{resolved:?}"
     );
     assert_eq!(outcome(deliver(&mut bench, held)), resolved);
-    let state = bench.store.store().snapshot();
+    let state = bench
+        .store
+        .store()
+        .snapshot()
+        .expect("healthy durable snapshot");
     assert!(state.fences.is_empty());
     assert_eq!(state.publications.len(), 1);
     let events = bench.store.take_events();
@@ -491,7 +549,11 @@ fn qabs_b_through_the_fence_point_fences_before_the_command() {
     release(&mut bench, held);
     enter(&mut bench, held);
     assert_eq!(outcome(deliver(&mut bench, held)), fenced);
-    let state = bench.store.store().snapshot();
+    let state = bench
+        .store
+        .store()
+        .snapshot()
+        .expect("healthy durable snapshot");
     assert!(state.fences.contains(&operation));
     assert!(state.publications.is_empty());
     assert_eq!(fences(&bench.store.take_events()), [(fence, operation)]);
@@ -536,7 +598,15 @@ fn qabs_c_through_the_fence_point_refuses_one_fence_and_nothing_else() {
         .position(|event| matches!(event, StoreEvent::ResultReady { id, .. } if *id == fence))
         .expect("a result");
     assert!(hit < refused && refused < ready, "{events:?}");
-    assert!(bench.store.store().snapshot().fences.is_empty());
+    assert!(
+        bench
+            .store
+            .store()
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .fences
+            .is_empty()
+    );
 
     // The store is available: the held command commits.
     release(&mut bench, held);
