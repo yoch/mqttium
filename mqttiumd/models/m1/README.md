@@ -88,20 +88,26 @@ Two properties, each with its own assumptions. Weak fairness only.
 
 | Property | Configuration | Assumptions |
 | - | - | - |
-| `LivePathResolves` | `M1a-live-path.cfg`, `LiveSpec` | No crash. `FairBroker`: the store applies commands and resolutions, results are delivered, the deadline fires and stays armed, the core authorises, frames are submitted, the peer reads its socket, the bench releases a held command. At most `MaxLoss` results are lost. **No fairness on any action by which the client sends a packet.** |
-| `RecoveryCompletes` | `M1a-recovery.cfg`, `RecoverySpec` | The above, no crash after the last one, and `FairClientResume`: the client reconnects and sends again the PUBLISH it has no answer for |
+| `LivePathResolves` | `M1a-live-path.cfg`, `LiveSpec` | No crash. `FairBroker`, action by action: the store applies a command that is not held (`ApplyCommand`) and a resolution (`Resolve`); the deadline fires and stays armed (`Timeout`); results are delivered to the core (`DeliverResult`); the core receives a frame that arrived, prepares, submits, authorises and refuses (`Receive`, `Prepare`, `Submit`, `Authorize`, `Refuse`); the transport adapter accepts an authorised frame (`SubmitFrame`); `Recover`. Faults are bounded: `MaxLoss` lost results, `MaxFenceFail` refused fences. **No fairness on any action the client, the peer or the bench owns**: `ClientPublish`, `ClientResend`, `ClientReconnect`, `ClientObserve`, `HoldCommand`, `ReleaseCommand`, `RejectCommand`, `LoseResult`, `Crash` |
+| `RecoveryCompletes` | `M1a-recovery.cfg`, `RecoverySpec` | The above, no crash after the last one, and `FairClientResume`: the client reconnects (`ClientReconnect`) and sends again the PUBLISH it has no answer for (`ClientResend`) |
 
-`LivePathResolves` goes from the unknown outcome to an observed answer:
-PUBREC, or the refusal when the resolution established a fence.
-`RecoveryCompletes` allows a creation suspended by the exhaustion of the
-identities; with one publication `NoSuspension` shows that this escape is
-not reachable in the checked configuration.
+The goal of both is `Answered`: the answer is on the wire of the
+connection the client reads, or the client has it. Whether the peer
+reads its socket is not assumed.
+
+`LivePathResolves` goes from the unknown outcome to that answer: PUBREC,
+or the refusal when the resolution established a fence. It does not need
+a held command to be released: the resolution fences an absent identity
+whether its command is held or not. `RecoveryCompletes` allows a creation
+suspended by the exhaustion of the identities; with one publication
+`NoSuspension` shows that this escape is not reachable in the checked
+configuration.
 
 Each property has a configuration that must violate it:
 
 - `M1a-live-path-no-rearm.cfg`: the deadline is not armed again after the
-  first resolution. The commit result is lost after an unknown answer and
-  nothing resolves the outcome.
+  first resolution. The commit result and the answer of that one
+  resolution are both lost, and nothing asks again.
 - `M1a-recovery-silent-client.cfg`: the same broker fairness, without
   `FairClientResume`. The client reconnects and never sends its PUBLISH
   again. This shows the assumption is used, and that the live path does not
@@ -119,8 +125,9 @@ violated; the counterexample is the witness.
 | `M1a-reach-unknown.cfg` | An unknown outcome |
 | `M1a-reach-rejection.cfg` | A certain rejection observed by the peer |
 | `M1a-reach-crash-after-commit.cfg` | A crash after a commit the core never knew nor answered |
-| `M1a-reach-recovery.cfg` | The shape of P1-02: recovered admission, PUBREC on the new connection, no second identity |
-| `M1a-reach-live-path.cfg` | The shape of P1-02b: no crash, result lost, PUBREC observed while an old unknown answer is still held |
+| `M1a-reach-recovery.cfg` | The shape of P1-02: result lost, nothing authorised before the crash, recovered admission, PUBREC on the new connection, no second identity |
+| `M1a-reach-live-path.cfg` | The shape of P1-02b: no crash, a first resolution whose fence is refused, the commit result lost, PUBREC observed on the first connection while the old unknown answer is still held |
+| `M1a-reach-fence-while-held.cfg` | QABS-B: the fence established while the command is held; the core knows the rejection |
 | `M1a-reach-exhaustion.cfg` | Both identities used, a creation suspended, a delayed command still held |
 
 ### Mutations
@@ -154,7 +161,7 @@ command and the liveness properties to M1a.
 | Reset of a destination session; settlement of an obligation | `DestSessionReset`, `Settle` | A command whose target generation is no longer current is refused |
 | Durable capacity per destination | `ApplyCommand` | A full capacity is a certain rejection, durable: it stays after the capacity is free again |
 | Commands that outlive a crash of the core; the change of epoch | `Crash`, `Recover`, `ApplyCommand` | The store keeps the commands it accepted and may apply one while the core is down; after recovery a command of a closed epoch is refused. Closing an epoch teaches the core nothing about an identity that left no durable fact |
-| `ResolveAndFence` in two steps | `ResolveRead`, `FenceEstablish`, `FenceAbandon` | The fence is established only if the identity is still absent when the writer orders it: a command applied in between wins (QABS-A), otherwise the fence wins (QABS-B), or the fence is abandoned and the outcome stays unknown (QABS-C) |
+| `ResolveAndFence` in two steps | `ResolveRead`, `FenceEstablish`, `FenceAbandon` | The fence is established only if the identity is still absent when the writer orders it: a command applied in between wins (QABS-A), otherwise the fence wins (QABS-B). Only a refused write of the fence, a counted fault, leaves the outcome unknown (QABS-C) |
 
 The store-side transport `tCmd` is not erased by a crash, unlike in M1a:
 this is what makes the change of epoch observable.
@@ -178,26 +185,26 @@ this is what makes the change of epoch observable.
 ### Configurations
 
 The fault kinds are checked in five groups, not all at once: the domain
-with every fault kind together was interrupted at 12.5 million distinct
+with every fault kind together was interrupted at 14.1 million distinct
 states and is inconclusive. `Dests = {B, C}`, `NumOps = 2` and
 `Capacity = 1` unless stated.
 
 | Configuration | Faults allowed (at most one of each) |
 | - | - |
-| `M1b-safety-epoch.cfg` | Crash, connection reset, lost result |
+| `M1b-safety-epoch.cfg` | Crash, connection reset, lost result, refused fence |
 | `M1b-safety-source.cfg` | Crash, reset of the producer's session, lost result |
 | `M1b-safety-connection.cfg` | Connection reset, reset of the producer's session, lost result |
 | `M1b-safety-destination.cfg` | Reset of a destination session, settlement, reset of the producer's session |
-| `M1b-safety-capacity.cfg` | Settlement, reset of the producer's session, lost result |
+| `M1b-safety-capacity.cfg` | Settlement, reset of the producer's session, lost result, refused fence |
 
 | Configuration | Witness |
 | - | - |
 | `M1b-reach-replay-while-unknown.cfg` | A PUBLISH replayed after a connection reset while its outcome is unknown, acknowledged on the new connection by the one admission |
 | `M1b-reach-commit-before-fence.cfg` | QABS-A, then PUBREC observed |
 | `M1b-reach-fence-before-command.cfg` | QABS-B, then the refusal observed |
-| `M1b-reach-capacity-refusal.cfg` | A second exchange refused for capacity, observed by the peer |
-| `M1b-reach-stale-target-refusal.cfg` | A command refused because a target session was reset |
-| `M1b-reach-epoch-closed-refusal.cfg` | A command of the first epoch refused in the second while a new admission of the same exchange commits |
+| `M1b-reach-capacity-refusal.cfg` | A second exchange refused for capacity and for no other reason, observed by the peer |
+| `M1b-reach-stale-target-refusal.cfg` | A command refused because a target session was reset, and for no other reason |
+| `M1b-reach-epoch-closed-refusal.cfg` | A command of the first epoch refused in the second, for that reason only, while a new admission of the same exchange commits |
 | `M1b-reach-second-exchange.cfg` | After a reset of the producer's session, a new exchange admitted on the same slot, the first obligations kept (`Capacity = 2`) |
 
 | Configuration | Mutation | Counterexample for |
@@ -212,11 +219,13 @@ states and is inconclusive. `Dests = {B, C}`, `NumOps = 2` and
 
 ## Bounds and limits
 
-- Domain of the safety campaign: `Pubs = {a, b}`, `Dests = {B, C}`,
-  `NumOps = 2`, `MaxCrash = 1`, `MaxLoss = 1`. No symmetry reduction.
-- Domain of the liveness campaign: one publication, `MaxLoss = 2`;
-  `MaxCrash = 0` for the live path and `1` for recovery. The two-publication
-  liveness runs do not fit the runner's time limit; see the report.
+- Domain of the safety campaign of M1a: `Pubs = {a, b}`, `Dests = {B, C}`,
+  `NumOps = 2`, `MaxCrash = 1`, `MaxLoss = 1`, `MaxFenceFail = 1`. No
+  symmetry reduction.
+- Domain of the liveness campaign: one publication, `MaxLoss = 2`,
+  `MaxFenceFail = 1`; `MaxCrash = 0` for the live path and `1` for
+  recovery. This is the bound claimed for liveness. Runs on two
+  publications do not fit the runner's time limit; see the report.
 - Identities are consumed in order and never reused; `dNextOp` stands for
   an identity made of the run epoch and a serial. Using up both suspends
   `Prepare` and removes nothing.
@@ -228,8 +237,13 @@ states and is inconclusive. `Dests = {B, C}`, `NumOps = 2` and
   in groups; no liveness property; the delivery and acknowledgement of an
   obligation are reduced to `Settle`; a reset of a session is one atomic
   durable step.
-- The store may fence an absent identity or fail to; the model does not
-  say why a fence cannot be established.
+- The fence follows the corrected reading of record 0001, confirmed
+  against DEM-018 and the store contract: a resolution applied to an
+  absent identity always fences it, and the outcome stays unknown only
+  when the write of the fence is refused, a counted fault
+  (`MaxFenceFail`). A held command plays no part. Step 3 of P1-02b in
+  record 0001 says otherwise; its correction is a proposed record that
+  has no number yet.
 - In M1a `RejectCommand` stands for every refusal of the store; M1b
   details the refusals for capacity, stale source, stale target and
   closed epoch.
@@ -268,7 +282,7 @@ sidecar lists no test until one does.
 | `DeliverResult`, repeated commit | `command.committed.result.duplicate` | — | Not replayed yet; L4 |
 | `DeliverResult`, contradiction | `command.committed.result.contradiction`, `command.rejected.result.contradiction` | — | Not replayed yet; L4 |
 | `Timeout` | `command.submitted.timeout`; a second deadline has no rule yet | P1-02b steps 3 and 5 (vocabulary to come, L3) | Not replayed yet; L4 |
-| `Resolve` | Store side: `ResolveAndFence` | P1-02b steps 3 and 5; QABS-A, B, C | Not replayed yet; L4 |
+| `Resolve` | Store side: `ResolveAndFence`; its refused fence is the injection `refuse_fence` at `store.fence.transit` (to come, L3) | P1-02b steps 3 and 5; QABS-A, B, C | Not replayed yet; L4 |
 | `Authorize` | `inbound_qos2.admission_pending.committed.authorize` | `DriveUntil PeerPacketObserved PUBREC` | Not replayed yet; L4 |
 | `Refuse` | — (ARC-011, certain rejection; no rule yet) | — | Not replayed yet; L4, after a rule by L3 |
 | `Receive`, slot `AwaitPubrel` | `inbound_qos2.await_pubrel.publish.replay` | `ClientResumeExchange` (P1-02) | Not replayed yet; L4 |
@@ -299,7 +313,7 @@ The scenarios expected to replay each witness, once L4 runs them:
 | - | - |
 | `M1a-reach-recovery.cfg`, `M1a-reach-crash-after-commit.cfg`, `M1a-reach-lost-result.cfg` | P1-02 |
 | `M1a-reach-live-path.cfg`, `M1a-reach-unknown.cfg`, `M1a-live-path.cfg` | P1-02b |
-| `M1a-reach-rejection.cfg`, `M1a-mut-unknown-as-rejection.cfg` | QABS-B, QABS-C, DEM-MU-01 |
+| `M1a-reach-rejection.cfg`, `M1a-reach-fence-while-held.cfg`, `M1a-mut-unknown-as-rejection.cfg` | QABS-B, QABS-C, DEM-MU-01 |
 | `M1a-mut-second-admission.cfg` | DEM-MU-04 |
 | `M1a-mut-late-unknown.cfg` | P1-02b step 6, DEM-MU-05 |
 | `M1a-mut-ack-before-commit.cfg` | Assertion `no_positive_ack_before_confirmed_commit` |

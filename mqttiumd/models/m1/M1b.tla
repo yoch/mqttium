@@ -36,6 +36,7 @@ CONSTANTS
     MaxDestReset,   \* resets of destination sessions, in all
     MaxSettle,      \* obligations settled by their destination
     MaxLoss,        \* results lost between the store and the core
+    MaxFenceFail,   \* resolutions whose write of the fence is refused
     Mutation
 
 Mutations == {"none", "FenceOnStaleRead", "OldEpochExecutes",
@@ -45,7 +46,7 @@ Mutations == {"none", "FenceOnStaleRead", "OldEpochExecutes",
 
 ASSUME /\ NumOps \in Nat /\ Capacity \in Nat /\ MaxSettle \in Nat
        /\ MaxCrash \in Nat /\ MaxConnReset \in Nat /\ MaxSrcReset \in Nat
-       /\ MaxDestReset \in Nat /\ MaxLoss \in Nat
+       /\ MaxDestReset \in Nat /\ MaxLoss \in Nat /\ MaxFenceFail \in Nat
        /\ Mutation \in Mutations
 
 Ops      == 1..NumOps
@@ -103,13 +104,14 @@ VARIABLES
     kSentGen,   \* connection generation of its last PUBLISH
     kGen,       \* connection generation the client reads from
     \* Fault environment of the bench.
-    proc, eCrash, eConnReset, eDestReset, eSettle, eLoss,
+    proc, eCrash, eConnReset, eDestReset, eSettle, eLoss, eFence,
     \* History of the verifier.
     hAdmit,     \* admissions really committed: [sgen, op, epoch at commit]
     hObl,       \* every obligation committed and not settled
     hRefused,   \* identities the core treated as certainly rejected
     hKnown,     \* identities the core learnt as committed
-    hRaces      \* which way a fence and an application were ordered
+    hRaces      \* how a fence and an application were ordered, and why
+                \* the store refused a command
 
 durable  == <<dEpoch, dCommitted, dFenced, dPub, dSlot, dObl, dUsed, dSrcGen,
               dDestGen, dNextOp>>
@@ -118,7 +120,7 @@ internal == <<tCmd, tResolve, tFencing, tResult>>
 conn     == <<cGen, cOpen>>
 external == <<xIn, xAuth, xWire>>
 client   == <<kPhase, kExch, kSentGen, kGen>>
-env      == <<proc, eCrash, eConnReset, eDestReset, eSettle, eLoss>>
+env      == <<proc, eCrash, eConnReset, eDestReset, eSettle, eLoss, eFence>>
 history  == <<hAdmit, hObl, hRefused, hKnown, hRaces>>
 vars     == <<durable, volatile, internal, conn, external, client, env, history>>
 
@@ -155,11 +157,13 @@ TypeOK ==
     /\ proc \in {"up", "down"}
     /\ eCrash \in 0..MaxCrash /\ eConnReset \in 0..MaxConnReset
     /\ eDestReset \in 0..MaxDestReset /\ eSettle \in 0..MaxSettle
-    /\ eLoss \in 0..MaxLoss
+    /\ eLoss \in 0..MaxLoss /\ eFence \in 0..MaxFenceFail
     /\ hAdmit \subseteq [sgen : SrcGens, op : Ops, epoch : Epochs]
     /\ hObl \subseteq Obligations
     /\ hRefused \subseteq Ops /\ hKnown \subseteq Ops
-    /\ hRaces \subseteq {"CommitBeforeFence", "FenceBeforeCommand"}
+    /\ hRaces \subseteq {"CommitBeforeFence", "FenceBeforeCommand",
+                         "EpochClosed", "StaleSource", "StaleTarget",
+                         "NoCapacity"}
 
 Init ==
     /\ dEpoch = 1 /\ dCommitted = {} /\ dFenced = {} /\ dPub = {} /\ dSlot = {}
@@ -174,7 +178,7 @@ Init ==
     /\ xIn = FALSE /\ xAuth = {} /\ xWire = {}
     /\ kPhase = "idle" /\ kExch = 1 /\ kSentGen = 0 /\ kGen = 1
     /\ proc = "up" /\ eCrash = 0 /\ eConnReset = 0 /\ eDestReset = 0
-    /\ eSettle = 0 /\ eLoss = 0
+    /\ eSettle = 0 /\ eLoss = 0 /\ eFence = 0
     /\ hAdmit = {} /\ hObl = {} /\ hRefused = {} /\ hKnown = {} /\ hRaces = {}
 
 (***************************************************************************)
@@ -240,7 +244,7 @@ DestSessionReset(d) ==
     /\ dUsed' = [dUsed EXCEPT ![d] = 0]
     /\ UNCHANGED <<dEpoch, dCommitted, dFenced, dPub, dSlot, dSrcGen, dNextOp,
                    volatile, internal, conn, external, client, proc, eCrash,
-                   eConnReset, eSettle, eLoss, history>>
+                   eConnReset, eSettle, eLoss, eFence, history>>
 
 \* A destination received and acknowledged a publication: the obligation
 \* is settled and its capacity is free again. Delivery itself is outside
@@ -253,7 +257,8 @@ Settle(x) ==
     /\ hObl' = hObl \ {x}
     /\ UNCHANGED <<dEpoch, dCommitted, dFenced, dPub, dSlot, dSrcGen, dDestGen,
                    dNextOp, volatile, internal, conn, external, client, proc,
-                   eCrash, eConnReset, eDestReset, eLoss, hAdmit, hRefused,
+                   eCrash, eConnReset, eDestReset, eLoss, eFence, hAdmit,
+                   hRefused,
                    hKnown, hRaces>>
 
 (***************************************************************************)
@@ -336,6 +341,13 @@ TargetsCurrent(r) ==
 
 HasCapacity(r) == \A t \in r.targets : dUsed[t.dest] < Capacity
 
+\* The first reason, in the order the store checks them.
+RefusalCause(r) ==
+    IF ~EpochOpen(r) THEN "EpochClosed"
+    ELSE IF ~SourceCurrent(r) THEN "StaleSource"
+    ELSE IF ~TargetsCurrent(r) THEN "StaleTarget"
+    ELSE "NoCapacity"
+
 Commit(o, r) ==
     LET new == {[op |-> o, dest |-> t.dest, gen |-> t.gen] : t \in r.targets} IN
     /\ dCommitted' = dCommitted \cup {o}
@@ -376,8 +388,9 @@ ApplyCommand(c) ==
           /\ dFenced' = IF Mutation = "RefusalNotDurable" THEN dFenced
                         ELSE dFenced \cup {o}
           /\ Report(o, "RejectedCertain")
+          /\ hRaces' = hRaces \cup {RefusalCause(r)}
           /\ UNCHANGED <<dEpoch, dCommitted, dPub, dSlot, dObl, dUsed,
-                         dSrcGen, dDestGen, dNextOp, hAdmit, hObl, hRaces>>
+                         dSrcGen, dDestGen, dNextOp, hAdmit, hObl>>
     /\ UNCHANGED <<volatile, tResolve, tFencing, conn, external, client,
                    env, hRefused, hKnown>>
 
@@ -417,13 +430,16 @@ FenceEstablish(o) ==
                    dDestGen, dNextOp, volatile, tCmd, tResolve, conn,
                    external, client, env, hAdmit, hObl, hRefused, hKnown>>
 
-\* The fence cannot be established: the outcome stays unknown (QABS-C).
+\* The write of the fence is refused, a fault of the bench: the outcome
+\* stays unknown (QABS-C). Nothing else leaves an absence unresolved.
 FenceAbandon(o) ==
-    /\ proc = "up" /\ o \in tFencing
+    /\ proc = "up" /\ o \in tFencing /\ eFence < MaxFenceFail
+    /\ eFence' = eFence + 1
     /\ tFencing' = tFencing \ {o}
     /\ Ready(o, "PendingOrUnknown")
     /\ UNCHANGED <<durable, volatile, tCmd, tResolve, conn, external, client,
-                   env, history>>
+                   proc, eCrash, eConnReset, eDestReset, eSettle, eLoss,
+                   history>>
 
 LoseResult(r) ==
     /\ r \in tResult /\ eLoss < MaxLoss
@@ -431,7 +447,7 @@ LoseResult(r) ==
     /\ eLoss' = eLoss + 1
     /\ UNCHANGED <<durable, volatile, tCmd, tResolve, tFencing, conn,
                    external, client, proc, eCrash, eConnReset, eDestReset,
-                   eSettle, history>>
+                   eSettle, eFence, history>>
 
 DeliverResult(r) ==
     LET o == r.op
@@ -507,7 +523,7 @@ ConnectionReset ==
     /\ cOpen' = FALSE
     /\ xIn' = FALSE
     /\ UNCHANGED <<durable, volatile, internal, cGen, xAuth, xWire, client,
-                   proc, eCrash, eDestReset, eSettle, eLoss, history>>
+                   proc, eCrash, eDestReset, eSettle, eLoss, eFence, history>>
 
 \* The core dies. The store keeps the commands it accepted.
 Crash ==
@@ -522,7 +538,7 @@ Crash ==
     /\ xIn' = FALSE /\ xAuth' = {}
     /\ cOpen' = FALSE
     /\ UNCHANGED <<durable, tCmd, cGen, xWire, client, eConnReset,
-                   eDestReset, eSettle, eLoss, history>>
+                   eDestReset, eSettle, eLoss, eFence, history>>
 
 \* Recovery closes the old epoch, then reads the durable data. Closing an
 \* epoch forbids old executions; it does not turn an unknown outcome into
@@ -541,7 +557,7 @@ Recover ==
     /\ UNCHANGED <<dCommitted, dFenced, dPub, dSlot, dObl, dUsed, dSrcGen,
                    dDestGen, dNextOp, vDeadline, vFault, internal, conn,
                    external, client, eCrash, eConnReset, eDestReset, eSettle,
-                   eLoss, hAdmit, hObl, hRefused, hRaces>>
+                   eLoss, eFence, hAdmit, hObl, hRefused, hRaces>>
 
 Suspended == vSlot = "Received" /\ dNextOp > NumOps
 
@@ -647,34 +663,33 @@ ReachReplayWhileUnknown ==
 \* QABS-A: the resolver observed an absence, the command committed, the
 \* fence step returned the commit and PUBREC was observed.
 ReachCommitBeforeFence ==
-    /\ "CommitBeforeFence" \in hRaces /\ dFenced = {} /\ kPhase = "acked"
+    /\ hRaces = {"CommitBeforeFence"} /\ dFenced = {} /\ kPhase = "acked"
 
 \* QABS-B: the fence won, the delayed command was then refused without
 \* effect, and the refusal was observed.
 ReachFenceBeforeCommand ==
-    /\ "FenceBeforeCommand" \in hRaces /\ dCommitted = {} /\ kPhase = "refused"
+    /\ hRaces = {"FenceBeforeCommand"} /\ dCommitted = {} /\ kPhase = "refused"
 
 \* The second exchange finds the capacity used by the first and is refused
 \* without any resolution being involved.
 ReachCapacityRefusal ==
-    /\ kPhase = "refused" /\ kExch = 2 /\ eDestReset = 0 /\ eCrash = 0
+    /\ kPhase = "refused" /\ kExch = 2
     /\ \A d \in Dests : dUsed[d] = Capacity
     /\ 1 \in dCommitted /\ 2 \in dFenced
-    /\ \A o \in Ops : ~vDeadline[o] \/ vKnow[o] = "Submitted"
+    /\ hRaces = {"NoCapacity"}
 
 \* A command prepared for a destination session that was then reset is
 \* refused.
 ReachStaleTargetRefusal ==
-    /\ eDestReset > 0 /\ eCrash = 0 /\ dSrcGen = 1
-    /\ kPhase = "refused" /\ dNextOp = 2 /\ 1 \in dFenced
-    /\ \E x \in vPrep : /\ x.op = 1
-                        /\ \E t \in x.recipe.targets : t.gen # dDestGen[t.dest]
+    /\ eDestReset > 0 /\ kPhase = "refused" /\ dNextOp = 2 /\ 1 \in dFenced
+    /\ hRaces = {"StaleTarget"}
 
 \* A command of the first epoch refused in the second, while a new
 \* admission of the same exchange commits.
 ReachEpochClosedRefusal ==
     /\ dEpoch = 2 /\ 1 \in dFenced /\ 2 \in dCommitted
     /\ kPhase = "acked" /\ kExch = 1
+    /\ hRaces = {"EpochClosed"}
 
 \* The source session was reset after a commit: the obligations stay and
 \* a new exchange is admitted on the same Packet Identifier.

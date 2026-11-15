@@ -8,15 +8,22 @@ and this file is rewritten.
 
 | | |
 | - | - |
-| Models | `M1a.tla` (sidecar `M1a.json`, 18 configurations), `M1b.tla` (sidecar `M1b.json`, 19 configurations) |
-| Base | Integration branch at `b4c80fb`, runner with `--models-dir` at `785c5fc` |
+| Models | `M1a.tla` (sidecar `M1a.json`, 19 configurations), `M1b.tla` (sidecar `M1b.json`, 19 configurations) |
+| Base | Integration branch at `b4c80fb`, runner chain `8978453`, `785c5fc`, `f88da6e`, `f84db36` |
 | Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb` |
 | TLC | 2.19 of 08 August 2024 (rev 5a47802), `tla2tools.jar` 1.7.4, digest pinned by `tools/formal/run_tlc.py` |
 | Java | OpenJDK 21.0.12, 64-bit server VM |
 | Command | `python tools/formal/run_tlc.py --models-dir mqttiumd/models/m1` |
 | Search | Breadth-first, one worker, no symmetry reduction, no state constraint |
 | Machine | 4 cores, 3 GB heap (TLC default for the host) |
-| Result | 37 of 37 configurations gave the outcome their sidecar declares; exit 0; 9 min 36 s in all, on a machine that was also running the extended run below |
+| Result | 38 of 38 configurations gave the outcome their sidecar declares; exit 0; 5 min 42 s in all |
+
+The models follow the corrected reading of the fence (see `README.md`,
+"Bounds and limits"): a resolution applied to an absent identity always
+fences it; the outcome stays unknown only when the write of the fence is
+refused, a fault counted by `MaxFenceFail`. Record 0001 says otherwise in
+step 3 of P1-02b; the record that corrects it is proposed and has no
+number yet.
 
 States and depth are those TLC printed; for a violation they are the
 states explored when the counterexample was found. Durations are
@@ -28,28 +35,31 @@ counterexample.
 
 ### M1a
 
-`Dests = {B, C}` and `NumOps = 2` in every configuration.
+`Dests = {B, C}` and `NumOps = 2` in every configuration. "trace" means
+that the verifier also records the events a witness names (`Trace =
+TRUE`); it changes no behaviour.
 
-| Configuration | Specification | Pubs, crashes, losses | Mutation | Declared | Outcome | States generated | Distinct states | Depth | Time |
+| Configuration | Specification | Pubs and faults | Mutation | Declared | Outcome | States generated | Distinct states | Depth | Time |
 | - | - | - | - | - | - | - | - | - | - |
-| `M1a-safety.cfg` | Spec | {a, b}, crash 1, loss 1 | none | pass | pass | 33429959 | 3292717 | 47 | 217.5s |
-| `M1a-reach-commit.cfg` | Spec | {a, b}, crash 1, loss 1 | none | violation NoCommit | violation NoCommit | 47 | 36 | 6 | 1.0s |
-| `M1a-reach-lost-result.cfg` | Spec | {a, b}, crash 1, loss 1 | none | violation NoLostResult | violation NoLostResult | 99 | 69 | 7 | 1.0s |
-| `M1a-reach-unknown.cfg` | Spec | {a, b}, crash 1, loss 1 | none | violation NoUnknown | violation NoUnknown | 45 | 34 | 6 | 1.0s |
-| `M1a-reach-rejection.cfg` | Spec | {a, b}, crash 1, loss 1 | none | violation NoRejection | violation NoRejection | 1361 | 590 | 10 | 1.2s |
-| `M1a-reach-crash-after-commit.cfg` | Spec | {a, b}, crash 1, loss 1 | none | violation NoCrashAfterCommit | violation NoCrashAfterCommit | 100 | 70 | 7 | 0.9s |
-| `M1a-reach-recovery.cfg` | Spec | {a, b}, crash 1, loss 1 | none | violation NoRecovery | violation NoRecovery | 11582 | 3689 | 13 | 1.3s |
-| `M1a-reach-live-path.cfg` | Spec | {a, b}, crash 0, loss 1 | none | violation NoLivePath | violation NoLivePath | 31287 | 8546 | 15 | 1.6s |
-| `M1a-reach-exhaustion.cfg` | Spec | {a, b}, crash 1, loss 1 | none | violation NoExhaustion | violation NoExhaustion | 22274 | 6603 | 14 | 1.7s |
-| `M1a-mut-ack-before-commit.cfg` | Spec | {a, b}, crash 1, loss 1 | AckBeforeCommit | violation AnswerOnKnowledge | violation AnswerOnKnowledge | 44 | 34 | 6 | 0.9s |
-| `M1a-mut-unknown-as-rejection.cfg` | Spec | {a, b}, crash 1, loss 1 | UnknownAsRejection | violation FenceForbidsExecution | violation FenceForbidsExecution | 86 | 64 | 7 | 1.1s |
-| `M1a-mut-recipe-change.cfg` | Spec | {a, b}, crash 1, loss 1 | RecipeChange | violation OneRecipePerIdentity | violation OneRecipePerIdentity | 84 | 62 | 7 | 1.1s |
-| `M1a-mut-second-admission.cfg` | Spec | {a, b}, crash 1, loss 1 | SecondAdmissionAtReplay | violation OneAdmissionPerExchange | violation OneAdmissionPerExchange | 22189 | 6554 | 14 | 1.8s |
-| `M1a-mut-late-unknown.cfg` | Spec | {a, b}, crash 1, loss 1 | LateUnknownRegresses | violation TerminalKnowledgeStable | violation TerminalKnowledgeStable | 1272 | 567 | 10 | 1.2s |
-| `M1a-live-path.cfg` | LiveSpec | {a}, crash 0, loss 2 | none | pass LivePathResolves | pass | 9810 | 1903 | 27 | 2.1s |
-| `M1a-live-path-no-rearm.cfg` | LiveSpec | {a}, crash 0, loss 2 | NoRearm | liveness LivePathResolves | liveness | 6128 | 1383 | - | 1.8s |
-| `M1a-recovery.cfg` | RecoverySpec | {a}, crash 1, loss 2 | none | pass RecoveryCompletes | pass | 80690 | 15436 | 38 | 6.0s |
-| `M1a-recovery-silent-client.cfg` | LiveSpec | {a}, crash 1, loss 2 | none | liveness RecoveryCompletes | liveness | 52182 | 11333 | - | 4.0s |
+| `M1a-safety.cfg` | Spec | {a, b}, crash 1, loss 1, refused fence 1 | none | pass | pass | 30921975 | 3334251 | 45 | 200.2s |
+| `M1a-reach-commit.cfg` | Spec | {a, b}, crash 1, loss 1, refused fence 1 | none | violation NoCommit | violation NoCommit | 47 | 36 | 6 | 0.9s |
+| `M1a-reach-lost-result.cfg` | Spec | {a, b}, crash 1, loss 1, refused fence 1 | none | violation NoLostResult | violation NoLostResult | 99 | 69 | 7 | 0.9s |
+| `M1a-reach-unknown.cfg` | Spec | {a, b}, crash 1, loss 1, refused fence 1 | none | violation NoUnknown | violation NoUnknown | 45 | 34 | 6 | 1.0s |
+| `M1a-reach-rejection.cfg` | Spec | {a, b}, crash 1, loss 1, refused fence 1 | none | violation NoRejection | violation NoRejection | 1392 | 639 | 10 | 1.1s |
+| `M1a-reach-crash-after-commit.cfg` | Spec | {a, b}, crash 1, loss 1, refused fence 1 | none | violation NoCrashAfterCommit | violation NoCrashAfterCommit | 100 | 70 | 7 | 0.9s |
+| `M1a-reach-recovery.cfg` | Spec | {a, b}, crash 1, loss 1, refused fence 1, trace | none | violation NoRecovery | violation NoRecovery | 40468 | 13430 | 14 | 1.4s |
+| `M1a-reach-live-path.cfg` | Spec | {a, b}, crash 0, loss 1, refused fence 1, trace | none | violation NoLivePath | violation NoLivePath | 58450 | 18039 | 15 | 1.6s |
+| `M1a-reach-exhaustion.cfg` | Spec | {a, b}, crash 1, loss 1, refused fence 1 | none | violation NoExhaustion | violation NoExhaustion | 25036 | 7905 | 14 | 1.3s |
+| `M1a-reach-fence-while-held.cfg` | Spec | {a, b}, crash 1, loss 1, refused fence 1, trace | none | violation NoFenceWhileHeld | violation NoFenceWhileHeld | 610 | 354 | 9 | 1.0s |
+| `M1a-mut-ack-before-commit.cfg` | Spec | {a, b}, crash 1, loss 1, refused fence 1 | AckBeforeCommit | violation AnswerOnKnowledge | violation AnswerOnKnowledge | 44 | 34 | 6 | 0.9s |
+| `M1a-mut-unknown-as-rejection.cfg` | Spec | {a, b}, crash 1, loss 1, refused fence 1 | UnknownAsRejection | violation FenceForbidsExecution | violation FenceForbidsExecution | 86 | 64 | 7 | 0.9s |
+| `M1a-mut-recipe-change.cfg` | Spec | {a, b}, crash 1, loss 1, refused fence 1 | RecipeChange | violation OneRecipePerIdentity | violation OneRecipePerIdentity | 84 | 62 | 7 | 0.9s |
+| `M1a-mut-second-admission.cfg` | Spec | {a, b}, crash 1, loss 1, refused fence 1 | SecondAdmissionAtReplay | violation OneAdmissionPerExchange | violation OneAdmissionPerExchange | 24951 | 7856 | 14 | 1.3s |
+| `M1a-mut-late-unknown.cfg` | Spec | {a, b}, crash 1, loss 1, refused fence 1 | LateUnknownRegresses | violation TerminalKnowledgeStable | violation TerminalKnowledgeStable | 1278 | 601 | 10 | 1.0s |
+| `M1a-live-path.cfg` | LiveSpec | {a}, crash 0, loss 2, refused fence 1 | none | pass LivePathResolves | pass | 13373 | 2772 | 27 | 1.7s |
+| `M1a-live-path-no-rearm.cfg` | LiveSpec | {a}, crash 0, loss 2, refused fence 1 | NoRearm | liveness LivePathResolves | liveness | 7676 | 1823 | - | 1.4s |
+| `M1a-recovery.cfg` | RecoverySpec | {a}, crash 1, loss 2, refused fence 1 | none | pass RecoveryCompletes | pass | 111994 | 22837 | 38 | 6.4s |
+| `M1a-recovery-silent-client.cfg` | LiveSpec | {a}, crash 1, loss 2, refused fence 1 | none | liveness RecoveryCompletes | liveness | 67639 | 15929 | - | 4.0s |
 
 ### M1b
 
@@ -58,25 +68,25 @@ fault named is allowed once, unless a number follows.
 
 | Configuration | Specification | Faults allowed | Mutation | Declared | Outcome | States generated | Distinct states | Depth | Time |
 | - | - | - | - | - | - | - | - | - | - |
-| `M1b-safety-epoch.cfg` | Spec | crash, connection reset, loss | none | pass | pass | 506720 | 100249 | 40 | 4.9s |
-| `M1b-safety-source.cfg` | Spec | crash, source reset, loss | none | pass | pass | 3604848 | 473287 | 41 | 23.5s |
-| `M1b-safety-connection.cfg` | Spec | connection reset, source reset, loss | none | pass | pass | 16325931 | 1979145 | 43 | 100.2s |
-| `M1b-safety-destination.cfg` | Spec | source reset, destination reset, settle | none | pass | pass | 13420360 | 1754718 | 39 | 113.5s |
-| `M1b-safety-capacity.cfg` | Spec | source reset, settle, loss | none | pass | pass | 4438834 | 522976 | 39 | 27.2s |
-| `M1b-reach-replay-while-unknown.cfg` | Spec | connection reset | none | violation NoReplayWhileUnknown | violation NoReplayWhileUnknown | 3471 | 1233 | 15 | 1.2s |
-| `M1b-reach-commit-before-fence.cfg` | Spec | loss | none | violation NoCommitBeforeFence | violation NoCommitBeforeFence | 699 | 269 | 13 | 1.0s |
-| `M1b-reach-fence-before-command.cfg` | Spec | no fault | none | violation NoFenceBeforeCommand | violation NoFenceBeforeCommand | 388 | 169 | 13 | 1.0s |
-| `M1b-reach-capacity-refusal.cfg` | Spec | source reset | none | violation NoCapacityRefusal | violation NoCapacityRefusal | 7258 | 2330 | 16 | 1.1s |
-| `M1b-reach-stale-target-refusal.cfg` | Spec | destination reset | none | violation NoStaleTargetRefusal | violation NoStaleTargetRefusal | 567 | 287 | 11 | 1.3s |
-| `M1b-reach-epoch-closed-refusal.cfg` | Spec | crash | none | violation NoEpochClosedRefusal | violation NoEpochClosedRefusal | 2822 | 1029 | 18 | 1.0s |
-| `M1b-reach-second-exchange.cfg` | Spec | source reset; capacity 2 | none | violation NoSecondExchange | violation NoSecondExchange | 7270 | 2340 | 16 | 1.0s |
-| `M1b-mut-fence-on-stale-read.cfg` | Spec | no fault | FenceOnStaleRead | violation DecisionExclusive | violation DecisionExclusive | 40 | 27 | 9 | 0.8s |
-| `M1b-mut-old-epoch-executes.cfg` | Spec | crash | OldEpochExecutes | violation NoExecutionInClosedEpoch | violation NoExecutionInClosedEpoch | 52 | 37 | 8 | 0.9s |
-| `M1b-mut-stale-target.cfg` | Spec | destination reset | StaleTargetAccepted | violation NoStaleTarget | violation NoStaleTarget | 36 | 27 | 7 | 0.9s |
-| `M1b-mut-refusal-not-durable.cfg` | Spec | source reset, settle 2 | RefusalNotDurable | violation RefusalNeverExecutes | violation RefusalNeverExecutes | 41985 | 10783 | 18 | 1.5s |
+| `M1b-safety-epoch.cfg` | Spec | crash, connection reset, loss, refused fence | none | pass | pass | 716141 | 154898 | 40 | 6.3s |
+| `M1b-safety-source.cfg` | Spec | crash, source reset, loss | none | pass | pass | 1008177 | 191434 | 38 | 8.3s |
+| `M1b-safety-connection.cfg` | Spec | connection reset, source reset, loss | none | pass | pass | 3919894 | 648015 | 37 | 26.9s |
+| `M1b-safety-destination.cfg` | Spec | source reset, destination reset, settle | none | pass | pass | 3915381 | 675186 | 33 | 26.4s |
+| `M1b-safety-capacity.cfg` | Spec | source reset, settle, loss, refused fence | none | pass | pass | 4883284 | 683377 | 36 | 30.8s |
+| `M1b-reach-replay-while-unknown.cfg` | Spec | connection reset, refused fence | none | violation NoReplayWhileUnknown | violation NoReplayWhileUnknown | 3846 | 1430 | 15 | 1.0s |
+| `M1b-reach-commit-before-fence.cfg` | Spec | loss | none | violation NoCommitBeforeFence | violation NoCommitBeforeFence | 465 | 198 | 13 | 0.9s |
+| `M1b-reach-fence-before-command.cfg` | Spec | no fault | none | violation NoFenceBeforeCommand | violation NoFenceBeforeCommand | 257 | 123 | 13 | 0.9s |
+| `M1b-reach-capacity-refusal.cfg` | Spec | source reset | none | violation NoCapacityRefusal | violation NoCapacityRefusal | 4997 | 1743 | 16 | 1.0s |
+| `M1b-reach-stale-target-refusal.cfg` | Spec | destination reset | none | violation NoStaleTargetRefusal | violation NoStaleTargetRefusal | 471 | 257 | 11 | 0.8s |
+| `M1b-reach-epoch-closed-refusal.cfg` | Spec | crash | none | violation NoEpochClosedRefusal | violation NoEpochClosedRefusal | 1736 | 761 | 18 | 0.9s |
+| `M1b-reach-second-exchange.cfg` | Spec | source reset; capacity 2 | none | violation NoSecondExchange | violation NoSecondExchange | 4996 | 1743 | 16 | 0.9s |
+| `M1b-mut-fence-on-stale-read.cfg` | Spec | no fault | FenceOnStaleRead | violation DecisionExclusive | violation DecisionExclusive | 34 | 23 | 9 | 0.8s |
+| `M1b-mut-old-epoch-executes.cfg` | Spec | crash | OldEpochExecutes | violation NoExecutionInClosedEpoch | violation NoExecutionInClosedEpoch | 51 | 36 | 8 | 0.8s |
+| `M1b-mut-stale-target.cfg` | Spec | destination reset | StaleTargetAccepted | violation NoStaleTarget | violation NoStaleTarget | 36 | 27 | 7 | 0.8s |
+| `M1b-mut-refusal-not-durable.cfg` | Spec | source reset, settle 2 | RefusalNotDurable | violation RefusalNeverExecutes | violation RefusalNeverExecutes | 27668 | 7578 | 18 | 1.2s |
 | `M1b-mut-source-reset-drops.cfg` | Spec | source reset | SourceResetDropsObligations | violation ObligationsConserved | violation ObligationsConserved | 29 | 22 | 7 | 0.8s |
-| `M1b-mut-reset-keeps-attachment.cfg` | Spec | source reset | ResetKeepsAttachment | violation AckedIsAdmitted | violation AckedIsAdmitted | 813 | 378 | 11 | 1.0s |
-| `M1b-mut-replay-readmits.cfg` | Spec | connection reset | ReplayReadmits | violation RefusedIsNotAdmitted | violation RefusedIsNotAdmitted | 8236 | 2683 | 17 | 1.2s |
+| `M1b-mut-reset-keeps-attachment.cfg` | Spec | source reset | ResetKeepsAttachment | violation AckedIsAdmitted | violation AckedIsAdmitted | 686 | 337 | 11 | 0.8s |
+| `M1b-mut-replay-readmits.cfg` | Spec | connection reset | ReplayReadmits | violation RefusedIsNotAdmitted | violation RefusedIsNotAdmitted | 5198 | 1846 | 17 | 1.0s |
 
 ### Counterexamples
 
@@ -90,13 +100,28 @@ java -cp ~/.cache/mqttium/formal/tla2tools-1.7.4.jar tlc2.TLC -workers 1 \
     -config M1a-mut-second-admission.cfg M1a.tla
 ```
 
-These traces were read, to check that they fail for the declared reason:
+These traces were read, to check that each reaches its target by the path
+its name claims:
 
-- `M1a-live-path-no-rearm.cfg`: publish, receive, prepare, submit; the
-  deadline fires once and is not armed again; the resolution answers
-  unknown and that answer is lost; the command then commits and its result
-  is lost too. The behaviour stutters with the commit done and the outcome
-  unknown for ever: no deadline is left to ask again.
+- `M1a-reach-live-path.cfg` (P1-02b): publish, receive, prepare, submit;
+  the deadline fires and the write of the fence is refused, so the
+  resolution answers unknown; the deadline fires again; the command
+  commits and its result is lost; the second resolution returns the
+  commit, the core authorises PUBREC and the client observes it on the
+  first connection, with the first unknown answer still undelivered. No
+  crash, no second presentation.
+- `M1a-reach-recovery.cfg` (P1-02): the command commits and its result is
+  lost; crash, recovery, reconnect, the client sends its PUBLISH again and
+  PUBREC is observed on the second connection. Nothing was authorised on
+  the first, and one identity was used.
+- `M1a-reach-fence-while-held.cfg` (QABS-B): the command is held; the
+  deadline fires; the resolution fences the absent identity; the core
+  receives the certain rejection while the command is still held.
+- `M1a-live-path-no-rearm.cfg`: the deadline fires once and is not armed
+  again; the command commits and its result is lost; the one resolution
+  returns the commit and that result is lost too. The behaviour stutters
+  with the commit done and the outcome unknown for ever: no deadline is
+  left to ask again.
 - `M1a-recovery-silent-client.cfg`: the client publishes; the broker
   crashes before it received the frame, recovers, and the client
   reconnects. The behaviour then stutters because the client never sends
@@ -121,19 +146,19 @@ These traces were read, to check that they fail for the declared reason:
 
 ### Extended runs, outside the campaign
 
-Run by hand with the same jar and one worker, on the same `M1a.tla`
-(SHA-256 `be34e011…`), because they exceed the runner's limit of 900 s per
-configuration.
+| Run | Domain | Outcome |
+| - | - | - |
+| `LivePathResolves`, two publications, no crash, one loss | Run on the module before the corrected fence rule: pass, 1,575,585 distinct states, 40 min 6 s | Superseded: it says nothing of the present module |
+| `RecoveryCompletes`, two publications, one crash, one loss | Interrupted | Inconclusive |
+| M1b, every fault kind at once | Interrupted at 14.1 million distinct states after 850 s | Inconclusive |
 
-| Run | Domain | Outcome | States generated | Distinct states | Depth | Time |
-| - | - | - | - | - | - | - |
-| `LivePathResolves` under `LiveSpec` | `Pubs = {a, b}`, no crash, one loss | pass | 15537563 | 1575585 | 44 | 40 min 6 s |
-| `RecoveryCompletes` under `RecoverySpec` | `Pubs = {a, b}`, one crash, one loss | Not finished when this report was written: inconclusive | — | — | — | — |
-| M1b, every fault kind at once | One of each fault | Interrupted at 12.5 million distinct states: inconclusive | — | — | — | — |
+The bound claimed for the two liveness properties is the one of the
+campaign: one publication.
 
 ### Not run
 
-- No domain larger than those above, no symmetry, no simulation mode.
+- No liveness on two publications on the present module; no domain larger
+  than those above; no symmetry; no simulation mode.
 - No liveness property on M1b.
 - M2 to M6 are other lots.
 

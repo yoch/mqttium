@@ -26,12 +26,16 @@ CONSTANTS
     NumOps,     \* admission identities; consumed in order, never reused
     MaxCrash,   \* crashes of the broker process
     MaxLoss,    \* results lost between the store and the core
-    Mutation    \* "none" or the name of a model mutation
+    MaxFenceFail, \* resolutions whose write of the fence is refused
+    Mutation,   \* "none" or the name of a model mutation
+    Trace       \* TRUE: the verifier also records the events that the
+                \* non-vacuity witnesses name; it changes no behaviour
 
 Mutations == {"none", "AckBeforeCommit", "UnknownAsRejection", "RecipeChange",
               "SecondAdmissionAtReplay", "LateUnknownRegresses", "NoRearm"}
 
 ASSUME /\ NumOps \in Nat /\ MaxCrash \in Nat /\ MaxLoss \in Nat
+       /\ MaxFenceFail \in Nat /\ Trace \in BOOLEAN
        /\ Mutation \in Mutations
 
 Ops  == 1..NumOps
@@ -85,13 +89,15 @@ VARIABLES
     proc,       \* "up" or "down"
     eCrash,     \* crashes so far
     eLoss,      \* results lost so far
+    eFence,     \* fence writes refused so far
     \* History of the verifier.
     hAdmit,     \* admissions really committed: [pub, op]
     hPresented, \* every recipe presented to the store: <<op, recipe>>
     hKnown,     \* identities the core learnt as committed (result or recovery)
     hRefused,   \* identities the core treated as certainly rejected
     hFenced,    \* identities the store fenced
-    hAuth       \* every answer the core authorised
+    hAuth,      \* every answer the core authorised
+    hEvents     \* events named by the witnesses, when Trace is TRUE
 
 durable  == <<dDecision, dPub, dSlot, dObl, dAcct, dEpoch, dNextOp>>
 volatile == <<vSlot, vOp, vKnow, vPrep, vDeadline, vFault>>
@@ -99,8 +105,12 @@ internal == <<tCmd, tResolve, tResult>>
 conn     == <<cGen, cOpen>>
 external == <<xIn, xAuth, xWire>>
 client   == <<kPhase, kSentGen, kGen>>
-env      == <<proc, eCrash, eLoss>>
-history  == <<hAdmit, hPresented, hKnown, hRefused, hFenced, hAuth>>
+env      == <<proc, eCrash, eLoss, eFence>>
+history  == <<hAdmit, hPresented, hKnown, hRefused, hFenced, hAuth, hEvents>>
+
+Events == {"CommitResultLost", "ResolvedCommitted", "FencedWhileHeld",
+           "Represented"}
+Note(events) == hEvents' = IF Trace THEN hEvents \cup events ELSE hEvents
 vars     == <<durable, volatile, internal, conn, external, client, env, history>>
 
 RecipeOf(o) == (CHOOSE x \in vPrep : x.op = o).recipe
@@ -135,12 +145,14 @@ TypeOK ==
     /\ proc \in {"up", "down"}
     /\ eCrash \in 0..MaxCrash
     /\ eLoss \in 0..MaxLoss
+    /\ eFence \in 0..MaxFenceFail
     /\ hAdmit \subseteq [pub : Pubs, op : Ops]
     /\ hPresented \subseteq Ops \X Recipes
     /\ hKnown \subseteq Ops
     /\ hRefused \subseteq Ops
     /\ hFenced \subseteq Ops
     /\ hAuth \subseteq Answers
+    /\ hEvents \subseteq Events
 
 Init ==
     /\ dDecision = [o \in Ops |-> "none"]
@@ -159,9 +171,9 @@ Init ==
     /\ kPhase = [p \in Pubs |-> "idle"]
     /\ kSentGen = [p \in Pubs |-> 0]
     /\ kGen = 1
-    /\ proc = "up" /\ eCrash = 0 /\ eLoss = 0
+    /\ proc = "up" /\ eCrash = 0 /\ eLoss = 0 /\ eFence = 0
     /\ hAdmit = {} /\ hPresented = {} /\ hKnown = {}
-    /\ hRefused = {} /\ hFenced = {} /\ hAuth = {}
+    /\ hRefused = {} /\ hFenced = {} /\ hAuth = {} /\ hEvents = {}
 
 (***************************************************************************)
 (* Client. MQTT 5 forbids resending a PUBLISH on a live connection: the    *)
@@ -235,7 +247,7 @@ Receive(p) ==
           /\ UNCHANGED vSlot
     /\ UNCHANGED <<durable, vOp, vKnow, vPrep, vDeadline, vFault, internal,
                    conn, xWire, client, env, hAdmit, hPresented, hKnown,
-                   hRefused, hFenced>>
+                   hRefused, hFenced, hEvents>>
 
 \* Creation takes the next identity. With none left it is suspended: the
 \* exchange stays Received and nothing else is touched.
@@ -265,7 +277,7 @@ Submit(o) ==
     /\ vDeadline' = [vDeadline EXCEPT ![o] = TRUE]
     /\ UNCHANGED <<durable, vSlot, vOp, vPrep, vFault, tResolve, tResult,
                    conn, external, client, env, hAdmit, hKnown, hRefused,
-                   hFenced, hAuth>>
+                   hFenced, hAuth, hEvents>>
 
 \* While the outcome is unknown the same identity may be presented again,
 \* with the same frozen recipe only (DEM-009).
@@ -276,6 +288,7 @@ Represent(o) ==
                 ELSE RecipeOf(o)
        IN /\ tCmd' = tCmd \cup {[op |-> o, recipe |-> r, hold |-> "fresh"]}
           /\ hPresented' = hPresented \cup {<<o, r>>}
+    /\ Note({"Represented"})
     /\ UNCHANGED <<durable, volatile, tResolve, tResult, conn, external,
                    client, env, hAdmit, hKnown, hRefused, hFenced, hAuth>>
 
@@ -338,7 +351,7 @@ ApplyCommand(c) ==
           /\ Ready(o, "RejectedCertain")
           /\ UNCHANGED <<dPub, dSlot, dObl, dAcct, dEpoch, dNextOp, hAdmit>>
     /\ UNCHANGED <<volatile, tResolve, conn, external, client, env,
-                   hPresented, hKnown, hRefused, hAuth>>
+                   hPresented, hKnown, hRefused, hAuth, hEvents>>
 
 \* The store refuses a command for a reason of its own (a durable
 \* capacity, detailed by M1b). Nothing is committed.
@@ -350,36 +363,47 @@ RejectCommand(c) ==
     /\ Ready(o, "RejectedCertain")
     /\ UNCHANGED <<dPub, dSlot, dObl, dAcct, dEpoch, dNextOp, volatile,
                    tResolve, conn, external, client, env, hAdmit, hPresented,
-                   hKnown, hRefused, hAuth>>
+                   hKnown, hRefused, hAuth, hEvents>>
 
-\* ResolveAndFence, ordered with the application of commands. An absent
-\* identity is either fenced, or the fence cannot be established and the
-\* outcome stays unknown: absence alone is never a rejection (DEM-010).
+\* ResolveAndFence, ordered with the application of commands. A resolution
+\* the writer applies to an absent identity always fences it, durably,
+\* before it reports a certain rejection; a held command plays no part and
+\* is refused when it arrives (QABS-B). The outcome stays unknown only when
+\* the write of the fence is refused, a fault of the bench (QABS-C):
+\* absence alone is never a rejection (DEM-010).
 Resolve(o) ==
     /\ proc = "up" /\ o \in tResolve
     /\ tResolve' = tResolve \ {o}
     /\ \/ /\ dDecision[o] = "committed"
           /\ Ready(o, "Committed")
-          /\ UNCHANGED <<dDecision, hFenced>>
+          /\ Note(IF "CommitResultLost" \in hEvents
+                  THEN {"ResolvedCommitted"} ELSE {})
+          /\ UNCHANGED <<dDecision, hFenced, eFence>>
        \/ /\ dDecision[o] = "fenced"
           /\ Ready(o, "RejectedCertain")
-          /\ UNCHANGED <<dDecision, hFenced>>
+          /\ UNCHANGED <<dDecision, hFenced, eFence, hEvents>>
        \/ /\ dDecision[o] = "none"
           /\ Fence(o)
           /\ Ready(o, "RejectedCertain")
-       \/ /\ dDecision[o] = "none"
+          /\ Note(IF \E c \in tCmd : c.op = o /\ c.hold = "held"
+                  THEN {"FencedWhileHeld"} ELSE {})
+          /\ UNCHANGED eFence
+       \/ /\ dDecision[o] = "none" /\ eFence < MaxFenceFail
+          /\ eFence' = eFence + 1
           /\ Ready(o, "PendingOrUnknown")
-          /\ UNCHANGED <<dDecision, hFenced>>
+          /\ UNCHANGED <<dDecision, hFenced, hEvents>>
     /\ UNCHANGED <<dPub, dSlot, dObl, dAcct, dEpoch, dNextOp, volatile, tCmd,
-                   conn, external, client, env, hAdmit, hPresented, hKnown,
-                   hRefused, hAuth>>
+                   conn, external, client, proc, eCrash, eLoss, hAdmit,
+                   hPresented, hKnown, hRefused, hAuth>>
 
 LoseResult(r) ==
     /\ r \in tResult /\ eLoss < MaxLoss
     /\ tResult' = tResult \ {r}
     /\ eLoss' = eLoss + 1
+    /\ Note(IF r.out = "Committed" THEN {"CommitResultLost"} ELSE {})
     /\ UNCHANGED <<durable, volatile, tCmd, tResolve, conn, external, client,
-                   proc, eCrash, history>>
+                   proc, eCrash, eFence, hAdmit, hPresented, hKnown, hRefused,
+                   hFenced, hAuth>>
 
 (***************************************************************************)
 (* Core: knowledge. It only grows; a late unknown never replaces a         *)
@@ -423,7 +447,7 @@ DeliverResult(r) ==
           /\ vFault' = TRUE
           /\ UNCHANGED <<vKnow, vDeadline, hKnown, hRefused>>
     /\ UNCHANGED <<durable, vSlot, vOp, vPrep, tCmd, tResolve, conn, external,
-                   client, env, hAdmit, hPresented, hFenced, hAuth>>
+                   client, env, hAdmit, hPresented, hFenced, hAuth, hEvents>>
 
 \* A deadline is applied only for an identity that is still unresolved; it
 \* asks for a resolution and stays armed until knowledge is terminal.
@@ -442,7 +466,7 @@ Timeout(o) ==
             /\ UNCHANGED hRefused
     /\ UNCHANGED <<durable, vSlot, vOp, vPrep, vFault, tCmd, tResult, conn,
                    external, client, env, hAdmit, hPresented, hKnown, hFenced,
-                   hAuth>>
+                   hAuth, hEvents>>
 
 (***************************************************************************)
 (* Core: authorisation. PUBREC needs the knowledge of the commit.          *)
@@ -455,7 +479,7 @@ Authorize(p) ==
     /\ Answer(p, "PUBREC")
     /\ UNCHANGED <<durable, vOp, vKnow, vPrep, vDeadline, vFault, internal,
                    conn, xIn, xWire, client, env, hAdmit, hPresented, hKnown,
-                   hRefused, hFenced>>
+                   hRefused, hFenced, hEvents>>
 
 \* A certain rejection ends the exchange without distribution.
 Refuse(p) ==
@@ -465,7 +489,7 @@ Refuse(p) ==
     /\ Answer(p, "NACK")
     /\ UNCHANGED <<durable, vOp, vKnow, vPrep, vDeadline, vFault, internal,
                    conn, xIn, xWire, client, env, hAdmit, hPresented, hKnown,
-                   hRefused, hFenced>>
+                   hRefused, hFenced, hEvents>>
 
 \* The transport adapter accepts an authorised frame. A frame for a
 \* connection that is no longer current is dropped.
@@ -493,7 +517,7 @@ Crash ==
     /\ tCmd' = {} /\ tResolve' = {} /\ tResult' = {}
     /\ xIn' = {} /\ xAuth' = {}
     /\ cOpen' = FALSE
-    /\ UNCHANGED <<durable, cGen, xWire, client, eLoss, history>>
+    /\ UNCHANGED <<durable, cGen, xWire, client, eLoss, eFence, history>>
 
 Recover ==
     /\ proc = "down"
@@ -510,7 +534,7 @@ Recover ==
     /\ hKnown' = hKnown \cup {o \in Ops : dDecision[o] = "committed"}
     /\ UNCHANGED <<dDecision, dPub, dSlot, dObl, dAcct, dNextOp, vDeadline,
                    vFault, internal, conn, external, client, eCrash, eLoss,
-                   hAdmit, hPresented, hRefused, hFenced, hAuth>>
+                   eFence, hAdmit, hPresented, hRefused, hFenced, hAuth, hEvents>>
 
 (***************************************************************************)
 (* Legitimate ends: every exchange the client opened is answered, or its   *)
@@ -624,14 +648,20 @@ ReachCrashAfterCommit ==
 \* the crash, recovered and acknowledged on the new connection without a
 \* second identity.
 ReachRecovery ==
-    /\ eCrash > 0 /\ proc = "up" /\ dNextOp = 2
+    /\ eCrash > 0 /\ hEvents = {"CommitResultLost"} /\ proc = "up"
+    /\ dNextOp = 2
     /\ \E p \in Pubs : /\ kPhase[p] = "acked" /\ kSentGen[p] = 2
                        /\ \E s \in dSlot : s.pub = p /\ s.op = 1
+                       \* Nothing was authorised before the crash.
+                       /\ ~\E f \in hAuth : f.pub = p /\ f.gen = 1
 
-\* The shape of P1-02b: no crash, the commit result lost, the outcome
-\* resolved and PUBREC observed while an old unknown answer is still held.
+\* The shape of P1-02b: no crash and no second presentation; a first
+\* resolution whose fence is refused; the commit result lost; a second
+\* resolution that returns the commit; PUBREC observed on the first
+\* connection while the old unknown answer is still held.
 ReachLivePath ==
-    /\ eCrash = 0 /\ eLoss > 0
+    /\ eCrash = 0 /\ eFence > 0
+    /\ hEvents = {"CommitResultLost", "ResolvedCommitted"}
     /\ \E p \in Pubs : /\ kPhase[p] = "acked" /\ kSentGen[p] = 1
                        /\ vOp[p] # NoOp /\ vKnow[vOp[p]] = "Committed"
                        /\ [op |-> vOp[p], out |-> "PendingOrUnknown"] \in tResult
@@ -642,6 +672,13 @@ ReachExhaustion ==
     /\ \E p \in Pubs : kPhase[p] = "sent" /\ Suspended(p)
     /\ \E c \in tCmd : c.hold = "held"
 
+\* QABS-B: the fence is established while the command is held; the core
+\* learns the rejection, and the held command can only be refused.
+ReachFenceWhileHeld ==
+    /\ "FencedWhileHeld" \in hEvents
+    /\ \E o \in Ops : /\ o \in hFenced /\ vKnow[o] = "Rejected"
+                      /\ \E c \in tCmd : c.op = o /\ c.hold = "held"
+
 NoCommit           == ~ReachCommit
 NoLostResult       == ~ReachLostResult
 NoUnknown          == ~ReachUnknown
@@ -650,6 +687,7 @@ NoCrashAfterCommit == ~ReachCrashAfterCommit
 NoRecovery         == ~ReachRecovery
 NoLivePath         == ~ReachLivePath
 NoExhaustion       == ~ReachExhaustion
+NoFenceWhileHeld   == ~ReachFenceWhileHeld
 
 \* With one publication and one crash the identities cannot run out: the
 \* recovery property is then checked without its suspension escape.
@@ -658,28 +696,32 @@ NoSuspension == \A p \in Pubs : ~Suspended(p)
 (***************************************************************************)
 (* Liveness: two properties, each with its own assumptions.                *)
 (***************************************************************************)
-Answered(p) == kPhase[p] \in {"acked", "refused"}
+\* The answer left the broker on the connection the client reads, or the
+\* client has it. Whether the peer reads its socket is not the broker's.
+Answered(p) ==
+    \/ kPhase[p] \in {"acked", "refused"}
+    \/ \E f \in xWire : f.pub = p /\ f.gen = kGen
 
-\* What the broker, its store, its timer and its transport do by
-\* themselves. Weak fairness only. Nothing is assumed of the client
-\* sending a packet; the peer reads the frames that reach its socket. The
-\* bench releases a command it holds, and loses at most MaxLoss results.
+\* What the broker does by itself: its core, its store, its timer and its
+\* transport adapter. Weak fairness only, and on no action that the
+\* client, the peer or the bench owns: nothing is assumed of a packet being
+\* sent, of a frame being read, or of a held command being released. The
+\* faults are bounded: at most MaxLoss lost results and MaxFenceFail
+\* refused fences.
 FairBroker ==
     /\ \A o \in Ops :
-        /\ WF_vars(\E c \in tCmd : c.op = o /\ ReleaseCommand(c))
         /\ WF_vars(\E c \in tCmd : c.op = o /\ ApplyCommand(c))
         /\ WF_vars(Resolve(o))
         /\ WF_vars(Timeout(o))
+        /\ WF_vars(Submit(o))
         /\ \A out \in Outcomes : WF_vars(DeliverResult([op |-> o, out |-> out]))
     /\ \A p \in Pubs :
         /\ WF_vars(Authorize(p))
         /\ WF_vars(Refuse(p))
         /\ WF_vars(\E f \in xAuth : f.pub = p /\ SubmitFrame(f))
-        /\ WF_vars(\E f \in xWire : f.pub = p /\ ClientObserve(f))
         \* Intake of a frame that did arrive; it assumes no arrival.
         /\ WF_vars(Receive(p))
         /\ WF_vars(Prepare(p))
-    /\ \A o \in Ops : WF_vars(Submit(o))
     /\ WF_vars(Recover)
 
 \* The live path of P1-02b (record 0001): from the unknown outcome to its

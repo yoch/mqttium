@@ -14,6 +14,7 @@
     {"config": "M1a-reach-recovery.cfg", "expect": "violation", "invariant": "NoRecovery"},
     {"config": "M1a-reach-live-path.cfg", "expect": "violation", "invariant": "NoLivePath"},
     {"config": "M1a-reach-exhaustion.cfg", "expect": "violation", "invariant": "NoExhaustion"},
+    {"config": "M1a-reach-fence-while-held.cfg", "expect": "violation", "invariant": "NoFenceWhileHeld"},
     {"config": "M1a-mut-ack-before-commit.cfg", "expect": "violation", "invariant": "AnswerOnKnowledge"},
     {"config": "M1a-mut-unknown-as-rejection.cfg", "expect": "violation", "invariant": "FenceForbidsExecution"},
     {"config": "M1a-mut-recipe-change.cfg", "expect": "violation", "invariant": "OneRecipePerIdentity"},
