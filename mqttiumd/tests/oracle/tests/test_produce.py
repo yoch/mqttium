@@ -225,7 +225,7 @@ class Campaign(unittest.TestCase):
         (self.campaign / path).parent.mkdir(parents=True, exist_ok=True)
         (self.campaign / path).write_bytes(data)
 
-    def produce(self, built_from=None, rustflags=None, **checkout):
+    def produce(self, built_from=None, rustflags=None, broker=None, **checkout):
         manifest = json.loads((ROOT / FULL).read_text())
         scenario = json.loads((ROOT / SCENARIO).read_text())
         manifest.update(
@@ -248,6 +248,8 @@ class Campaign(unittest.TestCase):
             manifest["artifact"]["built_from"] = built_from
         if rustflags is not None:
             manifest["artifact"]["built_with"]["rustflags"] = rustflags
+        if broker is not None:
+            manifest["broker"] = broker
         (self.campaign / "manifest.json").write_text(json.dumps(manifest))
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(io.StringIO()):
@@ -317,6 +319,21 @@ class Campaign(unittest.TestCase):
         self.assertEqual((self.result["verdict"], self.result["exit_code"]), ("PASS", 0))
         self.assertEqual(self.contracts.check_file("run-result.json"), [])
         self.assertEqual(results.recompute(self.contracts, "run-result.json"), [])
+
+    def test_a_manifest_and_a_trace_that_disagree_on_the_broker_are_named(self):
+        # Record 0019: the trace of p1-02-good says nothing, so in-process.
+        member = self.rebuilt()
+        manifest = json.loads((ROOT / FULL).read_text())
+        self.assertNotIn("broker", manifest)
+        unmet = self.produce(member, rustflags=REMAPPED, broker="child-process")
+        self.assertEqual(
+            unmet,
+            [
+                "not qualifying: the manifest says the broker ran as a child-process "
+                "and the trace header says in-process"
+            ],
+        )
+        self.assertEqual(self.produce(member, rustflags=REMAPPED, broker="in-process"), [])
 
     # R1 of the audit of a4aea95f: recompute checks the conditions of a
     # qualifying run again, not only the assertions and the faults. Each
