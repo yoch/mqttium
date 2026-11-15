@@ -363,3 +363,46 @@ fn changing_the_autocheckpoint_cannot_replace_an_armed_kill_hook() {
         "the WAL callback still runs"
     );
 }
+
+/// A physical SQLite consistency check alone misses an incomplete business
+/// transaction. The full comparison used by the kill tests rejects it.
+#[test]
+fn full_state_equality_detects_a_missing_obligation_in_a_sound_sqlite_file() {
+    let path = fresh_path();
+    let mut world = store_world(&path);
+    let mut expected = reference();
+    for n in 1..=BEFORE {
+        exchange(&mut world, n);
+    }
+    let command = commands(&world)[0].clone();
+    assert!(world.store.apply(&command).committed_now);
+    assert!(expected.store.apply(&command).committed_now);
+    let complete = expected.store.snapshot();
+    assert_eq!(
+        world.store.try_snapshot().expect("complete state"),
+        complete
+    );
+    drop(world);
+    let connection = rusqlite::Connection::open(&path).expect("isolated mutation connection");
+    assert_eq!(connection.execute(
+        "DELETE FROM obligations WHERE (publication, idx) IN (SELECT publication, idx FROM obligations LIMIT 1)", [],
+    ).expect("one obligation omitted"), 1);
+    let checked: String = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .expect("checked");
+    assert_eq!(
+        checked, "ok",
+        "the physical check passes the partial business state"
+    );
+    drop(connection);
+    let store = SqliteStore::open(&path).expect("physically sound file opens");
+    let partial = store.try_snapshot().expect("partial state decodes");
+    assert_ne!(
+        partial, complete,
+        "whole-state comparison rejects the missing obligation"
+    );
+    assert!(
+        accounts_match_what_is_held(&partial).is_err(),
+        "business accounts detect the omitted obligation"
+    );
+}
