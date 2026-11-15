@@ -54,6 +54,20 @@ P1_02B = json.loads(
     (ROOT / "contracts/examples/v1/valid/scenario-held-command-and-result.json").read_text()
 )
 P1_02B["assertions"] = ASSERTIONS
+# The same scenario with a second injection: the result of the release is
+# duplicated, and the dispatcher refuses the copy.
+P1_02_DUPLICATE = copy.deepcopy(P1_02)
+P1_02_DUPLICATE["faults"].append(
+    {
+        "id": "duplicated_release_result",
+        "point": "store.result.ready",
+        "match": {"command_kind": "ReleaseInbound"},
+        "occurrence": "1",
+        "action": "duplicate_result",
+        "expected_hits": "1",
+    }
+)
+OUTPUTS["scenarios/p1-02-duplicate.json"] = dump(P1_02_DUPLICATE)
 OUTPUTS["scenarios/p1-02.json"] = dump(P1_02)
 OUTPUTS["scenarios/p1-02b.json"] = dump(P1_02B)
 
@@ -871,7 +885,35 @@ case(
     "trace-origin-gap",
     "The collector sequence is gapless and the footer agrees, yet one origin skips a number.",
     ALL_INCONCLUSIVE,
-    raw=drop_and_renumber("StoreResultReady"),
+    raw=drop_and_renumber("PeerConnectionClosed"),
+)
+
+
+def collector_gap(records):
+    # Every origin is gapless and the footer counts what the file holds; only
+    # the collector skipped a number.
+    for record in records[10:]:
+        record["record_sequence"] = str(int(record["record_sequence"]) + 1)
+
+
+case(
+    "trace-collector-gap",
+    "The collector sequence skips a number: a record did not reach the file.",
+    ALL_INCONCLUSIVE,
+    raw=collector_gap,
+)
+
+
+def not_a_record(records):
+    record = next(record for record in records if record["kind"] == "FaultHit")
+    record["payload"]["note"] = "extra"
+
+
+case(
+    "trace-record-not-valid",
+    "One line is not a valid record: its sequences are in order, its payload is not of its kind.",
+    ALL_INCONCLUSIVE,
+    raw=not_a_record,
 )
 
 
@@ -992,6 +1034,20 @@ case(
     events=admission_before_publish,
 )
 
+
+def never_admitted(events):
+    for label in ("admit.stable", "admit.ready"):
+        del events[at(events, label)]
+    events[at(events, "hit.lost_admission_result")]["parents"] = ["admit.submitted"]
+
+
+case(
+    "acknowledged-without-admission",
+    "The client observes a positive PUBREC for an exchange the store never admitted.",
+    {"one_admission_per_observed_inbound_exchange": "FAIL"},
+    events=never_admitted,
+)
+
 # ----------------------------------------------------------------- obligations
 
 
@@ -1035,6 +1091,20 @@ case(
     "The obligations keep their identities and destinations; the payload they refer to changed.",
     {"same_required_obligations_at_both_checkpoints": "FAIL"},
     snapshots=other_payload,
+)
+
+
+def no_obligation(states):
+    for state in states.values():
+        state["obligations"] = []
+        state["publications"] = []
+
+
+case(
+    "obligation-none-held",
+    "Both checkpoints agree, on nothing: the store holds no publication and no obligation.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=no_obligation,
 )
 
 # ---------------------------------------------------------------------- recipe
@@ -1246,6 +1316,57 @@ case(
     ),
 )
 
+
+def duplicate_refused(events):
+    insert_after(
+        events,
+        "release.delivered",
+        [
+            fault_hit(
+                "duplicated_release_result",
+                "store.result.ready",
+                "release.ready",
+                operation=OP_RELEASE,
+                effect_id=effect(2, 2),
+            ),
+            ev(
+                "copy.refused",
+                "dispatcher",
+                "InputRefused",
+                {
+                    "input": "StoreResult",
+                    "effect_id": effect(2, 2),
+                    "operation_id": OP_RELEASE,
+                    "reason": "no-effect-in-flight",
+                },
+                ["hit.duplicated_release_result"],
+                2,
+            ),
+        ],
+    )
+
+
+case(
+    "p1-02-good-duplicate-refused",
+    "A declared injection duplicates a result; the dispatcher refuses the copy, and that is the expected outcome.",
+    scenario="p1-02-duplicate",
+    events=duplicate_refused,
+)
+
+
+def duplicate_delivered(events):
+    duplicate_refused(events)
+    events[at(events, "copy.refused")] = delivered("release", 2, 2, OP_RELEASE, label="copy.in")
+
+
+case(
+    "provenance-duplicate-reaches-the-core",
+    "The duplicated result is not refused: the core consumes a second answer to one effect.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    scenario="p1-02-duplicate",
+    events=duplicate_delivered,
+)
+
 # -------------------------------------------------------------------- snapshots
 
 
@@ -1260,8 +1381,60 @@ case(
     {
         "same_required_obligations_at_both_checkpoints": "INCONCLUSIVE",
         "same_recipe_for_op_A": "INCONCLUSIVE",
+        # The recipe of the release is in that snapshot only: without it the
+        # result the core received cannot be attributed to the exchange.
+        "no_positive_ack_before_confirmed_commit": "INCONCLUSIVE",
     },
     files=corrupt,
+)
+
+UNUSABLE_FINAL = {
+    "same_required_obligations_at_both_checkpoints": "INCONCLUSIVE",
+    "same_recipe_for_op_A": "INCONCLUSIVE",
+    "no_positive_ack_before_confirmed_commit": "INCONCLUSIVE",
+}
+case(
+    "snapshot-of-another-checkpoint",
+    "The file cited for the final checkpoint is the snapshot of another checkpoint.",
+    UNUSABLE_FINAL,
+    snapshots=lambda states: states["final"].update(checkpoint="elsewhere"),
+)
+case(
+    "snapshot-checkpoint-inspected-twice",
+    "The first checkpoint is inspected twice: neither inspection is the one the scenario asks for.",
+    {
+        "same_required_obligations_at_both_checkpoints": "INCONCLUSIVE",
+        "same_recipe_for_op_A": "INCONCLUSIVE",
+    },
+    events=lambda events: insert_after(
+        events,
+        "inspect.after_commit_before_crash",
+        [dict(inspected("after_commit_before_crash"), label="inspect.again")],
+    ),
+)
+case(
+    "provenance-refusal-not-caused-by-a-duplication",
+    "An input is refused after an injection that duplicates nothing: the refusal is not excused.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=lambda events: insert_after(
+        events,
+        "recovery.in",
+        [
+            ev(
+                "refused",
+                "dispatcher",
+                "InputRefused",
+                {
+                    "input": "StoreResult",
+                    "effect_id": effect(1, 1),
+                    "operation_id": OP_ADMIT,
+                    "reason": "no-effect-in-flight",
+                },
+                ["hit.lost_admission_result"],
+                2,
+            )
+        ],
+    ),
 )
 
 OUTPUTS["index.json"] = dump({"traces": INDEX})

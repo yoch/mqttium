@@ -39,9 +39,65 @@ The two readers reach that agreement by different means where it matters:
   document, not by member name: a member is range-checked when its schema
   refers to the `u64` primitive.
 
+| `mqttiumd_oracle/recipe.py` | The canonical bytes of a recipe, decoded independently |
+| `mqttiumd_oracle/trace.py` | A trace read as a whole, and the order it establishes between two records |
+| `mqttiumd_oracle/judge.py` | The observations of a run and the assertions of the catalogue |
+
+## Reading a trace
+
+A trace is complete when it starts with one header, ends with one footer
+that counts its records and declares completeness, has a gapless collector
+sequence and a gapless sequence per origin, and holds every cause its
+records name. A record that is not a valid record makes the trace
+unreadable; so does a record stated by another origin than the one its kind
+belongs to, which is how a trace that breaks the origin rule of ADR 0003 is
+refused.
+
+Nothing concluded from an incomplete trace is a PASS. A FAIL stands on an
+incomplete trace only where no missing record could undo it (two admissions
+for one exchange, obligations or a recipe that changed between two
+snapshots); elsewhere the missing record could be the very one that
+justifies what was observed, and the conclusion is inconclusive. A trace of
+another scenario concludes nothing.
+
+Order is what the trace establishes: two records of one origin are ordered
+by that origin, a cause precedes its consequence, and a simulated run has a
+known total order. Where the trace does not say, the oracle does not
+choose: several interleavings of independent records are accepted, and an
+event is never moved before its prerequisite.
+
+## The assertions
+
+| Assertion | Decided from |
+| - | - |
+| `trace_complete` | The trace as a whole |
+| `all_required_faults_hit` | The `FaultHit` records against the faults of the scenario; anything but the announced count is inconclusive |
+| `one_admission_per_observed_inbound_exchange` | The oracle's own exchanges, built from what the peers sent and observed, against the admissions the store committed. An admission is attributed through the recipe a snapshot holds, never through an ExchangeId: a fresh one does not reset the count |
+| `same_required_obligations_at_both_checkpoints` | The obligations of the first checkpoint, by DeliveryId, destination, cause, effective QoS and payload reference, against what the fixture's routes require and against every later checkpoint |
+| `same_recipe_for_op_A` | The bytes stored for the operation a `FaultHit` names, in every snapshot taken after its commit |
+| `no_positive_ack_before_confirmed_commit` | For each positive PUBREC or PUBCOMP, an earlier record of the same incarnation of the core: a committed result delivered to it, or a recovered fact that is sufficient. That the store had committed is not one |
+| `no_pubrec_observed_before_crash` | What the peer observed before the crash record |
+| `broker_inputs_have_provenance` | Each input the core consumed against its counterpart: a submission in flight, an armed deadline, a page the store adapter read, bytes the transport received |
+
+## The corpus of traces
+
+`build_traces.py` writes `traces/`: histories written by hand, event by
+event, with the snapshots they cite, and `traces/index.json`, which states
+the status of every assertion on every trace. None comes from a run of the
+broker. A faulty trace is one edit of a good one and is refused for one
+assertion and no other; the incomplete traces conclude nothing at all.
+
+```bash
+python tests/oracle/build_traces.py           # rewrite the corpus
+python tests/oracle/build_traces.py --check   # what the tests run
+```
+
 ## What does not exist yet
 
-Reading a trace as a whole, the oracle's own identity of an exchange, the
-assertions of the catalogue, the hand-written corpus of traces and the
-recomputation of a result. Until they exist no assertion is decided here,
-and `docs/reception/open-conditions.md` keeps their rows.
+- The recomputation of a qualifying result from the files it cites, and the
+  refusal of a result whose statuses differ.
+- Obligations of a run on a sub-perimeter (core without bytes): a trace
+  does not declare its perimeter yet.
+- Scenario files for QABS-A, B and C.
+
+`docs/reception/open-conditions.md` keeps the rows these close.

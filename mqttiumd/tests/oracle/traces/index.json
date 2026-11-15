@@ -113,6 +113,38 @@
       "why": "The collector sequence is gapless and the footer agrees, yet one origin skips a number."
     },
     {
+      "name": "trace-collector-gap",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/trace-collector-gap/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "INCONCLUSIVE",
+        "same_required_obligations_at_both_checkpoints": "INCONCLUSIVE",
+        "same_recipe_for_op_A": "INCONCLUSIVE",
+        "no_positive_ack_before_confirmed_commit": "INCONCLUSIVE",
+        "no_pubrec_observed_before_crash": "INCONCLUSIVE",
+        "broker_inputs_have_provenance": "INCONCLUSIVE",
+        "all_required_faults_hit": "INCONCLUSIVE",
+        "trace_complete": "INCONCLUSIVE"
+      },
+      "why": "The collector sequence skips a number: a record did not reach the file."
+    },
+    {
+      "name": "trace-record-not-valid",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/trace-record-not-valid/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "INCONCLUSIVE",
+        "same_required_obligations_at_both_checkpoints": "INCONCLUSIVE",
+        "same_recipe_for_op_A": "INCONCLUSIVE",
+        "no_positive_ack_before_confirmed_commit": "INCONCLUSIVE",
+        "no_pubrec_observed_before_crash": "INCONCLUSIVE",
+        "broker_inputs_have_provenance": "INCONCLUSIVE",
+        "all_required_faults_hit": "INCONCLUSIVE",
+        "trace_complete": "INCONCLUSIVE"
+      },
+      "why": "One line is not a valid record: its sequences are in order, its payload is not of its kind."
+    },
+    {
       "name": "trace-cause-missing",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/trace-cause-missing/trace.jsonl",
@@ -241,6 +273,22 @@
       "why": "The store commits an admission of Packet Identifier 7 before the client sent any PUBLISH."
     },
     {
+      "name": "acknowledged-without-admission",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/acknowledged-without-admission/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "FAIL",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "The client observes a positive PUBREC for an exchange the store never admitted."
+    },
+    {
       "name": "obligation-destination-changed",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/obligation-destination-changed/trace.jsonl",
@@ -303,6 +351,22 @@
         "trace_complete": "PASS"
       },
       "why": "The obligations keep their identities and destinations; the payload they refer to changed."
+    },
+    {
+      "name": "obligation-none-held",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/obligation-none-held/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "FAIL",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "Both checkpoints agree, on nothing: the store holds no publication and no obligation."
     },
     {
       "name": "recipe-changed-under-its-identity",
@@ -513,9 +577,73 @@
       "why": "One effect is answered twice."
     },
     {
+      "name": "p1-02-good-duplicate-refused",
+      "scenario": "tests/oracle/traces/scenarios/p1-02-duplicate.json",
+      "trace": "tests/oracle/traces/p1-02-good-duplicate-refused/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "A declared injection duplicates a result; the dispatcher refuses the copy, and that is the expected outcome."
+    },
+    {
+      "name": "provenance-duplicate-reaches-the-core",
+      "scenario": "tests/oracle/traces/scenarios/p1-02-duplicate.json",
+      "trace": "tests/oracle/traces/provenance-duplicate-reaches-the-core/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "The duplicated result is not refused: the core consumes a second answer to one effect."
+    },
+    {
       "name": "snapshot-not-the-cited-file",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/snapshot-not-the-cited-file/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "INCONCLUSIVE",
+        "same_recipe_for_op_A": "INCONCLUSIVE",
+        "no_positive_ack_before_confirmed_commit": "INCONCLUSIVE",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "The final snapshot is not the file the trace cites: what depends on it is not concluded."
+    },
+    {
+      "name": "snapshot-of-another-checkpoint",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/snapshot-of-another-checkpoint/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "INCONCLUSIVE",
+        "same_recipe_for_op_A": "INCONCLUSIVE",
+        "no_positive_ack_before_confirmed_commit": "INCONCLUSIVE",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "The file cited for the final checkpoint is the snapshot of another checkpoint."
+    },
+    {
+      "name": "snapshot-checkpoint-inspected-twice",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/snapshot-checkpoint-inspected-twice/trace.jsonl",
       "expected": {
         "one_admission_per_observed_inbound_exchange": "PASS",
         "same_required_obligations_at_both_checkpoints": "INCONCLUSIVE",
@@ -526,7 +654,23 @@
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS"
       },
-      "why": "The final snapshot is not the file the trace cites: what depends on it is not concluded."
+      "why": "The first checkpoint is inspected twice: neither inspection is the one the scenario asks for."
+    },
+    {
+      "name": "provenance-refusal-not-caused-by-a-duplication",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/provenance-refusal-not-caused-by-a-duplication/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "An input is refused after an injection that duplicates nothing: the refusal is not excused."
     }
   ]
 }

@@ -108,9 +108,6 @@ def read(contracts, lines, max_bytes=None) -> Trace:
         if len(line) > MAX_LINE_BYTES:
             trace.unreadable.append(f"line {position}: longer than {MAX_LINE_BYTES} bytes")
             break
-        if not line.endswith(b"\n"):
-            trace.incomplete.append(f"line {position}: no line break, the trace was cut")
-            break
         try:
             document = parse(line)
         except Refused as refusal:
