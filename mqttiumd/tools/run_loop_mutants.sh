@@ -13,7 +13,7 @@
 # The exit status is not zero when a patch no longer applies, when a
 # campaign cannot be written, when the oracle cannot judge, or when a
 # mutation expected to be rejected is not rejected with its verdict, its
-# assertion and its reason. A known survivor (expect: survives-known) is
+# assertion, its reason and, when the entry names one, the stop of the run. A known survivor (expect: survives-known) is
 # reported, with the finding it waits for, and does not change the status.
 set -euo pipefail
 
@@ -57,10 +57,11 @@ for id in $ids; do
         failures=$((failures + 1))
         continue
     fi
-    if ! python3 - "$expected" "$id" "$campaign/verdict.json" <<'PY'
+    if ! python3 - "$expected" "$id" "$campaign/verdict.json" "$campaign/campaign.json" <<'PY'
 import json, sys
 mutant = [m for m in json.load(open(sys.argv[1]))["mutants"] if m["id"] == sys.argv[2]][0]
 verdict = json.load(open(sys.argv[3]))
+stopped = json.load(open(sys.argv[4])).get("stopped") or ""
 failing = {name: a for name, a in verdict["assertions"].items() if a["status"] != "PASS"}
 summary = "; ".join(f"{name} {a['status']}: {' | '.join(a['reasons'])}" for name, a in failing.items())
 if mutant["expect"] == "survives-known":
@@ -71,10 +72,13 @@ if mutant["expect"] == "survives-known":
     sys.exit(0)
 assertion = failing.get(mutant["assertion"])
 reasons = " | ".join(assertion["reasons"]) if assertion else ""
-if verdict["verdict"] == mutant["verdict"] and assertion and assertion["status"] == "FAIL" and mutant["reason"] in reasons:
-    print(f"{mutant['id']}: rejected, {verdict['verdict']}, {mutant['assertion']}: {reasons}")
+status = mutant.get("assertion_status", "FAIL")
+stop_ok = "stopped" not in mutant or mutant["stopped"] in stopped
+if verdict["verdict"] == mutant["verdict"] and assertion and assertion["status"] == status and mutant["reason"] in reasons and stop_ok:
+    tail = f"; the run stopped: {stopped}" if stopped else ""
+    print(f"{mutant['id']}: rejected, {verdict['verdict']}, {mutant['assertion']} {status}: {reasons}{tail}")
     sys.exit(0)
-print(f"{mutant['id']}: NOT REJECTED AS EXPECTED: verdict {verdict['verdict']}, expected {mutant['verdict']} on {mutant['assertion']} with \"{mutant['reason']}\"; found: {summary or 'every assertion passes'}")
+print(f"{mutant['id']}: NOT REJECTED AS EXPECTED: verdict {verdict['verdict']}, expected {mutant['verdict']} on {mutant['assertion']} {status} with \"{mutant['reason']}\"" + (f" and a stop with \"{mutant['stopped']}\"" if "stopped" in mutant else "") + f"; found: {summary or 'every assertion passes'}; stopped: {stopped or 'no'}")
 sys.exit(1)
 PY
     then

@@ -187,7 +187,7 @@ fn f3_answers_with_a_steady_lag_longer_than_the_old_window_make_progress() {
 #[test]
 fn f3_as_a_scenario_the_first_answer_after_six_newer_resolutions_commits_the_exchange() {
     let campaign = bench_support::run_scenario(
-        "crates/mqttiumd-lab/tests/bench_scenarios/F3-steady-lag.json",
+        "tests/scenarios/audit/F3-steady-lag.json",
         1,
         "f3-scenario",
     );
