@@ -57,12 +57,11 @@
       "mutation": "the core no longer matches the answers of its landmark resolutions, so an answer that arrives after more newer resolutions than it keeps recent is absorbed (finding F3)",
       "scenario": "tests/scenarios/audit/F3-steady-lag.json",
       "expect": "rejected",
-      "verdict": "INCONCLUSIVE",
-      "assertion": "trace_complete",
-      "assertion_status": "INCONCLUSIVE",
-      "reason": "the footer does not declare the trace complete",
+      "verdict": "FAIL",
+      "assertion": "scenario_reaches_its_end",
+      "reason": "the wait of step 19 (DriveUntil) was unmet",
       "stopped": "step 19 (DriveUntil): nothing is eligible and the awaited event did not happen",
-      "note": "Step 19 waits for the PUBREC that answers the late answer: the run stops there. An interrupted run is never a PASS; whether a wait that can no longer be met is a FAIL is lot L3's to decide."
+      "note": "Step 19 waits for the PUBREC that answers the late answer; nothing eligible can bring it. The bench writes StepBlocked (quiescent) before a complete footer, and the oracle refutes for this run that the awaited event comes with no further stimulus."
     },
     {
       "id": "m5-late-unknown-acknowledged",
