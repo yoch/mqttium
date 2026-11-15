@@ -186,11 +186,8 @@ fn f3_answers_with_a_steady_lag_longer_than_the_old_window_make_progress() {
 /// held answers and one command in transit.
 #[test]
 fn f3_as_a_scenario_the_first_answer_after_six_newer_resolutions_commits_the_exchange() {
-    let campaign = bench_support::run_scenario(
-        "tests/scenarios/audit/F3-steady-lag.json",
-        1,
-        "f3-scenario",
-    );
+    let campaign =
+        bench_support::run_scenario("tests/scenarios/audit/F3-steady-lag.json", 1, "f3-scenario");
     assert_eq!(campaign.report.stopped, None);
     assert!(campaign.report.not_reached.is_empty());
     let trace = bench_support::records(&campaign.trace());
