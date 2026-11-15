@@ -1111,6 +1111,14 @@ trace_case(
     setter(["origin_component"], "broker-core"),
 )
 trace_case(
+    "durable-state-inspected-size-overflow",
+    INSPECTED,
+    "/payload/snapshot/bytes",
+    "The size of a cited snapshot is 64-bit.",
+    setter(["payload", "snapshot", "bytes"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
     "durable-state-inspected-without-digest",
     INSPECTED,
     "/payload/snapshot",
@@ -1334,8 +1342,8 @@ snap_case(
     "obligation-listed-twice",
     "duplicate-name",
     "/obligations/2",
-    "A DeliveryId designates one obligation.",
-    lambda v: v["obligations"].append(copy.deepcopy(v["obligations"][0])),
+    "A DeliveryId designates one obligation, whatever destination a second row claims.",
+    lambda v: v["obligations"].append({**v["obligations"][0], "session": "1"}),
 )
 snap_case(
     "inbound-slot-listed-twice",
@@ -1353,6 +1361,42 @@ snap_case(
     "A SessionId designates one session.",
     lambda v: v["sessions"].append({**v["sessions"][0], "client_id_hex": "7a"}),
 )
+snap_case(
+    "route-listed-twice",
+    "duplicate-name",
+    "/routes/1/topic_hex",
+    "An exact topic has one route.",
+    lambda v: v["routes"].append(copy.deepcopy(v["routes"][0])),
+)
+snap_case(
+    "fence-listed-twice",
+    "duplicate-name",
+    "/fences/1/operation_id",
+    "An identity is fenced once.",
+    lambda v: v.update(fences=[{"operation_id": OP}, {"operation_id": OP}]),
+)
+snap_case(
+    "publication-listed-twice",
+    "duplicate-name",
+    "/publications/1/publication_id",
+    "A PublicationId designates one publication.",
+    lambda v: v["publications"].append(copy.deepcopy(v["publications"][0])),
+)
+snap_case(
+    "account-listed-twice",
+    "duplicate-name",
+    "/accounts/1/account",
+    "An account is listed once.",
+    lambda v: v["accounts"].append(copy.deepcopy(v["accounts"][0])),
+)
+for member in ("payload_bytes", "exchange_slots", "receipt_slots"):
+    snap_case(
+        f"account-limit-{member.replace('_', '-')}-overflow",
+        "u64-out-of-range",
+        f"/accounts/0/limits/{member}",
+        "Every limit of an account is 64-bit.",
+        setter(["accounts", 0, "limits", member], OVER),
+    )
 snap_case(
     "payload-length-overflow",
     "u64-out-of-range",

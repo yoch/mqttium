@@ -113,7 +113,7 @@
         "sequence": "1"
       },
       "index": 0,
-      "session": "2",
+      "session": "1",
       "cause": "LiveExact",
       "effective_qos": 1,
       "phase": "Queued"

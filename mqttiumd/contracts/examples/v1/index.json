@@ -556,6 +556,12 @@
       "why": "The core never reads the store for the oracle: an inspection belongs to the bench."
     },
     {
+      "file": "contracts/examples/v1/invalid/trace-record-durable-state-inspected-size-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/snapshot/bytes",
+      "why": "The size of a cited snapshot is 64-bit."
+    },
+    {
       "file": "contracts/examples/v1/invalid/trace-record-durable-state-inspected-without-digest.json",
       "code": "schema-violation",
       "pointer": "/payload/snapshot",
@@ -631,7 +637,7 @@
       "file": "contracts/examples/v1/invalid/store-snapshot-obligation-listed-twice.json",
       "code": "duplicate-name",
       "pointer": "/obligations/2",
-      "why": "A DeliveryId designates one obligation."
+      "why": "A DeliveryId designates one obligation, whatever destination a second row claims."
     },
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-inbound-slot-listed-twice.json",
@@ -644,6 +650,48 @@
       "code": "duplicate-name",
       "pointer": "/sessions/3/session",
       "why": "A SessionId designates one session."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-route-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/routes/1/topic_hex",
+      "why": "An exact topic has one route."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-fence-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/fences/1/operation_id",
+      "why": "An identity is fenced once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-publication-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/publications/1/publication_id",
+      "why": "A PublicationId designates one publication."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-account-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/accounts/1/account",
+      "why": "An account is listed once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-account-limit-payload-bytes-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/accounts/0/limits/payload_bytes",
+      "why": "Every limit of an account is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-account-limit-exchange-slots-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/accounts/0/limits/exchange_slots",
+      "why": "Every limit of an account is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-account-limit-receipt-slots-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/accounts/0/limits/receipt_slots",
+      "why": "Every limit of an account is 64-bit."
     },
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-payload-length-overflow.json",

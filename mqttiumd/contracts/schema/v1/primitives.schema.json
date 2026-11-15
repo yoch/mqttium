@@ -155,6 +155,31 @@
         }
       }
     },
+    "payload_id": {
+      "description": "One durable immutable payload object.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch",
+        "owner",
+        "sequence"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "owner": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "sequence": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
     "effect_id": {
       "type": "object",
       "additionalProperties": false,

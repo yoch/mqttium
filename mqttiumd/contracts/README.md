@@ -15,6 +15,7 @@ it. The examples illustrate the contract and are not part of the digest.
 | Path | Content |
 | - | - |
 | `schema/v1/*.schema.json` | JSON Schema 2020-12. No `$id`; references are file-relative and never fetched |
+| `schema/v1/store-snapshot.schema.json` | The durable state of a store at one checkpoint, as `InspectDurableState` writes it |
 | `v1/fault-points.json` | Contractual injection points, what each carries (a command or a result) and the actions it offers |
 | `v1/profiles.json` | Profiles and their perimeter |
 | `v1/assertions.json` | Assertion names, their meaning and the requirements they serve |
@@ -99,6 +100,34 @@ result a step handed over.
 
 A record says what its emitter claims. Checking a trace as a whole, and
 the assertion `broker_inputs_have_provenance`, is the oracle's work.
+
+### Store snapshots
+
+`InspectDurableState` writes one document of the format
+`mqttiumd.store-snapshot` per checkpoint, and records it in the trace as
+`DurableStateInspected`, cited by path, digest and size. A snapshot is
+read from the store independently of the broker; it is evidence for the
+oracle and never an input of the broker.
+
+| Table | Rows |
+| - | - |
+| `meta` | Store incarnation and run epoch |
+| `sessions` | SessionId, ClientID bytes, revision |
+| `routes` | Exact topic, revision, target sessions and their QoS |
+| `operations` | OperationId, command kind, the exact canonical bytes of the recipe, the terminal decision |
+| `fences` | Identities that are definitively not executable |
+| `publications` | PublicationId, topic, QoS, retain, payload reference with length and digest |
+| `obligations` | DeliveryId (`publication_id`, `index`), target session, cause, effective QoS, phase |
+| `inbound_exchanges` | ExchangeId, Packet Identifier, publication, phase |
+| `accounts` | Usage and limits |
+
+Every table is present, even empty: an absent table is not an empty one.
+A snapshot shows what the store holds, sound or not. The reader checks
+its form only: 64-bit ranges, and no row listed twice under its key (an
+identity; `publication_id` and `index` for an obligation; session and
+Packet Identifier for an inbound exchange). An obligation without its
+publication, or two admissions for one exchange, is a finding the oracle
+asserts on, not a malformed document.
 
 ### Registry coverage
 

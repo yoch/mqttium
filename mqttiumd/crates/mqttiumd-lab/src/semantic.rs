@@ -98,6 +98,7 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
         "mqttiumd.run-result" => run_result(workspace, document, &mut report.diagnostics),
         "mqttiumd.run-manifest" => run_manifest(document, &mut report.diagnostics),
         "mqttiumd.trace-record" => trace_record(document, &mut report.diagnostics),
+        "mqttiumd.store-snapshot" => store_snapshot(document, &mut report.diagnostics),
         "mqttiumd.requirement-register" => {
             let entries = entry_names(document, "entries", "id");
             unique(
@@ -1186,10 +1187,68 @@ fn trace_record(document: &Value, out: &mut Vec<Diagnostic>) {
     decimal_strings(document.get("payload"), "/payload", out);
 }
 
+/// A store snapshot is checked for form only: every 64-bit member is in
+/// range and no row is listed twice under its key. Whether the rows are
+/// sound together is what the oracle asserts, not what makes a snapshot
+/// readable.
+fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
+    const TABLES: [(&str, &[&str], &str, &str); 7] = [
+        ("sessions", &["session"], "/session", "session"),
+        ("routes", &["topic_hex"], "/topic_hex", "route"),
+        (
+            "operations",
+            &["operation_id"],
+            "/operation_id",
+            "operation",
+        ),
+        ("fences", &["operation_id"], "/operation_id", "fence"),
+        (
+            "publications",
+            &["publication_id"],
+            "/publication_id",
+            "publication",
+        ),
+        (
+            "obligations",
+            &["publication_id", "index"],
+            "",
+            "obligation",
+        ),
+        ("accounts", &["account"], "/account", "account"),
+    ];
+    decimal_strings(Some(document), "", out);
+    let mut duplicate = |table: &str, index: usize, suffix: &str, what: &str, key: String| {
+        out.push(Diagnostic::new(
+            code::DUPLICATE_NAME,
+            format!("/{table}/{index}{suffix}"),
+            format!("{what} {key} is listed twice"),
+        ));
+    };
+    for (table, key, suffix, what) in TABLES {
+        let mut seen = BTreeSet::new();
+        for (index, row) in items(document, table).iter().enumerate() {
+            let identity: Vec<String> = key.iter().map(|member| row[*member].to_string()).collect();
+            let identity = identity.join(" ");
+            if !seen.insert(identity.clone()) {
+                duplicate(table, index, suffix, what, identity);
+            }
+        }
+    }
+    // A session has one inbound exchange per Packet Identifier, whatever
+    // generation a row claims.
+    let mut slots = BTreeSet::new();
+    for (index, row) in items(document, "inbound_exchanges").iter().enumerate() {
+        let slot = format!("{} {}", row["exchange"]["session"], row["packet_id"]);
+        if !slots.insert(slot.clone()) {
+            duplicate("inbound_exchanges", index, "", "inbound slot", slot);
+        }
+    }
+}
+
 /// Checks every decimal-looking identity component below `value`. Payload
 /// members that hold 64-bit components are objects of decimal strings.
 fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnostic>) {
-    const COMPONENTS: [&str; 19] = [
+    const COMPONENTS: [&str; 25] = [
         "incarnation",
         "epoch",
         "owner",
@@ -1209,6 +1268,12 @@ fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnosti
         "now",
         "page",
         "revision",
+        "length",
+        "payload_bytes",
+        "references",
+        "exchange_slots",
+        "receipt_slots",
+        "bytes",
     ];
     let members = match value {
         Some(Value::Object(members)) => members,
@@ -1287,6 +1352,37 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains(cell))
+    }
+
+    /// The recipe of the snapshot example is what the contract crate
+    /// calls canonical: decoding and encoding it again gives the same bytes.
+    #[test]
+    fn the_recipe_of_the_snapshot_example_is_canonical() {
+        use mqttiumd_contract::command::Recipe;
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = "contracts/examples/v1/valid/store-snapshot-after-commit.json";
+        let bytes = std::fs::read(root.join(path)).expect("example");
+        let snapshot: Value = serde_json::from_slice(&bytes).expect("JSON");
+        let hex = snapshot["operations"][0]["recipe_hex"]
+            .as_str()
+            .expect("hex");
+        let recipe: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex digit"))
+            .collect();
+        let decoded = Recipe::decode_canonical(&recipe, 4, 256).expect("canonical recipe");
+        let mut encoded = Vec::new();
+        decoded.encode_canonical(&mut encoded).expect("encodes");
+        assert_eq!(encoded, recipe);
+        let Recipe::AdmitPublication(admit) = decoded else {
+            panic!("an admission");
+        };
+        assert_eq!(
+            admit.targets.len(),
+            snapshot["obligations"].as_array().map_or(0, Vec::len)
+        );
+        assert_eq!(admit.source.packet_id.get(), 7);
     }
 
     /// ADR 0001, "Replayed PUBLISH": while the outcome of the admission is

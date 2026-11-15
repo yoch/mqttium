@@ -120,7 +120,8 @@
         "RecoveryPageRead",
         "RecoveryPageDelivered",
         "InputRefused",
-        "HeldItemReleased"
+        "HeldItemReleased",
+        "DurableStateInspected"
       ]
     },
     "payload": {
@@ -723,6 +724,30 @@
           "origin_component": {
             "enum": [
               "fault-injector"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "DurableStateInspected"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/DurableStateInspected"
+          },
+          "origin_component": {
+            "enum": [
+              "bench-supervisor"
             ]
           }
         }
@@ -1531,6 +1556,22 @@
       "properties": {
         "fault_id": {
           "$ref": "primitives.schema.json#/$defs/name"
+        }
+      }
+    },
+    "DurableStateInspected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checkpoint",
+        "snapshot"
+      ],
+      "properties": {
+        "checkpoint": {
+          "$ref": "primitives.schema.json#/$defs/name"
+        },
+        "snapshot": {
+          "$ref": "primitives.schema.json#/$defs/artifact"
         }
       }
     }
