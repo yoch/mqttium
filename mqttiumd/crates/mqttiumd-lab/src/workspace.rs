@@ -416,9 +416,78 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
-    use super::{MAX_REFERENCE_DEPTH, REFERENCES, ReferenceStack, StackRefusal, is_contained};
+    use super::{
+        MAX_REFERENCE_DEPTH, REFERENCES, ReferenceStack, StackRefusal, Workspace, is_contained,
+    };
+
+    /// A copy of the contract directory and its schemas under a root of
+    /// its own, so that a test may change the files.
+    fn copy_of_the_contracts(name: &str) -> PathBuf {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = source.join("target/workspace-tests").join(name);
+        let _ = fs::remove_dir_all(&root);
+        for directory in ["contracts/v1", "contracts/schema/v1"] {
+            fs::create_dir_all(root.join(directory)).expect("directory");
+            for entry in fs::read_dir(source.join(directory)).expect("contracts") {
+                let entry = entry.expect("entry");
+                fs::copy(entry.path(), root.join(directory).join(entry.file_name())).expect("copy");
+            }
+        }
+        root
+    }
+
+    /// The digest names the rules that are applied: a contract file that
+    /// changes after the workspace was opened changes neither the digest
+    /// nor what is validated, and a workspace opened afterwards names
+    /// other contracts.
+    #[test]
+    fn the_bytes_that_are_hashed_are_the_bytes_that_are_interpreted() {
+        let root = copy_of_the_contracts("one-snapshot");
+        let contracts = Path::new("contracts/v1");
+        let workspace = Workspace::open(&root, contracts).expect("opens");
+        let digest = workspace.contracts_digest().to_owned();
+        let registry = Path::new("contracts/v1/p1.transitions.json");
+        assert!(workspace.check_file(registry).is_accepted());
+
+        // The catalogue of the registry is replaced by one without machines.
+        let catalog = root.join("contracts/v1/p1.catalog.json");
+        let changed = fs::read_to_string(&catalog)
+            .expect("catalogue")
+            .replace("\"inbound_qos2\"", "\"inbound_qos3\"");
+        fs::write(&catalog, changed).expect("write");
+        fs::write(root.join("contracts/v1/profiles.json"), "{}").expect("write");
+
+        assert_eq!(workspace.contracts_digest(), digest);
+        let report = workspace.check_file(registry);
+        assert!(report.is_accepted(), "{:?}", report.diagnostics);
+        for (path, report) in workspace.check_contracts() {
+            assert!(
+                report.is_accepted(),
+                "{}: {:?}",
+                path.display(),
+                report.diagnostics
+            );
+        }
+        assert_eq!(workspace.check_contracts().len(), 6);
+
+        // Opened again, the directory is other contracts, and invalid ones.
+        assert!(Workspace::open(&root, contracts).is_err());
+        fs::write(
+            root.join("contracts/v1/profiles.json"),
+            fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/v1/profiles.json"),
+            )
+            .expect("profiles"),
+        )
+        .expect("write");
+        let reopened = Workspace::open(&root, contracts).expect("opens");
+        assert_ne!(reopened.contracts_digest(), digest);
+        assert!(!reopened.check_file(registry).is_accepted());
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn the_reference_graph_between_formats_is_acyclic() {
