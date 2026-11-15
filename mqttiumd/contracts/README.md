@@ -262,6 +262,12 @@ not fired and names the faults that still hold an item, so that a reader
 can tell a stopped product from a scenario that did not fire a deadline
 it armed or release what it holds; the verdict depends on `cause` alone.
 
+A real kill (record 0019, proposed): when the broker runs as a child
+process, the trace header and the manifest say `broker: child-process`
+(absent means in-process), and the supervisor writes `BrokerKilled
+{signal_sent: SIGKILL, wait_status: {signal}}` once `wait()` has returned
+the child's status, before `BrokerCrashed`. No pid enters the trace.
+
 `InputRefused` is what the dispatcher records when it refuses a result
 that answers no effect in flight. `StoreCommitStable`, `StoreFenceStable`,
 `StoreFenceRefused` and `StoreResultReady` are hidden truth of the store: they judge a run and
