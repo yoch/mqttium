@@ -5,6 +5,7 @@
     "tests/scenarios/p1/P1-02.json",
     "tests/fixtures/p1/three-persistent-sessions.json",
     "contracts/examples/v1/valid/scenario-u64-max.json",
+    "contracts/examples/v1/valid/scenario-core-without-bytes.json",
     "contracts/examples/v1/valid/scenario-qos0-publish.json",
     "contracts/examples/v1/valid/scenario-held-command-and-result.json",
     "contracts/examples/v1/valid/fault-catalog.json",
@@ -30,6 +31,7 @@
     "contracts/examples/v1/valid/trace-record-frame-eligible.json",
     "contracts/examples/v1/valid/trace-record-frame-eligible-connack.json",
     "contracts/examples/v1/valid/trace-record-durable-state-inspected.json",
+    "contracts/examples/v1/valid/trace-record-header-core-without-bytes.json",
     "contracts/examples/v1/valid/store-snapshot-after-commit.json",
     "contracts/examples/v1/valid/store-snapshot-empty.json",
     "contracts/examples/v1/valid/store-snapshot-orphan-obligation.json",
@@ -382,6 +384,12 @@
       "why": "RestartBroker needs a crashed broker."
     },
     {
+      "file": "contracts/examples/v1/invalid/scenario-unknown-perimeter.json",
+      "code": "schema-violation",
+      "pointer": "/perimeter",
+      "why": "A scenario requires a known perimeter."
+    },
+    {
       "file": "contracts/examples/v1/invalid/scenario-release-before-hold.json",
       "code": "step-order-invalid",
       "pointer": "/steps/2",
@@ -578,6 +586,18 @@
       "code": "schema-violation",
       "pointer": "/payload/snapshot",
       "why": "A snapshot is cited by path, digest and size, like any evidence."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-header-without-perimeter.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A run says what it exercised: a run without bytes must not be read as a full one."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-header-unknown-perimeter.json",
+      "code": "schema-violation",
+      "pointer": "/payload/perimeter",
+      "why": "Perimeters are a closed set."
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-store-truth-from-core.json",

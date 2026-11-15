@@ -28,6 +28,13 @@
     "profile": {
       "$ref": "primitives.schema.json#/$defs/slug"
     },
+    "perimeter": {
+      "description": "The perimeter a run of this scenario must have; absent, `full`. A run of another perimeter concludes nothing about this scenario. What a run exercises. `full`: client bytes through the transport, with independent peers. `core-without-bytes`: the core is driven with validated packets; no transport and no peer observes anything.",
+      "enum": [
+        "full",
+        "core-without-bytes"
+      ]
+    },
     "initial_fixture": {
       "$ref": "primitives.schema.json#/$defs/relative_path"
     },

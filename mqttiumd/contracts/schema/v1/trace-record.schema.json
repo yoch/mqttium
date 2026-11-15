@@ -760,7 +760,8 @@
       "additionalProperties": false,
       "required": [
         "scenario_id",
-        "backend"
+        "backend",
+        "perimeter"
       ],
       "properties": {
         "scenario_id": {
@@ -770,6 +771,13 @@
           "enum": [
             "sim-store",
             "sqlite"
+          ]
+        },
+        "perimeter": {
+          "description": "What a run exercises. `full`: client bytes through the transport, with independent peers. `core-without-bytes`: the core is driven with validated packets; no transport and no peer observes anything.",
+          "enum": [
+            "full",
+            "core-without-bytes"
           ]
         }
       }
