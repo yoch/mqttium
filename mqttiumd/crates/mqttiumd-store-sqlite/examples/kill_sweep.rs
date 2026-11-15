@@ -354,6 +354,20 @@ fn next(random: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+fn uniform_delay(random: &mut u64, max_us: u64) -> Result<u64, String> {
+    let width = max_us * 1000 + 1;
+    let ceiling = u64::MAX - u64::MAX % width;
+    // Reject the incomplete last bucket, so the requested delay has no
+    // modulo bias. The retry budget is explicit, including generator use.
+    for _ in 0..16 {
+        let value = next(random);
+        if value < ceiling {
+            return Ok(value % width);
+        }
+    }
+    Err("uniform-delay generator exhausted its retry budget".to_owned())
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     if args.len() != 5 {
         return Err(
@@ -428,7 +442,7 @@ fn run(args: &[String]) -> Result<(), String> {
         let delay_ns = if phase == "calibration" {
             CALIBRATION_DELAYS_US[(index / 8) as usize] * 1000
         } else {
-            next(&mut random) % (max_us * 1000 + 1)
+            uniform_delay(&mut random, max_us)?
         };
         let record = match trial(&out, index, delay_ns, seed, target) {
             Ok(record) => {
