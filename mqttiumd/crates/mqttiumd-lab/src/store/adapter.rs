@@ -655,13 +655,18 @@ impl<S: DurableStore> SimStore<S> {
                 )
             }
             Work::Open(command) => {
+                // A commit happened now when this run wrote the ledger.
+                // The outcome does not say so: the command that opened
+                // the last epoch is answered `Committed` again and
+                // writes nothing.
+                let before = self.store.ledger();
                 let outcome = self.store.open_epoch(command);
                 (
                     Answer::Opening {
                         command: *command,
                         outcome,
                     },
-                    matches!(outcome, OpeningOutcome::Committed(_)),
+                    self.store.ledger() != before,
                 )
             }
         };
