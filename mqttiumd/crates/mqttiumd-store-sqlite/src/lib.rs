@@ -88,6 +88,11 @@ use codec::{
 
 pub use schema::{FORMAT, SCHEMA_VERSION};
 
+/// Whether this compiled store carries test-only transaction kill points.
+/// The bench checks this before writing a campaign, including when Cargo
+/// unified a transitive request for the store feature into its normal build.
+pub const KILL_POINTS_ENABLED: bool = cfg!(feature = "kill-points");
+
 /// The points of the store at which the bench may kill its process, in
 /// a build with the feature `kill-points` only (record 0002, plan
 /// `docs/missions/L7-kill-inside-a-transaction.md`). The product is never
@@ -1155,7 +1160,7 @@ fn settle(conn: &Connection) -> Result<Settings, OpenError> {
         page_size,
         wal_autocheckpoint,
         checkpoint_policy: "sqlite-autocheckpoint",
-        kill_points: cfg!(feature = "kill-points"),
+        kill_points: KILL_POINTS_ENABLED,
     })
 }
 
