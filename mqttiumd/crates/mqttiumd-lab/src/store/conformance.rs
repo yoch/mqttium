@@ -31,7 +31,8 @@ use mqttiumd_contract::packet::{Qos, SharedBytes};
 
 use super::durable::{
     Accounts, AdminCommand, AdminDone, AdminRefused, Decision, DurableState, DurableStore, Limits,
-    MAX_CLIENT_ID_BYTES, ObligationPhase, RecoveryRefused, Resolved, SessionState,
+    MAX_CLIENT_ID_BYTES, ObligationPhase, ReadBudget, ReadError, RecoveryRefused, Resolved,
+    SessionState,
 };
 
 /// The incarnation every check creates its data set with.
@@ -1824,6 +1825,100 @@ pub fn recovered_facts_follow_the_order_of_an_inventory<S: DurableStore>(
     }
 }
 
+/// Snapshot refusals preserve durable state and distinguish a configured
+/// bound from an allocation failure. The healthy explicit/default reads agree.
+pub fn snapshot_limits_refuse_without_changing_the_store<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let world = World::new(make);
+    let before = world.store.snapshot().expect("healthy durable snapshot");
+    assert_eq!(
+        world.store.snapshot_with_budget(ReadBudget::SNAPSHOT),
+        Ok(before.clone())
+    );
+    for budget in [
+        ReadBudget {
+            max_rows: 0,
+            ..ReadBudget::SNAPSHOT
+        },
+        ReadBudget {
+            max_bytes: 0,
+            ..ReadBudget::SNAPSHOT
+        },
+        ReadBudget {
+            max_field_bytes: 1,
+            ..ReadBudget::SNAPSHOT
+        },
+    ] {
+        assert_eq!(
+            world.store.snapshot_with_budget(budget),
+            Err(ReadError::LimitExceeded),
+            "snapshot budget {budget:?}"
+        );
+        assert_eq!(
+            world.store.snapshot().expect("healthy durable snapshot"),
+            before
+        );
+    }
+}
+
+/// Refusing a page does not claim that inventory ended. The same cursor can
+/// still read its next valid fact, and neither refusal nor inspection writes.
+pub fn recovery_limits_refuse_without_claiming_the_inventory_ends<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let world = World::new(make);
+    let before = world.store.snapshot().expect("healthy durable snapshot");
+    assert_eq!(
+        world.store.recover(None, 0),
+        Err(RecoveryRefused::EmptyPage)
+    );
+    assert_eq!(
+        world.store.recover(None, usize::MAX),
+        Err(RecoveryRefused::Read(ReadError::LimitExceeded))
+    );
+    let first = world
+        .store
+        .recover_with_budget(None, 3, ReadBudget::PAGE)
+        .expect("metadata page");
+    assert_eq!(first.facts.as_slice().len(), 3);
+    let cursor = first
+        .next
+        .expect("the inventory includes routes and sessions");
+    for budget in [
+        ReadBudget {
+            max_rows: 0,
+            ..ReadBudget::PAGE
+        },
+        ReadBudget {
+            max_bytes: 0,
+            ..ReadBudget::PAGE
+        },
+        ReadBudget {
+            max_field_bytes: 1,
+            ..ReadBudget::PAGE
+        },
+    ] {
+        assert_eq!(
+            world.store.recover_with_budget(Some(cursor), 1, budget),
+            Err(RecoveryRefused::Read(ReadError::LimitExceeded)),
+            "recovery budget {budget:?}"
+        );
+    }
+    let next = world
+        .store
+        .recover(Some(cursor), 1)
+        .expect("the refused fact remains readable");
+    assert!(matches!(
+        next.facts.as_slice(),
+        [RecoveredFact::Route { .. }]
+    ));
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        before
+    );
+}
+
 /// Every check of this module, in order.
 pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     opening_opens_the_next_epoch_and_closes_the_older_ones(make);
@@ -1855,4 +1950,6 @@ pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     what_is_established_in_epoch_zero_is_never_collected(make);
     every_receipt_and_fence_holds_a_receipt_slot(make);
     recovered_facts_follow_the_order_of_an_inventory(make);
+    snapshot_limits_refuse_without_changing_the_store(make);
+    recovery_limits_refuse_without_claiming_the_inventory_ends(make);
 }
