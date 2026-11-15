@@ -5055,4 +5055,143 @@ mod tests {
         };
         faulted(&mut world, late, fault);
     }
+
+    // ----- Review of the second wave: R2 -----
+
+    // R2, the counterexample of the auditor, as given. On its own it also
+    // passes when the identity is burnt (`else { return; }`); the tests
+    // after it tell an authority kept from an identity burnt.
+    #[test]
+    fn review_failed_renewal_must_not_reopen_the_owner_identity() {
+        let mut world = World::connected();
+        let first = world.submit(publish(7));
+        assert_eq!(
+            world
+                .owner
+                .renew_box(&mut world.authority, nonzero(usize::MAX), bound(1)),
+            Err(RenewRefused::Create(CreateRefused::TooLarge)),
+        );
+        let Ok(outbox) = world.authority.create_outbox(
+            LogicalOwnerId::new(4),
+            nonzero(CAPACITY),
+            bound(ENTRIES),
+        ) else {
+            return;
+        };
+        let mut second = Owner::new(config(), outbox).expect("new owner accepted");
+        for input in [
+            page(&fixture(EPOCH), true),
+            connect(CONN + 1, b"p1-producer"),
+            publish_with(CONN + 1, 8, Qos::ExactlyOnce, b"xyz"),
+        ] {
+            assert!(matches!(
+                second.step(input, GRANT),
+                StepOutcome::Applied { .. }
+            ));
+        }
+        let mut sink = Taking(Vec::new());
+        let _ = second.dispatch(&mut sink);
+        let second_operation = sink
+            .0
+            .into_iter()
+            .find_map(|effect| {
+                if let (_, Effect::Persist { command }) = effect.into_parts() {
+                    Some(command.recipe.operation())
+                } else {
+                    None
+                }
+            })
+            .expect("second Persist");
+        assert_ne!(
+            first.operation, second_operation,
+            "a failed box renewal reopened the identity and reset its OperationId counter"
+        );
+    }
+
+    /// A box no allocator provides, though its size fits an allocation.
+    fn unobtainable() -> NonZeroUsize {
+        nonzero(isize::MAX as usize / core::mem::size_of::<OwnedEffect>())
+    }
+
+    // R2, reception 1 to 3: a renewal refused because the new box cannot be
+    // created, for its size or for lack of memory, keeps the owner's box,
+    // its effects, its counters and its state, keeps the authority as it
+    // was, and the identity stays taken: no second owner of it can be
+    // built. The owner goes on stepping and dispatching.
+    #[test]
+    fn a_failed_renewal_keeps_the_box_the_state_and_the_authority() {
+        for (capacity, refusal) in [
+            (nonzero(usize::MAX), CreateRefused::TooLarge),
+            (unobtainable(), CreateRefused::AllocationFailed),
+        ] {
+            let mut world = World::connected();
+            let first = world.submit(publish(7));
+            let serial = world.held().id().serial();
+            let before = world.snapshot();
+            assert_eq!(
+                world
+                    .owner
+                    .renew_box(&mut world.authority, capacity, bound(1)),
+                Err(RenewRefused::Create(refusal)),
+                "{refusal:?}"
+            );
+            assert_eq!(world.held().id().serial(), serial, "{refusal:?}");
+            assert_eq!(world.snapshot(), before, "{refusal:?}");
+            assert_eq!(
+                world.authority.active_box(LogicalOwnerId::new(4)),
+                Some(world.held().id()),
+                "{refusal:?}"
+            );
+            assert_eq!(
+                world
+                    .authority
+                    .create_outbox(LogicalOwnerId::new(4), nonzero(CAPACITY), bound(ENTRIES))
+                    .err(),
+                Some(CreateRefused::OwnerAlreadyActive),
+                "{refusal:?}"
+            );
+            // The owner goes on.
+            assert_eq!(world.sent(committed(&first)), ["EmitPubrec"], "{refusal:?}");
+            let next = world.submit(publish(8));
+            assert_eq!(
+                next.operation.sequence().get(),
+                first.operation.sequence().get() + 1,
+                "{refusal:?}"
+            );
+        }
+    }
+
+    // R2, reception 4: after refused renewals, a valid one succeeds and the
+    // counters go on.
+    #[test]
+    fn a_valid_renewal_after_refused_ones_keeps_the_counters() {
+        let mut world = World::connected();
+        let first = world.submit(publish(7));
+        for capacity in [nonzero(usize::MAX), unobtainable()] {
+            assert!(
+                world
+                    .owner
+                    .renew_box(&mut world.authority, capacity, bound(1))
+                    .is_err()
+            );
+        }
+        let serial = world.held().id().serial();
+        assert_eq!(
+            world
+                .owner
+                .renew_box(&mut world.authority, nonzero(CAPACITY), bound(ENTRIES)),
+            Ok(())
+        );
+        assert_ne!(world.held().id().serial(), serial);
+        assert_eq!(
+            world.authority.active_box(LogicalOwnerId::new(4)),
+            Some(world.held().id())
+        );
+        assert_eq!(world.sent(committed(&first)), ["EmitPubrec"]);
+        let next = world.submit(publish(8));
+        assert_eq!(
+            next.operation.sequence().get(),
+            first.operation.sequence().get() + 1
+        );
+    }
 }
