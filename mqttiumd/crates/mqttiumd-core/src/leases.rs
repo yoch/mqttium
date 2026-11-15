@@ -14,10 +14,6 @@
 //! a record from parts is [`LeaseTable::restore`], which refuses a slot
 //! that already holds one.
 
-// Interface only in this commit: the bodies below grant and check nothing
-// yet, so some names are not used. Removed with the implementation.
-#![allow(dead_code, unused_imports)]
-
 use core::num::NonZeroU32;
 
 use crate::contract::capacity::{AllocationFailed, BoundedVec, Resource};
@@ -87,8 +83,78 @@ impl LeaseTable {
         limit: Credits,
         max_leases: NonZeroU32,
     ) -> Result<Self, AllocationFailed> {
-        let _ = (account, limit, max_leases);
-        Err(AllocationFailed)
+        let count = usize::try_from(max_leases.get()).map_err(|_| AllocationFailed)?;
+        let mut slots = BoundedVec::with_capacity(count)?;
+        for _ in 0..count {
+            let free = LeaseSlot {
+                next_generation: Some(LeaseGeneration::new(0)),
+                record: None,
+            };
+            slots.try_push(free).map_err(|_| AllocationFailed)?;
+        }
+        Ok(Self {
+            account: Account::new(account, limit),
+            slots,
+        })
+    }
+
+    /// The slot `key` names when it holds exactly that lease.
+    fn locate(&self, key: LeaseKey) -> Option<usize> {
+        if key.account != self.account.id() {
+            return None;
+        }
+        let index = usize::try_from(key.slot).ok()?;
+        let record = self.slots.as_slice().get(index)?.record.as_ref()?;
+        (record.key() == key).then_some(index)
+    }
+
+    /// The slot the next lease takes, or why there is none.
+    fn free_slot(&self) -> Result<usize, LeaseRefused> {
+        let slots = self.slots.as_slice();
+        let free = slots
+            .iter()
+            .position(|slot| slot.record.is_none() && slot.next_generation.is_some());
+        if let Some(index) = free {
+            return Ok(index);
+        }
+        // A held slot is freed by a release unless its lease took the
+        // last generation: that slot is spent already.
+        if slots
+            .iter()
+            .any(|slot| slot.record.is_some() && slot.next_generation.is_some())
+        {
+            Err(LeaseRefused::TableFull)
+        } else {
+            Err(LeaseRefused::TableExhausted)
+        }
+    }
+
+    /// What the account lacks for `cost`, bytes before slots, comparing
+    /// against `ceiling`: the limit, or what the limit leaves free.
+    fn shortfall(cost: Credits, ceiling: Credits) -> Option<(Resource, u64)> {
+        if cost.bytes > ceiling.bytes {
+            return Some((
+                Resource::PayloadBytes,
+                cost.bytes.get() - ceiling.bytes.get(),
+            ));
+        }
+        if cost.slots > ceiling.slots {
+            return Some((
+                Resource::ExchangeSlots,
+                cost.slots.get() - ceiling.slots.get(),
+            ));
+        }
+        None
+    }
+
+    /// What the limit leaves free. A coherent account never underflows;
+    /// an incoherent one leaves nothing.
+    fn free(&self) -> Credits {
+        let (used, limit) = (self.account.used(), self.account.limit());
+        Credits::new(
+            limit.bytes.checked_sub(used.bytes).unwrap_or_default(),
+            limit.slots.checked_sub(used.slots).unwrap_or_default(),
+        )
     }
 
     /// The account the leases of this table are charged to.
@@ -110,24 +176,56 @@ impl LeaseTable {
     /// Whether `key` names a lease this table holds now.
     #[must_use]
     pub fn holds(&self, key: LeaseKey) -> bool {
-        let _ = key;
-        false
+        self.locate(key).is_some()
     }
 
     /// Whether a lease of this cost would be granted, changing nothing.
     /// A plan asks this; its application then calls [`LeaseTable::reserve`],
     /// which cannot refuse what this accepted.
     pub fn check(&self, cost: Credits) -> Result<(), LeaseRefused> {
-        let _ = cost;
-        Ok(())
+        self.admit(cost).map(|_| ())
+    }
+
+    /// The decisions of `check` and `reserve`, in the order the refusals
+    /// are reported: the definitive ones first.
+    fn admit(&self, cost: Credits) -> Result<usize, LeaseRefused> {
+        if let Some((resource, _)) = Self::shortfall(cost, self.account.limit()) {
+            return Err(LeaseRefused::LargerThanAccount(resource));
+        }
+        let slot = self.free_slot();
+        if slot == Err(LeaseRefused::TableExhausted) {
+            return slot;
+        }
+        if let Some((resource, missing)) = Self::shortfall(cost, self.free()) {
+            return Err(LeaseRefused::Limit { resource, missing });
+        }
+        slot
     }
 
     /// Charges `cost` to the account and holds the lease in a free slot,
     /// under a generation that slot never used. Nothing changes on a
     /// refusal.
     pub fn reserve(&mut self, cost: Credits) -> Result<LeaseKey, LeaseRefused> {
-        let _ = cost;
-        Err(LeaseRefused::TableExhausted)
+        let index = self.admit(cost)?;
+        // `admit` found the slot free and its generation not exhausted.
+        let slot = u32::try_from(index).map_err(|_| LeaseRefused::TableExhausted)?;
+        let entry = &mut self.slots.as_mut_slice()[index];
+        let generation = entry.next_generation.ok_or(LeaseRefused::TableExhausted)?;
+        let record = match self.account.reserve(slot, generation, cost) {
+            Ok(record) => record,
+            // `admit` compared the same limits; the account is the authority.
+            Err(crate::credits::ReserveError::LimitExceeded(resource)) => {
+                return Err(LeaseRefused::Limit {
+                    resource,
+                    missing: 0,
+                });
+            }
+        };
+        let key = record.key();
+        entry.record = Some(record);
+        // The generation is used whatever follows; the last leaves `None`.
+        entry.next_generation = generation.checked_next().ok();
+        Ok(key)
     }
 
     /// Gives back the lease `key` names, through `release_if_current`.
@@ -137,15 +235,63 @@ impl LeaseTable {
     /// `Ok(Stale)`, nothing changes. On `Released` the record leaves its
     /// slot, which moves to its next generation.
     pub fn release(&mut self, key: LeaseKey) -> Result<ReleaseOutcome, ReleaseError> {
-        let _ = key;
-        Ok(ReleaseOutcome::Released)
+        let Some(index) = self.locate(key) else {
+            return Ok(ReleaseOutcome::Stale);
+        };
+        let entry = &mut self.slots.as_mut_slice()[index];
+        let Some(record) = entry.record.as_mut() else {
+            return Ok(ReleaseOutcome::Stale);
+        };
+        let outcome = release_if_current(record, &mut self.account, key)?;
+        if outcome == ReleaseOutcome::Released {
+            // The one record of the lease leaves the table with it.
+            entry.record = None;
+        }
+        Ok(outcome)
     }
 
     /// Restores a held lease read from durable data, once per durable row.
     /// This is the one place of the core that rebuilds a record from its
     /// parts; it refuses a slot that already holds one.
     pub fn restore(&mut self, key: LeaseKey, cost: Credits) -> Result<(), RestoreRefused> {
-        let _ = (key, cost);
+        if key.account != self.account.id() {
+            return Err(RestoreRefused::ForeignAccount);
+        }
+        let index = usize::try_from(key.slot).map_err(|_| RestoreRefused::UnknownSlot)?;
+        let Some(entry) = self.slots.as_slice().get(index) else {
+            return Err(RestoreRefused::UnknownSlot);
+        };
+        if entry.record.is_some() {
+            return Err(RestoreRefused::SlotHeld);
+        }
+        // A spent slot used every generation.
+        if entry
+            .next_generation
+            .is_none_or(|next| key.generation < next)
+        {
+            return Err(RestoreRefused::GenerationReused);
+        }
+        if let Some((resource, _)) = Self::shortfall(cost, self.free()) {
+            return Err(RestoreRefused::LimitExceeded(resource));
+        }
+        // The shortfall check bounds both sums by the limit.
+        let used = self.account.used();
+        let (Some(bytes), Some(slots)) = (
+            used.bytes.checked_add(cost.bytes),
+            used.slots.checked_add(cost.slots),
+        ) else {
+            return Err(RestoreRefused::LimitExceeded(Resource::PayloadBytes));
+        };
+        // Recovery: the account counts the restored lease, and the record
+        // is rebuilt once, here, from the durable row that holds it.
+        self.account = Account::from_parts(
+            self.account.id(),
+            Credits::new(bytes, slots),
+            self.account.limit(),
+        );
+        let entry = &mut self.slots.as_mut_slice()[index];
+        entry.record = Some(LeaseRecord::from_parts(key, cost, LeaseState::Held));
+        entry.next_generation = key.generation.checked_next().ok();
         Ok(())
     }
 }
