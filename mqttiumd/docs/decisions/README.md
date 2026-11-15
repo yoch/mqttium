@@ -34,6 +34,8 @@ its source; a test fails when the register and the records drift apart.
 | [0017](0017-binary-tied-to-its-source.md) | Proposed | `artifact.built_from` in the run manifest: the binary of a run tied to the source it was rebuilt from; what a qualifying result establishes | L3, L4 |
 | [0018](0018-permanent-delay.md) | Proposed | Repeated faults, a lag on a repeated `delay_result`, a `DriveUntil` that fires deadlines: a permanent delay stated without fixing the delivery at which the core progresses; completes 0015 | L3, L4 |
 | [0019](0019-real-kill-of-the-broker.md) | Proposed | The record `BrokerKilled` of a real kill of the broker, and the member `broker` of the trace header and of the run manifest: where the broker ran | L3, L4 |
+| [0020](0020-kill-inside-a-transaction.md) | Proposed | Deterministic transaction points, acknowledged in-flight barriers and identity-based recovery evidence | L3, L4, L7 |
+| [0021](0021-typed-bounded-durable-reads.md) | Proposed | Typed bounded durable reads, lifecycle evidence and action termination through the surviving supervisor | L3, L4, L7 |
 
 What each record leaves open is tracked in
 [`../reception/open-conditions.md`](../reception/open-conditions.md).

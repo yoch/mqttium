@@ -5,9 +5,10 @@ associated with MQTTium. Its central contract: in Durable mode, a positive
 acknowledgement becomes eligible only after every responsibility it stands
 for is durably committed.
 
-**Status: lot L0 (contracts) only.** There is no broker here yet. Nothing in
-this tree is a validated prototype, a benchmark result or a conformance
-claim.
+**Status: S0, incoming core and validation lab.** The pure Rust core runs
+against a deterministic store and SQLite. The lab and independent Python
+oracle receive bounded scenarios, including real process kills. This is
+not yet a network broker or an MQTT conformance or performance claim.
 
 ## What exists
 
@@ -16,8 +17,10 @@ claim.
 | `docs/spec/fr/` | The four specification chapters, archived verbatim in French with their digests |
 | `docs/decisions/` | Decisions and proposed amendments to the specification |
 | `crates/mqttiumd-contract/` | Identities, bounded quantities, the four store outcomes, the step interface, effect ownership, frozen recipes |
-| `crates/mqttiumd-core/` | Empty skeleton that carries the purity boundary; transitions arrive with lot L1 |
-| `crates/mqttiumd-lab/` | `mqttiumd-lab validate` and `mqttiumd-lab manifest` |
+| `crates/mqttiumd-core/` | Pure prepared/applied transitions, bounded effects, recovery and incoming exchange state |
+| `crates/mqttiumd-store-api/`, `crates/mqttiumd-store-sqlite/` | Durable-store contract, typed bounded readers and SQLite implementation |
+| `crates/mqttiumd-lab/` | Deterministic store, adapters, child supervisor, campaign runner and format reader |
+| `tests/oracle/` | Independent Python semantic reader, assertions and campaign qualification |
 | `tools/build_corpus.py` | Rebuilds the derived contract files: the requirement register and the examples |
 | `tools/check_schemas.py` | A second, independent reader of the schemas, with pinned versions |
 | `tools/install-tools.sh` | Installs the proof, model and fuzzing tools at pinned versions |
@@ -47,9 +50,20 @@ python tools/check_schemas.py
 ```
 
 `validate` prints the digest that identifies the contracts by exact content,
-and exits 0 when every document is accepted and 2 otherwise. `run`,
-`replay` and `minimize` are specified by DEM-023 and not implemented; they
-are refused and report no verdict.
+and exits 0 when every document is accepted and 2 otherwise. It checks the
+document; only the oracle's `recompute` checks assertions and qualification
+conditions again. `run` produces evidence, never a verdict. `replay` keeps
+the backend, process mode and reconstruction scope of its campaign.
+
+```bash
+tools/run_read_failure_reception.sh /tmp/read-failures
+tools/run_transactional_reception.sh /tmp/transaction-points 1
+```
+
+The first command receives typed read/control failures; an interrupted
+business exchange remains INCONCLUSIVE or FAIL. The second requires fresh
+qualifying K1/K2b/K3 campaigns, recomputation and matching second builds.
+See `docs/reception/durable-read-journal.md` for the current continuation.
 
 ## Reading order
 

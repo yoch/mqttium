@@ -116,8 +116,22 @@ counts, in the order they become ready.
 SQLite store carry the command and offer only a barrier:
 `store.commit.prepared`, before the commit of the transaction, and
 `store.commit.logged`, SQLite WAL hook after commit and release of its
-write lock, before the outcome is available to the adapter. A scenario with a fault at one of them kills inside a
-transaction, which only a broker run as a child process does.
+write lock, before the outcome is available to the adapter. These in-flight
+command barriers require the broker to run as a child process. The WAL hook
+observes an already committed transaction; it does not locate a kill inside
+the SQLite COMMIT call.
+
+**Typed read and collection failures** (record 0021, proposed).
+`DurableReadFailed` preserves a stable code, read phase, process incarnation
+and optional page. `ProcessControlFailed` preserves the corresponding
+control code and phase, including a truncated frame after an observed kill.
+Both originate at the surviving bench supervisor. Optional messages are
+bounded and carry no offending durable value. Run results retain the first
+64 structured contexts and the total `failure_count`; the oracle recomputes
+them from the trace. `durable_reads_complete` is required for every run.
+Missing durable evidence makes the affected business exchange INCONCLUSIVE;
+an already established safety violation remains FAIL. A test that receives
+this refusal successfully is not a qualifying PASS of that exchange.
 
 **Where a fence waits.** A resolution enters the writer and reads what is
 established for its operation. A receipt, a fence or a retired identity
