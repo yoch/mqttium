@@ -861,7 +861,7 @@ impl<S: DurableStore> Process<S> {
                     None => None,
                 };
                 if let Some(cause) = cause {
-                    for effect in self.owner.outbox().into_iter().flat_map(Outbox::pending) {
+                    for effect in self.outbox().pending() {
                         books.published_by.entry(effect.id()).or_insert(cause);
                     }
                 }
@@ -921,10 +921,20 @@ impl<S: DurableStore> Process<S> {
         self.timer.armed.len()
     }
 
+    /// The box of the owner. Since finding R2 an owner never lives without
+    /// one (`Owner::renew_box` replaces it through the authority); the
+    /// `Option` of `Owner::outbox` is always `Some`, and the bench keeps no
+    /// branch for its absence.
+    fn outbox(&self) -> &Outbox {
+        self.owner
+            .outbox()
+            .expect("an owner always holds its box (finding R2)")
+    }
+
     /// Whether an effect still waits in the box, or an input for room.
     #[must_use]
     pub fn busy(&self) -> bool {
-        self.owner.outbox().is_some_and(|outbox| !outbox.is_empty()) || self.parked.is_some()
+        !self.outbox().is_empty() || self.parked.is_some()
     }
 
     /// After each choice: the parked input again, then the box.

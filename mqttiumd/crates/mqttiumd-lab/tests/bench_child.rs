@@ -283,6 +283,7 @@ fn the_crash_of_a_child_is_a_real_sigkill_and_the_next_child_reads_the_same_file
         "{crash}"
     );
     assert!(crash.contains("wait status signal 9"), "{crash}");
+    assert!(crash.contains("writer lock"), "{crash}");
     assert_eq!(
         campaign["failure_model"]["statement"],
         mqttiumd_lab::bench::campaign::FAILURE_MODEL
