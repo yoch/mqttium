@@ -49,6 +49,10 @@ use super::scenario::Scenario;
 /// the run.
 pub const SILENCE: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+#[path = "review_control_probe.rs"]
+mod review_control_probe;
+
 /// The origins of the child, in the order of their sockets.
 pub const CHILD_ORIGINS: [Origin; 7] = [
     Origin::BrokerCore,
