@@ -282,6 +282,8 @@ enum Txn<T, E> {
     Committed(T),
     /// A guard refused it; it was rolled back.
     Refused(E),
+    /// A metadata read failed before the transaction could be prepared.
+    ReadFailed(ReadError),
     /// It was not written: rolled back, or its commit failed.
     NotWritten,
 }
@@ -314,6 +316,10 @@ fn blob(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Vec<u8>> {
 }
 
 fn read_meta(conn: &Connection) -> Result<Meta, Fault> {
+    #[cfg(test)]
+    if let Some(error) = transaction_read_tests::take_if_transaction(conn) {
+        return Err(Fault::Read(error));
+    }
     let mut statement = conn.prepare_cached(
         "SELECT format, incarnation, last_opened, opened_by, collected_through, revision,
                 next_session, route_revision,
@@ -1496,7 +1502,7 @@ impl SqliteStore {
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|_| None)?;
-            let mut meta = read_meta(&tx).map_err(|_| None)?;
+            let mut meta = read_meta(&tx).map_err(|fault| Some(fault.read_error()))?;
             let value = match prepare(&tx, &mut meta) {
                 Ok(value) => value,
                 // Dropping the transaction rolls it back.
@@ -1518,7 +1524,8 @@ impl SqliteStore {
         match result {
             Ok(Ok(value)) => Txn::Committed(value),
             Ok(Err(refusal)) => Txn::Refused(refusal),
-            Err(None::<()>) | Err(Some(())) => Txn::NotWritten,
+            Err(Some(error)) => Txn::ReadFailed(error),
+            Err(None) => Txn::NotWritten,
         }
     }
 
@@ -1537,7 +1544,9 @@ impl SqliteStore {
         });
         match written {
             Txn::Committed(()) => (StoreOutcome::RejectedCertain(reason), true),
-            Txn::Refused(()) | Txn::NotWritten => (StoreOutcome::PendingOrUnknown, false),
+            Txn::Refused(()) | Txn::ReadFailed(_) | Txn::NotWritten => {
+                (StoreOutcome::PendingOrUnknown, false)
+            }
         }
     }
 
@@ -1987,11 +1996,13 @@ impl DurableStore for SqliteStore {
 
     fn open_epoch(&mut self, command: &OpenEpoch) -> Result<OpeningOutcome, ReadError> {
         // The decision is the contract's; only an opening writes.
-        if let LedgerOpening::Opens { ledger } = self.read_ledger()?.open(command) {
-            let _written = self.transact(|_, meta| {
+        if let LedgerOpening::Opens { ledger } = self.read_ledger()?.open(command)
+            && let Txn::ReadFailed(error) = self.transact(|_, meta| {
                 meta.ledger = ledger;
                 Ok::<(), Abort<()>>(())
-            });
+            })
+        {
+            return Err(error);
         }
         // The answer comes from what is durable now.
         Ok(OpeningOutcome::read(&self.read_ledger()?, command))
@@ -2083,7 +2094,7 @@ impl DurableStore for SqliteStore {
                 wrote: true,
             },
             Txn::Refused(reason) => rejected(self.commit_rejection(operation, &canonical, reason)),
-            Txn::NotWritten => unknown,
+            Txn::ReadFailed(_) | Txn::NotWritten => unknown,
         }
     }
 
@@ -2120,7 +2131,9 @@ impl DurableStore for SqliteStore {
                 fenced_now: true,
             },
             Txn::Refused(Some(outcome)) => settled(outcome),
-            Txn::Refused(None) | Txn::NotWritten => settled(StoreOutcome::PendingOrUnknown),
+            Txn::Refused(None) | Txn::ReadFailed(_) | Txn::NotWritten => {
+                settled(StoreOutcome::PendingOrUnknown)
+            }
         }
     }
 
@@ -2128,7 +2141,7 @@ impl DurableStore for SqliteStore {
         match self.transact(|conn, meta| stage_admin(conn, meta, command)) {
             Txn::Committed(done) => Ok(done),
             Txn::Refused(refusal) => Err(refusal),
-            Txn::NotWritten => Err(AdminRefused::WriteFailed),
+            Txn::ReadFailed(_) | Txn::NotWritten => Err(AdminRefused::WriteFailed),
         }
     }
 
@@ -2185,5 +2198,76 @@ impl DurableStore for SqliteStore {
     fn snapshot_with_budget(&self, budget: ReadBudget) -> Result<DurableState, ReadError> {
         self.read_snapshot(budget)
             .map_err(|fault| fault.read_error())
+    }
+}
+
+#[cfg(test)]
+mod transaction_read_tests {
+    use super::*;
+    use mqttiumd_contract::command::{OpeningAttempt, OpeningTicket, StartupNonce};
+    use std::cell::Cell;
+
+    std::thread_local! {
+        // One-shot fault at the first metadata read *inside* a transaction.
+        // Initial and final ledger reads are deliberately healthy.
+        static FAILURE: Cell<Option<ReadError>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn take_if_transaction(conn: &Connection) -> Option<ReadError> {
+        if conn.is_autocommit() {
+            None
+        } else {
+            FAILURE.with(|failure| failure.take())
+        }
+    }
+
+    #[test]
+    fn an_opening_keeps_the_read_cause_when_only_its_transactional_read_fails() {
+        let directory =
+            std::env::temp_dir().join(format!("mqttiumd-opening-read-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("test directory");
+        let path = directory.join("store.sqlite");
+        let mut store = SqliteStore::create(
+            &path,
+            StoreIncarnation::new(1),
+            Limits {
+                payload_bytes: PayloadBytes::new(4096),
+                references: References::new(16),
+                exchange_slots: ExchangeSlots::new(4),
+                receipt_slots: ReceiptSlots::new(8),
+                max_targets_per_admission: 4,
+                max_topic_bytes: 256,
+                max_payload_bytes: 1024,
+                max_sessions: 8,
+                max_route_targets: 4,
+            },
+        )
+        .expect("healthy store");
+        let before = store.snapshot().expect("healthy initial snapshot");
+        let command = OpenEpoch {
+            attempt: OpeningAttempt {
+                startup: StartupNonce::new([3; 16]),
+                ticket: OpeningTicket::new(1),
+            },
+            incarnation: before.ledger.incarnation(),
+            after: before.ledger.last_opened(),
+        };
+        for cause in [
+            ReadError::InvalidData,
+            ReadError::LimitExceeded,
+            ReadError::Unavailable,
+            ReadError::Io,
+            ReadError::AllocationFailed,
+        ] {
+            FAILURE.with(|failure| failure.set(Some(cause)));
+            assert_eq!(store.open_epoch(&command), Err(cause));
+            assert_eq!(store.snapshot().expect("fault is one-shot"), before);
+        }
+        assert!(matches!(
+            store.open_epoch(&command),
+            Ok(OpeningOutcome::Committed(_))
+        ));
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("cleanup");
     }
 }
