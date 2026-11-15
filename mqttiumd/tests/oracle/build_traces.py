@@ -1436,9 +1436,6 @@ case(
     "On a backend with no total order, the trace does not say whether op_A was committed before the inspection that lost its recipe.",
     {
         "same_recipe_for_op_A": "INCONCLUSIVE",
-        # Nor whether the admission falls inside its exchange: an exchange
-        # whose admission cannot be placed does not lack one.
-        "one_admission_per_observed_inbound_exchange": "INCONCLUSIVE",
         "no_pubrec_observed_before_crash": "INCONCLUSIVE",
         # Nor whether the acknowledgement precedes an inspection, so
         # whether that snapshot must hold the publication.
@@ -2786,12 +2783,22 @@ qabs(
     letter="B",
     events=reason_of("CapacityExceeded"),
 )
+
+
+def refusal_before_its_rejection(events):
+    # The refusing frame is made eligible before the rejection reaches the
+    # core: nothing it could answer happened before it.
+    frame = events.pop(at(events, "refusal"))
+    frame["parents"] = ["publish.in"]
+    events.insert(at(events, "fenced.delivered.handed"), frame)
+
+
 qabs(
     "refusal-answering-no-rejection",
-    "The PUBREC refuses, and no certain rejection is among its causes.",
+    "The PUBREC refuses before the core received any certain rejection.",
     {REASON: "FAIL"},
     letter="B",
-    events=lambda events: events[at(events, "refusal")].update(parents=["publish.in"]),
+    events=refusal_before_its_rejection,
 )
 
 

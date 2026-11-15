@@ -56,6 +56,13 @@ unreadable; so does a record stated by another origin than the one its kind
 belongs to, which is how a trace that breaks the origin rule of ADR 0003 is
 refused.
 
+The order is one relation (finding F5 of the audit): the local order of
+each origin and the explicit causes together, closed transitively. A
+trace in which the two form a cycle is incomplete, found in time linear in
+its records and causes; `before` is computed from that same relation, and
+two records it does not order stay unordered unless the run has a total
+order (the simulated store).
+
 Nothing concluded from an incomplete trace is a PASS. A FAIL stands on an
 incomplete trace only where no missing record could undo it (two admissions
 for one exchange, obligations or a recipe that changed between two
