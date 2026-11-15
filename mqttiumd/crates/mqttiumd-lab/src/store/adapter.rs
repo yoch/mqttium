@@ -277,7 +277,7 @@ pub struct AdapterLimits {
 enum Work {
     Persist(Command),
     Resolve(OperationId),
-    Open,
+    Open(OpenEpoch),
 }
 
 struct Transit {
@@ -347,7 +347,7 @@ fn describe(work: &Work) -> (WorkKind, Option<OperationId>, Source) {
             ),
         },
         Work::Resolve(operation) => (WorkKind::ResolveAndFence, Some(*operation), None),
-        Work::Open => (WorkKind::OpenEpoch, None, None),
+        Work::Open(_) => (WorkKind::OpenEpoch, None, None),
     }
 }
 
@@ -515,7 +515,7 @@ impl<S: DurableStore> SimStore<S> {
         if self.awaited.contains_key(&id) {
             return Err(SubmitBlock::Closed);
         }
-        self.accept(id, Work::Open);
+        self.accept(id, Work::Open(command));
         Ok(())
     }
 
@@ -630,8 +630,8 @@ impl<S: DurableStore> SimStore<S> {
                     false,
                 )
             }
-            Work::Open => {
-                let outcome = self.store.open_epoch();
+            Work::Open(command) => {
+                let outcome = self.store.open_epoch(command);
                 (
                     Answer::Opening(outcome),
                     matches!(outcome, OpeningOutcome::Committed(_)),

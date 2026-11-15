@@ -17,6 +17,11 @@ fn opening_opens_the_next_epoch_and_closes_the_older_ones() {
 }
 
 #[test]
+fn an_opening_that_expected_another_epoch_is_rejected() {
+    conformance::an_opening_that_expected_another_epoch_is_rejected(&memory);
+}
+
+#[test]
 fn a_command_of_an_unopened_epoch_never_executes() {
     conformance::a_command_of_an_unopened_epoch_never_executes(&memory);
 }

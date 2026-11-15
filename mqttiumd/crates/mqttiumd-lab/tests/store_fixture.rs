@@ -119,7 +119,13 @@ struct CommandsOnly {
 }
 
 impl DurableStore for CommandsOnly {
-    fn open_epoch(&mut self) -> mqttiumd_contract::outcome::OpeningOutcome {
+    fn ledger(&self) -> mqttiumd_contract::command::EpochLedger {
+        self.inner.ledger()
+    }
+    fn open_epoch(
+        &mut self,
+        _: &mqttiumd_contract::command::OpenEpoch,
+    ) -> mqttiumd_contract::outcome::OpeningOutcome {
         panic!("a fixture opens no epoch");
     }
     fn apply(&mut self, _: &mqttiumd_contract::command::Command) -> Applied {

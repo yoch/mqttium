@@ -36,6 +36,7 @@ use crate::ids::{
     DeliveryId, ExchangeGeneration, ExchangeId, Exhausted, InboundPacketId, OperationId, PayloadId,
     PublicationId, RequestId, Revision, RunEpoch, SessionId, StoreIncarnation,
 };
+use crate::outcome::OpeningRejection;
 use crate::packet::{Qos, SharedBytes};
 
 const MAGIC: &[u8; 4] = b"MQDR";
@@ -539,21 +540,37 @@ impl OpeningTicket {
 /// older epoch for execution and opens the next one, or changes nothing.
 /// There is no instant at which two epochs are open, and none at which an
 /// older epoch could be entered again.
+///
+/// The opening is conditional. Start-up reads the data set it verified
+/// and the last epoch opened in it, and the command carries both: the
+/// store opens `after + 1` only while `after` is still the last opened
+/// epoch. The ticket is volatile and guards nothing durable; the
+/// condition is what closes an older attempt. Of two commands that carry
+/// the same condition at most one commits, and a command that arrives
+/// after any later opening was committed is certainly rejected, however
+/// long it was held on its way.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OpenEpoch {
     pub ticket: OpeningTicket,
+    /// The data set start-up verified before it asked.
+    pub incarnation: StoreIncarnation,
+    /// The last opened epoch start-up read before it asked; zero when
+    /// the data set had none.
+    pub after: RunEpoch,
 }
 
 /// Durable phase of one run epoch of a data set.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EpochPhase {
-    /// No committed opening established this epoch yet.
+    /// No committed opening established this epoch. Epoch 0 is never
+    /// opened: it stays here whatever the data set went through.
     Unopened,
     /// The one epoch in which commands may execute.
     Open,
-    /// Definitively closed for execution. Closing forbids execution; it
-    /// does not turn the unknown results of the epoch into rejections
-    /// (V3-006), and its durable effects are still reconciled (DEM-012).
+    /// It was open and is definitively closed for execution. Closing
+    /// forbids execution; it does not turn the unknown results of the
+    /// epoch into rejections (V3-006), and its durable effects are still
+    /// reconciled (DEM-012).
     Closed,
 }
 
@@ -561,11 +578,11 @@ pub enum EpochPhase {
 /// the last epoch a committed opening established.
 ///
 /// Epochs open in increasing order, one at a time. The last opened epoch
-/// is the only open one and every epoch before it is closed; epoch 0 is
-/// never opened and encodes "no epoch yet". The same pure transition is
-/// used by the deterministic store and by SQLite, which reads the two
-/// values, calls `open_next` and writes the result in the transaction
-/// that applies `OpenEpoch`.
+/// is the only open one and every epoch opened before it is closed;
+/// epoch 0 is never opened and encodes "no epoch yet". The same pure
+/// transition is used by the deterministic store and by SQLite, which
+/// reads the two values, calls `open` with the command and writes the
+/// result in the transaction that applies it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EpochLedger {
     incarnation: StoreIncarnation,
@@ -613,24 +630,36 @@ impl EpochLedger {
     /// The durable phase of `epoch`.
     #[must_use]
     pub fn phase_of(&self, epoch: RunEpoch) -> EpochPhase {
-        if epoch > self.last_opened {
+        if epoch.get() == 0 || epoch > self.last_opened {
             EpochPhase::Unopened
-        } else if epoch == self.last_opened && epoch.get() != 0 {
+        } else if epoch == self.last_opened {
             EpochPhase::Open
-        } else if self.last_opened.get() == 0 {
-            EpochPhase::Unopened
         } else {
             EpochPhase::Closed
         }
     }
 
-    /// The ledger after one committed opening: the next epoch is open and
-    /// every epoch before it is closed. `Exhausted` is definitive; the
-    /// ledger it was asked of is unchanged and nothing wraps.
-    pub fn open_next(&self) -> Result<Self, Exhausted> {
+    /// The ledger after `command` commits: the epoch after the one it
+    /// expected is open and every epoch opened before is closed.
+    ///
+    /// A rejection is certain and leaves the ledger it was asked of
+    /// unchanged: the command names another data set, or the last opened
+    /// epoch is no longer the one it expected, or the counter reached
+    /// its end. Nothing wraps.
+    pub fn open(&self, command: &OpenEpoch) -> Result<Self, OpeningRejection> {
+        if command.incarnation != self.incarnation {
+            return Err(OpeningRejection::ForeignIncarnation);
+        }
+        if command.after != self.last_opened {
+            return Err(OpeningRejection::PredecessorMoved);
+        }
+        let next = self
+            .last_opened
+            .checked_next()
+            .map_err(|Exhausted| OpeningRejection::EpochsExhausted)?;
         Ok(Self {
             incarnation: self.incarnation,
-            last_opened: self.last_opened.checked_next()?,
+            last_opened: next,
         })
     }
 }
@@ -955,6 +984,19 @@ mod tests {
         assert_eq!(encode(kept.get()), encode(frozen.get()));
     }
 
+    /// The command a start-up that just read `ledger` would send.
+    fn opening(ledger: &EpochLedger, ticket: u64) -> OpenEpoch {
+        OpenEpoch {
+            ticket: OpeningTicket::new(ticket),
+            incarnation: ledger.incarnation(),
+            after: ledger.last_opened(),
+        }
+    }
+
+    fn opened(ledger: &EpochLedger) -> EpochLedger {
+        ledger.open(&opening(ledger, 1)).expect("room")
+    }
+
     #[test]
     fn a_fresh_ledger_has_no_open_epoch() {
         let ledger = EpochLedger::fresh(StoreIncarnation::new(7));
@@ -969,18 +1011,14 @@ mod tests {
     #[test]
     fn an_opening_opens_the_next_epoch_and_closes_every_older_one() {
         let fresh = EpochLedger::fresh(StoreIncarnation::new(7));
-        let first = fresh.open_next().expect("room");
+        let first = opened(&fresh);
         assert_eq!(first.open_epoch(), Some(RunEpoch::new(1)));
         assert_eq!(first.incarnation(), StoreIncarnation::new(7));
-        // Planning is pure: the ledger it was asked of did not move.
+        // The transition is pure: the ledger it was asked of did not move.
         assert_eq!(fresh.open_epoch(), None);
 
-        let third = first
-            .open_next()
-            .and_then(|second| second.open_next())
-            .expect("room");
+        let third = opened(&opened(&first));
         assert_eq!(third.open_epoch(), Some(RunEpoch::new(3)));
-        assert_eq!(third.phase_of(RunEpoch::new(0)), EpochPhase::Closed);
         assert_eq!(third.phase_of(RunEpoch::new(1)), EpochPhase::Closed);
         assert_eq!(third.phase_of(RunEpoch::new(2)), EpochPhase::Closed);
         assert_eq!(third.phase_of(RunEpoch::new(3)), EpochPhase::Open);
@@ -988,22 +1026,86 @@ mod tests {
     }
 
     #[test]
+    fn epoch_zero_is_never_open_and_never_closed() {
+        let mut ledger = EpochLedger::fresh(StoreIncarnation::new(7));
+        for _ in 0..4 {
+            assert_eq!(ledger.phase_of(RunEpoch::new(0)), EpochPhase::Unopened);
+            ledger = opened(&ledger);
+        }
+        assert_eq!(ledger.phase_of(RunEpoch::new(0)), EpochPhase::Unopened);
+        let last = EpochLedger::from_durable(StoreIncarnation::new(7), RunEpoch::new(u64::MAX));
+        assert_eq!(last.phase_of(RunEpoch::new(0)), EpochPhase::Unopened);
+    }
+
+    #[test]
     fn exactly_one_epoch_is_open_and_none_opens_twice() {
         let mut ledger = EpochLedger::fresh(StoreIncarnation::new(1));
-        let mut opened = Vec::new();
+        let mut seen = Vec::new();
         for _ in 0..6 {
-            ledger = ledger.open_next().expect("room");
+            ledger = opened(&ledger);
             let open = ledger.open_epoch().expect("an opening was committed");
-            assert!(!opened.contains(&open), "epoch {open} opened twice");
-            opened.push(open);
+            assert!(!seen.contains(&open), "epoch {open} opened twice");
+            seen.push(open);
             let open_now = (0..10)
                 .filter(|epoch| ledger.phase_of(RunEpoch::new(*epoch)) == EpochPhase::Open)
                 .count();
             assert_eq!(open_now, 1);
             // An epoch that was open before is closed and stays closed.
-            for older in &opened[..opened.len() - 1] {
+            for older in &seen[..seen.len() - 1] {
                 assert_eq!(ledger.phase_of(*older), EpochPhase::Closed);
             }
+        }
+    }
+
+    #[test]
+    fn an_opening_commits_only_after_the_epoch_it_expected() {
+        let at_three = opened(&opened(&opened(&EpochLedger::fresh(
+            StoreIncarnation::new(1),
+        ))));
+        assert_eq!(at_three.last_opened(), RunEpoch::new(3));
+        for stale in [0, 1, 2, 4, u64::MAX] {
+            let command = OpenEpoch {
+                after: RunEpoch::new(stale),
+                ..opening(&at_three, 1)
+            };
+            assert_eq!(
+                at_three.open(&command),
+                Err(OpeningRejection::PredecessorMoved),
+                "after {stale}"
+            );
+        }
+        let other_data_set = OpenEpoch {
+            incarnation: StoreIncarnation::new(2),
+            ..opening(&at_three, 1)
+        };
+        assert_eq!(
+            at_three.open(&other_data_set),
+            Err(OpeningRejection::ForeignIncarnation)
+        );
+        // The refusals changed nothing.
+        assert_eq!(at_three.last_opened(), RunEpoch::new(3));
+        assert_eq!(opened(&at_three).open_epoch(), Some(RunEpoch::new(4)));
+    }
+
+    /// Two attempts read the same ledger. Whichever the writer applies
+    /// first commits; the other one is certainly rejected, in both
+    /// orders, and so never closes the epoch the first one opened.
+    #[test]
+    fn of_two_openings_with_one_condition_at_most_one_commits() {
+        let read = opened(&EpochLedger::fresh(StoreIncarnation::new(1)));
+        let older = opening(&read, 1);
+        let newer = opening(&read, 2);
+        for (first, second) in [(older, newer), (newer, older)] {
+            let committed = read.open(&first).expect("the condition holds");
+            assert_eq!(committed.open_epoch(), Some(RunEpoch::new(2)));
+            assert_eq!(
+                committed.open(&second),
+                Err(OpeningRejection::PredecessorMoved)
+            );
+            // And it stays rejected after any number of later openings.
+            let later = opened(&opened(&committed));
+            assert_eq!(later.open(&second), Err(OpeningRejection::PredecessorMoved));
+            assert_eq!(later.open(&first), Err(OpeningRejection::PredecessorMoved));
         }
     }
 
@@ -1011,21 +1113,20 @@ mod tests {
     fn the_last_epoch_opens_and_the_next_opening_is_exhausted() {
         let before_last =
             EpochLedger::from_durable(StoreIncarnation::new(1), RunEpoch::new(u64::MAX - 1));
-        let last = before_last.open_next().expect("the last epoch is usable");
+        let last = opened(&before_last);
         assert_eq!(last.open_epoch(), Some(RunEpoch::new(u64::MAX)));
-        assert_eq!(last.open_next(), Err(Exhausted));
+        assert_eq!(
+            last.open(&opening(&last, 1)),
+            Err(OpeningRejection::EpochsExhausted)
+        );
         // The refusal changed nothing and nothing wrapped.
         assert_eq!(last.open_epoch(), Some(RunEpoch::new(u64::MAX)));
-        assert_eq!(last.phase_of(RunEpoch::new(0)), EpochPhase::Closed);
         assert_eq!(last.phase_of(RunEpoch::new(1)), EpochPhase::Closed);
     }
 
     #[test]
     fn the_ledger_round_trips_through_its_durable_values() {
-        let ledger = EpochLedger::fresh(StoreIncarnation::new(9))
-            .open_next()
-            .and_then(|first| first.open_next())
-            .expect("room");
+        let ledger = opened(&opened(&EpochLedger::fresh(StoreIncarnation::new(9))));
         let restored = EpochLedger::from_durable(ledger.incarnation(), ledger.last_opened());
         assert_eq!(restored, ledger);
         let empty = EpochLedger::fresh(StoreIncarnation::new(9));

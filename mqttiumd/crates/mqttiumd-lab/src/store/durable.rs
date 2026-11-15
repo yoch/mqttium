@@ -16,7 +16,8 @@ use mqttiumd_contract::capacity::{
     BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References, Resource,
 };
 use mqttiumd_contract::command::{
-    AdmitPublication, Command, DeliveryCause, EpochLedger, EpochPhase, Recipe, ReleaseInbound,
+    AdmitPublication, Command, DeliveryCause, EpochLedger, EpochPhase, OpenEpoch, Recipe,
+    ReleaseInbound,
 };
 use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
 use mqttiumd_contract::ids::{
@@ -24,8 +25,8 @@ use mqttiumd_contract::ids::{
     RunEpoch, SessionId, StoreIncarnation,
 };
 use mqttiumd_contract::outcome::{
-    CommitFacts, EpochOpened, Knowledge, OpeningOutcome, OpeningRejection, RejectReason,
-    StoreOutcome, StoreReply, StoreViolation,
+    CommitFacts, EpochOpened, Knowledge, OpeningOutcome, RejectReason, StoreOutcome, StoreReply,
+    StoreViolation,
 };
 use mqttiumd_contract::packet::{Qos, SharedBytes};
 
@@ -254,8 +255,14 @@ pub enum RecoveryRefused {
 /// The writer of a store. Each method is one step in the single order
 /// of authority; a method either commits entirely or changes nothing.
 pub trait DurableStore {
-    /// Opens the next epoch and closes every older one, atomically.
-    fn open_epoch(&mut self) -> OpeningOutcome;
+    /// The incarnation of the data set and the last epoch opened in it:
+    /// what start-up reads before it opens anything.
+    fn ledger(&self) -> EpochLedger;
+
+    /// Opens the epoch after the one the command expects and closes
+    /// every older one, atomically, or rejects the command for certain
+    /// when the last opened epoch is no longer the one it expects.
+    fn open_epoch(&mut self, command: &OpenEpoch) -> OpeningOutcome;
 
     /// Applies a frozen command.
     fn apply(&mut self, command: &Command) -> Applied;
@@ -840,22 +847,31 @@ impl DurableState {
 }
 
 impl DurableStore for MemoryStore {
-    fn open_epoch(&mut self) -> OpeningOutcome {
-        let Ok(ledger) = self.committed.ledger.open_next() else {
-            return OpeningOutcome::RejectedCertain(OpeningRejection::EpochsExhausted);
+    fn ledger(&self) -> EpochLedger {
+        self.committed.ledger
+    }
+
+    /// Skeleton: the command is applied whatever it expected.
+    fn open_epoch(&mut self, command: &OpenEpoch) -> OpeningOutcome {
+        let read = self.committed.ledger;
+        let unconditional = OpenEpoch {
+            incarnation: read.incarnation(),
+            after: read.last_opened(),
+            ..*command
+        };
+        let ledger = match read.open(&unconditional) {
+            Ok(ledger) => ledger,
+            Err(reason) => return OpeningOutcome::RejectedCertain(reason),
         };
         let mut staged = self.committed.clone();
         staged.ledger = ledger;
         if !self.commit(staged) {
             return OpeningOutcome::Unknown;
         }
-        match ledger.open_epoch() {
-            Some(epoch) => OpeningOutcome::Committed(EpochOpened {
-                incarnation: ledger.incarnation(),
-                epoch,
-            }),
-            None => OpeningOutcome::Unknown,
-        }
+        OpeningOutcome::Committed(EpochOpened {
+            incarnation: ledger.incarnation(),
+            epoch: ledger.last_opened(),
+        })
     }
 
     fn apply(&mut self, command: &Command) -> Applied {

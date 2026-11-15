@@ -13,7 +13,7 @@ use mqttiumd_lab::store::adapter::{
     AdapterLimits, Delivery, FaultAction, FaultPoint, FaultSpec, Performed, SimStore, StoreAction,
     StoreEvent, WorkId, WorkKind,
 };
-use mqttiumd_lab::store::conformance::{World, operation_id};
+use mqttiumd_lab::store::conformance::{World, opening_command, operation_id};
 use mqttiumd_lab::store::durable::{AdminCommand, Durability, DurableStore, Limits, MemoryStore};
 
 type Bench = World<SimStore<MemoryStore>>;
@@ -360,7 +360,8 @@ fn the_store_never_contradicts_a_terminal_result() {
                 Step::Fail => world.store.set_durability(Durability::Failing),
                 Step::Restore => world.store.set_durability(Durability::Available),
                 Step::OpenEpoch => {
-                    world.store.open_epoch();
+                    let command = opening_command(&world.store);
+                    world.store.open_epoch(&command);
                 }
                 Step::Collect => {
                     let _ = world.store.admin(AdminCommand::CollectClosedEpochs {

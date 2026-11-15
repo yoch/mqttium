@@ -13,8 +13,8 @@ use mqttiumd_contract::capacity::{
     BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References, Resource,
 };
 use mqttiumd_contract::command::{
-    AdmitPublication, Command, Costs, DeliveryCause, EpochPhase, FrozenRecipe, PayloadRef, Recipe,
-    ReleaseInbound, Source, Target,
+    AdmitPublication, Command, Costs, DeliveryCause, EpochPhase, FrozenRecipe, OpenEpoch,
+    OpeningTicket, PayloadRef, Recipe, ReleaseInbound, Source, Target,
 };
 use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
 use mqttiumd_contract::ids::{
@@ -23,8 +23,8 @@ use mqttiumd_contract::ids::{
     Revision, RunEpoch, SessionId, StoreIncarnation,
 };
 use mqttiumd_contract::outcome::{
-    CommitFacts, EpochOpened, Knowledge, OpeningOutcome, RejectReason, StoreOutcome, StoreReply,
-    StoreViolation,
+    CommitFacts, EpochOpened, Knowledge, OpeningOutcome, OpeningRejection, RejectReason,
+    StoreOutcome, StoreReply, StoreViolation,
 };
 use mqttiumd_contract::packet::{Qos, SharedBytes};
 
@@ -79,9 +79,20 @@ fn create_session<S: DurableStore>(store: &mut S, client_id: &[u8]) -> SessionId
     }
 }
 
-/// Opens the next epoch and returns it.
+/// The command of a start-up that just read the ledger of `store`.
+pub fn opening_command<S: DurableStore>(store: &S) -> OpenEpoch {
+    let ledger = store.ledger();
+    OpenEpoch {
+        ticket: OpeningTicket::new(1),
+        incarnation: ledger.incarnation(),
+        after: ledger.last_opened(),
+    }
+}
+
+/// Opens the next epoch, on the value just read, and returns it.
 pub fn open<S: DurableStore>(store: &mut S) -> RunEpoch {
-    match store.open_epoch() {
+    let command = opening_command(store);
+    match store.open_epoch(&command) {
         OpeningOutcome::Committed(EpochOpened { incarnation, epoch }) => {
             assert_eq!(incarnation, INCARNATION);
             epoch
@@ -318,14 +329,67 @@ pub fn opening_opens_the_next_epoch_and_closes_the_older_ones<S: DurableStore>(
     make: &dyn Fn(StoreIncarnation, Limits) -> S,
 ) {
     let mut store = make(INCARNATION, fixture_limits());
-    assert_eq!(store.snapshot().ledger.open_epoch(), None);
+    assert_eq!(store.ledger().incarnation(), INCARNATION);
+    assert_eq!(store.ledger().open_epoch(), None);
+    assert_eq!(store.snapshot().ledger, store.ledger());
     assert_eq!(open(&mut store), RunEpoch::new(1));
     assert_eq!(open(&mut store), RunEpoch::new(2));
-    let ledger = store.snapshot().ledger;
+    let ledger = store.ledger();
+    assert_eq!(ledger, store.snapshot().ledger);
     assert_eq!(ledger.incarnation(), INCARNATION);
     assert_eq!(ledger.open_epoch(), Some(RunEpoch::new(2)));
     assert_eq!(ledger.phase_of(RunEpoch::new(1)), EpochPhase::Closed);
     assert_eq!(ledger.phase_of(RunEpoch::new(3)), EpochPhase::Unopened);
+}
+
+/// An opening commits only while the last opened epoch is the one its
+/// command expects. An attempt that arrives after another opening was
+/// committed is certainly rejected and changes nothing: it cannot close
+/// the epoch that is open (ADR 0009).
+pub fn an_opening_that_expected_another_epoch_is_rejected<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut store = make(INCARNATION, fixture_limits());
+    // Two attempts read the same value; one was held on its way.
+    let held = opening_command(&store);
+    let passing = OpenEpoch {
+        ticket: OpeningTicket::new(2),
+        ..held
+    };
+    assert_eq!(
+        store.open_epoch(&passing),
+        OpeningOutcome::Committed(EpochOpened {
+            incarnation: INCARNATION,
+            epoch: RunEpoch::new(1)
+        })
+    );
+    let before = store.snapshot();
+    let moved = OpeningOutcome::RejectedCertain(OpeningRejection::PredecessorMoved);
+    assert_eq!(store.open_epoch(&held), moved);
+    assert_eq!(store.snapshot(), before);
+    // The same command again, and after later openings: still rejected.
+    assert_eq!(store.open_epoch(&passing), moved);
+    open(&mut store);
+    assert_eq!(store.open_epoch(&held), moved);
+    assert_eq!(store.ledger().open_epoch(), Some(RunEpoch::new(2)));
+
+    // A condition ahead of the store is no better than one behind.
+    let before = store.snapshot();
+    let ahead = OpenEpoch {
+        after: RunEpoch::new(7),
+        ..opening_command(&store)
+    };
+    assert_eq!(store.open_epoch(&ahead), moved);
+    // A command for another data set opens nothing here.
+    let elsewhere = OpenEpoch {
+        incarnation: StoreIncarnation::new(2),
+        ..opening_command(&store)
+    };
+    assert_eq!(
+        store.open_epoch(&elsewhere),
+        OpeningOutcome::RejectedCertain(OpeningRejection::ForeignIncarnation)
+    );
+    assert_eq!(store.snapshot(), before);
 }
 
 /// Nothing executes without an open epoch, and a command prepared for
@@ -1067,6 +1131,7 @@ pub fn administration_refusals_change_nothing<S: DurableStore>(
 /// Every check of this module, in order.
 pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     opening_opens_the_next_epoch_and_closes_the_older_ones(make);
+    an_opening_that_expected_another_epoch_is_rejected(make);
     a_command_of_an_unopened_epoch_never_executes(make);
     an_admission_commits_everything_together(make);
     a_repeated_command_returns_its_result_without_a_second_effect(make);
