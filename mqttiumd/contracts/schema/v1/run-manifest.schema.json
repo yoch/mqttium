@@ -68,9 +68,26 @@
               "maxLength": 4096
             }
           }
+        },
+        "built_from": {
+          "description": "Present only when the binary was rebuilt by the bench from a source the campaign keeps (run --rebuild): `source`, the archive of that source as a file of the campaign, and `build`, the command that built it. The bench declares the link; tools/check_campaign_binary.sh rebuilds the source and compares digests. That a build elsewhere gives the same binary is not established.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "build"
+          ],
+          "properties": {
+            "source": {
+              "$ref": "primitives.schema.json#/$defs/artifact"
+            },
+            "build": {
+              "$ref": "primitives.schema.json#/$defs/text"
+            }
+          }
         }
       },
-      "description": "The binary that produced this manifest: its digest, and the build parameters captured when it was compiled."
+      "description": "The binary that produced this manifest: its digest, the build parameters captured when it was compiled, and, when the bench rebuilt it, the source it was built from."
     },
     "checkout": {
       "type": "object",

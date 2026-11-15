@@ -1297,6 +1297,12 @@
       "why": "A binary built from a source says how it was built."
     },
     {
+      "file": "contracts/examples/v1/invalid/run-manifest-built-from-a-source-too-large.json",
+      "code": "u64-out-of-range",
+      "pointer": "/artifact/built_from/source/bytes",
+      "why": "The size of the source is 64-bit."
+    },
+    {
       "file": "contracts/examples/v1/invalid/run-manifest-built-from-a-source-outside.json",
       "code": "schema-violation",
       "pointer": "/artifact/built_from/source/path",

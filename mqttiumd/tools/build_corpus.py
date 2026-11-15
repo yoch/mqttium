@@ -2556,6 +2556,20 @@ bad(
     man(lambda v: v["artifact"].update(built_from={"source": BUILT_FROM["source"]})),
 )
 bad(
+    "run-manifest-built-from-a-source-too-large.json",
+    "u64-out-of-range",
+    "/artifact/built_from/source/bytes",
+    "The size of the source is 64-bit.",
+    man(
+        lambda v: v["artifact"].update(
+            built_from={
+                **BUILT_FROM,
+                "source": {**BUILT_FROM["source"], "bytes": "18446744073709551616"},
+            }
+        )
+    ),
+)
+bad(
     "run-manifest-built-from-a-source-outside.json",
     "schema-violation",
     "/artifact/built_from/source/path",
