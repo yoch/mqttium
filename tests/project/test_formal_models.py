@@ -246,11 +246,13 @@ def test_model_without_configuration_is_refused(
     _write_model(tmp_path, "Full", [{"config": "Full.cfg", "expect": "pass"}])
     _write_model(tmp_path, "Hollow", [])
     # One model that would run does not excuse one that runs nothing.
-    for selection in ([], ["Hollow"], ["Full", "Hollow"]):
+    for selection in ([], ["Hollow"], ["Full", "Hollow"], ["--list"], ["Hollow", "--list"]):
         with pytest.raises(SystemExit) as refused:
             run_tlc.main(["--models-dir", str(tmp_path), *selection])
         assert refused.value.code == 2, selection
-        assert "Hollow: no configuration" in capsys.readouterr().err, selection
+        captured = capsys.readouterr()
+        assert "Hollow: no configuration" in captured.err, selection
+        assert captured.out == "", selection
     # The model that holds one is still selectable on its own.
     assert run_tlc.main(["--models-dir", str(tmp_path), "Full", "--list"]) == 0
 
@@ -263,8 +265,18 @@ def test_model_without_configuration_is_refused(
         ({"config": "Bad.cfg", "expect": "maybe"}, None, "unknown expectation 'maybe'"),
         ({"config": "Bad.cfg", "expect": "pass"}, "Bad.cfg", "Bad.cfg does not exist"),
         ({"config": "Bad.cfg", "expect": "pass"}, "Bad.tla", "Bad.tla does not exist"),
+        ({"config": "Bad.cfg"}, None, "names no 'expect'"),
+        ({"expect": "pass"}, None, "names no 'config'"),
     ],
-    ids=["violation-unnamed", "liveness-unnamed", "unknown-expect", "no-config", "no-module"],
+    ids=[
+        "violation-unnamed",
+        "liveness-unnamed",
+        "unknown-expect",
+        "no-config",
+        "no-module",
+        "expect-missing",
+        "config-missing",
+    ],
 )
 def test_unusable_sidecar_is_refused(
     tmp_path: Path,
@@ -275,13 +287,43 @@ def test_unusable_sidecar_is_refused(
     reason: str,
 ) -> None:
     _no_tlc(monkeypatch)
-    _write_model(tmp_path, "Bad", [entry])
+    _write_model(tmp_path, "Bad", [{"config": "Bad.cfg", **entry}])
+    (tmp_path / "Bad.json").write_text(
+        json.dumps({"module": "Bad.tla", "status": "refinement", "configs": [entry]}),
+        encoding="utf-8",
+    )
     if remove is not None:
         (tmp_path / remove).unlink()
-    with pytest.raises(SystemExit) as refused:
-        run_tlc.main(["--models-dir", str(tmp_path)])
-    assert refused.value.code == 2
-    assert reason in capsys.readouterr().err
+    # The index is the Java-free check of a directory: it refuses what a
+    # campaign refuses, and prints nothing as an index.
+    for mode in ([], ["--list"]):
+        with pytest.raises(SystemExit) as refused:
+            run_tlc.main(["--models-dir", str(tmp_path), *mode])
+        assert refused.value.code == 2, mode
+        captured = capsys.readouterr()
+        assert reason in captured.err, mode
+        assert captured.out == "", mode
+
+
+@pytest.mark.parametrize("missing", ["module", "configs"])
+def test_sidecar_without_a_required_key_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    missing: str,
+) -> None:
+    _no_tlc(monkeypatch)
+    _write_model(tmp_path, "Bad", [{"config": "Bad.cfg", "expect": "pass"}])
+    sidecar = json.loads((tmp_path / "Bad.json").read_text(encoding="utf-8"))
+    del sidecar[missing]
+    (tmp_path / "Bad.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    for mode in ([], ["--list"]):
+        with pytest.raises(SystemExit) as refused:
+            run_tlc.main(["--models-dir", str(tmp_path), *mode])
+        assert refused.value.code == 2, mode
+        captured = capsys.readouterr()
+        assert f"Bad: names no '{missing}'" in captured.err, mode
+        assert captured.out == "", mode
 
 
 @pytest.mark.parametrize(

@@ -126,9 +126,19 @@ def validated_checks(sidecar: dict[str, object]) -> list[Check]:
     declared, is refused here. The well-formedness of the project's own
     sidecars stays with ``tests/project/test_formal_models.py``.
     """
-    checks = checks_for(sidecar)
     path = sidecar["_path"]
     assert isinstance(path, Path)
+    for key in ("module", "configs"):
+        if key not in sidecar:
+            raise SidecarError(f"{path.stem}: names no {key!r}")
+    configs = sidecar["configs"]
+    if not isinstance(configs, list) or not all(isinstance(entry, dict) for entry in configs):
+        raise SidecarError(f"{path.stem}: 'configs' is a list of entries")
+    for entry in configs:
+        for key in ("config", "expect"):
+            if key not in entry:
+                raise SidecarError(f"{path.stem}: an entry names no {key!r}")
+    checks = checks_for(sidecar)
     if not checks:
         raise SidecarError(f"{path.stem}: no configuration")
     for check in checks:
