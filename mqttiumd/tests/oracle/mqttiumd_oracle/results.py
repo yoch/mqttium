@@ -78,11 +78,11 @@ def produce(contracts, scenario_path, trace_path, manifest_path, scope):
     }
 
 
-# The condition of a qualifying run that no file given to the command can
-# establish yet (docs/reception/open-conditions.md, lot L4).
+# Without artifact.built_from (record 0017), nothing ties the binary to
+# the recorded content.
 UNTIED_BINARY = (
     "nothing establishes that the binary was built from the recorded content "
-    "(no member of run-manifest v1 says so)"
+    "(the manifest has no artifact.built_from)"
 )
 
 
@@ -124,8 +124,31 @@ def unmet(contracts, scenario_path, manifest_path):
         out += _oracle_unmet(manifest["oracle"]["files"])
     if manifest["checkout"]["tree_state"] != "clean":
         out += _kept_unmet(contracts, manifest["checkout"]["modified_paths"])
-    out.append(UNTIED_BINARY)
+    out += _source_unmet(contracts, manifest["artifact"].get("built_from"))
     return out
+
+
+def _source_unmet(contracts, built_from):
+    """Whether the campaign holds the source its binary is declared built from.
+
+    The oracle builds nothing: it checks that the archive the bench names
+    is in the campaign, with that digest and that size. That the binary
+    is the one it builds is the bench's declaration, checked outside the
+    oracle by ``tools/check_campaign_binary.sh``.
+    """
+    if built_from is None:
+        return [UNTIED_BINARY]
+    source = built_from["source"]
+    try:
+        sha256, size = contracts.hash_evidence(source["path"])
+    except Refused:
+        return [f"the source the manifest names, {source['path']}, is not in the campaign"]
+    if sha256 != source["sha256"] or str(size) != source["bytes"]:
+        return [
+            f"{source['path']} of the campaign is not the source the manifest names: "
+            "its digest or its size differs"
+        ]
+    return []
 
 
 # The checkout directory the bench names files from (``mqttiumd``), and the
