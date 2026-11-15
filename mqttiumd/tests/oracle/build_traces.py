@@ -288,7 +288,8 @@ def snapshot(run, checkpoint, admissions, releases=(), open_exchange=True, epoch
 
 
 # ---------------------------------------------------------------------- events
-CONNECT_HEX = "101700044d5154540500000a00000a70312d70726f6475636572"
+_CONNECT_BODY = bytes.fromhex("00044d5154540500000a00") + b"\x00\x0bp1-producer"
+CONNECT_HEX = (bytes([0x10, len(_CONNECT_BODY)]) + _CONNECT_BODY).hex()
 CONNACK_HEX = "20030100" + "00"
 PUBLISH_HEX = "3416000a" + TOPIC.hex() + "000700" + PAYLOAD.hex()
 PUBLISH_DUP_HEX = "3c" + PUBLISH_HEX[2:]
@@ -1605,8 +1606,9 @@ case(
 
 
 def other_bytes(events):
+    # Still the PUBLISH the core consumed, without the DUP flag the peer set.
     received = events[at(events, "replay.bytes")]
-    received["payload"] = dict(received["payload"], bytes_hex=PUBREL_HEX)
+    received["payload"] = dict(received["payload"], bytes_hex=PUBLISH_HEX)
 
 
 case(
@@ -1614,6 +1616,63 @@ case(
     "The transport records other bytes than the peer sent for the packet the core consumed.",
     {"broker_inputs_have_provenance": "FAIL"},
     events=other_bytes,
+)
+
+
+def bytes_of_the_transport_itself(events):
+    # The same bytes as the peer sent, with the wrong cause: an earlier
+    # record of the transport that carries them too.
+    events[at(events, "c2.connect.bytes")]["parents"] = ["c1.connect.bytes"]
+
+
+case(
+    "provenance-bytes-caused-by-no-peer",
+    "The bytes the transport received name as their cause a record that is not a packet a peer sent.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=bytes_of_the_transport_itself,
+)
+
+
+def another_kind(events):
+    delivered = events[at(events, "replay.in")]
+    delivered["payload"] = dict(delivered["payload"], packet_kind="PUBREL")
+
+
+case(
+    "provenance-packet-of-another-kind-than-the-bytes",
+    "The peer sent a PUBLISH, the transport received it, and the core consumed a PUBREL.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=another_kind,
+)
+
+
+def another_identifier(events):
+    # Peer and transport agree on a PUBREL of Packet Identifier 8; the core
+    # consumed one of Packet Identifier 7.
+    for label in ("pubrel", "pubrel.bytes"):
+        event = events[at(events, label)]
+        event["payload"] = dict(event["payload"], bytes_hex="62020008")
+
+
+case(
+    "provenance-packet-of-another-identifier-than-the-bytes",
+    "The bytes received carry another Packet Identifier than the packet the core consumed.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=another_identifier,
+)
+
+
+def two_packets(events):
+    for label in ("pubrel", "pubrel.bytes"):
+        event = events[at(events, label)]
+        event["payload"] = dict(event["payload"], bytes_hex=PUBREL_HEX + PUBREL_HEX)
+
+
+case(
+    "provenance-bytes-are-more-than-the-packet",
+    "The bytes received are more than the one packet the core consumed.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=two_packets,
 )
 
 UNUSABLE_FINAL = {

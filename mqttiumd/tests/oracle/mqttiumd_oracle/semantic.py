@@ -107,7 +107,8 @@ def _overlap(fault, earlier):
 
     Selections of one point, one command kind and compatible bindings
     overlap when they name the same occurrence, or when only one of them
-    names the effect: the two then count occurrences over different sets.
+    names the effect or the publication: the two then count occurrences
+    over different sets.
     """
     mine, theirs = fault["match"], earlier["match"]
 
@@ -122,6 +123,7 @@ def _overlap(fault, earlier):
         and (
             fault["occurrence"] == earlier["occurrence"]
             or ("result_of" in mine) != ("result_of" in theirs)
+            or ("publication_binding" in mine) != ("publication_binding" in theirs)
         )
     )
 
@@ -807,37 +809,39 @@ def _key(value):
 
 # Table, the members that form the key of a row, and where a diagnostic
 # points inside the row.
+# A table, the members of its row key with how each is read, and where a
+# diagnostic points. The schema says what a member is; its value never
+# does: topic bytes made of decimal digits are bytes.
 _SNAPSHOT_KEYS = [
-    ("/sessions", ["/session"], "/session"),
-    ("/route_table/routes", ["/topic_hex"], "/topic_hex"),
-    ("/operations", ["/operation_id"], "/operation_id"),
-    ("/fences", ["/operation_id"], "/operation_id"),
-    ("/payloads", ["/payload_id"], "/payload_id"),
-    ("/publications", ["/publication_id"], "/publication_id"),
-    ("/obligations", ["/publication_id", "/index"], ""),
-    ("/inbound_exchanges", ["/exchange/session", "/packet_id"], ""),
+    ("/sessions", [("/session", "decimal")], "/session"),
+    ("/route_table/routes", [("/topic_hex", "bytes")], "/topic_hex"),
+    ("/operations", [("/operation_id", "scoped")], "/operation_id"),
+    ("/fences", [("/operation_id", "scoped")], "/operation_id"),
+    ("/payloads", [("/payload_id", "scoped")], "/payload_id"),
+    ("/publications", [("/publication_id", "scoped")], "/publication_id"),
+    ("/obligations", [("/publication_id", "scoped"), ("/index", "integer")], ""),
+    (
+        "/inbound_exchanges",
+        [("/exchange/session", "decimal"), ("/packet_id", "integer")],
+        "",
+    ),
 ]
-_IDENTITY = ("incarnation", "epoch", "owner", "sequence", "session", "generation")
+_SCOPED = ("incarnation", "epoch", "owner", "sequence")
 
 
-def _sort_key(value):
-    """The key of a row as a tuple that sorts as the store sorts.
+def _sort_key(value, kind):
+    """The components of one key member, read as ``kind``.
 
-    Numbers sort numerically and before bytes; an identity object is its
-    components in their declared order; bytes in hexadecimal sort like the
-    bytes they spell. ``ValueError`` when a number is not one.
+    A 64-bit quantity and a small integer sort numerically; bytes in
+    lower-case hexadecimal sort like the bytes they spell; a scoped identity
+    is its four components in their declared order. ``ValueError`` when a
+    number is not one.
     """
-    if isinstance(value, int):
-        return ((0, value),)
-    if isinstance(value, str):
-        if value.isascii() and value.isdigit():
-            return ((0, u64(value)),)
-        return ((1, value),)
-    parts = ()
-    for name in _IDENTITY:
-        if name in value:
-            parts += _sort_key(value[name])
-    return parts
+    if kind == "decimal":
+        return (u64(value),)
+    if kind == "scoped":
+        return tuple(u64(value[name]) for name in _SCOPED)
+    return (value,)
 
 
 def _store_snapshot(contracts, document, out):
@@ -846,7 +850,7 @@ def _store_snapshot(contracts, document, out):
         previous = None
         for index, row in enumerate(_get(document, table)):
             try:
-                key = sum((_sort_key(_get(row, member)) for member in members), ())
+                key = sum((_sort_key(_get(row, member), kind) for member, kind in members), ())
             except ValueError:
                 # The range check already reported it.
                 continue

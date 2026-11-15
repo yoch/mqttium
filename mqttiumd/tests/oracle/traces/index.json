@@ -785,6 +785,70 @@
       "why": "The transport records other bytes than the peer sent for the packet the core consumed."
     },
     {
+      "name": "provenance-bytes-caused-by-no-peer",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/provenance-bytes-caused-by-no-peer/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "The bytes the transport received name as their cause a record that is not a packet a peer sent."
+    },
+    {
+      "name": "provenance-packet-of-another-kind-than-the-bytes",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/provenance-packet-of-another-kind-than-the-bytes/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "The peer sent a PUBLISH, the transport received it, and the core consumed a PUBREL."
+    },
+    {
+      "name": "provenance-packet-of-another-identifier-than-the-bytes",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/provenance-packet-of-another-identifier-than-the-bytes/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "The bytes received carry another Packet Identifier than the packet the core consumed."
+    },
+    {
+      "name": "provenance-bytes-are-more-than-the-packet",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/provenance-bytes-are-more-than-the-packet/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "The bytes received are more than the one packet the core consumed."
+    },
+    {
       "name": "snapshot-of-another-checkpoint",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/snapshot-of-another-checkpoint/trace.jsonl",

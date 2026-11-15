@@ -28,9 +28,11 @@ from .trace import read as read_trace
 
 PASS, FAIL, INCONCLUSIVE, OUT_OF_SCOPE = "PASS", "FAIL", "INCONCLUSIVE", "OUT_OF_SCOPE"
 
-# A violation of these stays a violation whatever records are added to the
-# trace, so it stands even when the trace is incomplete. For the others a
-# missing record could be the very one that justifies what was observed.
+# A violation of these can stay a violation whatever records are added to
+# the trace, so it can stand even when the trace is incomplete. For the
+# others a missing record could be the very one that justifies what was
+# observed. Within these, a status says itself whether its reason is of
+# that kind (``Status.stands``).
 MONOTONE = {
     "fenced_operation_never_executed",
     "one_admission_per_observed_inbound_exchange",
@@ -51,11 +53,60 @@ NEEDS_PEERS = {
 class Status:
     status: str
     reasons: list = field(default_factory=list)
+    # Whether a FAIL rests only on what no record added to the trace could
+    # undo. Read for the assertions of ``MONOTONE`` on an incomplete trace.
+    stands: bool = True
+
+
+# The components an identity can have, in the order they are compared. An
+# identity is these named members, in whatever order a writer puts them.
+_COMPONENTS = ("incarnation", "epoch", "owner", "sequence", "session", "generation")
 
 
 def _key(identity: dict) -> tuple:
     """An identity object of decimal strings, as a tuple of integers."""
-    return tuple(int(value) for value in identity.values())
+    unknown = identity.keys() - set(_COMPONENTS)
+    if unknown:
+        raise ValueError(f"an identity has the unknown components {sorted(unknown)}")
+    return tuple(int(identity[name]) for name in _COMPONENTS if name in identity)
+
+
+_PACKET_KINDS = {1: "CONNECT", 3: "PUBLISH", 6: "PUBREL"}
+
+
+def _packet(data: bytes):
+    """``(kind, Packet Identifier)`` of bytes that are exactly one packet.
+
+    Read from the MQTT fixed header and, for the identifier, the variable
+    header. ``None`` when the bytes are not one whole packet of a kind the
+    core is delivered.
+    """
+    if len(data) < 2:
+        return None
+    kind = _PACKET_KINDS.get(data[0] >> 4)
+    length, shift, at = 0, 0, 1
+    while True:
+        if at >= len(data) or shift > 21:
+            return None
+        byte = data[at]
+        length |= (byte & 0x7F) << shift
+        shift += 7
+        at += 1
+        if not byte & 0x80:
+            break
+    if kind is None or len(data) != at + length:
+        return None
+    if kind == "CONNECT":
+        return kind, None
+    if kind == "PUBLISH":
+        if (data[0] >> 1) & 3 == 0:
+            return kind, None
+        if at + 2 > len(data):
+            return None
+        at += 2 + int.from_bytes(data[at : at + 2], "big")
+    if at + 2 > len(data):
+        return None
+    return kind, int.from_bytes(data[at : at + 2], "big")
 
 
 @dataclass
@@ -124,6 +175,15 @@ class Run:
                 self.missing[checkpoint] = f"{cited['path']} is not a store snapshot"
             elif snapshot["checkpoint"] != checkpoint:
                 self.missing[checkpoint] = f"{cited['path']} is the snapshot of another checkpoint"
+            elif snapshot["run_id"] != self.trace.run_id:
+                self.missing[checkpoint] = (
+                    f"{cited['path']} is a snapshot of the run {snapshot['run_id']}"
+                )
+            elif snapshot["backend"] != self.trace.backend:
+                self.missing[checkpoint] = (
+                    f"{cited['path']} was read from {snapshot['backend']}, "
+                    f"the run declares {self.trace.backend}"
+                )
             else:
                 self.snapshots[checkpoint] = (record, snapshot)
 
@@ -273,6 +333,10 @@ def one_admission_per_observed_inbound_exchange(run):
     slots = run.slots()
     counts = {id(exchange): [] for exchange in exchanges}
     statuses, reasons = [], []
+    # Two admissions of one exchange stay two whatever record is added. An
+    # admission that is missing, or an exchange that is, may be the very
+    # record an incomplete trace lacks.
+    stands = False
     for commit in run.trace.of_kind("StoreCommitStable"):
         if commit.payload["command_kind"] != "AdmitPublication":
             continue
@@ -305,12 +369,13 @@ def one_admission_per_observed_inbound_exchange(run):
         admissions = counts[id(exchange)]
         name = f"exchange {exchange.ordinal} of {exchange.client}, Packet Identifier {exchange.packet_id}"
         if len(admissions) > 1:
+            stands = True
             statuses.append(FAIL)
             reasons.append(f"{name} has {len(admissions)} admissions: {admissions}")
         elif not admissions and exchange.positive_pubrec is not None:
             statuses.append(FAIL)
             reasons.append(f"{name} was acknowledged and has no admission")
-    return Status(_worst(statuses), reasons)
+    return Status(_worst(statuses), reasons, stands)
 
 
 def _obligations(snapshot):
@@ -362,9 +427,18 @@ def same_required_obligations_at_both_checkpoints(run):
     routes = {route["topic"].encode().hex(): route["targets"] for route in run.fixture["routes"]}
     for row in first["publications"]:
         publication = _key(row["publication_id"])
+        targets = routes.get(row["topic_hex"], [])
+        lost = sorted(target["client"] for target in targets if target["client"] not in sessions)
+        if lost:
+            # Nothing can be owed to a session the store does not hold.
+            reasons.append(
+                f"{names[0]}: publication {publication} is routed to {lost}, "
+                "and the store holds no session for them"
+            )
+            continue
         required = sorted(
-            (sessions.get(target["client"]), "LiveExact", min(row["qos"], target["qos"]))
-            for target in routes.get(row["topic_hex"], [])
+            (sessions[target["client"]], "LiveExact", min(row["qos"], target["qos"]))
+            for target in targets
         )
         held = sorted(
             obligation[:3] for (owner, _), obligation in lot.items() if owner == publication
@@ -382,6 +456,14 @@ def same_required_obligations_at_both_checkpoints(run):
                 reasons.append(
                     f"{name}: the obligation {delivery} changed from {obligation} to {later[delivery]}"
                 )
+        # A publication of the first checkpoint owes what it owed there and
+        # nothing more. What a publication admitted since owes is the
+        # matter of its own admission, not of this comparison.
+        known = {publication for publication, _ in lot}
+        known.update(_key(row["publication_id"]) for row in first["publications"])
+        for delivery in sorted(later.keys() - lot.keys()):
+            if delivery[0] in known:
+                reasons.append(f"{name}: the obligation {delivery} appeared")
     return Status(FAIL if reasons else PASS, reasons)
 
 
@@ -537,6 +619,7 @@ def broker_inputs_have_provenance(run):
             record for record in trace.of_kind(*kinds) if record.origin == (component, incarnation)
         ]
 
+    by_key = {record.key: record for record in trace.records}
     cores = sorted(
         {record.origin[1] for record in trace.records if record.origin[0] == "broker-core"}
     )
@@ -598,13 +681,30 @@ def broker_inputs_have_provenance(run):
         received = {
             record.key: record for record in side("transport", incarnation, "ClientBytesReceived")
         }
-        for record in side("broker-core", incarnation, "PacketDelivered"):
-            sources = [received[parent] for parent in record.parents if parent in received]
+        for record in received.values():
             if not any(
-                source.payload["connection_generation"] == record.payload["connection_generation"]
+                cause.kind == "PeerPacketSent"
+                and cause.payload["bytes_hex"] == record.payload["bytes_hex"]
+                for cause in map(by_key.get, record.parents)
+                if cause is not None
+            ):
+                blame(record, "the transport received bytes that no peer it names sent")
+        for record in side("broker-core", incarnation, "PacketDelivered"):
+            sources = [
+                received[parent]
+                for parent in record.parents
+                if parent in received
+                and received[parent].payload["connection_generation"]
+                == record.payload["connection_generation"]
+            ]
+            delivered = (record.payload["packet_kind"], record.payload.get("packet_id"))
+            if not sources:
+                blame(record, "the packet comes from no bytes the transport received")
+            elif not any(
+                _packet(bytes.fromhex(source.payload["bytes_hex"])) == delivered
                 for source in sources
             ):
-                blame(record, "the packet comes from no bytes the transport received")
+                blame(record, f"the bytes received are not the packet delivered, {delivered}")
 
         eligible = {
             _key(record.payload["effect_id"]): record
@@ -620,7 +720,6 @@ def broker_inputs_have_provenance(run):
     duplicating = {
         fault["id"] for fault in run.scenario["faults"] if fault["action"] == "duplicate_result"
     }
-    by_key = {record.key: record for record in trace.records}
     for record in trace.of_kind("InputRefused"):
         causes = [by_key[key] for key in trace.ancestors(record) if key in by_key]
         if not any(
@@ -756,7 +855,7 @@ def judge(run: Run) -> dict:
         # undo it.
         for name, status in statuses.items():
             if status.status in (PASS, OUT_OF_SCOPE) or (
-                status.status == FAIL and name not in MONOTONE
+                status.status == FAIL and not (name in MONOTONE and status.stands)
             ):
                 statuses[name] = Status(INCONCLUSIVE, status.reasons + ["the trace is incomplete"])
     return statuses

@@ -37,7 +37,9 @@ The two readers reach that agreement by different means where it matters:
   names.
 - 64-bit members are found by walking the schema that applies to a
   document, not by member name: a member is range-checked when its schema
-  refers to the `u64` primitive.
+  refers to the `u64` primitive. The Rust reader finds them by name, and a
+  test of its own walks the schemas to prove that no 64-bit member is
+  missing from its list.
 
 | `mqttiumd_oracle/recipe.py` | The canonical bytes of a recipe, decoded independently |
 | `mqttiumd_oracle/trace.py` | A trace read as a whole, and the order it establishes between two records |
@@ -58,8 +60,22 @@ Nothing concluded from an incomplete trace is a PASS. A FAIL stands on an
 incomplete trace only where no missing record could undo it (two admissions
 for one exchange, obligations or a recipe that changed between two
 snapshots); elsewhere the missing record could be the very one that
-justifies what was observed, and the conclusion is inconclusive. A trace of
-another scenario concludes nothing.
+justifies what was observed, and the conclusion is inconclusive. The
+distinction is made per reason, not per assertion: an acknowledged exchange
+without admission, or an admission outside any exchange, may only lack the
+record that was lost, and is inconclusive on an incomplete trace. A trace
+of another scenario concludes nothing.
+
+A snapshot the trace cites is evidence only when it is the snapshot of the
+same run and of the backend the trace declares, for the checkpoint that
+cites it. Otherwise the checkpoint has no usable snapshot.
+
+The packets the core consumed are audited down to the bytes: the bytes the
+transport received name the packet of a peer that carries the same bytes,
+and those bytes are exactly the one packet delivered, by its type and its
+Packet Identifier. The oracle decodes them itself from the MQTT fixed and
+variable headers. One `ClientBytesReceived` therefore carries one whole
+packet in v1; a transport that records fragments is a contract change.
 
 Order is what the trace establishes: two records of one origin are ordered
 by that origin, a cause precedes its consequence, and a simulated run has a
@@ -125,7 +141,8 @@ PYTHONPATH=tests/oracle python -m mqttiumd_oracle recompute --result <file>
 
 `judge` exits with the code of the verdict (0 PASS, 1 FAIL, 2 INCONCLUSIVE,
 3 OUT_OF_SCOPE); `recompute` exits 0 when the result stands and 2 when it
-is refused.
+is refused. A defect of the oracle, or contracts it cannot read, exits 70:
+the run was not judged, and a caller must never record that as a verdict.
 
 ## What does not exist yet
 

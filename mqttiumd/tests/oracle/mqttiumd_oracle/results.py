@@ -8,7 +8,6 @@ refused. The verdict of a result is never taken from the result.
 
 from __future__ import annotations
 
-import hashlib
 
 from . import judge
 from .semantic import verdict_of
@@ -103,11 +102,12 @@ def recompute(contracts, result_path):
         run = judge.Run.load(contracts, result["scenario"]["path"], result["trace"]["path"])
     except Refused as refusal:
         return [refusal.diagnostic]
-    with (contracts.root / result["trace"]["path"]).open("rb") as stream:
-        if hashlib.sha256(stream.read()).hexdigest() != result["trace"]["sha256"]:
-            return [
-                Diagnostic("evidence-mismatch", "/trace", "the trace changed while it was read")
-            ]
+    try:
+        sha256, _ = contracts.hash_evidence(result["trace"]["path"])
+    except Refused as refusal:
+        return [refusal.diagnostic]
+    if sha256 != result["trace"]["sha256"]:
+        return [Diagnostic("evidence-mismatch", "/trace", "the trace changed while it was read")]
     out = []
     if run.trace.run_id is not None and result["run_id"] != run.trace.run_id:
         out.append(

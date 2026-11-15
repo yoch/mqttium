@@ -315,8 +315,9 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
     // Two faults must not select the same command or result: which of them
     // acts would depend on the store. Selections of one point, one command
     // kind and compatible bindings overlap when they name the same
-    // occurrence, or when only one of them names the effect, because the
-    // two then count occurrences over different sets.
+    // occurrence, or when only one of them names the effect or the
+    // publication, because the two then count occurrences over different
+    // sets.
     let member = |fault: &'_ Value, pointer: &str| -> Option<String> {
         fault
             .pointer(pointer)
@@ -333,14 +334,17 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
                 member(fault, "/match/result_of"),
                 member(earlier, "/match/result_of"),
             );
+            let bindings = (
+                member(fault, "/match/publication_binding"),
+                member(earlier, "/match/publication_binding"),
+            );
             if same("/point")
                 && same("/match/command_kind")
-                && compatible(
-                    &member(fault, "/match/publication_binding"),
-                    &member(earlier, "/match/publication_binding"),
-                )
+                && compatible(&bindings.0, &bindings.1)
                 && compatible(&effects.0, &effects.1)
-                && (same("/occurrence") || effects.0.is_some() != effects.1.is_some())
+                && (same("/occurrence")
+                    || effects.0.is_some() != effects.1.is_some()
+                    || bindings.0.is_some() != bindings.1.is_some())
             {
                 out.push(Diagnostic::new(
                     code::FAULT_MATCH_INVALID,
@@ -1310,33 +1314,33 @@ enum KeyPart {
     Bytes(String),
 }
 
-/// The key components `value` holds: a decimal string or a small integer
-/// is one number, an identity object is its components in their declared
-/// order, any other string is bytes. `None` when a number is not one: the
-/// range check reports it, and the row is left out of the order check.
-fn key_parts(value: &Value, out: &mut Vec<KeyPart>) -> Option<()> {
-    const IDENTITY: [&str; 6] = [
-        "incarnation",
-        "epoch",
-        "owner",
-        "sequence",
-        "session",
-        "generation",
-    ];
-    match value {
-        Value::Number(number) => out.push(KeyPart::Number(number.as_u64()?)),
-        Value::String(text) if text.chars().all(|digit| digit.is_ascii_digit()) => {
-            out.push(KeyPart::Number(parse_u64(text).ok()?));
-        }
-        Value::String(text) => out.push(KeyPart::Bytes(text.clone())),
-        Value::Object(members) => {
-            for name in IDENTITY {
-                if let Some(member) = members.get(name) {
-                    key_parts(member, out)?;
-                }
+/// How one member of a row key is read. The schema says what a member is;
+/// its value never does: topic bytes made of decimal digits are bytes.
+#[derive(Clone, Copy)]
+enum KeyKind {
+    /// A 64-bit quantity as a decimal string.
+    Decimal,
+    /// A small JSON integer.
+    Integer,
+    /// Bytes in lower-case hexadecimal, which sort like the bytes.
+    Bytes,
+    /// A scoped identity: incarnation, epoch, owner, sequence.
+    Scoped,
+}
+
+/// Appends the key components of `value` read as `kind`. `None` when a
+/// number is not one: the range check reports it, and the row is left out
+/// of the order check.
+fn key_parts(value: &Value, kind: KeyKind, out: &mut Vec<KeyPart>) -> Option<()> {
+    match kind {
+        KeyKind::Decimal => out.push(KeyPart::Number(parse_u64(value.as_str()?).ok()?)),
+        KeyKind::Integer => out.push(KeyPart::Number(value.as_u64()?)),
+        KeyKind::Bytes => out.push(KeyPart::Bytes(value.as_str()?.to_owned())),
+        KeyKind::Scoped => {
+            for name in ["incarnation", "epoch", "owner", "sequence"] {
+                key_parts(value.get(name)?, KeyKind::Decimal, out)?;
             }
         }
-        _ => return None,
     }
     Some(())
 }
@@ -1348,17 +1352,53 @@ fn key_parts(value: &Value, out: &mut Vec<KeyPart>) -> Option<()> {
 fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
     // Table, the members that form its key, and where a diagnostic points
     // inside a row.
-    const TABLES: [(&str, &[&str], &str); 8] = [
-        ("/sessions", &["/session"], "/session"),
-        ("/route_table/routes", &["/topic_hex"], "/topic_hex"),
-        ("/operations", &["/operation_id"], "/operation_id"),
-        ("/fences", &["/operation_id"], "/operation_id"),
-        ("/payloads", &["/payload_id"], "/payload_id"),
-        ("/publications", &["/publication_id"], "/publication_id"),
-        ("/obligations", &["/publication_id", "/index"], ""),
+    /// A table, the members of its row key, and where a diagnostic points.
+    type Table = (
+        &'static str,
+        &'static [(&'static str, KeyKind)],
+        &'static str,
+    );
+    const TABLES: [Table; 8] = [
+        ("/sessions", &[("/session", KeyKind::Decimal)], "/session"),
+        (
+            "/route_table/routes",
+            &[("/topic_hex", KeyKind::Bytes)],
+            "/topic_hex",
+        ),
+        (
+            "/operations",
+            &[("/operation_id", KeyKind::Scoped)],
+            "/operation_id",
+        ),
+        (
+            "/fences",
+            &[("/operation_id", KeyKind::Scoped)],
+            "/operation_id",
+        ),
+        (
+            "/payloads",
+            &[("/payload_id", KeyKind::Scoped)],
+            "/payload_id",
+        ),
+        (
+            "/publications",
+            &[("/publication_id", KeyKind::Scoped)],
+            "/publication_id",
+        ),
+        (
+            "/obligations",
+            &[
+                ("/publication_id", KeyKind::Scoped),
+                ("/index", KeyKind::Integer),
+            ],
+            "",
+        ),
         (
             "/inbound_exchanges",
-            &["/exchange/session", "/packet_id"],
+            &[
+                ("/exchange/session", KeyKind::Decimal),
+                ("/packet_id", KeyKind::Integer),
+            ],
             "",
         ),
     ];
@@ -1371,9 +1411,9 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
         let mut previous: Option<Vec<KeyPart>> = None;
         for (index, row) in rows.iter().enumerate() {
             let mut parts = Vec::new();
-            let readable = key.iter().all(|member| {
+            let readable = key.iter().all(|(member, kind)| {
                 row.pointer(member)
-                    .is_some_and(|value| key_parts(value, &mut parts).is_some())
+                    .is_some_and(|value| key_parts(value, *kind, &mut parts).is_some())
             });
             if !readable {
                 continue;
@@ -1402,48 +1442,52 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
     }
 }
 
+/// Names of the members that hold a 64-bit decimal string, in a trace
+/// payload or a snapshot. A test walks the schemas and fails when one of
+/// their 64-bit members is missing here.
+const COMPONENTS: [&str; 37] = [
+    "incarnation",
+    "epoch",
+    "owner",
+    "sequence",
+    "session",
+    "generation",
+    "record_count",
+    "bytes_confirmed",
+    "bytes_total",
+    "occurrence",
+    "run_epoch",
+    "time_value",
+    "connection_generation",
+    "ingress_order",
+    "token",
+    "after",
+    "now",
+    "page",
+    "revision",
+    "length",
+    "payload_bytes",
+    "references",
+    "exchange_slots",
+    "receipt_slots",
+    "bytes",
+    "last_opened_epoch",
+    "ticket",
+    "collected_through",
+    "state_revision",
+    "next_session",
+    "source_session",
+    "target_revision",
+    "max_targets_per_admission",
+    "max_topic_bytes",
+    "max_payload_bytes",
+    "max_sessions",
+    "max_route_targets",
+];
+
 /// Checks every decimal-looking identity component below `value`. Payload
 /// members that hold 64-bit components are objects of decimal strings.
 fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnostic>) {
-    const COMPONENTS: [&str; 37] = [
-        "incarnation",
-        "epoch",
-        "owner",
-        "sequence",
-        "session",
-        "generation",
-        "record_count",
-        "bytes_confirmed",
-        "bytes_total",
-        "occurrence",
-        "run_epoch",
-        "time_value",
-        "connection_generation",
-        "ingress_order",
-        "token",
-        "after",
-        "now",
-        "page",
-        "revision",
-        "length",
-        "payload_bytes",
-        "references",
-        "exchange_slots",
-        "receipt_slots",
-        "bytes",
-        "last_opened_epoch",
-        "ticket",
-        "collected_through",
-        "state_revision",
-        "next_session",
-        "source_session",
-        "target_revision",
-        "max_targets_per_admission",
-        "max_topic_bytes",
-        "max_payload_bytes",
-        "max_sessions",
-        "max_route_targets",
-    ];
     let members = match value {
         Some(Value::Object(members)) => members,
         // The facts of a recovery page are objects in a list.
@@ -1521,6 +1565,50 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains(cell))
+    }
+
+    /// The Rust reader finds 64-bit members by name. Every member that a
+    /// trace or snapshot schema declares as a `u64` must be in its list:
+    /// one added to a schema and forgotten here would go unchecked.
+    #[test]
+    fn every_64_bit_member_of_the_schemas_is_range_checked() {
+        fn walk(schema: &Value, found: &mut BTreeSet<String>) {
+            match schema {
+                Value::Object(members) => {
+                    if let Some(Value::Object(properties)) = members.get("properties") {
+                        for (name, property) in properties {
+                            let reference = property.get("$ref").and_then(Value::as_str);
+                            if reference.is_some_and(|target| target.ends_with("#/$defs/u64")) {
+                                found.insert(name.clone());
+                            }
+                        }
+                    }
+                    members.values().for_each(|value| walk(value, found));
+                }
+                Value::Array(items) => items.iter().for_each(|value| walk(value, found)),
+                _ => {}
+            }
+        }
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/schema/v1");
+        let mut found = BTreeSet::new();
+        for file in [
+            "trace-record.schema.json",
+            "store-snapshot.schema.json",
+            "primitives.schema.json",
+        ] {
+            let bytes = std::fs::read(directory.join(file)).expect("schema");
+            walk(&serde_json::from_slice(&bytes).expect("JSON"), &mut found);
+        }
+        assert!(found.len() >= 30, "{found:?}");
+        // Envelope members of a record are checked by pointer.
+        for name in ["record_sequence", "origin_incarnation", "origin_sequence"] {
+            found.remove(name);
+        }
+        let missing: Vec<&String> = found
+            .iter()
+            .filter(|name| !COMPONENTS.contains(&name.as_str()))
+            .collect();
+        assert!(missing.is_empty(), "not range-checked: {missing:?}");
     }
 
     /// The recipe of the snapshot example is what the contract crate

@@ -142,7 +142,7 @@ core consumed:
 
 | Input of the core | Record of the core | What must precede it |
 | - | - | - |
-| Packet | `PacketDelivered` | `ClientBytesReceived` of the transport, itself after `PeerPacketSent` of the peer |
+| Packet | `PacketDelivered` | `ClientBytesReceived` of the transport whose bytes are exactly that packet, itself caused by the `PeerPacketSent` of the peer with the same bytes |
 | Store result | `StoreResultDelivered` | `CommandSubmitted` or `ResolveSubmitted` of the store adapter with the same effect and operation, not answered before |
 | Deadline | `DeadlineDelivered` | `DeadlineArmed` of the timer with the same token, not delivered before |
 | Recovery page | `RecoveryPageDelivered` | `RecoveryPageRead` of the store adapter with the same content |
@@ -183,9 +183,11 @@ What is volatile (a command in transit, a transaction in preparation, a
 result not yet delivered, the control state of an opening) is not in a
 snapshot; the trace shows it.
 
-Rows are in the order of their key, numbers numerically and identities
-component by component, so that two stores in the same state write the
-same bytes. A snapshot shows what the store holds, sound or not. The
+Rows are in the order of their key, numbers numerically, identities
+component by component and bytes as bytes, so that two stores in the same
+state write the same bytes. What a key member is comes from the schema,
+never from its value: a topic whose bytes are all decimal digits is bytes,
+and an empty topic is a key like another. A snapshot shows what the store holds, sound or not. The
 reader checks its form only: 64-bit ranges, no row listed twice under its
 key (`duplicate-name`) and rows in order (`rows-out-of-order`). An
 obligation without its publication, or two admissions for one exchange, is

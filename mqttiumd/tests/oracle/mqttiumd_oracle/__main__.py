@@ -10,6 +10,9 @@ Paths are relative to ``--root``, which defaults to the current directory.
 with the code of the verdict they determine: 0 PASS, 1 FAIL, 2 INCONCLUSIVE,
 3 OUT_OF_SCOPE (DEM-023). ``recompute`` exits 0 when the result stands and 2
 when it is refused: a refused result concludes nothing.
+
+A defect of the oracle itself, or contracts it cannot read, exits 70: the
+run was not judged, and no verdict code may say otherwise.
 """
 
 from __future__ import annotations
@@ -17,9 +20,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 
 from . import judge, results
-from .documents import Contracts
+from .documents import Contracts, ContractsUnreadable
 from .semantic import verdict_of
 from .strict import Refused
 
@@ -30,6 +34,17 @@ ORACLE_DEFECT = 70
 
 
 def main(arguments=None) -> int:
+    try:
+        return _main(arguments)
+    except ContractsUnreadable as error:
+        print(f"oracle defect: the contracts cannot be read: {error}", file=sys.stderr)
+    except Exception:  # every defect, whatever raised it, has the one code
+        traceback.print_exc()
+        print("oracle defect: the run was not judged", file=sys.stderr)
+    return ORACLE_DEFECT
+
+
+def _main(arguments) -> int:
     parser = argparse.ArgumentParser(prog="mqttiumd_oracle", description=__doc__.splitlines()[0])
     parser.add_argument("--root", default=".")
     parser.add_argument("--contracts", default="contracts/v1")
