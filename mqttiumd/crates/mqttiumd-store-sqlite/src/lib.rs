@@ -1147,6 +1147,19 @@ impl SqliteStore {
         &self.settings
     }
 
+    /// For a measurement only: sets `PRAGMA wal_autocheckpoint` on the
+    /// writer's connection and reads it back into the settings. A store
+    /// keeps the engine's default otherwise; nothing in the product calls
+    /// this.
+    pub fn set_wal_autocheckpoint_for_measurement(&mut self, pages: i64) -> Result<i64, OpenError> {
+        self.conn.pragma_update(None, "wal_autocheckpoint", pages)?;
+        let read_back: i64 = self
+            .conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
+        self.settings.wal_autocheckpoint = read_back;
+        Ok(read_back)
+    }
+
     /// Sets whether the medium accepts writes. While it fails, every
     /// transaction is rolled back instead of committed.
     pub fn set_durability(&mut self, durability: Durability) {
