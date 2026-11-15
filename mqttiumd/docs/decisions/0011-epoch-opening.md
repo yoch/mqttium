@@ -1,7 +1,7 @@
 # 0011 — The opening of an epoch is one conditional, idempotent command with an identity
 
 Status: **Proposed** (15 November 2026, lot L2, first wave). Written by
-lot L2 after four reviews of its contract change, recorded by the
+lot L2 after five reviews of its contract change, recorded by the
 integration owner. It amends record 0009, section "A durable fact is not
 an authorisation to construct". It becomes a requirement only when the
 owner of the repository accepts it; until then the requirement register
@@ -116,22 +116,48 @@ epoch than the one after its condition cannot be true: with a commit
 together with a rejection, it stops start-up. The opening is then faulted
 for good.
 
-### A commit is not forgotten, and a grant for a closed epoch is never handed over
+### The opening holds facts, not a stage
+
+For the command in flight, start-up keeps what the replies it took
+establish about the ledger: that the command opened the epoch after its
+condition, that another attempt did, that this epoch is closed, that the
+epoch of the condition was opened under the same identity, that the epochs
+are exhausted, that the store holds another data set. Each is durable, so
+the set only grows and the order of the replies does not matter. The
+stage, the lowest value a later read may return and every refusal are read
+from the set; a definitive rejection is read first.
 
 `Superseded` says that the epoch an attempt asked for is closed; it does
-not say that the attempt did not commit. An opening keeps whether the
-commit of its attempt was reported, before or after `Superseded`, and a
-certain rejection of the same attempt is then a fault that stops start-up.
-A grant for an epoch known closed is never handed over, even if the commit
-of that attempt arrives later or was already held. A grant that was handed
-over cannot be taken back: the opening records that its epoch was reported
-closed and stays there, with no new attempt and no recovered fact
-confirming that grant; stopping its holder is start-up's (lot L4).
+not say that the attempt did not commit. A grant for an epoch known closed
+is never handed over, even if the commit of that attempt arrives later or
+was already held. A grant that was handed over cannot be taken back: the
+opening records that its epoch was reported closed, with no new attempt
+and no recovered fact confirming that grant; stopping its holder is
+start-up's (lot L4).
+
+### One rule for a fault
+
+A recognised reply faults the opening when it cannot be true of any ledger
+of which the replies already taken are true. A store that follows
+`EpochLedger` never produces such a reply, however late, repeated or
+reordered its replies are. What was established before a fault stays
+established: a grant whose epoch was reported closed is not confirmed
+again.
+
+### What a reused identity allows the ledger to say
+
+The ledger rejects a command under the identity of the opener only when
+the command's condition is the epoch that identity opened: that command
+opened nothing and never will. With an older condition the command may be
+the one that opened an epoch since closed, and it is `Superseded`; with a
+condition ahead of the ledger it would open an epoch once another start-up
+opened the one before, and it is undecided. Rejecting those two cases for
+certain would be false; both counterexamples are tests of the ledger.
 
 ## Consequences
 
-- `crates/mqttiumd-contract/src/command.rs` and `outcome.rs` gain the
-  opening: `OpenEpoch`, `OpeningAttempt`, `StartupNonce`, `EpochLedger`,
+- `crates/mqttiumd-contract/src/opening.rs` holds the opening, with the
+  former paths in `command.rs` and `outcome.rs` kept: `OpenEpoch`, `OpeningAttempt`, `StartupNonce`, `EpochLedger`,
   `OpeningReply`, `EpochOpening`, `EpochGrant`. The contract digest is
   unchanged: no file under `contracts/` is touched.
 - Lot L1 builds the creation authority by consuming an `EpochGrant` and in
@@ -141,9 +167,9 @@ confirming that grant; stopping its holder is start-up's (lot L4).
 - Lot L4 wires start-up through this path and stops the holder of a grant
   whose epoch was reported closed.
 
-## What the fourth review leaves open
+## What the reviews leave open
 
-Five points in the handling of replies that disagree or arrive in another
-order, found on the revision that was merged into the integration branch
-(`251026a1`). They are open conditions of the reception of lot L2; see
-`../reception/open-conditions.md`.
+Four points on the revision merged into the integration branch
+(`7941f334`), all in what a faulted opening does with later replies and in
+what `observe` reports. They are the open condition of the reception of
+lot L2; see `../reception/open-conditions.md`.
