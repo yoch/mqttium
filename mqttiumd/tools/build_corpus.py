@@ -1206,6 +1206,23 @@ REJECTED = record(
     [("store-evidence", 0)],
 )
 ok("trace-record-store-result-rejected.json", REJECTED)
+# The store refuses a recipe that differs from the one an OperationId
+# already designates: no outcome, a violation (StoreViolation).
+VIOLATION = record(
+    7,
+    "store-evidence",
+    1,
+    "StoreResultReady",
+    {
+        "effect_id": EFFECT,
+        "operation_id": OP,
+        "outcome": "Violation",
+        "violation": "RecipeMismatch",
+    },
+    [("store-evidence", 0)],
+)
+ok("trace-record-store-result-violation.json", VIOLATION)
+
 ok(
     "trace-record-store-result-delivered-rejected.json",
     record(
@@ -1515,6 +1532,20 @@ trace_case(
     "The index of a step is 64-bit.",
     setter(["payload", "step"], "18446744073709551616"),
     code="u64-out-of-range",
+)
+trace_case(
+    "violation-without-its-kind",
+    VIOLATION,
+    "/payload",
+    "A violation says which one: the store reports no outcome, a violation of the contract.",
+    dropped("payload", "violation"),
+)
+trace_case(
+    "commit-with-a-violation",
+    VIOLATION,
+    "/payload",
+    "Only a violation names a violation.",
+    setter(["payload", "outcome"], "Committed"),
 )
 trace_case(
     "rejection-without-its-reason",

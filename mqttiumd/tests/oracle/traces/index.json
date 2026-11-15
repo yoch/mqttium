@@ -1243,6 +1243,24 @@
       "why": "K1: the adapter submits a resolution caused by the bench, not by the core."
     },
     {
+      "name": "pubcomp-after-a-recipe-mismatch",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/pubcomp-after-a-recipe-mismatch/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "FAIL",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
+      },
+      "why": "The store reports a violation for the release, not a commit, and the core acknowledges it."
+    },
+    {
       "name": "run-blocked-with-nothing-eligible",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/run-blocked-with-nothing-eligible/trace.jsonl",

@@ -35,6 +35,7 @@
     "contracts/examples/v1/valid/trace-record-epoch-grant-handed-over.json",
     "contracts/examples/v1/valid/trace-record-step-blocked.json",
     "contracts/examples/v1/valid/trace-record-store-result-rejected.json",
+    "contracts/examples/v1/valid/trace-record-store-result-violation.json",
     "contracts/examples/v1/valid/trace-record-store-result-delivered-rejected.json",
     "contracts/examples/v1/valid/trace-record-store-fence-stable.json",
     "contracts/examples/v1/valid/trace-record-deadline-armed.json",
@@ -711,6 +712,18 @@
       "code": "u64-out-of-range",
       "pointer": "/payload/step",
       "why": "The index of a step is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-violation-without-its-kind.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A violation says which one: the store reports no outcome, a violation of the contract."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-commit-with-a-violation.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "Only a violation names a violation."
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-rejection-without-its-reason.json",

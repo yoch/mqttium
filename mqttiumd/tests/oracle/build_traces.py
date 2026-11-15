@@ -2101,6 +2101,29 @@ case(
     events=resolved_from_the_bench,
 )
 
+# ---------------------------------------------- a violation of the store (f)
+
+
+def release_violates(events):
+    # The store reports RecipeMismatch for the release, along the whole
+    # chain, and the core acknowledges the release all the same.
+    deepcopy_payloads(events)
+    for label in ("release.ready", "release.delivered.handed", "release.delivered"):
+        events[at(events, label)]["payload"].update(outcome="Violation", violation="RecipeMismatch")
+    del events[at(events, "release.stable")]
+    events[at(events, "release.ready")]["parents"] = ["release.submitted"]
+
+
+case(
+    "pubcomp-after-a-recipe-mismatch",
+    "The store reports a violation for the release, not a commit, and the core acknowledges it.",
+    {
+        "no_positive_ack_before_confirmed_commit": "FAIL",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+    },
+    events=release_violates,
+)
+
 # ---------------------------------------------- a run that stopped (d)
 END = "scenario_reaches_its_end"
 
