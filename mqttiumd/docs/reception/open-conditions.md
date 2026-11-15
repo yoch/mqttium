@@ -58,13 +58,15 @@ another lot's part.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| The proof that is received is on `release_if_current` as the product really executes it. Tooling may be prepared in parallel; a proof of a separate demonstration function does not receive the lot | L6, with L1 | Reception of L6 |
+| The proof that is received is on `release_if_current` as the product really executes it. Established at the final head of lot L6 (`709c887`): the proof is on the production body, without a copy; the product calls it at one site, `LeaseTable::release` in `crates/mqttiumd-core/src/leases.rs`, and a test of lot L1 counts that site; the job `pilot proof` was read green on that revision by lot L6 and on the integration branch by the integrator. Whether this receives the lot is the owner's decision | Owner of the repository | Reception of L6 |
+| The precondition of the proof, one record per held lease, is not proved and the function cannot check it: with two records of one lease the usage is under-counted (harness p12). The lease table of lot L1 carries it, backed by a test that counts no `from_parts` and one `release_if_current` in the product, not by a proof. The proof covers the function alone, neither `LeaseTable` nor recovery, and rests on Kani, CBMC and the nightly compiler Kani brings | Lot that proves the lease table, not planned in this wave | P1 proofs |
 
 ## Model M1: reception of L5, then L4
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| The sidecar of a model lists as `tests` only files that exist and replay one of its counterexamples. Until a deterministic test replays a counterexample of M1, the list stays empty and the correspondence table names, row by row, the lot that owes the replay | L5 for the table, L4 for the replays | G1 |
+| The sidecar of a model lists as `tests` only files that exist and replay one of its counterexamples. Until a deterministic test replays a counterexample of M1, the list stays empty and the correspondence table names, row by row, the lot that owes the replay | L4 for the replays; the table is written (lot L5, final head `3d6f562`) | G1 |
+| **M1, what its campaign does not establish** (closing report of lot L5). Liveness is claimed on one publication only: on two publications no run of the present module completed. M1b is checked by groups of fault kinds: the run with every kind at once was interrupted at 14.1 million distinct states. M1b has no liveness property. The atomicity of `ApplyCommit` is an assumption the SQLite tests discharge. The fence of both models follows record 0015, and their `Refuse` differs from the registry (record 0013, line 12): both records are proposed | Owner of the repository for the two records; L7 for the atomicity; the bounds stay stated limits | G1 |
 
 ## Process topology (ADR 0002)
 
