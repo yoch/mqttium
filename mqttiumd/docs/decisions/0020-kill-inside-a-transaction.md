@@ -48,6 +48,22 @@ It becomes a requirement only when the owner of the repository accepts it.
   incarnation; at K2b and K3 the effect is durable and no second admission
   is made.
 
+## Recovery lifecycle observation
+
+`BrokerRecovered.run_epoch` identifies the startup rank observed by the
+surviving supervisor. The matching child origin incarnation and the
+`RecoveryPageRead` / `RecoveryPageDelivered` `run_epoch` identify pages of
+that startup. This rank is a process lifecycle identity, not the epoch
+component of a durable operation id. For SQLite the oracle links a kill
+to the first recovery through exactly one matching `BrokerRecovered`,
+ordered after the kill, whose observed core parent belongs to that same
+child incarnation. A mismatched or reused rank, a mismatched incarnation,
+or absent startup evidence is inconclusive. Read-before-delivery and exact
+page content remain required. The oracle neither treats collector arrival
+as causality nor adds an edge from the supervisor into product startup;
+`Trace.before` is unchanged. The simulated backend retains its declared
+total observation order.
+
 ## Test instrumentation and checkpoint policy
 
 The lab's `kill-points` feature forwards to the store feature and is off

@@ -355,6 +355,39 @@ def fault_hits(run):
     return hits
 
 
+def _recovery_after_kill(run, page, kill):
+    """Whether the page belongs to a startup observed after this kill.
+
+    A survivor's BrokerRecovered identifies a process startup by run_epoch.
+    The child channels supply the matching incarnation; its page carries
+    that same startup rank. This is lifecycle evidence, not a product cause
+    or the collector's total arrival order. A simulated trace retains the
+    total order its backend contract supplies.
+    """
+    trace = run.trace
+    if trace.backend == "sim-store":
+        return trace.before(kill, page)
+    epoch = int(page.payload["run_epoch"])
+    frontier = [parent[1] for parent in kill.parents if parent[0] in CHILD]
+    if not frontier or epoch <= max(frontier):
+        return False
+    if page.origin[1] != epoch:
+        return None
+    starts = [
+        record for record in trace.of_kind("BrokerRecovered")
+        if int(record.payload["run_epoch"]) == epoch
+    ]
+    if len(starts) != 1:
+        return None
+    startup = starts[0]
+    core = {parent[1] for parent in startup.parents if parent[0] == "broker-core"}
+    if core != {epoch} or trace.before(kill, startup) is not True:
+        return None
+    if trace.before(page, kill) is True:
+        return False
+    return True
+
+
 def one_admission_per_observed_inbound_exchange(run):
     exchanges, notes = run.exchanges()
     if notes:
@@ -427,7 +460,22 @@ def one_admission_per_observed_inbound_exchange(run):
             decisions.setdefault(_key(row["operation_id"]), set()).add(row["decision"]["kind"])
     found = set()
     for page in run.trace.of_kind("RecoveryPageDelivered"):
-        if not any(run.trace.before(kill, page) for kill in kills):
+        follows = [_recovery_after_kill(run, page, kill) for kill in kills]
+        if True not in follows:
+            if None in follows:
+                for fact in page.payload["facts"]:
+                    if fact["kind"] != "Operation" or fact["knowledge"] != "Committed":
+                        continue
+                    operation = _key(fact["operation_id"])
+                    kind, session, packet_id = slots.get(operation, (None, None, None))
+                    if kind != "AdmitPublication":
+                        continue
+                    statuses.append(INCONCLUSIVE)
+                    reasons.append(f"the recovered admission {operation} has no unambiguous startup")
+                    placeable.update(
+                        id(exchange) for exchange in exchanges
+                        if (exchange.client, exchange.packet_id) == (clients.get(session), packet_id)
+                    )
             continue
         for fact in page.payload["facts"]:
             if fact["kind"] != "Operation" or fact["knowledge"] != "Committed":
@@ -1362,7 +1410,8 @@ def transactional_kill_matches_recovery(run):
         # kill; another restart or a later retransmission cannot supply it.
         pages = [
             page for page in run.trace.of_kind("RecoveryPageDelivered")
-            if page.origin[1] > hit.origin[1] and run.trace.before(kill, page) is True
+            if page.origin[1] > hit.origin[1]
+            and _recovery_after_kill(run, page, kill) is True
         ]
         if pages:
             incarnation = min(page.origin[1] for page in pages)
