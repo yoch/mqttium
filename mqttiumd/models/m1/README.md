@@ -244,13 +244,14 @@ states and is inconclusive. `Dests = {B, C}`, `NumOps = 2` and
   in groups; no liveness property; the delivery and acknowledgement of an
   obligation are reduced to `Settle`; a reset of a session is one atomic
   durable step.
-- The fence follows the corrected reading of record 0001, confirmed
-  against DEM-018 and the store contract: a resolution applied to an
-  absent identity always fences it, and the outcome stays unknown only
-  when the write of the fence is refused, a counted fault
-  (`MaxFenceFail`). A held command plays no part. Step 3 of P1-02b in
-  record 0001 says otherwise; its correction is a proposed record that
-  has no number yet.
+- The fence follows record 0015 (proposed), which corrects step 3 of
+  P1-02b in record 0001 and agrees with DEM-018 and the store contract: a
+  resolution applied to an absent identity always fences it, and the
+  outcome stays unknown only when the write of the fence is refused, a
+  counted fault (`MaxFenceFail`), which record 0015 injects as
+  `refuse_fence` at `store.fence.transit`. A held command plays no part.
+  Record 0015 is proposed, not accepted: if its decision changes, the
+  fence of M1a and M1b changes with it.
 - In M1a `RejectCommand` stands for every refusal of the store; M1b
   details the refusals for capacity, stale source, stale target and
   closed epoch.
@@ -263,8 +264,9 @@ states and is inconclusive. `Dests = {B, C}`, `NumOps = 2` and
 
 ## Correspondence (draft, completed with L4)
 
-Model actions against the rules of `contracts/v1/p1.transitions.json` and
-the steps of the scenarios. A dash means that nothing exists yet on that
+Model actions against the rules of `contracts/v1/p1.transitions.json`
+(status `complete`, 92 rules, at the integration head `88c92a0`) and the
+steps of the scenarios. A dash means that nothing exists yet on that
 side. The last column names the deterministic test that replays the action
 on the real core, or the lot that owes it: no replay exists yet, and the
 sidecar lists no test until one does.
@@ -274,11 +276,11 @@ sidecar lists no test until one does.
 | `ClientPublish` | — | `ClientPublish` (P1-02; P1-02b step 1) | Not replayed yet; L4 |
 | `Receive`, slot `Absent` | `inbound_qos2.absent.publish.admit` (first half) | Driven by `DriveUntil` | Not replayed yet; L4 |
 | `Prepare` | `inbound_qos2.absent.publish.admit` (second half) | Driven | Not replayed yet; L4 |
-| `Prepare` disabled, no identity left | `inbound_qos2.absent.publish.defer` speaks of effect capacity; the exhaustion of identities has no rule yet | — | Not replayed yet; L4, after a rule by L3 |
+| `Prepare` disabled, no identity left | No rule: `inbound_qos2.absent.publish.defer` covers a lack of effect capacity, not an exhausted identity counter | — | Not replayed yet; L4, after a rule exists (L1 and L3) |
 | `Submit` | `command.prepared.submit`; `ArmDeadline` after `Persist` (record 0001) | Driven; P1-02b step 1 | Not replayed yet; L4 |
-| `Represent` | — (the `Replay` cells of the `command` machine are not covered) | — | Not replayed yet; L4, after a rule by L3 |
-| `HoldCommand` | — | P1-02b step 2; QABS-A, B, C (vocabulary to come, L3) | Not replayed yet; L4 |
-| `ReleaseCommand` | — | P1-02b step 4 (vocabulary to come, L3) | Not replayed yet; L4 |
+| `Represent` | `command.indeterminate.replay.same` (and `command.submitted.replay.same`); a changed recipe is `command.*.replay.mismatch`, a fault, which is what `M1a-mut-recipe-change.cfg` violates | — | Not replayed yet; L4 |
+| `HoldCommand` | — | Fault action `hold_command` at `store.command.transit` (QABS-A, B, C; P1-02b step 2, record 0015) | Not replayed yet; L4 |
+| `ReleaseCommand` | — | Step `ReleaseHeldCommand` (record 0015; P1-02b step 4) | Not replayed yet; L4 |
 | `ApplyCommand`, commit | Store side; not a registry rule | Checkpoint `after_commit_before_crash` | Not replayed yet; L4 (L7 on SQLite) |
 | `ApplyCommand` on a fenced identity; `RejectCommand` | Store side | QABS-B | Not replayed yet; L4 |
 | `LoseResult` | — | Fault `lost_admission_result`: `drop_result` at `store.result.ready` | Not replayed yet; L4 |
@@ -288,12 +290,12 @@ sidecar lists no test until one does.
 | `DeliverResult`, late unknown | `command.committed.result.unknown`, `command.rejected.result.unknown`, `inbound_qos2.await_pubrel.late_unknown.ignore` | P1-02b step 6 | Not replayed yet; L4 |
 | `DeliverResult`, repeated commit | `command.committed.result.duplicate` | — | Not replayed yet; L4 |
 | `DeliverResult`, contradiction | `command.committed.result.contradiction`, `command.rejected.result.contradiction` | — | Not replayed yet; L4 |
-| `Timeout` | `command.submitted.timeout`; a second deadline has no rule yet | P1-02b steps 3 and 5 (vocabulary to come, L3) | Not replayed yet; L4 |
-| `Resolve` | Store side: `ResolveAndFence`; its refused fence is the injection `refuse_fence` at `store.fence.transit` (to come, L3) | P1-02b steps 3 and 5; QABS-A, B, C | Not replayed yet; L4 |
+| `Timeout` | `command.submitted.timeout`; the second deadline, while the outcome is unknown, `command.indeterminate.timeout`; a deadline after a terminal result is ignored, `command.committed.timeout.stale`, `command.rejected.timeout.stale` | Step `FireDeadline` (record 0015; P1-02b steps 3 and 5) | Not replayed yet; L4 |
+| `Resolve` | Store side: `ResolveAndFence`; its refused fence is the injection `refuse_fence` at `store.fence.transit` (record 0015) | P1-02b steps 3 and 5; QABS-A, B, C | Not replayed yet; L4 |
 | `Authorize` | `inbound_qos2.admission_pending.committed.authorize` | `DriveUntil PeerPacketObserved PUBREC` | Not replayed yet; L4 |
-| `Refuse` | — (ARC-011, certain rejection; no rule yet) | — | Not replayed yet; L4, after a rule by L3 |
+| `Refuse` | `inbound_qos2.admission_pending.rejected.refuse`. **Differs**: the rule's next state is `Absent`; the model keeps a volatile `Refused` slot and answers a replay with the refusal again. See "Disagreements with the registry" below | QABS-B | Not replayed yet; L4 |
 | `Receive`, slot `AwaitPubrel` | `inbound_qos2.await_pubrel.publish.replay` | `ClientResumeExchange` (P1-02) | Not replayed yet; L4 |
-| `Receive`, slot `Received` or `AdmissionPending` | — (rows of record 0001, to be written by L3) | — | Not replayed yet; L4, after M1b reaches it |
+| `Receive`, slot `Received` or `AdmissionPending` | `inbound_qos2.admission_pending.publish.replay_after_reconnect` (M1b, after `ConnectionReset`), `inbound_qos2.admission_pending.publish.repeat_on_live_connection` (not reachable: the client never repeats on a live connection) | — | Not replayed yet; L4 |
 | `SubmitFrame` | — | `DriveUntil PeerPacketObserved` | Not replayed yet; L4 |
 | `ClientObserve` | — | `DriveUntil PeerPacketObserved` | Not replayed yet; L4 |
 | `Crash` | — | `CrashBroker` | Not replayed yet; L4 |
@@ -301,8 +303,8 @@ sidecar lists no test until one does.
 | `ClientReconnect` | — | `ClientResumeSession` | Not replayed yet; L4 |
 | `ClientResend` | — | `ClientResumeExchange` | Not replayed yet; L4 |
 | `ConnectionReset` (M1b) | — | — (no step closes a connection without a crash yet) | Not replayed yet; L4, after vocabulary by L3 |
-| `SourceSessionReset` (M1b) | — (session machines are outside the P1 registry seed) | — | Not replayed yet; L4, after a rule by L3 |
-| `DestSessionReset` (M1b) | — | — (the fixture keeps the destinations without reset) | Not replayed yet; L4, after a rule by L3 |
+| `SourceSessionReset` (M1b) | No rule: the registry has no session machine. A late result for the detached identity is `inbound_qos2.absent.admission_result.stale` | — | Not replayed yet; L4, after a rule exists |
+| `DestSessionReset` (M1b) | No rule: the registry has no session machine | — (the fixture keeps the destinations without reset) | Not replayed yet; L4, after a rule exists |
 | `Settle` (M1b) | — (outbound delivery, outside M1) | — | Not an admission step; owed by the lot of outbound delivery |
 | `ResolveRead` (M1b) | Store side: first half of `ResolveAndFence` | QABS-A, B, C: the absent read | Not replayed yet; L4 (L2 for the store alone) |
 | `FenceEstablish` (M1b) | Store side: second half of `ResolveAndFence` | QABS-A (commit returned), QABS-B (fence established) | Not replayed yet; L4 (L2 for the store alone) |
@@ -311,6 +313,20 @@ sidecar lists no test until one does.
 
 Not in the model: the `defer` rules on effect capacity, PUBREL and the
 `release` rules.
+
+## Disagreements with the registry
+
+A disagreement between a model and a registry rule is a decision to take,
+not an edit on either side (DEM-025). One is open:
+
+- After a certain rejection, `inbound_qos2.admission_pending.rejected.refuse`
+  takes the slot to `Absent`; `Refuse` of M1a and M1b takes it to a
+  volatile `Refused` slot, which answers a replayed PUBLISH of the same
+  exchange with the refusal again. The two differ only when the client
+  sends that PUBLISH again before it observed the refusal, which M1b
+  reaches after a connection reset: under the rule the replay would open
+  a new admission with a new identity. Which one is intended is not
+  decided here; the model keeps its predicate until it is.
 
 ## Witnesses and scenarios
 
@@ -325,8 +341,8 @@ The scenarios expected to replay each witness, once L4 runs them:
 | `M1a-mut-late-unknown.cfg` | P1-02b step 6, DEM-MU-05 |
 | `M1a-mut-ack-before-commit.cfg` | Assertion `no_positive_ack_before_confirmed_commit` |
 | `M1a-mut-recipe-change.cfg` | Assertion `same_recipe_for_op_A` |
-| `M1b-reach-commit-before-fence.cfg` | QABS-A |
-| `M1b-reach-fence-before-command.cfg`, `M1b-mut-fence-on-stale-read.cfg` | QABS-B |
-| `M1b-reach-replay-while-unknown.cfg`, `M1b-mut-replay-readmits.cfg` | The replay rows of record 0001, once L3 writes them |
+| `M1b-reach-commit-before-fence.cfg` | QABS-A (`tests/scenarios/qabs/QABS-A.json`) |
+| `M1b-reach-fence-before-command.cfg`, `M1b-mut-fence-on-stale-read.cfg` | QABS-B (`tests/scenarios/qabs/QABS-B.json`) |
+| `M1b-reach-replay-while-unknown.cfg`, `M1b-mut-replay-readmits.cfg` | Rule `inbound_qos2.admission_pending.publish.replay_after_reconnect`; no scenario yet |
 | `M1b-reach-epoch-closed-refusal.cfg`, `M1b-mut-old-epoch-executes.cfg` | No scenario yet; DEM-012 |
 | The other M1b configurations | No scenario yet |
