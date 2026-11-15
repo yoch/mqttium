@@ -40,6 +40,17 @@ tools/run_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02        # seed 1
 tools/run_campaign.sh tests/scenarios/qabs/QABS-B.json /tmp/qabs-b 7  # another seed
 ```
 
+The loop is shown to reject a defect by mutations kept as diffs under
+`tests/mutants/loop/` (`*.mutant`: the root `.gitignore` ignores `*.patch`
+and `*.diff`). The script applies each one in a temporary worktree, never
+in the current tree, plays the campaign with the mutated binary, has the
+oracle of the unmodified tree judge it, and compares the verdict, the
+failing assertion and its reason with `expected.json`:
+
+```bash
+tools/run_loop_mutants.sh
+```
+
 `proofs/` is a workspace of its own, so the four commands above do not see
 it. Its scripts are its only verification, and CI runs them in the job
 `pilot proof`; they need Kani (`tools/install-tools.sh kani`):
