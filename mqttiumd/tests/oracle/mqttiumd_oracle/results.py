@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import pathlib
+import tarfile
 
 
 from . import judge
@@ -124,18 +125,23 @@ def unmet(contracts, scenario_path, manifest_path):
         out += _oracle_unmet(manifest["oracle"]["files"])
     if manifest["checkout"]["tree_state"] != "clean":
         out += _kept_unmet(contracts, manifest["checkout"]["modified_paths"])
-    out += _source_unmet(contracts, manifest["artifact"].get("built_from"))
+    out += _source_unmet(contracts, manifest)
     return out
 
 
-def _source_unmet(contracts, built_from):
+def _source_unmet(contracts, manifest):
     """Whether the campaign holds the source its binary is declared built from.
 
-    The oracle builds nothing: it checks that the archive the bench names
-    is in the campaign, with that digest and that size. That the binary
-    is the one it builds is the bench's declaration, checked outside the
+    The oracle builds nothing. It checks that the archive the bench names
+    is in the campaign, with that digest and that size, that the binary
+    was built with its paths remapped as run --rebuild builds, and, reading
+    the archive member by member, that it holds the contract and oracle
+    files the manifest lists and the untracked files the campaign keeps.
+    That the binary is the one the archive builds, and that the archive is
+    the recorded revision, is the bench's declaration, checked outside the
     oracle by ``tools/check_campaign_binary.sh``.
     """
+    built_from = manifest["artifact"].get("built_from")
     if built_from is None:
         return [UNTIED_BINARY]
     source = built_from["source"]
@@ -148,7 +154,75 @@ def _source_unmet(contracts, built_from):
             f"{source['path']} of the campaign is not the source the manifest names: "
             "its digest or its size differs"
         ]
-    return []
+    out = []
+    flags = manifest["artifact"]["built_with"]["rustflags"]
+    if not (flags.startswith(REMAP_PREFIX) and flags.endswith(REMAP_TARGET)):
+        out.append(
+            "a binary rebuilt from its source is built with "
+            f"{REMAP_PREFIX}<dir>{REMAP_TARGET}, and these rustflags are not"
+        )
+    listed = {entry["path"]: entry["sha256"] for entry in manifest["contracts"]}
+    listed.update(
+        {entry["path"]: entry["sha256"] for entry in manifest.get("oracle", {}).get("files", [])}
+    )
+    kept = {}
+    for path in manifest["checkout"]["modified_paths"]:
+        try:
+            kept[path], _ = contracts.hash_evidence(f"modified/untracked/{path}")
+        except Refused:
+            continue  # a tracked file, kept as a patch: not comparable without applying it
+    try:
+        held = _archive_digests(contracts.root / source["path"], listed.keys() | kept.keys())
+    except _Unreadable as unreadable:
+        return [*out, f"{source['path']} {unreadable}"]
+    for path, digest in sorted(listed.items()):
+        if held.get(path) != digest:
+            out.append(f"{source['path']} does not hold {path} as the manifest lists it")
+    for path, digest in sorted(kept.items()):
+        if held.get(path) != digest:
+            out.append(f"{source['path']} does not hold the untracked {path} the campaign keeps")
+    return out
+
+
+# How run --rebuild builds: the directory of the extracted source is
+# remapped, so that the binary does not depend on where it was built.
+REMAP_PREFIX = "--remap-path-prefix="
+REMAP_TARGET = "=/mqttiumd-source"
+# The members an archive of the source may have; the checkout has about a
+# thousand.
+MAX_SOURCE_MEMBERS = 100_000
+CHUNK = 1 << 16
+
+
+class _Unreadable(Exception):
+    pass
+
+
+def _archive_digests(path, wanted):
+    """The SHA-256 of the regular members of the archive at ``path`` named in ``wanted``.
+
+    The archive is read as a stream, member by member, never extracted;
+    a member is hashed by chunks, and the number of members is bounded.
+    """
+    held = {}
+    count = 0
+    try:
+        with tarfile.open(path, mode="r|") as archive:
+            for member in archive:
+                count += 1
+                if count > MAX_SOURCE_MEMBERS:
+                    raise _Unreadable(f"has more than {MAX_SOURCE_MEMBERS} members")
+                name = member.name[2:] if member.name.startswith("./") else member.name
+                if not member.isreg() or name not in wanted:
+                    continue
+                digest = hashlib.sha256()
+                stream = archive.extractfile(member)
+                while chunk := stream.read(CHUNK):
+                    digest.update(chunk)
+                held[name] = digest.hexdigest()
+    except (tarfile.TarError, OSError, EOFError) as error:
+        raise _Unreadable("is not an archive the oracle can read") from error
+    return held
 
 
 # The checkout directory the bench names files from (``mqttiumd``), and the

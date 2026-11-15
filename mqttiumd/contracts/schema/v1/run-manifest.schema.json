@@ -70,7 +70,7 @@
           }
         },
         "built_from": {
-          "description": "Present only when the binary was rebuilt by the bench from a source the campaign keeps (run --rebuild): `source`, the archive of that source as a file of the campaign, and `build`, the command that built it. The bench declares the link; tools/check_campaign_binary.sh rebuilds the source and compares digests. That a build elsewhere gives the same binary is not established.",
+          "description": "Present only when the binary was rebuilt by the bench from a source the campaign keeps (run --rebuild): `source`, the archive of that source, named by a path relative to the campaign directory (`source.tar`), whose members are the files of the checkout as `./<path>`; and `build`, the text of the build command, which names placeholders (`<dir>`) and describes the build rather than being run as it stands. Such a binary is built with `--remap-path-prefix=<dir>=/mqttiumd-source` in its rustflags. The bench declares the link; tools/check_campaign_binary.sh rebuilds the source and compares digests. That a build elsewhere gives the same binary is not established.",
           "type": "object",
           "additionalProperties": false,
           "required": [

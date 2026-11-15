@@ -211,16 +211,22 @@ is listed with its digest; every modified path the manifest records is
 kept in the campaign as the bench keeps it, a tracked one by its diff in
 `modified/tracked.patch` and an untracked one as
 `modified/untracked/<path>`; and the manifest ties the binary to its
-source (`artifact.built_from`, record 0017), which the campaign holds with
-the digest and size the member names. Without that member the result is
-provisional.
+source (`artifact.built_from`, record 0017): the campaign holds it with
+the digest and size the member names, the binary was built with its
+paths remapped (`--remap-path-prefix=<dir>=/mqttiumd-source`), and the
+archive, read member by member as a stream with a bound on their number,
+holds each contract and oracle file the manifest lists with the same
+digest, and each untracked file the campaign keeps with the same
+content. Without that member the result is provisional.
 
 What a qualifying result establishes, from the campaign alone: the
 verdict is the one the observations determine, the cited files are the
 ones the run read, the oracle that judged is the one the manifest
 identifies, the modified content is kept, and the campaign holds the
-source the bench declares its binary built from. The oracle builds
-nothing: that the binary which ran is the one that source builds is the
+source the bench declares its binary built from, holding the contracts
+and the oracle of the run. It does not establish that this source is the
+recorded revision: that needs git, and a modified tracked file is kept as
+a patch the oracle does not apply. The oracle builds nothing: that the binary which ran is the one that source builds is the
 bench's declaration, which `tools/check_campaign_binary.sh` checks
 outside the oracle by building it again. That a build on another machine
 gives the same binary is not established.
