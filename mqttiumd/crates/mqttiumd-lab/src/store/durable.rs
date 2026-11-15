@@ -410,7 +410,9 @@ impl MemoryStore {
         // No slot, no receipt: the rejection could not be recorded, and
         // a later presentation could still execute, so nothing certain
         // is announced. Durable state never grows past its accounts.
-
+        if staged.charge(Accounts::receipt()).is_err() {
+            return (StoreOutcome::PendingOrUnknown, false);
+        }
         staged.operations.insert(
             operation,
             OperationRecord {
@@ -419,7 +421,7 @@ impl MemoryStore {
             },
         );
         if self.commit(staged) {
-            (StoreOutcome::RejectedCertain(reason), false)
+            (StoreOutcome::RejectedCertain(reason), true)
         } else {
             (StoreOutcome::PendingOrUnknown, false)
         }
@@ -588,7 +590,7 @@ impl DurableState {
         // then charged. Without a target nothing refers to them: they are
         // charged and released in this same transaction, so nothing is
         // left that no obligation would ever release.
-        {
+        if reference_count > 0 {
             self.payloads.insert(
                 admit.payload.id,
                 PayloadRecord {
@@ -633,7 +635,13 @@ impl DurableState {
             exchange_slots: admit.costs.exchange_slots,
             receipt_slots: admit.costs.receipt_slots,
         })?;
-
+        if reference_count == 0 {
+            self.accounts.payload_bytes = self
+                .accounts
+                .payload_bytes
+                .checked_sub(admit.costs.payload_bytes)
+                .ok_or(failed)?;
+        }
         Ok(CommitFacts::PublicationAdmitted {
             publication: admit.publication,
             exchange: admit.source.exchange,
@@ -691,6 +699,9 @@ impl DurableState {
     fn stage_admin(&mut self, command: AdminCommand) -> Result<AdminDone, AdminRefused> {
         match command {
             AdminCommand::CreateSession { client_id } => {
+                if client_id.len() > MAX_CLIENT_ID_BYTES {
+                    return Err(AdminRefused::ClientIdTooLong);
+                }
                 let active = || {
                     self.sessions
                         .values()
@@ -699,7 +710,7 @@ impl DurableState {
                 if active().any(|record| record.client_id == client_id) {
                     return Err(AdminRefused::DuplicateClientId);
                 }
-                if self.sessions.len() >= self.limits.max_sessions {
+                if active().count() >= self.limits.max_sessions {
                     return Err(AdminRefused::TableFull);
                 }
                 let session = self.next_session;
@@ -806,16 +817,13 @@ impl DurableState {
                 let collected = self.collected_through;
                 // Epoch 0 is never opened, so never closed: its receipts
                 // and fences are never retired, and they stay.
-                let retired = |operation: &OperationId| operation.epoch() <= collected;
+                let retired = |operation: &OperationId| {
+                    operation.epoch() <= collected && operation.epoch().get() != 0
+                };
                 // Every receipt and every fence holds one receipt slot.
                 let mut freed = 0u64;
-                let held = self.operations.iter().filter(|(_, record)| {
-                    matches!(
-                        record.decision,
-                        Decision::Committed(CommitFacts::PublicationAdmitted { .. })
-                    )
-                });
-                for (operation, _) in held {
+                let held = self.operations.keys().chain(self.fences.iter());
+                for operation in held {
                     if retired(operation) {
                         freed = freed.checked_add(1).ok_or(AdminRefused::Exhausted)?;
                     }
@@ -846,7 +854,7 @@ impl DurableState {
             .iter()
             .filter(|(_, record)| record.state == SessionState::Active)
             .map(|(session, record)| {
-                let client_id = SharedBytes::copy_from(&record.client_id, usize::MAX)
+                let client_id = SharedBytes::copy_from(&record.client_id, MAX_CLIENT_ID_BYTES)
                     .map_err(|_| RecoveryRefused::AllocationFailed)?;
                 Ok(RecoveredFact::Session {
                     session: *session,
@@ -1012,7 +1020,9 @@ impl DurableStore for MemoryStore {
                 let mut staged = self.committed.clone();
                 // A fence holds a receipt slot. Without one no fence is
                 // written, and absence proves nothing: unknown.
-
+                if staged.charge(Accounts::receipt()).is_err() {
+                    return settled(StoreOutcome::PendingOrUnknown);
+                }
                 staged.fences.insert(operation);
                 if self.commit(staged) {
                     Resolved {

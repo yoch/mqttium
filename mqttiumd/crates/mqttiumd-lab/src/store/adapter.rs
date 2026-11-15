@@ -451,7 +451,9 @@ impl<S: DurableStore> SimStore<S> {
                     .zip(spec.source)
                     .is_none_or(|(left, right)| left == right)
         });
-        let _ = overlap;
+        if let Some(index) = overlap {
+            return Err(FaultRefused::Overlaps(FaultId(index)));
+        }
         self.faults.push(ArmedFault {
             spec,
             seen: 0,
@@ -742,8 +744,7 @@ impl<S: DurableStore> SimStore<S> {
         if committed_now {
             self.record(StoreEvent::CommitStable { id, operation });
         }
-        if committed_now
-            && wrote
+        if wrote
             && self.pass(FaultPoint::CommitApplied, id, kind, operation, source)
                 == Some(FaultAction::Barrier)
         {
@@ -814,8 +815,7 @@ impl<S: DurableStore> SimStore<S> {
             | (WorkId::Opening(_), Answer::Operation { .. }) => None,
         };
         let answers = self.awaited.get(&id).is_some_and(|(awaited, ticket)| {
-            let _ = (ticket, origin.map(|origin| origin.ticket));
-            *awaited == operation
+            *awaited == operation && origin.is_none_or(|origin| origin.ticket == *ticket)
         });
         let (Some(delivery), true) = (delivery, answers) else {
             self.record(StoreEvent::UncorrelatedResult { id, operation });
@@ -852,6 +852,9 @@ impl<S: DurableStore> SimStore<S> {
         operation: OperationId,
         reply: StoreReply,
     ) -> Result<Performed, ActionRefused> {
+        if self.halt.is_some() {
+            return Err(ActionRefused::Halted);
+        }
         Ok(self.deliver(
             WorkId::Effect(effect),
             Answer::Operation { operation, reply },
