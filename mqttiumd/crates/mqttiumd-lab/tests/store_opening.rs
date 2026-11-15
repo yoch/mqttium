@@ -15,7 +15,7 @@ use mqttiumd_contract::outcome::{
 };
 use mqttiumd_lab::store::adapter::{
     AdapterLimits, Answer, Delivery, FaultAction, FaultPoint, FaultSpec, Performed, SimStore,
-    StoreAction, StoreEvent, WorkId, WorkKind, startup_nonce,
+    StoreAction, StoreEvent, Uncorrelated, WorkId, WorkKind, startup_nonce,
 };
 use mqttiumd_lab::store::conformance::{INCARNATION, World, fixture_limits};
 use mqttiumd_lab::store::durable::{Durability, DurableStore, Limits, MemoryStore};
@@ -197,7 +197,8 @@ fn a_duplicated_reply_gives_no_second_authority() {
     );
     assert!(sim.take_events().contains(&StoreEvent::UncorrelatedResult {
         id,
-        operation: None
+        operation: None,
+        reason: Uncorrelated::NoWorkInFlight,
     }));
 
     let grant = opening.hand_over().expect("committed");

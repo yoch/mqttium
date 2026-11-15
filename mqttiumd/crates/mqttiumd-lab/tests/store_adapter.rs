@@ -13,7 +13,7 @@ use mqttiumd_contract::ids::{
 use mqttiumd_contract::outcome::{RejectReason, StoreOutcome, StoreReply};
 use mqttiumd_lab::store::adapter::{
     ActionRefused, AdapterLimits, Answer, Delivery, FaultAction, FaultId, FaultPoint, FaultRefused,
-    FaultSpec, Performed, SimStore, StoreAction, StoreEvent, WorkId, WorkKind,
+    FaultSpec, Performed, SimStore, StoreAction, StoreEvent, Uncorrelated, WorkId, WorkKind,
 };
 use mqttiumd_lab::store::conformance::{World, admission_in, open, operation_id, publication_id};
 use mqttiumd_lab::store::durable::{Durability, DurableStore, Limits, MemoryStore};
@@ -463,7 +463,11 @@ fn a_duplicated_result_is_handed_over_once() {
     assert!(bench.store.eligible().is_empty());
     assert_eq!(
         bench.store.take_events().last(),
-        Some(&StoreEvent::UncorrelatedResult { id, operation })
+        Some(&StoreEvent::UncorrelatedResult {
+            id,
+            operation,
+            reason: Uncorrelated::NoWorkInFlight
+        })
     );
 }
 
@@ -652,7 +656,8 @@ fn a_result_that_answers_no_effect_in_flight_is_refused_and_recorded() {
         bench.store.take_events(),
         [StoreEvent::UncorrelatedResult {
             id: WorkId::Effect(stray),
-            operation: Some(operation)
+            operation: Some(operation),
+            reason: Uncorrelated::NoWorkInFlight
         }]
     );
 
@@ -710,7 +715,8 @@ fn an_identity_remembered_by_the_bench_is_refused_after_a_restart() {
         restarted.take_events(),
         [StoreEvent::UncorrelatedResult {
             id,
-            operation: Some(remembered)
+            operation: Some(remembered),
+            reason: Uncorrelated::NoWorkInFlight
         }]
     );
     assert_eq!(restarted.store().snapshot(), before);
@@ -787,6 +793,7 @@ fn recovery_pages_read_through_the_adapter_leave_their_evidence() {
         assert_eq!(
             bench.store.take_events(),
             [StoreEvent::RecoveryPageRead {
+                run_epoch: bench.store.store().ledger().last_opened(),
                 page: pages,
                 last,
                 facts: page.facts.as_slice().to_vec(),
@@ -859,7 +866,8 @@ fn a_left_over_copy_does_not_answer_work_submitted_again() {
         [
             StoreEvent::UncorrelatedResult {
                 id,
-                operation: Some(operation)
+                operation: Some(operation),
+                reason: Uncorrelated::NoWorkInFlight
             },
             StoreEvent::ResultDelivered {
                 id,
