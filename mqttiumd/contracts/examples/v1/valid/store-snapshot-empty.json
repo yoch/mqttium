@@ -1,0 +1,45 @@
+{
+  "format": "mqttiumd.store-snapshot",
+  "schema_version": 1,
+  "run_id": "p1-02-example",
+  "checkpoint": "initial",
+  "backend": "sqlite",
+  "meta": {
+    "incarnation": "1",
+    "last_opened_epoch": "0",
+    "opened_by": null,
+    "collected_through": "0",
+    "state_revision": "0",
+    "next_session": "1"
+  },
+  "sessions": [],
+  "route_table": {
+    "revision": "0",
+    "routes": []
+  },
+  "operations": [],
+  "fences": [],
+  "payloads": [],
+  "publications": [],
+  "obligations": [],
+  "inbound_exchanges": [],
+  "account": {
+    "used": {
+      "payload_bytes": "0",
+      "references": "0",
+      "exchange_slots": "0",
+      "receipt_slots": "0"
+    },
+    "limits": {
+      "payload_bytes": "4096",
+      "references": "16",
+      "exchange_slots": "4",
+      "receipt_slots": "8",
+      "max_targets_per_admission": "4",
+      "max_topic_bytes": "256",
+      "max_payload_bytes": "1024",
+      "max_sessions": "8",
+      "max_route_targets": "8"
+    }
+  }
+}
