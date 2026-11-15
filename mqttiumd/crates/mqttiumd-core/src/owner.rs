@@ -52,6 +52,11 @@ use crate::leases::{LeaseRefused, LeaseTable};
 /// amendment).
 pub const MAX_TRANSITION_SLOTS: usize = 2;
 
+/// How many times the durable termination of one exchange is prepared,
+/// the first one included, while the store refuses it because a
+/// resolution fenced the operation before it arrived.
+pub const MAX_RELEASE_PREPARATIONS: u32 = 4;
+
 /// The bits of an exchange generation that count the exchanges of one run
 /// epoch. The bits above them hold the epoch: see [`Counters`].
 const GENERATION_BITS: u32 = 32;
@@ -241,6 +246,16 @@ enum Stop {
     Need(CapacityNeed),
     Exhausted(Exhaustion),
     Fatal(CoreFault),
+}
+
+impl From<AllocationFailed> for Stop {
+    fn from(_: AllocationFailed) -> Self {
+        Self::Need(CapacityNeed {
+            resource: Resource::References,
+            amount: 1,
+            wake: WakeCondition::ResourceReleased,
+        })
+    }
 }
 
 /// An input the adapters cannot produce in this state.
@@ -842,8 +857,7 @@ impl Owner {
             Err(LeaseRefused::TableFull) => return Err(lacking(Resource::ExchangeSlots, 1)),
         }
         let references = u64::try_from(targets).unwrap_or(u64::MAX);
-        let mut list = BoundedVec::with_capacity(targets)
-            .map_err(|_| lacking(Resource::References, references))?;
+        let mut list = BoundedVec::with_capacity(targets).map_err(Stop::from)?;
 
         let generation = draw(&mut draft.counters.generation, next_generation)?;
         let exchange = ExchangeId {
@@ -1479,10 +1493,6 @@ mod tests {
         flights: Vec<Flight>,
     }
 
-    /// The generation the next lease of a slot takes, and the lease the
-    /// slot holds.
-    type LeaseView = (Option<u64>, Option<LeaseKey>);
-
     /// Everything a refusal must leave unchanged: the state, the identity
     /// counters, the account and its leases, and the content of the box.
     #[derive(PartialEq, Debug)]
@@ -1496,7 +1506,7 @@ mod tests {
         routes: Vec<Route>,
         sessions: Vec<Session>,
         slots: Vec<Slot>,
-        leases: (Credits, Vec<LeaseView>),
+        leases: (Credits, Vec<crate::leases::LeaseSlotView>),
         waiting: Vec<EffectId>,
         free_slots: usize,
         live_reservations: bool,
@@ -1840,6 +1850,19 @@ mod tests {
             };
             self.flights.push(flight);
             flight
+        }
+
+        /// The certain refusal the tests deliver for a command: `Fenced`
+        /// for a release, which is prepared again, and a lack of capacity
+        /// for an admission.
+        fn refusal_of(&self, flight: &Flight) -> StoreOutcome {
+            let reason = match flight.facts {
+                CommitFacts::InboundReleased { .. } => RejectReason::Fenced,
+                CommitFacts::PublicationAdmitted { .. } => {
+                    RejectReason::CapacityExceeded(Resource::PayloadBytes)
+                }
+            };
+            StoreOutcome::RejectedCertain(reason)
         }
 
         fn phase(&self, raw: u16) -> Option<ExchangePhase> {
@@ -2302,7 +2325,7 @@ mod tests {
         assert_eq!(
             whole.step(page(&facts, true)),
             StepOutcome::Applied {
-                work_used: WorkUnits::new(9),
+                work_used: WorkUnits::new(FIXTURE_WORK),
                 progress: Progress::Complete,
             }
         );
@@ -2416,6 +2439,16 @@ mod tests {
                 "more sessions than the table holds",
                 with(&[session_fact(8, b"p1-d")]),
             ),
+            ("a route twice", {
+                let mut facts = base.clone();
+                facts[4] = route_fact(b"p1/example", 2);
+                facts
+            }),
+            ("a route to no session", {
+                let mut facts = base.clone();
+                facts[4] = route_fact(b"p1/example", 8);
+                facts
+            }),
             ("a session twice", {
                 let mut facts = without(7);
                 facts.push(session_fact(2, b"p1-other"));
@@ -2590,8 +2623,9 @@ mod tests {
             world.owner.connection_of(SessionId::new(PRODUCER)),
             Some(ConnectionGeneration::new(11))
         );
-        // The connection that was replaced has no session any more.
-        assert_eq!(world.sent(publish(7)), ["CloseConnection"]);
+        // The connection that was replaced is closed: what it still
+        // carries is absorbed.
+        absorbed(&mut world, publish(7));
         assert_eq!(world.phase(7), None);
     }
 
@@ -2603,9 +2637,20 @@ mod tests {
         };
         // An unknown client, and a packet before CONNECT.
         let mut world = World::recovered();
-        for input in [connect(CONN, b"stranger"), publish(7), pubrel(7)] {
+        let pubrel_on = |connection: u64| Input::Packet {
+            connection: ConnectionGeneration::new(connection),
+            ingress_order: 0,
+            packet: InboundPacket::Pubrel {
+                packet_id: packet_id(7),
+            },
+        };
+        for (connection, input) in [
+            (CONN, connect(CONN, b"stranger")),
+            (12, publish_with(12, 7, Qos::ExactlyOnce, b"payload")),
+            (13, pubrel_on(13)),
+        ] {
             world.applied(input);
-            assert_eq!(world.drain()[0].1, close(CONN));
+            assert_eq!(world.drain()[0].1, close(connection));
         }
         assert_eq!(world.owner.connection_of(SessionId::new(PRODUCER)), None);
         // A second CONNECT, a QoS below 2, a retained message: the session
@@ -2668,6 +2713,10 @@ mod tests {
         world.applied(frame(PRODUCER, CONN, FrameProgress::Failed));
         assert_eq!(world.owner.connection_of(SessionId::new(PRODUCER)), None);
         assert!(world.outbox.is_empty());
+        // The connection is gone: what it still carries is absorbed.
+        absorbed(&mut world, publish(7));
+        absorbed(&mut world, connect(CONN, b"p1-producer"));
+        assert_eq!(world.owner.connection_of(SessionId::new(PRODUCER)), None);
     }
 
     // ----- The machine `inbound_qos2`: one test per rule, named after it -----
@@ -2698,15 +2747,30 @@ mod tests {
         }
     }
 
-    /// Every result of an operation no exchange waits for is absorbed.
-    fn every_result_is_absorbed(world: &mut World, flight: &Flight) {
-        for input in [
-            committed(flight),
-            rejected(flight),
-            unknown(flight),
-            retired(flight),
-        ] {
+    /// The results of an operation no exchange waits for that agree with
+    /// what is known of it are absorbed: an unknown or retired answer, and
+    /// the repetition of its terminal result. A contradiction is a fault:
+    /// see `a_late_result_that_contradicts_an_operation_that_ended_is_a_fault`.
+    fn every_result_is_absorbed(world: &mut World, flight: &Flight, committed_known: bool) {
+        let repeated = if committed_known {
+            committed(flight)
+        } else {
+            result(flight, world.refusal_of(flight))
+        };
+        for input in [repeated, unknown(flight), retired(flight)] {
             absorbed(world, input);
+        }
+    }
+
+    fn fenced(flight: &Flight) -> Input {
+        result(flight, StoreOutcome::RejectedCertain(RejectReason::Fenced))
+    }
+
+    fn mismatch(flight: &Flight) -> Input {
+        Input::StoreResult {
+            effect: flight.effect,
+            operation: flight.operation,
+            reply: StoreReply::Violation(StoreViolation::RecipeMismatch),
         }
     }
 
@@ -2881,10 +2945,10 @@ mod tests {
     fn rule_inbound_qos2_absent_admission_result_stale() {
         let mut world = World::ended();
         let admission = world.flights[0];
-        every_result_is_absorbed(&mut world, &admission);
+        every_result_is_absorbed(&mut world, &admission, true);
         let mut world = refused();
         let admission = world.flights[0];
-        every_result_is_absorbed(&mut world, &admission);
+        every_result_is_absorbed(&mut world, &admission, false);
     }
 
     // Unreachable: a Packet Identifier with no exchange has no operation a
@@ -2896,7 +2960,7 @@ mod tests {
         assert_eq!(world.phase(7), None);
         assert!(world.owner.slots.is_empty());
         let admission = world.flights[0];
-        every_result_is_absorbed(&mut world, &admission);
+        every_result_is_absorbed(&mut world, &admission, false);
         assert_eq!(world.phase(7), None);
     }
 
@@ -2904,7 +2968,7 @@ mod tests {
     fn rule_inbound_qos2_absent_release_result_stale() {
         let mut world = World::ended();
         let release = world.flights[1];
-        every_result_is_absorbed(&mut world, &release);
+        every_result_is_absorbed(&mut world, &release, true);
     }
 
     // Unreachable, for the same reason as the admission result.
@@ -2914,7 +2978,7 @@ mod tests {
         assert_eq!(world.phase(7), None);
         assert!(world.owner.slots.is_empty());
         let release = world.flights[1];
-        every_result_is_absorbed(&mut world, &release);
+        every_result_is_absorbed(&mut world, &release, true);
         assert_eq!(world.phase(7), None);
     }
 
@@ -2999,7 +3063,7 @@ mod tests {
         let mut world = refused();
         let current = world.submit(publish(7));
         let stale = world.flights[0];
-        every_result_is_absorbed(&mut world, &stale);
+        every_result_is_absorbed(&mut world, &stale, false);
         assert_eq!(world.in_flight(7).operation, current.operation);
     }
 
@@ -3008,7 +3072,7 @@ mod tests {
         let mut world = World::ended();
         let current = world.submit(publish(7));
         let stale = world.flights[1];
-        every_result_is_absorbed(&mut world, &stale);
+        every_result_is_absorbed(&mut world, &stale, true);
         assert_eq!(world.in_flight(7).operation, current.operation);
     }
 
@@ -3036,7 +3100,7 @@ mod tests {
         let current = world.submit(publish(7));
         assert_eq!(world.sent(committed(&current)), ["EmitPubrec"]);
         let stale = world.flights[1];
-        every_result_is_absorbed(&mut world, &stale);
+        every_result_is_absorbed(&mut world, &stale, true);
         assert_eq!(world.phase(7), AWAIT);
     }
 
@@ -3155,7 +3219,7 @@ mod tests {
     fn rule_inbound_qos2_release_pending_rejected_prepare_again() {
         let mut world = World::release_pending();
         let refused = world.flights[1];
-        let again = world.submit(rejected(&refused));
+        let again = world.submit(fenced(&refused));
         // Another operation for the same exchange.
         assert_ne!(again.operation, refused.operation);
         assert_eq!(again.facts, refused.facts);
@@ -3167,7 +3231,7 @@ mod tests {
 
     #[test]
     fn rule_inbound_qos2_release_pending_rejected_defer() {
-        handed_back(World::release_pending, &|w| rejected(&w.flights[1]), 2);
+        handed_back(World::release_pending, &|w| fenced(&w.flights[1]), 2);
     }
 
     #[test]
@@ -3199,8 +3263,8 @@ mod tests {
     fn rule_inbound_qos2_release_pending_release_result_stale() {
         let mut world = World::release_pending();
         let stale = world.flights[1];
-        let current = world.submit(rejected(&stale));
-        every_result_is_absorbed(&mut world, &stale);
+        let current = world.submit(fenced(&stale));
+        every_result_is_absorbed(&mut world, &stale, false);
         assert_eq!(world.in_flight(7).operation, current.operation);
     }
 
@@ -3249,8 +3313,17 @@ mod tests {
         assert_ne!(second[1].1, first[1].1);
     }
 
+    // command.prepared.submit.defer: a submission whose slots are missing
+    // is handed back before the command exists.
     #[test]
-    fn a_deadline_is_handed_back_at_each_boundary_of_capacity() {
+    fn rule_command_prepared_submit_defer() {
+        handed_back(World::connected, &|_| publish(7), 2);
+        handed_back(World::await_pubrel, &|_| pubrel(7), 2);
+    }
+
+    // command.submitted.timeout.defer
+    #[test]
+    fn rule_command_submitted_timeout_defer() {
         handed_back(
             World::admission_pending,
             &|w| deadline(w.flights[0].deadline),
@@ -3261,6 +3334,17 @@ mod tests {
             &|w| deadline(w.flights[1].deadline),
             2,
         );
+    }
+
+    // command.indeterminate.timeout.defer
+    #[test]
+    fn rule_command_indeterminate_timeout_defer() {
+        let indeterminate = || {
+            let mut world = World::admission_pending();
+            world.applied(unknown(&world.flights[0]));
+            world
+        };
+        handed_back(indeterminate, &|w| deadline(w.flights[0].deadline), 2);
     }
 
     #[test]
@@ -3627,11 +3711,6 @@ mod tests {
     // MU-03: one identity, one recipe.
     #[test]
     fn a_recipe_mismatch_reported_by_the_store_is_a_fault() {
-        let mismatch = |flight: &Flight| Input::StoreResult {
-            effect: flight.effect,
-            operation: flight.operation,
-            reply: StoreReply::Violation(StoreViolation::RecipeMismatch),
-        };
         let fault = |flight: &Flight| CoreFault::RecipeMismatch {
             operation: flight.operation,
         };
@@ -3643,9 +3722,9 @@ mod tests {
         faulted(&mut world, mismatch(&admission), fault(&admission));
         let release = world.flights[1];
         faulted(&mut world, mismatch(&release), fault(&release));
-        // An operation no exchange holds any more has no recipe to compare.
+        // Also for an operation that ended, while the owner retains it.
         let mut world = World::ended();
-        absorbed(&mut world, mismatch(&release));
+        faulted(&mut world, mismatch(&release), fault(&release));
     }
 
     #[test]
@@ -3720,7 +3799,7 @@ mod tests {
         let mut world = World::cold(EPOCH, CAPACITY);
         let before = world.snapshot();
         let short = TurnGrant {
-            work_limit: WorkUnits::new(8),
+            work_limit: WorkUnits::new(FIXTURE_WORK - 1),
         };
         assert_eq!(
             world
@@ -3738,7 +3817,7 @@ mod tests {
         );
         assert_eq!(world.snapshot(), before);
         let exact = TurnGrant {
-            work_limit: WorkUnits::new(9),
+            work_limit: WorkUnits::new(FIXTURE_WORK),
         };
         let outcome = world
             .owner
@@ -3746,6 +3825,168 @@ mod tests {
         assert!(
             matches!(outcome, StepOutcome::Applied { .. }),
             "{outcome:?}"
+        );
+    }
+
+    // ----- Review of the core at fe26568 -----
+
+    /// The work of the fixture page: three facts of one unit, two routes
+    /// that each compare with the route table, three sessions that each
+    /// compare with the session table, and the check that closes the
+    /// inventory, every route against every session (config: 2 routes,
+    /// 3 sessions, 2 exchanges).
+    const FIXTURE_WORK: u64 = 3 + 2 * (1 + 2) + 3 * (1 + 3) + (1 + 2 * 3);
+
+    // Finding 7: the work counted for a page bounds the comparisons its
+    // checks make, which grow with the tables, not only with the page.
+    #[test]
+    fn the_work_of_a_recovery_page_bounds_every_comparison_it_makes() {
+        let mut world = World::cold(EPOCH, CAPACITY);
+        let mut facts = fixture(EPOCH);
+        facts.push(exchange_fact(1, 7, 1));
+        facts.push(operation_fact(1));
+        assert_eq!(
+            world.step(page(&facts, true)),
+            StepOutcome::Applied {
+                // An exchange compares with the sessions and the exchanges.
+                work_used: WorkUnits::new(FIXTURE_WORK + (1 + 3 + 2) + 1),
+                progress: Progress::Complete,
+            }
+        );
+        // A page that does not close the inventory does not pay for the
+        // check that closes it.
+        let mut world = World::cold(EPOCH, CAPACITY);
+        assert_eq!(
+            world.step(page(&fixture(EPOCH), false)),
+            StepOutcome::Applied {
+                work_used: WorkUnits::new(FIXTURE_WORK - (1 + 2 * 3)),
+                progress: Progress::Complete,
+            }
+        );
+    }
+
+    // Finding 1: a release refused for a reason that a new preparation
+    // cannot change is not prepared again.
+    #[test]
+    fn a_release_refused_for_a_reason_a_new_preparation_cannot_change_stops_the_owner() {
+        for reason in [
+            RejectReason::PreconditionFailed,
+            RejectReason::EpochClosed,
+            RejectReason::CapacityExceeded(Resource::ExchangeSlots),
+        ] {
+            let mut world = World::release_pending();
+            let release = world.flights[1];
+            let refusal = result(&release, StoreOutcome::RejectedCertain(reason));
+            let fault = CoreFault::ReleaseRefused {
+                operation: release.operation,
+                reason,
+            };
+            faulted(&mut world, refusal, fault);
+        }
+    }
+
+    // Finding 1: a fenced release is prepared again, a bounded number of
+    // times.
+    #[test]
+    fn a_fenced_release_is_prepared_again_a_bounded_number_of_times() {
+        let mut world = World::release_pending();
+        let mut release = world.flights[1];
+        for _ in 1..MAX_RELEASE_PREPARATIONS {
+            release = world.submit(fenced(&release));
+        }
+        let preparations = usize::try_from(MAX_RELEASE_PREPARATIONS).expect("small");
+        assert_eq!(world.flights.len(), 1 + preparations);
+        let fault = CoreFault::ReleaseRefused {
+            operation: release.operation,
+            reason: RejectReason::Fenced,
+        };
+        faulted(&mut world, fenced(&release), fault);
+    }
+
+    // Finding 2: a terminal result that contradicts an operation which no
+    // exchange holds any more is a fault, not a stale answer.
+    #[test]
+    fn a_late_result_that_contradicts_an_operation_that_ended_is_a_fault() {
+        let contradiction = |flight: &Flight| CoreFault::ContradictoryOutcome {
+            operation: flight.operation,
+        };
+        let recipe = |flight: &Flight| CoreFault::RecipeMismatch {
+            operation: flight.operation,
+        };
+        // An admission refused, then reported committed: a publication the
+        // client was refused is in fact admitted.
+        let mut world = refused();
+        let admission = world.flights[0];
+        faulted(&mut world, committed(&admission), contradiction(&admission));
+        faulted(&mut world, mismatch(&admission), recipe(&admission));
+        // An exchange that ended, then its admission or release refused.
+        let mut world = World::ended();
+        for flight in world.flights.clone() {
+            faulted(&mut world, rejected(&flight), contradiction(&flight));
+            faulted(&mut world, mismatch(&flight), recipe(&flight));
+        }
+        // A release refused and prepared again, then reported committed.
+        let mut world = World::release_pending();
+        let first = world.flights[1];
+        let _ = world.submit(fenced(&first));
+        faulted(&mut world, committed(&first), contradiction(&first));
+    }
+
+    // Finding 3: a result is matched by the effect the owner emitted for
+    // the operation, not by the operation alone.
+    #[test]
+    fn a_result_is_matched_to_its_operation_by_the_effect_that_asked_for_it() {
+        let mut world = World::connected();
+        let admission = world.submit(publish(7));
+        let effect = |sequence: u64| EffectId {
+            sequence: EffectSeq::new(sequence),
+            ..admission.effect
+        };
+        // The CONNACK of the session and the deadline of the admission.
+        let connack = effect(1);
+        let arm = effect(admission.effect.sequence.get() + 1);
+        for answer in [connack, arm] {
+            let input = Input::StoreResult {
+                effect: answer,
+                operation: admission.operation,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(admission.facts)),
+            };
+            absorbed(&mut world, input);
+            assert_eq!(world.phase(7), PENDING);
+        }
+        assert_eq!(world.sent(committed(&admission)), ["EmitPubrec"]);
+    }
+
+    // Finding 4: a connection the owner ordered closed resumes nothing.
+    #[test]
+    fn a_connection_the_owner_closed_resumes_nothing() {
+        let mut world = World::connected();
+        assert_eq!(
+            world.sent(connect(11, b"p1-producer")),
+            ["CloseConnection", "EmitConnack"]
+        );
+        absorbed(&mut world, connect(CONN, b"p1-producer"));
+        assert_eq!(
+            world.owner.connection_of(SessionId::new(PRODUCER)),
+            Some(ConnectionGeneration::new(11))
+        );
+        // Closed for a protocol error.
+        let mut world = World::connected();
+        assert_eq!(
+            world.sent(connect(CONN, b"p1-producer")),
+            ["CloseConnection"]
+        );
+        absorbed(&mut world, connect(CONN, b"p1-producer"));
+        assert_eq!(world.owner.connection_of(SessionId::new(PRODUCER)), None);
+    }
+
+    // Finding 6: an allocation that fails while planning stops the owner;
+    // no wake-up gives memory back.
+    #[test]
+    fn a_failed_allocation_while_planning_is_a_fault() {
+        assert_eq!(
+            Stop::from(AllocationFailed),
+            Stop::Fatal(CoreFault::AllocationFailed)
         );
     }
 }

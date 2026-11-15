@@ -294,14 +294,14 @@ impl LeaseTable {
     }
 }
 
+/// What one slot of a table shows: the generation its next lease takes,
+/// or `None` once it is spent, and the lease it holds.
+pub type LeaseSlotView = (Option<u64>, Option<LeaseKey>);
+
 /// For the tests of the crate: what a refusal must leave unchanged.
 #[cfg(test)]
 mod snapshot {
     use super::*;
-
-    /// The generation the next lease of a slot takes, and the lease the
-    /// slot holds.
-    pub(crate) type LeaseSlotView = (Option<u64>, Option<LeaseKey>);
 
     impl LeaseTable {
         /// The usage of the account and the view of each slot.
@@ -350,26 +350,6 @@ mod tests {
         }
     }
 
-    /// A slot as a test compares it: its next generation and the key of
-    /// the lease it holds.
-    type SlotView = (Option<u64>, Option<LeaseKey>);
-
-    /// Everything a refusal must leave unchanged.
-    fn state(table: &LeaseTable) -> (Credits, Vec<SlotView>) {
-        let slots = table
-            .slots
-            .as_slice()
-            .iter()
-            .map(|slot| {
-                (
-                    slot.next_generation.map(LeaseGeneration::get),
-                    slot.record.as_ref().map(LeaseRecord::key),
-                )
-            })
-            .collect();
-        (table.account.used(), slots)
-    }
-
     /// The usage of the account is the sum of the held leases, and every
     /// record is held, in its own slot, at a generation the slot left.
     fn assert_invariant(table: &LeaseTable) {
@@ -407,9 +387,9 @@ mod tests {
         assert_invariant(&table);
 
         // A second release of the same key subtracts nothing.
-        let before = state(&table);
+        let before = table.snapshot();
         assert_eq!(table.release(lease), Ok(ReleaseOutcome::Stale));
-        assert_eq!(state(&table), before);
+        assert_eq!(table.snapshot(), before);
     }
 
     #[test]
@@ -422,9 +402,9 @@ mod tests {
         assert_ne!(first, second);
 
         // The old key is a late release: it never touches the new lease.
-        let before = state(&table);
+        let before = table.snapshot();
         assert_eq!(table.release(first), Ok(ReleaseOutcome::Stale));
-        assert_eq!(state(&table), before);
+        assert_eq!(table.snapshot(), before);
         assert!(table.holds(second));
         assert_invariant(&table);
     }
@@ -435,7 +415,7 @@ mod tests {
     fn no_path_builds_a_second_record_of_a_held_lease() {
         let mut table = table(100, 4, 2);
         let held = table.reserve(credits(30, 1)).expect("room");
-        let before = state(&table);
+        let before = table.snapshot();
 
         // Recovery presenting the row of a held lease again is refused.
         assert_eq!(
@@ -447,7 +427,7 @@ mod tests {
             table.restore(key(0, 7), credits(1, 1)),
             Err(RestoreRefused::SlotHeld)
         );
-        assert_eq!(state(&table), before);
+        assert_eq!(table.snapshot(), before);
 
         // A reservation never takes the slot of a held lease.
         let other = table.reserve(credits(30, 1)).expect("room");
@@ -464,8 +444,8 @@ mod tests {
         assert_invariant(&table);
     }
 
-    // Record 0010: nothing but recovery rebuilds a record from its parts.
-    // The source of this crate names `LeaseRecord::from_parts` in one
+    // Record 0010: one charge path and one release path. The source of
+    // this crate rebuilds no record from its parts, charges an account in
     // function outside `credits.rs`, and names no other release or
     // charge of an account.
     #[test]
@@ -480,9 +460,12 @@ mod tests {
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect();
         let count = |needle: &str| code.iter().filter(|line| line.contains(needle)).count();
-        assert_eq!(count("LeaseRecord::from_parts("), 1, "rebuilt elsewhere");
+        // Recovery charges a restored lease through `Account::reserve`,
+        // like a new one: there is one charge path, the one the proof
+        // covers, and no record is rebuilt from its parts.
+        assert_eq!(count("from_parts("), 0, "rebuilt or charged by hand");
         assert_eq!(count("release_if_current("), 1, "released elsewhere");
-        assert_eq!(count(".reserve(slot"), 1, "charged elsewhere");
+        assert_eq!(count("self.account.reserve("), 2, "charged elsewhere");
 
         // No other module of the core touches a record or an account.
         for entry in std::fs::read_dir("src").expect("the sources of this crate") {
@@ -505,7 +488,7 @@ mod tests {
     fn a_refused_lease_changes_nothing() {
         let mut table = table(100, 2, 2);
         let _held = table.reserve(credits(60, 1)).expect("room");
-        let before = state(&table);
+        let before = table.snapshot();
         let cases = [
             // Definitive: the cost alone exceeds a limit.
             (
@@ -546,11 +529,11 @@ mod tests {
         for (cost, expected) in cases {
             assert_eq!(table.check(cost), Err(expected), "{cost:?}");
             assert_eq!(table.reserve(cost), Err(expected), "{cost:?}");
-            assert_eq!(state(&table), before, "{cost:?}");
+            assert_eq!(table.snapshot(), before, "{cost:?}");
         }
         // What `check` accepts, `reserve` grants.
         assert_eq!(table.check(credits(40, 1)), Ok(()));
-        assert_eq!(state(&table), before, "check changed something");
+        assert_eq!(table.snapshot(), before, "check changed something");
         assert!(table.reserve(credits(40, 1)).is_ok());
         assert_invariant(&table);
     }
@@ -560,10 +543,10 @@ mod tests {
         let mut table = table(100, 8, 2);
         let first = table.reserve(credits(1, 1)).expect("room");
         let second = table.reserve(credits(1, 1)).expect("room");
-        let before = state(&table);
+        let before = table.snapshot();
         assert_eq!(table.check(credits(1, 1)), Err(LeaseRefused::TableFull));
         assert_eq!(table.reserve(credits(1, 1)), Err(LeaseRefused::TableFull));
-        assert_eq!(state(&table), before);
+        assert_eq!(table.snapshot(), before);
 
         // A release ends the wait.
         assert_eq!(table.release(first), Ok(ReleaseOutcome::Released));
@@ -608,7 +591,7 @@ mod tests {
         assert_eq!(table.release(last), Ok(ReleaseOutcome::Released));
         // Thirty bytes are in use: fifty more would be a temporary lack on
         // a table with a slot left.
-        let before = state(&table);
+        let before = table.snapshot();
         assert_eq!(
             table.check(credits(80, 1)),
             Err(LeaseRefused::TableExhausted)
@@ -617,7 +600,7 @@ mod tests {
             table.reserve(credits(80, 1)),
             Err(LeaseRefused::TableExhausted)
         );
-        assert_eq!(state(&table), before);
+        assert_eq!(table.snapshot(), before);
     }
 
     fn table_at_last_generation(max_leases: u32) -> LeaseTable {
@@ -632,7 +615,7 @@ mod tests {
     fn a_key_that_names_no_held_lease_is_a_late_release() {
         let mut table = table(100, 4, 2);
         let held = table.reserve(credits(10, 1)).expect("room");
-        let before = state(&table);
+        let before = table.snapshot();
         let foreign = LeaseKey {
             account: AccountId::new(ACCOUNT + 1),
             ..held
@@ -640,7 +623,7 @@ mod tests {
         for late in [foreign, key(1, 0), key(99, 0), key(0, 5)] {
             assert!(!table.holds(late), "{late:?}");
             assert_eq!(table.release(late), Ok(ReleaseOutcome::Stale), "{late:?}");
-            assert_eq!(state(&table), before, "{late:?}");
+            assert_eq!(table.snapshot(), before, "{late:?}");
         }
         assert!(table.holds(held));
     }
@@ -670,7 +653,7 @@ mod tests {
         assert_eq!(table.restore(key(0, 3), credits(60, 1)), Ok(()));
         assert_eq!(table.release(key(0, 3)), Ok(ReleaseOutcome::Released));
         assert_eq!(table.restore(key(1, 0), credits(60, 1)), Ok(()));
-        let before = state(&table);
+        let before = table.snapshot();
         let foreign = LeaseKey {
             account: AccountId::new(ACCOUNT + 1),
             ..key(0, 9)
@@ -695,7 +678,7 @@ mod tests {
         ];
         for (key, cost, expected) in cases {
             assert_eq!(table.restore(key, cost), Err(expected), "{key:?}");
-            assert_eq!(state(&table), before, "{key:?}");
+            assert_eq!(table.snapshot(), before, "{key:?}");
         }
         assert_eq!(table.restore(key(0, 4), credits(40, 1)), Ok(()));
         assert_invariant(&table);
@@ -711,14 +694,14 @@ mod tests {
             table.release(key(0, u64::MAX)),
             Ok(ReleaseOutcome::Released)
         );
-        let before = state(&table);
+        let before = table.snapshot();
         for generation in [0, 7, u64::MAX] {
             assert_eq!(
                 table.restore(key(0, generation), credits(1, 1)),
                 Err(RestoreRefused::GenerationReused),
                 "generation {generation}"
             );
-            assert_eq!(state(&table), before);
+            assert_eq!(table.snapshot(), before);
         }
     }
 

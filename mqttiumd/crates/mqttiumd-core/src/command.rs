@@ -155,18 +155,12 @@ mod tests {
     ];
 
     // One test per rule of the machine `command`, named after the rule.
+    // The rules whose disposition is DEFER hand the input back before the
+    // command moves: they are tested in the owner, at each boundary of
+    // capacity, under the same names.
     // command.prepared.submit
     #[test]
     fn rule_command_prepared_submit() {
-        assert_eq!(Prepared.on(Submit), Transition(Submitted));
-    }
-
-    // command.prepared.submit.defer
-    #[test]
-    fn rule_command_prepared_submit_defer() {
-        // A lack of effect slots hands the input back before the command
-        // moves: the verdict is the one of the event, and the owner applies
-        // it only once the slots are reserved.
         assert_eq!(Prepared.on(Submit), Transition(Submitted));
     }
 
@@ -203,15 +197,6 @@ mod tests {
         assert_eq!(Submitted.on(ResultTimeout), Transition(Indeterminate));
     }
 
-    // command.submitted.timeout.defer
-    #[test]
-    fn rule_command_submitted_timeout_defer() {
-        // A lack of effect slots hands the input back before the command
-        // moves: the verdict is the one of the event, and the owner applies
-        // it only once the slots are reserved.
-        assert_eq!(Submitted.on(ResultTimeout), Transition(Indeterminate));
-    }
-
     // command.indeterminate.result.committed
     #[test]
     fn rule_command_indeterminate_result_committed() {
@@ -242,15 +227,6 @@ mod tests {
     // command.indeterminate.timeout
     #[test]
     fn rule_command_indeterminate_timeout() {
-        assert_eq!(Indeterminate.on(ResultTimeout), Transition(Indeterminate));
-    }
-
-    // command.indeterminate.timeout.defer
-    #[test]
-    fn rule_command_indeterminate_timeout_defer() {
-        // A lack of effect slots hands the input back before the command
-        // moves: the verdict is the one of the event, and the owner applies
-        // it only once the slots are reserved.
         assert_eq!(Indeterminate.on(ResultTimeout), Transition(Indeterminate));
     }
 
