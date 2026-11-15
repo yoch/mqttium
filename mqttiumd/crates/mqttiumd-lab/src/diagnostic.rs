@@ -46,6 +46,10 @@ pub mod code {
     pub const FAULT_POINT_UNKNOWN: &str = "fault-point-unknown";
     /// The action is not offered by the injection point.
     pub const FAULT_ACTION_UNKNOWN: &str = "fault-action-unknown";
+    /// A fault matches on something its injection point does not carry.
+    pub const FAULT_MATCH_INVALID: &str = "fault-match-invalid";
+    /// A step releases or delivers something its fault does not hold.
+    pub const HELD_ITEM_MISMATCH: &str = "held-item-mismatch";
     /// The command kind is not in the catalogue.
     pub const COMMAND_KIND_UNKNOWN: &str = "command-kind-unknown";
     /// The profile is not in the catalogue.
@@ -81,7 +85,7 @@ pub mod code {
     pub const EVIDENCE_MISMATCH: &str = "evidence-mismatch";
 
     /// Every code, so that the example corpus can prove it exercises them.
-    pub const ALL: [&str; 34] = [
+    pub const ALL: [&str; 36] = [
         JSON_SYNTAX,
         DUPLICATE_KEY,
         NUMBER_NOT_INTEGER,
@@ -100,6 +104,8 @@ pub mod code {
         BINDING_DUPLICATE,
         FAULT_POINT_UNKNOWN,
         FAULT_ACTION_UNKNOWN,
+        FAULT_MATCH_INVALID,
+        HELD_ITEM_MISMATCH,
         COMMAND_KIND_UNKNOWN,
         PROFILE_UNKNOWN,
         ASSERTION_UNKNOWN,

@@ -18,6 +18,9 @@ use crate::{manifest, semantic, strict};
 pub struct Catalogs {
     /// Injection point to the actions it offers.
     pub fault_points: BTreeMap<String, BTreeSet<String>>,
+    /// Injection points through which a store result passes; a command
+    /// passes through the others.
+    pub result_points: BTreeSet<String>,
     /// Command kinds a fault may match.
     pub command_kinds: BTreeSet<String>,
     /// Profile identifiers.
@@ -222,6 +225,14 @@ impl Workspace {
                         strings(point, "actions", ""),
                     )
                 })
+                .collect(),
+            result_points: faults
+                .get("points")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|point| point["carries"].as_str() == Some("result"))
+                .map(|point| point["point"].as_str().unwrap_or_default().to_owned())
                 .collect(),
             command_kinds: strings(faults, "command_kinds", ""),
             profiles: strings(profiles, "profiles", "id"),

@@ -15,7 +15,7 @@ it. The examples illustrate the contract and are not part of the digest.
 | Path | Content |
 | - | - |
 | `schema/v1/*.schema.json` | JSON Schema 2020-12. No `$id`; references are file-relative and never fetched |
-| `v1/fault-points.json` | Contractual injection points and the actions each offers |
+| `v1/fault-points.json` | Contractual injection points, what each carries (a command or a result) and the actions it offers |
 | `v1/profiles.json` | Profiles and their perimeter |
 | `v1/assertions.json` | Assertion names, their meaning and the requirements they serve |
 | `v1/requirements.json` | Every identifier the specification defines, each with its source: a chapter or an accepted decision record |
@@ -52,6 +52,30 @@ binding definitions, the causal order of steps, verdicts, cited evidence,
 and the coverage of a transition registry. A report keeps at most 64
 diagnostics and 64 notes and counts the others exactly; a truncated report
 still refuses.
+
+### Held commands, held results and deadlines
+
+Three steps let a scenario order a race without a crash (ADR 0001):
+
+| Step | What the bench does |
+| - | - |
+| `FireDeadline` | Lets the timer adapter deliver the armed deadline that is due first, and drives the broker, within `max_steps`, until the core has consumed it. Logical time advances in no other way: a deadline never fires by itself between two steps |
+| `ReleaseHeldCommand` | Lets the command that the named fault holds (action `hold_command`) enter the writer |
+| `DeliverHeldResult` | Hands the result that the named fault delays (action `delay_result`) to the core, and drives, within `max_steps`, until the core has consumed it |
+
+A fault holds something only once a `DriveUntil` step has waited for its
+hit. What is held is handed over at most once, and a crash of the broker
+destroys it. A `delay_result` that no step delivers stays held to the end
+of the run.
+
+Each injection point `carries` a command or a result. On a point that
+carries a result, `match.result_of` selects the result of a `Persist` or
+of a `ResolveAndFence` about a matching operation; without it, any result
+about a matching operation counts, in the order they become ready.
+
+These steps give the broker nothing it could not know (ADR 0003): a fired
+deadline carries the token the core armed, a released command is the one
+the adapter accepted, a delivered result answers an effect still in flight.
 
 ### Registry coverage
 
