@@ -1320,11 +1320,6 @@ bad(
 # store snapshots: what InspectDurableState writes and the oracle reads
 SESSIONS = [("1", "p1-producer"), ("2", "p1-b"), ("3", "p1-c")]
 PAYLOAD = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "1"}
-USAGE = {"payload_bytes": "7", "references": "2", "exchange_slots": "1", "receipt_slots": "1"}
-LIMITS = {
-    name: fixture["capacities"][name]
-    for name in ("payload_bytes", "references", "exchange_slots", "receipt_slots")
-}
 
 
 def be(value, width=8):
@@ -1352,43 +1347,78 @@ RECIPE_HEX = "".join(
         be(3) + be(1) + be(1, 4) + be(1, 1) + be(1, 1),  # target c
     ]
 )
+SIZES = ("payload_bytes", "references", "exchange_slots", "receipt_slots")
+LIMITS = {name: fixture["capacities"][name] for name in SIZES} | {
+    "max_targets_per_admission": fixture["capacities"]["max_targets_per_admission"],
+    "max_topic_bytes": fixture["capacities"]["max_topic_bytes"],
+    "max_payload_bytes": fixture["capacities"]["max_payload_bytes"],
+    "max_sessions": "8",
+    "max_route_targets": "8",
+}
+EXCHANGE = {"session": "1", "generation": "1"}
 snapshot = env(
     "mqttiumd.store-snapshot",
     run_id="p1-02-example",
     checkpoint="after_commit_before_crash",
     backend="sim-store",
-    meta={"incarnation": "1", "epoch": "1"},
+    meta={
+        "incarnation": "1",
+        "last_opened_epoch": "1",
+        "opened_by": {"startup_hex": "a7" * 16, "ticket": "1"},
+        "collected_through": "0",
+        "state_revision": "1",
+        "next_session": "4",
+    },
     sessions=[
-        {"session": number, "client_id_hex": client_id.encode().hex(), "revision": "1"}
+        {
+            "session": number,
+            "client_id_hex": client_id.encode().hex(),
+            "revision": "1",
+            "state": "Active",
+        }
         for number, client_id in SESSIONS
     ],
-    routes=[
-        {
-            "topic_hex": b"p1/example".hex(),
-            "revision": "1",
-            "targets": [{"session": "2", "qos": 1}, {"session": "3", "qos": 1}],
-        }
-    ],
+    route_table={
+        "revision": "1",
+        "routes": [
+            {
+                "topic_hex": b"p1/example".hex(),
+                "targets": [{"session": "2", "qos": 1}, {"session": "3", "qos": 1}],
+            }
+        ],
+    },
     operations=[
         {
             "operation_id": OP,
-            "command_kind": "AdmitPublication",
             "recipe_hex": RECIPE_HEX,
-            "decision": "Committed",
+            "decision": {
+                "kind": "Committed",
+                "facts": {
+                    "kind": "PublicationAdmitted",
+                    "publication_id": PUBLICATION,
+                    "exchange": EXCHANGE,
+                },
+            },
         }
     ],
     fences=[],
+    payloads=[
+        {
+            "payload_id": PAYLOAD,
+            "length": "7",
+            "sha256": hashlib.sha256(b"payload").hexdigest(),
+            "references": "2",
+        }
+    ],
     publications=[
         {
             "publication_id": PUBLICATION,
+            "operation_id": OP,
+            "source_session": "1",
             "topic_hex": b"p1/example".hex(),
             "qos": 2,
             "retain": False,
-            "payload": {
-                "payload_id": PAYLOAD,
-                "length": "7",
-                "sha256": hashlib.sha256(b"payload").hexdigest(),
-            },
+            "payload_id": PAYLOAD,
         }
     ],
     obligations=[
@@ -1396,6 +1426,7 @@ snapshot = env(
             "publication_id": PUBLICATION,
             "index": index,
             "session": target,
+            "target_revision": "1",
             "cause": "LiveExact",
             "effective_qos": 1,
             "phase": "Queued",
@@ -1404,13 +1435,21 @@ snapshot = env(
     ],
     inbound_exchanges=[
         {
-            "exchange": {"session": "1", "generation": "1"},
+            "exchange": EXCHANGE,
             "packet_id": 7,
             "publication_id": PUBLICATION,
             "phase": "AwaitPubrel",
         }
     ],
-    accounts=[{"account": "broker", "used": USAGE, "limits": LIMITS}],
+    account={
+        "used": {
+            "payload_bytes": "7",
+            "references": "2",
+            "exchange_slots": "1",
+            "receipt_slots": "1",
+        },
+        "limits": LIMITS,
+    },
 )
 ok("store-snapshot-after-commit.json", snapshot)
 ok(
@@ -1420,15 +1459,23 @@ ok(
         run_id="p1-02-example",
         checkpoint="initial",
         backend="sqlite",
-        meta={"incarnation": "1", "epoch": "1"},
+        meta={
+            "incarnation": "1",
+            "last_opened_epoch": "0",
+            "opened_by": None,
+            "collected_through": "0",
+            "state_revision": "0",
+            "next_session": "1",
+        },
         sessions=[],
-        routes=[],
+        route_table={"revision": "0", "routes": []},
         operations=[],
         fences=[],
+        payloads=[],
         publications=[],
         obligations=[],
         inbound_exchanges=[],
-        accounts=[],
+        account={"used": dict.fromkeys(SIZES, "0"), "limits": LIMITS},
     ),
 )
 # A snapshot shows what the store holds, sound or not: an obligation without
@@ -1437,10 +1484,46 @@ ok(
     "store-snapshot-orphan-obligation.json",
     edited(snapshot, lambda v: v.update(publications=[])),
 )
+REFUSED_OP = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "2"}
+ok(
+    "store-snapshot-refused-and-fenced.json",
+    edited(
+        snapshot,
+        lambda v: (
+            v["operations"].append(
+                {
+                    "operation_id": REFUSED_OP,
+                    "recipe_hex": RECIPE_HEX,
+                    "decision": {
+                        "kind": "RejectedCertain",
+                        "reason": "CapacityExceeded",
+                        "resource": "references",
+                    },
+                }
+            ),
+            v["fences"].append(
+                {"operation_id": {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "3"}}
+            ),
+            v["sessions"][2].update(state="Terminal"),
+            # A publication outlives its payload once its obligations ended.
+            v.update(payloads=[], obligations=[]),
+        ),
+    ),
+)
 
 
 def snap_case(name, code, pointer, why, edit):
     bad(f"store-snapshot-{name}.json", code, pointer, why, edited(snapshot, edit))
+
+
+def twice(table, index=0, **changes):
+    """Repeat one row of a table, with ``changes``, right after itself."""
+
+    def edit(value):
+        rows = value[table]
+        rows.insert(index + 1, {**copy.deepcopy(rows[index]), **changes})
+
+    return edit
 
 
 snap_case(
@@ -1462,7 +1545,21 @@ snap_case(
     "schema-violation",
     "/operations/0/decision",
     "A receipt records a terminal decision; an unknown outcome is not a durable fact.",
-    setter(["operations", 0, "decision"], "PendingOrUnknown"),
+    setter(["operations", 0, "decision"], {"kind": "PendingOrUnknown"}),
+)
+snap_case(
+    "commit-without-facts",
+    "schema-violation",
+    "/operations/0/decision",
+    "A committed receipt says what was committed.",
+    dropped("operations", 0, "decision", "facts"),
+)
+snap_case(
+    "rejection-without-reason",
+    "schema-violation",
+    "/operations/0/decision",
+    "A certain rejection is recorded with its reason: that is what keeps it rejected.",
+    setter(["operations", 0, "decision"], {"kind": "RejectedCertain"}),
 )
 snap_case(
     "recipe-not-hex",
@@ -1479,41 +1576,60 @@ snap_case(
     dropped("obligations", 0, "cause"),
 )
 snap_case(
+    "opening-attempt-without-ticket",
+    "schema-violation",
+    "/meta/opened_by",
+    "The attempt that opened the last epoch is its start-up nonce and its ticket.",
+    dropped("meta", "opened_by", "ticket"),
+)
+snap_case(
+    "startup-nonce-too-short",
+    "schema-violation",
+    "/meta/opened_by/startup_hex",
+    "A start-up nonce is sixteen bytes.",
+    setter(["meta", "opened_by", "startup_hex"], "a7" * 15),
+)
+snap_case(
+    "session-state-unknown",
+    "schema-violation",
+    "/sessions/0/state",
+    "A session is active or terminal; a deleted one stays, terminal.",
+    setter(["sessions", 0, "state"], "Deleted"),
+)
+snap_case(
     "operation-listed-twice",
     "duplicate-name",
     "/operations/1/operation_id",
     "An OperationId designates one recipe: one row.",
-    lambda v: v["operations"].append(copy.deepcopy(v["operations"][0])),
+    twice("operations"),
 )
 snap_case(
     "obligation-listed-twice",
     "duplicate-name",
-    "/obligations/2",
+    "/obligations/1",
     "A DeliveryId designates one obligation, whatever destination a second row claims.",
-    lambda v: v["obligations"].append({**v["obligations"][0], "session": "1"}),
+    twice("obligations", session="1"),
 )
 snap_case(
     "inbound-slot-listed-twice",
     "duplicate-name",
     "/inbound_exchanges/1",
     "A session has one inbound exchange per Packet Identifier.",
-    lambda v: v["inbound_exchanges"].append(
-        {**v["inbound_exchanges"][0], "exchange": {"session": "1", "generation": "2"}}
-    ),
+    twice("inbound_exchanges", exchange={"session": "1", "generation": "2"}),
 )
 snap_case(
     "session-listed-twice",
     "duplicate-name",
-    "/sessions/3/session",
+    "/sessions/1/session",
     "A SessionId designates one session.",
-    lambda v: v["sessions"].append({**v["sessions"][0], "client_id_hex": "7a"}),
+    twice("sessions", client_id_hex="7a"),
 )
 snap_case(
     "route-listed-twice",
     "duplicate-name",
-    "/routes/1/topic_hex",
+    "/route_table/routes/1/topic_hex",
     "An exact topic has one route.",
-    lambda v: v["routes"].append(copy.deepcopy(v["routes"][0])),
+    lambda v: v["route_table"]["routes"].append(copy.deepcopy(v["route_table"]["routes"][0])),
 )
 snap_case(
     "fence-listed-twice",
@@ -1527,36 +1643,55 @@ snap_case(
     "duplicate-name",
     "/publications/1/publication_id",
     "A PublicationId designates one publication.",
-    lambda v: v["publications"].append(copy.deepcopy(v["publications"][0])),
+    twice("publications"),
 )
 snap_case(
-    "account-listed-twice",
+    "payload-listed-twice",
     "duplicate-name",
-    "/accounts/1/account",
-    "An account is listed once.",
-    lambda v: v["accounts"].append(copy.deepcopy(v["accounts"][0])),
+    "/payloads/1/payload_id",
+    "A PayloadId designates one payload.",
+    twice("payloads"),
 )
-for member in ("payload_bytes", "exchange_slots", "receipt_slots"):
-    snap_case(
-        f"account-limit-{member.replace('_', '-')}-overflow",
-        "u64-out-of-range",
-        f"/accounts/0/limits/{member}",
-        "Every limit of an account is 64-bit.",
-        setter(["accounts", 0, "limits", member], OVER),
-    )
+# Two stores in the same state write the same bytes: rows are in key order.
+snap_case(
+    "sessions-out-of-order",
+    "rows-out-of-order",
+    "/sessions/1/session",
+    "Sessions are listed in the numeric order of their SessionId.",
+    lambda v: v["sessions"].reverse(),
+)
+snap_case(
+    "sessions-in-text-order",
+    "rows-out-of-order",
+    "/sessions/3/session",
+    "The order is numeric: 10 comes after 3, not between 1 and 2.",
+    lambda v: (
+        v["sessions"].append({**v["sessions"][0], "session": "10", "client_id_hex": "7a"}),
+        v["sessions"].sort(key=lambda row: row["session"]),
+    ),
+)
+snap_case(
+    "obligations-out-of-order",
+    "rows-out-of-order",
+    "/obligations/1",
+    "Obligations are listed by publication, then index.",
+    lambda v: v["obligations"].reverse(),
+)
+snap_case(
+    "operations-out-of-order",
+    "rows-out-of-order",
+    "/operations/1/operation_id",
+    "Operations are listed by incarnation, epoch, owner, sequence.",
+    lambda v: v["operations"].insert(
+        0, {**copy.deepcopy(v["operations"][0]), "operation_id": REFUSED_OP}
+    ),
+)
 snap_case(
     "payload-length-overflow",
     "u64-out-of-range",
-    "/publications/0/payload/length",
+    "/payloads/0/length",
     "Sizes are 64-bit.",
-    setter(["publications", 0, "payload", "length"], OVER),
-)
-snap_case(
-    "account-usage-overflow",
-    "u64-out-of-range",
-    "/accounts/0/used/references",
-    "Accounts are 64-bit.",
-    setter(["accounts", 0, "used", "references"], OVER),
+    setter(["payloads", 0, "length"], OVER),
 )
 snap_case(
     "obligation-session-overflow",
@@ -1565,6 +1700,33 @@ snap_case(
     "Identities inside a list are range-checked as well.",
     setter(["obligations", 1, "session"], OVER),
 )
+for path in (
+    ["meta", "last_opened_epoch"],
+    ["meta", "opened_by", "ticket"],
+    ["meta", "collected_through"],
+    ["meta", "state_revision"],
+    ["meta", "next_session"],
+    ["route_table", "revision"],
+    ["payloads", 0, "references"],
+    ["publications", 0, "source_session"],
+    ["obligations", 0, "target_revision"],
+    ["account", "used", "references"],
+    ["account", "limits", "payload_bytes"],
+    ["account", "limits", "exchange_slots"],
+    ["account", "limits", "receipt_slots"],
+    ["account", "limits", "max_targets_per_admission"],
+    ["account", "limits", "max_topic_bytes"],
+    ["account", "limits", "max_payload_bytes"],
+    ["account", "limits", "max_sessions"],
+    ["account", "limits", "max_route_targets"],
+):
+    snap_case(
+        "overflow-" + "-".join(str(part).replace("_", "-") for part in path),
+        "u64-out-of-range",
+        "".join(f"/{part}" for part in path),
+        "Every 64-bit member of a snapshot is range-checked.",
+        setter(path, OVER),
+    )
 
 
 # run results. Qualifying results name files by digest, so their examples

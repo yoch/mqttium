@@ -37,6 +37,7 @@
     "contracts/examples/v1/valid/store-snapshot-after-commit.json",
     "contracts/examples/v1/valid/store-snapshot-empty.json",
     "contracts/examples/v1/valid/store-snapshot-orphan-obligation.json",
+    "contracts/examples/v1/valid/store-snapshot-refused-and-fenced.json",
     "contracts/examples/v1/valid/run-result-provisional-all-passing.json",
     "contracts/examples/v1/valid/run-result-provisional-fail-with-inconclusive.json",
     "contracts/examples/v1/valid/run-result-provisional-fault-not-hit.json",
@@ -698,6 +699,18 @@
       "why": "A receipt records a terminal decision; an unknown outcome is not a durable fact."
     },
     {
+      "file": "contracts/examples/v1/invalid/store-snapshot-commit-without-facts.json",
+      "code": "schema-violation",
+      "pointer": "/operations/0/decision",
+      "why": "A committed receipt says what was committed."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-rejection-without-reason.json",
+      "code": "schema-violation",
+      "pointer": "/operations/0/decision",
+      "why": "A certain rejection is recorded with its reason: that is what keeps it rejected."
+    },
+    {
       "file": "contracts/examples/v1/invalid/store-snapshot-recipe-not-hex.json",
       "code": "schema-violation",
       "pointer": "/operations/0/recipe_hex",
@@ -710,6 +723,24 @@
       "why": "The cause of an obligation stays inspectable (DEM-011)."
     },
     {
+      "file": "contracts/examples/v1/invalid/store-snapshot-opening-attempt-without-ticket.json",
+      "code": "schema-violation",
+      "pointer": "/meta/opened_by",
+      "why": "The attempt that opened the last epoch is its start-up nonce and its ticket."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-startup-nonce-too-short.json",
+      "code": "schema-violation",
+      "pointer": "/meta/opened_by/startup_hex",
+      "why": "A start-up nonce is sixteen bytes."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-session-state-unknown.json",
+      "code": "schema-violation",
+      "pointer": "/sessions/0/state",
+      "why": "A session is active or terminal; a deleted one stays, terminal."
+    },
+    {
       "file": "contracts/examples/v1/invalid/store-snapshot-operation-listed-twice.json",
       "code": "duplicate-name",
       "pointer": "/operations/1/operation_id",
@@ -718,7 +749,7 @@
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-obligation-listed-twice.json",
       "code": "duplicate-name",
-      "pointer": "/obligations/2",
+      "pointer": "/obligations/1",
       "why": "A DeliveryId designates one obligation, whatever destination a second row claims."
     },
     {
@@ -730,13 +761,13 @@
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-session-listed-twice.json",
       "code": "duplicate-name",
-      "pointer": "/sessions/3/session",
+      "pointer": "/sessions/1/session",
       "why": "A SessionId designates one session."
     },
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-route-listed-twice.json",
       "code": "duplicate-name",
-      "pointer": "/routes/1/topic_hex",
+      "pointer": "/route_table/routes/1/topic_hex",
       "why": "An exact topic has one route."
     },
     {
@@ -752,46 +783,154 @@
       "why": "A PublicationId designates one publication."
     },
     {
-      "file": "contracts/examples/v1/invalid/store-snapshot-account-listed-twice.json",
+      "file": "contracts/examples/v1/invalid/store-snapshot-payload-listed-twice.json",
       "code": "duplicate-name",
-      "pointer": "/accounts/1/account",
-      "why": "An account is listed once."
+      "pointer": "/payloads/1/payload_id",
+      "why": "A PayloadId designates one payload."
     },
     {
-      "file": "contracts/examples/v1/invalid/store-snapshot-account-limit-payload-bytes-overflow.json",
-      "code": "u64-out-of-range",
-      "pointer": "/accounts/0/limits/payload_bytes",
-      "why": "Every limit of an account is 64-bit."
+      "file": "contracts/examples/v1/invalid/store-snapshot-sessions-out-of-order.json",
+      "code": "rows-out-of-order",
+      "pointer": "/sessions/1/session",
+      "why": "Sessions are listed in the numeric order of their SessionId."
     },
     {
-      "file": "contracts/examples/v1/invalid/store-snapshot-account-limit-exchange-slots-overflow.json",
-      "code": "u64-out-of-range",
-      "pointer": "/accounts/0/limits/exchange_slots",
-      "why": "Every limit of an account is 64-bit."
+      "file": "contracts/examples/v1/invalid/store-snapshot-sessions-in-text-order.json",
+      "code": "rows-out-of-order",
+      "pointer": "/sessions/3/session",
+      "why": "The order is numeric: 10 comes after 3, not between 1 and 2."
     },
     {
-      "file": "contracts/examples/v1/invalid/store-snapshot-account-limit-receipt-slots-overflow.json",
-      "code": "u64-out-of-range",
-      "pointer": "/accounts/0/limits/receipt_slots",
-      "why": "Every limit of an account is 64-bit."
+      "file": "contracts/examples/v1/invalid/store-snapshot-obligations-out-of-order.json",
+      "code": "rows-out-of-order",
+      "pointer": "/obligations/1",
+      "why": "Obligations are listed by publication, then index."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-operations-out-of-order.json",
+      "code": "rows-out-of-order",
+      "pointer": "/operations/1/operation_id",
+      "why": "Operations are listed by incarnation, epoch, owner, sequence."
     },
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-payload-length-overflow.json",
       "code": "u64-out-of-range",
-      "pointer": "/publications/0/payload/length",
+      "pointer": "/payloads/0/length",
       "why": "Sizes are 64-bit."
-    },
-    {
-      "file": "contracts/examples/v1/invalid/store-snapshot-account-usage-overflow.json",
-      "code": "u64-out-of-range",
-      "pointer": "/accounts/0/used/references",
-      "why": "Accounts are 64-bit."
     },
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-obligation-session-overflow.json",
       "code": "u64-out-of-range",
       "pointer": "/obligations/1/session",
       "why": "Identities inside a list are range-checked as well."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-meta-last-opened-epoch.json",
+      "code": "u64-out-of-range",
+      "pointer": "/meta/last_opened_epoch",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-meta-opened-by-ticket.json",
+      "code": "u64-out-of-range",
+      "pointer": "/meta/opened_by/ticket",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-meta-collected-through.json",
+      "code": "u64-out-of-range",
+      "pointer": "/meta/collected_through",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-meta-state-revision.json",
+      "code": "u64-out-of-range",
+      "pointer": "/meta/state_revision",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-meta-next-session.json",
+      "code": "u64-out-of-range",
+      "pointer": "/meta/next_session",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-route-table-revision.json",
+      "code": "u64-out-of-range",
+      "pointer": "/route_table/revision",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-payloads-0-references.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payloads/0/references",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-publications-0-source-session.json",
+      "code": "u64-out-of-range",
+      "pointer": "/publications/0/source_session",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-obligations-0-target-revision.json",
+      "code": "u64-out-of-range",
+      "pointer": "/obligations/0/target_revision",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-used-references.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/used/references",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-payload-bytes.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/payload_bytes",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-exchange-slots.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/exchange_slots",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-receipt-slots.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/receipt_slots",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-max-targets-per-admission.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/max_targets_per_admission",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-max-topic-bytes.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/max_topic_bytes",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-max-payload-bytes.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/max_payload_bytes",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-max-sessions.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/max_sessions",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-max-route-targets.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/max_route_targets",
+      "why": "Every 64-bit member of a snapshot is range-checked."
     },
     {
       "file": "contracts/examples/v1/invalid/run-result-provisional-pass.json",
