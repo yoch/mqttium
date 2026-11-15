@@ -848,19 +848,23 @@ impl<B: Backend> Runner<'_, B> {
                         // The kill as the wait status showed it, before the
                         // crash (decision 0019); its process identifier goes
                         // to campaign.json only.
-                        if let Some(killed) = attempt.observed {
-                            self.emit(
-                                Origin::BenchSupervisor,
-                                "BrokerKilled",
-                                &[],
-                                json!({
-                                    "signal_sent": killed.signal_sent,
-                                    "wait_status": {"signal": killed.wait_signal},
-                                }),
-                            )?;
+                        let announcement = if let Some(killed) = attempt.observed {
+                            let payload = json!({
+                                "signal_sent": killed.signal_sent,
+                                "wait_status": {"signal": killed.wait_signal},
+                            });
+                            // Keep the OS receipt independently of whether the
+                            // collector can retain its trace announcement.
                             self.kills.push(killed);
-                        }
+                            self.emit(Origin::BenchSupervisor, "BrokerKilled", &[], payload)
+                                .map(|_| ())
+                        } else {
+                            Ok(())
+                        };
+                        // A typed drain failure remains the primary cause if
+                        // announcing the confirmed signal also failed.
                         attempt.result?;
+                        announcement?;
                         (None, open)
                     }
                 };
