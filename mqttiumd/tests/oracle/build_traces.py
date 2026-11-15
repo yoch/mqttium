@@ -2128,6 +2128,86 @@ case(
     events=resolved_from_the_bench,
 )
 
+# ------------------------------------------------- a real kill (record 0019)
+KILL = "broker_killed_for_real"
+CHILD = ("broker-core", "transport", "timer", "store-adapter", "dispatcher", "fault-injector")
+
+
+def killed(signal=9, claim=True, record=True):
+    """P1-02 whose broker is a child process the supervisor kills before the crash."""
+
+    def edit(events):
+        deepcopy_payloads(events)
+        if claim:
+            events[at(events, "header")]["payload"]["broker"] = "child-process"
+        if record:
+            crash = at(events, "crash")
+            frontier = [e["label"] for e in events[:crash] if e["origin"] in CHILD][-1]
+            events.insert(
+                crash,
+                ev(
+                    "killed",
+                    "bench-supervisor",
+                    "BrokerKilled",
+                    {"signal_sent": "SIGKILL", "wait_status": {"signal": signal}},
+                    [frontier],
+                ),
+            )
+
+    return edit
+
+
+case(
+    "p1-02-good-killed-for-real",
+    "The broker runs as a child process; the supervisor kills it with SIGKILL and records the status before the crash.",
+    events=killed(),
+)
+case(
+    "killed-without-its-evidence",
+    "The run claims a child process and records no kill before its crash: the evidence is missing.",
+    {KILL: "INCONCLUSIVE"},
+    events=killed(record=False),
+)
+case(
+    "killed-by-another-signal",
+    "The run claims a kill and the status says the child ended by signal 15, not 9.",
+    {KILL: "FAIL"},
+    events=killed(signal=15),
+)
+case(
+    "kill-recorded-by-a-run-in-process",
+    "A run that claims no child process records a kill.",
+    {KILL: "FAIL"},
+    events=killed(claim=False),
+)
+
+
+def child_after_its_kill(events):
+    # The killed incarnation still writes after the kill: a deadline armed
+    # by the timer of incarnation 1.
+    killed()(events)
+    insert_after(
+        events,
+        "killed",
+        [
+            ev(
+                "zombie",
+                "timer",
+                "DeadlineArmed",
+                {"effect_id": effect(1, 9), "token": "9", "after": "30"},
+                ["killed"],
+            )
+        ],
+    )
+
+
+case(
+    "child-writes-after-its-kill",
+    "A record of the killed incarnation of the child comes after the kill.",
+    {KILL: "FAIL"},
+    events=child_after_its_kill,
+)
+
 # ---------------------------------------------- a violation of the store (f)
 
 
