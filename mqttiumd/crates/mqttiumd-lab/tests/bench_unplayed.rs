@@ -13,6 +13,10 @@ use std::path::PathBuf;
 use mqttiumd_lab::bench::campaign::{Request, execute};
 
 fn refused(scenario: &str, name: &str) -> String {
+    refused_on(scenario, name, "sim-store")
+}
+
+fn refused_on(scenario: &str, name: &str, backend: &str) -> String {
     let out = bench_support::fresh(name);
     let request = Request {
         root: bench_support::root(),
@@ -21,7 +25,7 @@ fn refused(scenario: &str, name: &str) -> String {
         out: out.clone(),
         seed: 1,
         run_id: Some("bench-test".to_owned()),
-        backend: "sim-store".to_owned(),
+        backend: backend.to_owned(),
         built_from: None,
         process: "in-process".to_owned(),
     };
@@ -38,4 +42,27 @@ fn a_repeated_fault_of_decision_0018_is_refused_before_anything_is_written() {
     );
     assert!(why.contains("from_occurrence"), "{why}");
     assert!(why.contains("not played"), "{why}");
+}
+
+/// `tests/scenarios/audit/F3-permanent.json` (`F3-PERMANENT`) is the
+/// example of the contracts as it stands; it stays refused, on both
+/// stores, until the store adapter repeats a fault (lot L2).
+#[test]
+fn the_permanent_delay_of_the_audit_is_the_example_and_is_refused_until_faults_repeat() {
+    const AUDIT: &str = "tests/scenarios/audit/F3-permanent.json";
+    let read = |relative: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(bench_support::root().join(relative)).unwrap())
+            .unwrap()
+    };
+    let audit = read(AUDIT);
+    assert_eq!(
+        audit,
+        read("contracts/examples/v1/valid/scenario-permanent-delay.json")
+    );
+    assert_eq!(audit["id"], "F3-PERMANENT");
+    for backend in ["sim-store", "sqlite"] {
+        let why = refused_on(AUDIT, &format!("unplayed-permanent-{backend}"), backend);
+        assert!(why.contains("from_occurrence"), "{backend}: {why}");
+        assert!(why.contains("not played"), "{backend}: {why}");
+    }
 }
