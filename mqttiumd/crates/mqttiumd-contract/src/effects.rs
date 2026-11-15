@@ -161,7 +161,24 @@ impl RecoveryOrder {
     /// Accepts `fact` as the next of the inventory, or says why it is out
     /// of place. A refusal changes nothing.
     pub fn admit(&mut self, fact: &RecoveredFact) -> Result<(), OrderRefused> {
-        let _ = fact;
+        let found = fact.rank();
+        if let Some(previous) = self.last {
+            if found < previous {
+                return Err(OrderRefused::RankDecreased { previous, found });
+            }
+            if found == previous && found.at_most_once() {
+                return Err(OrderRefused::Repeated(found));
+            }
+        }
+        if let RecoveredFact::Route { topic, .. } = fact {
+            if let Some(previous) = &self.last_topic
+                && topic.as_slice() < previous.as_slice()
+            {
+                return Err(OrderRefused::RoutesUnsorted);
+            }
+            self.last_topic = Some(topic.clone());
+        }
+        self.last = Some(found);
         Ok(())
     }
 }
