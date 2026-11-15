@@ -259,6 +259,8 @@ pub struct Books {
     pub hits: Vec<u64>,
     /// The work each scenario fault holds, while it holds one.
     pub held: BTreeMap<usize, WorkId>,
+    /// The scenario fault of the last barrier reached.
+    pub barrier: Option<usize>,
     /// Events no record of the formats carries, by kind, counted.
     pub unwritten: BTreeMap<String, u64>,
 }
@@ -433,6 +435,9 @@ fn flush(
                 fault, action, id, ..
             } => {
                 if let Some(scenario) = books.scenario_fault.get(fault.0).copied() {
+                    if action == FaultAction::Barrier {
+                        books.barrier = Some(scenario);
+                    }
                     if let Some(hits) = books.hits.get_mut(scenario) {
                         *hits = hits.saturating_add(1);
                     }

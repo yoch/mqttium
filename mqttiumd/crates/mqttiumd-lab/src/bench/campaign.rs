@@ -581,7 +581,6 @@ pub fn execute(request: &Request) -> Result<Report, String> {
         "limits": [
             "the binary is identified by its digest; that it was built from the recorded revision and modifications is not established",
             "a fault at the fence point, or on the result of a resolution, selects every resolution: the store adapter gives a resolution no source",
-            "the scenario vocabulary has no step that leaves a barrier: the runner keeps the store adapter at its barrier while the next steps only inspect the store or crash the broker, and leaves it before any other step",
             "the authority of the runner keeps one owner active: S0 runs owner 0 only",
         ],
         "artifacts": inventory,

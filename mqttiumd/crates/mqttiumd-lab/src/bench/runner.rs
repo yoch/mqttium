@@ -143,6 +143,8 @@ struct Runner<'a> {
     snapshots: Vec<(String, Vec<u8>)>,
     /// Hits of each fault already awaited by a `DriveUntil`.
     awaited: Vec<u64>,
+    /// The barriers a `LeaveBarrier` step left, by scenario fault.
+    left_barriers: std::collections::BTreeSet<usize>,
     step_index: usize,
 }
 
@@ -464,17 +466,6 @@ impl Runner<'_> {
     }
 
     fn play(&mut self, step: &Step) -> Result<(), Stop> {
-        // A barrier holds the adapter at its point while the steps after
-        // the one that waited for it only look (an inspection) or crash
-        // the broker. Any other step acts on the broker, and the adapter
-        // first goes on from the point. The scenario vocabulary has no
-        // step that leaves a barrier: this is the rule of the runner.
-        if !matches!(step, Step::InspectDurableState { .. } | Step::CrashBroker)
-            && let Some(process) = self.process.as_mut()
-            && process.halted()
-        {
-            process.leave_barrier(&mut self.collector, &mut self.books)?;
-        }
         match step {
             Step::ClientResumeSession {
                 client,
@@ -641,6 +632,29 @@ impl Runner<'_> {
                 }
                 Ok(())
             }
+            Step::LeaveBarrier { fault } => {
+                let index = self.fault_index(fault)?;
+                let declared = &self.scenario.faults[index];
+                if declared.action != crate::store::adapter::FaultAction::Barrier {
+                    return Err(Stop::new(format!("{fault} is not a barrier")));
+                }
+                if self.books.hits.get(index).copied().unwrap_or(0) == 0 {
+                    return Err(Stop::new(format!("{fault} was not reached")));
+                }
+                if !self.left_barriers.insert(index) {
+                    return Err(Stop::new(format!("{fault} was already left")));
+                }
+                let process = self
+                    .process
+                    .as_mut()
+                    .ok_or_else(|| Stop::new("the broker is not running"))?;
+                if !process.halted() || self.books.barrier != Some(index) {
+                    return Err(Stop::new(format!(
+                        "the store adapter is not stopped at {fault}"
+                    )));
+                }
+                process.leave_barrier(&mut self.collector, &mut self.books)
+            }
             Step::InspectDurableState { checkpoint } => {
                 let durable = match (&self.process, &self.dormant) {
                     (Some(process), _) => process.durable(),
@@ -763,6 +777,7 @@ pub fn run(plan: Plan<'_>) -> Outcome {
         elementary: 0,
         snapshots: Vec::new(),
         awaited: vec![0; scenario.faults.len()],
+        left_barriers: std::collections::BTreeSet::new(),
         step_index: 0,
     };
     let mut stopped = header
