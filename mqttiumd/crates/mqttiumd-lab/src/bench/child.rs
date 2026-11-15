@@ -37,13 +37,15 @@ use mqttiumd_contract::ids::{ConnectionGeneration, SessionId};
 use super::backend::sqlite_settings;
 use super::campaign::settings_of;
 use super::collector::{Cause, Collector, KindTable, Origin};
+use super::failure::{ControlCode, ControlPhase};
 use super::process::{Books, Choice, Process, Stop, Written};
 use super::protocol::{
-    Action, Evidence, Report, Sequencer, Window, choices_digest, read_frame, resolve_choice,
-    write_frame,
+    Action, Evidence, Refusal, Report, Sequencer, Window, choices_digest, read_frame,
+    resolve_choice, write_frame,
 };
 use super::runner::{Population, bound_exchanges, specification};
 use super::scenario::Scenario;
+use mqttiumd_store_api::ReadPhase;
 
 /// How long the supervisor waits for one frame of a child before it stops
 /// the run.
@@ -105,7 +107,7 @@ pub struct State {
 enum Arrival {
     Evidence(Origin, Evidence),
     Report(Report),
-    Broken(String),
+    Broken(Refusal),
 }
 
 /// What the supervisor observed of a kill.
@@ -162,6 +164,8 @@ pub struct Child {
     ended: bool,
     /// A command still owns its SQLite stack, after the retained hit's ack.
     parked: Option<Value>,
+    /// Each non-ack action consumes one serial, including empty actions.
+    next_action: u64,
 }
 
 fn stop(reason: impl Into<String>) -> Stop {
@@ -203,17 +207,14 @@ fn reader(
                 Ok(Some(body)) => match origin {
                     Some(origin) => match Evidence::decode(&body) {
                         Ok(evidence) => Arrival::Evidence(origin, evidence),
-                        Err(refusal) => Arrival::Broken(format!("{}: {refusal}", origin.name())),
+                        Err(refusal) => Arrival::Broken(refusal),
                     },
                     None => match Report::decode(&body) {
                         Ok(report) => Arrival::Report(report),
-                        Err(refusal) => Arrival::Broken(format!("a report: {refusal}")),
+                        Err(refusal) => Arrival::Broken(refusal),
                     },
                 },
-                Err(refusal) => Arrival::Broken(format!(
-                    "{}: {refusal}",
-                    origin.map_or("the control descriptor", Origin::name)
-                )),
+                Err(refusal) => Arrival::Broken(refusal),
             };
             let broken = matches!(read, Arrival::Broken(_));
             if to.send(read).is_err() || broken {
@@ -224,6 +225,19 @@ fn reader(
 }
 
 impl Child {
+    fn control(&self, code: ControlCode, phase: ControlPhase, message: impl Into<String>) -> Stop {
+        Stop::control(code, phase, self.rank + 1, message)
+    }
+
+    fn broken(&self, refusal: Refusal, phase: ControlPhase) -> Stop {
+        let code = match refusal {
+            Refusal::Truncated => ControlCode::TruncatedFrame,
+            Refusal::TooLarge(_) => ControlCode::FrameTooLarge,
+            Refusal::Io(_) => ControlCode::Io,
+            _ => ControlCode::InvalidFrame,
+        };
+        self.control(code, phase, format!("the child broke: {refusal}"))
+    }
     /// Starts a child of rank `rank` with the scenario faults `armed`, and
     /// has it start the process by the real path.
     pub fn spawn(
@@ -304,6 +318,7 @@ impl Child {
             silence: config.silence,
             ended: true,
             parked: None,
+            next_action: 0,
         };
         let deadline = Instant::now() + config.silence;
         for (origin, listener) in &listeners {
@@ -376,10 +391,22 @@ impl Child {
                 "a transaction is parked in flight: only SIGKILL may follow",
             ));
         }
-        let actions = self
-            .actions
-            .as_mut()
-            .ok_or_else(|| stop("the standard input of the child is closed"))?;
+        let action_sequence = self.next_action;
+        self.next_action = self.next_action.checked_add(1).ok_or_else(|| {
+            self.control(
+                ControlCode::InvalidOrdering,
+                ControlPhase::Action,
+                "action serial exhausted",
+            )
+        })?;
+        let actions = self.actions.as_mut().ok_or_else(|| {
+            Stop::control(
+                ControlCode::ClosedChannel,
+                ControlPhase::Action,
+                self.rank + 1,
+                "the standard input of the child is closed",
+            )
+        })?;
         self.ended = false;
         write_frame(actions, &action.encode())
             .map_err(|refusal| stop(format!("the child does not read: {refusal}")))?;
@@ -426,6 +453,13 @@ impl Child {
             {
                 break;
             }
+            if Instant::now() >= deadline {
+                return Err(self.control(
+                    ControlCode::ActionDeadlineExceeded,
+                    ControlPhase::Action,
+                    "the action exceeded its absolute deadline",
+                ));
+            }
             match self
                 .received
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -440,28 +474,34 @@ impl Child {
                 }
                 Ok(Arrival::Report(report)) => {
                     if control_reports >= REPORTS_PER_ACTION {
-                        return Err(stop("the child exceeded the bounded action report list"));
+                        return Err(self.control(
+                            ControlCode::ReportBudgetExceeded,
+                            ControlPhase::Action,
+                            "the child exceeded the bounded action report list",
+                        ));
                     }
                     control_reports += 1;
                     match report {
-                        Report::EndOfAction { last_emission } => {
-                            if end.is_some() {
-                                return Err(stop(
-                                    "the child sent more than one action termination",
-                                ));
+                        Report::EndOfAction {
+                            action_sequence: received_action,
+                            last_emission,
+                        } => {
+                            if received_action != action_sequence || end.is_some() {
+                                return Err(self.control(ControlCode::DuplicateTermination, ControlPhase::Action,
+                                    "the child repeated, contradicted or reused an action termination"));
                             }
                             end = Some(last_emission);
                         }
                         Report::Parked {
+                            action_sequence: received_action,
                             last_emission,
                             fault,
                             point,
                             settings,
                         } => {
-                            if end.is_some() {
-                                return Err(stop(
-                                    "the child sent more than one action termination",
-                                ));
+                            if received_action != action_sequence || end.is_some() {
+                                return Err(self.control(ControlCode::DuplicateTermination, ControlPhase::Action,
+                                    "the child repeated, contradicted or reused an action termination"));
                             }
                             if Some(last_emission) != acknowledged || !self.sequencer.is_empty() {
                                 return Err(stop(
@@ -494,19 +534,24 @@ impl Child {
                         other => reports.push(other),
                     }
                 }
-                Ok(Arrival::Broken(why)) => return Err(stop(format!("the child broke: {why}"))),
+                Ok(Arrival::Broken(why)) => return Err(self.broken(why, ControlPhase::Action)),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(stop(format!(
-                        "the child {} did not finish its action within {} ms",
-                        self.pid,
-                        self.silence.as_millis()
-                    )));
+                    return Err(self.control(
+                        ControlCode::ActionDeadlineExceeded,
+                        ControlPhase::Action,
+                        format!(
+                            "the child {} did not finish its action within {} ms",
+                            self.pid,
+                            self.silence.as_millis()
+                        ),
+                    ));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(stop(format!(
-                        "the child {} closed its descriptors",
-                        self.pid
-                    )));
+                    return Err(self.control(
+                        ControlCode::ClosedChannel,
+                        ControlPhase::Action,
+                        format!("the child {} closed its descriptors", self.pid),
+                    ));
                 }
             }
         }
@@ -556,13 +601,22 @@ impl Child {
                     books.barrier = self.state.barrier;
                 }
                 Report::Refused { reason } | Report::Stopped { reason } => {
-                    failure.get_or_insert(reason);
+                    failure.get_or_insert_with(|| stop(reason));
+                }
+                Report::Failed {
+                    failure: cause,
+                    message,
+                } => {
+                    failure.get_or_insert(Stop {
+                        message,
+                        failure: Some(cause),
+                    });
                 }
                 other => others.push(other),
             }
         }
         match failure {
-            Some(reason) => Err(stop(reason)),
+            Some(reason) => Err(reason),
             None => {
                 if self.parked.is_some() {
                     self.eligible.clear();
@@ -780,7 +834,7 @@ impl Child {
             let what = match arrival {
                 Arrival::Evidence(origin, _) => format!("a record of {}", origin.name()),
                 Arrival::Report(_) => "a report".to_owned(),
-                Arrival::Broken(why) => why,
+                Arrival::Broken(why) => return Err(self.broken(why, ControlPhase::KillDrain)),
             };
             return Err(stop(format!(
                 "the child {} is not drained: {what} waits unread",
@@ -818,25 +872,37 @@ impl Child {
                 Ok(arrival) => {
                     count += 1;
                     if count > ARRIVAL_CAPACITY {
-                        return Err(stop(
+                        return Err(self.control(
+                            ControlCode::ReportBudgetExceeded,
+                            ControlPhase::KillDrain,
                             "the killed child's evidence drain exceeded its frame budget",
                         ));
                     }
-                    let why = match arrival {
-                        Arrival::Evidence(origin, _) => {
-                            format!("a record of {} arrived after the kill", origin.name())
-                        }
-                        Arrival::Report(_) => "a control report arrived after the kill".to_owned(),
-                        Arrival::Broken(why) => format!("the killed child's evidence broke: {why}"),
+                    let error = match arrival {
+                        Arrival::Evidence(origin, _) => self.control(
+                            ControlCode::LateEvidence,
+                            ControlPhase::KillDrain,
+                            format!("a record of {} arrived after the kill", origin.name()),
+                        ),
+                        Arrival::Report(_) => self.control(
+                            ControlCode::LateReport,
+                            ControlPhase::KillDrain,
+                            "a control report arrived after the kill",
+                        ),
+                        Arrival::Broken(why) => self.broken(why, ControlPhase::KillDrain),
                     };
-                    failure.get_or_insert_with(|| stop(why));
+                    failure.get_or_insert(error);
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(stop(format!(
-                        "the descriptors of the killed child {} did not close",
-                        self.pid
-                    )));
+                    return Err(self.control(
+                        ControlCode::DrainDeadlineExceeded,
+                        ControlPhase::KillDrain,
+                        format!(
+                            "the descriptors of the killed child {} did not close",
+                            self.pid
+                        ),
+                    ));
                 }
             }
         }
@@ -1039,6 +1105,7 @@ fn arm_transaction_barrier(
     choice: &Choice,
     books: &Books,
     io: &Arc<Mutex<ChildIo>>,
+    action_sequence: u64,
 ) -> Result<bool, Stop> {
     use crate::store::adapter::FaultPoint;
     use mqttiumd_store_sqlite::kill_points::KillPoint;
@@ -1102,6 +1169,7 @@ fn arm_transaction_barrier(
                 write_frame(
                     reports,
                     &Report::Parked {
+                        action_sequence,
                         last_emission: relay.last.ok_or("transaction hit was not emitted")?,
                         fault,
                         point: prepared.point.name().to_owned(),
@@ -1163,7 +1231,7 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
             .map(|(name, id)| (name.clone(), Vec::new(), SessionId::new(*id)))
             .collect(),
     };
-    let bound = bound_exchanges(&scenario, &population).map_err(|Stop(why)| why)?;
+    let bound = bound_exchanges(&scenario, &population).map_err(|error| error.to_string())?;
     let mut faults = Vec::new();
     for &index in &arguments.armed {
         let fault = scenario
@@ -1173,7 +1241,7 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
         let name: &'static str = Box::leak(fault.id.clone().into_boxed_str());
         faults.push((
             index,
-            specification(fault, &bound).map_err(|Stop(why)| why)?,
+            specification(fault, &bound).map_err(|error| error.to_string())?,
             name,
         ));
     }
@@ -1205,6 +1273,7 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
     let mut process: Option<Process<mqttiumd_store_sqlite::SqliteStore>> = None;
     let mut offered: Vec<Choice> = Vec::new();
     let mut published: Vec<String> = Vec::new();
+    let mut next_action = 0_u64;
     loop {
         let body = {
             let mut io = io.lock().map_err(|_| "the child IO lock is poisoned")?;
@@ -1215,6 +1284,10 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
             return Ok(());
         };
         let action = Action::decode(&body).map_err(|refusal| refusal.to_string())?;
+        let action_sequence = next_action;
+        next_action = next_action
+            .checked_add(1)
+            .ok_or("action serial exhausted")?;
         let mut others: Vec<Report> = Vec::new();
         let mut stopping = false;
         let outcome: Result<(), Stop> = (|| {
@@ -1225,7 +1298,12 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
                     }
                     let store = mqttiumd_store_sqlite::SqliteStore::open(&arguments.store)
                         .map_err(|error| {
-                            stop(format!("{}: {error:?}", arguments.store.display()))
+                            Stop::read(
+                                error.read_error(),
+                                ReadPhase::Open,
+                                arguments.rank + 1,
+                                None,
+                            )
                         })?;
                     let read_back = sqlite_settings(&store).to_string();
                     let mut startup = Vec::new();
@@ -1276,7 +1354,13 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
                                     relay.send(&mut collector, actions).map_err(stop)?;
                                     relay.drain(actions).map_err(stop)?;
                                 }
-                                arm_transaction_barrier(current, &choice, &books, &io)?
+                                arm_transaction_barrier(
+                                    current,
+                                    &choice,
+                                    &books,
+                                    &io,
+                                    action_sequence,
+                                )?
                             };
                             let written = current.perform(&choice, &mut collector, &mut books)?;
                             #[cfg(feature = "kill-points")]
@@ -1377,8 +1461,23 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
         for other in &others {
             report(reports, other)?;
         }
-        if let Err(Stop(reason)) = outcome {
-            report(reports, &Report::Stopped { reason })?;
+        if let Err(error) = outcome {
+            stopping = true;
+            match error.failure {
+                Some(failure) => report(
+                    reports,
+                    &Report::Failed {
+                        failure,
+                        message: error.message,
+                    },
+                )?,
+                None => report(
+                    reports,
+                    &Report::Stopped {
+                        reason: error.message,
+                    },
+                )?,
+            }
         }
         if let Some(current) = &process {
             offered = current.choices();
@@ -1421,6 +1520,7 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
         report(
             reports,
             &Report::EndOfAction {
+                action_sequence,
                 last_emission: relay.last,
             },
         )?;

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 
 use mqttiumd_contract::ids::StoreIncarnation;
+use mqttiumd_store_api::ReadError;
 
 use crate::store::durable::{DurableState, DurableStore, Limits, MemoryStore};
 
@@ -28,16 +29,16 @@ pub trait Backend {
         &mut self,
         incarnation: StoreIncarnation,
         limits: Limits,
-    ) -> Result<Self::Store, String>;
+    ) -> Result<Self::Store, ReadError>;
 
     /// What a crash of the process under test leaves, reopened for the
     /// next start-up: the durable state and nothing else.
-    fn reopen_after_crash(&mut self, store: Self::Store) -> Result<Self::Store, String>;
+    fn reopen_after_crash(&mut self, store: Self::Store) -> Result<Self::Store, ReadError>;
 
     /// The durable state, read independently of the broker.
     /// `store` is the store of the process when it runs in the process of
     /// the supervisor, `None` when it runs in a child or does not run.
-    fn inspect(&self, store: Option<&Self::Store>) -> Result<DurableState, String>;
+    fn inspect(&self, store: Option<&Self::Store>) -> Result<DurableState, ReadError>;
 
     /// What the campaign states about the engine: for SQLite its exact
     /// version, compile options and the settings read back (DEM-011).
@@ -62,18 +63,16 @@ impl Backend for Memory {
         &mut self,
         incarnation: StoreIncarnation,
         limits: Limits,
-    ) -> Result<MemoryStore, String> {
+    ) -> Result<MemoryStore, ReadError> {
         Ok(MemoryStore::create(incarnation, limits))
     }
 
-    fn reopen_after_crash(&mut self, store: MemoryStore) -> Result<MemoryStore, String> {
-        Ok(MemoryStore::reopen(store.snapshot()))
+    fn reopen_after_crash(&mut self, store: MemoryStore) -> Result<MemoryStore, ReadError> {
+        Ok(MemoryStore::reopen(store.snapshot()?))
     }
 
-    fn inspect(&self, store: Option<&MemoryStore>) -> Result<DurableState, String> {
-        store.map(MemoryStore::snapshot).ok_or_else(|| {
-            "the deterministic store lives only in the process that runs it".to_owned()
-        })
+    fn inspect(&self, store: Option<&MemoryStore>) -> Result<DurableState, ReadError> {
+        store.ok_or(ReadError::Unavailable)?.snapshot()
     }
 
     fn describe(&self) -> Value {
@@ -144,32 +143,35 @@ impl Backend for Sqlite {
         &mut self,
         incarnation: StoreIncarnation,
         limits: Limits,
-    ) -> Result<Self::Store, String> {
+    ) -> Result<Self::Store, ReadError> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("{}: {error}", parent.display()))?;
+            std::fs::create_dir_all(parent).map_err(|error| match error.kind() {
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound => {
+                    ReadError::Unavailable
+                }
+                _ => ReadError::Io,
+            })?;
         }
         let store = mqttiumd_store_sqlite::SqliteStore::create(&self.path, incarnation, limits)
-            .map_err(|error| format!("{}: {error:?}", self.path.display()))?;
+            .map_err(|error| error.read_error())?;
         self.remember(&store);
         Ok(store)
     }
 
-    fn reopen_after_crash(&mut self, store: Self::Store) -> Result<Self::Store, String> {
+    fn reopen_after_crash(&mut self, store: Self::Store) -> Result<Self::Store, ReadError> {
         // The connection goes with the process; the next start-up opens
         // the same file and finds what the engine made durable.
         drop(store);
         let store = mqttiumd_store_sqlite::SqliteStore::open(&self.path)
-            .map_err(|error| format!("{}: {error:?}", self.path.display()))?;
+            .map_err(|error| error.read_error())?;
         self.remember(&store);
         Ok(store)
     }
 
-    fn inspect(&self, _store: Option<&Self::Store>) -> Result<DurableState, String> {
+    fn inspect(&self, _store: Option<&Self::Store>) -> Result<DurableState, ReadError> {
         // Without the writer: a connection of its own, read-only, one read
         // transaction, closed before the answer; never a checkpoint.
         mqttiumd_store_sqlite::SqliteStore::inspect(&self.path)
-            .map_err(|error| format!("{}: {error:?}", self.path.display()))
     }
 
     fn describe(&self) -> Value {

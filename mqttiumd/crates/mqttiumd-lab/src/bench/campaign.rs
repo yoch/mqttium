@@ -44,6 +44,7 @@ use crate::store::durable::MAX_CLIENT_ID_BYTES;
 use crate::store::fixture;
 use crate::strict;
 use crate::workspace::Workspace;
+use mqttiumd_store_api::ReadPhase;
 
 /// The resolution delay of the owner, in logical time units. The
 /// specification fixes none for S0; the corpus uses 30.
@@ -312,7 +313,7 @@ pub fn settings_of(
         limits.payload_bytes.get(),
         RESOLUTION_DELAY,
     )
-    .map_err(|Stop(reason)| reason)?;
+    .map_err(|error| error.to_string())?;
     let effect_slots: usize = narrow(capacity(fixture_document, "effect_slots")?, "effect_slots")?;
     let effect_slots = NonZeroUsize::new(effect_slots).ok_or("no effect slot")?;
     let reservations = NonZeroU32::new(narrow(effect_slots.get() as u64, "reservations")?)
@@ -359,12 +360,17 @@ impl<S: crate::store::durable::DurableStore> Setup<S> {
         run_id: &str,
         seed: u64,
         faults: usize,
-    ) -> Result<Self, String> {
-        let plan = fixture::plan(fixture_document).map_err(|error| format!("{error:?}"))?;
-        let mut store = backend.create(plan.incarnation, plan.limits)?;
-        let installed =
-            fixture::install(&mut store, &plan).map_err(|error| format!("{error:?}"))?;
-        let settings = settings_of(fixture_document, run_id, seed, faults)?;
+    ) -> Result<Self, Stop> {
+        let plan =
+            fixture::plan(fixture_document).map_err(|error| Stop::new(format!("{error:?}")))?;
+        let mut store = backend
+            .create(plan.incarnation, plan.limits)
+            .map_err(|error| Stop::read(error, ReadPhase::Open, 1, None))?;
+        let installed = fixture::install(&mut store, &plan).map_err(|error| match error {
+            fixture::FixtureError::Read(error) => Stop::read(error, ReadPhase::Snapshot, 1, None),
+            other => Stop::new(format!("{other:?}")),
+        })?;
+        let settings = settings_of(fixture_document, run_id, seed, faults).map_err(Stop::new)?;
         let population = Population {
             clients: plan
                 .sessions
@@ -376,7 +382,8 @@ impl<S: crate::store::durable::DurableStore> Setup<S> {
                         .map(|id| (session.client.clone(), session.client_id.clone(), *id))
                         .ok_or_else(|| format!("{} has no session", session.client))
                 })
-                .collect::<Result<_, _>>()?,
+                .collect::<Result<_, _>>()
+                .map_err(Stop::new)?,
         };
         Ok(Self {
             settings,
@@ -590,7 +597,8 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         &run_id,
         request.seed,
         scenario.faults.len(),
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let schema_path = out.join(format!(
         "{}/trace-record.schema.json",
         files::contract_directories(Path::new(&contracts))?.1
@@ -746,7 +754,7 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     for (path, _) in &outcome.snapshots {
         artifacts.push(artifact(out, path)?);
     }
-    let result = json!({
+    let mut result = json!({
         "format": "mqttiumd.run-result",
         "schema_version": 1,
         "qualification": "provisional",
@@ -759,6 +767,10 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         "faults": faults,
         "artifacts": artifacts,
     });
+    if outcome.failure_count != 0 {
+        result["failure_count"] = json!(outcome.failure_count.to_string());
+        result["failures"] = json!(&outcome.failures);
+    }
     let mut text = serde_json::to_vec_pretty(&result).map_err(|error| error.to_string())?;
     text.push(b'\n');
     write(out, "run-result.json", &text)?;

@@ -53,9 +53,8 @@ use crate::store::adapter::{
 use crate::store::durable::DurableStore;
 use crate::store::evidence::{Cause as EvidenceCause, TraceWriter, outcome_fields, recovered_fact};
 
-/// Why the run cannot go on. The trace is then declared incomplete.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Stop(pub String);
+pub use super::failure::Stop;
+use mqttiumd_store_api::ReadPhase;
 
 /// Evidence staged for one concrete command. It is emitted only by the
 /// callback at the selected SQLite point; it is never normal evidence
@@ -65,12 +64,6 @@ pub struct TransactionBarrier {
     pub point: crate::store::adapter::FaultPoint,
     pub scenario_fault: usize,
     pub lines: Vec<u8>,
-}
-
-impl Stop {
-    pub fn new(reason: impl Into<String>) -> Self {
-        Self(reason.into())
-    }
 }
 
 /// The parameters of the process, the same at every start-up.
@@ -693,9 +686,19 @@ impl<S: DurableStore> Process<S> {
             names,
         );
         // The opening: read the ledger, submit, writer, reply, grant.
-        let mut opening = sim.begin_opening(startup_nonce(settings.seed, rank));
+        let process_incarnation = collector.incarnation(Origin::StoreAdapter);
+        let mut opening = sim
+            .begin_opening(startup_nonce(settings.seed, rank))
+            .map_err(|error| Stop::read(error, ReadPhase::Ledger, process_incarnation, None))?;
         let command = opening
-            .submit(sim.store().ledger().last_opened())
+            .submit(
+                sim.store()
+                    .ledger()
+                    .map_err(|error| {
+                        Stop::read(error, ReadPhase::Ledger, process_incarnation, None)
+                    })?
+                    .last_opened(),
+            )
             .map_err(|refused| Stop::new(format!("the opening cannot start: {refused:?}")))?;
         sim.submit_opening(command).map_err(|blocked| {
             Stop::new(format!("the adapter refused the opening: {blocked:?}"))
@@ -738,6 +741,14 @@ impl<S: DurableStore> Process<S> {
                             )));
                         }
                     }
+                }
+                Err(crate::store::adapter::ActionRefused::Read(error)) => {
+                    return Err(Stop::read(
+                        error,
+                        ReadPhase::Opening,
+                        process_incarnation,
+                        None,
+                    ));
                 }
                 other => return Err(Stop::new(format!("the opening went wrong: {other:?}"))),
             }
@@ -827,16 +838,30 @@ impl<S: DurableStore> Process<S> {
     pub fn recover(&mut self, collector: &mut Collector, books: &mut Books) -> Result<(), Stop> {
         let mut cursor = None;
         let mut page_number = 0u64;
+        let mut inventory_rows = 0_usize;
         loop {
-            let page = match self.store.recover(cursor, self.settings.recovery_page) {
-                Ok(page) => page,
-                Err(crate::store::durable::RecoveryRefused::FrontierMoved) => {
-                    cursor = None;
-                    page_number = 0;
-                    continue;
-                }
-                Err(refused) => return Err(Stop::new(format!("recovery refused: {refused:?}"))),
-            };
+            let page = self
+                .store
+                .recover(cursor, self.settings.recovery_page)
+                .map_err(|error| {
+                    Stop::read(
+                        error,
+                        ReadPhase::Recovery,
+                        collector.incarnation(Origin::StoreAdapter),
+                        Some(page_number),
+                    )
+                })?;
+            inventory_rows = inventory_rows
+                .checked_add(page.facts.as_slice().len())
+                .filter(|total| *total <= mqttiumd_store_api::MAX_RECOVERY_INVENTORY_ROWS)
+                .ok_or_else(|| {
+                    Stop::read(
+                        mqttiumd_store_api::ReadError::LimitExceeded,
+                        ReadPhase::Recovery,
+                        collector.incarnation(Origin::StoreAdapter),
+                        Some(page_number),
+                    )
+                })?;
             let read = flush(&mut self.store, &mut self.writer, collector, books)?
                 .ok_or_else(|| Stop::new("a recovery page was read without its record"))?;
             for fact in page.facts.as_slice() {
@@ -1113,9 +1138,22 @@ impl<S: DurableStore> Process<S> {
                 Ok(None)
             }
             Choice::Store(action) => {
-                let performed = self.store.perform(*action).map_err(|refused| {
-                    Stop::new(format!("the store refused {action:?}: {refused:?}"))
-                })?;
+                let performed = self
+                    .store
+                    .perform(*action)
+                    .map_err(|refused| match refused {
+                        crate::store::adapter::ActionRefused::Read(error) => Stop::read(
+                            error,
+                            if matches!(action, StoreAction::EnterWriter(WorkId::Opening(_))) {
+                                ReadPhase::Opening
+                            } else {
+                                ReadPhase::Lookup
+                            },
+                            collector.incarnation(Origin::StoreAdapter),
+                            None,
+                        ),
+                        other => Stop::new(format!("the store refused {action:?}: {other:?}")),
+                    })?;
                 flush(&mut self.store, &mut self.writer, collector, books)?;
                 if let Performed::Delivered { delivery, barrier } = performed {
                     self.consume(delivery, barrier, collector, books)?;
