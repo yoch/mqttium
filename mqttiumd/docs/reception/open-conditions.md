@@ -68,6 +68,13 @@ another lot's part.
 | The proof runs in CI, reproducibly, on the production function, after a versioned preflight in which a true property passes and a false one fails on the real production dependency | L6 | Reception of L6 |
 | `tools/install-tools.sh`: `present()` ignores the exit code of the command it runs and accepts the pinned version as a substring of any output; nothing checks that the tool found is the one `PATH` selects | L6, through the integration owner | Start of L6 |
 
+## Model M1: reception of L5, then L4
+
+| Condition | Closed by | Blocks |
+| - | - | - |
+| The sidecar of a model lists as `tests` only files that exist and replay one of its counterexamples. Until a deterministic test replays a counterexample of M1, the list stays empty and the correspondence table names, row by row, the lot that owes the replay | L5 for the table, L4 for the replays | G1 |
+| The `mqttiumd` workflow runs the models of `mqttiumd/models/` with the client's TLC runner and its `--models-dir` option; a runner change runs them again | L5, through the integration owner | Reception of L5 |
+
 ## Process topology (ADR 0002)
 
 | Condition | Closed by | Blocks |
