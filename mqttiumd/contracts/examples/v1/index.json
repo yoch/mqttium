@@ -29,6 +29,10 @@
     "contracts/examples/v1/valid/trace-record-held-item-released.json",
     "contracts/examples/v1/valid/trace-record-frame-eligible.json",
     "contracts/examples/v1/valid/trace-record-frame-eligible-connack.json",
+    "contracts/examples/v1/valid/trace-record-durable-state-inspected.json",
+    "contracts/examples/v1/valid/store-snapshot-after-commit.json",
+    "contracts/examples/v1/valid/store-snapshot-empty.json",
+    "contracts/examples/v1/valid/store-snapshot-orphan-obligation.json",
     "contracts/examples/v1/valid/run-result-provisional-all-passing.json",
     "contracts/examples/v1/valid/run-result-provisional-fail-with-inconclusive.json",
     "contracts/examples/v1/valid/run-result-provisional-fault-not-hit.json",
@@ -546,6 +550,18 @@
       "why": "Every 64-bit member of a payload is range-checked, whatever its name."
     },
     {
+      "file": "contracts/examples/v1/invalid/trace-record-durable-state-inspected-by-the-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "The core never reads the store for the oracle: an inspection belongs to the bench."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-durable-state-inspected-without-digest.json",
+      "code": "schema-violation",
+      "pointer": "/payload/snapshot",
+      "why": "A snapshot is cited by path, digest and size, like any evidence."
+    },
+    {
       "file": "contracts/examples/v1/invalid/trace-record-store-truth-from-core.json",
       "code": "schema-violation",
       "pointer": "/origin_component",
@@ -574,6 +590,78 @@
       "code": "u64-out-of-range",
       "pointer": "/payload/operation_id/sequence",
       "why": "Identity components are 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-unknown-table.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "The tables of a snapshot are a closed set."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-without-fences.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "Every table is present, even empty: an absent table is not an empty one."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-decision-unknown-outcome.json",
+      "code": "schema-violation",
+      "pointer": "/operations/0/decision",
+      "why": "A receipt records a terminal decision; an unknown outcome is not a durable fact."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-recipe-not-hex.json",
+      "code": "schema-violation",
+      "pointer": "/operations/0/recipe_hex",
+      "why": "A recipe is its exact canonical bytes."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-obligation-without-cause.json",
+      "code": "schema-violation",
+      "pointer": "/obligations/0",
+      "why": "The cause of an obligation stays inspectable (DEM-011)."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-operation-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/operations/1/operation_id",
+      "why": "An OperationId designates one recipe: one row."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-obligation-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/obligations/2",
+      "why": "A DeliveryId designates one obligation."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-inbound-slot-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/inbound_exchanges/1",
+      "why": "A session has one inbound exchange per Packet Identifier."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-session-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/sessions/3/session",
+      "why": "A SessionId designates one session."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-payload-length-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/publications/0/payload/length",
+      "why": "Sizes are 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-account-usage-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/accounts/0/used/references",
+      "why": "Accounts are 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-obligation-session-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/obligations/1/session",
+      "why": "Identities inside a list are range-checked as well."
     },
     {
       "file": "contracts/examples/v1/invalid/run-result-provisional-pass.json",

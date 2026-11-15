@@ -575,7 +575,9 @@ HELD = scenario(
             BASE["steps"][10],
             BASE["steps"][11],
         ],
-        assertions=[name for name in BASE["assertions"] if name != "no_pubrec_observed_before_crash"],
+        assertions=[
+            name for name in BASE["assertions"] if name != "no_pubrec_observed_before_crash"
+        ],
     )
 )
 RELEASE, DELIVER = 5, 10
@@ -873,7 +875,9 @@ ok(
 )
 ok(
     "trace-record-store-fence-stable.json",
-    record(10, "store-evidence", 2, "StoreFenceStable", {"operation_id": OP}, [("store-adapter", 1)]),
+    record(
+        10, "store-evidence", 2, "StoreFenceStable", {"operation_id": OP}, [("store-adapter", 1)]
+    ),
 )
 ARMED = record(
     8,
@@ -893,7 +897,12 @@ PAGE = {
     "last": True,
     "facts": [
         {"kind": "Epoch", "incarnation": "1", "epoch": "2"},
-        {"kind": "Session", "session": "1", "client_id_hex": "70312d70726f6475636572", "revision": "1"},
+        {
+            "kind": "Session",
+            "session": "1",
+            "client_id_hex": "70312d70726f6475636572",
+            "revision": "1",
+        },
         {
             "kind": "InboundExchange",
             "exchange": {"session": "1", "generation": "1"},
@@ -1079,6 +1088,36 @@ for case_name, base, path in [
         code="u64-out-of-range",
     )
 
+INSPECTED = record(
+    13,
+    "bench-supervisor",
+    1,
+    "DurableStateInspected",
+    {
+        "checkpoint": "after_commit_before_crash",
+        "snapshot": {
+            "path": "runs/p1-02-example/after_commit_before_crash.snapshot.json",
+            "sha256": "7" * 64,
+            "bytes": "2048",
+        },
+    },
+)
+ok("trace-record-durable-state-inspected.json", INSPECTED)
+trace_case(
+    "durable-state-inspected-by-the-core",
+    INSPECTED,
+    "/origin_component",
+    "The core never reads the store for the oracle: an inspection belongs to the bench.",
+    setter(["origin_component"], "broker-core"),
+)
+trace_case(
+    "durable-state-inspected-without-digest",
+    INSPECTED,
+    "/payload/snapshot",
+    "A snapshot is cited by path, digest and size, like any evidence.",
+    dropped("payload", "snapshot", "sha256"),
+)
+
 
 def rec(edit):
     value = copy.deepcopy(commit)
@@ -1120,6 +1159,220 @@ bad(
     "/payload/operation_id/sequence",
     "Identity components are 64-bit.",
     rec(setter(["payload", "operation_id", "sequence"], "18446744073709551616")),
+)
+
+
+# store snapshots: what InspectDurableState writes and the oracle reads
+SESSIONS = [("1", "p1-producer"), ("2", "p1-b"), ("3", "p1-c")]
+PAYLOAD = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "1"}
+USAGE = {"payload_bytes": "7", "references": "2", "exchange_slots": "1", "receipt_slots": "1"}
+LIMITS = {
+    name: fixture["capacities"][name]
+    for name in ("payload_bytes", "references", "exchange_slots", "receipt_slots")
+}
+
+
+def be(value, width=8):
+    """`value` as `width` big-endian bytes, in hexadecimal."""
+    return value.to_bytes(width, "big").hex()
+
+
+def scoped(sequence):
+    """A scoped identity of incarnation 1, epoch 1, owner 0."""
+    return be(1) + be(1) + be(0) + be(sequence)
+
+
+# The canonical recipe of the admission, byte for byte (`MQDR`, format 1).
+RECIPE_HEX = "".join(
+    [
+        b"MQDR".hex() + be(1, 2) + be(1, 1),
+        scoped(1) + scoped(1) + scoped(1),  # operation, request, publication
+        be(1) + be(1) + be(7, 2) + be(1),  # source: session, revision, packet, generation
+        be(1) + be(2, 1) + be(0, 1),  # route revision, QoS, retain
+        be(10, 2) + b"p1/example".hex(),
+        scoped(1) + be(7),  # payload identity and length
+        be(7) + be(2) + be(1) + be(1),  # costs
+        be(2, 2),
+        be(2) + be(1) + be(0, 4) + be(1, 1) + be(1, 1),  # target b
+        be(3) + be(1) + be(1, 4) + be(1, 1) + be(1, 1),  # target c
+    ]
+)
+snapshot = env(
+    "mqttiumd.store-snapshot",
+    run_id="p1-02-example",
+    checkpoint="after_commit_before_crash",
+    backend="sim-store",
+    meta={"incarnation": "1", "epoch": "1"},
+    sessions=[
+        {"session": number, "client_id_hex": client_id.encode().hex(), "revision": "1"}
+        for number, client_id in SESSIONS
+    ],
+    routes=[
+        {
+            "topic_hex": b"p1/example".hex(),
+            "revision": "1",
+            "targets": [{"session": "2", "qos": 1}, {"session": "3", "qos": 1}],
+        }
+    ],
+    operations=[
+        {
+            "operation_id": OP,
+            "command_kind": "AdmitPublication",
+            "recipe_hex": RECIPE_HEX,
+            "decision": "Committed",
+        }
+    ],
+    fences=[],
+    publications=[
+        {
+            "publication_id": PUBLICATION,
+            "topic_hex": b"p1/example".hex(),
+            "qos": 2,
+            "retain": False,
+            "payload": {
+                "payload_id": PAYLOAD,
+                "length": "7",
+                "sha256": hashlib.sha256(b"payload").hexdigest(),
+            },
+        }
+    ],
+    obligations=[
+        {
+            "publication_id": PUBLICATION,
+            "index": index,
+            "session": target,
+            "cause": "LiveExact",
+            "effective_qos": 1,
+            "phase": "Queued",
+        }
+        for index, target in enumerate(["2", "3"])
+    ],
+    inbound_exchanges=[
+        {
+            "exchange": {"session": "1", "generation": "1"},
+            "packet_id": 7,
+            "publication_id": PUBLICATION,
+            "phase": "AwaitPubrel",
+        }
+    ],
+    accounts=[{"account": "broker", "used": USAGE, "limits": LIMITS}],
+)
+ok("store-snapshot-after-commit.json", snapshot)
+ok(
+    "store-snapshot-empty.json",
+    env(
+        "mqttiumd.store-snapshot",
+        run_id="p1-02-example",
+        checkpoint="initial",
+        backend="sqlite",
+        meta={"incarnation": "1", "epoch": "1"},
+        sessions=[],
+        routes=[],
+        operations=[],
+        fences=[],
+        publications=[],
+        obligations=[],
+        inbound_exchanges=[],
+        accounts=[],
+    ),
+)
+# A snapshot shows what the store holds, sound or not: an obligation without
+# its publication is a finding for the oracle, not a malformed document.
+ok(
+    "store-snapshot-orphan-obligation.json",
+    edited(snapshot, lambda v: v.update(publications=[])),
+)
+
+
+def snap_case(name, code, pointer, why, edit):
+    bad(f"store-snapshot-{name}.json", code, pointer, why, edited(snapshot, edit))
+
+
+snap_case(
+    "unknown-table",
+    "schema-violation",
+    "",
+    "The tables of a snapshot are a closed set.",
+    lambda v: v.update(wills=[]),
+)
+snap_case(
+    "without-fences",
+    "schema-violation",
+    "",
+    "Every table is present, even empty: an absent table is not an empty one.",
+    dropped("fences"),
+)
+snap_case(
+    "decision-unknown-outcome",
+    "schema-violation",
+    "/operations/0/decision",
+    "A receipt records a terminal decision; an unknown outcome is not a durable fact.",
+    setter(["operations", 0, "decision"], "PendingOrUnknown"),
+)
+snap_case(
+    "recipe-not-hex",
+    "schema-violation",
+    "/operations/0/recipe_hex",
+    "A recipe is its exact canonical bytes.",
+    setter(["operations", 0, "recipe_hex"], "MQDR"),
+)
+snap_case(
+    "obligation-without-cause",
+    "schema-violation",
+    "/obligations/0",
+    "The cause of an obligation stays inspectable (DEM-011).",
+    dropped("obligations", 0, "cause"),
+)
+snap_case(
+    "operation-listed-twice",
+    "duplicate-name",
+    "/operations/1/operation_id",
+    "An OperationId designates one recipe: one row.",
+    lambda v: v["operations"].append(copy.deepcopy(v["operations"][0])),
+)
+snap_case(
+    "obligation-listed-twice",
+    "duplicate-name",
+    "/obligations/2",
+    "A DeliveryId designates one obligation.",
+    lambda v: v["obligations"].append(copy.deepcopy(v["obligations"][0])),
+)
+snap_case(
+    "inbound-slot-listed-twice",
+    "duplicate-name",
+    "/inbound_exchanges/1",
+    "A session has one inbound exchange per Packet Identifier.",
+    lambda v: v["inbound_exchanges"].append(
+        {**v["inbound_exchanges"][0], "exchange": {"session": "1", "generation": "2"}}
+    ),
+)
+snap_case(
+    "session-listed-twice",
+    "duplicate-name",
+    "/sessions/3/session",
+    "A SessionId designates one session.",
+    lambda v: v["sessions"].append({**v["sessions"][0], "client_id_hex": "7a"}),
+)
+snap_case(
+    "payload-length-overflow",
+    "u64-out-of-range",
+    "/publications/0/payload/length",
+    "Sizes are 64-bit.",
+    setter(["publications", 0, "payload", "length"], OVER),
+)
+snap_case(
+    "account-usage-overflow",
+    "u64-out-of-range",
+    "/accounts/0/used/references",
+    "Accounts are 64-bit.",
+    setter(["accounts", 0, "used", "references"], OVER),
+)
+snap_case(
+    "obligation-session-overflow",
+    "u64-out-of-range",
+    "/obligations/1/session",
+    "Identities inside a list are range-checked as well.",
+    setter(["obligations", 1, "session"], OVER),
 )
 
 
