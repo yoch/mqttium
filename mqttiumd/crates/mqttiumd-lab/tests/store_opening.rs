@@ -678,3 +678,87 @@ fn an_attempt_held_past_a_later_opening_is_superseded() {
     let grant = open_and_hand_over(&mut sim, &mut opening);
     assert_eq!(grant.epoch(), RunEpoch::new(3));
 }
+
+/// The nonce of a start-up comes from the seed of the run and the rank
+/// of the start-up: a restart inside one scenario never draws the nonce
+/// of the process it replaces, and the same run draws the same nonces.
+#[test]
+fn each_start_up_of_a_run_draws_its_own_nonce() {
+    let mut drawn = Vec::new();
+    for seed in [0, SEED, u64::MAX] {
+        for restart in [0, 1, 2, u64::MAX] {
+            let nonce = startup_nonce(seed, restart);
+            assert_eq!(nonce, startup_nonce(seed, restart), "not reproducible");
+            assert!(!drawn.contains(&nonce), "seed {seed} restart {restart}");
+            drawn.push(nonce);
+        }
+    }
+}
+
+/// Two processes alive on one data set, the older one only presumed
+/// dead. Both read the same value and issue the same ticket; each has
+/// its own nonce. Whatever the order in the writer, one of them holds
+/// the open epoch and the other holds nothing.
+#[test]
+fn two_live_processes_never_hold_the_same_epoch() {
+    for older_first in [true, false] {
+        let mut sim = started();
+        let mut openings = [
+            sim.begin_opening(startup_nonce(SEED, 0)),
+            sim.begin_opening(startup_nonce(SEED, 1)),
+        ];
+        let submitted = openings.each_mut().map(|opening| submit(&mut sim, opening));
+        assert_eq!(submitted[0].1.attempt.ticket, submitted[1].1.attempt.ticket);
+        let order = if older_first { [0, 1] } else { [1, 0] };
+        for index in order {
+            enter(&mut sim, submitted[index].0);
+        }
+        let mut grants = Vec::new();
+        for index in [order[1], order[0]] {
+            let answer = reply(&mut sim, submitted[index].0);
+            openings[index].observe(answer).expect("its own reply");
+            if let Ok(grant) = openings[index].hand_over() {
+                grants.push((index, grant));
+            }
+        }
+        assert_eq!(grants.len(), 1, "one epoch, one authority");
+        assert_eq!(grants[0].0, order[0]);
+        assert_eq!(ledger(&sim).open_epoch(), Some(grants[0].1.epoch()));
+        assert_eq!(
+            openings[order[1]].stage(),
+            OpeningStage::Rejected(OpeningRejection::PredecessorMoved)
+        );
+    }
+}
+
+/// The precondition of the trusted draw, made visible in the bench: if
+/// a restart drew the nonce of its predecessor, their commands would be
+/// one command and both would be answered the same commit.
+#[test]
+fn a_restart_that_reused_a_nonce_would_share_the_epoch_of_its_predecessor() {
+    let mut sim = started();
+    let reused = startup_nonce(SEED, 0);
+    let mut predecessor = sim.begin_opening(reused);
+    let (first, command) = submit(&mut sim, &mut predecessor);
+    enter(&mut sim, first);
+    let answer = reply(&mut sim, first);
+    predecessor.observe(answer).expect("its own reply");
+    let held = predecessor.hand_over().expect("committed");
+
+    // A successor with the same nonce forms the same command while the
+    // first one is still the last opening: the store cannot tell.
+    let mut successor = sim.begin_opening(reused);
+    let again = successor
+        .submit(command.after)
+        .expect("an attempt may start");
+    assert_eq!(again, command);
+    let outcome = sim.store_mut().open_epoch(&again);
+    successor
+        .observe(OpeningReply {
+            command: again,
+            outcome,
+        })
+        .expect("correlated");
+    let shared = successor.hand_over().expect("committed");
+    assert_eq!(shared.opened(), held.opened());
+}
