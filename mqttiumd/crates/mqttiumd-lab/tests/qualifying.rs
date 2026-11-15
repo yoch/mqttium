@@ -190,6 +190,14 @@ fn the_faults_are_exactly_those_of_the_scenario() {
         codes_of(&directory, &relative, &result),
         vec!["result-incomplete"]
     );
+    // Record 0018: at least once is not exactly once.
+    result["faults"] = json!([
+        {"id": "lost_admission_result", "expected_hits_at_least": "1", "hits": "1"}
+    ]);
+    assert_eq!(
+        codes_of(&directory, &relative, &result),
+        vec!["result-incomplete"]
+    );
 }
 
 #[test]
