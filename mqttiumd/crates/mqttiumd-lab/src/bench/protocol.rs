@@ -133,10 +133,18 @@ pub enum Action {
     Start { rank: u32 },
     /// One of the eligible choices the child published last.
     Choose { index: u32, digest: [u8; 32] },
-    /// A connection, by the generation the supervisor assigned.
-    Connect { generation: u64 },
-    /// The bytes a peer sent on a connection.
-    Bytes { generation: u64, bytes: Vec<u8> },
+    /// A connection of a client, by the generation the supervisor
+    /// assigned.
+    Connect { generation: u64, client: String },
+    /// The bytes a peer sent on a connection, and the incarnation and
+    /// sequence of the `PeerPacketSent` record that states them, which the
+    /// transport names as the cause of its reception.
+    Bytes {
+        generation: u64,
+        bytes: Vec<u8>,
+        sent_incarnation: u64,
+        sent_sequence: u64,
+    },
     /// The armed deadline due first.
     FireDeadline,
     /// The command a fault holds may enter the writer.
@@ -153,6 +161,10 @@ pub enum Action {
     Stop,
     /// Every evidence frame up to `through`, included, is read.
     Acknowledge { through: u64 },
+    /// The recovery of the process just started.
+    Recover,
+    /// The adapters move what waits in the box.
+    Settle,
 }
 
 /// What the child writes on its control descriptor.
@@ -170,6 +182,40 @@ pub enum Report {
     Refused { reason: String },
     /// The run cannot go on in the child.
     Stopped { reason: String },
+    /// The process started: its epoch, the elementary choices of its
+    /// start-up for the choice log, and the settings the store engine read
+    /// back, as JSON, for the supervisor to compare to the manifest.
+    Started {
+        epoch: u64,
+        startup: Vec<String>,
+        settings: String,
+    },
+    /// What the supervisor needs of the process after an action: whether
+    /// an effect waits in the box, whether the store adapter stands at a
+    /// barrier, the deadlines armed and not fired, the scenario fault of
+    /// the barrier, the hits of each scenario fault in this incarnation,
+    /// and the scenario faults that hold an item.
+    State {
+        busy: bool,
+        halted: bool,
+        armed: u32,
+        barrier: Option<u32>,
+        hits: Vec<u64>,
+        held: Vec<u32>,
+    },
+    /// The transport wrote bytes to a client: the record that states it,
+    /// by origin, incarnation and sequence, for the peer to name.
+    Written {
+        client: String,
+        bytes: Vec<u8>,
+        origin: String,
+        incarnation: u64,
+        sequence: u64,
+    },
+    /// The simulated crash is done: the clients whose connection was open.
+    Crashed { open: Vec<String> },
+    /// The process stopped: the events no record carries, counted by kind.
+    Finished { unwritten: Vec<(String, u64)> },
 }
 
 /// One record of one origin, with the emission number of the child. The
@@ -232,6 +278,20 @@ impl Writer {
         this.0.extend_from_slice(value);
         this
     }
+    fn flag(mut self, value: bool) -> Self {
+        self.0.push(u8::from(value));
+        self
+    }
+    fn count(self, value: usize) -> Self {
+        self.u32(u32::try_from(value).unwrap_or(u32::MAX))
+    }
+    fn texts(self, values: &[String]) -> Self {
+        let mut this = self.count(values.len());
+        for value in values {
+            this = this.bytes(value.as_bytes());
+        }
+        this
+    }
 }
 
 struct Reader<'a> {
@@ -268,6 +328,30 @@ impl<'a> Reader<'a> {
     fn text(&mut self) -> Result<String, Refusal> {
         String::from_utf8(self.bytes()?).map_err(|_| Refusal::NotText)
     }
+    fn flag(&mut self) -> Result<bool, Refusal> {
+        match self.take(1)?[0] {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Refusal::Short),
+        }
+    }
+    /// A count of items of at least `least` bytes each: one the rest of the
+    /// message cannot hold is refused before anything is allocated.
+    fn count(&mut self, least: usize) -> Result<usize, Refusal> {
+        let count = self.u32()? as usize;
+        if count > self.rest.len() / least.max(1) {
+            return Err(Refusal::Short);
+        }
+        Ok(count)
+    }
+    fn texts(&mut self) -> Result<Vec<String>, Refusal> {
+        let count = self.count(4)?;
+        let mut texts = Vec::with_capacity(count);
+        for _ in 0..count {
+            texts.push(self.text()?);
+        }
+        Ok(texts)
+    }
     fn end<T>(self, value: T) -> Result<T, Refusal> {
         if self.rest.is_empty() {
             Ok(value)
@@ -289,8 +373,19 @@ impl Action {
         match self {
             Self::Start { rank } => Writer::tag(1).u32(*rank),
             Self::Choose { index, digest } => Writer::tag(2).u32(*index).digest(digest),
-            Self::Connect { generation } => Writer::tag(3).u64(*generation),
-            Self::Bytes { generation, bytes } => Writer::tag(4).u64(*generation).bytes(bytes),
+            Self::Connect { generation, client } => {
+                Writer::tag(3).u64(*generation).bytes(client.as_bytes())
+            }
+            Self::Bytes {
+                generation,
+                bytes,
+                sent_incarnation,
+                sent_sequence,
+            } => Writer::tag(4)
+                .u64(*generation)
+                .bytes(bytes)
+                .u64(*sent_incarnation)
+                .u64(*sent_sequence),
             Self::FireDeadline => Writer::tag(5),
             Self::ReleaseHeld { fault } => Writer::tag(6).u32(*fault),
             Self::DeliverHeld { fault } => Writer::tag(7).u32(*fault),
@@ -299,6 +394,8 @@ impl Action {
             Self::Inspect => Writer::tag(10),
             Self::Stop => Writer::tag(11),
             Self::Acknowledge { through } => Writer::tag(12).u64(*through),
+            Self::Recover => Writer::tag(13),
+            Self::Settle => Writer::tag(14),
         }
         .0
     }
@@ -316,10 +413,13 @@ impl Action {
             },
             3 => Self::Connect {
                 generation: reader.u64()?,
+                client: reader.text()?,
             },
             4 => Self::Bytes {
                 generation: reader.u64()?,
                 bytes: reader.bytes()?,
+                sent_incarnation: reader.u64()?,
+                sent_sequence: reader.u64()?,
             },
             5 => Self::FireDeadline,
             6 => Self::ReleaseHeld {
@@ -337,6 +437,8 @@ impl Action {
             12 => Self::Acknowledge {
                 through: reader.u64()?,
             },
+            13 => Self::Recover,
+            14 => Self::Settle,
             other => return Err(Refusal::UnknownTag(other)),
         };
         reader.end(action)
@@ -363,6 +465,57 @@ impl Report {
             },
             Self::Refused { reason } => Writer::tag(4).bytes(reason.as_bytes()),
             Self::Stopped { reason } => Writer::tag(5).bytes(reason.as_bytes()),
+            Self::Started {
+                epoch,
+                startup,
+                settings,
+            } => Writer::tag(6)
+                .u64(*epoch)
+                .texts(startup)
+                .bytes(settings.as_bytes()),
+            Self::State {
+                busy,
+                halted,
+                armed,
+                barrier,
+                hits,
+                held,
+            } => {
+                let mut writer = Writer::tag(7).flag(*busy).flag(*halted).u32(*armed);
+                writer = match barrier {
+                    None => writer.flag(false),
+                    Some(fault) => writer.flag(true).u32(*fault),
+                };
+                writer = writer.count(hits.len());
+                for hit in hits {
+                    writer = writer.u64(*hit);
+                }
+                writer = writer.count(held.len());
+                for fault in held {
+                    writer = writer.u32(*fault);
+                }
+                writer
+            }
+            Self::Written {
+                client,
+                bytes,
+                origin,
+                incarnation,
+                sequence,
+            } => Writer::tag(8)
+                .bytes(client.as_bytes())
+                .bytes(bytes)
+                .bytes(origin.as_bytes())
+                .u64(*incarnation)
+                .u64(*sequence),
+            Self::Crashed { open } => Writer::tag(9).texts(open),
+            Self::Finished { unwritten } => {
+                let mut writer = Writer::tag(10).count(unwritten.len());
+                for (kind, count) in unwritten {
+                    writer = writer.bytes(kind.as_bytes()).u64(*count);
+                }
+                writer
+            }
         }
         .0
     }
@@ -397,6 +550,57 @@ impl Report {
             5 => Self::Stopped {
                 reason: reader.text()?,
             },
+            6 => Self::Started {
+                epoch: reader.u64()?,
+                startup: reader.texts()?,
+                settings: reader.text()?,
+            },
+            7 => {
+                let busy = reader.flag()?;
+                let halted = reader.flag()?;
+                let armed = reader.u32()?;
+                let barrier = if reader.flag()? {
+                    Some(reader.u32()?)
+                } else {
+                    None
+                };
+                let count = reader.count(8)?;
+                let mut hits = Vec::with_capacity(count);
+                for _ in 0..count {
+                    hits.push(reader.u64()?);
+                }
+                let count = reader.count(4)?;
+                let mut held = Vec::with_capacity(count);
+                for _ in 0..count {
+                    held.push(reader.u32()?);
+                }
+                Self::State {
+                    busy,
+                    halted,
+                    armed,
+                    barrier,
+                    hits,
+                    held,
+                }
+            }
+            8 => Self::Written {
+                client: reader.text()?,
+                bytes: reader.bytes()?,
+                origin: reader.text()?,
+                incarnation: reader.u64()?,
+                sequence: reader.u64()?,
+            },
+            9 => Self::Crashed {
+                open: reader.texts()?,
+            },
+            10 => {
+                let count = reader.count(12)?;
+                let mut unwritten = Vec::with_capacity(count);
+                for _ in 0..count {
+                    unwritten.push((reader.text()?, reader.u64()?));
+                }
+                Self::Finished { unwritten }
+            }
             other => return Err(Refusal::UnknownTag(other)),
         };
         reader.end(report)
@@ -621,10 +825,15 @@ mod tests {
                 index: 3,
                 digest: [7; 32],
             },
-            Action::Connect { generation: 9 },
+            Action::Connect {
+                generation: 9,
+                client: "producer".to_owned(),
+            },
             Action::Bytes {
                 generation: 9,
                 bytes: vec![0x10, 0x00],
+                sent_incarnation: 1,
+                sent_sequence: 4,
             },
             Action::FireDeadline,
             Action::ReleaseHeld { fault: 1 },
@@ -634,6 +843,8 @@ mod tests {
             Action::Inspect,
             Action::Stop,
             Action::Acknowledge { through: 63 },
+            Action::Recover,
+            Action::Settle,
         ]
     }
 
@@ -659,6 +870,40 @@ mod tests {
             },
             Report::Stopped {
                 reason: "core fault".to_owned(),
+            },
+            Report::Started {
+                epoch: 2,
+                startup: vec!["EnterWriter(Opening(1))".to_owned()],
+                settings: "{\"journal_mode\":\"wal\"}".to_owned(),
+            },
+            Report::State {
+                busy: true,
+                halted: false,
+                armed: 1,
+                barrier: Some(2),
+                hits: vec![1, 0, 3],
+                held: vec![0, 2],
+            },
+            Report::State {
+                busy: false,
+                halted: false,
+                armed: 0,
+                barrier: None,
+                hits: Vec::new(),
+                held: Vec::new(),
+            },
+            Report::Written {
+                client: "producer".to_owned(),
+                bytes: vec![0x20, 0x03, 0, 0, 0],
+                origin: "transport".to_owned(),
+                incarnation: 2,
+                sequence: 7,
+            },
+            Report::Crashed {
+                open: vec!["producer".to_owned()],
+            },
+            Report::Finished {
+                unwritten: vec![("ResultDelivered".to_owned(), 3)],
             },
         ]
     }
@@ -707,8 +952,13 @@ mod tests {
             );
         }
         assert_eq!(Action::decode(&[0]), Err(Refusal::UnknownTag(0)));
-        assert_eq!(Action::decode(&[13]), Err(Refusal::UnknownTag(13)));
-        assert_eq!(Report::decode(&[6]), Err(Refusal::UnknownTag(6)));
+        assert_eq!(Action::decode(&[15]), Err(Refusal::UnknownTag(15)));
+        assert_eq!(Report::decode(&[11]), Err(Refusal::UnknownTag(11)));
+        // A flag is 0 or 1.
+        assert_eq!(
+            Report::decode(&[7, 2, 0, 0, 0, 0, 0, 0]),
+            Err(Refusal::Short)
+        );
         assert_eq!(Action::decode(&[]), Err(Refusal::Empty));
         assert_eq!(Evidence::decode(&5_u64.to_be_bytes()), Err(Refusal::Short));
         let mut not_text = vec![4, 0, 0, 0, 1];
