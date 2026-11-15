@@ -25,7 +25,8 @@ Exit codes: 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 3 OUT_OF_SCOPE (DEM-023).
 validate exits 0 when every document is accepted and 2 otherwise.
 run computes no verdict: it exits 0 when the campaign directory was
 written, whatever the oracle will find in it, and 2 when no campaign
-could be written. The oracle judges the directory (--root <out>).";
+could be written; it refuses an --out inside the work tree of the
+repository, where a campaign never goes. The oracle judges the directory (--root <out>).";
 
 /// Invalid configuration prevents a conclusion (DEM-023).
 const INCONCLUSIVE: u8 = 2;
@@ -148,6 +149,8 @@ fn run(arguments: &Arguments) -> Result<bool, String> {
         built_from: arguments.built_from.clone(),
     };
     if arguments.rebuild {
+        // Refused before anything is built.
+        campaign::refuse_inside_work_tree(&request.root, &request.out)?;
         return rebuilt(arguments, &request);
     }
     let report = campaign::execute(&request)?;
