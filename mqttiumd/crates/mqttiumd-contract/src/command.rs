@@ -613,19 +613,24 @@ impl EpochLedger {
     /// The durable phase of `epoch`.
     #[must_use]
     pub fn phase_of(&self, epoch: RunEpoch) -> EpochPhase {
-        if epoch <= self.last_opened {
-            EpochPhase::Open
-        } else {
+        if epoch > self.last_opened {
             EpochPhase::Unopened
+        } else if epoch == self.last_opened && epoch.get() != 0 {
+            EpochPhase::Open
+        } else if self.last_opened.get() == 0 {
+            EpochPhase::Unopened
+        } else {
+            EpochPhase::Closed
         }
     }
 
-    /// The ledger after one committed opening. Skeleton: the rules are
-    /// not written yet.
+    /// The ledger after one committed opening: the next epoch is open and
+    /// every epoch before it is closed. `Exhausted` is definitive; the
+    /// ledger it was asked of is unchanged and nothing wraps.
     pub fn open_next(&self) -> Result<Self, Exhausted> {
         Ok(Self {
             incarnation: self.incarnation,
-            last_opened: self.last_opened.checked_next().unwrap_or(self.last_opened),
+            last_opened: self.last_opened.checked_next()?,
         })
     }
 }

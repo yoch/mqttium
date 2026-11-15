@@ -352,8 +352,22 @@ impl EpochOpening {
         self.stage
     }
 
-    /// Starts an attempt. Skeleton: the rules are not written yet.
+    /// Starts an attempt and returns its command, under a ticket no
+    /// earlier attempt of this opening used.
+    ///
+    /// After an unknown outcome this is the only way forward. The new
+    /// attempt abandons the old one: a late reply to the old ticket is
+    /// then refused, and the epoch it may have opened is closed by the
+    /// opening the new attempt commits.
     pub fn submit(&mut self) -> Result<OpenEpoch, SubmitRefused> {
+        match self.stage {
+            OpeningStage::Idle | OpeningStage::Unknown => {}
+            OpeningStage::Submitted => return Err(SubmitRefused::AwaitingReply),
+            OpeningStage::Rejected(reason) => return Err(SubmitRefused::Rejected(reason)),
+            OpeningStage::Committed(_) | OpeningStage::HandedOver(_) => {
+                return Err(SubmitRefused::AlreadyOpened);
+            }
+        }
         let ticket = self
             .ticket
             .checked_next()
@@ -363,24 +377,64 @@ impl EpochOpening {
         Ok(OpenEpoch { ticket })
     }
 
-    /// Takes the store's reply. Skeleton: the rules are not written yet.
+    /// Takes the store's reply to the attempt in flight.
+    ///
+    /// Knowledge only grows: `Submitted`, then `Unknown`, then one
+    /// terminal result. A repeated reply and a late `Unknown` change
+    /// nothing; a reply to another ticket is refused; two different
+    /// terminal results for one attempt are a fault.
     pub fn observe(&mut self, reply: OpeningReply) -> Result<Observed, ReplyRefused> {
-        let next = match reply.outcome {
-            OpeningOutcome::Committed(opened) => OpeningStage::Committed(opened),
-            OpeningOutcome::RejectedCertain(reason) => OpeningStage::Rejected(reason),
-            OpeningOutcome::Unknown => OpeningStage::Unknown,
+        if self.stage == OpeningStage::Idle || reply.ticket != self.ticket {
+            return Err(ReplyRefused::Uncorrelated {
+                ticket: reply.ticket,
+            });
+        }
+        let contradictory = ReplyRefused::Contradictory {
+            established: self.stage,
+            reported: reply.outcome,
+        };
+        let next = match (self.stage, reply.outcome) {
+            (OpeningStage::Submitted, OpeningOutcome::Unknown) => OpeningStage::Unknown,
+            (_, OpeningOutcome::Unknown) => return Ok(Observed::Unchanged),
+            (
+                OpeningStage::Submitted | OpeningStage::Unknown,
+                OpeningOutcome::Committed(opened),
+            ) => OpeningStage::Committed(opened),
+            (
+                OpeningStage::Submitted | OpeningStage::Unknown,
+                OpeningOutcome::RejectedCertain(reason),
+            ) => OpeningStage::Rejected(reason),
+            (
+                OpeningStage::Committed(known) | OpeningStage::HandedOver(known),
+                OpeningOutcome::Committed(opened),
+            ) if known == opened => return Ok(Observed::Unchanged),
+            (OpeningStage::Rejected(known), OpeningOutcome::RejectedCertain(reason))
+                if known == reason =>
+            {
+                return Ok(Observed::Unchanged);
+            }
+            (
+                OpeningStage::Idle
+                | OpeningStage::Committed(_)
+                | OpeningStage::HandedOver(_)
+                | OpeningStage::Rejected(_),
+                OpeningOutcome::Committed(_) | OpeningOutcome::RejectedCertain(_),
+            ) => return Err(contradictory),
         };
         self.stage = next;
         Ok(Observed::Advanced(next))
     }
 
-    /// Hands over a grant. Skeleton: the rules are not written yet.
+    /// Hands over the grant of the committed opening. This transition is
+    /// taken once: the stage moves to `HandedOver` and no later call, no
+    /// repeated reply and no recovered fact produces another grant.
     pub fn hand_over(&mut self) -> Result<EpochGrant, HandOverRefused> {
         match self.stage {
-            OpeningStage::Committed(opened) | OpeningStage::HandedOver(opened) => {
+            OpeningStage::Committed(opened) => {
                 self.stage = OpeningStage::HandedOver(opened);
                 Ok(EpochGrant { opened })
             }
+            OpeningStage::HandedOver(_) => Err(HandOverRefused::AlreadyHandedOver),
             stage => Err(HandOverRefused::NotCommitted(stage)),
         }
     }
