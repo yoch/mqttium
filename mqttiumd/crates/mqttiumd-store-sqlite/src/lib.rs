@@ -1409,8 +1409,16 @@ impl SqliteStore {
     /// For a measurement only: sets `PRAGMA wal_autocheckpoint` on the
     /// writer's connection and reads it back into the settings. A store
     /// keeps the engine's default otherwise; nothing in the product calls
-    /// this.
+    /// this. Refused while a kill hook is armed: setting the PRAGMA would
+    /// replace that hook in SQLite, even if its value stayed zero.
     pub fn set_wal_autocheckpoint_for_measurement(&mut self, pages: i64) -> Result<i64, OpenError> {
+        #[cfg(feature = "kill-points")]
+        if self.autocheckpoint_before_hook.is_some() {
+            return Err(OpenError::Setting {
+                name: "wal_autocheckpoint_while_kill_hook_armed",
+                read_back: self.settings.wal_autocheckpoint.to_string(),
+            });
+        }
         self.conn.pragma_update(None, "wal_autocheckpoint", pages)?;
         let read_back: i64 = self
             .conn
