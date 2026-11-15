@@ -15,13 +15,10 @@ the assertions are true.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| The oracle recomputes every assertion from the trace, the snapshots and the decoded packets, and a result whose statuses differ is refused | L3 | G0 |
-| The obligations of a run are derived from its exact scenario and perimeter; a run on a sub-perimeter (core without bytes) has its own declared obligations and never passes the full scenario | L3 | G0 |
-| A trace is checked as a whole: header first, gapless sequence per origin, causal parents present, footer count and completeness | L3 | G0 |
-| The collector assigns the origin of a record from its channel and refuses a record that claims another (ADR 0003). L3: the rule, and the refusal of a trace that breaks it. L4: the collector that assigns the origin. The row stays until both parts are done | L3, L4 | G0 |
-| A PASS requires a registry whose status is `complete`; the 39 uncovered cells of `p1.transitions.json` are written by the oracle role | L3 | G0 |
-| The assertion `broker_inputs_have_provenance` and the trace records it needs join the contracts (ADR 0003) | L3 | S0, DEM-MU-03 |
-| A permanent second reader of the semantic rules exists; today only the schema level has one (`tools/check_schemas.py`) | L3 | G0 |
+| The collector assigns the origin of a record from its channel and refuses a record that claims another (ADR 0003). The rule and the refusal of a trace that breaks it are done by lot L3; the collector that assigns the origin is owed | L4 | G0 |
+| **Core, limits of what it remembers** (lot L1, corrections of the review of its core). An operation that ended is kept in a bounded window (`OwnerConfig::retained_operations`); beyond it a contradicting result is absorbed. A connection the owner closed is kept in a bounded window (`remembered_connections`); beyond it what the connection still carries is no longer known as stale. Lot L4, which assigns connection generations, decides whether "older than the current one" closes the second limit | L1, L4 | S0 |
+| **Oracle, review of lot L3** (head `3c023bf`). (1) `certain_rejection_has_a_closure` accepts a certain rejection when any snapshot, even a later one, holds its closure. (2) The order of a recovery inventory is judged on the pages read, not on the pages delivered to the core. (3) `same_recipe_for_op_A` and (4) `fenced_operation_never_executed` pass where the trace does not establish the order, or the order is the reverse. (5) The trace reader and the contract reader of the oracle allocate before they check a size. (6) A packet observed by a peer is trusted on its declared reason and identifier (the reason of a refusing PUBREC is now checked by `refusal_carries_the_reason_of_its_rejection`). (7) The order of recovered facts is written three times instead of calling `RecoveryOrder::admit`. (8) The limits of an admission have two encodings, in a trace and in a snapshot. (9) The list of contract files is computed twice, and the two readers disagree on a stray file in the schema directory | L3 | G0 |
+| The registry rules that decide a behaviour of the broker which the chapters leave open (record 0013, proposed) are accepted or replaced | Owner of the repository | G0 |
 
 ## Before a campaign is run (L4, L7)
 
@@ -41,8 +38,6 @@ observed in the checkout. It does not connect the two.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| The scenario format gains the steps P1-02b needs: firing a deadline, releasing a held command, delivering a held result; as a contract change with examples | L3 | P1-02b |
-| The registry rows for a replayed PUBLISH while the outcome is unknown, after a reconnect and on a live connection | L3 | P1-02b, G0 |
 | `tests/scenarios/p1/P1-02b.json` and its run on the deterministic store | L4 | S0 |
 
 ## Effect boxes and transitions (ADR 0006): reception of L1
@@ -53,27 +48,21 @@ another lot's part.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| **Owner counters** (ADR 0009, record 0012 proposed). Replacing a box resets no counter of its owner; the constructor of an owner refuses a box smaller than the largest reservation a transition makes; an exhausted identity counter is reported as `Exhaustion::IdentityCounter`. All three come with the state of an owner in `mqttiumd-core` | L1 | Reception of L1 |
 | **Creation authority, its issuance** (ADR 0009). A durable fact is not an authorisation to construct. The contract of opening an epoch and the hand-over give at most one authority per live opening: none for a duplicated reply, a replayed fact or a further recovery page, none usable for an unknown outcome | L2, with L1 | Reception of L2 |
-| **Epoch opening, after a fault** (record 0011, proposed; fifth review of the contract of L2 at `7941f334`). (1) A faulted opening drops every later reply, so a `Superseded` that arrives after the fault never marks a handed-over grant closed, and `check_recovered` answers by the order of the replies. (2) `AttemptReused` is taken for a command whose condition is epoch 0, which no ledger reports; the exhaustive test does not use that condition. (3) `observe` reports `Unchanged` when a reply raises the lowest value a later read may return without moving the stage. (4) The documentation of `OpeningStage::Rejected` says the first reason is kept, while a definitive reason replaces it | L2 | Reception of L2 |
 | **Creation authority, the real path** (ADR 0009). The trusted entry point that constructs an authority is stated; start-up is wired through it, and composition tests go through that path, not through a helper that builds an authority directly | L4 | S0 |
 | **Creation authority on SQLite** (ADR 0009). The opening of an epoch and its results realised on the SQLite store, with the same contract tests | L7 | S0 on SQLite |
-| **Transition contract.** `PlanStamp` is a support for validation, not yet the private single-use plan of ADR 0006. L1 establishes: no mutation while planning; a plan consumed once; owner and revision checked before application; resources reserved before mutation; the exact behaviour of `NeedCapacity`. Reserving then releasing an entry advances its generation: L1 orders its acquisitions so that a refused transition restores what the contract requires. Any provisional metadata allowed to differ needs an explicit amendment of the contract, by a decision record; a report cannot grant it | L1 | Reception of L1 |
 
 ## Pilot proof (DEM-021): reception of L6
 
 | Condition | Closed by | Blocks |
 | - | - | - |
 | The proof that is received is on `release_if_current` as the product really executes it. Tooling may be prepared in parallel; a proof of a separate demonstration function does not receive the lot | L6, with L1 | Reception of L6 |
-| The proof runs in CI, reproducibly, on the production function, after a versioned preflight in which a true property passes and a false one fails on the real production dependency | L6 | Reception of L6 |
-| The lease table holds each `LeaseRecord` exactly once: one record per held lease. Recovery calls `LeaseRecord::from_parts` once per durable row and nothing else calls it outside the proof crate. A test of the table shows that no path builds a second record of a held lease (record 0010, proposed) | L1 | Reception of L6 |
 
 ## Model M1: reception of L5, then L4
 
 | Condition | Closed by | Blocks |
 | - | - | - |
 | The sidecar of a model lists as `tests` only files that exist and replay one of its counterexamples. Until a deterministic test replays a counterexample of M1, the list stays empty and the correspondence table names, row by row, the lot that owes the replay | L5 for the table, L4 for the replays | G1 |
-| The `mqttiumd` workflow runs the models of `mqttiumd/models/` with the client's TLC runner and its `--models-dir` option; a runner change runs them again | L5, through the integration owner | Reception of L5 |
 
 ## Process topology (ADR 0002)
 

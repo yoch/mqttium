@@ -33,10 +33,14 @@ fn passing(name: &str) -> (std::path::PathBuf, String, Value) {
     fs::write(directory.join("trace.jsonl"), b"{}\n").expect("trace");
     let scenario: Value =
         serde_json::from_slice(&fs::read(root().join(SCENARIO)).expect("P1-02")).expect("JSON");
+    // The assertions of the scenario, and the one every run owes that
+    // P1-02 does not list.
     let assertions: Vec<Value> = scenario["assertions"]
         .as_array()
         .expect("assertions")
         .iter()
+        .cloned()
+        .chain([json!("broker_inputs_have_provenance")])
         .map(|name| json!({"name": name, "status": "PASS"}))
         .collect();
     let result = json!({
@@ -98,6 +102,30 @@ fn a_pass_with_only_out_of_scope_assertions_is_refused() {
     let codes = codes_of(&directory, &relative, &result);
     assert!(codes.contains(&"verdict-inconsistent"), "{codes:?}");
     assert!(codes.contains(&"result-incomplete"), "{codes:?}");
+}
+
+/// P1-02 is the text of the specification and lists neither assertion
+/// below; every run owes them all the same (ADR 0003, DEM-MU-03).
+const EVERY_RUN: [&str; 2] = ["trace_complete", "broker_inputs_have_provenance"];
+
+#[test]
+fn an_assertion_every_run_owes_cannot_be_left_out() {
+    for name in EVERY_RUN {
+        let (directory, relative, mut result) = passing(&format!("every-run-{name}"));
+        let assertions = result["assertions"].as_array_mut().expect("assertions");
+        let before = assertions.len();
+        assertions.retain(|assertion| assertion["name"] != name);
+        assert_eq!(
+            assertions.len(),
+            before - 1,
+            "{name} is reported by a passing result"
+        );
+        assert_eq!(
+            codes_of(&directory, &relative, &result),
+            vec!["result-incomplete"],
+            "{name}"
+        );
+    }
 }
 
 #[test]

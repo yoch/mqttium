@@ -62,15 +62,14 @@ pub struct LeaseRecord {
 }
 
 impl LeaseRecord {
-    /// Rebuilds a record from its parts, as recovery reads them.
+    /// Builds a record from its parts, unchecked.
     ///
-    /// Two callers have a reason to use it: recovery, which rebuilds each
-    /// record once from the durable row that holds it, and the proof
-    /// crate, which must state every record, the incoherent ones included.
-    /// A transition never calls it: it gets a held lease from
-    /// [`Account::reserve`], which charges the account. Building a second
-    /// record of a lease that is already held breaks the precondition of
-    /// [`release_if_current`].
+    /// The product does not call it: a held lease comes from
+    /// [`Account::reserve`], which charges the account, both when a
+    /// transition reserves and when recovery restores a durable row. The
+    /// proof crate calls it, because it must state every record, the
+    /// incoherent ones included. Building a second record of a lease that
+    /// is already held breaks the precondition of [`release_if_current`].
     ///
     /// Nothing is checked against any account: [`release_if_current`] does
     /// not rely on the record and the account agreeing, and refuses without
@@ -130,12 +129,12 @@ impl Account {
         }
     }
 
-    /// Rebuilds an account from its parts, as recovery reads them.
+    /// Builds an account from its parts, unchecked.
     ///
-    /// Two callers have a reason to use it: recovery, and the proof crate,
-    /// which must state the accounts whose usage exceeds a limit. A
-    /// transition never calls it: an account starts with [`Account::new`]
-    /// and changes through [`Account::reserve`] and [`release_if_current`].
+    /// The product does not call it: an account starts with
+    /// [`Account::new`] and changes through [`Account::reserve`] and
+    /// [`release_if_current`], recovery included. The proof crate calls it,
+    /// because it must state the accounts whose usage exceeds a limit.
     ///
     /// Coherence is not checked: see [`Account::is_coherent`]. An
     /// incoherent account is not refused by [`release_if_current`]: a
