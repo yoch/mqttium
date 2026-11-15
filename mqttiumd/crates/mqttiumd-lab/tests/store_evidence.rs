@@ -373,4 +373,17 @@ fn the_evidence_of_a_run_is_written_as_accepted_trace_records() {
         released["causal_parents"][0]["origin_component"],
         "fault-injector"
     );
+    // Each component numbers its own records from zero, without a gap.
+    let mut next = std::collections::BTreeMap::new();
+    for record in &written.records {
+        let component = record["origin_component"].as_str().expect("a component");
+        let expected: &mut u64 = next.entry(component).or_insert(0);
+        assert_eq!(
+            record["origin_sequence"],
+            expected.to_string(),
+            "{component}"
+        );
+        *expected += 1;
+    }
+    assert!(next.len() >= 4, "{next:?}");
 }

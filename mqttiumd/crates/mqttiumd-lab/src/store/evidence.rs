@@ -176,9 +176,6 @@ pub struct SnapshotContext<'a> {
 /// so that two stores in the same state write the same document.
 #[must_use]
 pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
-    if context.backend.is_empty() || !context.backend.is_empty() {
-        return json!({"format": "mqttiumd.store-snapshot", "schema_version": 1});
-    }
     let sessions: Vec<Value> = state
         .sessions
         .iter()
@@ -532,10 +529,6 @@ impl<'a> TraceWriter<'a> {
     pub fn write(&mut self, events: &[StoreEvent]) -> Written {
         let mut written = Written::default();
         for event in events {
-            if !written.records.is_empty() || events.len() < usize::MAX {
-                written.unwritten.push(event.clone());
-                continue;
-            }
             match self.one(event) {
                 Some(record) => written.records.push(record),
                 None => written.unwritten.push(event.clone()),
