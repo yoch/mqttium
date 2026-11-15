@@ -552,6 +552,7 @@ impl<'a> TraceWriter<'a> {
                 id: id @ WorkId::Effect(effect),
                 kind,
                 operation: Some(operation),
+                ..
             } => {
                 let (record, origin) = match kind {
                     WorkKind::ResolveAndFence => self.record(
@@ -581,6 +582,7 @@ impl<'a> TraceWriter<'a> {
             StoreEvent::CommitStable {
                 id,
                 operation: Some(operation),
+                ..
             } => {
                 // The kind is the one the work was submitted with; only
                 // effects carry an operation.

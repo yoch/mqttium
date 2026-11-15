@@ -14,7 +14,7 @@ use mqttiumd_contract::ids::{
 };
 use mqttiumd_lab::store::adapter::{
     AdapterLimits, Answer, FaultAction, FaultPoint, FaultSpec, Performed, SimStore, StoreAction,
-    StoreEvent, WorkId, WorkKind,
+    StoreEvent, WorkId, WorkKind, startup_nonce,
 };
 use mqttiumd_lab::store::conformance::{World, altered, fixture_limits, operation_id};
 use mqttiumd_lab::store::durable::{AdminCommand, DurableStore, Limits, MemoryStore};
@@ -474,4 +474,188 @@ fn the_public_forms_are_what_the_trace_writer_writes() {
             .iter()
             .any(|(_, reason)| reason.as_deref() == Some("Fenced"))
     );
+}
+
+fn adapter_bench() -> Bench {
+    World::new(&memory).wrap(|store| {
+        SimStore::new(
+            store,
+            AdapterLimits {
+                operations_in_flight: 4,
+                result_slots: 8,
+                faults: 4,
+                events: 256,
+            },
+        )
+    })
+}
+
+fn of_kind<'a>(records: &'a [Value], kind: &str) -> Vec<&'a Value> {
+    records
+        .iter()
+        .filter(|record| record["kind"] == kind)
+        .collect()
+}
+
+/// The reference a record makes to `parent` in its `causal_parents`.
+fn reference(parent: &Value) -> Value {
+    serde_json::json!({
+        "origin_component": parent["origin_component"],
+        "origin_incarnation": parent["origin_incarnation"],
+        "origin_sequence": parent["origin_sequence"],
+    })
+}
+
+/// K1: a result the adapter hands over is written as
+/// `StoreResultHandedOver`, with the content of the `StoreResultReady`
+/// the store produced and that record as its parent: committed,
+/// rejected, delayed then released. A duplicate's second copy is not
+/// handed over. A result presented from outside was produced by no
+/// store: its handover has no such parent.
+#[test]
+fn a_result_handed_over_follows_the_result_the_store_produced() {
+    let mut bench = adapter_bench();
+    let delay = FaultSpec {
+        point: FaultPoint::ResultReady,
+        action: FaultAction::DelayResult,
+        kind: Some(WorkKind::ResolveAndFence),
+        source: None,
+        occurrence: 1,
+    };
+    let duplicate = FaultSpec {
+        point: FaultPoint::ResultReady,
+        action: FaultAction::DuplicateResult,
+        kind: Some(WorkKind::AdmitPublication),
+        source: None,
+        occurrence: 1,
+    };
+    bench.store.arm(delay).expect("allowed");
+    bench.store.arm(duplicate).expect("allowed");
+    let names = ["delayed_fence", "duplicated_admission"];
+
+    let command = bench.admission(1, 7, b"payload", &[bench.b, bench.c]);
+    let admitted = submit(&mut bench, 1, Effect::Persist { command });
+    perform(&mut bench, StoreAction::EnterWriter(admitted));
+    perform(&mut bench, StoreAction::DeliverResult(admitted));
+    assert_eq!(
+        perform(&mut bench, StoreAction::DeliverResult(admitted)),
+        Performed::Uncorrelated
+    );
+    let absent = operation_id(bench.epoch, 9);
+    let fenced = resolve(&mut bench, 2, absent);
+    perform(&mut bench, StoreAction::EnterWriter(fenced));
+    perform(&mut bench, StoreAction::ReleaseResult(fenced));
+    perform(&mut bench, StoreAction::DeliverResult(fenced));
+    // A result from outside, for work in flight.
+    let other = operation_id(bench.epoch, 10);
+    let outside = resolve(&mut bench, 3, other);
+    let WorkId::Effect(outside_effect) = outside else {
+        panic!("an effect");
+    };
+    let presented = bench.store.present_result(
+        outside_effect,
+        other,
+        mqttiumd_contract::outcome::StoreReply::Outcome(
+            mqttiumd_contract::outcome::StoreOutcome::PendingOrUnknown,
+        ),
+    );
+    assert!(matches!(presented, Ok(Performed::Delivered { .. })));
+
+    let events = bench.store.take_events();
+    let written = TraceWriter::new("k1-handover", 1, 1, &names).write(&events);
+    let workspace = workspace();
+    for record in &written.records {
+        accepted(&workspace, record);
+    }
+    let ready = of_kind(&written.records, "StoreResultReady");
+    let handed = of_kind(&written.records, "StoreResultHandedOver");
+    assert_eq!(ready.len(), 2);
+    assert_eq!(handed.len(), 3, "{:#?}", written.unwritten);
+    for (handover, produced) in handed.iter().zip(&ready) {
+        assert_eq!(handover["origin_component"], "store-adapter");
+        assert_eq!(handover["payload"], produced["payload"]);
+        assert_eq!(
+            handover["causal_parents"],
+            serde_json::json!([reference(produced)])
+        );
+    }
+    assert_eq!(handed[1]["payload"]["reject_reason"], "Fenced");
+    let foreign = handed[2];
+    assert_eq!(foreign["payload"]["outcome"], "PendingOrUnknown");
+    assert!(
+        foreign["causal_parents"]
+            .as_array()
+            .expect("parents")
+            .iter()
+            .all(|parent| parent["origin_component"] != "store-evidence")
+    );
+    assert!(
+        !written
+            .unwritten
+            .iter()
+            .any(|event| matches!(event, StoreEvent::ResultDelivered { .. }))
+    );
+}
+
+/// The opening of an epoch is written as `OpeningSubmitted`, the whole
+/// command, then `StoreEpochOpened` once, from the ledger, caused by it.
+/// The same command answered `Committed` again opens nothing and writes
+/// no second `StoreEpochOpened`. The reply itself is the core's record.
+#[test]
+fn an_opening_is_written_as_submitted_then_opened_once() {
+    let mut bench = adapter_bench();
+    let mut opening = bench.store.begin_opening(startup_nonce(7, 1));
+    let command = opening
+        .submit(bench.store.store().ledger().last_opened())
+        .expect("an attempt");
+    let id = WorkId::Opening(command.attempt);
+    for _ in 0..2 {
+        bench.store.submit_opening(command).expect("room");
+        perform(&mut bench, StoreAction::EnterWriter(id));
+        perform(&mut bench, StoreAction::DeliverResult(id));
+    }
+    let events = bench.store.take_events();
+    let names: [&str; 0] = [];
+    let written = TraceWriter::new("opening", 1, 1, &names).write(&events);
+    let workspace = workspace();
+    for record in &written.records {
+        accepted(&workspace, record);
+    }
+    let attempt = serde_json::json!({
+        "startup_hex": "00000000000000070000000000000001",
+        "ticket": command.attempt.ticket.get().to_string(),
+    });
+    let submitted = of_kind(&written.records, "OpeningSubmitted");
+    assert_eq!(submitted.len(), 2);
+    for record in &submitted {
+        assert_eq!(record["origin_component"], "store-adapter");
+        assert_eq!(
+            record["payload"],
+            serde_json::json!({
+                "attempt": attempt,
+                "incarnation": command.incarnation.get().to_string(),
+                "after": command.after.get().to_string(),
+            })
+        );
+    }
+    let opened = of_kind(&written.records, "StoreEpochOpened");
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0]["origin_component"], "store-evidence");
+    assert_eq!(
+        opened[0]["payload"],
+        serde_json::json!({
+            "incarnation": command.incarnation.get().to_string(),
+            "epoch": (command.after.get() + 1).to_string(),
+            "attempt": attempt,
+        })
+    );
+    assert_eq!(
+        opened[0]["causal_parents"],
+        serde_json::json!([reference(submitted[0])])
+    );
+    // The replies are handed to the core, which writes them.
+    assert!(written.unwritten.iter().all(|event| matches!(
+        event,
+        StoreEvent::ResultReady { .. } | StoreEvent::ResultDelivered { .. }
+    )));
 }
