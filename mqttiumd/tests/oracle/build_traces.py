@@ -2135,7 +2135,13 @@ def blocked(cause):
                 "blocked",
                 "bench-supervisor",
                 "StepBlocked",
-                {"step": "19", "step_kind": "DriveUntil", "cause": cause},
+                {
+                    "step": "19",
+                    "step_kind": "DriveUntil",
+                    "cause": cause,
+                    "armed_deadlines": "0",
+                    "holding_faults": [],
+                },
             )
         )
 
@@ -2144,7 +2150,7 @@ def blocked(cause):
 
 case(
     "run-blocked-with-nothing-eligible",
-    "The bench stopped: nothing was eligible and the awaited event never happened. The product is stuck.",
+    "The bench stopped: nothing was eligible and the awaited event had not happened, which refutes what the DriveUntil step asserted.",
     {END: "FAIL"},
     events=blocked("quiescent"),
 )

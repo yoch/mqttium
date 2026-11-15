@@ -1,0 +1,21 @@
+{
+  "format": "mqttiumd.trace-record",
+  "schema_version": 1,
+  "run_id": "p1-02-example",
+  "record_sequence": "9",
+  "origin_component": "bench-supervisor",
+  "origin_incarnation": "1",
+  "origin_sequence": "3",
+  "causal_parents": [],
+  "time_domain": "logical-step",
+  "time_value": "9",
+  "kind": "StepBlocked",
+  "payload": {
+    "step": "19",
+    "step_kind": "DriveUntil",
+    "cause": "quiescent",
+    "holding_faults": [
+      "hold-result"
+    ]
+  }
+}

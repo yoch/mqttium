@@ -1189,7 +1189,13 @@ BLOCKED = record(
     "bench-supervisor",
     3,
     "StepBlocked",
-    {"step": "19", "step_kind": "DriveUntil", "cause": "quiescent"},
+    {
+        "step": "19",
+        "step_kind": "DriveUntil",
+        "cause": "quiescent",
+        "armed_deadlines": "1",
+        "holding_faults": ["hold-result"],
+    },
 )
 ok("trace-record-step-blocked.json", BLOCKED)
 REJECTED = record(
@@ -1532,6 +1538,27 @@ trace_case(
     "The index of a step is 64-bit.",
     setter(["payload", "step"], "18446744073709551616"),
     code="u64-out-of-range",
+)
+trace_case(
+    "step-blocked-without-what-waits",
+    BLOCKED,
+    "/payload",
+    "A stopped run says what still waits: the deadlines armed and not fired.",
+    dropped("payload", "armed_deadlines"),
+)
+trace_case(
+    "step-blocked-without-what-is-held",
+    BLOCKED,
+    "/payload",
+    "A stopped run says which faults still hold an item.",
+    dropped("payload", "holding_faults"),
+)
+trace_case(
+    "step-blocked-naming-a-fault-twice",
+    BLOCKED,
+    "/payload/holding_faults",
+    "Each fault that holds an item is named once.",
+    setter(["payload", "holding_faults"], ["hold-result", "hold-result"]),
 )
 trace_case(
     "violation-without-its-kind",

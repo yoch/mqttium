@@ -13,6 +13,10 @@
   "payload": {
     "step": "19",
     "step_kind": "DriveUntil",
-    "cause": "timeout"
+    "cause": "timeout",
+    "armed_deadlines": "1",
+    "holding_faults": [
+      "hold-result"
+    ]
   }
 }

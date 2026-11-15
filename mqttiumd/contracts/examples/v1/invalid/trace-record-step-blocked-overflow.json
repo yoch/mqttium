@@ -13,6 +13,10 @@
   "payload": {
     "step": "18446744073709551616",
     "step_kind": "DriveUntil",
-    "cause": "quiescent"
+    "cause": "quiescent",
+    "armed_deadlines": "1",
+    "holding_faults": [
+      "hold-result"
+    ]
   }
 }

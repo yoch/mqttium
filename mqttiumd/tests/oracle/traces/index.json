@@ -1276,7 +1276,7 @@
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "FAIL"
       },
-      "why": "The bench stopped: nothing was eligible and the awaited event never happened. The product is stuck."
+      "why": "The bench stopped: nothing was eligible and the awaited event had not happened, which refutes what the DriveUntil step asserted."
     },
     {
       "name": "run-stopped-by-its-budget",

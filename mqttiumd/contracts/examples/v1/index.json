@@ -714,6 +714,24 @@
       "why": "The index of a step is 64-bit."
     },
     {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-without-what-waits.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A stopped run says what still waits: the deadlines armed and not fired."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-without-what-is-held.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A stopped run says which faults still hold an item."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-naming-a-fault-twice.json",
+      "code": "schema-violation",
+      "pointer": "/payload/holding_faults",
+      "why": "Each fault that holds an item is named once."
+    },
+    {
       "file": "contracts/examples/v1/invalid/trace-record-violation-without-its-kind.json",
       "code": "schema-violation",
       "pointer": "/payload",
