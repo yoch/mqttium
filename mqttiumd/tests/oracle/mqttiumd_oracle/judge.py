@@ -1319,6 +1319,16 @@ def transactional_kill_matches_recovery(run):
             reasons.append(f"{fault['id']}: FaultHit does not match its declared point")
             continue
         operation = _key(hit.payload["operation_id"])
+        submitted = [
+            command for command in run.trace.of_kind("CommandSubmitted")
+            if command.origin[1] == hit.origin[1]
+            and _key(command.payload["operation_id"]) == operation
+            and run.trace.before(command, hit) is True
+        ]
+        if not submitted:
+            statuses.append(INCONCLUSIVE)
+            reasons.append(f"{fault['id']}: the hit names no submitted command of its incarnation")
+            continue
         kills = [kill for kill in run.trace.of_kind("BrokerKilled") if run.trace.before(hit, kill) is True]
         if not kills:
             statuses.append(INCONCLUSIVE)
