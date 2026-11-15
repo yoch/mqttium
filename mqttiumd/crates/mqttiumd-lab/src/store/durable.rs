@@ -231,23 +231,32 @@ impl FactRef<'_> {
                     revision: record.revision,
                 }
             }
-            Self::Inbound(packet_id, marker) => RecoveredFact::InboundExchange {
-                exchange: marker.exchange,
-                packet_id,
-                publication: marker.publication,
-                phase: marker.phase,
-            },
-            Self::Operation(operation, record) => RecoveredFact::Operation {
-                operation,
-                knowledge: match record.decision {
-                    Decision::Committed(facts) => Knowledge::Committed(facts),
-                    Decision::Rejected(reason) => Knowledge::RejectedCertain(reason),
-                },
-            },
-            Self::Fence(operation) => RecoveredFact::Operation {
-                operation,
-                knowledge: Knowledge::RejectedCertain(RejectReason::Fenced),
-            },
+            Self::Inbound(packet_id, marker) => {
+                meter.field(32, 32)?;
+                RecoveredFact::InboundExchange {
+                    exchange: marker.exchange,
+                    packet_id,
+                    publication: marker.publication,
+                    phase: marker.phase,
+                }
+            }
+            Self::Operation(operation, record) => {
+                meter.field(32, 32)?;
+                RecoveredFact::Operation {
+                    operation,
+                    knowledge: match record.decision {
+                        Decision::Committed(facts) => Knowledge::Committed(facts),
+                        Decision::Rejected(reason) => Knowledge::RejectedCertain(reason),
+                    },
+                }
+            }
+            Self::Fence(operation) => {
+                meter.field(32, 32)?;
+                RecoveredFact::Operation {
+                    operation,
+                    knowledge: Knowledge::RejectedCertain(RejectReason::Fenced),
+                }
+            }
         })
     }
 }
@@ -291,6 +300,9 @@ fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
 fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadError> {
     let mut meter = ReadMeter::new(budget);
     budget.check_field(8)?;
+    if state.ledger.opened_by().is_some() {
+        budget.check_field(24)?;
+    }
     meter.charge(256)?;
     for record in state.sessions.values() {
         meter.field(record.client_id.len(), MAX_CLIENT_ID_BYTES)?;
@@ -993,6 +1005,7 @@ impl DurableStore for MemoryStore {
         if limit == 0 {
             return Err(RecoveryRefused::EmptyPage);
         }
+        budget.check_field(8).map_err(refused)?;
         budget
             .check_totals(
                 limit,
