@@ -1,0 +1,143 @@
+{
+  "format": "mqttiumd.assertion-catalog",
+  "schema_version": 1,
+  "assertions": [
+    {
+      "name": "one_admission_per_observed_inbound_exchange",
+      "meaning": "Each inbound exchange, identified independently by the client and the oracle, has exactly one internal admission. A fresh ExchangeId does not reset the count.",
+      "requirements": [
+        "ADM-006",
+        "ARC-011",
+        "V3-003",
+        "DEM-017",
+        "DEM-019"
+      ]
+    },
+    {
+      "name": "same_required_obligations_at_both_checkpoints",
+      "meaning": "Both checkpoints hold the same obligations: DeliveryId, target SessionId, cause, effective QoS and payload reference. A count of two is not enough.",
+      "every_run": false,
+      "requirements": [
+        "DUR-003",
+        "ROUTE-001",
+        "DEM-017"
+      ]
+    },
+    {
+      "name": "same_recipe_for_op_A",
+      "meaning": "The canonical recipe stored for the operation bound as op_A is byte-identical at every observation.",
+      "every_run": false,
+      "requirements": [
+        "DEM-009",
+        "V3-003"
+      ]
+    },
+    {
+      "name": "no_positive_ack_before_confirmed_commit",
+      "meaning": "No positive acknowledgement is eligible before the core received a confirmation or recovered a sufficient durable fact, even if the store had committed.",
+      "every_run": false,
+      "requirements": [
+        "ACK-001",
+        "V3-003",
+        "DEM-019"
+      ]
+    },
+    {
+      "name": "no_pubrec_observed_before_crash",
+      "meaning": "The peer decoder observed no PUBREC of the exchange before the crash.",
+      "every_run": false,
+      "requirements": [
+        "DEM-012",
+        "DEM-017"
+      ]
+    },
+    {
+      "name": "broker_inputs_have_provenance",
+      "meaning": "Every input the core consumed is a recovery page the store adapter read, a result or a deadline answering an effect still in flight, or a packet from bytes the transport received; and no input was refused for lack of correlation.",
+      "every_run": true,
+      "requirements": [
+        "DEM-008",
+        "DEM-012",
+        "V3-004"
+      ]
+    },
+    {
+      "name": "fenced_operation_never_executed",
+      "meaning": "Once an operation is fenced or refused with certainty, the store never commits it: no commit follows its fence in the trace, and no snapshot holds both.",
+      "every_run": false,
+      "requirements": [
+        "DEM-010",
+        "V3-006",
+        "DEM-018",
+        "DEM-019"
+      ]
+    },
+    {
+      "name": "certain_rejection_has_a_closure",
+      "meaning": "Every certain refusal the store reports has what makes it certain: a fence written before it, or a receipt of rejection or a fence that a snapshot holds. An absence that was only read is not one.",
+      "every_run": false,
+      "requirements": [
+        "DEM-010",
+        "IO-001",
+        "DEM-018"
+      ]
+    },
+    {
+      "name": "all_required_faults_hit",
+      "meaning": "Every declared injection was reached exactly as many times as expected; otherwise the run is inconclusive.",
+      "every_run": false,
+      "requirements": [
+        "V3-001",
+        "DEM-013"
+      ]
+    },
+    {
+      "name": "trace_complete",
+      "meaning": "The trace has its header, a gapless record sequence per origin and a footer declaring completeness.",
+      "every_run": true,
+      "requirements": [
+        "DEM-016"
+      ]
+    },
+    {
+      "name": "refusal_carries_the_reason_of_its_rejection",
+      "meaning": "A PUBREC that refuses an admission carries the reason the transition catalogue gives for the reason of the certain rejection the core received for it, in the same incarnation, before the frame. It judges the decision of the core on what the core received; that what the core received is what the store produced is the matter of broker_inputs_have_provenance (K1).",
+      "every_run": false,
+      "requirements": [
+        "ARC-011"
+      ]
+    },
+    {
+      "name": "one_grant_per_opened_epoch",
+      "meaning": "At most one grant is handed over per opened epoch, and each follows, among its causes in the same incarnation of the core, a committed reply for that epoch to an attempt whose epoch the store opened.",
+      "every_run": true,
+      "requirements": [
+        "DEM-012"
+      ]
+    },
+    {
+      "name": "terminal_knowledge_never_regresses",
+      "meaning": "An unknown result consumed after a terminal result of the same operation changes nothing: no record of the product names it as its cause, no second acknowledgement, no new resolution of the operation. A record of the bench ordered after it (an inspection, a crash, a packet of a peer) is no reaction of the product.",
+      "every_run": false,
+      "requirements": [
+        "DEM-010"
+      ]
+    },
+    {
+      "name": "scenario_reaches_its_end",
+      "meaning": "The run reached the last step of its scenario. A DriveUntil step asserts that the awaited event comes with no stimulus beyond what the scenario has already injected; a run the bench stopped because no action was eligible and the wait was unmet refutes that assertion for this run, and fails. It does not establish that the product is stuck for ever. A run stopped by its budget of steps concludes nothing.",
+      "every_run": true,
+      "requirements": [
+        "DEM-017"
+      ]
+    },
+    {
+      "name": "broker_killed_for_real",
+      "meaning": "A run whose trace header claims a broker run as a child process shows its kill: every BrokerCrashed follows a BrokerKilled of that crash whose wait status is signal 9, and no record of the killed incarnation of the child comes after the kill. A missing BrokerKilled is missing evidence and concludes nothing; another signal, a record of the killed incarnation after the kill, or a kill recorded by a run that claims no child process fails. A run in-process that records no kill has nothing to show.",
+      "every_run": true,
+      "requirements": [
+        "FAIL-001"
+      ]
+    }
+  ]
+}

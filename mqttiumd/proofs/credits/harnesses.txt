@@ -1,0 +1,16 @@
+# The harnesses of the proof and the number of witnesses of non-vacuity
+# (cover properties) each must satisfy. proofs/credits/run.sh fails when a
+# harness of the source is missing here, when one listed here is missing
+# from the source, or when a count differs.
+p1_total_specification 6
+p2_stale_key_mutates_nothing 5
+p3_repeated_release_subtracts_once 2
+p4_wrong_account_is_refused_whole 2
+p5_cost_above_usage_changes_neither_dimension 5
+p6_current_key_releases_exactly 5
+p7_old_key_leaves_the_reused_slot 3
+p8_incoherent_account_refusal_mutates_nothing 4
+p9_incoherent_account_release_is_exact 4
+p10_coherence_is_preserved 2
+p11_reserve_then_release_restores_the_account 1
+p12_a_second_record_of_a_held_lease_is_released_too 2

@@ -25,6 +25,9 @@ pub mod code {
     pub const SCHEMA_NOT_LOCAL: &str = "schema-not-local";
     /// A decimal string denotes a value above `u64::MAX`.
     pub const U64_OUT_OF_RANGE: &str = "u64-out-of-range";
+    /// A decimal string of a 32-bit quantity denotes a value above
+    /// `u32::MAX`.
+    pub const U32_OUT_OF_RANGE: &str = "u32-out-of-range";
     /// A decimal string is not the canonical spelling of its value.
     pub const U64_NOT_CANONICAL: &str = "u64-not-canonical";
     /// A path is absolute or leaves the mqttiumd root.
@@ -46,6 +49,10 @@ pub mod code {
     pub const FAULT_POINT_UNKNOWN: &str = "fault-point-unknown";
     /// The action is not offered by the injection point.
     pub const FAULT_ACTION_UNKNOWN: &str = "fault-action-unknown";
+    /// A fault matches on something its injection point does not carry.
+    pub const FAULT_MATCH_INVALID: &str = "fault-match-invalid";
+    /// A step releases or delivers something its fault does not hold.
+    pub const HELD_ITEM_MISMATCH: &str = "held-item-mismatch";
     /// The command kind is not in the catalogue.
     pub const COMMAND_KIND_UNKNOWN: &str = "command-kind-unknown";
     /// The profile is not in the catalogue.
@@ -62,6 +69,8 @@ pub mod code {
     pub const DUPLICATE_NAME: &str = "duplicate-name";
     /// A name refers to no entry of its catalogue.
     pub const CATALOG_REFERENCE_UNKNOWN: &str = "catalog-reference-unknown";
+    /// The rows of a table are not in the order of their keys.
+    pub const ROWS_OUT_OF_ORDER: &str = "rows-out-of-order";
     /// The requirement identifier is not in the register.
     pub const REQUIREMENT_UNKNOWN: &str = "requirement-unknown";
     /// Two rules of a registry cover the same guard point.
@@ -81,7 +90,7 @@ pub mod code {
     pub const EVIDENCE_MISMATCH: &str = "evidence-mismatch";
 
     /// Every code, so that the example corpus can prove it exercises them.
-    pub const ALL: [&str; 34] = [
+    pub const ALL: [&str; 38] = [
         JSON_SYNTAX,
         DUPLICATE_KEY,
         NUMBER_NOT_INTEGER,
@@ -90,6 +99,7 @@ pub mod code {
         SCHEMA_VIOLATION,
         SCHEMA_NOT_LOCAL,
         U64_OUT_OF_RANGE,
+        U32_OUT_OF_RANGE,
         U64_NOT_CANONICAL,
         PATH_ESCAPE,
         FILE_UNREADABLE,
@@ -100,6 +110,8 @@ pub mod code {
         BINDING_DUPLICATE,
         FAULT_POINT_UNKNOWN,
         FAULT_ACTION_UNKNOWN,
+        FAULT_MATCH_INVALID,
+        HELD_ITEM_MISMATCH,
         COMMAND_KIND_UNKNOWN,
         PROFILE_UNKNOWN,
         ASSERTION_UNKNOWN,
@@ -108,6 +120,7 @@ pub mod code {
         STEP_ORDER_INVALID,
         DUPLICATE_NAME,
         CATALOG_REFERENCE_UNKNOWN,
+        ROWS_OUT_OF_ORDER,
         REQUIREMENT_UNKNOWN,
         REGISTRY_OVERLAP,
         REGISTRY_HOLE,

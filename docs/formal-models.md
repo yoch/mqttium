@@ -101,6 +101,16 @@ python tools/formal/run_tlc.py Foo Bar    # selected models
 python tools/formal/run_tlc.py --list     # index of models, issues and expectations
 ```
 
+`--models-dir DIR` selects another directory of sidecars, read the same way
+and not recursively; `formal/models/` stays the default, and the models of one
+directory are unknown in another. The `mqttiumd` broker keeps its models under
+`mqttiumd/models/` and checks them with this runner. A campaign is refused
+before TLC is looked up when the directory does not exist or holds no sidecar,
+when a selected model holds no configuration, when an entry declares an
+unknown outcome, a `violation` without its `invariant` or a `liveness` without
+its `property`, or when a module or configuration file it names is missing. A
+campaign that ran no configuration is never a success.
+
 The runner needs Java 11 or newer. On first use it downloads the pinned
 `tla2tools.jar` release, checks its SHA-256, and caches it under
 `~/.cache/mqttium/formal/`. To use a pre-fetched copy, set

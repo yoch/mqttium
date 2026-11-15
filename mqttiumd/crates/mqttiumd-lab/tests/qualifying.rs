@@ -33,10 +33,19 @@ fn passing(name: &str) -> (std::path::PathBuf, String, Value) {
     fs::write(directory.join("trace.jsonl"), b"{}\n").expect("trace");
     let scenario: Value =
         serde_json::from_slice(&fs::read(root().join(SCENARIO)).expect("P1-02")).expect("JSON");
-    let assertions: Vec<Value> = scenario["assertions"]
+    // The assertions of the scenario, and those every run owes that P1-02
+    // does not list.
+    let mut names: Vec<Value> = scenario["assertions"]
         .as_array()
         .expect("assertions")
-        .iter()
+        .clone();
+    for name in EVERY_RUN {
+        if !names.iter().any(|listed| listed == name) {
+            names.push(json!(name));
+        }
+    }
+    let assertions: Vec<Value> = names
+        .into_iter()
         .map(|name| json!({"name": name, "status": "PASS"}))
         .collect();
     let result = json!({
@@ -100,6 +109,36 @@ fn a_pass_with_only_out_of_scope_assertions_is_refused() {
     assert!(codes.contains(&"result-incomplete"), "{codes:?}");
 }
 
+/// What every run owes, which P1-02, the text of the specification, does
+/// not all list (ADR 0003, DEM-MU-03, DEM-012).
+const EVERY_RUN: [&str; 5] = [
+    "trace_complete",
+    "broker_inputs_have_provenance",
+    "one_grant_per_opened_epoch",
+    "scenario_reaches_its_end",
+    "broker_killed_for_real",
+];
+
+#[test]
+fn an_assertion_every_run_owes_cannot_be_left_out() {
+    for name in EVERY_RUN {
+        let (directory, relative, mut result) = passing(&format!("every-run-{name}"));
+        let assertions = result["assertions"].as_array_mut().expect("assertions");
+        let before = assertions.len();
+        assertions.retain(|assertion| assertion["name"] != name);
+        assert_eq!(
+            assertions.len(),
+            before - 1,
+            "{name} is reported by a passing result"
+        );
+        assert_eq!(
+            codes_of(&directory, &relative, &result),
+            vec!["result-incomplete"],
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn an_assertion_of_the_scenario_cannot_be_left_out() {
     let (directory, relative, mut result) = passing("qualifying-missing-assertion");
@@ -148,6 +187,14 @@ fn the_faults_are_exactly_those_of_the_scenario() {
         vec!["result-incomplete"]
     );
     result["faults"] = json!([]);
+    assert_eq!(
+        codes_of(&directory, &relative, &result),
+        vec!["result-incomplete"]
+    );
+    // Record 0018: at least once is not exactly once.
+    result["faults"] = json!([
+        {"id": "lost_admission_result", "expected_hits_at_least": "1", "hits": "1"}
+    ]);
     assert_eq!(
         codes_of(&directory, &relative, &result),
         vec!["result-incomplete"]
