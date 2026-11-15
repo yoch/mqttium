@@ -11,7 +11,8 @@
       "meaning": "The adapter accepted a command that has not entered the writer yet.",
       "carries": "command",
       "actions": [
-        "hold_command"
+        "hold_command",
+        "delay_result"
       ]
     },
     {

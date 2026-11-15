@@ -105,6 +105,29 @@ fn every_invalid_example_is_refused_for_its_declared_reason() {
     }
 }
 
+/// One misplaced member is one diagnostic: a reader that reports the same
+/// mistake twice, or lets it cascade, spends the bounded report on noise.
+#[test]
+fn a_scenario_with_one_misplaced_step_gets_one_diagnostic() {
+    let workspace = workspace();
+    for name in [
+        "scenario-deliver-while-crashed.json",
+        "scenario-second-wait-on-a-holding-fault.json",
+        "scenario-release-twice.json",
+        "scenario-release-before-hold.json",
+        "scenario-inspect-while-crashed.json",
+    ] {
+        let file = format!("contracts/examples/v1/invalid/{name}");
+        let report = workspace.check_file(Path::new(&file));
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "{file}: {:?}",
+            report.diagnostics
+        );
+    }
+}
+
 #[test]
 fn every_example_file_is_indexed_exactly_once() {
     let index = index();

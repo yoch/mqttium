@@ -37,6 +37,18 @@ class ReaderAgreement(unittest.TestCase):
                 self.assertEqual({d.code for d in diagnostics}, {case["code"]}, diagnostics)
                 self.assertIn(case["pointer"], [d.pointer for d in diagnostics], diagnostics)
 
+    def test_a_scenario_with_one_misplaced_step_gets_one_diagnostic(self):
+        for name in [
+            "scenario-deliver-while-crashed.json",
+            "scenario-second-wait-on-a-holding-fault.json",
+            "scenario-release-twice.json",
+            "scenario-release-before-hold.json",
+            "scenario-inspect-while-crashed.json",
+        ]:
+            with self.subTest(name):
+                found = self.contracts.check_file(f"contracts/examples/v1/invalid/{name}")
+                self.assertEqual(len(found), 1, found)
+
     def test_the_oracle_and_the_rust_reader_name_the_same_contracts(self):
         # The digest `mqttiumd-lab validate` prints is defined by
         # contracts/README.md; the oracle computes it from the same bytes

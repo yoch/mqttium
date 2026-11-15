@@ -8,7 +8,9 @@
     "contracts/examples/v1/valid/scenario-core-without-bytes.json",
     "contracts/examples/v1/valid/scenario-qos0-publish.json",
     "contracts/examples/v1/valid/scenario-held-command-and-result.json",
-    "contracts/examples/v1/valid/fault-catalog.json",
+    "contracts/examples/v1/valid/scenario-hold-reached-after-a-restart.json",
+    "contracts/examples/v1/valid/scenario-command-held-to-the-end.json",
+    "contracts/v1/fault-points.json",
     "contracts/examples/v1/valid/trace-record-header.json",
     "contracts/examples/v1/valid/trace-record-store-commit-stable.json",
     "contracts/examples/v1/valid/trace-record-fault-hit.json",
@@ -402,10 +404,34 @@
       "why": "A held command is released once."
     },
     {
-      "file": "contracts/examples/v1/invalid/scenario-release-after-second-wait.json",
+      "file": "contracts/examples/v1/invalid/scenario-second-wait-on-a-holding-fault.json",
       "code": "step-order-invalid",
-      "pointer": "/steps/7",
-      "why": "Waiting for the fault again does not make it hold a second command."
+      "pointer": "/steps/6",
+      "why": "A fault that holds something holds one item in the life of a scenario: it is waited for once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-holding-fault-expected-twice.json",
+      "code": "held-item-mismatch",
+      "pointer": "/faults/0/expected_hits",
+      "why": "A fault that holds something is reached once: a second item would have no step to release it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-wait-for-a-fault-never-expected.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/6",
+      "why": "A scenario does not wait for an injection it announces will never be reached."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-two-faults-select-one-result.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/2/match",
+      "why": "Without result_of the delay also selects the first result of the Persist that another fault drops."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-deliver-while-crashed.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/11",
+      "why": "One misplaced step is one diagnostic: the hand-over is not judged again while the broker is down."
     },
     {
       "file": "contracts/examples/v1/invalid/scenario-deliver-after-crash.json",
@@ -454,6 +480,18 @@
       "code": "budget-exceeded",
       "pointer": "/steps/3/max_steps",
       "why": "The new steps obey the scenario budget."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/fault-catalog-result-action-on-a-command-point.json",
+      "code": "fault-action-unknown",
+      "pointer": "/points/0/actions/1",
+      "why": "A point that carries a command cannot delay a result."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/fault-catalog-action-nobody-defines.json",
+      "code": "fault-action-unknown",
+      "pointer": "/points/0/actions/0",
+      "why": "The actions of an injection point are a closed vocabulary."
     },
     {
       "file": "contracts/examples/v1/invalid/fault-catalog-point-without-carries.json",

@@ -17,8 +17,9 @@ Run from the ``mqttiumd`` directory::
     python tools/build_corpus.py           # rewrite the derived files
     python tools/build_corpus.py --check   # fail if a derived file is not up to date
 
-After editing a chapter digest, a decision record, the base scenario or the fixture, run it
-without ``--check`` and commit the result. Standard library only.
+After editing a chapter digest, a decision record, the base scenario, the fixture or the
+fault catalogue (invalid examples are edits of it), run it without ``--check`` and commit the
+result. Standard library only.
 """
 
 from __future__ import annotations
@@ -173,8 +174,8 @@ def bad(name, code, pointer, why, value=None, raw=None):
     )
 
 
-def scenario(edit):
-    value = copy.deepcopy(BASE)
+def scenario(edit, base=None):
+    value = copy.deepcopy(BASE if base is None else base)
     edit(value)
     return value
 
@@ -611,9 +612,7 @@ RELEASE, DELIVER = 5, 10
 
 
 def held(edit):
-    value = copy.deepcopy(HELD)
-    edit(value)
-    return value
+    return scenario(edit, HELD)
 
 
 def swap(first, second):
@@ -640,14 +639,60 @@ bad(
     held(lambda v: v["steps"].insert(RELEASE + 1, copy.deepcopy(v["steps"][RELEASE]))),
 )
 bad(
-    "scenario-release-after-second-wait.json",
+    "scenario-second-wait-on-a-holding-fault.json",
     "step-order-invalid",
-    f"/steps/{RELEASE + 2}",
-    "Waiting for the fault again does not make it hold a second command.",
+    f"/steps/{RELEASE + 1}",
+    "A fault that holds something holds one item in the life of a scenario: it is waited for once.",
+    held(lambda v: v["steps"].insert(RELEASE + 1, drive_fault("held_admission"))),
+)
+bad(
+    "scenario-holding-fault-expected-twice.json",
+    "held-item-mismatch",
+    "/faults/0/expected_hits",
+    "A fault that holds something is reached once: a second item would have no step to release it.",
+    held(setter(["faults", 0, "expected_hits"], "2")),
+)
+ok(
+    "scenario-hold-reached-after-a-restart.json",
     held(
         lambda v: v["steps"].__setitem__(
-            slice(RELEASE + 1, RELEASE + 1),
-            [drive_fault("held_admission"), copy.deepcopy(v["steps"][RELEASE])],
+            slice(2, 2), [BASE["steps"][4], BASE["steps"][5], BASE["steps"][0]]
+        )
+    ),
+)
+ok(
+    "scenario-command-held-to-the-end.json",
+    held(
+        lambda v: v.update(
+            faults=v["faults"][:1],
+            steps=[*v["steps"][:3], {"kind": "InspectDurableState", "checkpoint": "held"}],
+        )
+    ),
+)
+bad(
+    "scenario-wait-for-a-fault-never-expected.json",
+    "step-order-invalid",
+    "/steps/6",
+    "A scenario does not wait for an injection it announces will never be reached.",
+    held(setter(["faults", 2, "expected_hits"], "0")),
+)
+bad(
+    "scenario-two-faults-select-one-result.json",
+    "fault-match-invalid",
+    "/faults/2/match",
+    "Without result_of the delay also selects the first result of the Persist that another fault drops.",
+    held(lambda v: v["faults"][1]["match"].pop("result_of")),
+)
+bad(
+    "scenario-deliver-while-crashed.json",
+    "step-order-invalid",
+    f"/steps/{DELIVER + 1}",
+    "One misplaced step is one diagnostic: the hand-over is not judged again while the broker is down.",
+    held(
+        lambda v: (
+            v["steps"].insert(DELIVER, BASE["steps"][4]),
+            v["steps"].insert(DELIVER + 2, BASE["steps"][5]),
+            v["steps"].insert(DELIVER + 3, BASE["steps"][0]),
         )
     ),
 )
@@ -714,7 +759,22 @@ bad(
 
 # fault catalogue
 FAULTS = json.loads((V1 / "fault-points.json").read_text())
-ok("fault-catalog.json", FAULTS)
+# The catalogue is a source: it is listed by its own path, like the fixture.
+valid.append("contracts/v1/fault-points.json")
+bad(
+    "fault-catalog-result-action-on-a-command-point.json",
+    "fault-action-unknown",
+    "/points/0/actions/1",
+    "A point that carries a command cannot delay a result.",
+    (lambda v: (v["points"][0]["actions"].append("delay_result"), v)[1])(copy.deepcopy(FAULTS)),
+)
+bad(
+    "fault-catalog-action-nobody-defines.json",
+    "fault-action-unknown",
+    "/points/0/actions/0",
+    "The actions of an injection point are a closed vocabulary.",
+    (lambda v: (v["points"][0].update(actions=["teleport"]), v)[1])(copy.deepcopy(FAULTS)),
+)
 bad(
     "fault-catalog-point-without-carries.json",
     "schema-violation",
