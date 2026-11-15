@@ -28,6 +28,13 @@
     "profile": {
       "$ref": "primitives.schema.json#/$defs/slug"
     },
+    "perimeter": {
+      "description": "The perimeter a run of this scenario must have; absent, `full`. A run of another perimeter concludes nothing about this scenario. What a run exercises. `full`: client bytes through the transport, with independent peers. `core-without-bytes`: the core is driven with validated packets; no transport and no peer observes anything.",
+      "enum": [
+        "full",
+        "core-without-bytes"
+      ]
+    },
     "initial_fixture": {
       "$ref": "primitives.schema.json#/$defs/relative_path"
     },
@@ -103,6 +110,13 @@
             },
             "publication_binding": {
               "$ref": "primitives.schema.json#/$defs/binding"
+            },
+            "result_of": {
+              "description": "The effect whose store result the fault selects. Only on a point that carries a result; absent, any result about a matching operation counts.",
+              "enum": [
+                "Persist",
+                "ResolveAndFence"
+              ]
             }
           }
         },
@@ -135,7 +149,10 @@
             "CrashBroker",
             "RestartBroker",
             "ClientResumeExchange",
-            "ClientSendPubrel"
+            "ClientSendPubrel",
+            "FireDeadline",
+            "ReleaseHeldCommand",
+            "DeliverHeldResult"
           ]
         }
       },
@@ -516,6 +533,94 @@
               },
               "packet_id": {
                 "$ref": "primitives.schema.json#/$defs/packet_id"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "FireDeadline"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "max_steps"
+            ],
+            "properties": {
+              "kind": {
+                "const": "FireDeadline"
+              },
+              "max_steps": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ReleaseHeldCommand"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "fault"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ReleaseHeldCommand"
+              },
+              "fault": {
+                "$ref": "primitives.schema.json#/$defs/name"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "DeliverHeldResult"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "fault",
+              "max_steps"
+            ],
+            "properties": {
+              "kind": {
+                "const": "DeliverHeldResult"
+              },
+              "fault": {
+                "$ref": "primitives.schema.json#/$defs/name"
+              },
+              "max_steps": {
+                "$ref": "primitives.schema.json#/$defs/u64"
               }
             }
           }

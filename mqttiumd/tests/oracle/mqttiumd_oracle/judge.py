@@ -1,0 +1,876 @@
+"""Deciding the assertions of a run from its observations (DEM-019).
+
+The observations are the trace, the store snapshots the trace cites, and the
+scenario with its fixture. Every expectation is computed here, from the
+specification: nothing is asked of the broker, and what the broker says
+about itself (an ExchangeId, a generation) is never taken for the identity
+the oracle reasons on.
+
+Three rules hold for every assertion:
+
+* Hidden truth of the store judges a run and never justifies an answer of
+  the core.
+* Order is what the trace establishes (``Trace.before``). Where it does not
+  say, the conclusion is inconclusive: an event is never moved before its
+  prerequisite to make a trace acceptable.
+* Missing data is inconclusive, never accepted.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass, field
+
+from . import recipe as recipes
+from .semantic import InventoryOrder
+from .strict import Refused, parse
+from .trace import Trace
+from .trace import read as read_trace
+
+PASS, FAIL, INCONCLUSIVE, OUT_OF_SCOPE = "PASS", "FAIL", "INCONCLUSIVE", "OUT_OF_SCOPE"
+
+# A violation of these can stay a violation whatever records are added to
+# the trace, so it can stand even when the trace is incomplete. For the
+# others a missing record could be the very one that justifies what was
+# observed. Within these, a status says itself whether its reason is of
+# that kind (``Status.stands``).
+MONOTONE = {
+    "fenced_operation_never_executed",
+    "one_admission_per_observed_inbound_exchange",
+    "same_required_obligations_at_both_checkpoints",
+    "same_recipe_for_op_A",
+}
+
+
+# What only independent peers can decide: without bytes nobody observed
+# what a client sent or received.
+NEEDS_PEERS = {
+    "one_admission_per_observed_inbound_exchange",
+    "no_pubrec_observed_before_crash",
+}
+
+
+@dataclass
+class Status:
+    status: str
+    reasons: list = field(default_factory=list)
+    # Whether a FAIL rests only on what no record added to the trace could
+    # undo. Read for the assertions of ``MONOTONE`` on an incomplete trace.
+    stands: bool = True
+
+
+# The components an identity can have, in the order they are compared. An
+# identity is these named members, in whatever order a writer puts them.
+_COMPONENTS = ("incarnation", "epoch", "owner", "sequence", "session", "generation")
+
+
+def _key(identity: dict) -> tuple:
+    """An identity object of decimal strings, as a tuple of integers."""
+    unknown = identity.keys() - set(_COMPONENTS)
+    if unknown:
+        raise ValueError(f"an identity has the unknown components {sorted(unknown)}")
+    return tuple(int(identity[name]) for name in _COMPONENTS if name in identity)
+
+
+_PACKET_KINDS = {1: "CONNECT", 3: "PUBLISH", 6: "PUBREL"}
+
+
+def _packet(data: bytes):
+    """``(kind, Packet Identifier)`` of bytes that are exactly one packet.
+
+    Read from the MQTT fixed header and, for the identifier, the variable
+    header. ``None`` when the bytes are not one whole packet of a kind the
+    core is delivered.
+    """
+    if len(data) < 2:
+        return None
+    kind = _PACKET_KINDS.get(data[0] >> 4)
+    length, shift, at = 0, 0, 1
+    while True:
+        if at >= len(data) or shift > 21:
+            return None
+        byte = data[at]
+        length |= (byte & 0x7F) << shift
+        shift += 7
+        at += 1
+        if not byte & 0x80:
+            break
+    if kind is None or len(data) != at + length:
+        return None
+    if kind == "CONNECT":
+        return kind, None
+    if kind == "PUBLISH":
+        if (data[0] >> 1) & 3 == 0:
+            return kind, None
+        if at + 2 > len(data):
+            return None
+        at += 2 + int.from_bytes(data[at : at + 2], "big")
+    if at + 2 > len(data):
+        return None
+    return kind, int.from_bytes(data[at : at + 2], "big")
+
+
+@dataclass
+class Exchange:
+    """One QoS 2 exchange as the client lived it: the oracle's own identity."""
+
+    client: str
+    packet_id: int
+    ordinal: int
+    opened: object
+    closed: object = None
+    positive_pubrec: object = None
+
+
+@dataclass
+class Run:
+    contracts: object
+    scenario: dict
+    fixture: dict
+    trace: Trace
+    # checkpoint -> snapshot document
+    snapshots: dict = field(default_factory=dict)
+    # checkpoint -> why its snapshot cannot be used
+    missing: dict = field(default_factory=dict)
+
+    # ------------------------------------------------------------- loading
+
+    @classmethod
+    def load(cls, contracts, scenario_path, trace_path):
+        problems = contracts.check_file(scenario_path)
+        if problems:
+            raise Refused("reference-invalid", "", f"{scenario_path}: {problems[0]}")
+        scenario = parse(contracts.read(scenario_path))
+        fixture = parse(contracts.read(scenario["initial_fixture"]))
+        budget = int(scenario["budgets"]["max_trace_bytes"])
+        with (contracts.root / trace_path).open("rb") as stream:
+            trace = read_trace(contracts, stream, max_bytes=budget)
+        run = cls(contracts, scenario, fixture, trace)
+        run._load_snapshots()
+        return run
+
+    def _load_snapshots(self):
+        for record in self.trace.of_kind("DurableStateInspected"):
+            checkpoint = record.payload["checkpoint"]
+            cited = record.payload["snapshot"]
+            if checkpoint in self.snapshots or checkpoint in self.missing:
+                self.missing[checkpoint] = "the checkpoint was inspected twice"
+                self.snapshots.pop(checkpoint, None)
+                continue
+            try:
+                data = self.contracts.read(cited["path"])
+            except Refused as refusal:
+                self.missing[checkpoint] = str(refusal.diagnostic)
+                continue
+            if hashlib.sha256(data).hexdigest() != cited["sha256"] or len(data) != int(
+                cited["bytes"]
+            ):
+                self.missing[checkpoint] = f"{cited['path']} is not the file the trace cites"
+                continue
+            problems = self.contracts.check_bytes(data)
+            if problems:
+                self.missing[checkpoint] = f"{cited['path']}: {problems[0]}"
+                continue
+            snapshot = parse(data)
+            if snapshot["format"] != "mqttiumd.store-snapshot":
+                self.missing[checkpoint] = f"{cited['path']} is not a store snapshot"
+            elif snapshot["checkpoint"] != checkpoint:
+                self.missing[checkpoint] = f"{cited['path']} is the snapshot of another checkpoint"
+            elif snapshot["run_id"] != self.trace.run_id:
+                self.missing[checkpoint] = (
+                    f"{cited['path']} is a snapshot of the run {snapshot['run_id']}"
+                )
+            elif snapshot["backend"] != self.trace.backend:
+                self.missing[checkpoint] = (
+                    f"{cited['path']} was read from {snapshot['backend']}, "
+                    f"the run declares {self.trace.backend}"
+                )
+            else:
+                self.snapshots[checkpoint] = (record, snapshot)
+
+    # -------------------------------------------------------- derived facts
+
+    def checkpoints(self):
+        return [
+            step["checkpoint"]
+            for step in self.scenario["steps"]
+            if step["kind"] == "InspectDurableState"
+        ]
+
+    def client_of_session(self):
+        """SessionId -> client name, through the ClientID the fixture gives."""
+        names = {
+            session["client_id"].encode().hex(): session["client"]
+            for session in self.fixture["sessions"]
+        }
+        found = {}
+        for _, snapshot in self.snapshots.values():
+            for row in snapshot["sessions"]:
+                client = names.get(row["client_id_hex"])
+                if client is not None:
+                    found[int(row["session"])] = client
+        return found
+
+    def recipes(self):
+        """OperationId -> set of recipe bytes seen for it in the snapshots."""
+        found = {}
+        for _, snapshot in self.snapshots.values():
+            for row in snapshot["operations"]:
+                found.setdefault(_key(row["operation_id"]), set()).add(row["recipe_hex"])
+        return found
+
+    def slots(self):
+        """OperationId -> (kind, session, Packet Identifier) of the exchange it serves.
+
+        Every content seen for the operation must be readable and name the
+        same exchange; a recipe whose other fields changed still tells which
+        exchange it belongs to.
+        """
+        found = {}
+        for operation, seen in self.recipes().items():
+            slots = set()
+            for content in seen:
+                try:
+                    recipe = recipes.decode(bytes.fromhex(content))
+                except recipes.RecipeError:
+                    slots.add(None)
+                    continue
+                slots.add((recipe.kind, recipe.session, recipe.packet_id))
+            if len(slots) == 1 and None not in slots:
+                found[operation] = next(iter(slots))
+        return found
+
+    def exchanges(self):
+        """The QoS 2 exchanges of every client, from what the peers did.
+
+        An exchange opens with the first PUBLISH of a Packet Identifier that
+        is not in use, and ends when the client observes PUBCOMP or a PUBREC
+        that carries a failure. A PUBLISH sent meanwhile with the same
+        identifier is a replay of the same exchange, whatever the broker
+        calls it.
+        """
+        found, open_now, notes = [], {}, []
+        for record in self.trace.records:
+            if record.origin[0] != "peer":
+                continue
+            payload = record.payload
+            slot = (payload.get("client"), payload.get("packet_id"))
+            if record.kind == "PeerPacketSent" and payload["packet_kind"] == "PUBLISH":
+                header = bytes.fromhex(payload["bytes_hex"][:2] or "00")[0]
+                if header >> 4 != 3 or bool(header & 0x08) != payload["dup"]:
+                    notes.append(f"record {record.sequence}: the bytes are not the PUBLISH stated")
+                    continue
+                if (header >> 1) & 3 != 2:
+                    continue
+                if slot not in open_now:
+                    ordinal = sum(
+                        1 for exchange in found if (exchange.client, exchange.packet_id) == slot
+                    )
+                    open_now[slot] = Exchange(slot[0], slot[1], ordinal, record)
+                    found.append(open_now[slot])
+            elif record.kind == "PeerPacketObserved" and slot in open_now:
+                if payload["packet_kind"] == "PUBREC":
+                    if payload["reason_code"] >= 0x80:
+                        open_now.pop(slot).closed = record
+                    elif open_now[slot].positive_pubrec is None:
+                        open_now[slot].positive_pubrec = record
+                elif payload["packet_kind"] == "PUBCOMP":
+                    open_now.pop(slot).closed = record
+        return found, notes
+
+
+# ---------------------------------------------------------------- assertions
+
+
+def _worst(statuses):
+    for status in (FAIL, INCONCLUSIVE):
+        if status in statuses:
+            return status
+    return PASS
+
+
+def trace_complete(run):
+    trace = run.trace
+    if trace.unreadable:
+        return Status(INCONCLUSIVE, list(trace.unreadable))
+    if trace.incomplete:
+        return Status(INCONCLUSIVE, list(trace.incomplete))
+    if trace.scenario_id != run.scenario["id"]:
+        return Status(INCONCLUSIVE, [f"the trace is a run of {trace.scenario_id}"])
+    return Status(PASS)
+
+
+def all_required_faults_hit(run):
+    reasons = []
+    hits = fault_hits(run)
+    declared = {fault["id"]: int(fault["expected_hits"]) for fault in run.scenario["faults"]}
+    for fault, expected in declared.items():
+        if hits.get(fault, 0) != expected:
+            reasons.append(f"{fault} was reached {hits.get(fault, 0)} times, {expected} expected")
+    for fault in hits.keys() - declared.keys():
+        reasons.append(f"{fault} was reached and is not declared")
+    return Status(INCONCLUSIVE if reasons else PASS, reasons)
+
+
+def fault_hits(run):
+    hits = {}
+    for record in run.trace.of_kind("FaultHit"):
+        hits[record.payload["fault_id"]] = hits.get(record.payload["fault_id"], 0) + 1
+    return hits
+
+
+def one_admission_per_observed_inbound_exchange(run):
+    exchanges, notes = run.exchanges()
+    if notes:
+        return Status(INCONCLUSIVE, notes)
+    bound = [
+        step
+        for step in run.scenario["steps"]
+        if step["kind"] == "ClientPublish" and step["qos"] == 2 and "bind_exchange_as" in step
+    ]
+    if len(exchanges) < len(bound):
+        return Status(INCONCLUSIVE, ["the peers did not record every exchange the scenario binds"])
+    clients = run.client_of_session()
+    slots = run.slots()
+    counts = {id(exchange): [] for exchange in exchanges}
+    statuses, reasons = [], []
+    # Two admissions of one exchange stay two whatever record is added. An
+    # admission that is missing, or an exchange that is, may be the very
+    # record an incomplete trace lacks.
+    stands = False
+    for commit in run.trace.of_kind("StoreCommitStable"):
+        if commit.payload["command_kind"] != "AdmitPublication":
+            continue
+        operation = _key(commit.payload["operation_id"])
+        kind, session, packet_id = slots.get(operation, (None, None, None))
+        if kind != "AdmitPublication" or session not in clients:
+            statuses.append(INCONCLUSIVE)
+            reasons.append(f"the admission {operation} cannot be attributed: no readable recipe")
+            continue
+        slot = (clients[session], packet_id)
+        owner, unknown = None, False
+        for exchange in exchanges:
+            if (exchange.client, exchange.packet_id) != slot:
+                continue
+            opened = run.trace.before(exchange.opened, commit)
+            ended = exchange.closed is not None and run.trace.before(exchange.closed, commit)
+            if opened is None or ended is None:
+                unknown = True
+            elif opened and not ended:
+                owner = exchange
+        if owner is not None:
+            counts[id(owner)].append(operation)
+        elif unknown:
+            statuses.append(INCONCLUSIVE)
+            reasons.append(f"the trace does not order the admission {operation} with its exchange")
+        else:
+            statuses.append(FAIL)
+            reasons.append(f"the admission {operation} belongs to no exchange {slot} had open")
+    for exchange in exchanges:
+        admissions = counts[id(exchange)]
+        name = f"exchange {exchange.ordinal} of {exchange.client}, Packet Identifier {exchange.packet_id}"
+        if len(admissions) > 1:
+            stands = True
+            statuses.append(FAIL)
+            reasons.append(f"{name} has {len(admissions)} admissions: {admissions}")
+        elif not admissions and exchange.positive_pubrec is not None:
+            statuses.append(FAIL)
+            reasons.append(f"{name} was acknowledged and has no admission")
+    return Status(_worst(statuses), reasons, stands)
+
+
+def _obligations(snapshot):
+    """DeliveryId -> what identifies the obligation, payload reference included.
+
+    The payload is the object the publication refers to, with its length and
+    digest when the store still holds it.
+    """
+    stored = {
+        _key(row["payload_id"]): (row["length"], row["sha256"]) for row in snapshot["payloads"]
+    }
+    payloads = {
+        _key(row["publication_id"]): (
+            _key(row["payload_id"]),
+            stored.get(_key(row["payload_id"])),
+        )
+        for row in snapshot["publications"]
+    }
+    return {
+        (_key(row["publication_id"]), row["index"]): (
+            int(row["session"]),
+            row["cause"],
+            row["effective_qos"],
+            payloads.get(_key(row["publication_id"])),
+        )
+        for row in snapshot["obligations"]
+    }
+
+
+def same_required_obligations_at_both_checkpoints(run):
+    names = run.checkpoints()
+    if len(names) < 2:
+        return Status(OUT_OF_SCOPE, ["the scenario inspects fewer than two checkpoints"])
+    unusable = [
+        f"{name}: {run.missing.get(name, 'no snapshot')}"
+        for name in names
+        if name not in run.snapshots
+    ]
+    if unusable:
+        return Status(INCONCLUSIVE, unusable)
+    first = run.snapshots[names[0]][1]
+    lot = _obligations(first)
+    if not lot:
+        return Status(FAIL, [f"{names[0]} holds no obligation"])
+    reasons = []
+    # What the fixture requires of each publication, computed here: the
+    # exact-topic route and the lower of the two QoS.
+    sessions = {client: session for session, client in run.client_of_session().items()}
+    routes = {route["topic"].encode().hex(): route["targets"] for route in run.fixture["routes"]}
+    for row in first["publications"]:
+        publication = _key(row["publication_id"])
+        targets = routes.get(row["topic_hex"], [])
+        lost = sorted(target["client"] for target in targets if target["client"] not in sessions)
+        if lost:
+            # Nothing can be owed to a session the store does not hold.
+            reasons.append(
+                f"{names[0]}: publication {publication} is routed to {lost}, "
+                "and the store holds no session for them"
+            )
+            continue
+        required = sorted(
+            (sessions[target["client"]], "LiveExact", min(row["qos"], target["qos"]))
+            for target in targets
+        )
+        held = sorted(
+            obligation[:3] for (owner, _), obligation in lot.items() if owner == publication
+        )
+        if held != required:
+            reasons.append(
+                f"{names[0]}: publication {publication} holds {held}, the routes require {required}"
+            )
+    for name in names[1:]:
+        later = _obligations(run.snapshots[name][1])
+        for delivery, obligation in lot.items():
+            if delivery not in later:
+                reasons.append(f"{name}: the obligation {delivery} is gone")
+            elif later[delivery] != obligation:
+                reasons.append(
+                    f"{name}: the obligation {delivery} changed from {obligation} to {later[delivery]}"
+                )
+        # A publication of the first checkpoint owes what it owed there and
+        # nothing more. What a publication admitted since owes is the
+        # matter of its own admission, not of this comparison.
+        known = {publication for publication, _ in lot}
+        known.update(_key(row["publication_id"]) for row in first["publications"])
+        for delivery in sorted(later.keys() - lot.keys()):
+            if delivery[0] in known:
+                reasons.append(f"{name}: the obligation {delivery} appeared")
+    return Status(FAIL if reasons else PASS, reasons)
+
+
+def same_recipe_for_op_A(run):
+    binding = next(
+        (fault for fault in run.scenario["faults"] if fault.get("bind_operation_as") == "op_A"),
+        None,
+    )
+    if binding is None:
+        return Status(OUT_OF_SCOPE, ["the scenario binds no operation as op_A"])
+    hits = [
+        record
+        for record in run.trace.of_kind("FaultHit")
+        if record.payload["fault_id"] == binding["id"]
+    ]
+    if not hits or "operation_id" not in hits[0].payload:
+        return Status(INCONCLUSIVE, [f"no hit of {binding['id']} names the operation it stopped"])
+    operation = _key(hits[0].payload["operation_id"])
+    unusable = [
+        f"{name}: {run.missing.get(name, 'no snapshot')}"
+        for name in run.checkpoints()
+        if name not in run.snapshots
+    ]
+    seen = run.recipes().get(operation, set())
+    if len(seen) > 1:
+        return Status(FAIL, [f"the recipe of {operation} has {len(seen)} different contents"])
+    if unusable:
+        return Status(INCONCLUSIVE, unusable)
+    commits = [
+        record
+        for record in run.trace.of_kind("StoreCommitStable")
+        if _key(record.payload["operation_id"]) == operation
+    ]
+    reasons, observed = [], 0
+    for name, (inspection, snapshot) in run.snapshots.items():
+        present = any(_key(row["operation_id"]) == operation for row in snapshot["operations"])
+        observed += present
+        if not present and any(run.trace.before(commit, inspection) for commit in commits):
+            reasons.append(f"{name}: the committed operation {operation} has no recipe")
+    if reasons:
+        return Status(FAIL, reasons)
+    if observed == 0:
+        return Status(INCONCLUSIVE, [f"no snapshot holds the recipe of {operation}"])
+    return Status(PASS)
+
+
+def no_positive_ack_before_confirmed_commit(run):
+    """A positive PUBREC or PUBCOMP follows what the core itself learned.
+
+    The justification is looked for in the records of the same incarnation
+    of the core, before the frame: a result delivered to the core, or a
+    recovered fact that is sufficient. That the store had committed is not
+    one.
+    """
+    slots = run.slots()
+    statuses, reasons = [], []
+    for origin in sorted(
+        {record.origin for record in run.trace.records if record.origin[0] == "broker-core"}
+    ):
+        learned = {"PUBREC": {}, "PUBCOMP": {}}
+        unattributed = False
+        for record in run.trace.records:
+            if record.origin != origin:
+                continue
+            payload = record.payload
+            if record.kind == "StoreResultDelivered" and payload["outcome"] == "Committed":
+                known = slots.get(_key(payload["operation_id"]))
+                if known is None:
+                    unattributed = True
+                elif known[0] == "AdmitPublication":
+                    learned["PUBREC"][known[1:]] = record
+                else:
+                    learned["PUBCOMP"][known[1:]] = record
+            elif record.kind == "RecoveryPageDelivered":
+                for fact in payload["facts"]:
+                    if fact["kind"] == "InboundExchange" and fact["phase"] == "AwaitPubrel":
+                        slot = (int(fact["exchange"]["session"]), fact["packet_id"])
+                        learned["PUBREC"][slot] = record
+            elif record.kind == "FrameEligible" and payload["packet_kind"] in learned:
+                if payload["reason"] != "Success":
+                    continue
+                kind = payload["packet_kind"]
+                slot = (int(payload["connection"]["session"]), payload["packet_id"])
+                if slot in learned[kind]:
+                    if kind == "PUBCOMP":
+                        # The exchange is over: its knowledge justifies no
+                        # later acknowledgement of the same slot.
+                        learned["PUBCOMP"].pop(slot)
+                        learned["PUBREC"].pop(slot, None)
+                elif unattributed:
+                    statuses.append(INCONCLUSIVE)
+                    reasons.append(
+                        f"record {record.sequence}: a result the core received cannot be attributed"
+                    )
+                else:
+                    statuses.append(FAIL)
+                    reasons.append(
+                        f"record {record.sequence}: {kind} of Packet Identifier {slot[1]} is "
+                        "eligible before the core knew of a commit"
+                    )
+    return Status(_worst(statuses), reasons)
+
+
+def no_pubrec_observed_before_crash(run):
+    crashes = run.trace.of_kind("BrokerCrashed")
+    if not any(step["kind"] == "CrashBroker" for step in run.scenario["steps"]):
+        return Status(OUT_OF_SCOPE, ["the scenario has no crash"])
+    if not crashes:
+        return Status(INCONCLUSIVE, ["the trace records no crash"])
+    bound = {
+        (step["client"], step["packet_id"])
+        for step in run.scenario["steps"]
+        if step["kind"] == "ClientPublish" and "bind_exchange_as" in step and "packet_id" in step
+    }
+    statuses, reasons = [], []
+    for record in run.trace.of_kind("PeerPacketObserved"):
+        payload = record.payload
+        if (
+            payload["packet_kind"] != "PUBREC"
+            or (payload["client"], payload["packet_id"]) not in bound
+        ):
+            continue
+        order = run.trace.before(record, crashes[0])
+        if order is None:
+            statuses.append(INCONCLUSIVE)
+            reasons.append(f"record {record.sequence}: not ordered with the crash")
+        elif order:
+            statuses.append(FAIL)
+            reasons.append(f"record {record.sequence}: PUBREC observed before the crash")
+    return Status(_worst(statuses), reasons)
+
+
+def broker_inputs_have_provenance(run):
+    """Every input the core consumed has its counterpart (ADR 0003)."""
+    trace = run.trace
+    statuses, reasons = [], []
+
+    def blame(record, why):
+        statuses.append(FAIL)
+        reasons.append(f"record {record.sequence}: {why}")
+
+    def ordered(cause, record, what):
+        order = trace.before(cause, record)
+        if order is None:
+            statuses.append(INCONCLUSIVE)
+            reasons.append(f"record {record.sequence}: not ordered with {what}")
+        elif not order:
+            blame(record, f"it precedes {what}")
+        return bool(order)
+
+    def side(component, incarnation, *kinds):
+        return [
+            record for record in trace.of_kind(*kinds) if record.origin == (component, incarnation)
+        ]
+
+    by_key = {record.key: record for record in trace.records}
+    cores = sorted(
+        {record.origin[1] for record in trace.records if record.origin[0] == "broker-core"}
+    )
+    for incarnation in cores:
+        submitted = {
+            _key(record.payload["effect_id"]): record
+            for record in side("store-adapter", incarnation, "CommandSubmitted", "ResolveSubmitted")
+        }
+        answered = set()
+        for record in side("broker-core", incarnation, "StoreResultDelivered"):
+            effect = _key(record.payload["effect_id"])
+            submission = submitted.get(effect)
+            if submission is None:
+                blame(record, f"the result answers the effect {effect}, which is not in flight")
+            elif submission.payload["operation_id"] != record.payload["operation_id"]:
+                blame(record, "the result names another operation than its submission")
+            elif effect in answered:
+                blame(record, f"the effect {effect} was already answered")
+            else:
+                ordered(submission, record, "its submission")
+            answered.add(effect)
+
+        armed = {
+            record.payload["token"]: record
+            for record in side("timer", incarnation, "DeadlineArmed")
+        }
+        fired = set()
+        for record in side("broker-core", incarnation, "DeadlineDelivered"):
+            token = record.payload["token"]
+            if token not in armed:
+                blame(record, f"the deadline token {token} was never armed")
+            elif token in fired:
+                blame(record, f"the deadline token {token} was already delivered")
+            else:
+                ordered(armed[token], record, "its arming")
+            fired.add(token)
+
+        pages = side("store-adapter", incarnation, "RecoveryPageRead")
+        # The pages the adapter read are one inventory (record 0014): the
+        # order holds from page to page, and a route belongs to the table
+        # that precedes it. A page of another kind of store is not an input
+        # a core may be given.
+        inventory, table = InventoryOrder(), False
+        for page in pages:
+            for index, fact in enumerate(page.payload["facts"]):
+                refusal = inventory.admit(fact)
+                if refusal is not None:
+                    blame(page, f"fact {index} is out of place in the inventory: {refusal[2]}")
+                elif fact["kind"] == "RouteTable":
+                    table = True
+                elif fact["kind"] == "Route" and not table:
+                    blame(page, f"fact {index} is a route and no route table precedes it")
+        used = set()
+        expected = 0
+        for record in side("broker-core", incarnation, "RecoveryPageDelivered"):
+            source = next(
+                (page for page in pages if page.payload == record.payload and page.key not in used),
+                None,
+            )
+            if source is None:
+                blame(record, "the recovery page is not a page the store adapter read")
+                continue
+            used.add(source.key)
+            ordered(source, record, "the read of its page")
+            if int(record.payload["page"]) != expected:
+                blame(record, f"page {record.payload['page']} delivered, page {expected} expected")
+            expected += 1
+
+        if trace.perimeter != "full":
+            # Without bytes there is no transport: the packets the core
+            # consumed are the validated packets of the scenario.
+            continue
+        received = {
+            record.key: record for record in side("transport", incarnation, "ClientBytesReceived")
+        }
+        for record in received.values():
+            if not any(
+                cause.kind == "PeerPacketSent"
+                and cause.payload["bytes_hex"] == record.payload["bytes_hex"]
+                for cause in map(by_key.get, record.parents)
+                if cause is not None
+            ):
+                blame(record, "the transport received bytes that no peer it names sent")
+        for record in side("broker-core", incarnation, "PacketDelivered"):
+            sources = [
+                received[parent]
+                for parent in record.parents
+                if parent in received
+                and received[parent].payload["connection_generation"]
+                == record.payload["connection_generation"]
+            ]
+            delivered = (record.payload["packet_kind"], record.payload.get("packet_id"))
+            if not sources:
+                blame(record, "the packet comes from no bytes the transport received")
+            elif not any(
+                _packet(bytes.fromhex(source.payload["bytes_hex"])) == delivered
+                for source in sources
+            ):
+                blame(record, f"the bytes received are not the packet delivered, {delivered}")
+
+        eligible = {
+            _key(record.payload["effect_id"]): record
+            for record in side("broker-core", incarnation, "FrameEligible")
+        }
+        for record in side("transport", incarnation, "FrameWriteProgress"):
+            frame = eligible.get(_key(record.payload["effect_id"]))
+            if frame is None:
+                blame(record, "write progress of a frame the core never made eligible")
+            else:
+                ordered(frame, record, "the frame it writes")
+
+    duplicating = {
+        fault["id"] for fault in run.scenario["faults"] if fault["action"] == "duplicate_result"
+    }
+    for record in trace.of_kind("InputRefused"):
+        causes = [by_key[key] for key in trace.ancestors(record) if key in by_key]
+        if not any(
+            cause.kind == "FaultHit" and cause.payload["fault_id"] in duplicating
+            for cause in causes
+        ):
+            blame(record, f"an input was refused: {record.payload['reason']}")
+    return Status(_worst(statuses), reasons)
+
+
+def _closures(run):
+    """OperationId -> the snapshots' word that it is closed: fenced, or refused by receipt."""
+    closed = set()
+    for _, snapshot in run.snapshots.values():
+        closed.update(_key(row["operation_id"]) for row in snapshot["fences"])
+        closed.update(
+            _key(row["operation_id"])
+            for row in snapshot["operations"]
+            if row["decision"]["kind"] == "RejectedCertain"
+        )
+    return closed
+
+
+def fenced_operation_never_executed(run):
+    """A fenced or refused identity is never committed (DEM-010, V3-006)."""
+    statuses, reasons = [], []
+    commits = {}
+    for record in run.trace.of_kind("StoreCommitStable"):
+        commits.setdefault(_key(record.payload["operation_id"]), []).append(record)
+    for fence in run.trace.of_kind("StoreFenceStable"):
+        operation = _key(fence.payload["operation_id"])
+        for commit in commits.get(operation, []):
+            order = run.trace.before(fence, commit)
+            if order is None:
+                statuses.append(INCONCLUSIVE)
+                reasons.append(
+                    f"record {commit.sequence}: not ordered with the fence of {operation}"
+                )
+            elif order:
+                statuses.append(FAIL)
+                reasons.append(
+                    f"record {commit.sequence}: {operation} is committed after its fence"
+                )
+    for name, (_, snapshot) in run.snapshots.items():
+        closed = {_key(row["operation_id"]) for row in snapshot["fences"]}
+        for row in snapshot["operations"]:
+            if row["decision"]["kind"] == "Committed" and _key(row["operation_id"]) in closed:
+                statuses.append(FAIL)
+                reasons.append(f"{name}: {_key(row['operation_id'])} is both fenced and committed")
+    unusable = [name for name in run.checkpoints() if name not in run.snapshots]
+    if unusable and FAIL not in statuses:
+        return Status(
+            INCONCLUSIVE, [f"{name}: {run.missing.get(name, 'no snapshot')}" for name in unusable]
+        )
+    return Status(_worst(statuses), reasons)
+
+
+def certain_rejection_has_a_closure(run):
+    """A certain refusal rests on a fence or a receipt, never on a read absence (DEM-MU-01)."""
+    closed = _closures(run)
+    unusable = [name for name in run.checkpoints() if name not in run.snapshots]
+    statuses, reasons = [], []
+    fences = run.trace.of_kind("StoreFenceStable")
+    for record in run.trace.of_kind("StoreResultReady", "StoreResultDelivered"):
+        if record.payload["outcome"] != "RejectedCertain":
+            continue
+        operation = _key(record.payload["operation_id"])
+        fenced_before = [
+            run.trace.before(fence, record)
+            for fence in fences
+            if _key(fence.payload["operation_id"]) == operation
+        ]
+        if any(fenced_before) or operation in closed:
+            continue
+        if None in fenced_before or unusable:
+            statuses.append(INCONCLUSIVE)
+            reasons.append(
+                f"record {record.sequence}: the closure of {operation} cannot be established"
+            )
+        else:
+            statuses.append(FAIL)
+            reasons.append(
+                f"record {record.sequence}: {operation} is refused with certainty and nothing closes it"
+            )
+    return Status(_worst(statuses), reasons)
+
+
+ASSERTIONS = {
+    "fenced_operation_never_executed": fenced_operation_never_executed,
+    "certain_rejection_has_a_closure": certain_rejection_has_a_closure,
+    "one_admission_per_observed_inbound_exchange": one_admission_per_observed_inbound_exchange,
+    "same_required_obligations_at_both_checkpoints": same_required_obligations_at_both_checkpoints,
+    "same_recipe_for_op_A": same_recipe_for_op_A,
+    "no_positive_ack_before_confirmed_commit": no_positive_ack_before_confirmed_commit,
+    "no_pubrec_observed_before_crash": no_pubrec_observed_before_crash,
+    "broker_inputs_have_provenance": broker_inputs_have_provenance,
+    "all_required_faults_hit": all_required_faults_hit,
+    "trace_complete": trace_complete,
+}
+
+
+def judge(run: Run) -> dict:
+    """The status of every assertion of the scenario, by name."""
+    trace = run.trace
+    required = run.scenario.get("perimeter", "full")
+    statuses = {}
+    # The assertions of the scenario, then those every run owes.
+    owed = list(run.scenario["assertions"])
+    owed += [name for name in run.contracts.catalogs["every_run"] if name not in owed]
+    for name in owed:
+        decide = ASSERTIONS.get(name)
+        if decide is None:
+            statuses[name] = Status(INCONCLUSIVE, ["the oracle does not decide this assertion"])
+        elif trace.unreadable:
+            statuses[name] = Status(INCONCLUSIVE, list(trace.unreadable))
+        elif trace.scenario_id not in (None, run.scenario["id"]):
+            # A run is judged only against its own scenario.
+            statuses[name] = Status(INCONCLUSIVE, [f"the trace is a run of {trace.scenario_id}"])
+        elif trace.perimeter not in (None, required):
+            # Nor against a scenario of another perimeter: a run without
+            # bytes never passes a full scenario.
+            statuses[name] = Status(
+                OUT_OF_SCOPE,
+                [f"the run is {trace.perimeter}; the scenario requires {required}"],
+            )
+        elif trace.perimeter != "full" and name in NEEDS_PEERS:
+            statuses[name] = Status(OUT_OF_SCOPE, [f"no peer observes a {trace.perimeter} run"])
+        else:
+            statuses[name] = decide(run)
+    if trace.incomplete:
+        # Nothing concluded from an incomplete trace is a PASS or a scope
+        # decision, and a FAIL stands only where no missing record could
+        # undo it.
+        for name, status in statuses.items():
+            if status.status in (PASS, OUT_OF_SCOPE) or (
+                status.status == FAIL and not (name in MONOTONE and status.stands)
+            ):
+                statuses[name] = Status(INCONCLUSIVE, status.reasons + ["the trace is incomplete"])
+    return statuses

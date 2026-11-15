@@ -10,7 +10,7 @@
     {
       "origin_component": "store-evidence",
       "origin_incarnation": "1",
-      "origin_sequence": "0"
+      "origin_sequence": "1"
     }
   ],
   "time_domain": "logical-step",
@@ -19,6 +19,17 @@
   "payload": {
     "fault_id": "lost_admission_result",
     "point": "store.result.ready",
-    "occurrence": "1"
+    "occurrence": "1",
+    "operation_id": {
+      "incarnation": "1",
+      "epoch": "1",
+      "owner": "0",
+      "sequence": "1"
+    },
+    "effect_id": {
+      "epoch": "1",
+      "owner": "0",
+      "sequence": "1"
+    }
   }
 }
