@@ -265,6 +265,28 @@ pub struct RecoveryCursor {
     position: usize,
 }
 
+impl RecoveryCursor {
+    /// The position `position` of the inventory read at state revision
+    /// `revision`. Built by a store for its next page; a cursor is only
+    /// ever handed back to the store that issued it.
+    #[must_use]
+    pub const fn new(revision: u64, position: usize) -> Self {
+        Self { revision, position }
+    }
+
+    /// The state revision the inventory was read at.
+    #[must_use]
+    pub const fn revision(self) -> u64 {
+        self.revision
+    }
+
+    /// The position of the next fact in that inventory.
+    #[must_use]
+    pub const fn position(self) -> usize {
+        self.position
+    }
+}
+
 #[derive(PartialEq, Eq, Debug)]
 pub struct RecoveryPage {
     pub facts: BoundedVec<RecoveredFact>,
