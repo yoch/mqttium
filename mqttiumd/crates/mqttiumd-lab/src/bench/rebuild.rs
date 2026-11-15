@@ -219,6 +219,7 @@ fn build(tar: &Path, work: &Path) -> Result<(PathBuf, String), String> {
             .env("CARGO_TARGET_DIR", &target)
             .env("RUSTFLAGS", &flags)
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("CARGO_BUILD_TARGET")
             .current_dir(&tree),
         "cargo build",
     )?;

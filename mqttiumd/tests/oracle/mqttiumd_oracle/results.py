@@ -14,6 +14,7 @@ import tarfile
 
 
 from . import judge
+from .semantic import reached as reached_by
 from .semantic import verdict_of
 from .strict import Diagnostic, Refused, parse
 
@@ -38,7 +39,11 @@ def _observed(run):
     faults = [
         {
             "id": fault["id"],
-            "expected_hits": fault["expected_hits"],
+            **{
+                key: fault[key]
+                for key in ("expected_hits", "expected_hits_at_least")
+                if key in fault
+            },
             "hits": str(hits.get(fault["id"], 0)),
         }
         for fault in run.scenario["faults"]
@@ -50,7 +55,7 @@ def produce(contracts, scenario_path, trace_path, manifest_path, scope):
     """A qualifying result for the run a trace records."""
     run = judge.Run.load(contracts, scenario_path, trace_path)
     statuses, faults = _observed(run)
-    reached = all(fault["hits"] == fault["expected_hits"] for fault in faults)
+    reached = all(reached_by(fault, fault["hits"]) for fault in faults)
     verdict = verdict_of([status.status for status in statuses.values()], reached)
     reasons = [
         _text(f"{name}: {reason}")

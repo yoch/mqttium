@@ -127,11 +127,30 @@ def _overlap(fault, earlier):
         and compatible("publication_binding")
         and compatible("result_of")
         and (
-            fault["occurrence"] == earlier["occurrence"]
+            _same_occurrence(fault, earlier)
             or ("result_of" in mine) != ("result_of" in theirs)
             or ("publication_binding" in mine) != ("publication_binding" in theirs)
         )
     )
+
+
+def _occurrences(fault):
+    """The first occurrence a fault selects, and whether it selects every later one."""
+    if "from_occurrence" in fault:
+        return int(fault["from_occurrence"]), True
+    return int(fault["occurrence"]), False
+
+
+def _same_occurrence(fault, earlier):
+    """Whether two faults can select the same occurrence (record 0018)."""
+    (first, every), (other, every_other) = _occurrences(fault), _occurrences(earlier)
+    if every and every_other:
+        return True
+    if every:
+        return other >= first
+    if every_other:
+        return first >= other
+    return first == other
 
 
 def _scenario(contracts, document, out):
@@ -155,10 +174,18 @@ def _scenario(contracts, document, out):
     holds = {}
     for index, fault in enumerate(document["faults"]):
         base = f"/faults/{index}"
-        _u64(document, f"{base}/occurrence", out)
-        expected = _u64(document, f"{base}/expected_hits", out)
+        repeated = "from_occurrence" in fault
+        if repeated:
+            # Record 0018: a repeated fault is reached at least so often; a
+            # repeated delay delivers each answer by its lag, so it holds
+            # no one item a step could hand over.
+            _u64(document, f"{base}/from_occurrence", out)
+            expected = _u64(document, f"{base}/expected_hits_at_least", out)
+        else:
+            _u64(document, f"{base}/occurrence", out)
+            expected = _u64(document, f"{base}/expected_hits", out)
         definitions.append((f"{base}/id", fault["id"]))
-        item = _HOLDS.get(fault["action"])
+        item = None if repeated else _HOLDS.get(fault["action"])
         holds.setdefault(fault["id"], [item, _NOT_YET, expected != 0])
         if item is not None and expected is not None and expected > 1:
             out.append(
@@ -606,6 +633,19 @@ def _registry(contracts, document, out):
 # ---------------------------------------------------------------- run result
 
 
+def expectation(fault):
+    """How often a fault of a scenario or a result is expected: exactly, or at least."""
+    if "expected_hits_at_least" in fault:
+        return ("at_least", fault["expected_hits_at_least"])
+    return ("exactly", fault["expected_hits"])
+
+
+def reached(fault, hits):
+    """Whether ``hits`` reaches what ``fault`` expects."""
+    kind, count = expectation(fault)
+    return int(hits) >= int(count) if kind == "at_least" else int(hits) == int(count)
+
+
 def verdict_of(statuses, injections_reached):
     """The verdict that assertion statuses and injections determine (DEM-023)."""
     if "FAIL" in statuses:
@@ -622,10 +662,14 @@ def _run_result(contracts, document, out):
     _unique(_named(document, "faults", "id"), "fault", "duplicate-name", out)
     statuses = [assertion["status"] for assertion in document["assertions"]]
     reached = True
-    for index in range(len(document["faults"])):
-        expected = _u64(document, f"/faults/{index}/expected_hits", out)
+    for index, fault in enumerate(document["faults"]):
         hits = _u64(document, f"/faults/{index}/hits", out)
-        reached = reached and expected is not None and expected == hits
+        if "expected_hits_at_least" in fault:
+            least = _u64(document, f"/faults/{index}/expected_hits_at_least", out)
+            reached = reached and None not in (least, hits) and hits >= least
+        else:
+            expected = _u64(document, f"/faults/{index}/expected_hits", out)
+            reached = reached and expected is not None and expected == hits
     for index in range(len(document["artifacts"])):
         _u64(document, f"/artifacts/{index}/bytes", out)
 
@@ -713,8 +757,8 @@ def _run_result(contracts, document, out):
                     "an assertion of the scenario cannot be out of scope for a run of it",
                 )
             )
-    declared = {fault["id"]: fault["expected_hits"] for fault in scenario["faults"]}
-    observed = {fault["id"]: fault["expected_hits"] for fault in document["faults"]}
+    declared = {fault["id"]: expectation(fault) for fault in scenario["faults"]}
+    observed = {fault["id"]: expectation(fault) for fault in document["faults"]}
     if declared != observed:
         out.append(
             Diagnostic(
