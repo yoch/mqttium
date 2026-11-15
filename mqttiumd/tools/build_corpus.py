@@ -647,7 +647,12 @@ for point, name in (("store.commit.prepared", "prepared"), ("store.commit.logged
         "fault-action-unknown",
         "/faults/2/action",
         f"{point} only stops the writer at a barrier: no command is held there.",
-        qabs_a(lambda v, point=point: v["faults"][2].update(point=point, action="hold_command")),
+        qabs_a(
+            lambda v, point=point: (
+                v["faults"][2].update(point=point, action="hold_command"),
+                v["steps"].pop(LEAVE),
+            )
+        ),
     )
     bad(
         f"scenario-result-at-commit-{name}.json",
@@ -1121,12 +1126,15 @@ bad(
     "A point that carries a command cannot delay a result.",
     (lambda v: (v["points"][0]["actions"].append("delay_result"), v)[1])(copy.deepcopy(FAULTS)),
 )
+READY_AT = next(i for i, p in enumerate(FAULTS["points"]) if p["point"] == "store.result.ready")
 bad(
     "fault-catalog-refuse-fence-on-a-result-point.json",
     "fault-action-unknown",
-    "/points/3/actions/3",
+    f"/points/{READY_AT}/actions/{len(FAULTS['points'][READY_AT]['actions'])}",
     "A fence is a command of the writer: a point that carries a result cannot refuse one.",
-    (lambda v: (v["points"][3]["actions"].append("refuse_fence"), v)[1])(copy.deepcopy(FAULTS)),
+    (lambda v: (v["points"][READY_AT]["actions"].append("refuse_fence"), v)[1])(
+        copy.deepcopy(FAULTS)
+    ),
 )
 bad(
     "fault-catalog-action-nobody-defines.json",

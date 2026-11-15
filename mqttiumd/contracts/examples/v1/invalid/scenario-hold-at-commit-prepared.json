@@ -92,10 +92,6 @@
       "checkpoint": "after_commit"
     },
     {
-      "kind": "LeaveBarrier",
-      "fault": "admission_applied"
-    },
-    {
       "kind": "ReleaseHeldCommand",
       "fault": "held_fence"
     },

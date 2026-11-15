@@ -112,6 +112,13 @@ selects the result of a `Persist` or of a `ResolveAndFence` about a
 matching operation; without it, every result about a matching operation
 counts, in the order they become ready.
 
+**Inside the transaction** (record 0020, proposed). Two points of the
+SQLite store carry the command and offer only a barrier:
+`store.commit.prepared`, before the commit of the transaction, and
+`store.commit.logged`, the commit frame synced and `COMMIT` not
+returned. A scenario with a fault at one of them kills inside a
+transaction, which only a broker run as a child process does.
+
 **Where a fence waits.** A resolution enters the writer and reads what is
 established for its operation. A receipt, a fence or a retired identity
 answers it. An absence brings it to the point `store.fence.transit`, the

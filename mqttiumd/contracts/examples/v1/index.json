@@ -707,7 +707,7 @@
     {
       "file": "contracts/examples/v1/invalid/fault-catalog-refuse-fence-on-a-result-point.json",
       "code": "fault-action-unknown",
-      "pointer": "/points/3/actions/3",
+      "pointer": "/points/5/actions/3",
       "why": "A fence is a command of the writer: a point that carries a result cannot refuse one."
     },
     {
