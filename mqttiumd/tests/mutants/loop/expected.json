@@ -1,13 +1,31 @@
 {
   "format": "mqttiumd-lab.loop-mutants",
   "version": 1,
-  "description": "Mutations of the real loop of lot L4: each patch, applied to a temporary worktree of the repository, is played by the runner and judged by the oracle of the unmodified tree. A rejected mutation must get the verdict, the assertion with its status (FAIL unless `assertion_status` says otherwise) and a reason holding the fragment below; when `stopped` is given, the campaign must also say that the run stopped, with that fragment. A known survivor is reported and does not fail the run until the finding it names is merged.",
+  "description": "Mutations of the real loop of lot L4: each patch, applied to a temporary worktree of the repository, is played by the runner and judged by the oracle of the unmodified tree. A rejected mutation must get the verdict, the assertion with its status (FAIL unless `assertion_status` says otherwise) and a reason holding the fragment below; when `stopped` is given, the campaign must also say that the run stopped, with that fragment. An entry that names `backends` is played only on those (`tools/run_loop_mutants.sh --backend <name>`); one that names none, on every backend. A known survivor is reported and does not fail the run until the finding it names is merged.",
   "mutants": [
     {
       "id": "m1-payload-owed-lost",
       "patch": "m1-payload-owed-lost.mutant",
       "mutation": "the store loses the payload its obligations still owe when the exchange is released",
       "scenario": "tests/scenarios/p1/P1-02.json",
+      "expect": "rejected",
+      "verdict": "FAIL",
+      "assertion": "same_required_obligations_at_both_checkpoints",
+      "reason": "names a payload the store does not hold",
+      "backends": [
+        "sim-store"
+      ],
+      "not_on": "the mutation is in the deterministic store, which the SQLite backend does not run; m1s is its equivalent there"
+    },
+    {
+      "id": "m1s-payload-owed-lost-sqlite",
+      "patch": "m1s-payload-owed-lost-sqlite.mutant",
+      "mutation": "the SQLite store deletes every payload when it releases an inbound exchange, those its obligations still owe included",
+      "scenario": "tests/scenarios/p1/P1-02.json",
+      "backends": [
+        "sqlite"
+      ],
+      "not_on": "the mutation is in the SQLite store, which the deterministic backend does not run; m1 is its equivalent there",
       "expect": "rejected",
       "verdict": "FAIL",
       "assertion": "same_required_obligations_at_both_checkpoints",
