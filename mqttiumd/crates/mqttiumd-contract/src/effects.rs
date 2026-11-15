@@ -1092,6 +1092,43 @@ mod tests {
         assert_invariant(&outbox);
     }
 
+    /// Spends every entry of the reservation table: each one is taken at
+    /// its last generation and released.
+    fn spend_every_entry(outbox: &mut Outbox) {
+        for record in outbox.records.as_mut_slice() {
+            record.generation = u64::MAX;
+        }
+        for _ in 0..outbox.records.len() {
+            let key = outbox.reserve(slots(1)).expect("an entry is left");
+            assert_eq!(outbox.release(key), Ok(1));
+        }
+        assert!(outbox.records.as_slice().iter().all(|record| record.spent));
+    }
+
+    // Open condition "Exhausted reservation table": no release can free an
+    // entry of a table whose entries are all spent, so the refusal must
+    // not name a wake-up.
+    #[test]
+    fn a_table_whose_entries_are_all_spent_is_not_reported_as_a_wait() {
+        let mut outbox = outbox_of(0, 4);
+        spend_every_entry(&mut outbox);
+        assert_eq!(outbox.free_slots(), 4, "the slots themselves are free");
+        let before = snapshot(&outbox);
+        let refusal = outbox.reserve(slots(1)).expect_err("no entry is left");
+        assert!(
+            !matches!(
+                refusal,
+                CapacityNeed {
+                    wake: WakeCondition::ResourceReleased,
+                    ..
+                }
+            ),
+            "a definitive exhaustion was reported as a wait: {refusal:?}"
+        );
+        assert_eq!(snapshot(&outbox), before);
+        assert_invariant(&outbox);
+    }
+
     #[test]
     fn a_deadline_is_dispatched_only_after_the_persist_it_watches() {
         use crate::ids::{DeadlineToken, OperationId, OperationSeq};
