@@ -1164,3 +1164,514 @@ mod tests {
         }
     }
 }
+
+/// The tests named by ADR 0009 for the creation authority.
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    use crate::ids::EffectSeq;
+
+    const INCARNATION: u64 = 7;
+    const EPOCH: u64 = 3;
+
+    fn authority_of(incarnation: u64, epoch: u64, max_owners: u32) -> OwnerAuthority {
+        OwnerAuthority::issue_for_opened_epoch(
+            StoreIncarnation::new(incarnation),
+            RunEpoch::new(epoch),
+            max_owners,
+        )
+        .expect("small")
+    }
+
+    fn authority(max_owners: u32) -> OwnerAuthority {
+        authority_of(INCARNATION, EPOCH, max_owners)
+    }
+
+    fn owner(raw: u64) -> LogicalOwnerId {
+        LogicalOwnerId::new(raw)
+    }
+
+    fn create(authority: &mut OwnerAuthority, raw: u64) -> Result<Outbox, CreateRefused> {
+        authority.create_outbox(owner(raw), EffectSlots::new(4), 2)
+    }
+
+    fn slots(count: usize) -> NonZeroUsize {
+        NonZeroUsize::new(count).expect("at least one slot")
+    }
+
+    fn effect(sequence: u64) -> OwnedEffect {
+        OwnedEffect::new(
+            EffectId {
+                epoch: RunEpoch::new(EPOCH),
+                owner: owner(0),
+                sequence: EffectSeq::new(sequence),
+            },
+            Effect::LoadWork {
+                session: SessionId::new(sequence),
+                limit: 8,
+            },
+        )
+    }
+
+    /// Everything a refusal must leave unchanged in an authority: the
+    /// table of active owners, in its order, and the next serial.
+    fn authority_state(authority: &OwnerAuthority) -> (Vec<ActiveBox>, Option<OutboxSerial>) {
+        (authority.active.as_slice().to_vec(), authority.next_serial)
+    }
+
+    /// Everything that identifies a box and its content.
+    fn box_state(outbox: &Outbox) -> (OutboxId, Vec<u64>, usize, usize) {
+        (
+            outbox.id(),
+            outbox.pending().map(|e| e.id().sequence.get()).collect(),
+            outbox.free_slots(),
+            outbox.reserved,
+        )
+    }
+
+    #[test]
+    fn a_created_box_carries_the_identity_of_its_authority() {
+        let mut authority = authority(2);
+        let outbox = create(&mut authority, 5).expect("first box of the owner");
+        let id = outbox.id();
+        assert_eq!(id.incarnation(), StoreIncarnation::new(INCARNATION));
+        assert_eq!(id.epoch(), RunEpoch::new(EPOCH));
+        assert_eq!(id.owner(), owner(5));
+        assert_eq!(authority.active_box(owner(5)), Some(id));
+        assert_eq!(authority.active_box(owner(6)), None);
+        assert_eq!(authority.active_owners(), 1);
+        assert_eq!(outbox.free_slots(), 4);
+        assert!(outbox.is_empty());
+        assert!(!outbox.has_live_reservations());
+    }
+
+    // ADR 0009, context: two creations for one owner in one incarnation.
+    #[test]
+    fn a_second_creation_for_an_active_owner_is_refused() {
+        let mut authority = authority(4);
+        let first = create(&mut authority, 1).expect("first box of the owner");
+        let before = authority_state(&authority);
+        assert_eq!(
+            create(&mut authority, 1).map(|outbox| outbox.id()),
+            Err(CreateRefused::OwnerAlreadyActive)
+        );
+        assert_eq!(authority_state(&authority), before);
+        assert_eq!(authority.active_box(owner(1)), Some(first.id()));
+    }
+
+    // ADR 0009, context: destruction then recreation, with an old key kept.
+    #[test]
+    fn a_key_of_a_retired_box_is_foreign_to_the_box_that_replaces_it() {
+        let mut authority = authority(4);
+        let mut old = create(&mut authority, 1).expect("first box of the owner");
+        let old_key = old.reserve(slots(1)).expect("room");
+        assert_eq!(old.release(old_key), Ok(1));
+        authority.retire(old).expect("empty and unreserved");
+
+        let mut new = create(&mut authority, 1).expect("the owner is free again");
+        // The new box holds a live reservation in the same table entry and
+        // at the same generation: only the serial tells the keys apart.
+        let own = new.reserve(slots(1)).expect("room");
+        assert_eq!(
+            (own.slot, own.generation),
+            (old_key.slot, old_key.generation)
+        );
+        let before = box_state(&new);
+
+        let refused = new.publish(old_key, effect(0)).expect_err("old key");
+        assert_eq!(refused.reason, ReservationError::ForeignOutbox);
+        assert_eq!(refused.effect, effect(0));
+        assert_eq!(new.release(old_key), Err(ReservationError::ForeignOutbox));
+        assert_eq!(new.remaining(old_key), Err(ReservationError::ForeignOutbox));
+        assert_eq!(box_state(&new), before);
+        assert_eq!(new.remaining(own), Ok(1));
+    }
+
+    // ADR 0009, context: no silent reuse of an identity.
+    #[test]
+    fn no_identity_is_given_twice() {
+        let mut authority = authority(3);
+        let mut seen: Vec<OutboxId> = Vec::new();
+        let mut live: Vec<Outbox> = Vec::new();
+        for round in 0..4u64 {
+            for raw in 0..3u64 {
+                let outbox = create(&mut authority, raw).expect("the owner is free");
+                assert!(
+                    !seen.contains(&outbox.id()),
+                    "round {round}: identity {:?} was given before",
+                    outbox.id()
+                );
+                assert!(
+                    seen.iter().all(|id| id.serial() != outbox.id().serial()),
+                    "round {round}: serial used again"
+                );
+                seen.push(outbox.id());
+                live.push(outbox);
+            }
+            for outbox in live.drain(..) {
+                authority.retire(outbox).expect("empty and unreserved");
+            }
+        }
+        assert_eq!(seen.len(), 12);
+    }
+
+    #[test]
+    fn a_serial_is_not_used_again_after_its_box_was_retired() {
+        let mut authority = authority(1);
+        let first = create(&mut authority, 1).expect("first box of the owner");
+        let first_serial = first.id().serial();
+        authority.retire(first).expect("empty and unreserved");
+        let second = create(&mut authority, 1).expect("the owner is free again");
+        assert_eq!(
+            second.id().serial(),
+            first_serial.checked_next().expect("far")
+        );
+        authority.retire(second).expect("empty and unreserved");
+        let third = create(&mut authority, 2).expect("another owner");
+        assert!(third.id().serial() > first_serial.checked_next().expect("far"));
+    }
+
+    // ADR 0009, context: contexts that could exchange keys by accident are
+    // kept apart. The rule of the bench: two simulated stores have
+    // distinct incarnations, so their authorities give distinct identities
+    // even for the same epoch, owner and serial.
+    #[test]
+    fn authorities_of_distinct_incarnations_do_not_exchange_keys() {
+        let mut here = authority_of(1, EPOCH, 2);
+        let mut there = authority_of(2, EPOCH, 2);
+        let mut ours = create(&mut here, 1).expect("first box");
+        let mut theirs = create(&mut there, 1).expect("first box");
+        assert_eq!(ours.id().serial(), theirs.id().serial());
+        assert_eq!(ours.id().owner(), theirs.id().owner());
+        assert_ne!(ours.id(), theirs.id());
+
+        let own = ours.reserve(slots(1)).expect("room");
+        let foreign = theirs.reserve(slots(1)).expect("room");
+        assert_eq!(
+            (own.slot, own.generation),
+            (foreign.slot, foreign.generation)
+        );
+        let before = (box_state(&ours), box_state(&theirs));
+        let refused = ours.publish(foreign, effect(0)).expect_err("foreign key");
+        assert_eq!(refused.reason, ReservationError::ForeignOutbox);
+        assert_eq!(ours.release(foreign), Err(ReservationError::ForeignOutbox));
+        assert_eq!((box_state(&ours), box_state(&theirs)), before);
+
+        // A box cannot be retired by the authority of another context.
+        assert_eq!(theirs.release(foreign), Ok(1));
+        let refused = here.retire(theirs).expect_err("foreign box");
+        assert_eq!(refused.reason, RetireRefusal::ForeignAuthority);
+        there.retire(refused.outbox).expect("its own authority");
+    }
+
+    // ADR 0009, context: explicit exhaustion of the identity domain.
+    #[test]
+    fn the_last_serial_creates_a_box_and_the_next_creation_is_exhausted() {
+        let mut authority = authority(4);
+        authority.next_serial = Some(OutboxSerial::new(u64::MAX - 1));
+        let before_last = create(&mut authority, 1).expect("a serial is left");
+        assert_eq!(before_last.id().serial(), OutboxSerial::new(u64::MAX - 1));
+        let last = create(&mut authority, 2).expect("the last usable serial");
+        assert_eq!(last.id().serial(), OutboxSerial::new(u64::MAX));
+        assert_eq!(authority.next_serial, None);
+
+        let before = authority_state(&authority);
+        assert_eq!(
+            create(&mut authority, 3).map(|outbox| outbox.id()),
+            Err(CreateRefused::SerialsExhausted)
+        );
+        assert_eq!(authority_state(&authority), before);
+
+        // Definitive: retiring every box frees no serial.
+        authority.retire(before_last).expect("empty and unreserved");
+        authority.retire(last).expect("empty and unreserved");
+        for raw in 1..=3 {
+            assert_eq!(
+                create(&mut authority, raw).map(|outbox| outbox.id()),
+                Err(CreateRefused::SerialsExhausted)
+            );
+        }
+        assert_eq!(authority.active_owners(), 0);
+        assert_eq!(authority.next_serial, None);
+    }
+
+    #[test]
+    fn exhaustion_is_reported_before_a_refusal_that_a_retirement_could_lift() {
+        let mut authority = authority(1);
+        authority.next_serial = Some(OutboxSerial::new(u64::MAX));
+        let _last = create(&mut authority, 1).expect("the last usable serial");
+        // The owner is active and the table is full as well.
+        assert_eq!(
+            create(&mut authority, 1).map(|outbox| outbox.id()),
+            Err(CreateRefused::SerialsExhausted)
+        );
+        assert_eq!(
+            create(&mut authority, 2).map(|outbox| outbox.id()),
+            Err(CreateRefused::SerialsExhausted)
+        );
+    }
+
+    #[test]
+    fn a_full_table_refuses_a_new_owner_until_a_box_is_retired() {
+        let mut authority = authority(2);
+        let first = create(&mut authority, 1).expect("room in the table");
+        let _second = create(&mut authority, 2).expect("room in the table");
+        let before = authority_state(&authority);
+        assert_eq!(
+            create(&mut authority, 3).map(|outbox| outbox.id()),
+            Err(CreateRefused::TableFull)
+        );
+        assert_eq!(authority_state(&authority), before);
+
+        authority.retire(first).expect("empty and unreserved");
+        let third = create(&mut authority, 3).expect("an entry was freed");
+        assert_eq!(authority.active_box(owner(3)), Some(third.id()));
+        assert_eq!(authority.active_box(owner(1)), None);
+        assert_eq!(authority.active_owners(), 2);
+    }
+
+    #[test]
+    fn a_table_of_no_entry_refuses_every_creation() {
+        let mut authority = authority(0);
+        assert_eq!(
+            create(&mut authority, 1).map(|outbox| outbox.id()),
+            Err(CreateRefused::TableFull)
+        );
+        assert_eq!(
+            authority_state(&authority),
+            (Vec::new(), Some(OutboxSerial::new(0)))
+        );
+    }
+
+    #[test]
+    fn a_failed_allocation_is_recoverable_and_consumes_no_serial() {
+        let mut authority = authority(2);
+        let before = authority_state(&authority);
+        // More slots than any allocation can hold.
+        assert_eq!(
+            authority
+                .create_outbox(owner(1), EffectSlots::new(u64::MAX), 2)
+                .map(|outbox| outbox.id()),
+            Err(CreateRefused::AllocationFailed)
+        );
+        assert_eq!(authority_state(&authority), before);
+        assert_eq!(authority.active_box(owner(1)), None);
+
+        let outbox = create(&mut authority, 1).expect("the caller may try again");
+        assert_eq!(Some(outbox.id().serial()), before.1, "a serial was skipped");
+    }
+
+    // ADR 0009: a refused creation leaves unchanged the table of active
+    // owners, the boxes that exist and the next serial.
+    #[test]
+    fn a_refused_creation_changes_nothing() {
+        let mut authority = authority(2);
+        let mut first = create(&mut authority, 1).expect("room in the table");
+        let mut second = create(&mut authority, 2).expect("room in the table");
+        let key = first.reserve(slots(2)).expect("room");
+        first.publish(key, effect(0)).expect("reserved");
+        let other = second.reserve(slots(1)).expect("room");
+
+        let unchanged = |authority: &OwnerAuthority, first: &Outbox, second: &Outbox| {
+            (
+                authority_state(authority),
+                box_state(first),
+                box_state(second),
+            )
+        };
+        let before = unchanged(&authority, &first, &second);
+
+        let attempts: [(u64, u64, CreateRefused); 3] = [
+            (1, 4, CreateRefused::OwnerAlreadyActive),
+            (3, 4, CreateRefused::TableFull),
+            (2, u64::MAX, CreateRefused::OwnerAlreadyActive),
+        ];
+        for (raw, capacity, expected) in attempts {
+            assert_eq!(
+                authority
+                    .create_outbox(owner(raw), EffectSlots::new(capacity), 2)
+                    .map(|outbox| outbox.id()),
+                Err(expected),
+                "owner {raw}"
+            );
+            assert_eq!(
+                unchanged(&authority, &first, &second),
+                before,
+                "owner {raw}"
+            );
+        }
+
+        // Allocation failure, with a free entry so that it is reached.
+        first.release(key).expect("live");
+        let mut sink = Taking(Vec::new());
+        assert_eq!(first.dispatch(&mut sink).accepted, 1);
+        let first_id = first.id();
+        authority.retire(first).expect("empty and unreserved");
+        let before = (authority_state(&authority), box_state(&second));
+        assert_eq!(
+            authority
+                .create_outbox(owner(3), EffectSlots::new(u64::MAX), 2)
+                .map(|outbox| outbox.id()),
+            Err(CreateRefused::AllocationFailed)
+        );
+        assert_eq!((authority_state(&authority), box_state(&second)), before);
+
+        // The boxes that exist still accept their own keys, and the next
+        // creation takes the serial the refusals did not consume.
+        assert_eq!(second.remaining(other), Ok(1));
+        let third = create(&mut authority, 3).expect("an entry is free");
+        assert_eq!(Some(third.id().serial()), before.0.1);
+        assert_ne!(third.id().serial(), first_id.serial());
+    }
+
+    /// Accepts every effect.
+    struct Taking(Vec<OwnedEffect>);
+
+    impl EffectSink for Taking {
+        fn try_submit(&mut self, effect: OwnedEffect) -> SubmitResult {
+            self.0.push(effect);
+            SubmitResult::Accepted
+        }
+    }
+
+    // ADR 0009: on a refusal the same box comes back and the authority is
+    // unchanged. One case per condition of retirement.
+    #[test]
+    fn a_box_with_a_pending_effect_is_not_retired() {
+        let mut authority = authority(2);
+        let mut outbox = create(&mut authority, 1).expect("first box of the owner");
+        let key = outbox.reserve(slots(1)).expect("room");
+        outbox.publish(key, effect(4)).expect("reserved");
+        let before = (authority_state(&authority), box_state(&outbox));
+
+        let refused = authority.retire(outbox).expect_err("an effect waits");
+        assert_eq!(refused.reason, RetireRefusal::PendingEffects);
+        let mut outbox = refused.outbox;
+        assert_eq!((authority_state(&authority), box_state(&outbox)), before);
+        let pending: Vec<&OwnedEffect> = outbox.pending().collect();
+        assert_eq!(pending, vec![&effect(4)], "the effect changed");
+
+        // Once an adapter accepted the effect the same box is retired.
+        let mut sink = Taking(Vec::new());
+        assert_eq!(outbox.dispatch(&mut sink).accepted, 1);
+        assert_eq!(sink.0, vec![effect(4)]);
+        authority.retire(outbox).expect("empty and unreserved");
+        assert_eq!(authority.active_box(owner(1)), None);
+    }
+
+    #[test]
+    fn a_box_with_a_live_reservation_is_not_retired() {
+        let mut authority = authority(2);
+        let mut outbox = create(&mut authority, 1).expect("first box of the owner");
+        let key = outbox.reserve(slots(2)).expect("room");
+        let before = (authority_state(&authority), box_state(&outbox));
+
+        let refused = authority.retire(outbox).expect_err("a reservation is live");
+        assert_eq!(refused.reason, RetireRefusal::LiveReservations);
+        let mut outbox = refused.outbox;
+        assert_eq!((authority_state(&authority), box_state(&outbox)), before);
+        assert_eq!(outbox.remaining(key), Ok(2), "the key lost its slots");
+
+        assert_eq!(outbox.release(key), Ok(2));
+        authority.retire(outbox).expect("empty and unreserved");
+    }
+
+    #[test]
+    fn a_box_of_another_epoch_is_not_retired() {
+        let mut authority = authority(2);
+        let mut older = authority_of(INCARNATION, EPOCH - 1, 2);
+        let _own = create(&mut authority, 1).expect("first box of the owner");
+        let foreign = create(&mut older, 1).expect("first box of the owner");
+        let before = (authority_state(&authority), box_state(&foreign));
+
+        let refused = authority.retire(foreign).expect_err("another epoch");
+        assert_eq!(refused.reason, RetireRefusal::ForeignAuthority);
+        assert_eq!(
+            (authority_state(&authority), box_state(&refused.outbox)),
+            before
+        );
+        older.retire(refused.outbox).expect("its own authority");
+    }
+
+    #[test]
+    fn a_box_that_is_not_the_active_entry_of_its_owner_is_not_retired() {
+        let mut authority = authority(2);
+        let live = create(&mut authority, 1).expect("first box of the owner");
+        // Boxes this authority never recorded, with its incarnation and
+        // epoch: one for the active owner under another serial, one for an
+        // owner that is not active. Only this module can build them.
+        for (raw, serial) in [(1, 99), (2, live.id().serial().get())] {
+            let stray_id = OutboxId {
+                incarnation: authority.incarnation(),
+                epoch: authority.epoch(),
+                owner: owner(raw),
+                serial: OutboxSerial::new(serial),
+            };
+            let stray = Outbox::with_capacity(stray_id, EffectSlots::new(4), 2).expect("small");
+            let before = (authority_state(&authority), box_state(&stray));
+
+            let refused = authority.retire(stray).expect_err("not the active entry");
+            assert_eq!(refused.reason, RetireRefusal::NotActiveEntry, "owner {raw}");
+            assert_eq!(
+                (authority_state(&authority), box_state(&refused.outbox)),
+                before
+            );
+        }
+        assert_eq!(authority.active_box(owner(1)), Some(live.id()));
+        authority.retire(live).expect("the exact active entry");
+    }
+
+    #[test]
+    fn the_refusals_of_retirement_have_a_stated_order() {
+        // A foreign box that also holds an effect and a reservation.
+        let mut authority = authority(2);
+        let mut other = authority_of(INCARNATION + 1, EPOCH, 2);
+        let mut outbox = create(&mut other, 1).expect("first box of the owner");
+        let key = outbox.reserve(slots(2)).expect("room");
+        outbox.publish(key, effect(0)).expect("reserved");
+        let refused = authority.retire(outbox).expect_err("foreign");
+        assert_eq!(refused.reason, RetireRefusal::ForeignAuthority);
+
+        // Its own authority names the effect before the reservation.
+        let refused = other.retire(refused.outbox).expect_err("an effect waits");
+        assert_eq!(refused.reason, RetireRefusal::PendingEffects);
+    }
+
+    // ADR 0009: dropping a box without retiring it does not free the entry
+    // of its owner.
+    #[test]
+    fn a_box_dropped_without_retirement_leaves_its_owner_active() {
+        let mut authority = authority(2);
+        let outbox = create(&mut authority, 1).expect("first box of the owner");
+        let id = outbox.id();
+        let before = authority_state(&authority);
+        drop(outbox);
+
+        assert_eq!(authority_state(&authority), before);
+        assert_eq!(authority.active_box(owner(1)), Some(id));
+        assert_eq!(
+            create(&mut authority, 1).map(|outbox| outbox.id()),
+            Err(CreateRefused::OwnerAlreadyActive)
+        );
+        assert_eq!(authority_state(&authority), before);
+    }
+
+    #[test]
+    fn retiring_a_box_frees_the_entry_of_its_owner_only() {
+        let mut authority = authority(3);
+        let first = create(&mut authority, 1).expect("room in the table");
+        let second = create(&mut authority, 2).expect("room in the table");
+        let third = create(&mut authority, 3).expect("room in the table");
+        let (second_id, third_id) = (second.id(), third.id());
+
+        authority.retire(first).expect("empty and unreserved");
+        assert_eq!(authority.active_box(owner(1)), None);
+        assert_eq!(authority.active_box(owner(2)), Some(second_id));
+        assert_eq!(authority.active_box(owner(3)), Some(third_id));
+        assert_eq!(authority.active_owners(), 2);
+
+        authority.retire(third).expect("empty and unreserved");
+        authority.retire(second).expect("empty and unreserved");
+        assert_eq!(authority.active_owners(), 0);
+    }
+}
