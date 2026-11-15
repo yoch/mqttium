@@ -43,7 +43,6 @@ observed in the checkout. It does not connect the two.
 | Modified content is kept in the run directory, so that a run on a modified tree can be reproduced from its own directory | L4 | Any qualifying run on a modified tree |
 | The manifest records the effective parameters: scenario, fixture, backend, failure model, scheduler version and seed, commands | L4 | Any qualifying run |
 | For SQLite: the exact engine version and compile options, and the effective `journal_mode` and `synchronous` read back after they are set (DEM-011) | L7 | S0 on SQLite |
-| The lab binary, the oracle and the generators are identified separately in the manifest (V3-002). The schema `run-manifest` has the two optional members `oracle` and `generators` (lot L3); the runner still writes these identities in its own `campaign.json` and must write them in the manifest | L4 | G0 |
 | **One snapshot of the contracts.** The contract digest is computed from one read of the contract files and the schemas and catalogues are then read again; a file that changes in between leaves a digest that names other rules than the ones loaded. Either the bytes that are hashed are the bytes that are interpreted, or the snapshot of a campaign is established as immutable. L3: the readers interpret the bytes they hashed. L4: the snapshot of a campaign. The row stays until both parts are done | L3, L4 | Any qualifying result |
 
 ## Effect boxes and transitions (ADR 0006): reception of L1
