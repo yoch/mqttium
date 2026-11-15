@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 MODELS = ROOT / "formal" / "models"
@@ -139,3 +142,180 @@ def test_tlc_outcome_classification() -> None:
     check = run_tlc.Check("M", MODELS / "M.tla", MODELS / "M.cfg", "violation", "Inv")
     assert run_tlc.matches(check, violated) is False
     assert run_tlc.matches(check, run_tlc.Outcome("violation", "Inv", 1, "")) is True
+
+
+# --- Selection of another models directory (--models-dir) -------------------
+
+
+def _write_model(root: Path, name: str, configs: list[dict[str, str]]) -> None:
+    """Write a sidecar with the module and configuration files it names."""
+    (root / f"{name}.tla").write_text(f"---- MODULE {name} ----\n====\n", encoding="utf-8")
+    for entry in configs:
+        (root / entry["config"]).write_text("SPECIFICATION Spec\n", encoding="utf-8")
+    sidecar = {
+        "module": f"{name}.tla",
+        "status": "refinement",
+        "summary": "A model of another directory.",
+        "issues": [1],
+        "tests": [],
+        "configs": configs,
+    }
+    (root / f"{name}.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+
+def _no_tlc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if Java or the jar is looked up: a refusal comes first."""
+
+    def unexpected(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("the campaign was refused too late")
+
+    monkeypatch.setattr(run_tlc.shutil, "which", unexpected)
+    monkeypatch.setattr(run_tlc, "tla2tools_jar", unexpected)
+
+
+def _stub_tlc(monkeypatch: pytest.MonkeyPatch, outcome: object) -> list[object]:
+    """Replace TLC by a fixed outcome; return the checks that were run."""
+    ran: list[object] = []
+
+    def run_check(check: object, _jar: object, _java: object) -> object:
+        ran.append(check)
+        return outcome
+
+    monkeypatch.setattr(run_tlc.shutil, "which", lambda _name: "java")
+    monkeypatch.setattr(run_tlc, "tla2tools_jar", lambda: Path("tla2tools.jar"))
+    monkeypatch.setattr(run_tlc, "run_check", run_check)
+    return ran
+
+
+def test_default_models_directory_is_the_client_one(capsys: pytest.CaptureFixture[str]) -> None:
+    assert run_tlc.main(["--list"]) == 0
+    default = capsys.readouterr().out
+    assert run_tlc.main(["--models-dir", str(MODELS), "--list"]) == 0
+    assert capsys.readouterr().out == default
+    listed = set(re.findall(r"^(\w+) \[", default, re.MULTILINE))
+    assert listed == {path.stem for path in MODELS.glob("*.json")}
+
+
+def test_models_dir_selects_that_directory_and_no_other(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    models = tmp_path / "models"
+    models.mkdir()
+    _write_model(models, "Elsewhere", [{"config": "Elsewhere.cfg", "expect": "pass"}])
+    assert run_tlc.main(["--models-dir", str(models), "--list"]) == 0
+    listed = set(re.findall(r"^(\w+) \[", capsys.readouterr().out, re.MULTILINE))
+    assert listed == {"Elsewhere"}
+
+    # A client model is unknown there, and the other way round.
+    client_model = sorted(path.stem for path in MODELS.glob("*.json"))[0]
+    for argv in (["--models-dir", str(models), client_model], ["Elsewhere"]):
+        with pytest.raises(SystemExit) as refused:
+            run_tlc.main([*argv, "--list"])
+        assert refused.value.code == 2
+
+    # A relative directory is resolved: TLC runs from the module's directory.
+    monkeypatch.chdir(tmp_path)
+    ran = _stub_tlc(monkeypatch, run_tlc.Outcome("pass", None, 1, ""))
+    assert run_tlc.main(["--models-dir", "models"]) == 0
+    assert [(check.model, check.module, check.config) for check in ran] == [  # type: ignore[attr-defined]
+        ("Elsewhere", models.resolve() / "Elsewhere.tla", models.resolve() / "Elsewhere.cfg")
+    ]
+
+
+def test_missing_or_empty_models_directory_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _no_tlc(monkeypatch)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    a_file = tmp_path / "file"
+    a_file.write_text("", encoding="utf-8")
+    reasons = {tmp_path / "absent": "not a directory", a_file: "not a directory", empty: "no model"}
+    for directory, reason in reasons.items():
+        for mode in ([], ["--list"]):
+            with pytest.raises(SystemExit) as refused:
+                run_tlc.main(["--models-dir", str(directory), *mode])
+            assert refused.value.code == 2, directory
+            assert reason in capsys.readouterr().err, directory
+
+
+def test_model_without_configuration_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _no_tlc(monkeypatch)
+    _write_model(tmp_path, "Full", [{"config": "Full.cfg", "expect": "pass"}])
+    _write_model(tmp_path, "Hollow", [])
+    # One model that would run does not excuse one that runs nothing.
+    for selection in ([], ["Hollow"], ["Full", "Hollow"]):
+        with pytest.raises(SystemExit) as refused:
+            run_tlc.main(["--models-dir", str(tmp_path), *selection])
+        assert refused.value.code == 2, selection
+        assert "Hollow: no configuration" in capsys.readouterr().err, selection
+    # The model that holds one is still selectable on its own.
+    assert run_tlc.main(["--models-dir", str(tmp_path), "Full", "--list"]) == 0
+
+
+@pytest.mark.parametrize(
+    ("entry", "remove", "reason"),
+    [
+        ({"config": "Bad.cfg", "expect": "violation"}, None, "names no invariant"),
+        ({"config": "Bad.cfg", "expect": "liveness"}, None, "names no property"),
+        ({"config": "Bad.cfg", "expect": "maybe"}, None, "unknown expectation 'maybe'"),
+        ({"config": "Bad.cfg", "expect": "pass"}, "Bad.cfg", "Bad.cfg does not exist"),
+        ({"config": "Bad.cfg", "expect": "pass"}, "Bad.tla", "Bad.tla does not exist"),
+    ],
+    ids=["violation-unnamed", "liveness-unnamed", "unknown-expect", "no-config", "no-module"],
+)
+def test_unusable_sidecar_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    entry: dict[str, str],
+    remove: str | None,
+    reason: str,
+) -> None:
+    _no_tlc(monkeypatch)
+    _write_model(tmp_path, "Bad", [entry])
+    if remove is not None:
+        (tmp_path / remove).unlink()
+    with pytest.raises(SystemExit) as refused:
+        run_tlc.main(["--models-dir", str(tmp_path)])
+    assert refused.value.code == 2
+    assert reason in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        run_tlc.Outcome("violation", "AnotherInvariant", 3, ""),
+        run_tlc.Outcome("deadlock", None, 3, ""),
+        run_tlc.Outcome("liveness", None, 3, ""),
+        run_tlc.Outcome("pass", None, 3, ""),
+        run_tlc.Outcome("error", None, None, ""),
+    ],
+    ids=lambda outcome: outcome.kind,
+)
+def test_violation_fails_unless_tlc_names_the_declared_invariant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    outcome: object,
+) -> None:
+    entry = {"config": "Model.cfg", "expect": "violation", "invariant": "DeclaredInvariant"}
+    _write_model(tmp_path, "Model", [entry])
+    assert len(_stub_tlc(monkeypatch, outcome)) == 0
+    assert run_tlc.main(["--models-dir", str(tmp_path)]) == 1
+    # The failure names the exact invariant that was expected.
+    assert "FAIL Model/Model.cfg: expected violation DeclaredInvariant, got " in (
+        capsys.readouterr().out
+    )
+
+    _stub_tlc(monkeypatch, run_tlc.Outcome("violation", "DeclaredInvariant", 3, ""))
+    assert run_tlc.main(["--models-dir", str(tmp_path)]) == 0
+    assert "ok   Model/Model.cfg: expected violation DeclaredInvariant, got " in (
+        capsys.readouterr().out
+    )
+
+
+def test_campaign_that_ran_no_configuration_is_not_a_success() -> None:
+    assert run_tlc.run_campaign([], Path("tla2tools.jar"), "java", verbose=False) != 0
