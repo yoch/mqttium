@@ -9,9 +9,8 @@ publish.workspace = true
 
 [dependencies]
 mqttiumd-contract.workspace = true
-# The interface of the store and its contract tests. A move of the
-# interface to a crate of its own is proposed to the integration owner.
-mqttiumd-lab = { path = "../mqttiumd-lab" }
+# The interface of the store, and nothing of the bench.
+mqttiumd-store-api = { path = "../mqttiumd-store-api" }
 # `bundled` compiles the SQLite amalgamation pinned by libsqlite3-sys: the
 # same engine on every machine and in CI, whatever the system provides
 # (DEM-011). The binding holds the `unsafe`; this crate forbids it.
@@ -21,6 +20,10 @@ rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled
 workspace = true
 
 [dev-dependencies]
+# The contract tests and the deterministic store, for the conformance and
+# differential tests and the measurement. A dev-dependency only: the bench
+# depends on this crate.
+mqttiumd-lab = { path = "../mqttiumd-lab" }
 # Writes a foreign schema version into a file, for the refusal test.
 rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled", "cache"] }
 # The measurement example writes its report as JSON.

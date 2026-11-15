@@ -131,7 +131,7 @@ before you start.
 | - | - | - |
 | Contracts and oracle | `contracts/`, `tests/oracle/`, `tests/scenarios/` | Core behaviour to match an expectation |
 | Core | `crates/mqttiumd-core/` | `contracts/`, `tests/oracle/`, assertions |
-| Store | `crates/mqttiumd-store-sqlite/`, the deterministic store in `crates/mqttiumd-lab/` | Admission guarantees |
+| Store | `crates/mqttiumd-store-api/` (the interface every store realises), `crates/mqttiumd-store-sqlite/`, the deterministic store in `crates/mqttiumd-lab/` | Admission guarantees |
 | Bench and adversarial | `crates/mqttiumd-lab/`, mutations, injectors | An assertion, to turn a run green |
 
 A change of public type, durable encoding, injection point or schema is a
