@@ -559,6 +559,19 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         ],
     )?;
     let mut run_manifest = manifest::collect(root, Path::new(&contracts))?;
+    // The binary tied to the source it was rebuilt from (decision 0017):
+    // only when this run's binary was built by run --rebuild from the
+    // archive the campaign keeps; absent otherwise.
+    let built_from = match request.built_from {
+        Some(_) => Some(json!({
+            "source": artifact(out, "source.tar")?,
+            "build": super::rebuild::build_command(),
+        })),
+        None => None,
+    };
+    if let Some(built_from) = &built_from {
+        run_manifest["artifact"]["built_from"] = built_from.clone();
+    }
     run_manifest["oracle"] = oracle.clone();
     run_manifest["generators"] = generators.clone();
     run_manifest["scenario"] = artifact(out, &scenario_path)?;
@@ -683,13 +696,7 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
             "start_up": "the real path: EpochOpening through the store adapter, EpochGrant, OwnerAuthority::from_grant, one box for owner 0, Owner::new",
         },
         "backend_settings": backend_settings,
-        "built_from": match request.built_from {
-            Some(_) => json!({
-                "source": artifact(out, "source.tar")?,
-                "build": super::rebuild::build_command(),
-            }),
-            None => Value::Null,
-        },
+        "built_from": built_from.unwrap_or(Value::Null),
         "lab": run_manifest["artifact"].clone(),
         "contracts_digest": workspace.contracts_digest(),
         "oracle": oracle,
