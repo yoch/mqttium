@@ -55,3 +55,25 @@ fn an_oversized_client_id_is_refused_before_a_snapshot_is_materialised() {
     assert!(store.try_snapshot().is_err(),
         "a snapshot must enforce MAX_CLIENT_ID_BYTES before copying the field");
 }
+
+#[test]
+fn an_invalid_next_page_does_not_replace_the_first_valid_page() {
+    let path = fixture("later-route-error");
+    change(&path, "UPDATE routes SET qos = 99");
+    let store = SqliteStore::open(&path).expect("physical opening succeeds");
+    // Epoch, limits, route-table header fit in the first page. The route
+    // on the following page is invalid; lookahead may not decode it early.
+    let first = store.recover(None, 3);
+    assert!(first.is_ok(), "the valid first page must remain observable: {first:?}");
+    let first = first.expect("checked");
+    assert_eq!(first.facts.len(), 3);
+    assert!(first.next.is_some(), "the failed route belongs to a later page");
+}
+
+#[test]
+fn an_unreasonable_page_request_is_a_limit_not_an_allocation_failure() {
+    let path = fixture("oversized-page");
+    let store = SqliteStore::open(&path).expect("healthy store opens");
+    assert_ne!(store.recover(None, usize::MAX), Err(RecoveryRefused::AllocationFailed),
+        "an invalid requested bound must be refused before any reservation");
+}
