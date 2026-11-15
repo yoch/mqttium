@@ -19,7 +19,8 @@ use mqttiumd_lab::store::adapter::{
 use mqttiumd_lab::store::conformance::{World, altered, fixture_limits, operation_id};
 use mqttiumd_lab::store::durable::{AdminCommand, DurableStore, Limits, MemoryStore};
 use mqttiumd_lab::store::evidence::{
-    Cause, CauseRefused, SnapshotContext, TraceWriter, recovered_fact, snapshot, store_outcome,
+    Cause, CauseRefused, SnapshotContext, TraceWriter, outcome_fields, recovered_fact, snapshot,
+    store_outcome,
 };
 use mqttiumd_lab::workspace::Workspace;
 
@@ -420,8 +421,16 @@ fn the_public_forms_are_what_the_trace_writer_writes() {
                 answer: Answer::Operation { reply, .. },
                 ..
             } => {
-                let (outcome, reason) = store_outcome(*reply).expect("an outcome");
-                outcomes.push((outcome.to_owned(), reason.map(str::to_owned)));
+                let fields = outcome_fields(*reply);
+                // The kept form agrees with it on every outcome but a violation.
+                assert_eq!(
+                    store_outcome(*reply),
+                    Some((fields.outcome, fields.reject_reason))
+                );
+                outcomes.push((
+                    fields.outcome.to_owned(),
+                    fields.reject_reason.map(str::to_owned),
+                ));
             }
             _ => {}
         }

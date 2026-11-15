@@ -20,7 +20,9 @@ use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
 use mqttiumd_contract::ids::{
     EffectId, ExchangeId, OperationId, PayloadId, PublicationId, SessionId,
 };
-use mqttiumd_contract::outcome::{CommitFacts, Knowledge, RejectReason, StoreOutcome, StoreReply};
+use mqttiumd_contract::outcome::{
+    CommitFacts, Knowledge, RejectReason, StoreOutcome, StoreReply, StoreViolation,
+};
 use mqttiumd_contract::packet::Qos;
 
 use super::adapter::{Answer, FaultId, StoreEvent, Uncorrelated, WorkId, WorkKind};
@@ -467,10 +469,60 @@ fn kind_name(kind: WorkKind) -> &'static str {
     kind.name()
 }
 
-/// The `outcome` and, for a certain rejection, the `reject_reason` of a
-/// store result, as `StoreResultReady` writes them; the record of the
-/// core that consumes the result (`StoreResultDelivered`) writes them
-/// with this same function. A violation has no outcome: `None`.
+/// The outcome of a store result as a record carries it: `outcome`, the
+/// `reject_reason` of a certain rejection, the `violation` of a
+/// violation, and nothing else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OutcomeFields {
+    pub outcome: &'static str,
+    pub reject_reason: Option<&'static str>,
+    pub violation: Option<&'static str>,
+}
+
+impl OutcomeFields {
+    /// Writes the fields into the payload of a record.
+    pub fn write_into(&self, payload: &mut Value) {
+        payload["outcome"] = json!(self.outcome);
+        if let Some(reason) = self.reject_reason {
+            payload["reject_reason"] = json!(reason);
+        }
+        if let Some(violation) = self.violation {
+            payload["violation"] = json!(violation);
+        }
+    }
+}
+
+/// The outcome of `reply` as `StoreResultReady` and
+/// `StoreResultHandedOver` write it; the record of the core that consumes
+/// the result (`StoreResultDelivered`) is to write it with this same
+/// function.
+#[must_use]
+pub fn outcome_fields(reply: StoreReply) -> OutcomeFields {
+    let plain = |outcome| OutcomeFields {
+        outcome,
+        reject_reason: None,
+        violation: None,
+    };
+    match reply {
+        StoreReply::Outcome(StoreOutcome::Committed(_)) => plain("Committed"),
+        StoreReply::Outcome(StoreOutcome::RejectedCertain(rejected)) => OutcomeFields {
+            reject_reason: Some(reason(rejected)),
+            ..plain("RejectedCertain")
+        },
+        StoreReply::Outcome(StoreOutcome::PendingOrUnknown) => plain("PendingOrUnknown"),
+        StoreReply::Outcome(StoreOutcome::RetiredOutcomeUnavailable) => {
+            plain("RetiredOutcomeUnavailable")
+        }
+        StoreReply::Violation(StoreViolation::RecipeMismatch) => OutcomeFields {
+            violation: Some("RecipeMismatch"),
+            ..plain("Violation")
+        },
+    }
+}
+
+/// The `outcome` and the `reject_reason` of a store result, `None` for a
+/// violation. Kept while the bench moves to `outcome_fields`, which also
+/// writes a violation; the two agree on every other outcome.
 #[must_use]
 pub fn store_outcome(reply: StoreReply) -> Option<(&'static str, Option<&'static str>)> {
     match reply {
@@ -727,15 +779,11 @@ impl<'a> TraceWriter<'a> {
                 id: id @ WorkId::Effect(effect),
                 answer: Answer::Operation { operation, reply },
             } => {
-                let (outcome, rejected) = store_outcome(*reply)?;
                 let mut payload = json!({
                     "effect_id": effect_id(*effect),
                     "operation_id": operation_id(*operation),
-                    "outcome": outcome,
                 });
-                if let Some(rejected) = rejected {
-                    payload["reject_reason"] = json!(rejected);
-                }
+                outcome_fields(*reply).write_into(&mut payload);
                 let parents = self.parent_of(*id);
                 let (record, origin) =
                     self.record("store-evidence", "StoreResultReady", &parents, payload);
@@ -750,15 +798,11 @@ impl<'a> TraceWriter<'a> {
                 // What the adapter hands over has the content of what the
                 // store produced; a result presented from outside follows
                 // no `StoreResultReady`.
-                let (outcome, rejected) = store_outcome(*reply)?;
                 let mut payload = json!({
                     "effect_id": effect_id(*effect),
                     "operation_id": operation_id(*operation),
-                    "outcome": outcome,
                 });
-                if let Some(rejected) = rejected {
-                    payload["reject_reason"] = json!(rejected);
-                }
+                outcome_fields(*reply).write_into(&mut payload);
                 let parents: Vec<Origin> = if *produced {
                     self.ready.get(id).copied().into_iter().collect()
                 } else {
