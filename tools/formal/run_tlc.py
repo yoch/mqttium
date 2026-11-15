@@ -1,6 +1,7 @@
 """Model-check every formal model against its declared expected outcome.
 
-Each ``formal/models/<Model>.json`` sidecar names one TLA+ module, the issues
+Each ``<Model>.json`` sidecar of the models directory (``formal/models/``
+unless ``--models-dir`` selects another one) names one TLA+ module, the issues
 and executable tests it is tied to, and one or more TLC configurations with the
 outcome TLC must produce:
 
@@ -24,6 +25,12 @@ Usage::
     python tools/formal/run_tlc.py            # check every model
     python tools/formal/run_tlc.py Foo Bar    # check selected models
     python tools/formal/run_tlc.py --list     # print the model index
+    python tools/formal/run_tlc.py --models-dir mqttiumd/models/m1
+
+A campaign is refused, before TLC is looked up, when the models directory
+does not exist or holds no sidecar, when a selected model holds no
+configuration, or when a sidecar entry cannot be checked. A campaign that ran
+no configuration is never a success.
 """
 
 from __future__ import annotations
@@ -106,6 +113,46 @@ def checks_for(sidecar: dict[str, object]) -> list[Check]:
         )
         for entry in configs
     ]
+
+
+class SidecarError(ValueError):
+    """A sidecar entry that cannot be checked as written."""
+
+
+def validated_checks(sidecar: dict[str, object]) -> list[Check]:
+    """Return the checks of a sidecar, or refuse it.
+
+    Only what would make a campaign run nothing, or accept an outcome nobody
+    declared, is refused here. The well-formedness of the project's own
+    sidecars stays with ``tests/project/test_formal_models.py``.
+    """
+    path = sidecar["_path"]
+    assert isinstance(path, Path)
+    for key in ("module", "configs"):
+        if key not in sidecar:
+            raise SidecarError(f"{path.stem}: names no {key!r}")
+    configs = sidecar["configs"]
+    if not isinstance(configs, list) or not all(isinstance(entry, dict) for entry in configs):
+        raise SidecarError(f"{path.stem}: 'configs' is a list of entries")
+    for entry in configs:
+        for key in ("config", "expect"):
+            if key not in entry:
+                raise SidecarError(f"{path.stem}: an entry names no {key!r}")
+    checks = checks_for(sidecar)
+    if not checks:
+        raise SidecarError(f"{path.stem}: no configuration")
+    for check in checks:
+        where = f"{check.model}/{check.config.name}"
+        if check.expect not in EXPECTATIONS:
+            raise SidecarError(f"{where}: unknown expectation {check.expect!r}")
+        if check.expect == "violation" and not check.invariant:
+            raise SidecarError(f"{where}: a violation names no invariant")
+        if check.expect == "liveness" and not check.property:
+            raise SidecarError(f"{where}: a liveness violation names no property")
+        for needed in (check.module, check.config):
+            if not needed.is_file():
+                raise SidecarError(f"{where}: {needed.name} does not exist")
+    return checks
 
 
 def _cache_dir() -> Path:
@@ -219,20 +266,59 @@ def print_index(sidecars: list[dict[str, object]]) -> None:
             print(f"    {check.config.name}: expect {_expected(check)}")
 
 
+def run_campaign(checks: list[Check], jar: Path, java: str, *, verbose: bool) -> int:
+    """Run the checks; succeed only if every one gave its declared outcome."""
+    failures = 0
+    for check in checks:
+        outcome = run_check(check, jar, java)
+        ok = matches(check, outcome)
+        failures += not ok
+        expected = _expected(check)
+        status = "ok  " if ok else "FAIL"
+        print(
+            f"{status} {check.model}/{check.config.name}: "
+            f"expected {expected}, got {_describe(outcome)}"
+        )
+        if not ok and (verbose or outcome.kind == "error"):
+            print(outcome.output, file=sys.stderr)
+    if not checks:
+        print("no configuration was run", file=sys.stderr)
+        return 1
+    return 1 if failures else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("models", nargs="*", help="model names (default: all)")
     parser.add_argument("--list", action="store_true", help="print the model index and exit")
     parser.add_argument("--verbose", action="store_true", help="print TLC output on mismatch")
+    parser.add_argument(
+        "--models-dir",
+        type=Path,
+        default=MODELS,
+        metavar="DIR",
+        help="directory holding the sidecars (default: formal/models)",
+    )
     args = parser.parse_args(argv)
 
-    sidecars = load_sidecars()
+    # Resolved: TLC runs from the module's directory, so a relative path
+    # would no longer name the files once the working directory changed.
+    root = args.models_dir.resolve()
+    if not root.is_dir():
+        parser.error(f"--models-dir is not a directory: {args.models_dir}")
+    sidecars = load_sidecars(root)
+    if not sidecars:
+        parser.error(f"no model sidecar (*.json) in {root}")
     if args.models:
         wanted = set(args.models)
         sidecars = [s for s in sidecars if s["_path"].stem in wanted]  # type: ignore[union-attr]
         missing = wanted - {s["_path"].stem for s in sidecars}  # type: ignore[union-attr]
         if missing:
             parser.error(f"unknown models: {', '.join(sorted(missing))}")
+    try:
+        checks = [check for sidecar in sidecars for check in validated_checks(sidecar)]
+    except SidecarError as refusal:
+        parser.error(str(refusal))
     if args.list:
         print_index(sidecars)
         return 0
@@ -241,22 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     if java is None:
         print("java is required to run TLC", file=sys.stderr)
         return 2
-    jar = tla2tools_jar()
-    failures = 0
-    for sidecar in sidecars:
-        for check in checks_for(sidecar):
-            outcome = run_check(check, jar, java)
-            ok = matches(check, outcome)
-            failures += not ok
-            expected = _expected(check)
-            status = "ok  " if ok else "FAIL"
-            print(
-                f"{status} {check.model}/{check.config.name}: "
-                f"expected {expected}, got {_describe(outcome)}"
-            )
-            if not ok and (args.verbose or outcome.kind == "error"):
-                print(outcome.output, file=sys.stderr)
-    return 1 if failures else 0
+    return run_campaign(checks, tla2tools_jar(), java, verbose=args.verbose)
 
 
 if __name__ == "__main__":

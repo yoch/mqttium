@@ -42,7 +42,7 @@ implementations continue in parallel:
 
 | Lot | First deliverable | Coordination |
 | - | - | - |
-| L1 | The interface of `OwnerAuthority`, then creation, retirement and their tests | With L2 on the opening and the hand-over; with L6 on credits |
+| L1 | Creation and retirement by `OwnerAuthority` and their tests; its constructor after the permit of L2 is merged | With L2 on the opening and the hand-over; with L6 on credits |
 | L2 | The contract of opening an epoch: durable states and results | With L1 for the authority; with L3 before the snapshots are fixed |
 | L3 | The store snapshot and trace formats, the steps of P1-02b, the first registry rules L1 needs | Gives the formats to L2 and the rules to L1; the oracle stays independent |
 | L5 | The extension of the TLC runner, then M1a and its configurations | Needs no Rust implementation to advance |
@@ -60,9 +60,10 @@ pinned versions: Kani and Verus for L6, the TLC jar for L5, cargo-fuzz for
 L8, cargo-deny. A session that starts a lot runs it for the tools it needs
 and names the versions in its report. Changing a pinned version changes the
 evidence the tool produces and goes through the integration owner. The
-installer has two known defects in how it recognises a tool that is
-already present; lot L6 has them corrected when it starts (see its
-mission). No tool needed a change of network settings.
+presence check accepts a tool only when the command that `PATH` selects
+succeeds and prints exactly the pinned version line;
+`tools/test-install-tools.sh` holds the cases, and the workflow runs it.
+No tool needed a change of network settings.
 
 ## Lots and what each owns
 
