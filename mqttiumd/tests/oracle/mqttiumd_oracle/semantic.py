@@ -217,6 +217,27 @@ def _scenario(contracts, document, out):
                     )
                 )
 
+    # A fence fault names the resolved operation by its command as the
+    # bench knows it: some fault at the command point selects that command
+    # kind and that publication (record 0015, the fault catalogue).
+    for index, fault in enumerate(document["faults"]):
+        if fault["point"] != "store.fence.transit":
+            continue
+        if not any(
+            other["point"] == "store.command.transit"
+            and other["match"]["command_kind"] == fault["match"]["command_kind"]
+            and other["match"].get("publication_binding")
+            == fault["match"].get("publication_binding")
+            for other in document["faults"]
+        ):
+            out.append(
+                Diagnostic(
+                    "fault-match-invalid",
+                    f"/faults/{index}/match",
+                    f"{fault['id']!r} names a command no fault at store.command.transit selects",
+                )
+            )
+
     exchanges = {
         step["bind_exchange_as"] for step in document["steps"] if "bind_exchange_as" in step
     }

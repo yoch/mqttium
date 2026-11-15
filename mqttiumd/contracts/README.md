@@ -123,8 +123,9 @@ At `store.fence.transit`, `match.command_kind` and
 the bench knows it, from the fault that selected that command earlier in
 the scenario (`store.command.transit` in QABS-A, B and C). The runner of
 the bench maps the selection to the operation; the store is handed only
-the identity. No semantic rule yet refuses a scenario whose fence fault
-names a command no earlier fault selected.
+the identity. Both readers refuse a fence fault whose command kind and
+publication no fault at `store.command.transit` selects
+(`fault-match-invalid`).
 
 **One fault per item.** Two faults of a scenario never select the same
 command or result. Two selections on one point, for one command kind, with

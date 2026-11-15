@@ -368,6 +368,30 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
             }
         }
     }
+    // A fence fault names the resolved operation by its command as the
+    // bench knows it: some fault at the command point selects that command
+    // kind and that publication (record 0015, the fault catalogue).
+    for (index, fault) in faults.iter().enumerate() {
+        if text(fault, "point") != "store.fence.transit" {
+            continue;
+        }
+        let selected = faults.iter().any(|other| {
+            text(other, "point") == "store.command.transit"
+                && member(other, "/match/command_kind") == member(fault, "/match/command_kind")
+                && member(other, "/match/publication_binding")
+                    == member(fault, "/match/publication_binding")
+        });
+        if !selected {
+            out.push(Diagnostic::new(
+                code::FAULT_MATCH_INVALID,
+                format!("/faults/{index}/match"),
+                format!(
+                    "{:?} names a command no fault at store.command.transit selects",
+                    text(fault, "id")
+                ),
+            ));
+        }
+    }
     let exchanges: BTreeSet<&str> = steps
         .iter()
         .filter_map(|step| step.get("bind_exchange_as").and_then(Value::as_str))
