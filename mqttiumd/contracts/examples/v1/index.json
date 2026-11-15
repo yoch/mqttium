@@ -42,6 +42,8 @@
     "contracts/examples/v1/valid/store-snapshot-empty.json",
     "contracts/examples/v1/valid/store-snapshot-orphan-obligation.json",
     "contracts/examples/v1/valid/store-snapshot-refused-and-fenced.json",
+    "contracts/examples/v1/valid/store-snapshot-routes-in-byte-order.json",
+    "contracts/examples/v1/valid/store-snapshot-long-digit-topics.json",
     "contracts/examples/v1/valid/run-result-provisional-all-passing.json",
     "contracts/examples/v1/valid/run-result-provisional-fail-with-inconclusive.json",
     "contracts/examples/v1/valid/run-result-provisional-fault-not-hit.json",
@@ -451,6 +453,12 @@
       "why": "Only the point where a fence waits offers to refuse it."
     },
     {
+      "file": "contracts/examples/v1/invalid/scenario-two-faults-one-without-binding.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/4/match",
+      "why": "A fault without a publication binding counts over every publication: its second command may be the first of the publication another fault names."
+    },
+    {
       "file": "contracts/examples/v1/invalid/scenario-deliver-while-crashed.json",
       "code": "step-order-invalid",
       "pointer": "/steps/12",
@@ -809,6 +817,24 @@
       "code": "duplicate-name",
       "pointer": "/payloads/1/payload_id",
       "why": "A PayloadId designates one payload."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-digit-topics-out-of-byte-order.json",
+      "code": "rows-out-of-order",
+      "pointer": "/route_table/routes/1/topic_hex",
+      "why": "6161 comes before 62 as bytes, whatever the two read as decimal numbers."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-long-digit-topic-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/route_table/routes/1/topic_hex",
+      "why": "Twenty-four hexadecimal digits are bytes, not a number too large to compare."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-empty-topic-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/route_table/routes/1/topic_hex",
+      "why": "The empty byte string is a key like another."
     },
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-sessions-out-of-order.json",

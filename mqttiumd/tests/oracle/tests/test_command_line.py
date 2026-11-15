@@ -4,8 +4,9 @@ import contextlib
 import io
 import json
 import unittest
+from unittest import mock
 
-from mqttiumd_oracle.__main__ import main
+from mqttiumd_oracle.__main__ import ORACLE_DEFECT, main
 
 from .support import ROOT
 
@@ -45,6 +46,35 @@ class CommandLine(unittest.TestCase):
 
     def test_a_trace_that_does_not_exist_concludes_nothing(self):
         self.assertEqual(self.judge("absent")[0], 2)
+
+    # A defect of the oracle has a code of its own: the exit status 1 means
+    # FAIL, and a run that was never judged must not be recorded as one.
+
+    def test_contracts_that_cannot_be_read_are_not_a_verdict(self):
+        code, _ = run(
+            "--contracts",
+            "contracts/v2",
+            "judge",
+            "--scenario",
+            f"{TRACES}/scenarios/p1-02.json",
+            "--trace",
+            f"{TRACES}/p1-02-good/trace.jsonl",
+        )
+        self.assertEqual(code, ORACLE_DEFECT)
+        self.assertNotIn(ORACLE_DEFECT, (0, 1, 2, 3))
+
+    def test_a_defect_while_judging_is_not_a_verdict(self):
+        with mock.patch("mqttiumd_oracle.results._observed", side_effect=TypeError("defect")):
+            self.assertEqual(self.judge("p1-02-good")[0], ORACLE_DEFECT)
+
+    def test_a_defect_while_recomputing_is_not_a_verdict(self):
+        with mock.patch("mqttiumd_oracle.results.recompute", side_effect=KeyError("defect")):
+            code, _ = run("recompute", "--result", "contracts/v1/profiles.json")
+        self.assertEqual(code, ORACLE_DEFECT)
+
+    def test_a_result_that_cannot_be_recomputed_is_refused_not_failed(self):
+        code, _ = run("recompute", "--result", "contracts/v1/profiles.json")
+        self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":

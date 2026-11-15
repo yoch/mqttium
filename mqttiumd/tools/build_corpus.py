@@ -722,6 +722,25 @@ bad(
     held(setter(["faults", 3, "point"], "store.commit.applied")),
 )
 bad(
+    "scenario-two-faults-one-without-binding.json",
+    "fault-match-invalid",
+    "/faults/4/match",
+    "A fault without a publication binding counts over every publication: its second command "
+    "may be the first of the publication another fault names.",
+    held(
+        lambda v: v["faults"].append(
+            {
+                "id": "any_admission",
+                "point": "store.command.transit",
+                "match": {"command_kind": "AdmitPublication"},
+                "occurrence": "2",
+                "action": "hold_command",
+                "expected_hits": "1",
+            }
+        )
+    ),
+)
+bad(
     "scenario-deliver-while-crashed.json",
     "step-order-invalid",
     f"/steps/{DELIVER + 1}",
@@ -1691,6 +1710,45 @@ snap_case(
     "/payloads/1/payload_id",
     "A PayloadId designates one payload.",
     twice("payloads"),
+)
+
+
+# The type of a key comes from the schema, never from how its value looks:
+# topic bytes made of decimal digits only are still bytes.
+def routes(*topics):
+    def edit(value):
+        value["route_table"]["routes"] = [
+            {"topic_hex": topic.encode().hex(), "targets": []} for topic in topics
+        ]
+
+    return edit
+
+
+ok("store-snapshot-routes-in-byte-order.json", edited(snapshot, routes("a/b", "aa", "b", "p")))
+ok(
+    "store-snapshot-long-digit-topics.json",
+    edited(snapshot, routes("tttttttttttt", "tttttttttttu")),
+)
+snap_case(
+    "digit-topics-out-of-byte-order",
+    "rows-out-of-order",
+    "/route_table/routes/1/topic_hex",
+    "6161 comes before 62 as bytes, whatever the two read as decimal numbers.",
+    routes("b", "aa"),
+)
+snap_case(
+    "long-digit-topic-listed-twice",
+    "duplicate-name",
+    "/route_table/routes/1/topic_hex",
+    "Twenty-four hexadecimal digits are bytes, not a number too large to compare.",
+    routes("tttttttttttt", "tttttttttttt"),
+)
+snap_case(
+    "empty-topic-listed-twice",
+    "duplicate-name",
+    "/route_table/routes/1/topic_hex",
+    "The empty byte string is a key like another.",
+    routes("", ""),
 )
 # Two stores in the same state write the same bytes: rows are in key order.
 snap_case(

@@ -24,6 +24,11 @@ from .semantic import verdict_of
 from .strict import Refused
 
 
+# The exit status of a defect of the oracle itself. It is none of the four
+# verdict codes: a run that was never judged is not recorded as a verdict.
+ORACLE_DEFECT = 70
+
+
 def main(arguments=None) -> int:
     parser = argparse.ArgumentParser(prog="mqttiumd_oracle", description=__doc__.splitlines()[0])
     parser.add_argument("--root", default=".")

@@ -10,6 +10,7 @@ import hashlib
 import json
 import shutil
 import unittest
+from unittest import mock
 
 from mqttiumd_oracle import results
 from mqttiumd_oracle.documents import Contracts
@@ -145,6 +146,21 @@ class Results(unittest.TestCase):
         result = self.produced("p1-02-good")
         result["run_id"] = "another-run"
         self.assertEqual(self.refusals(result), [("evidence-mismatch", "/run_id")])
+
+    def test_a_cited_trace_is_hashed_as_a_stream(self):
+        # Evidence has no size bound: recomputing never loads the trace whole.
+        result = self.produced("p1-02-good")
+        path = self.write("result.json", result)
+        calls = []
+        original = self.contracts.hash_evidence
+
+        def counting(relative):
+            calls.append(relative)
+            return original(relative)
+
+        with mock.patch.object(self.contracts, "hash_evidence", side_effect=counting):
+            self.assertEqual(results.recompute(self.contracts, path), [])
+        self.assertEqual(calls.count(result["trace"]["path"]), 2, calls)
 
     def test_a_provisional_result_is_not_evidence(self):
         result = self.produced("p1-02-good")

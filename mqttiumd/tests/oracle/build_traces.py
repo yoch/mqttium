@@ -971,6 +971,39 @@ def drop_and_renumber(kind):
     return edit
 
 
+def drop_admission_commit(records):
+    index = next(
+        i
+        for i, record in enumerate(records)
+        if record["kind"] == "StoreCommitStable"
+        and record["payload"]["command_kind"] == "AdmitPublication"
+    )
+    del records[index]
+
+
+case(
+    "trace-missing-the-commit-of-the-admission",
+    "The missing record is the commit: an acknowledgement without admission is not concluded.",
+    ALL_INCONCLUSIVE,
+    raw=drop_admission_commit,
+)
+
+
+def drop_first_publish(records):
+    index = next(
+        i
+        for i, record in enumerate(records)
+        if record["kind"] == "PeerPacketSent" and record["payload"]["packet_kind"] == "PUBLISH"
+    )
+    del records[index]
+
+
+case(
+    "trace-missing-the-publish-of-the-client",
+    "The missing record is the PUBLISH: an admission outside any exchange is not concluded.",
+    ALL_INCONCLUSIVE,
+    raw=drop_first_publish,
+)
 case(
     "trace-origin-gap",
     "The collector sequence is gapless and the footer agrees, yet one origin skips a number.",
@@ -1107,6 +1140,15 @@ case(
     snapshots=with_run(second_admission_state),
 )
 
+case(
+    "admission-twice-on-a-cut-trace",
+    "The trace is cut, and what it holds already shows two admissions: no missing record undoes that.",
+    {**ALL_INCONCLUSIVE, "one_admission_per_observed_inbound_exchange": "FAIL"},
+    events=second_admission,
+    snapshots=with_run(second_admission_state),
+    raw=lambda records: records.pop(),
+)
+
 
 def admission_before_publish(events):
     for label in ("admit.stable", "admit.ready"):
@@ -1195,6 +1237,32 @@ case(
     "Both checkpoints agree, on nothing: the store holds no publication and no obligation.",
     {"same_required_obligations_at_both_checkpoints": "FAIL"},
     snapshots=no_obligation,
+)
+
+
+def one_more(states):
+    extra = dict(states["final"]["obligations"][1], index=6)
+    states["final"]["obligations"].append(extra)
+
+
+case(
+    "obligation-appeared",
+    "The second checkpoint holds one obligation more for the same publication: not the same obligations.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=one_more,
+)
+
+
+def no_session_row(states):
+    for state in states.values():
+        del state["sessions"][2]
+
+
+case(
+    "obligation-towards-a-session-the-store-lost",
+    "The store holds no session for a target of the route: a finding, not a crash of the judge.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=no_session_row,
 )
 
 # ---------------------------------------------------------------------- recipe
@@ -1476,6 +1544,76 @@ case(
         "no_positive_ack_before_confirmed_commit": "INCONCLUSIVE",
     },
     files=corrupt,
+)
+
+
+def reordered_identities(states):
+    # The same identities with their members written in another order.
+    def turn(value):
+        if isinstance(value, dict):
+            return {key: turn(value[key]) for key in sorted(value, reverse=True)}
+        if isinstance(value, list):
+            return [turn(item) for item in value]
+        return value
+
+    for name in states:
+        states[name] = turn(states[name])
+
+
+case(
+    "p1-02-good-identities-in-another-member-order",
+    "An identity is its named components, in whatever order a writer puts the members.",
+    snapshots=reordered_identities,
+)
+case(
+    "snapshot-of-another-run",
+    "The final snapshot is a valid snapshot of another run: it is not evidence for this one.",
+    {
+        "same_required_obligations_at_both_checkpoints": "INCONCLUSIVE",
+        "same_recipe_for_op_A": "INCONCLUSIVE",
+        "no_positive_ack_before_confirmed_commit": "INCONCLUSIVE",
+    },
+    snapshots=lambda states: states["final"].update(run_id="another-run"),
+)
+case(
+    "snapshot-of-another-store",
+    "The final snapshot was read from another backend than the run declares.",
+    {
+        "same_required_obligations_at_both_checkpoints": "INCONCLUSIVE",
+        "same_recipe_for_op_A": "INCONCLUSIVE",
+        "no_positive_ack_before_confirmed_commit": "INCONCLUSIVE",
+    },
+    snapshots=lambda states: states["final"].update(backend="sqlite"),
+)
+
+
+def invented_packets(events):
+    # Every packet the core consumed follows bytes the transport says it
+    # received, but those bytes are a PINGREQ that no peer sent.
+    for event in events:
+        if event["kind"] == "ClientBytesReceived":
+            event["payload"] = dict(event["payload"], bytes_hex="c000")
+            event["parents"] = []
+
+
+case(
+    "provenance-packets-nobody-sent",
+    "The transport records bytes no peer sent, and they are not the packets the core consumed.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=invented_packets,
+)
+
+
+def other_bytes(events):
+    received = events[at(events, "replay.bytes")]
+    received["payload"] = dict(received["payload"], bytes_hex=PUBREL_HEX)
+
+
+case(
+    "provenance-bytes-are-not-what-the-peer-sent",
+    "The transport records other bytes than the peer sent for the packet the core consumed.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=other_bytes,
 )
 
 UNUSABLE_FINAL = {
