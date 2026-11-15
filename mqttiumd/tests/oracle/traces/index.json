@@ -481,6 +481,22 @@
       "why": "op_A was committed before the second inspection, which holds no recipe for it."
     },
     {
+      "name": "recipe-lost-on-a-store-without-total-order",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/recipe-lost-on-a-store-without-total-order/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "INCONCLUSIVE",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "INCONCLUSIVE",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "INCONCLUSIVE",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "On a backend with no total order, the trace does not say whether op_A was committed before the inspection that lost its recipe."
+    },
+    {
       "name": "pubrec-eligible-on-a-hidden-commit",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/pubrec-eligible-on-a-hidden-commit/trace.jsonl",
@@ -655,6 +671,54 @@
         "trace_complete": "PASS"
       },
       "why": "Routes belong to the table that precedes them: an inventory with routes and no table is not one."
+    },
+    {
+      "name": "recovery-delivered-out-of-inventory-order",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/recovery-delivered-out-of-inventory-order/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "Read in an order that is an inventory, delivered in one that is not: the core got the sessions before the epoch."
+    },
+    {
+      "name": "recovery-page-read-again",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/recovery-page-read-again/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "A page read twice by the adapter and delivered once is one inventory, not a second epoch."
+    },
+    {
+      "name": "observed-reason-is-not-the-bytes",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/observed-reason-is-not-the-bytes/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "INCONCLUSIVE",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "The reason a peer says it decoded is not the reason in the bytes it observed."
     },
     {
       "name": "provenance-input-refused",
@@ -1223,6 +1287,38 @@
         "broker_inputs_have_provenance": "PASS"
       },
       "why": "The PUBREC refuses, and the result among its causes is an unknown outcome, not a rejection."
+    },
+    {
+      "name": "certain-rejection-closed-only-afterwards",
+      "scenario": "tests/scenarios/qabs/QABS-C.json",
+      "trace": "tests/oracle/traces/certain-rejection-closed-only-afterwards/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "fenced_operation_never_executed": "PASS",
+        "certain_rejection_has_a_closure": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "broker_inputs_have_provenance": "PASS"
+      },
+      "why": "DEM-MU-01: the store refuses on an absence it read, and the fence a later snapshot lists came after."
+    },
+    {
+      "name": "fence-stable-after-the-commit",
+      "scenario": "tests/scenarios/qabs/QABS-A.json",
+      "trace": "tests/oracle/traces/fence-stable-after-the-commit/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "fenced_operation_never_executed": "FAIL",
+        "certain_rejection_has_a_closure": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "broker_inputs_have_provenance": "PASS"
+      },
+      "why": "The operation is committed, and the store then writes a fence for the same identity."
     },
     {
       "name": "certain-rejection-without-a-fence-on-a-cut-trace",
