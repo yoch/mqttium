@@ -140,6 +140,23 @@
       "assertion": "one_admission_per_observed_inbound_exchange",
       "assertion_status": "INCONCLUSIVE",
       "reason": "schema-violation at /payload/wait_status/signal: 0 is less than the minimum of 1"
+    },
+    {
+      "id": "n5-kill-not-written",
+      "patch": "n5-kill-not-written.mutant",
+      "mutation": "the supervisor kills the child for real but writes no BrokerKilled in the trace",
+      "scenario": "tests/scenarios/p1/P1-02.json",
+      "backends": [
+        "sqlite"
+      ],
+      "process": "child",
+      "not_on": "the mutation is in the child process mode, which runs on sqlite only",
+      "expect": "rejected",
+      "verdict": "INCONCLUSIVE",
+      "assertion": "broker_killed_for_real",
+      "assertion_status": "INCONCLUSIVE",
+      "reason": "follows no recorded kill",
+      "note": "A run that claims a child-process broker must show each kill: a crash with no BrokerKilled before it is missing evidence."
     }
   ]
 }

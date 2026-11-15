@@ -431,7 +431,7 @@ fn crash_statement(in_child: bool, kills: &[super::child::Killed], in_process: &
         })
         .collect();
     format!(
-        "process killed: {}; the supervisor and its collector stayed alive, waited for the end of the child before starting the next one on the same file, and nothing opened, copied or moved the database or its -wal and -shm files in between",
+        "process killed: {}; the supervisor and its collector stayed alive, waited for the end of the child before starting the next one on the same file, and nothing opened, copied, moved or deleted the database, its -wal and -shm files or its writer lock in between",
         each.join("; ")
     )
 }
