@@ -514,3 +514,20 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sweep_command_uses_the_declared_large_payload_and_commits() {
+        let mut world = World::with_limits(&MemoryStore::create, limits());
+        let command = admission(&world, 1);
+        assert_eq!(command.payload.as_ref().unwrap().len(), PAYLOAD);
+        assert!(world.store.apply(&command).committed_now);
+        assert_eq!(
+            world.store.snapshot().accounts.payload_bytes.get(),
+            PAYLOAD as u64
+        );
+    }
+}
