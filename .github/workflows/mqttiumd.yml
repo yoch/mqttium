@@ -79,5 +79,10 @@ jobs:
       - run: java -version
       - name: Model files are consistent
         run: python models/check_models.py
-      - run: python ../tools/formal/run_tlc.py --models-dir models/m1 --list
-      - run: python ../tools/formal/run_tlc.py --models-dir models/m1
+      - name: Model-check every directory of models
+        run: |
+          set -euo pipefail
+          for directory in models/*/; do
+            python ../tools/formal/run_tlc.py --models-dir "$directory" --list
+            python ../tools/formal/run_tlc.py --models-dir "$directory"
+          done
