@@ -192,6 +192,12 @@ fn modifications_digest(root: &Path) -> Result<String, String> {
     Ok(sha256_hex(content.as_bytes()))
 }
 
+/// The paths a manifest lists as modified.
+fn listed_modifications(root: &Path) -> Result<Vec<String>, String> {
+    let status = run("git", &["status", "--porcelain", "--", "."], root)?;
+    Ok(status.lines().map(str::to_owned).collect())
+}
+
 /// Collects the content sections of a manifest for the workspace at `root`
 /// and the contract directory `contracts`, given relative to it.
 pub fn collect(root: &Path, contracts: &Path) -> Result<Value, String> {
@@ -202,8 +208,7 @@ pub fn collect(root: &Path, contracts: &Path) -> Result<Value, String> {
             .and_then(files::hash_stream)
             .map_err(|error| format!("{}: {error}", executable.display()))?;
     let revision = run("git", &["rev-parse", "HEAD"], root)?;
-    let status = run("git", &["status", "--porcelain", "--", "."], root)?;
-    let modified: Vec<&str> = status.lines().collect();
+    let modified = listed_modifications(root)?;
     let files = contract_files(root, contracts)?;
     let digest = contracts_digest(
         files
@@ -262,7 +267,10 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use super::{contracts_digest, describe, modifications_digest, modified_paths, sha256_hex};
+    use super::{
+        contracts_digest, describe, listed_modifications, modifications_digest, modified_paths,
+        sha256_hex,
+    };
 
     fn git(root: &Path, arguments: &[&str]) {
         let status = Command::new("git")
@@ -308,6 +316,26 @@ mod tests {
         // A rename is one path gone and one path new, under both settings.
         assert_eq!(paths_detected, vec!["new.rs", "old.rs"]);
         assert_eq!(paths_undetected, paths_detected);
+    }
+
+    #[test]
+    fn the_manifest_lists_the_paths_the_modifications_digest_is_computed_on() {
+        // The workspace is a subdirectory of the repository, as `mqttiumd/`
+        // is: a listed path is relative to the workspace and is a path,
+        // not a line of a status report.
+        let repository = repository("listed");
+        let root = repository.join("workspace");
+        fs::create_dir_all(&root).expect("workspace");
+        fs::write(root.join("tracked.rs"), "pub fn one() {}\n").expect("file");
+        git(&repository, &["add", "workspace/tracked.rs"]);
+        git(&repository, &["commit", "-q", "-m", "a workspace"]);
+        fs::write(root.join("tracked.rs"), "pub fn two() {}\n").expect("modified");
+        fs::write(root.join("untracked.txt"), b"new").expect("untracked");
+        let listed = listed_modifications(&root).expect("listed");
+        let hashed = modified_paths(&root).expect("paths");
+        fs::remove_dir_all(&repository).expect("cleanup");
+        assert_eq!(hashed, vec!["tracked.rs", "untracked.txt"]);
+        assert_eq!(listed, hashed, "the list and the digest name other paths");
     }
 
     #[test]
