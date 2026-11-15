@@ -9,7 +9,11 @@ Steps, in this order; the first that fails ends the run with its code.
 1. The preflight (`proofs/preflight.sh`): the tool PATH selects, its
    version, a true property verified and a false one refuted. Its own
    exit code is passed on.
-2. No allocation (exit 9): a test binary with a counting allocator calls
+2. One file may use `unsafe` (exit 10): the proof workspace denies
+   `unsafe`, and `credits/tests/no_allocation.rs` alone lifts the ban,
+   for its counting allocator. Any other Rust file under `proofs/` that
+   names `unsafe` or `unsafe_code` fails the run.
+   No allocation (exit 9): a test binary with a counting allocator calls
    the function once per outcome and requires zero allocations.
 3. The harnesses, by the tool's own account (exit 6, 7). The tool is run
    on the whole proof crate, with no filter; the harnesses it reports
@@ -27,7 +31,7 @@ Steps, in this order; the first that fails ends the run with its code.
 Exit codes: 0 pass; 2 unknown argument; 5 a digest differs; 6 the
 harnesses run are not the listed ones; 7 a harness is not verified with
 its witnesses; 8 coverage; 9 the function allocated; otherwise the
-preflight's code.
+preflight's code; 10 a second file of the proof workspace uses `unsafe`.
 """
 
 from __future__ import annotations
@@ -69,7 +73,21 @@ def main(arguments: list[str]) -> int:
     tool = shutil.which("cargo-kani")
     kani = [tool, "kani", "-p", PACKAGE]
 
-    # --- 2. no allocation ------------------------------------------------
+    # --- 2. one file may use `unsafe`; no allocation ----------------------
+    allowed = (HERE / "tests/no_allocation.rs").resolve()
+    stray = []
+    for file in sorted(PROOFS.rglob("*.rs")):
+        if "target" in file.relative_to(PROOFS).parts or file.resolve() == allowed:
+            continue
+        for number, line in enumerate(file.read_text().splitlines(), start=1):
+            code_part = line.split("//", 1)[0]
+            if re.search(r"\bunsafe(_code)?\b", code_part):
+                stray.append(f"{file.relative_to(PROOFS)}:{number}: {line.strip()}")
+    if stray:
+        return fail(10, "only credits/tests/no_allocation.rs may use `unsafe` in the proof "
+                        "workspace:\n  " + "\n  ".join(stray))
+    if "allow(unsafe_code)" not in allowed.read_text():
+        return fail(10, "credits/tests/no_allocation.rs no longer lifts the ban it is listed for")
     code, output, _ = prooflib.run_bounded(
         ["cargo", "test", "--locked", "-p", PACKAGE, "--test", "no_allocation"],
         PROOFS, TIME_LIMIT_SECONDS,
