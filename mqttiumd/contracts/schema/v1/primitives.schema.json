@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mqttiumd primitives",
+  "description": "Identities, bounds, encodings and digests shared by every v1 format (DEM-005, DEM-014). Strings that carry numbers or digests also forbid line breaks explicitly, because validators disagree on whether `$` matches before a trailing line break.",
+  "$defs": {
+    "u64": {
+      "description": "Canonical decimal string of an unsigned 64-bit value. The semantic pass also enforces the upper bound 18446744073709551615.",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$",
+      "maxLength": 20,
+      "not": {
+        "pattern": "[\\n\\r]"
+      }
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "packet_id": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "qos": {
+      "type": "integer",
+      "enum": [
+        0,
+        1,
+        2
+      ]
+    },
+    "name": {
+      "description": "Lower-case identifier of a catalogue entry, client or checkpoint.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$",
+      "not": {
+        "pattern": "[\\n\\r]"
+      }
+    },
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,63}$",
+      "not": {
+        "pattern": "[\\n\\r]"
+      }
+    },
+    "binding": {
+      "description": "A scenario and oracle reference. It is never given to the broker.",
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$",
+      "not": {
+        "pattern": "[\\n\\r]"
+      }
+    },
+    "dotted_name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$",
+      "maxLength": 96,
+      "not": {
+        "pattern": "[\\n\\r]"
+      }
+    },
+    "type_name": {
+      "description": "Name of a variant, state class or effect.",
+      "type": "string",
+      "pattern": "^[A-Z][A-Za-z0-9]{0,63}$",
+      "not": {
+        "pattern": "[\\n\\r]"
+      }
+    },
+    "requirement_id": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*(-[A-Z0-9]+)*[a-z]?$",
+      "maxLength": 32,
+      "not": {
+        "pattern": "[\\n\\r]"
+      }
+    },
+    "decision_id": {
+      "type": "string",
+      "pattern": "^[0-9]{4}$",
+      "minLength": 4,
+      "maxLength": 4
+    },
+    "hex_bytes": {
+      "description": "Exact bytes, two lower-case hexadecimal digits each.",
+      "type": "string",
+      "pattern": "^([0-9a-f]{2})*$",
+      "not": {
+        "pattern": "[\\n\\r]"
+      }
+    },
+    "relative_path": {
+      "description": "Path relative to the mqttiumd root. The semantic pass refuses `..` segments and absolute paths.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_][A-Za-z0-9_./-]*$",
+      "maxLength": 255,
+      "not": {
+        "pattern": "[\\n\\r]"
+      }
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "operation_id": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch",
+        "owner",
+        "sequence"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "owner": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "sequence": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "effect_id": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "epoch",
+        "owner",
+        "sequence"
+      ],
+      "properties": {
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "owner": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "sequence": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "connection_key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session",
+        "generation"
+      ],
+      "properties": {
+        "session": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "generation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "exchange_id": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "session",
+        "generation"
+      ],
+      "properties": {
+        "session": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "generation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "store_outcome": {
+      "enum": [
+        "Committed",
+        "RejectedCertain",
+        "PendingOrUnknown",
+        "RetiredOutcomeUnavailable"
+      ]
+    },
+    "verdict": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "INCONCLUSIVE",
+        "OUT_OF_SCOPE"
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "bytes"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "primitives.schema.json#/$defs/relative_path"
+        },
+        "sha256": {
+          "$ref": "primitives.schema.json#/$defs/sha256"
+        },
+        "bytes": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    }
+  }
+}

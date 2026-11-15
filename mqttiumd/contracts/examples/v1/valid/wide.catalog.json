@@ -1,0 +1,205 @@
+{
+  "format": "mqttiumd.transition-catalog",
+  "schema_version": 1,
+  "id": "wide",
+  "guard_dimensions": [
+    {
+      "name": "d0",
+      "values": [
+        {
+          "value": "v0",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v1",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v2",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v3",
+          "meaning": "One value of a wide guard dimension."
+        }
+      ]
+    },
+    {
+      "name": "d1",
+      "values": [
+        {
+          "value": "v0",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v1",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v2",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v3",
+          "meaning": "One value of a wide guard dimension."
+        }
+      ]
+    },
+    {
+      "name": "d2",
+      "values": [
+        {
+          "value": "v0",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v1",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v2",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v3",
+          "meaning": "One value of a wide guard dimension."
+        }
+      ]
+    },
+    {
+      "name": "d3",
+      "values": [
+        {
+          "value": "v0",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v1",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v2",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v3",
+          "meaning": "One value of a wide guard dimension."
+        }
+      ]
+    },
+    {
+      "name": "d4",
+      "values": [
+        {
+          "value": "v0",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v1",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v2",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v3",
+          "meaning": "One value of a wide guard dimension."
+        }
+      ]
+    },
+    {
+      "name": "d5",
+      "values": [
+        {
+          "value": "v0",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v1",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v2",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v3",
+          "meaning": "One value of a wide guard dimension."
+        }
+      ]
+    },
+    {
+      "name": "d6",
+      "values": [
+        {
+          "value": "v0",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v1",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v2",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v3",
+          "meaning": "One value of a wide guard dimension."
+        }
+      ]
+    },
+    {
+      "name": "d7",
+      "values": [
+        {
+          "value": "v0",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v1",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v2",
+          "meaning": "One value of a wide guard dimension."
+        },
+        {
+          "value": "v3",
+          "meaning": "One value of a wide guard dimension."
+        }
+      ]
+    }
+  ],
+  "event_classes": [
+    {
+      "name": "Wide",
+      "meaning": "An event with eight guard dimensions.",
+      "guard_dimensions": [
+        "d0",
+        "d1",
+        "d2",
+        "d3",
+        "d4",
+        "d5",
+        "d6",
+        "d7"
+      ]
+    }
+  ],
+  "effects": [
+    "Persist"
+  ],
+  "machines": [
+    {
+      "name": "wide",
+      "state_classes": [
+        "Only"
+      ],
+      "event_classes": [
+        "Wide"
+      ]
+    }
+  ]
+}

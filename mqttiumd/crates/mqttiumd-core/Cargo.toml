@@ -1,0 +1,16 @@
+[package]
+name = "mqttiumd-core"
+description = "Synchronous deterministic transitions of mqttiumd owners."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Only mqttiumd-contract is allowed here: the boundary test in mqttiumd-lab
+# fails on any other entry (ADR 0007).
+[dependencies]
+mqttiumd-contract.workspace = true
+
+[lints]
+workspace = true

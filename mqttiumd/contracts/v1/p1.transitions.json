@@ -1,0 +1,715 @@
+{
+  "format": "mqttiumd.transition-registry",
+  "schema_version": 1,
+  "id": "p1",
+  "catalog": "contracts/v1/p1.catalog.json",
+  "status": "seed",
+  "rules": [
+    {
+      "id": "inbound_qos2.absent.publish.admit",
+      "machine": "inbound_qos2",
+      "state_class": "Absent",
+      "event_class": "PublishQos2",
+      "guard_partition": {
+        "effect_capacity": [
+          "sufficient"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "AdmissionPending",
+      "required_effects": [
+        "Persist"
+      ],
+      "forbidden_effects": [
+        "EmitPubrec"
+      ],
+      "resource_delta_class": "reserve",
+      "requirements": [
+        "ARC-011",
+        "ADM-004",
+        "V3-007"
+      ],
+      "witnesses": [
+        "P1-02"
+      ],
+      "mutations": [
+        "MU-01"
+      ]
+    },
+    {
+      "id": "inbound_qos2.absent.publish.defer",
+      "machine": "inbound_qos2",
+      "state_class": "Absent",
+      "event_class": "PublishQos2",
+      "guard_partition": {
+        "effect_capacity": [
+          "insufficient"
+        ]
+      },
+      "disposition": "DEFER",
+      "next_state_class": "Absent",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-006"
+      ],
+      "witnesses": [
+        "P1-19"
+      ],
+      "mutations": [
+        "MU-25"
+      ]
+    },
+    {
+      "id": "inbound_qos2.admission_pending.committed.authorize",
+      "machine": "inbound_qos2",
+      "state_class": "AdmissionPending",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "committed"
+        ],
+        "effect_capacity": [
+          "sufficient"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "AwaitPubrel",
+      "required_effects": [
+        "EmitPubrec"
+      ],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "transfer",
+      "requirements": [
+        "ARC-011",
+        "ACK-001",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-01"
+      ],
+      "mutations": [
+        "MU-01"
+      ]
+    },
+    {
+      "id": "inbound_qos2.admission_pending.committed.defer",
+      "machine": "inbound_qos2",
+      "state_class": "AdmissionPending",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "committed"
+        ],
+        "effect_capacity": [
+          "insufficient"
+        ]
+      },
+      "disposition": "DEFER",
+      "next_state_class": "AdmissionPending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "EmitPubrec",
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-006",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-19"
+      ],
+      "mutations": [
+        "MU-25"
+      ]
+    },
+    {
+      "id": "inbound_qos2.await_pubrel.publish.replay",
+      "machine": "inbound_qos2",
+      "state_class": "AwaitPubrel",
+      "event_class": "PublishQos2",
+      "guard_partition": {
+        "effect_capacity": [
+          "sufficient"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "AwaitPubrel",
+      "required_effects": [
+        "EmitPubrec"
+      ],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ADM-006",
+        "ARC-011"
+      ],
+      "witnesses": [
+        "P1-02"
+      ],
+      "mutations": [
+        "DEM-MU-04"
+      ]
+    },
+    {
+      "id": "inbound_qos2.await_pubrel.publish.defer",
+      "machine": "inbound_qos2",
+      "state_class": "AwaitPubrel",
+      "event_class": "PublishQos2",
+      "guard_partition": {
+        "effect_capacity": [
+          "insufficient"
+        ]
+      },
+      "disposition": "DEFER",
+      "next_state_class": "AwaitPubrel",
+      "required_effects": [],
+      "forbidden_effects": [
+        "EmitPubrec",
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-006"
+      ],
+      "witnesses": [
+        "P1-19"
+      ],
+      "mutations": [
+        "MU-25"
+      ]
+    },
+    {
+      "id": "inbound_qos2.await_pubrel.pubrel.release",
+      "machine": "inbound_qos2",
+      "state_class": "AwaitPubrel",
+      "event_class": "Pubrel",
+      "guard_partition": {
+        "effect_capacity": [
+          "sufficient"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "ReleasePending",
+      "required_effects": [
+        "Persist"
+      ],
+      "forbidden_effects": [
+        "EmitPubcomp"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ADM-005",
+        "ARC-011"
+      ],
+      "witnesses": [
+        "P1-02"
+      ],
+      "mutations": [
+        "MU-01"
+      ]
+    },
+    {
+      "id": "inbound_qos2.await_pubrel.pubrel.defer",
+      "machine": "inbound_qos2",
+      "state_class": "AwaitPubrel",
+      "event_class": "Pubrel",
+      "guard_partition": {
+        "effect_capacity": [
+          "insufficient"
+        ]
+      },
+      "disposition": "DEFER",
+      "next_state_class": "AwaitPubrel",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubcomp"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-006"
+      ],
+      "witnesses": [
+        "P1-19"
+      ],
+      "mutations": [
+        "MU-25"
+      ]
+    },
+    {
+      "id": "inbound_qos2.await_pubrel.late_unknown.ignore",
+      "machine": "inbound_qos2",
+      "state_class": "AwaitPubrel",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "outcome": [
+          "unknown"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "AwaitPubrel",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "DEM-MU-05"
+      ]
+    },
+    {
+      "id": "inbound_qos2.release_pending.committed.complete",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "committed"
+        ],
+        "effect_capacity": [
+          "sufficient"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "Absent",
+      "required_effects": [
+        "EmitPubcomp"
+      ],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "release",
+      "requirements": [
+        "ARC-011",
+        "ACK-001"
+      ],
+      "witnesses": [
+        "P1-02"
+      ],
+      "mutations": [
+        "MU-01"
+      ]
+    },
+    {
+      "id": "inbound_qos2.release_pending.committed.defer",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "committed"
+        ],
+        "effect_capacity": [
+          "insufficient"
+        ]
+      },
+      "disposition": "DEFER",
+      "next_state_class": "ReleasePending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "EmitPubcomp"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-006"
+      ],
+      "witnesses": [
+        "P1-19"
+      ],
+      "mutations": [
+        "MU-25"
+      ]
+    },
+    {
+      "id": "command.prepared.submit",
+      "machine": "command",
+      "state_class": "Prepared",
+      "event_class": "Submit",
+      "guard_partition": {
+        "effect_capacity": [
+          "sufficient"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "Submitted",
+      "required_effects": [
+        "Persist"
+      ],
+      "forbidden_effects": [],
+      "resource_delta_class": "reserve",
+      "requirements": [
+        "V3-006",
+        "DEM-009"
+      ],
+      "witnesses": [
+        "P1-01"
+      ],
+      "mutations": [
+        "MU-03"
+      ]
+    },
+    {
+      "id": "command.prepared.submit.defer",
+      "machine": "command",
+      "state_class": "Prepared",
+      "event_class": "Submit",
+      "guard_partition": {
+        "effect_capacity": [
+          "insufficient"
+        ]
+      },
+      "disposition": "DEFER",
+      "next_state_class": "Prepared",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-006"
+      ],
+      "witnesses": [
+        "P1-19"
+      ],
+      "mutations": [
+        "MU-25"
+      ]
+    },
+    {
+      "id": "command.submitted.result.committed",
+      "machine": "command",
+      "state_class": "Submitted",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "committed"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "Committed",
+      "required_effects": [],
+      "forbidden_effects": [],
+      "resource_delta_class": "transfer",
+      "requirements": [
+        "V3-006",
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-01"
+      ],
+      "mutations": [
+        "MU-01"
+      ]
+    },
+    {
+      "id": "command.submitted.result.rejected",
+      "machine": "command",
+      "state_class": "Submitted",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "rejected_certain"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "RejectedCertain",
+      "required_effects": [],
+      "forbidden_effects": [],
+      "resource_delta_class": "release",
+      "requirements": [
+        "V3-006",
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-11"
+      ],
+      "mutations": [
+        "MU-08"
+      ]
+    },
+    {
+      "id": "command.submitted.result.unknown",
+      "machine": "command",
+      "state_class": "Submitted",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "unknown"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "Indeterminate",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "IO-001",
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-02"
+      ],
+      "mutations": [
+        "MU-02"
+      ]
+    },
+    {
+      "id": "command.submitted.timeout",
+      "machine": "command",
+      "state_class": "Submitted",
+      "event_class": "ResultTimeout",
+      "guard_partition": {},
+      "disposition": "TRANSITION",
+      "next_state_class": "Indeterminate",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "IO-001"
+      ],
+      "witnesses": [
+        "P1-02"
+      ],
+      "mutations": [
+        "MU-02",
+        "DEM-MU-01"
+      ]
+    },
+    {
+      "id": "command.indeterminate.result.committed",
+      "machine": "command",
+      "state_class": "Indeterminate",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "committed"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "Committed",
+      "required_effects": [],
+      "forbidden_effects": [],
+      "resource_delta_class": "transfer",
+      "requirements": [
+        "V3-006",
+        "IO-002"
+      ],
+      "witnesses": [
+        "QABS-A"
+      ],
+      "mutations": [
+        "MU-02"
+      ]
+    },
+    {
+      "id": "command.indeterminate.result.rejected",
+      "machine": "command",
+      "state_class": "Indeterminate",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "rejected_certain"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "RejectedCertain",
+      "required_effects": [],
+      "forbidden_effects": [],
+      "resource_delta_class": "release",
+      "requirements": [
+        "V3-006",
+        "DEM-010"
+      ],
+      "witnesses": [
+        "QABS-B"
+      ],
+      "mutations": [
+        "DEM-MU-01"
+      ]
+    },
+    {
+      "id": "command.indeterminate.result.unknown",
+      "machine": "command",
+      "state_class": "Indeterminate",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "unknown"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "Indeterminate",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010"
+      ],
+      "witnesses": [
+        "QABS-C"
+      ],
+      "mutations": [
+        "DEM-MU-01"
+      ]
+    },
+    {
+      "id": "command.committed.result.unknown",
+      "machine": "command",
+      "state_class": "Committed",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "unknown"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "Committed",
+      "required_effects": [],
+      "forbidden_effects": [],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "DEM-MU-05"
+      ]
+    },
+    {
+      "id": "command.committed.result.duplicate",
+      "machine": "command",
+      "state_class": "Committed",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "committed"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "Committed",
+      "required_effects": [],
+      "forbidden_effects": [],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010",
+        "V3-003"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-17"
+      ]
+    },
+    {
+      "id": "command.committed.result.contradiction",
+      "machine": "command",
+      "state_class": "Committed",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "rejected_certain"
+        ]
+      },
+      "disposition": "FAULT",
+      "next_state_class": "Committed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010"
+      ],
+      "witnesses": [],
+      "mutations": []
+    },
+    {
+      "id": "command.rejected.result.unknown",
+      "machine": "command",
+      "state_class": "RejectedCertain",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "unknown"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "RejectedCertain",
+      "required_effects": [],
+      "forbidden_effects": [],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-11"
+      ],
+      "mutations": [
+        "DEM-MU-05"
+      ]
+    },
+    {
+      "id": "command.rejected.result.contradiction",
+      "machine": "command",
+      "state_class": "RejectedCertain",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "committed"
+        ]
+      },
+      "disposition": "FAULT",
+      "next_state_class": "RejectedCertain",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010"
+      ],
+      "witnesses": [],
+      "mutations": []
+    }
+  ]
+}

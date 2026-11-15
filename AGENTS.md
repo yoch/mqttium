@@ -4,6 +4,14 @@ MQTTium is a dependency-free, async-native MQTT 3.1.1 and MQTT 5.0 client for
 Python 3.11–3.15, licensed under Apache-2.0. This is the canonical repository
 guide for coding agents. Detailed user and maintainer contracts live in `docs/`.
 
+## Scope
+
+This guide covers the Python client. `mqttiumd/` is a separate Rust
+workspace for a broker under specification; it has its own guide,
+`mqttiumd/AGENTS.md`, its own CI workflow, and ships nothing in the Python
+distribution. `mqttiumd/docs/spec/fr/` is an immutable French archive and the
+only exception to the English-only rule.
+
 ## Development loop
 
 This project uses pip, not uv. Runtime dependencies must remain empty.

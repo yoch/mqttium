@@ -26,3 +26,7 @@ benchmarks/results/
 # Review patches are transient artefacts, never release sources
 *.patch
 *.diff
+
+# mqttiumd (Rust workspace under mqttiumd/)
+mqttiumd/target/
+mqttiumd/runs/

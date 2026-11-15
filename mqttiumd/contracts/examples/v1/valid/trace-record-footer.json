@@ -1,0 +1,17 @@
+{
+  "format": "mqttiumd.trace-record",
+  "schema_version": 1,
+  "run_id": "p1-02-example",
+  "record_sequence": "31",
+  "origin_component": "bench-supervisor",
+  "origin_incarnation": "1",
+  "origin_sequence": "4",
+  "causal_parents": [],
+  "time_domain": "logical-step",
+  "time_value": "31",
+  "kind": "TraceFooter",
+  "payload": {
+    "record_count": "32",
+    "complete": true
+  }
+}

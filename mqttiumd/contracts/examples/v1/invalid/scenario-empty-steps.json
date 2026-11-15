@@ -1,0 +1,35 @@
+{
+  "format": "mqttiumd.scenario",
+  "schema_version": 1,
+  "id": "P1-02",
+  "profile": "p1-durable-mqtt5-without-expiry",
+  "initial_fixture": "tests/fixtures/p1/three-persistent-sessions.json",
+  "budgets": {
+    "max_steps": "4096",
+    "max_trace_bytes": "16777216"
+  },
+  "faults": [
+    {
+      "id": "lost_admission_result",
+      "point": "store.result.ready",
+      "match": {
+        "command_kind": "AdmitPublication",
+        "publication_binding": "pub_A"
+      },
+      "occurrence": "1",
+      "action": "drop_result",
+      "bind_operation_as": "op_A",
+      "expected_hits": "1"
+    }
+  ],
+  "steps": [],
+  "assertions": [
+    "one_admission_per_observed_inbound_exchange",
+    "same_required_obligations_at_both_checkpoints",
+    "same_recipe_for_op_A",
+    "no_positive_ack_before_confirmed_commit",
+    "no_pubrec_observed_before_crash",
+    "all_required_faults_hit",
+    "trace_complete"
+  ]
+}

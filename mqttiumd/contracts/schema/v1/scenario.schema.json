@@ -1,0 +1,526 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mqttiumd scenario",
+  "description": "Preconditions, steps, injections and assertions of one declarative scenario (DEM-017). 64-bit quantities are canonical decimal strings; protocol enumerations are integers.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "schema_version",
+    "id",
+    "profile",
+    "initial_fixture",
+    "budgets",
+    "faults",
+    "steps",
+    "assertions"
+  ],
+  "properties": {
+    "format": {
+      "const": "mqttiumd.scenario"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "primitives.schema.json#/$defs/requirement_id"
+    },
+    "profile": {
+      "$ref": "primitives.schema.json#/$defs/slug"
+    },
+    "initial_fixture": {
+      "$ref": "primitives.schema.json#/$defs/relative_path"
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_steps",
+        "max_trace_bytes"
+      ],
+      "properties": {
+        "max_steps": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "max_trace_bytes": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "faults": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/fault"
+      },
+      "maxItems": 64
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/step"
+      },
+      "minItems": 1,
+      "maxItems": 4096
+    },
+    "assertions": {
+      "type": "array",
+      "items": {
+        "$ref": "primitives.schema.json#/$defs/binding"
+      },
+      "minItems": 1,
+      "maxItems": 256,
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "fault": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "point",
+        "match",
+        "occurrence",
+        "action",
+        "expected_hits"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "primitives.schema.json#/$defs/name"
+        },
+        "point": {
+          "$ref": "primitives.schema.json#/$defs/dotted_name"
+        },
+        "match": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "command_kind"
+          ],
+          "properties": {
+            "command_kind": {
+              "$ref": "primitives.schema.json#/$defs/type_name"
+            },
+            "publication_binding": {
+              "$ref": "primitives.schema.json#/$defs/binding"
+            }
+          }
+        },
+        "occurrence": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "action": {
+          "$ref": "primitives.schema.json#/$defs/name"
+        },
+        "bind_operation_as": {
+          "$ref": "primitives.schema.json#/$defs/binding"
+        },
+        "expected_hits": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "ClientResumeSession",
+            "ClientPublish",
+            "DriveUntil",
+            "InspectDurableState",
+            "CrashBroker",
+            "RestartBroker",
+            "ClientResumeExchange",
+            "ClientSendPubrel"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ClientResumeSession"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "client",
+              "expect_session_present",
+              "max_steps"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ClientResumeSession"
+              },
+              "client": {
+                "$ref": "primitives.schema.json#/$defs/name"
+              },
+              "expect_session_present": {
+                "type": "boolean"
+              },
+              "max_steps": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ClientPublish"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "client",
+              "topic",
+              "qos",
+              "retain",
+              "payload_hex"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ClientPublish"
+              },
+              "client": {
+                "$ref": "primitives.schema.json#/$defs/name"
+              },
+              "topic": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65535
+              },
+              "qos": {
+                "$ref": "primitives.schema.json#/$defs/qos"
+              },
+              "retain": {
+                "type": "boolean"
+              },
+              "packet_id": {
+                "$ref": "primitives.schema.json#/$defs/packet_id"
+              },
+              "payload_hex": {
+                "$ref": "primitives.schema.json#/$defs/hex_bytes"
+              },
+              "bind_exchange_as": {
+                "$ref": "primitives.schema.json#/$defs/binding"
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "required": [
+                    "qos"
+                  ],
+                  "properties": {
+                    "qos": {
+                      "enum": [
+                        1,
+                        2
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "packet_id"
+                  ]
+                },
+                "else": {
+                  "not": {
+                    "required": [
+                      "packet_id"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "DriveUntil"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "required": [
+              "event"
+            ],
+            "properties": {
+              "event": {
+                "enum": [
+                  "FaultHit",
+                  "PeerPacketObserved"
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "required": [
+                    "event"
+                  ],
+                  "properties": {
+                    "event": {
+                      "const": "FaultHit"
+                    }
+                  }
+                },
+                "then": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "kind",
+                    "event",
+                    "binding",
+                    "max_steps"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "const": "DriveUntil"
+                    },
+                    "event": {
+                      "const": "FaultHit"
+                    },
+                    "binding": {
+                      "$ref": "primitives.schema.json#/$defs/name"
+                    },
+                    "max_steps": {
+                      "$ref": "primitives.schema.json#/$defs/u64"
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "required": [
+                    "event"
+                  ],
+                  "properties": {
+                    "event": {
+                      "const": "PeerPacketObserved"
+                    }
+                  }
+                },
+                "then": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "kind",
+                    "event",
+                    "client",
+                    "packet_kind",
+                    "max_steps"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "const": "DriveUntil"
+                    },
+                    "event": {
+                      "const": "PeerPacketObserved"
+                    },
+                    "client": {
+                      "$ref": "primitives.schema.json#/$defs/name"
+                    },
+                    "packet_kind": {
+                      "enum": [
+                        "CONNACK",
+                        "PUBREC",
+                        "PUBCOMP"
+                      ]
+                    },
+                    "packet_id": {
+                      "$ref": "primitives.schema.json#/$defs/packet_id"
+                    },
+                    "max_steps": {
+                      "$ref": "primitives.schema.json#/$defs/u64"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "InspectDurableState"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "checkpoint"
+            ],
+            "properties": {
+              "kind": {
+                "const": "InspectDurableState"
+              },
+              "checkpoint": {
+                "$ref": "primitives.schema.json#/$defs/name"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "CrashBroker"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "failure_model"
+            ],
+            "properties": {
+              "kind": {
+                "const": "CrashBroker"
+              },
+              "failure_model": {
+                "enum": [
+                  "process"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "RestartBroker"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "workers"
+            ],
+            "properties": {
+              "kind": {
+                "const": "RestartBroker"
+              },
+              "workers": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1024
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ClientResumeExchange"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "client",
+              "exchange"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ClientResumeExchange"
+              },
+              "client": {
+                "$ref": "primitives.schema.json#/$defs/name"
+              },
+              "exchange": {
+                "$ref": "primitives.schema.json#/$defs/binding"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ClientSendPubrel"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "client",
+              "packet_id"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ClientSendPubrel"
+              },
+              "client": {
+                "$ref": "primitives.schema.json#/$defs/name"
+              },
+              "packet_id": {
+                "$ref": "primitives.schema.json#/$defs/packet_id"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

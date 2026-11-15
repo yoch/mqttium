@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mqttiumd run manifest",
+  "description": "Exact content and configuration of one run (DEM-003, V3-002). It keeps apart what is certain about the running binary (`artifact`) from what was observed in the checkout when it ran (`checkout`); it does not claim that the binary was built from that checkout. The experiment sections become required with the lots that run something.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "schema_version",
+    "artifact",
+    "checkout",
+    "tools_at_execution",
+    "contracts",
+    "contracts_digest",
+    "platform"
+  ],
+  "properties": {
+    "format": {
+      "const": "mqttiumd.run-manifest"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sha256",
+        "bytes",
+        "built_with"
+      ],
+      "properties": {
+        "sha256": {
+          "$ref": "primitives.schema.json#/$defs/sha256"
+        },
+        "bytes": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "built_with": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rustc",
+            "target",
+            "profile",
+            "opt_level",
+            "debug_assertions",
+            "rustflags"
+          ],
+          "properties": {
+            "rustc": {
+              "$ref": "primitives.schema.json#/$defs/text"
+            },
+            "target": {
+              "$ref": "primitives.schema.json#/$defs/text"
+            },
+            "profile": {
+              "$ref": "primitives.schema.json#/$defs/text"
+            },
+            "opt_level": {
+              "$ref": "primitives.schema.json#/$defs/text"
+            },
+            "debug_assertions": {
+              "type": "boolean"
+            },
+            "rustflags": {
+              "type": "string",
+              "maxLength": 4096
+            }
+          }
+        }
+      },
+      "description": "The binary that produced this manifest: its digest, and the build parameters captured when it was compiled."
+    },
+    "checkout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observed",
+        "revision",
+        "tree_state",
+        "modified_paths",
+        "modifications_sha256",
+        "lockfile_sha256",
+        "workspace_manifest_sha256"
+      ],
+      "properties": {
+        "observed": {
+          "const": "at-execution"
+        },
+        "revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "tree_state": {
+          "enum": [
+            "clean",
+            "modified"
+          ]
+        },
+        "modified_paths": {
+          "type": "array",
+          "items": {
+            "$ref": "primitives.schema.json#/$defs/text"
+          },
+          "maxItems": 4096
+        },
+        "modifications_sha256": {
+          "$ref": "primitives.schema.json#/$defs/sha256"
+        },
+        "lockfile_sha256": {
+          "$ref": "primitives.schema.json#/$defs/sha256"
+        },
+        "workspace_manifest_sha256": {
+          "$ref": "primitives.schema.json#/$defs/sha256"
+        }
+      },
+      "description": "The work tree as observed when the binary ran. `modifications_sha256` is the digest of one `<content>  <path>` line per path that differs from the revision or is untracked, in path order, with rename detection off; the content is the SHA-256 of a regular file, `link:<target>` for a symbolic link and `deleted` for a missing path."
+    },
+    "tools_at_execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rustc",
+        "cargo"
+      ],
+      "properties": {
+        "rustc": {
+          "$ref": "primitives.schema.json#/$defs/text"
+        },
+        "cargo": {
+          "$ref": "primitives.schema.json#/$defs/text"
+        }
+      },
+      "description": "Tools found on the path when the binary ran. They are not necessarily the ones that built it."
+    },
+    "contracts": {
+      "type": "array",
+      "items": {
+        "$ref": "primitives.schema.json#/$defs/artifact"
+      },
+      "minItems": 1,
+      "maxItems": 1024
+    },
+    "contracts_digest": {
+      "$ref": "primitives.schema.json#/$defs/sha256"
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os",
+        "arch"
+      ],
+      "properties": {
+        "os": {
+          "$ref": "primitives.schema.json#/$defs/text"
+        },
+        "arch": {
+          "$ref": "primitives.schema.json#/$defs/text"
+        }
+      }
+    },
+    "scenario": {
+      "$ref": "primitives.schema.json#/$defs/artifact"
+    },
+    "fixture": {
+      "$ref": "primitives.schema.json#/$defs/artifact"
+    },
+    "backend": {
+      "enum": [
+        "sim-store",
+        "sqlite"
+      ]
+    },
+    "failure_model": {
+      "enum": [
+        "none",
+        "process"
+      ]
+    },
+    "scheduler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "seed"
+      ],
+      "properties": {
+        "version": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "seed": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "$ref": "primitives.schema.json#/$defs/text"
+      },
+      "maxItems": 64
+    }
+  }
+}

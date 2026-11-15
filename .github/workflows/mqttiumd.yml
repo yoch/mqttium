@@ -1,0 +1,59 @@
+name: mqttiumd
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "mqttiumd/**"
+      - ".github/workflows/mqttiumd.yml"
+  pull_request:
+    paths:
+      - "mqttiumd/**"
+      - ".github/workflows/mqttiumd.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mqttiumd-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    working-directory: mqttiumd
+
+jobs:
+  contracts:
+    name: contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      # The toolchain is pinned by mqttiumd/rust-toolchain.toml.
+      - name: Install the pinned toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: Validate the contracts and scenario P1-02
+        run: >-
+          cargo run --quiet --locked -p mqttiumd-lab -- validate
+          --contracts contracts/v1
+          --scenario tests/scenarios/p1/P1-02.json
+      # A second, unrelated JSON Schema implementation must read the schema
+      # files the same way. Versions are pinned in tools/requirements.txt.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+      - name: Derived contract files are up to date
+        run: python tools/build_corpus.py --check
+      - name: Second schema reader
+        run: |
+          python -m pip install --disable-pip-version-check -r tools/requirements.txt
+          python tools/check_schemas.py

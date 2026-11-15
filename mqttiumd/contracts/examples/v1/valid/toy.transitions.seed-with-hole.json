@@ -1,0 +1,87 @@
+{
+  "format": "mqttiumd.transition-registry",
+  "schema_version": 1,
+  "id": "toy",
+  "catalog": "contracts/examples/v1/valid/toy.catalog.json",
+  "status": "seed",
+  "rules": [
+    {
+      "id": "toy.idle.tick",
+      "machine": "toy",
+      "state_class": "Idle",
+      "event_class": "Tick",
+      "guard_partition": {
+        "capacity": [
+          "sufficient"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "Busy",
+      "required_effects": [
+        "Persist"
+      ],
+      "forbidden_effects": [],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-015"
+      ],
+      "witnesses": [],
+      "mutations": []
+    },
+    {
+      "id": "toy.idle.tick.defer",
+      "machine": "toy",
+      "state_class": "Idle",
+      "event_class": "Tick",
+      "guard_partition": {
+        "capacity": [
+          "insufficient"
+        ]
+      },
+      "disposition": "DEFER",
+      "next_state_class": "Idle",
+      "required_effects": [],
+      "forbidden_effects": [],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-015"
+      ],
+      "witnesses": [],
+      "mutations": []
+    },
+    {
+      "id": "toy.idle.stop",
+      "machine": "toy",
+      "state_class": "Idle",
+      "event_class": "Stop",
+      "guard_partition": {},
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "Idle",
+      "required_effects": [],
+      "forbidden_effects": [],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-015"
+      ],
+      "witnesses": [],
+      "mutations": []
+    },
+    {
+      "id": "toy.busy.tick",
+      "machine": "toy",
+      "state_class": "Busy",
+      "event_class": "Tick",
+      "guard_partition": {},
+      "disposition": "REJECT",
+      "next_state_class": "Busy",
+      "required_effects": [],
+      "forbidden_effects": [],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-015"
+      ],
+      "witnesses": [],
+      "mutations": []
+    }
+  ]
+}

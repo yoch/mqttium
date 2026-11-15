@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/mqttiumd-contract",
+    "crates/mqttiumd-core",
+    "crates/mqttiumd-lab",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.dependencies]
+mqttiumd-contract = { path = "crates/mqttiumd-contract" }
+
+# Profiles are shared by the whole workspace and recorded in every run
+# manifest (DEM-003). Change them only with a contract revision.
+[profile.dev]
+overflow-checks = true
+
+# The bench hashes its own binary for the manifest; unoptimised SHA-256
+# makes every test that collects a manifest take seconds.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.release]
+overflow-checks = true
+debug = "line-tables-only"

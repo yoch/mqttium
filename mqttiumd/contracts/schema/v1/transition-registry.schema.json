@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "mqttiumd transition registry",
+  "description": "States, guard partitions and coverage of the sub-machines (DEM-015). The registry gives test obligations and shared vocabulary; it does not generate the decisions of the core or the expectations of the oracle.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "schema_version",
+    "id",
+    "catalog",
+    "status",
+    "rules"
+  ],
+  "properties": {
+    "format": {
+      "const": "mqttiumd.transition-registry"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "primitives.schema.json#/$defs/slug"
+    },
+    "catalog": {
+      "$ref": "primitives.schema.json#/$defs/relative_path"
+    },
+    "status": {
+      "description": "`seed` lists its holes without failing validation and cannot support a PASS; `complete` must have no hole.",
+      "enum": [
+        "seed",
+        "complete"
+      ]
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/rule"
+      },
+      "maxItems": 4096
+    }
+  },
+  "$defs": {
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "machine",
+        "state_class",
+        "event_class",
+        "guard_partition",
+        "disposition",
+        "next_state_class",
+        "required_effects",
+        "forbidden_effects",
+        "resource_delta_class",
+        "requirements",
+        "witnesses",
+        "mutations"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "primitives.schema.json#/$defs/dotted_name"
+        },
+        "machine": {
+          "$ref": "primitives.schema.json#/$defs/name"
+        },
+        "state_class": {
+          "$ref": "primitives.schema.json#/$defs/type_name"
+        },
+        "event_class": {
+          "$ref": "primitives.schema.json#/$defs/type_name"
+        },
+        "guard_partition": {
+          "description": "Guard dimension to the values this rule covers. A dimension of the event class that is absent covers all its values.",
+          "type": "object",
+          "propertyNames": {
+            "$ref": "primitives.schema.json#/$defs/name"
+          },
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "primitives.schema.json#/$defs/name"
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          }
+        },
+        "disposition": {
+          "enum": [
+            "TRANSITION",
+            "DEFER",
+            "IGNORE_STALE",
+            "REJECT",
+            "CLOSE",
+            "FAULT",
+            "UNREACHABLE"
+          ]
+        },
+        "next_state_class": {
+          "$ref": "primitives.schema.json#/$defs/type_name"
+        },
+        "required_effects": {
+          "type": "array",
+          "items": {
+            "$ref": "primitives.schema.json#/$defs/type_name"
+          },
+          "uniqueItems": true
+        },
+        "forbidden_effects": {
+          "type": "array",
+          "items": {
+            "$ref": "primitives.schema.json#/$defs/type_name"
+          },
+          "uniqueItems": true
+        },
+        "resource_delta_class": {
+          "enum": [
+            "none",
+            "reserve",
+            "transfer",
+            "release"
+          ]
+        },
+        "requirements": {
+          "type": "array",
+          "items": {
+            "$ref": "primitives.schema.json#/$defs/requirement_id"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "witnesses": {
+          "type": "array",
+          "items": {
+            "$ref": "primitives.schema.json#/$defs/requirement_id"
+          },
+          "uniqueItems": true
+        },
+        "mutations": {
+          "type": "array",
+          "items": {
+            "$ref": "primitives.schema.json#/$defs/requirement_id"
+          },
+          "uniqueItems": true
+        },
+        "justification": {
+          "$ref": "primitives.schema.json#/$defs/text"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "disposition"
+            ],
+            "properties": {
+              "disposition": {
+                "const": "UNREACHABLE"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "justification"
+            ],
+            "properties": {
+              "witnesses": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

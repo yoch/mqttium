@@ -1,0 +1,16 @@
+{
+  "format": "mqttiumd.scenario",
+  "schema_version": 1,
+  "id": "P1-02",
+  "profile": "p1-durable-mqtt5-without-expiry",
+  "initial_fixture": "tests/fixtures/p1/three-persistent-sessions.json",
+  "budgets": {
+    "max_steps": "4096",
+    "max_trace_bytes": "16777216"
+  },
+  "faults": [
+    {
+      "id": "lost_admission_result",
+      "point": "store.result.ready",
+      "match": {
+        "comma
