@@ -133,3 +133,43 @@ fn acknowledged_transaction_points_kill_and_recover_without_finishing_the_comman
         let _ = std::fs::remove_dir_all(&out);
     }
 }
+
+/// Run explicitly with --features mqttiumd-store-sqlite/kill-points,
+/// without the lab's feature, to exercise Cargo's dependency unification.
+#[cfg(not(feature = "kill-points"))]
+#[test]
+fn dependency_feature_unification_cannot_silently_change_the_rebuilt_binary() {
+    use mqttiumd_contract::ids::StoreIncarnation;
+    use mqttiumd_lab::bench::campaign::{Request, execute};
+    use mqttiumd_lab::store::conformance::fixture_limits;
+    let probe = bench_support::fresh("unified-probe").with_extension("sqlite");
+    let store = mqttiumd_store_sqlite::SqliteStore::create(
+        &probe,
+        StoreIncarnation::new(1),
+        fixture_limits(),
+    )
+    .unwrap();
+    let instrumented = store.effective_settings().kill_points;
+    drop(store);
+    for suffix in ["", "-wal", "-shm", ".writer-lock"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", probe.display()));
+    }
+    if !instrumented {
+        return;
+    }
+    let out = bench_support::fresh("unified-refused");
+    let request = Request {
+        root: bench_support::root(),
+        contracts: "contracts/v1".into(),
+        scenario: "tests/scenarios/p1/P1-02.json".into(),
+        out: out.clone(),
+        seed: 1,
+        run_id: None,
+        backend: "sqlite".to_owned(),
+        built_from: None,
+        process: "in-process".to_owned(),
+    };
+    let why = execute(&request).expect_err("the store carries unrecorded test instrumentation");
+    assert!(why.contains("Cargo feature unification"), "{why}");
+    assert!(!out.exists(), "the mismatch must be refused before writes");
+}
