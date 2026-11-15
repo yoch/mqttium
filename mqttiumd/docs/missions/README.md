@@ -54,6 +54,29 @@ then take the new base and run again the checks it touches. The core and
 the store do not wait for the proofs to end; their interfaces must not
 drift apart meanwhile.
 
+## Second wave: the audit of the first wave and lot L4
+
+The audit of the first wave (head `0daf0eb`) found seven defects that
+the tests of the lots did not show. Each is corrected by the lot that
+owns the file, test first, while lot L4 builds the runner. The findings
+and their reception criteria are in
+[open-conditions](../reception/open-conditions.md), section "Audit of the
+first wave". The priority of the wave is a first S0 campaign really
+executed by the runner of lot L4, then a first slice of the SQLite store
+(lot L7).
+
+| Session | Work |
+| - | - |
+| L1, core | F3, progress of resolutions; F4, one owner per box; what the composition of L4 needs from the core |
+| L2, store | F1, receipts of a release; F6, result budget; both as contract tests of `DurableStore` |
+| L3, oracle | F2, integrity of snapshots; K1, provenance of a result; F5, one causal order |
+| L4, runner | [L4](L4-bench-runner.md): the runner, the scenarios, the collection, the campaign directories |
+| Integrator | Interfaces between the four, shared files, reception of each change and of the final revision |
+
+The rules of the first wave hold: one owner per shared file, a contract
+change as a short chain with the digest before and after, merged one at
+a time, taken by the others through the integration branch.
+
 ## Tools
 
 `tools/install-tools.sh` installs the proof, model and fuzzing tools at
@@ -75,6 +98,7 @@ One lot per branch and per session. A lot changes only the paths it owns.
 | L1 Inbound core | `crates/mqttiumd-core/` except `src/credits.rs`; in `crates/mqttiumd-contract/src/`: `effects.rs`, `step.rs`, `ids.rs`, `capacity.rs`, `packet.rs` | [L1](L1-inbound-core.md) |
 | L2 Deterministic store | `crates/mqttiumd-lab/src/store/`, `crates/mqttiumd-lab/tests/store_*.rs`; in `crates/mqttiumd-contract/src/`: `command.rs`, `outcome.rs`, `opening.rs` | [L2](L2-deterministic-store.md) |
 | L3 Oracle, traces, registry | `contracts/`, `tests/oracle/`, `tests/scenarios/`, `tests/fixtures/`, `tools/build_corpus.py`, `tools/check_schemas.py`; the validation code of `crates/mqttiumd-lab/src/` (`semantic.rs`, `schemas.rs`, `strict.rs`, `workspace.rs`, `diagnostic.rs`); in `crates/mqttiumd-lab/tests/`: `contracts.rs`, `qualifying.rs`, `requirements.rs`, `support/`, and new files named `oracle_*.rs`, `trace_*.rs`, `scenario_*.rs`, `registry_*.rs` | [L3](L3-oracle-traces-registry.md) |
+| L4 Bench runner (second wave) | `crates/mqttiumd-lab/src/bench/`, the `run` command of `crates/mqttiumd-lab/src/main.rs`, `crates/mqttiumd-lab/tests/bench_*.rs`, `tests/scenarios/p1/P1-02b.json` (the vocabulary stays with L3) | [L4](L4-bench-runner.md) |
 | L5 Model M1 | `models/`, the model step of the workflow | [L5](L5-model-m1.md) |
 | L6 Pilot proof | `crates/mqttiumd-core/src/credits.rs`, `proofs/` | [L6](L6-pilot-proof.md) |
 
