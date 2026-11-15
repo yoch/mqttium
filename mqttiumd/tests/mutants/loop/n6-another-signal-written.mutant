@@ -1,0 +1,14 @@
+diff --git a/mqttiumd/crates/mqttiumd-lab/src/bench/runner.rs b/mqttiumd/crates/mqttiumd-lab/src/bench/runner.rs
+index b40b8350..6892687f 100644
+--- a/mqttiumd/crates/mqttiumd-lab/src/bench/runner.rs
++++ b/mqttiumd/crates/mqttiumd-lab/src/bench/runner.rs
+@@ -837,7 +837,8 @@ impl<B: Backend> Runner<'_, B> {
+                             &[],
+                             json!({
+                                 "signal_sent": killed.signal_sent,
+-                                "wait_status": {"signal": killed.wait_signal},
++                                // MUTANT N6: a signal other than the observed one.
++                                "wait_status": {"signal": 15},
+                             }),
+                         )?;
+                         self.kills.push(killed);

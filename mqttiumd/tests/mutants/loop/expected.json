@@ -157,6 +157,22 @@
       "assertion_status": "INCONCLUSIVE",
       "reason": "follows no recorded kill",
       "note": "A run that claims a child-process broker must show each kill: a crash with no BrokerKilled before it is missing evidence."
+    },
+    {
+      "id": "n6-another-signal-written",
+      "patch": "n6-another-signal-written.mutant",
+      "mutation": "the supervisor kills the child by SIGKILL but writes in BrokerKilled a signal other than the one the wait status showed (15)",
+      "scenario": "tests/scenarios/p1/P1-02.json",
+      "backends": [
+        "sqlite"
+      ],
+      "process": "child",
+      "not_on": "the mutation is in the child process mode, which runs on sqlite only",
+      "expect": "rejected",
+      "verdict": "FAIL",
+      "assertion": "broker_killed_for_real",
+      "reason": "not by SIGKILL",
+      "note": "The signal of BrokerKilled comes from the observed wait status, never from a constant: a record that says another signal than 9 is a broker not killed for real."
     }
   ]
 }
