@@ -15,3 +15,5 @@
 extern crate alloc;
 
 pub use mqttiumd_contract as contract;
+
+pub mod credits;
