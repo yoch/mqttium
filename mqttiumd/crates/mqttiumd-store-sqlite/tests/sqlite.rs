@@ -45,6 +45,8 @@ fn the_settings_in_force_are_read_back() {
     assert_eq!(settings.user_version, SCHEMA_VERSION);
     assert!(settings.sqlite_version.starts_with("3."), "{settings:?}");
     assert!(!settings.compile_options.is_empty());
+    assert!(settings.page_size > 0);
+    assert!(settings.wal_autocheckpoint > 0);
 }
 
 #[test]

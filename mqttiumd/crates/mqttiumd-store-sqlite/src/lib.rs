@@ -75,6 +75,11 @@ pub struct Settings {
     pub synchronous: i64,
     /// `PRAGMA user_version`: the schema version of the file.
     pub user_version: i64,
+    /// `PRAGMA page_size`, in bytes.
+    pub page_size: i64,
+    /// `PRAGMA wal_autocheckpoint`, in pages: the engine's checkpoint of
+    /// the WAL into the database. Commits are not grouped otherwise.
+    pub wal_autocheckpoint: i64,
 }
 
 /// Why a file was not opened as a store.
@@ -1032,12 +1037,17 @@ fn settle(conn: &Connection) -> Result<Settings, OpenError> {
         }
     }
     let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let wal_autocheckpoint: i64 =
+        conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
     Ok(Settings {
         sqlite_version,
         compile_options,
         journal_mode,
         synchronous,
         user_version,
+        page_size,
+        wal_autocheckpoint,
     })
 }
 

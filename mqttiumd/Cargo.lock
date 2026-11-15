@@ -401,6 +401,7 @@ dependencies = [
  "mqttiumd-contract",
  "mqttiumd-lab",
  "rusqlite",
+ "serde_json",
 ]
 
 [[package]]
