@@ -129,6 +129,30 @@ fn acknowledged_transaction_points_kill_and_recover_without_finishing_the_comman
                     .any(|record| record["kind"] == "StoreCommitStable"
                         && &record["payload"]["operation_id"] == operation)
             );
+        } else {
+            // Different origins are unordered unless the writer states
+            // the actual dependency. The applied point is reached only
+            // after this command's successful COMMIT was recorded.
+            let operation = &trace[hit]["payload"]["operation_id"];
+            let stable = trace[..hit]
+                .iter()
+                .find(|record| {
+                    record["kind"] == "StoreCommitStable"
+                        && &record["payload"]["operation_id"] == operation
+                })
+                .expect("K3 recorded this command's commit");
+            let cause = json!({
+                "origin_component": stable["origin_component"],
+                "origin_incarnation": stable["origin_incarnation"],
+                "origin_sequence": stable["origin_sequence"],
+            });
+            assert!(
+                trace[hit]["causal_parents"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&cause),
+                "K3's FaultHit must follow its own StoreCommitStable, not only share CommandSubmitted as a parent"
+            );
         }
         let _ = std::fs::remove_dir_all(&out);
     }
