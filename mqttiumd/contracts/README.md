@@ -231,12 +231,19 @@ holds when each epoch is granted at most once, after a committed reply
 the ledger confirms.
 
 A run the bench stops before the last step of its scenario ends with
-`StepBlocked {step, step_kind, cause}` of the bench supervisor, before
-the footer: `quiescent` when no action was eligible and the awaited event
-had not happened, `budget` when the steps ran out. The assertion
-`scenario_reaches_its_end`, owed by every run, fails on `quiescent` (the
-product is stuck, and no missing record undoes that) and is
-inconclusive on `budget`.
+`StepBlocked {step, step_kind, cause, armed_deadlines, holding_faults}`
+of the bench supervisor, before the footer: `quiescent` when no action
+was eligible and the awaited event had not happened, `budget` when the
+steps ran out. The assertion `scenario_reaches_its_end`, owed by every
+run, fails on `quiescent` and is inconclusive on `budget`. The FAIL says
+what one finished run establishes: a `DriveUntil` step asserts that the
+awaited event comes with no stimulus beyond what the scenario has already
+injected, and nothing eligible with the wait unmet refutes that for this
+run (no missing record undoes it). It does not say the product is stuck
+for ever. For diagnosis only, the record counts the deadlines armed and
+not fired and names the faults that still hold an item, so that a reader
+can tell a stopped product from a scenario that did not fire a deadline
+it armed or release what it holds; the verdict depends on `cause` alone.
 
 `InputRefused` is what the dispatcher records when it refuses a result
 that answers no effect in flight. `StoreCommitStable`, `StoreFenceStable`,

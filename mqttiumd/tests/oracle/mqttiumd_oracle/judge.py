@@ -1119,27 +1119,41 @@ def refusal_carries_the_reason_of_its_rejection(run):
 def scenario_reaches_its_end(run):
     """The run reached the last step of its scenario (point d of the second wave).
 
-    The bench says why it stopped earlier. Nothing eligible while the
-    awaited event has not happened is the product stuck: a FAIL, which no
-    missing record undoes. A budget of steps that ran out establishes
-    nothing about the product.
+    A DriveUntil step asserts that the awaited event comes with no
+    stimulus beyond what the scenario has already injected. The bench
+    says why it stopped earlier. Nothing eligible while the wait is unmet
+    refutes that assertion for this run: a FAIL, which no missing record
+    undoes, and which does not say the product is stuck for ever. A
+    budget of steps that ran out establishes nothing. What still waited
+    at the stop is reported for diagnosis; the status depends on the
+    cause alone.
     """
+
+    def waiting(payload):
+        held = payload["holding_faults"]
+        faults = f"faults holding an item: {', '.join(held)}" if held else "no fault holds an item"
+        return f"{payload['armed_deadlines']} deadlines armed and not fired, {faults}"
+
     blocks = run.trace.of_kind("StepBlocked")
     stuck = [record for record in blocks if record.payload["cause"] == "quiescent"]
     if stuck:
         return Status(
             FAIL,
             [
-                f"record {record.sequence}: step {record.payload['step']} "
-                f"({record.payload['step_kind']}): nothing was eligible and the awaited event "
-                "did not happen"
+                f"record {record.sequence}: nothing was eligible and the wait of step "
+                f"{record.payload['step']} ({record.payload['step_kind']}) was unmet, which "
+                "refutes for this run that the awaited event comes with no further stimulus; "
+                f"{waiting(record.payload)}"
                 for record in stuck
             ],
         )
     if blocks:
         return Status(
             INCONCLUSIVE,
-            [f"record {record.sequence}: the budget of steps ran out" for record in blocks],
+            [
+                f"record {record.sequence}: the budget of steps ran out; {waiting(record.payload)}"
+                for record in blocks
+            ],
         )
     return Status(PASS)
 

@@ -1194,7 +1194,7 @@ BLOCKED = record(
         "step_kind": "DriveUntil",
         "cause": "quiescent",
         "armed_deadlines": "1",
-        "holding_faults": ["hold-result"],
+        "holding_faults": ["hold_result"],
     },
 )
 ok("trace-record-step-blocked.json", BLOCKED)
@@ -1540,6 +1540,14 @@ trace_case(
     code="u64-out-of-range",
 )
 trace_case(
+    "step-blocked-deadlines-overflow",
+    BLOCKED,
+    "/payload/armed_deadlines",
+    "The count of armed deadlines is 64-bit.",
+    setter(["payload", "armed_deadlines"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
     "step-blocked-without-what-waits",
     BLOCKED,
     "/payload",
@@ -1558,7 +1566,7 @@ trace_case(
     BLOCKED,
     "/payload/holding_faults",
     "Each fault that holds an item is named once.",
-    setter(["payload", "holding_faults"], ["hold-result", "hold-result"]),
+    setter(["payload", "holding_faults"], ["hold_result", "hold_result"]),
 )
 trace_case(
     "violation-without-its-kind",

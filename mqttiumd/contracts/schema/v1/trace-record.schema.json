@@ -2281,13 +2281,15 @@
       }
     },
     "StepBlocked": {
-      "description": "The bench stopped the run before its last step: at `step`, of kind `step_kind`, because no action was eligible and the awaited event had not happened (`quiescent`), or because the budget of steps ran out (`budget`).",
+      "description": "The bench stopped the run before its last step: at `step`, of kind `step_kind`, because no action was eligible and the awaited event had not happened (`quiescent`), or because the budget of steps ran out (`budget`). For diagnosis only, what still waited at the stop: `armed_deadlines`, the deadlines armed and not fired, and `holding_faults`, the faults that still hold an item. The verdict depends on `cause` alone.",
       "type": "object",
       "additionalProperties": false,
       "required": [
         "step",
         "step_kind",
-        "cause"
+        "cause",
+        "armed_deadlines",
+        "holding_faults"
       ],
       "properties": {
         "step": {
@@ -2301,6 +2303,16 @@
             "quiescent",
             "budget"
           ]
+        },
+        "armed_deadlines": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "holding_faults": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "primitives.schema.json#/$defs/name"
+          }
         }
       }
     }

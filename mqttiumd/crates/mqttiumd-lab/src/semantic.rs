@@ -1634,7 +1634,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
 /// Names of the members that hold a 64-bit decimal string, in a trace
 /// payload or a snapshot. A test walks the schemas and fails when one of
 /// their 64-bit members is missing here.
-const COMPONENTS: [&str; 37] = [
+const COMPONENTS: [&str; 38] = [
     "incarnation",
     "epoch",
     "owner",
@@ -1666,6 +1666,7 @@ const COMPONENTS: [&str; 37] = [
     "state_revision",
     "target",
     "step",
+    "armed_deadlines",
     "next_session",
     "source_session",
     "target_revision",

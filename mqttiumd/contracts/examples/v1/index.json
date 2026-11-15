@@ -714,6 +714,12 @@
       "why": "The index of a step is 64-bit."
     },
     {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-deadlines-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/armed_deadlines",
+      "why": "The count of armed deadlines is 64-bit."
+    },
+    {
       "file": "contracts/examples/v1/invalid/trace-record-step-blocked-without-what-waits.json",
       "code": "schema-violation",
       "pointer": "/payload",

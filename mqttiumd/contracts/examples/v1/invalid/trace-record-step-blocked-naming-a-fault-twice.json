@@ -16,8 +16,8 @@
     "cause": "quiescent",
     "armed_deadlines": "1",
     "holding_faults": [
-      "hold-result",
-      "hold-result"
+      "hold_result",
+      "hold_result"
     ]
   }
 }
