@@ -130,7 +130,7 @@ pub fn read_frame(stream: &mut impl Read) -> Result<Option<Vec<u8>>, Refusal> {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Action {
     /// Start with the rank of the start-up.
-    Start { rank: u32 },
+    Start { rank: u32, recovery_page: u32 },
     /// One of the eligible choices the child published last.
     Choose { index: u32, digest: [u8; 32] },
     /// A connection of a client, by the generation the supervisor
@@ -389,7 +389,10 @@ impl Action {
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Self::Start { rank } => Writer::tag(1).u32(*rank),
+            Self::Start {
+                rank,
+                recovery_page,
+            } => Writer::tag(1).u32(*rank).u32(*recovery_page),
             Self::Choose { index, digest } => Writer::tag(2).u32(*index).digest(digest),
             Self::Connect { generation, client } => {
                 Writer::tag(3).u64(*generation).bytes(client.as_bytes())
@@ -424,6 +427,7 @@ impl Action {
         let action = match tag {
             1 => Self::Start {
                 rank: reader.u32()?,
+                recovery_page: reader.u32()?,
             },
             2 => Self::Choose {
                 index: reader.u32()?,
@@ -907,7 +911,10 @@ mod tests {
 
     fn every_action() -> Vec<Action> {
         vec![
-            Action::Start { rank: 2 },
+            Action::Start {
+                rank: 2,
+                recovery_page: 64,
+            },
             Action::Choose {
                 index: 3,
                 digest: [7; 32],

@@ -90,6 +90,8 @@ pub struct Config {
     /// How long the supervisor waits for a frame of the child before it
     /// stops the run ([`SILENCE`] for a campaign).
     pub silence: Duration,
+    /// Maximum number of facts requested per recovery page (1..=4096).
+    pub recovery_page: u32,
 }
 
 /// What the supervisor knows of the child after an action.
@@ -329,7 +331,14 @@ impl Child {
         drop(listeners);
         let rank = u32::try_from(rank).map_err(|_| stop("too many start-ups"))?;
         let mut startup = Vec::new();
-        for report in child.act(&Action::Start { rank }, collector, books)? {
+        for report in child.act(
+            &Action::Start {
+                rank,
+                recovery_page: config.recovery_page,
+            },
+            collector,
+            books,
+        )? {
             if let Report::Started {
                 epoch,
                 startup: lines,
@@ -1292,7 +1301,20 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
         let mut stopping = false;
         let outcome: Result<(), Stop> = (|| {
             match action {
-                Action::Start { rank } => {
+                Action::Start {
+                    rank,
+                    recovery_page,
+                } => {
+                    if recovery_page == 0 || recovery_page > 4096 {
+                        return Err(Stop::control(
+                            ControlCode::InvalidFrame,
+                            ControlPhase::Start,
+                            arguments.rank + 1,
+                            "the recovery page is outside 1..=4096",
+                        ));
+                    }
+                    let mut settings = settings;
+                    settings.recovery_page = recovery_page as usize;
                     if process.is_some() || u64::from(rank) != arguments.rank {
                         return Err(stop("a start-up of another rank, or a second one"));
                     }

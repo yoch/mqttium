@@ -223,6 +223,7 @@ fn a_child_that_never_speaks_stops_the_run_at_its_deadline() {
         store: directory.join("none.sqlite"),
         sessions: Vec::new(),
         silence: Duration::from_millis(300),
+        recovery_page: 64,
     };
     let schema = mqttiumd_lab::strict::parse(
         &std::fs::read(bench_support::root().join("contracts/schema/v1/trace-record.schema.json"))
@@ -369,6 +370,7 @@ fn a_second_child_on_the_same_file_while_the_first_lives_is_refused() {
         run_id: run_id.clone(),
         sessions: sessions(),
         silence: Duration::from_secs(30),
+        recovery_page: 64,
     };
     let collector = || Collector::new(&run_id, KindTable::from_schema(&schema).unwrap(), 1 << 24);
     let (mut first_collector, mut second_collector) = (collector(), collector());
@@ -386,7 +388,15 @@ fn a_second_child_on_the_same_file_while_the_first_lives_is_refused() {
     let Err(refused) = Child::spawn(&config, 8, &[], &mut second_collector, &mut books) else {
         panic!("a second writer started on the same file");
     };
-    assert!(refused.failure.is_some(), "{}", refused.message);
+    assert_eq!(
+        refused.failure,
+        Some(mqttiumd_lab::bench::failure::Failure::Read {
+            cause: mqttiumd_store_api::ReadError::Unavailable.into(),
+            phase: mqttiumd_store_api::ReadPhase::Open,
+            process_incarnation: 9,
+            page: None,
+        })
+    );
     first
         .stop(&mut first_collector, &mut books)
         .expect("the first child stops");

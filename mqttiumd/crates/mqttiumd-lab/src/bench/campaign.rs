@@ -35,7 +35,7 @@ use super::child::Config as ChildConfig;
 use super::collector::{Collector, KindTable};
 use super::mqtt::transport::Bounds;
 use super::process::{Settings, Stop, owner_config};
-use super::runner::{Outcome, Plan, Population, SCHEDULER_VERSION, run};
+use super::runner::{Outcome, Plan, Population, SCHEDULER_VERSION, failed_before_start, run};
 use super::scenario::Scenario;
 use crate::files;
 use crate::manifest;
@@ -49,6 +49,9 @@ use mqttiumd_store_api::ReadPhase;
 /// The resolution delay of the owner, in logical time units. The
 /// specification fixes none for S0; the corpus uses 30.
 pub const RESOLUTION_DELAY: u64 = 30;
+
+/// Ordinary campaigns request this many facts per bounded recovery page.
+pub const RECOVERY_PAGE_FACTS: usize = 64;
 
 /// What a campaign is asked to do.
 #[derive(Clone, Debug)]
@@ -324,7 +327,7 @@ pub fn settings_of(
         seed,
         resolution_delay: RESOLUTION_DELAY,
         work_limit: 4096,
-        recovery_page: 64,
+        recovery_page: RECOVERY_PAGE_FACTS,
         effect_slots,
         reservations,
         adapter: AdapterLimits {
@@ -587,18 +590,6 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         .run_id
         .clone()
         .unwrap_or_else(|| slug(&format!("{}-seed-{}", scenario.id, request.seed)));
-    let Setup {
-        settings,
-        store,
-        population,
-    } = Setup::from_fixture(
-        &mut backend,
-        &fixture_document,
-        &run_id,
-        request.seed,
-        scenario.faults.len(),
-    )
-    .map_err(|error| error.to_string())?;
     let schema_path = out.join(format!(
         "{}/trace-record.schema.json",
         files::contract_directories(Path::new(&contracts))?.1
@@ -608,39 +599,60 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     let kinds = KindTable::from_schema(&schema)?;
     let collector = Collector::new(&run_id, kinds, scenario.max_trace_bytes);
     let backend_name = backend.name();
-    let backend_settings = backend.describe();
-    let child = (request.process == "child")
-        .then(|| -> Result<ChildConfig, String> {
-            let campaign = out.canonicalize().map_err(|error| io(out, error))?;
-            Ok(ChildConfig {
-                executable: std::env::current_exe()
-                    .map_err(|error| format!("the binary of the run: {error}"))?,
-                store: campaign.join("store").join("mqttiumd.sqlite"),
-                campaign,
-                contracts: contracts.clone(),
-                scenario: scenario_path.clone(),
-                seed: request.seed,
-                run_id: run_id.clone(),
-                sessions: population
-                    .clients
-                    .iter()
-                    .map(|(name, _, session)| (name.clone(), *session))
-                    .collect(),
-                silence: super::child::SILENCE,
-            })
-        })
-        .transpose()?;
-    let in_child = child.is_some();
     let backend_crash = backend.crash();
-    let outcome: Outcome = run(Plan {
-        scenario: &scenario,
-        backend,
-        settings,
-        population,
-        store,
-        collector,
-        child,
-    });
+    let setup = Setup::from_fixture(
+        &mut backend,
+        &fixture_document,
+        &run_id,
+        request.seed,
+        scenario.faults.len(),
+    );
+    let backend_settings = backend.describe();
+    let in_child = request.process == "child";
+    let outcome: Outcome = match setup {
+        Ok(Setup {
+            settings,
+            store,
+            population,
+        }) => {
+            let child = (request.process == "child")
+                .then(|| -> Result<ChildConfig, String> {
+                    let campaign = out.canonicalize().map_err(|error| io(out, error))?;
+                    Ok(ChildConfig {
+                        executable: std::env::current_exe()
+                            .map_err(|error| format!("the binary of the run: {error}"))?,
+                        store: campaign.join("store").join("mqttiumd.sqlite"),
+                        campaign,
+                        contracts: contracts.clone(),
+                        scenario: scenario_path.clone(),
+                        seed: request.seed,
+                        run_id: run_id.clone(),
+                        sessions: population
+                            .clients
+                            .iter()
+                            .map(|(name, _, session)| (name.clone(), *session))
+                            .collect(),
+                        silence: super::child::SILENCE,
+                        recovery_page: u32::try_from(settings.recovery_page)
+                            .map_err(|_| "recovery page does not fit")?,
+                    })
+                })
+                .transpose()?;
+            run(Plan {
+                scenario: &scenario,
+                backend,
+                settings,
+                population,
+                store,
+                collector,
+                child,
+            })
+        }
+        Err(error) if error.failure.is_some() => {
+            failed_before_start(&scenario, backend_name, in_child, collector, error)
+        }
+        Err(error) => return Err(error.to_string()),
+    };
 
     // The evidence, as it was collected.
     write(out, "trace.jsonl", &outcome.trace)?;
@@ -841,6 +853,8 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
             "start_up": "the real path: EpochOpening through the store adapter, EpochGrant, OwnerAuthority::from_grant, one box for owner 0, Owner::new",
         },
         "backend_settings": backend_settings,
+        "recovery_page": RECOVERY_PAGE_FACTS.to_string(),
+        "durable_read_budgets": super::failure::read_budgets(),
         "build_features": super::rebuild::BUILD_FEATURES,
         "process_protocol": if in_child { json!({
             "max_frame_bytes": super::protocol::MAX_FRAME,
@@ -903,3 +917,7 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         judge,
     })
 }
+
+#[cfg(test)]
+#[path = "setup_failure_tests.rs"]
+mod setup_failure_tests;

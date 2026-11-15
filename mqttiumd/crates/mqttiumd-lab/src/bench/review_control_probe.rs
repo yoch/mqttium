@@ -1,4 +1,21 @@
 use super::*;
+fn assert_control<T: std::fmt::Debug>(
+    result: &Result<T, Stop>,
+    code: ControlCode,
+    phase: ControlPhase,
+) {
+    assert_eq!(
+        result
+            .as_ref()
+            .expect_err("the malformed control must be refused")
+            .failure,
+        Some(super::super::failure::Failure::Control {
+            code,
+            phase,
+            process_incarnation: 1
+        })
+    );
+}
 fn fixture() -> (Child, mpsc::SyncSender<Arrival>, Collector, Books) {
     let mut process = Command::new("cat")
         .stdin(Stdio::piped())
@@ -52,9 +69,10 @@ fn repeated_contradictory_ends_exceeding_report_budget_are_refused() {
         .unwrap();
     drop(sender);
     let result = child.act(&Action::Settle, &mut collector, &mut books);
-    assert!(
-        result.is_err(),
-        "accepted 65 EndOfAction(Some(0)) followed by EndOfAction(None) with no evidence: {result:?}"
+    assert_control(
+        &result,
+        ControlCode::DuplicateTermination,
+        ControlPhase::Action,
     );
 }
 #[test]
@@ -73,9 +91,10 @@ fn broken_evidence_after_signal_is_not_silently_discarded() {
         sender.send(Arrival::Broken(refusal)).unwrap();
     });
     let result = child.kill();
-    assert!(
-        result.is_err(),
-        "accepted kill although its evidence reader reported a truncated frame: {result:?}"
+    assert_control(
+        &result,
+        ControlCode::TruncatedFrame,
+        ControlPhase::KillDrain,
     );
 }
 
@@ -95,10 +114,10 @@ fn one_end_cannot_erase_the_evidence_promised_by_an_earlier_end() {
         }))
         .unwrap();
     drop(sender);
-    assert!(
-        child
-            .act(&Action::Settle, &mut collector, &mut books)
-            .is_err()
+    assert_control(
+        &child.act(&Action::Settle, &mut collector, &mut books),
+        ControlCode::DuplicateTermination,
+        ControlPhase::Action,
     );
 }
 
@@ -126,10 +145,10 @@ fn termination_reports_are_in_the_same_bounded_control_budget() {
         }))
         .unwrap();
     drop(sender);
-    assert!(
-        child
-            .act(&Action::Settle, &mut collector, &mut books)
-            .is_err()
+    assert_control(
+        &child.act(&Action::Settle, &mut collector, &mut books),
+        ControlCode::ReportBudgetExceeded,
+        ControlPhase::Action,
     );
 }
 
@@ -158,9 +177,10 @@ fn reports_without_evidence_progress_do_not_reset_the_action_deadline() {
     let result = child.act(&Action::Settle, &mut collector, &mut books);
     drop(child);
     producer.join().unwrap();
-    assert!(
-        result.is_err(),
-        "reports without progress kept an action alive: {result:?}"
+    assert_control(
+        &result,
+        ControlCode::ActionDeadlineExceeded,
+        ControlPhase::Action,
     );
 }
 
@@ -184,9 +204,10 @@ fn an_actual_unix_reader_preserves_a_truncated_frame_after_real_kill() {
     });
     let result = child.kill();
     producer.join().unwrap();
-    assert!(
-        result.is_err(),
-        "the real Unix frame reader's truncation was dropped: {result:?}"
+    assert_control(
+        &result,
+        ControlCode::TruncatedFrame,
+        ControlPhase::KillDrain,
     );
 }
 
@@ -207,7 +228,11 @@ fn a_drain_failure_keeps_the_confirmed_signal_nine_receipt() {
     });
     let attempt = child.kill_observed();
     producer.join().unwrap();
-    assert!(attempt.result.is_err());
+    assert_control(
+        &attempt.result,
+        ControlCode::TruncatedFrame,
+        ControlPhase::KillDrain,
+    );
     let observed = attempt
         .observed
         .expect("the real SIGKILL is not erased by collection failure");
@@ -259,8 +284,77 @@ fn a_duplicate_empty_end_cannot_complete_a_second_action() {
     drop(sender);
     let first = child.act(&Action::Settle, &mut collector, &mut books);
     let second = child.act(&Action::Settle, &mut collector, &mut books);
+    assert!(first.is_ok(), "the first empty action is valid");
+    assert_control(
+        &second,
+        ControlCode::DuplicateTermination,
+        ControlPhase::Action,
+    );
+}
+
+#[test]
+fn successive_empty_actions_with_distinct_serials_are_valid() {
+    let (mut child, sender, mut collector, mut books) = fixture();
+    for action_sequence in 0..2 {
+        sender
+            .send(Arrival::Report(Report::EndOfAction {
+                action_sequence,
+                last_emission: None,
+            }))
+            .unwrap();
+    }
     assert!(
-        first.is_err() || second.is_err(),
-        "two actions were accepted from one repeated empty terminator"
+        child
+            .act(&Action::Settle, &mut collector, &mut books)
+            .is_ok()
+    );
+    assert!(
+        child
+            .act(&Action::Settle, &mut collector, &mut books)
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_parked_report_cannot_reuse_the_serial_of_an_earlier_action() {
+    let (mut child, sender, mut collector, mut books) = fixture();
+    child.next_action = 1;
+    sender
+        .send(Arrival::Report(Report::Parked {
+            action_sequence: 0,
+            last_emission: 0,
+            fault: 0,
+            point: "store.commit.prepared".to_owned(),
+            settings: "{}".to_owned(),
+        }))
+        .unwrap();
+    assert_control(
+        &child.act(&Action::Settle, &mut collector, &mut books),
+        ControlCode::DuplicateTermination,
+        ControlPhase::Action,
+    );
+}
+
+#[test]
+fn duplicate_terminations_cross_the_actual_unix_control_reader() {
+    let (mut child, sender, mut collector, mut books) = fixture();
+    let (input, mut output) = UnixStream::pair().expect("Unix control socket pair");
+    reader(input, None, sender);
+    for last_emission in [Some(0), None] {
+        write_frame(
+            &mut output,
+            &Report::EndOfAction {
+                action_sequence: 0,
+                last_emission,
+            }
+            .encode(),
+        )
+        .unwrap();
+    }
+    drop(output);
+    assert_control(
+        &child.act(&Action::Settle, &mut collector, &mut books),
+        ControlCode::DuplicateTermination,
+        ControlPhase::Action,
     );
 }
