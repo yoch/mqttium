@@ -133,10 +133,12 @@ impl AckReason {
     /// Packet Identifier is free again (MQTT 5 section 4.3.3).
     #[must_use]
     pub const fn refusing(rejection: RejectReason) -> Self {
-        // Interface only: every refusal still claims a quota, as the
-        // traces did before this reason existed.
-        let _ = rejection;
-        Self::QuotaExceeded
+        match rejection {
+            RejectReason::CapacityExceeded(_) => Self::QuotaExceeded,
+            RejectReason::Fenced | RejectReason::PreconditionFailed | RejectReason::EpochClosed => {
+                Self::ImplementationSpecificError
+            }
+        }
     }
 }
 
