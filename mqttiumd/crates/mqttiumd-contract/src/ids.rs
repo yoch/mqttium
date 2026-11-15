@@ -134,6 +134,12 @@ scalar_id!(
     EffectSeq
 );
 scalar_id!(
+    /// Serial of one effect box under one creation authority. It comes from
+    /// a checked counter and is never used again, even after the box was
+    /// retired (ADR 0009).
+    OutboxSerial
+);
+scalar_id!(
     /// A capacity account.
     AccountId
 );

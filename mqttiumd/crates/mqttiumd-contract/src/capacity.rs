@@ -107,6 +107,10 @@ pub enum WakeCondition {
     EffectAccepted,
     /// A result was delivered and its reserve returned.
     ResultDelivered,
+    /// Either `EffectAccepted` or `ResourceReleased`: what is missing is
+    /// held partly by effects that wait for an adapter and partly by live
+    /// reservations, and the end of either may free it. Retry after each.
+    EffectAcceptedOrResourceReleased,
     /// The scheduler granted a new turn with a larger work limit.
     TurnGranted,
 }

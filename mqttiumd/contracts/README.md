@@ -15,12 +15,13 @@ it. The examples illustrate the contract and are not part of the digest.
 | Path | Content |
 | - | - |
 | `schema/v1/*.schema.json` | JSON Schema 2020-12. No `$id`; references are file-relative and never fetched |
-| `v1/fault-points.json` | Contractual injection points and the actions each offers |
+| `schema/v1/store-snapshot.schema.json` | The durable state of a store at one checkpoint, as `InspectDurableState` writes it |
+| `v1/fault-points.json` | Contractual injection points, what each carries (a command or a result) and the actions it offers |
 | `v1/profiles.json` | Profiles and their perimeter |
 | `v1/assertions.json` | Assertion names, their meaning and the requirements they serve |
 | `v1/requirements.json` | Every identifier the specification defines, each with its source: a chapter or an accepted decision record |
 | `v1/p1.catalog.json` | Vocabulary of the transition registry: machines, state classes, event classes, guard dimensions, effects |
-| `v1/p1.transitions.json` | Transition registry of P1. Status `seed`: its holes are listed, not hidden |
+| `v1/p1.transitions.json` | Transition registry of P1. Status `complete`: every guard point of every cell has exactly one rule |
 | `examples/v1/index.json` | Every example, and for each invalid one the code and pointer it must be refused with |
 
 ## Rules every v1 document follows
@@ -53,6 +54,173 @@ and the coverage of a transition registry. A report keeps at most 64
 diagnostics and 64 notes and counts the others exactly; a truncated report
 still refuses.
 
+### Held commands, held results and deadlines
+
+Three steps let a scenario order a race without a crash (ADR 0001):
+
+| Step | What the bench does |
+| - | - |
+| `FireDeadline` | Drives the broker, within `max_steps`, until no effect waits in an effect box; then lets the timer adapter deliver the armed deadline that is due first, and drives until the core has consumed it. Two deadlines due at the same logical time fire in the order they were armed. If no deadline is armed the step fails and the run is inconclusive: it is never a no-op. Logical time advances in no other way: a deadline never fires by itself between two steps |
+| `ReleaseHeldCommand` | Lets the command that the named fault holds enter the writer |
+| `DeliverHeldResult` | Hands the result that the named fault delays to the core, and drives, within `max_steps`, until the core has consumed it |
+
+**What a fault holds.** The action `hold_command` holds a command and
+`delay_result` holds a result. Such a fault holds one item in the life of a
+scenario:
+
+- it holds it once a `DriveUntil` step has waited for its hit, and a
+  scenario waits for it once, so its `expected_hits` is at most 1;
+- what is held is handed over at most once, by the step of its kind;
+- a crash of the broker destroys it, and the fault holds nothing again. A
+  fault that no step waited for before a crash may still be reached, and
+  waited for, after the restart;
+- a held command or result that no step hands over stays held to the end
+  of the run (QABS-C keeps its command held).
+
+A scenario does not wait for a fault whose `expected_hits` is 0.
+
+**What a point carries.** Each injection point `carries` a command or a
+result, and offers only actions that act on it: `hold_command` on a
+command; `drop_result`, `delay_result` and `duplicate_result` on a result;
+`refuse_fence` on the fence of a resolution, which is a command of the
+writer; `barrier` on either. On a point that carries a result, `match.result_of`
+selects the result of a `Persist` or of a `ResolveAndFence` about a
+matching operation; without it, every result about a matching operation
+counts, in the order they become ready.
+
+**Where a fence waits.** A resolution enters the writer and reads what is
+established for its operation. A receipt, a fence or a retired identity
+answers it. An absence brings it to the point `store.fence.transit`, the
+`occurrence` being counted over the resolutions of the operation that read
+an absence. There:
+
+- `hold_command` sets the fence aside until `ReleaseHeldCommand`. The
+  read of the absence is not a decision: the fence is written only if the
+  operation is still absent when the held fence enters the writer. If the
+  command committed meanwhile (QABS-A) the resolution answers `Committed`
+  and writes no fence; otherwise it fences (QABS-B), and the command
+  released afterwards is refused without effect;
+- `refuse_fence` makes the write of this one fence impossible: the
+  resolution answers `PendingOrUnknown` (QABS-C), nothing else changes and
+  the store stays available. The trace records it as `StoreFenceRefused`,
+  so that a refused fence is never inferred from a missing
+  `StoreFenceStable`.
+
+A held command does not by itself prevent a fence: a store fences whenever
+it can write the fence.
+
+**One fault per item.** Two faults of a scenario never select the same
+command or result. Two selections on one point, for one command kind, with
+compatible publication bindings and compatible `result_of`, are refused
+when they name the same occurrence, and also when only one of them names
+`result_of` or only one of them names `publication_binding`: they would
+count occurrences over different sets, and which fault acts would depend
+on the store.
+
+These steps give the broker nothing it could not know (ADR 0003): a fired
+deadline carries the token the core armed, a released command is the one
+the adapter accepted, a delivered result answers an effect still in flight.
+
+### Perimeter
+
+A trace header declares the `perimeter` of its run: `full`, or
+`core-without-bytes` when the core is driven with validated packets and no
+transport or peer observes anything. A scenario may require a perimeter;
+absent, it requires `full`.
+
+A run is judged only against a scenario of its own perimeter: for any
+other, every assertion is out of scope, and a qualifying result that holds
+an out-of-scope assertion is refused. A run without bytes therefore never
+passes a full scenario. It has its own scenario, which declares
+`core-without-bytes` and lists the assertions that perimeter can decide;
+an assertion that needs what the peers observed stays out of scope there.
+
+### Trace records and the provenance of broker inputs
+
+Every kind of record is stated by one origin only. The audit of ADR 0003
+reads the trace as chains, from what happened outside the core to what the
+core consumed:
+
+| Input of the core | Record of the core | What must precede it |
+| - | - | - |
+| Packet | `PacketDelivered` | `ClientBytesReceived` of the transport whose bytes are exactly that packet, itself caused by the `PeerPacketSent` of the peer with the same bytes |
+| Store result | `StoreResultDelivered` | `CommandSubmitted` or `ResolveSubmitted` of the store adapter with the same effect and operation, not answered before |
+| Deadline | `DeadlineDelivered` | `DeadlineArmed` of the timer with the same token, not delivered before |
+| Recovery page | `RecoveryPageDelivered` | `RecoveryPageRead` of the store adapter with the same content |
+
+A recovery page lists its facts. Besides the epoch, the sessions, the
+inbound exchanges and the operations, an inventory holds what the core
+needs to prepare an admission (record 0014): `Limits`, `RouteTable` and
+one `Route` per target of a topic. A 64-bit quantity is a decimal string
+and a 32-bit bound a JSON integer. The facts of a page follow the order
+of an inventory, which is the rule of `RecoveryOrder::admit`: `Epoch`,
+`Limits`, `RouteTable`, `Route`, `Session`, `InboundExchange`,
+`Operation`, ranks never decreasing; the first three at most once
+(`duplicate-name`); routes sorted by the bytes of their topic, equal
+topics accepted (`rows-out-of-order` for a rank or a topic out of place).
+A reader of documents sees one page. That the pages of one recovery form
+one inventory, and that a route has its table before it, is checked by
+the oracle on the whole trace.
+
+`FrameEligible` carries the reason of an acknowledgement. A certain
+rejection in `StoreResultReady` and `StoreResultDelivered` names its
+`reject_reason`, and no other outcome has one. The reason a refusing
+PUBREC carries is a function of it, stated once by the transition
+catalogue as the `refusal_reasons` of the effect `EmitPubrecRefusal`:
+`QuotaExceeded` for `CapacityExceeded`, `ImplementationSpecificError`
+(0x83) for `Fenced`, `PreconditionFailed` and `EpochClosed` (record 0013,
+line 10). A test holds that table to `AckReason::refusing` of the
+contract crate, and the assertion
+`refusal_carries_the_reason_of_its_rejection` holds a run to it: the
+rejection a refusing frame answers is the latest certain rejection among
+its causes, delivered to the same incarnation of the core.
+
+`InputRefused` is what the dispatcher records when it refuses a result
+that answers no effect in flight. `StoreCommitStable`, `StoreFenceStable`,
+`StoreFenceRefused` and `StoreResultReady` are hidden truth of the store: they judge a run and
+are never an input. `FaultHit` names the operation and effect it stopped,
+when there is one, and `HeldItemReleased` the fault whose command or
+result a step handed over.
+
+A record says what its emitter claims. Checking a trace as a whole, and
+the assertion `broker_inputs_have_provenance`, is the oracle's work.
+
+### Store snapshots
+
+`InspectDurableState` writes one document of the format
+`mqttiumd.store-snapshot` per checkpoint, and records it in the trace as
+`DurableStateInspected`, cited by path, digest and size. A snapshot is
+read from the store independently of the broker; it is evidence for the
+oracle and never an input of the broker.
+
+| Table | Rows, in the order of their key |
+| - | - |
+| `meta` | Store incarnation; the last opened epoch (every earlier one is closed) and the attempt that opened it; the revision frontier; the next session |
+| `sessions` | SessionId, ClientID bytes, revision, state. A deleted session stays, terminal |
+| `route_table` | Its revision, and each exact topic with its target sessions and their QoS |
+| `operations` | Receipts: OperationId, the exact canonical bytes of the recipe, the terminal decision with its content (commit facts, or the reason of a certain rejection) |
+| `fences` | Identities fenced without a recipe: definitively not executable |
+| `payloads` | PayloadId, length, digest, count of live obligations that refer to it |
+| `publications` | PublicationId, the admission that created it, source session, topic, QoS, retain, PayloadId |
+| `obligations` | DeliveryId (`publication_id`, `index`), target session and its revision, cause, effective QoS, phase |
+| `inbound_exchanges` | ExchangeId, Packet Identifier, publication, phase; a released exchange has no row |
+| `account` | Usage and limits of the one account of S0 |
+
+Every table is present, even empty: an absent table is not an empty one.
+What is volatile (a command in transit, a transaction in preparation, a
+result not yet delivered, the control state of an opening) is not in a
+snapshot; the trace shows it.
+
+Rows are in the order of their key, numbers numerically, identities
+component by component and bytes as bytes, so that two stores in the same
+state write the same bytes. What a key member is comes from the schema,
+never from its value: a topic whose bytes are all decimal digits is bytes,
+and an empty topic is a key like another. A snapshot shows what the store holds, sound or not. The
+reader checks its form only: 64-bit ranges, no row listed twice under its
+key (`duplicate-name`) and rows in order (`rows-out-of-order`). An
+obligation without its publication, or two admissions for one exchange, is
+a finding the oracle asserts on, not a malformed document.
+
 ### Registry coverage
 
 For each machine, state class and event class, the guard domain is the
@@ -78,8 +246,15 @@ A result is `provisional` or `qualifying`.
 - A **qualifying** result is offered as evidence. It names its scenario,
   manifest and trace by path, digest and size, and the contract digest. The
   files must exist with those digests, the contracts must be the ones in
-  use, its assertions and faults must be exactly those of the scenario, and
-  none of them may be out of scope.
+  use, its faults must be exactly those of the scenario, its assertions
+  exactly those of the scenario and those every run owes, and none of them
+  may be out of scope.
+
+Each entry of the assertion catalogue says whether `every_run` owes it.
+`trace_complete` and `broker_inputs_have_provenance` are owed by every
+run: a scenario cannot opt out of them by not listing them, and P1-02,
+which is the text of the specification and lists only the first, owes
+both (ADR 0003).
 
 For both, the verdict must equal the one the assertions and injections
 determine: FAIL if any assertion failed; otherwise INCONCLUSIVE if any is

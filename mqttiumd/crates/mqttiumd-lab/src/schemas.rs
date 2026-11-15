@@ -37,6 +37,7 @@ pub const FORMATS: &[(&str, &str)] = &[
     ),
     ("mqttiumd.run-manifest", "run-manifest.schema.json"),
     ("mqttiumd.run-result", "run-result.schema.json"),
+    ("mqttiumd.store-snapshot", "store-snapshot.schema.json"),
     ("mqttiumd.fault-catalog", "catalogs.schema.json"),
     ("mqttiumd.profile-catalog", "catalogs.schema.json"),
     ("mqttiumd.assertion-catalog", "catalogs.schema.json"),
@@ -120,12 +121,24 @@ impl Schemas {
         }
         files.sort();
 
-        let mut documents = Vec::new();
-        for file in &files {
-            let bytes = files::read_document(canonical_root, &directory.join(file))
+        let mut contents = Vec::new();
+        for file in files {
+            let bytes = files::read_document(canonical_root, &directory.join(&file))
                 .map_err(|(code, message)| Diagnostic::new(code, "", message))?
                 .bytes;
-            let schema = strict::parse(&bytes)
+            contents.push((file, bytes));
+        }
+        Self::from_bytes(&contents)
+    }
+
+    /// Builds the validators from the bytes of the schema files, given as
+    /// `(file name, content)` in name order. Nothing is read from disk:
+    /// the schemas that validate are the bytes the caller holds.
+    pub fn from_bytes(contents: &[(String, Vec<u8>)]) -> Result<Self, Diagnostic> {
+        let files: Vec<String> = contents.iter().map(|(name, _)| name.clone()).collect();
+        let mut documents = Vec::new();
+        for (file, bytes) in contents {
+            let schema = strict::parse(bytes)
                 .map_err(|error| not_local(file, format!("{}: {}", error.code, error.message)))?;
             check_schema_document(file, &schema, &files)?;
             documents.push((file.clone(), schema));

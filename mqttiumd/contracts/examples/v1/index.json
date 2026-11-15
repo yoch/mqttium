@@ -3,14 +3,52 @@
   "schema_version": 1,
   "valid": [
     "tests/scenarios/p1/P1-02.json",
+    "tests/scenarios/qabs/QABS-A.json",
+    "tests/scenarios/qabs/QABS-B.json",
+    "tests/scenarios/qabs/QABS-C.json",
     "tests/fixtures/p1/three-persistent-sessions.json",
     "contracts/examples/v1/valid/scenario-u64-max.json",
+    "contracts/examples/v1/valid/scenario-core-without-bytes.json",
     "contracts/examples/v1/valid/scenario-qos0-publish.json",
+    "contracts/examples/v1/valid/scenario-held-command-and-result.json",
+    "contracts/examples/v1/valid/scenario-hold-reached-after-a-restart.json",
+    "contracts/examples/v1/valid/scenario-command-held-to-the-end.json",
+    "contracts/v1/fault-points.json",
     "contracts/examples/v1/valid/trace-record-header.json",
     "contracts/examples/v1/valid/trace-record-store-commit-stable.json",
     "contracts/examples/v1/valid/trace-record-fault-hit.json",
     "contracts/examples/v1/valid/trace-record-peer-packet-observed.json",
     "contracts/examples/v1/valid/trace-record-footer.json",
+    "contracts/examples/v1/valid/trace-record-peer-connection-opened.json",
+    "contracts/examples/v1/valid/trace-record-peer-packet-sent.json",
+    "contracts/examples/v1/valid/trace-record-peer-connection-closed.json",
+    "contracts/examples/v1/valid/trace-record-client-bytes-received.json",
+    "contracts/examples/v1/valid/trace-record-packet-delivered.json",
+    "contracts/examples/v1/valid/trace-record-resolve-submitted.json",
+    "contracts/examples/v1/valid/trace-record-store-result-ready.json",
+    "contracts/examples/v1/valid/trace-record-store-result-rejected.json",
+    "contracts/examples/v1/valid/trace-record-store-result-delivered-rejected.json",
+    "contracts/examples/v1/valid/trace-record-store-fence-stable.json",
+    "contracts/examples/v1/valid/trace-record-deadline-armed.json",
+    "contracts/examples/v1/valid/trace-record-deadline-delivered.json",
+    "contracts/examples/v1/valid/trace-record-recovery-page-read.json",
+    "contracts/examples/v1/valid/trace-record-recovery-page-delivered.json",
+    "contracts/examples/v1/valid/trace-record-recovery-page-with-routes-and-limits.json",
+    "contracts/examples/v1/valid/trace-record-recovery-page-of-routes-only.json",
+    "contracts/examples/v1/valid/trace-record-input-refused.json",
+    "contracts/examples/v1/valid/trace-record-held-item-released.json",
+    "contracts/examples/v1/valid/trace-record-frame-eligible.json",
+    "contracts/examples/v1/valid/trace-record-frame-eligible-refusal-without-quota.json",
+    "contracts/examples/v1/valid/trace-record-frame-eligible-connack.json",
+    "contracts/examples/v1/valid/trace-record-store-fence-refused.json",
+    "contracts/examples/v1/valid/trace-record-durable-state-inspected.json",
+    "contracts/examples/v1/valid/trace-record-header-core-without-bytes.json",
+    "contracts/examples/v1/valid/store-snapshot-after-commit.json",
+    "contracts/examples/v1/valid/store-snapshot-empty.json",
+    "contracts/examples/v1/valid/store-snapshot-orphan-obligation.json",
+    "contracts/examples/v1/valid/store-snapshot-refused-and-fenced.json",
+    "contracts/examples/v1/valid/store-snapshot-routes-in-byte-order.json",
+    "contracts/examples/v1/valid/store-snapshot-long-digit-topics.json",
     "contracts/examples/v1/valid/run-result-provisional-all-passing.json",
     "contracts/examples/v1/valid/run-result-provisional-fail-with-inconclusive.json",
     "contracts/examples/v1/valid/run-result-provisional-fault-not-hit.json",
@@ -258,6 +296,12 @@
       "why": "ClientResumeExchange refers to an exchange no earlier step bound."
     },
     {
+      "file": "contracts/examples/v1/invalid/scenario-exchange-used-before-binding.json",
+      "code": "binding-undefined",
+      "pointer": "/steps/1/exchange",
+      "why": "An exchange is resumed only after the step that binds it, not merely somewhere in the file."
+    },
+    {
       "file": "contracts/examples/v1/invalid/scenario-binding-undefined-fault.json",
       "code": "binding-undefined",
       "pointer": "/steps/2/binding",
@@ -354,6 +398,156 @@
       "why": "RestartBroker needs a crashed broker."
     },
     {
+      "file": "contracts/examples/v1/invalid/scenario-unknown-perimeter.json",
+      "code": "schema-violation",
+      "pointer": "/perimeter",
+      "why": "A scenario requires a known perimeter."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-release-before-hold.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/2",
+      "why": "A command is released only after the step that reached its hold."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-release-twice.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/7",
+      "why": "A held command is released once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-second-wait-on-a-holding-fault.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/7",
+      "why": "A fault that holds something holds one item in the life of a scenario: it is waited for once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-holding-fault-expected-twice.json",
+      "code": "held-item-mismatch",
+      "pointer": "/faults/0/expected_hits",
+      "why": "A fault that holds something is reached once: a second item would have no step to release it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-wait-for-a-fault-never-expected.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/7",
+      "why": "A scenario does not wait for an injection it announces will never be reached."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-two-faults-select-one-result.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/2/match",
+      "why": "Without result_of the delay counts over every result of the operation: its second may be the first of the Persist, which another fault drops."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-two-faults-select-one-occurrence.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/4/match",
+      "why": "Two faults name the same occurrence of the same result: only one could act."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-release-of-a-refused-fence.json",
+      "code": "held-item-mismatch",
+      "pointer": "/steps/6/fault",
+      "why": "A refused fence is not written and not kept: nothing is left to release."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-refuse-fence-where-no-fence-waits.json",
+      "code": "fault-action-unknown",
+      "pointer": "/faults/3/action",
+      "why": "Only the point where a fence waits offers to refuse it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-two-faults-one-without-binding.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/4/match",
+      "why": "A fault without a publication binding counts over every publication: its second command may be the first of the publication another fault names."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-deliver-while-crashed.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/12",
+      "why": "One misplaced step is one diagnostic: the hand-over is not judged again while the broker is down."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-deliver-after-crash.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/13",
+      "why": "A crash destroys what the broker process held; nothing is left to deliver."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-release-undeclared-fault.json",
+      "code": "binding-undefined",
+      "pointer": "/steps/6/fault",
+      "why": "ReleaseHeldCommand names a fault that is not declared."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-release-of-a-held-result.json",
+      "code": "held-item-mismatch",
+      "pointer": "/steps/6/fault",
+      "why": "The fault delays a result; it holds no command to release."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-deliver-of-a-dropped-result.json",
+      "code": "held-item-mismatch",
+      "pointer": "/steps/11/fault",
+      "why": "A dropped result is gone; only a delayed result can be delivered."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-result-of-on-a-command-point.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/0/match/result_of",
+      "why": "The point carries a command; `result_of` selects among results."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-result-of-unknown-effect.json",
+      "code": "schema-violation",
+      "pointer": "/faults/1/match/result_of",
+      "why": "Only Persist and ResolveAndFence are answered by a store result."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-fire-deadline-without-budget.json",
+      "code": "schema-violation",
+      "pointer": "/steps/3",
+      "why": "Firing a deadline is bounded like every step that drives the broker."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-fire-deadline-budget-exceeded.json",
+      "code": "budget-exceeded",
+      "pointer": "/steps/3/max_steps",
+      "why": "The new steps obey the scenario budget."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/fault-catalog-result-action-on-a-command-point.json",
+      "code": "fault-action-unknown",
+      "pointer": "/points/0/actions/1",
+      "why": "A point that carries a command cannot delay a result."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/fault-catalog-refuse-fence-on-a-result-point.json",
+      "code": "fault-action-unknown",
+      "pointer": "/points/3/actions/3",
+      "why": "A fence is a command of the writer: a point that carries a result cannot refuse one."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/fault-catalog-action-nobody-defines.json",
+      "code": "fault-action-unknown",
+      "pointer": "/points/0/actions/0",
+      "why": "The actions of an injection point are a closed vocabulary."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/fault-catalog-point-without-carries.json",
+      "code": "schema-violation",
+      "pointer": "/points/0",
+      "why": "Every injection point says whether a command or a result passes through it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/assertion-catalog-entry-without-every-run.json",
+      "code": "schema-violation",
+      "pointer": "/assertions/0",
+      "why": "Every assertion says whether every run owes it or only the scenarios that list it."
+    },
+    {
       "file": "contracts/examples/v1/invalid/fixture-route-target-unknown.json",
       "code": "client-unknown",
       "pointer": "/routes/0/targets/1/client",
@@ -378,6 +572,192 @@
       "why": "S0 fixtures hold persistent sessions only."
     },
     {
+      "file": "contracts/examples/v1/invalid/trace-record-recovery-page-from-the-bench.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A recovery page is read by the store adapter; no other origin may state one (ADR 0003)."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-input-refused-by-the-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "The dispatcher refuses an input before the core sees it; the core cannot record it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-fact-unknown-kind.json",
+      "code": "schema-violation",
+      "pointer": "/payload/facts/3/kind",
+      "why": "Recovered facts are a closed union: a remembered binding is not one of them."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-operation-without-knowledge.json",
+      "code": "schema-violation",
+      "pointer": "/payload/facts/3",
+      "why": "A recovered operation states what the store knows of it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-peer-publish-without-dup.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A PUBLISH that a client sent says whether it is a retransmission."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-peer-packet-sent-of-a-broker-kind.json",
+      "code": "schema-violation",
+      "pointer": "/payload/packet_kind",
+      "why": "A client of the subset sends CONNECT, PUBLISH and PUBREL; PUBREC comes from the broker."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-frame-eligible-pubrec-without-reason.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A PUBREC is positive or not: the record carries its reason."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-deadline-token-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/token",
+      "why": "A deadline token is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-packet-delivered-ingress-order-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/ingress_order",
+      "why": "The ingress order is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovery-page-fact-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/facts/1/revision",
+      "why": "Identity components inside a recovered fact are 64-bit as well."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-rejection-without-its-reason.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A certain rejection says why: the reason of the refusing PUBREC follows from it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-commit-with-a-rejection-reason.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "Only a certain rejection has a reason."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-rejection-of-an-unknown-reason.json",
+      "code": "schema-violation",
+      "pointer": "/payload/reject_reason",
+      "why": "The reasons of a rejection are those of the contract."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-facts-rank-decreases.json",
+      "code": "rows-out-of-order",
+      "pointer": "/payload/facts/8/kind",
+      "why": "The facts of a page are in the order of the inventory: a route never follows a session."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-epoch-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/payload/facts/1/kind",
+      "why": "An inventory holds its epoch once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-limits-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/payload/facts/2/kind",
+      "why": "An inventory holds its limits once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-routes-unsorted.json",
+      "code": "rows-out-of-order",
+      "pointer": "/payload/facts/5/topic_hex",
+      "why": "Routes are sorted by the bytes of their topic: a prefix comes before what it prefixes."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-route-qos-3.json",
+      "code": "schema-violation",
+      "pointer": "/payload/facts/3/max_qos",
+      "why": "The QoS of a route is 0, 1 or 2."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-limit-of-targets-as-text.json",
+      "code": "schema-violation",
+      "pointer": "/payload/facts/1/max_targets_per_admission",
+      "why": "A 32-bit bound is a JSON integer; only 64-bit quantities are decimal strings."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-payload-limit-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/facts/1/max_payload_bytes",
+      "why": "The bound on a payload is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-route-target-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/facts/4/target",
+      "why": "The session a route targets is a 64-bit identity."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-route-target-revision-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/facts/4/target_revision",
+      "why": "The revision of a route target is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-deadline-time-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/now",
+      "why": "Every 64-bit member of a payload is range-checked, whatever its name."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-deadline-delay-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/after",
+      "why": "Every 64-bit member of a payload is range-checked, whatever its name."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovery-page-number-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/page",
+      "why": "Every 64-bit member of a payload is range-checked, whatever its name."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-packet-delivered-connection-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/connection_generation",
+      "why": "Every 64-bit member of a payload is range-checked, whatever its name."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-durable-state-inspected-by-the-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "The core never reads the store for the oracle: an inspection belongs to the bench."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-durable-state-inspected-size-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/snapshot/bytes",
+      "why": "The size of a cited snapshot is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-durable-state-inspected-without-digest.json",
+      "code": "schema-violation",
+      "pointer": "/payload/snapshot",
+      "why": "A snapshot is cited by path, digest and size, like any evidence."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-header-without-perimeter.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A run says what it exercised: a run without bytes must not be read as a full one."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-header-unknown-perimeter.json",
+      "code": "schema-violation",
+      "pointer": "/payload/perimeter",
+      "why": "Perimeters are a closed set."
+    },
+    {
       "file": "contracts/examples/v1/invalid/trace-record-store-truth-from-core.json",
       "code": "schema-violation",
       "pointer": "/origin_component",
@@ -396,10 +776,286 @@
       "why": "The payload shape follows the kind."
     },
     {
+      "file": "contracts/examples/v1/invalid/trace-record-store-commit-without-command-kind.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "Hidden truth says what was committed, not only that something was."
+    },
+    {
       "file": "contracts/examples/v1/invalid/trace-record-operation-overflow.json",
       "code": "u64-out-of-range",
       "pointer": "/payload/operation_id/sequence",
       "why": "Identity components are 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-unknown-table.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "The tables of a snapshot are a closed set."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-without-fences.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "Every table is present, even empty: an absent table is not an empty one."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-decision-unknown-outcome.json",
+      "code": "schema-violation",
+      "pointer": "/operations/0/decision/kind",
+      "why": "A receipt records a terminal decision; an unknown outcome is not a durable fact."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-commit-without-facts.json",
+      "code": "schema-violation",
+      "pointer": "/operations/0/decision",
+      "why": "A committed receipt says what was committed."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-rejection-without-reason.json",
+      "code": "schema-violation",
+      "pointer": "/operations/0/decision",
+      "why": "A certain rejection is recorded with its reason: that is what keeps it rejected."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-recipe-not-hex.json",
+      "code": "schema-violation",
+      "pointer": "/operations/0/recipe_hex",
+      "why": "A recipe is its exact canonical bytes."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-obligation-without-cause.json",
+      "code": "schema-violation",
+      "pointer": "/obligations/0",
+      "why": "The cause of an obligation stays inspectable (DEM-011)."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-opening-attempt-without-ticket.json",
+      "code": "schema-violation",
+      "pointer": "/meta/opened_by",
+      "why": "The attempt that opened the last epoch is its start-up nonce and its ticket."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-startup-nonce-too-short.json",
+      "code": "schema-violation",
+      "pointer": "/meta/opened_by",
+      "why": "A start-up nonce is sixteen bytes."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-session-state-unknown.json",
+      "code": "schema-violation",
+      "pointer": "/sessions/0/state",
+      "why": "A session is active or terminal; a deleted one stays, terminal."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-operation-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/operations/1/operation_id",
+      "why": "An OperationId designates one recipe: one row."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-obligation-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/obligations/1",
+      "why": "A DeliveryId designates one obligation, whatever destination a second row claims."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-inbound-slot-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/inbound_exchanges/1",
+      "why": "A session has one inbound exchange per Packet Identifier."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-session-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/sessions/1/session",
+      "why": "A SessionId designates one session."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-route-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/route_table/routes/1/topic_hex",
+      "why": "An exact topic has one route."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-fence-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/fences/1/operation_id",
+      "why": "An identity is fenced once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-publication-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/publications/1/publication_id",
+      "why": "A PublicationId designates one publication."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-payload-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/payloads/1/payload_id",
+      "why": "A PayloadId designates one payload."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-digit-topics-out-of-byte-order.json",
+      "code": "rows-out-of-order",
+      "pointer": "/route_table/routes/1/topic_hex",
+      "why": "6161 comes before 62 as bytes, whatever the two read as decimal numbers."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-long-digit-topic-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/route_table/routes/1/topic_hex",
+      "why": "Twenty-four hexadecimal digits are bytes, not a number too large to compare."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-empty-topic-listed-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/route_table/routes/1/topic_hex",
+      "why": "The empty byte string is a key like another."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-sessions-out-of-order.json",
+      "code": "rows-out-of-order",
+      "pointer": "/sessions/1/session",
+      "why": "Sessions are listed in the numeric order of their SessionId."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-sessions-in-text-order.json",
+      "code": "rows-out-of-order",
+      "pointer": "/sessions/3/session",
+      "why": "The order is numeric: 10 comes after 3, not between 1 and 2."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-obligations-out-of-order.json",
+      "code": "rows-out-of-order",
+      "pointer": "/obligations/1",
+      "why": "Obligations are listed by publication, then index."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-operations-out-of-order.json",
+      "code": "rows-out-of-order",
+      "pointer": "/operations/1/operation_id",
+      "why": "Operations are listed by incarnation, epoch, owner, sequence."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-payload-length-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payloads/0/length",
+      "why": "Sizes are 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-obligation-session-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/obligations/1/session",
+      "why": "Identities inside a list are range-checked as well."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-meta-last-opened-epoch.json",
+      "code": "u64-out-of-range",
+      "pointer": "/meta/last_opened_epoch",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-meta-opened-by-ticket.json",
+      "code": "u64-out-of-range",
+      "pointer": "/meta/opened_by/ticket",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-meta-collected-through.json",
+      "code": "u64-out-of-range",
+      "pointer": "/meta/collected_through",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-meta-state-revision.json",
+      "code": "u64-out-of-range",
+      "pointer": "/meta/state_revision",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-meta-next-session.json",
+      "code": "u64-out-of-range",
+      "pointer": "/meta/next_session",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-route-table-revision.json",
+      "code": "u64-out-of-range",
+      "pointer": "/route_table/revision",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-payloads-0-references.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payloads/0/references",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-publications-0-source-session.json",
+      "code": "u64-out-of-range",
+      "pointer": "/publications/0/source_session",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-obligations-0-target-revision.json",
+      "code": "u64-out-of-range",
+      "pointer": "/obligations/0/target_revision",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-used-references.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/used/references",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-payload-bytes.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/payload_bytes",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-exchange-slots.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/exchange_slots",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-receipt-slots.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/receipt_slots",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-max-targets-per-admission.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/max_targets_per_admission",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-max-topic-bytes.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/max_topic_bytes",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-max-payload-bytes.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/max_payload_bytes",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-max-sessions.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/max_sessions",
+      "why": "Every 64-bit member of a snapshot is range-checked."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-max-route-targets.json",
+      "code": "u64-out-of-range",
+      "pointer": "/account/limits/max_route_targets",
+      "why": "Every 64-bit member of a snapshot is range-checked."
     },
     {
       "file": "contracts/examples/v1/invalid/run-result-provisional-pass.json",
@@ -544,6 +1200,66 @@
       "code": "coverage-budget-exceeded",
       "pointer": "/catalog",
       "why": "65 536 guard points in one cell exceed the coverage budget; they are counted, never built."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-peer-connection-opened-stated-by-transport.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-peer-connection-closed-stated-by-broker-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-client-bytes-received-stated-by-peer.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-resolve-submitted-stated-by-broker-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-store-fence-stable-stated-by-store-adapter.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-store-fence-refused-stated-by-broker-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovery-page-delivered-stated-by-store-adapter.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-held-item-released-stated-by-bench-supervisor.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-fault-hit-stated-by-broker-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-peer-packet-observed-stated-by-transport.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
     }
   ]
 }

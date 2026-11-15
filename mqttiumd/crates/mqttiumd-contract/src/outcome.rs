@@ -3,6 +3,9 @@
 //! An observed absence is not a certain rejection: a command may still sit in
 //! a queue while a read finds no receipt. Only a durable fence ordered with
 //! the writer turns "absent" into `RejectedCertain`.
+//!
+//! The outcomes of opening an epoch, and what start-up does with them,
+//! are in `opening` (ADR 0009).
 
 use crate::capacity::Resource;
 use crate::ids::{ExchangeId, PublicationId};
@@ -131,6 +134,11 @@ impl Knowledge {
         }
     }
 }
+
+pub use crate::opening::{
+    EpochGrant, EpochOpened, EpochOpening, HandOverRefused, NotAwaiting, Observed, OpeningOutcome,
+    OpeningReply, OpeningStage, RecoveredEpochCheck, ReplyRefused, SubmitRefused,
+};
 
 #[cfg(test)]
 mod tests {

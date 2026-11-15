@@ -14,6 +14,7 @@
     "client": "producer",
     "packet_kind": "PUBREC",
     "packet_id": 7,
-    "bytes_hex": "5004000700"
+    "reason_code": 0,
+    "bytes_hex": "50020007"
   }
 }

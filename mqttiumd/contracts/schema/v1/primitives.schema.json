@@ -130,6 +130,56 @@
         }
       }
     },
+    "publication_id": {
+      "description": "One internal publication, independent of any Packet Identifier.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch",
+        "owner",
+        "sequence"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "owner": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "sequence": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "payload_id": {
+      "description": "One durable immutable payload object.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch",
+        "owner",
+        "sequence"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "owner": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "sequence": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
     "effect_id": {
       "type": "object",
       "additionalProperties": false,
@@ -217,6 +267,15 @@
           "$ref": "primitives.schema.json#/$defs/u64"
         }
       }
+    },
+    "reject_reason": {
+      "description": "Why the store rejected an operation for certain, in the vocabulary of RejectReason.",
+      "enum": [
+        "PreconditionFailed",
+        "CapacityExceeded",
+        "Fenced",
+        "EpochClosed"
+      ]
     }
   }
 }
