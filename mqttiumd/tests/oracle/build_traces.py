@@ -2015,6 +2015,23 @@ case(
 )
 
 
+def bench_reads_the_late_unknown(events):
+    # The bench orders what it does after what it read: the peer sends its
+    # PUBREL, and the supervisor inspects, after the late unknown answer.
+    # Neither is a reaction of the product to it.
+    events[at(events, "pubrel")]["parents"] = ["unknown.delivered"]
+    events[at(events, "inspect.final")]["parents"] = ["unknown.delivered"]
+
+
+case(
+    "p1-02b-good-bench-ordered-after-the-late-unknown",
+    "The bench acts after it read the late unknown answer: an order, not a regression of the product.",
+    base=p1_02b,
+    scenario="p1-02b",
+    events=bench_reads_the_late_unknown,
+)
+
+
 def resolves_again_later(events):
     # Long after the commit is known, the core resolves the operation once
     # more, from no answer in particular.
@@ -2393,6 +2410,45 @@ case(
     "A declared injection duplicates a result: handed over twice, the copy refused; that is expected.",
     scenario="p1-02-duplicate",
     events=duplicate_handed_over,
+)
+
+
+def bench_between(events, labels):
+    # The supervisor read the injection, then the records ``labels`` name
+    # its inspection: an order, which explains nothing of the product.
+    events[at(events, "inspect.final")]["parents"] = ["hit.duplicated_release_result"]
+    for label in labels:
+        moved = events.pop(at(events, label))
+        moved["parents"] = ["inspect.final"]
+        insert_after(events, "inspect.final", [moved])
+
+
+def refused_after_the_bench(events):
+    duplicate_refused(events)
+    bench_between(events, ["copy.refused"])
+
+
+case(
+    "provenance-refusal-excused-only-through-the-bench",
+    "The refusal follows the injection only through the supervisor's inspection: no cause excuses it.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    scenario="p1-02-duplicate",
+    events=refused_after_the_bench,
+)
+
+
+def handed_after_the_bench(events):
+    duplicate_handed_over(events)
+    bench_between(events, ["copy.refused", "copy.handed"])
+    events[at(events, "copy.refused")]["parents"] = ["copy.handed"]
+
+
+case(
+    "provenance-result-handed-over-only-through-the-bench",
+    "K1: the copy follows the store's result only through the supervisor's inspection: the store did not produce it.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    scenario="p1-02-duplicate",
+    events=handed_after_the_bench,
 )
 
 
