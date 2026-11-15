@@ -16,6 +16,7 @@
 use crate::capacity::{CapacityNeed, WorkUnits};
 use crate::effects::{Input, ReserveRefused};
 use crate::ids::{LogicalOwnerId, OperationId, Revision};
+use crate::outcome::RejectReason;
 
 /// An input owned by the caller of a step.
 pub type OwnedInput = Input;
@@ -78,6 +79,18 @@ pub enum CoreFault {
     /// box, so this is a fault of the core and never a wait (ADR 0006,
     /// amendment).
     BoxTooSmall { requested: usize, capacity: usize },
+    /// The store certainly refused the durable termination of an inbound
+    /// exchange for a reason that a new preparation cannot change, or as
+    /// many times as the owner prepares it again. The exchange and what it
+    /// holds can never be given back by this owner, so it stops rather than
+    /// prepare again without end.
+    ReleaseRefused {
+        operation: OperationId,
+        reason: RejectReason,
+    },
+    /// Memory that planning needed could not be allocated. No event that
+    /// the core can wait for gives it back.
+    AllocationFailed,
 }
 
 /// What is exhausted when a step answers `Exhausted`. No wake-up ends it.
