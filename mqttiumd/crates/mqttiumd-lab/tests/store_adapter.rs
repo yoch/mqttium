@@ -269,7 +269,15 @@ fn a_held_command_does_not_enter_the_writer_until_it_is_released() {
         bench.store.perform(StoreAction::EnterWriter(id)),
         Err(ActionRefused::NotEligible)
     );
-    assert!(bench.store.store().snapshot().operations.is_empty());
+    assert!(
+        bench
+            .store
+            .store()
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .operations
+            .is_empty()
+    );
 
     // A later command is not held: the occurrence was the first one.
     let other = bench.admission(2, 8, b"payload", &[bench.b]);
@@ -288,7 +296,16 @@ fn a_held_command_does_not_enter_the_writer_until_it_is_released() {
         Ok(Performed::Released)
     );
     assert_eq!(enter(&mut bench, id), Performed::Executed);
-    assert_eq!(bench.store.store().snapshot().publications.len(), 2);
+    assert_eq!(
+        bench
+            .store
+            .store()
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .publications
+            .len(),
+        2
+    );
     assert_eq!(bench.store.hits(hold), 1);
 }
 
@@ -305,7 +322,16 @@ fn a_barrier_after_the_commit_stops_before_any_result_exists() {
     assert_eq!(bench.store.halted_at(), Some(FaultPoint::CommitApplied));
 
     // Committed, and no result anywhere.
-    assert_eq!(bench.store.store().snapshot().publications.len(), 1);
+    assert_eq!(
+        bench
+            .store
+            .store()
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .publications
+            .len(),
+        1
+    );
     let events = bench.store.take_events();
     hit(&events, barrier, "store.commit.applied", "barrier", id);
     assert!(
@@ -332,7 +358,15 @@ fn a_barrier_after_the_commit_stops_before_any_result_exists() {
 
     // The supervisor crashes the process there: the commit survives.
     let crashed = bench.store.crash();
-    assert_eq!(crashed.store.snapshot().publications.len(), 1);
+    assert_eq!(
+        crashed
+            .store
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .publications
+            .len(),
+        1
+    );
     assert!(!crashed.evidence_lost);
 }
 
@@ -380,7 +414,16 @@ fn a_dropped_result_never_reaches_the_core_and_the_commit_is_reconciled() {
         id,
     );
     assert!(bench.store.eligible().is_empty(), "nothing to deliver");
-    assert_eq!(bench.store.store().snapshot().publications.len(), 1);
+    assert_eq!(
+        bench
+            .store
+            .store()
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .publications
+            .len(),
+        1
+    );
     // Nothing answers the lost result's effect any more.
     let WorkId::Effect(lost) = id else {
         panic!("an effect");
@@ -409,7 +452,16 @@ fn a_dropped_result_never_reaches_the_core_and_the_commit_is_reconciled() {
         delivered_reply(deliver(&mut bench, resolve)),
         StoreReply::Outcome(StoreOutcome::Committed(_))
     ));
-    assert_eq!(bench.store.store().snapshot().publications.len(), 1);
+    assert_eq!(
+        bench
+            .store
+            .store()
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .publications
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -713,7 +765,10 @@ fn an_identity_remembered_by_the_bench_is_refused_after_a_restart() {
 
     let crashed = bench.store.crash();
     let mut restarted = SimStore::new(crashed.store, LIMITS);
-    let before = restarted.store().snapshot();
+    let before = restarted
+        .store()
+        .snapshot()
+        .expect("healthy durable snapshot");
     assert_eq!(
         restarted.present_result(
             remembered_effect,
@@ -730,7 +785,13 @@ fn an_identity_remembered_by_the_bench_is_refused_after_a_restart() {
             reason: Uncorrelated::NoWorkInFlight
         }]
     );
-    assert_eq!(restarted.store().snapshot(), before);
+    assert_eq!(
+        restarted
+            .store()
+            .snapshot()
+            .expect("healthy durable snapshot"),
+        before
+    );
 }
 
 #[test]
@@ -746,7 +807,11 @@ fn a_crash_loses_what_is_volatile_and_keeps_what_is_durable() {
     persist(&mut bench, 1, &held_command);
     let ready = persist(&mut bench, 2, &ready_command);
     assert_eq!(enter(&mut bench, ready), Performed::Executed);
-    let durable = bench.store.store().snapshot();
+    let durable = bench
+        .store
+        .store()
+        .snapshot()
+        .expect("healthy durable snapshot");
     assert_eq!(durable.publications.len(), 1);
 
     let crashed = bench.store.crash();
@@ -757,8 +822,17 @@ fn a_crash_loses_what_is_volatile_and_keeps_what_is_durable() {
             .iter()
             .any(|event| matches!(event, StoreEvent::CommitStable { id, .. } if *id == ready))
     );
-    let mut restarted = SimStore::new(MemoryStore::reopen(crashed.store.snapshot()), LIMITS);
-    assert_eq!(restarted.store().snapshot(), durable);
+    let mut restarted = SimStore::new(
+        MemoryStore::reopen(crashed.store.snapshot().expect("healthy durable snapshot")),
+        LIMITS,
+    );
+    assert_eq!(
+        restarted
+            .store()
+            .snapshot()
+            .expect("healthy durable snapshot"),
+        durable
+    );
     // No command in transit, no result, no fault, no barrier.
     assert!(restarted.eligible().is_empty());
     assert_eq!(restarted.halted_at(), None);
@@ -804,7 +878,12 @@ fn recovery_pages_read_through_the_adapter_leave_their_evidence() {
         assert_eq!(
             bench.store.take_events(),
             [StoreEvent::RecoveryPageRead {
-                run_epoch: bench.store.store().ledger().last_opened(),
+                run_epoch: bench
+                    .store
+                    .store()
+                    .ledger()
+                    .expect("healthy durable ledger")
+                    .last_opened(),
                 page: pages,
                 last,
                 facts: page.facts.as_slice().to_vec(),
@@ -988,7 +1067,14 @@ fn a_fence_and_a_rejection_receipt_pass_the_point_after_their_commit() {
         id,
     );
     let crashed = bench.store.crash();
-    assert!(crashed.store.snapshot().fences.contains(&operation));
+    assert!(
+        crashed
+            .store
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .fences
+            .contains(&operation)
+    );
     assert!(
         !crashed
             .events
@@ -1034,6 +1120,7 @@ fn a_fence_and_a_rejection_receipt_pass_the_point_after_their_commit() {
             .store
             .store()
             .snapshot()
+            .expect("healthy durable snapshot")
             .operations
             .contains_key(&command.recipe.operation())
     );

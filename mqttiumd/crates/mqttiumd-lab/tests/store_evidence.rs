@@ -66,7 +66,10 @@ fn a_snapshot_after_a_commit_is_the_example_of_the_corpus() {
     let mut world = World::with_limits(&memory, limits);
     let command = world.admission(1, 7, b"payload", &[world.b, world.c]);
     assert!(world.store.apply(&command).committed_now);
-    let written = snapshot(&world.store.snapshot(), CONTEXT);
+    let written = snapshot(
+        &world.store.snapshot().expect("healthy durable snapshot"),
+        CONTEXT,
+    );
     let workspace = workspace();
     accepted(&workspace, &written);
 
@@ -113,7 +116,13 @@ fn a_snapshot_after_a_commit_is_the_example_of_the_corpus() {
 fn every_snapshot_of_the_store_is_accepted() {
     let workspace = workspace();
     let empty = memory(StoreIncarnation::new(1), fixture_limits());
-    accepted(&workspace, &snapshot(&empty.snapshot(), CONTEXT));
+    accepted(
+        &workspace,
+        &snapshot(
+            &empty.snapshot().expect("healthy durable snapshot"),
+            CONTEXT,
+        ),
+    );
 
     let mut limits = fixture_limits();
     limits.references = References::new(2);
@@ -135,7 +144,7 @@ fn every_snapshot_of_the_store_is_accepted() {
             .admin(AdminCommand::DeleteSession { session: world.c })
             .is_ok()
     );
-    let state = world.store.snapshot();
+    let state = world.store.snapshot().expect("healthy durable snapshot");
     assert!(!state.fences.is_empty());
     let written = snapshot(&state, CONTEXT);
     accepted(&workspace, &written);
@@ -612,7 +621,14 @@ fn an_opening_is_written_as_submitted_then_opened_once() {
     mqttiumd_lab::store::conformance::open(bench.store.store_mut());
     let mut opening = bench.store.begin_opening(startup_nonce(7, 1));
     let command = opening
-        .submit(bench.store.store().ledger().last_opened())
+        .submit(
+            bench
+                .store
+                .store()
+                .ledger()
+                .expect("healthy durable ledger")
+                .last_opened(),
+        )
         .expect("an attempt");
     let id = WorkId::Opening(command.attempt);
     for _ in 0..2 {
@@ -679,7 +695,14 @@ fn a_submission_has_the_causes_the_caller_gives() {
     let fenced = resolve(&mut bench, 2, absent);
     let mut opening = bench.store.begin_opening(startup_nonce(7, 1));
     let open = opening
-        .submit(bench.store.store().ledger().last_opened())
+        .submit(
+            bench
+                .store
+                .store()
+                .ledger()
+                .expect("healthy durable ledger")
+                .last_opened(),
+        )
         .expect("an attempt");
     bench.store.submit_opening(open).expect("room");
     perform(&mut bench, StoreAction::EnterWriter(admitted));

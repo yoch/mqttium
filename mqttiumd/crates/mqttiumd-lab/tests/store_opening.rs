@@ -39,7 +39,7 @@ fn started() -> Sim {
 }
 
 fn ledger(sim: &Sim) -> EpochLedger {
-    sim.store().ledger()
+    sim.store().ledger().expect("healthy durable ledger")
 }
 
 /// The seed of the run, from which each start-up draws its nonce.
@@ -287,7 +287,7 @@ fn a_held_older_attempt_cannot_close_the_epoch_of_a_grant_handed_over() {
     // The newer attempt reads the same value: nothing was opened yet.
     let grant = open_and_hand_over(&mut sim, &mut opening);
     assert_eq!(grant.epoch(), RunEpoch::new(1));
-    let after_grant = sim.store().snapshot();
+    let after_grant = sim.store().snapshot().expect("healthy durable snapshot");
 
     // The older command is really delivered to the writer now.
     assert_eq!(
@@ -295,7 +295,11 @@ fn a_held_older_attempt_cannot_close_the_epoch_of_a_grant_handed_over() {
         Ok(Performed::Released)
     );
     enter(&mut sim, older);
-    assert_eq!(sim.store().snapshot(), after_grant, "the ledger moved");
+    assert_eq!(
+        sim.store().snapshot().expect("healthy durable snapshot"),
+        after_grant,
+        "the ledger moved"
+    );
     assert_eq!(ledger(&sim).open_epoch(), Some(grant.epoch()));
     assert_eq!(ledger(&sim).phase_of(grant.epoch()), EpochPhase::Open);
 
@@ -455,7 +459,7 @@ fn an_opening_the_medium_cannot_write_is_unknown_and_opens_nothing() {
 #[test]
 fn an_opening_for_another_data_set_is_refused_by_the_store() {
     let mut sim = started();
-    let before = sim.store().snapshot();
+    let before = sim.store().snapshot().expect("healthy durable snapshot");
     let foreign = OpeningRejection::ForeignIncarnation;
     let mut elsewhere = EpochOpening::new(StoreIncarnation::new(2), startup_nonce(SEED, 0));
     let id = attempt(&mut sim, &mut elsewhere);
@@ -470,14 +474,19 @@ fn an_opening_for_another_data_set_is_refused_by_the_store() {
         elsewhere.submit(RunEpoch::new(0)),
         Err(SubmitRefused::Rejected(foreign))
     );
-    assert_eq!(sim.store().snapshot(), before);
+    assert_eq!(
+        sim.store().snapshot().expect("healthy durable snapshot"),
+        before
+    );
 }
 
 #[test]
 fn an_exhausted_epoch_counter_refuses_the_opening_for_good() {
     // No sequence of commands reaches the last epoch: this state is
     // written directly, for this test only.
-    let mut durable = memory(INCARNATION, fixture_limits()).snapshot();
+    let mut durable = memory(INCARNATION, fixture_limits())
+        .snapshot()
+        .expect("healthy durable snapshot");
     let opener = OpeningAttempt {
         startup: startup_nonce(SEED, u64::MAX),
         ticket: OpeningTicket::new(1),
@@ -491,7 +500,7 @@ fn an_exhausted_epoch_counter_refuses_the_opening_for_good() {
     let grant = open_and_hand_over(&mut sim, &mut last);
     assert_eq!(grant.epoch(), RunEpoch::new(u64::MAX));
 
-    let before = sim.store().snapshot();
+    let before = sim.store().snapshot().expect("healthy durable snapshot");
     let mut opening = sim.begin_opening(startup_nonce(SEED, 1));
     let id = attempt(&mut sim, &mut opening);
     let refused = reply(&mut sim, id);
@@ -507,7 +516,10 @@ fn an_exhausted_epoch_counter_refuses_the_opening_for_good() {
         Err(SubmitRefused::Rejected(exhausted))
     );
     // Nothing moved and nothing wrapped.
-    assert_eq!(sim.store().snapshot(), before);
+    assert_eq!(
+        sim.store().snapshot().expect("healthy durable snapshot"),
+        before
+    );
 }
 
 /// After the volatile state is lost, recovery opens a new epoch and the
@@ -522,13 +534,23 @@ fn after_a_crash_a_new_epoch_is_opened_and_the_older_one_is_not_entered_again() 
     let in_transit = world.admission(2, 8, b"payload", &[world.b]);
     let mut world = world.wrap(|store| SimStore::new(store, LIMITS));
     assert!(world.store.store_mut().apply(&admitted).committed_now);
-    let durable = world.store.store().snapshot();
+    let durable = world
+        .store
+        .store()
+        .snapshot()
+        .expect("healthy durable snapshot");
 
     let crashed = world.store.crash();
     // The grant, the opening and every owner died with the process.
     // The next one starts from the durable state and from nothing else.
-    let mut sim = SimStore::new(MemoryStore::reopen(crashed.store.snapshot()), LIMITS);
-    assert_eq!(sim.store().snapshot(), durable);
+    let mut sim = SimStore::new(
+        MemoryStore::reopen(crashed.store.snapshot().expect("healthy durable snapshot")),
+        LIMITS,
+    );
+    assert_eq!(
+        sim.store().snapshot().expect("healthy durable snapshot"),
+        durable
+    );
 
     let mut opening = sim.begin_opening(startup_nonce(SEED, 1));
     let grant = open_and_hand_over(&mut sim, &mut opening);
@@ -564,14 +586,17 @@ fn after_a_crash_a_new_epoch_is_opened_and_the_older_one_is_not_entered_again() 
 
     // The command the dead process had not delivered: its epoch is
     // closed, it executes nothing.
-    let before = sim.store().snapshot();
+    let before = sim.store().snapshot().expect("healthy durable snapshot");
     let late = sim.store_mut().apply(&in_transit);
     assert_eq!(
         late.reply,
         StoreReply::Outcome(StoreOutcome::RejectedCertain(RejectReason::EpochClosed))
     );
     assert!(!late.committed_now);
-    assert_eq!(sim.store().snapshot(), before);
+    assert_eq!(
+        sim.store().snapshot().expect("healthy durable snapshot"),
+        before
+    );
 }
 
 /// The ordinary path of DEM-012, with the scenario of the review: a
@@ -590,7 +615,10 @@ fn a_restart_is_not_confused_with_the_process_that_died() {
         // writer, which the bench delivers by hand below.
         let crashed = first_process.crash();
 
-        let mut sim = SimStore::new(MemoryStore::reopen(crashed.store.snapshot()), LIMITS);
+        let mut sim = SimStore::new(
+            MemoryStore::reopen(crashed.store.snapshot().expect("healthy durable snapshot")),
+            LIMITS,
+        );
         let mut opening = sim.begin_opening(startup_nonce(SEED, 1));
         let (id, command) = submit(&mut sim, &mut opening);
         assert_eq!(command.attempt.ticket, dead_command.attempt.ticket);
@@ -605,7 +633,12 @@ fn a_restart_is_not_confused_with_the_process_that_died() {
             attempt: dead_command.attempt,
         });
         if dead_command_first {
-            assert_eq!(sim.store_mut().open_epoch(&dead_command), committed(1));
+            assert_eq!(
+                sim.store_mut()
+                    .open_epoch(&dead_command)
+                    .expect("healthy epoch read"),
+                committed(1)
+            );
             enter(&mut sim, id);
             let rejected = reply(&mut sim, id);
             assert_eq!(rejected.outcome, MOVED);
@@ -623,9 +656,17 @@ fn a_restart_is_not_confused_with_the_process_that_died() {
             take(&mut opening, own);
             let grant = opening.hand_over().expect("committed");
             assert_eq!(grant.epoch(), RunEpoch::new(1));
-            let before = sim.store().snapshot();
-            assert_eq!(sim.store_mut().open_epoch(&dead_command), MOVED);
-            assert_eq!(sim.store().snapshot(), before);
+            let before = sim.store().snapshot().expect("healthy durable snapshot");
+            assert_eq!(
+                sim.store_mut()
+                    .open_epoch(&dead_command)
+                    .expect("healthy epoch read"),
+                MOVED
+            );
+            assert_eq!(
+                sim.store().snapshot().expect("healthy durable snapshot"),
+                before
+            );
             assert_eq!(opening.observe(stray(MOVED)), refused);
         }
         let open = ledger(&sim).open_epoch().expect("an epoch is open");
@@ -649,11 +690,17 @@ fn an_opening_delivered_twice_to_the_writer_is_one_opening() {
     let mut opening = opening_for(&sim);
     let (id, command) = submit(&mut sim, &mut opening);
     enter(&mut sim, id);
-    let before = sim.store().snapshot();
+    let before = sim.store().snapshot().expect("healthy durable snapshot");
     // The second delivery, by hand: the adapter has no fault for it.
-    let again = sim.store_mut().open_epoch(&command);
+    let again = sim
+        .store_mut()
+        .open_epoch(&command)
+        .expect("healthy epoch read");
     assert_eq!(again, committed(1));
-    assert_eq!(sim.store().snapshot(), before);
+    assert_eq!(
+        sim.store().snapshot().expect("healthy durable snapshot"),
+        before
+    );
 
     let first = reply(&mut sim, id);
     assert_eq!(first.outcome, again);
@@ -778,7 +825,7 @@ fn a_restart_that_reused_the_nonce_of_the_opener_opens_nothing() {
     let mut predecessor = sim.begin_opening(reused);
     let held = open_and_hand_over(&mut sim, &mut predecessor);
     assert_eq!(held.epoch(), RunEpoch::new(1));
-    let before = sim.store().snapshot();
+    let before = sim.store().snapshot().expect("healthy durable snapshot");
 
     let mut successor = sim.begin_opening(reused);
     let (id, command) = submit(&mut sim, &mut successor);
@@ -798,7 +845,10 @@ fn a_restart_that_reused_the_nonce_of_the_opener_opens_nothing() {
         Err(SubmitRefused::Rejected(stopped))
     );
     // Nothing was written: the epoch of the first grant is still open.
-    assert_eq!(sim.store().snapshot(), before);
+    assert_eq!(
+        sim.store().snapshot().expect("healthy durable snapshot"),
+        before
+    );
     assert_eq!(ledger(&sim).open_epoch(), Some(held.epoch()));
 }
 
@@ -823,7 +873,10 @@ fn two_start_ups_with_one_nonce_and_one_condition_share_an_epoch() {
         .submit(command.after)
         .expect("an attempt may start");
     assert_eq!(again, command);
-    let outcome = sim.store_mut().open_epoch(&again);
+    let outcome = sim
+        .store_mut()
+        .open_epoch(&again)
+        .expect("healthy epoch read");
     take(
         &mut successor,
         OpeningReply {
@@ -857,7 +910,10 @@ fn a_grant_whose_epoch_the_store_reports_closed_is_never_confirmed_again() {
     let next = open_and_hand_over(&mut sim, &mut restart);
     assert_eq!(next.epoch(), RunEpoch::new(2));
 
-    let outcome = sim.store_mut().open_epoch(&command);
+    let outcome = sim
+        .store_mut()
+        .open_epoch(&command)
+        .expect("healthy epoch read");
     assert_eq!(outcome, OpeningOutcome::Superseded);
     let closed = OpeningStage::GrantSuperseded(grant.opened());
     assert_eq!(
@@ -911,7 +967,7 @@ fn an_opening_run_again_by_the_writer_leaves_no_second_commit_in_the_evidence() 
     let first = reply(&mut sim, id);
     take(&mut opening, first);
     assert_eq!(commits(&sim.take_events()), 1);
-    let before = sim.store().snapshot();
+    let before = sim.store().snapshot().expect("healthy durable snapshot");
 
     sim.arm(opening_fault(
         FaultPoint::CommitApplied,
@@ -926,7 +982,10 @@ fn an_opening_run_again_by_the_writer_leaves_no_second_commit_in_the_evidence() 
     );
     let again = reply(&mut sim, id);
     assert_eq!(again.outcome, committed(1));
-    assert_eq!(sim.store().snapshot(), before);
+    assert_eq!(
+        sim.store().snapshot().expect("healthy durable snapshot"),
+        before
+    );
     let events = sim.take_events();
     assert_eq!(commits(&events), 0, "{events:?}");
     assert!(
