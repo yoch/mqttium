@@ -13,27 +13,29 @@ close.
 
 | | |
 | - | - |
-| Base branch | `main`, after PR yoch/mqttium#647 (lot L0, with the amended record 0009) is merged |
-| Integrated revision | Not fixed yet. A commit cannot hold its own identifier: once L0 is merged, a change to this table alone records the revision of `main` that holds it |
-| Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb`. It depends on the content of the contract files only, so it is exact before the merge; the record of the revision repeats what `validate` prints on it |
+| Base branch | `main` |
+| Integrated revision | `874f298b4de7c3a13006cb1ff767dfb09e4031ac`, the merge of PR yoch/mqttium#647 (lot L0, with the amended record 0009) |
+| Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb`, as `validate` prints it on that revision |
 
-The wave starts from the commit of `main` that records the integrated
-revision. It differs from that revision by this table only. Every lot
+Every lot starts from the integrated revision. The commit that records it
+here differs from it by this file only, and changes no contract. Every lot
 names the revision it started from, and the contract digest it was
 verified against, in its report.
 
 ## Before the wave starts
 
-1. Lot L0 is received and merged into `main`.
+1. Lot L0 is received and merged into `main`. Done.
 2. Decision record 0009 (creation authority for owners and effect boxes)
    is accepted. Done, with amendments.
 3. The integrated revision and the contract digest are recorded above.
+   Done.
 
 ## Organisation
 
 One session and one branch per lot, and an integrator. The integrator
 writes no lot: it merges contract changes one at a time, keeps the shared
-files, and receives each lot on the revision actually proposed.
+files, reviews the code of each lot and receives it on the revision
+actually proposed.
 
 Each session starts with the interface the others wait for, then the
 implementations continue in parallel:
@@ -150,7 +152,10 @@ Each mission lists its criteria. For every lot:
 - each control mutation is seen to fail its test, then reverted; a
   surviving mutation is reported and closed with a test;
 - the open conditions the lot closes are removed from
-  `../reception/open-conditions.md` in the same change.
+  `../reception/open-conditions.md` in the same change;
+- the integrator reviews the code of the proposed revision. A finding is a
+  defect like any other: it is reproduced by a test that fails, then
+  fixed, and the lot is received on the revision that holds the fix.
 
 A lot is received on the revision actually proposed. If the content changes
 afterwards, the evidence it touches is run again.
