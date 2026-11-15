@@ -71,7 +71,14 @@ P1_02["assertions"] = ASSERTIONS
 P1_02B = json.loads(
     (ROOT / "contracts/examples/v1/valid/scenario-held-command-and-result.json").read_text()
 )
-P1_02B["assertions"] = ASSERTIONS
+# P1-02b runs on a live process: no crash, so the assertion about a PUBREC
+# before the crash does not apply; that knowledge never regresses does.
+P1_02B_ASSERTIONS = [
+    *ASSERTIONS[: ASSERTIONS.index("no_pubrec_observed_before_crash")],
+    "terminal_knowledge_never_regresses",
+    *ASSERTIONS[ASSERTIONS.index("no_pubrec_observed_before_crash") + 1 :],
+]
+P1_02B["assertions"] = P1_02B_ASSERTIONS
 # The same scenario with a second injection: the result of the release is
 # duplicated, and the dispatcher refuses the copy.
 P1_02_DUPLICATE = copy.deepcopy(P1_02)
@@ -998,10 +1005,10 @@ def case(
     }
     files(written)
     OUTPUTS.update(written)
+    if scenario == "p1-02b" and assertions is ASSERTIONS:
+        assertions = P1_02B_ASSERTIONS
     assertions = [*assertions, *(name for name in EVERY_RUN if name not in assertions)]
     statuses = dict.fromkeys(assertions, "PASS")
-    if base is p1_02b:
-        statuses["no_pubrec_observed_before_crash"] = "OUT_OF_SCOPE"
     statuses.update(expected or {})
     INDEX.append(
         {
@@ -1937,6 +1944,114 @@ case(
 )
 
 
+# ---------------------------------- P1-02b: terminal knowledge never regresses
+TERMINAL = "terminal_knowledge_never_regresses"
+
+
+def resolves_again(events):
+    # The late unknown answer after the commit makes the core resolve
+    # again: it went back to waiting.
+    insert_after(
+        events,
+        "unknown.delivered",
+        [
+            ev(
+                "resolve.again",
+                "store-adapter",
+                "ResolveSubmitted",
+                {"effect_id": effect(1, 12), "operation_id": OP_ADMIT},
+                ["unknown.delivered"],
+            )
+        ],
+    )
+
+
+case(
+    "late-unknown-resolved-again",
+    "DEM-MU-05: an unknown answer arriving after the commit makes the core resolve again.",
+    {TERMINAL: "FAIL"},
+    base=p1_02b,
+    scenario="p1-02b",
+    events=resolves_again,
+)
+
+
+def acknowledges_again(events):
+    insert_after(
+        events,
+        "unknown.delivered",
+        ack_out("pubrec.again", 1, 1, 12, "PUBREC", PUBREC_HEX, "unknown.delivered"),
+    )
+
+
+case(
+    "late-unknown-acknowledged-again",
+    "DEM-MU-05: an unknown answer arriving after the commit makes the core acknowledge again.",
+    {TERMINAL: "FAIL"},
+    base=p1_02b,
+    scenario="p1-02b",
+    events=acknowledges_again,
+)
+
+
+def resolves_again_later(events):
+    # Long after the commit is known, the core resolves the operation once
+    # more, from no answer in particular.
+    insert_after(
+        events,
+        "release.delivered",
+        [
+            ev(
+                "resolve.again",
+                "store-adapter",
+                "ResolveSubmitted",
+                {"effect_id": effect(1, 12), "operation_id": OP_ADMIT},
+                ["release.delivered"],
+            )
+        ],
+    )
+
+
+case(
+    "operation-resolved-again-after-its-commit",
+    "DEM-MU-05: after the commit is known, the operation is resolved again.",
+    {TERMINAL: "FAIL"},
+    base=p1_02b,
+    scenario="p1-02b",
+    events=resolves_again_later,
+)
+
+
+def unknown_before_the_commit(events):
+    # The unknown answer reaches the core while the outcome is still
+    # unknown, and the core arms a deadline on it: knowledge has not
+    # regressed, it has not yet progressed.
+    for label in ("unknown.released", "unknown.delivered.handed", "unknown.delivered"):
+        event = events.pop(at(events, label))
+        events.insert(at(events, "deadline.2"), event)
+    insert_after(
+        events,
+        "unknown.delivered",
+        [
+            ev(
+                "armed.on.unknown",
+                "timer",
+                "DeadlineArmed",
+                {"effect_id": effect(1, 13), "token": "9", "after": "30"},
+                ["unknown.delivered"],
+            )
+        ],
+    )
+
+
+case(
+    "p1-02b-good-unknown-before-the-commit",
+    "An unknown answer consumed before any terminal one may be followed: nothing regressed.",
+    base=p1_02b,
+    scenario="p1-02b",
+    events=unknown_before_the_commit,
+)
+
 # ------------------------------------------ the opening of an epoch
 GRANT = "one_grant_per_opened_epoch"
 
@@ -2517,8 +2632,12 @@ def qabs_a():
                 ["released.held_admission"],
             ),
             fault_hit("admission_applied", "store.commit.applied", "admit.stable"),
-            ready("admit.ready", 1, "Committed", "admit.stable"),
+            # At the barrier the commit is applied and no result exists:
+            # the inspection sees the commit, then the adapter leaves the
+            # barrier and the result becomes ready (LeaveBarrier).
             inspected("after_commit"),
+            released("admission_applied"),
+            ready("admit.ready", 1, "Committed", "released.admission_applied"),
             delivered("admit", 1, 1, OP_ADMIT),
             # The held fence enters the writer, reads again and writes nothing.
             released("held_fence"),

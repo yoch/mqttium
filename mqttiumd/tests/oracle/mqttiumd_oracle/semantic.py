@@ -97,7 +97,8 @@ _ACTS_ON = {
     "duplicate_result": "result",
 }
 # What a fault keeps until a step hands it over.
-_HOLDS = {"hold_command": "command", "delay_result": "result"}
+# A barrier keeps the adapter where it stopped until LeaveBarrier.
+_HOLDS = {"hold_command": "command", "delay_result": "result", "barrier": "barrier"}
 
 _NOT_YET, _HELD, _HANDED, _DESTROYED = range(4)
 _WHY_NOT = {
@@ -275,8 +276,12 @@ def _scenario(contracts, document, out):
                 )
             elif hold[0] is not None:
                 hold[1] = _HELD
-        elif kind in ("ReleaseHeldCommand", "DeliverHeldResult"):
-            wanted = "command" if kind == "ReleaseHeldCommand" else "result"
+        elif kind in ("ReleaseHeldCommand", "DeliverHeldResult", "LeaveBarrier"):
+            wanted = {
+                "ReleaseHeldCommand": "command",
+                "DeliverHeldResult": "result",
+                "LeaveBarrier": "barrier",
+            }[kind]
             hold = holds.get(step["fault"])
             if hold is None:
                 out.append(

@@ -63,9 +63,11 @@ Three steps let a scenario order a race without a crash (ADR 0001):
 | `FireDeadline` | Drives the broker, within `max_steps`, until no effect waits in an effect box; then lets the timer adapter deliver the armed deadline that is due first, and drives until the core has consumed it. Two deadlines due at the same logical time fire in the order they were armed. If no deadline is armed the step fails and the run is inconclusive: it is never a no-op. Logical time advances in no other way: a deadline never fires by itself between two steps |
 | `ReleaseHeldCommand` | Lets the command that the named fault holds enter the writer |
 | `DeliverHeldResult` | Hands the result that the named fault delays to the core, and drives, within `max_steps`, until the core has consumed it |
+| `LeaveBarrier` | Lets the adapter that the named `barrier` fault stopped leave its point. Until then it stays there, whatever the following steps are: an inspection taken before `LeaveBarrier` sees the state at the barrier |
 
-**What a fault holds.** The action `hold_command` holds a command and
-`delay_result` holds a result. Such a fault holds one item in the life of a
+**What a fault holds.** The action `hold_command` holds a command,
+`delay_result` holds a result, and `barrier` holds the adapter at its
+point. Such a fault holds one item in the life of a
 scenario:
 
 - it holds it once a `DriveUntil` step has waited for its hit, and a
@@ -78,6 +80,11 @@ scenario:
   of the run (QABS-C keeps its command held).
 
 A scenario does not wait for a fault whose `expected_hits` is 0.
+
+QABS-A inspects at the barrier of the applied commit and then leaves
+it: `after_commit` sees the commit and no result, and the result becomes
+ready only after `LeaveBarrier`. A barrier no step leaves holds the
+adapter to the end of the run (QABS-B and QABS-C end at theirs).
 
 **What a point carries.** Each injection point `carries` a command or a
 result, and offers only actions that act on it: `hold_command` on a

@@ -152,7 +152,8 @@
             "ClientSendPubrel",
             "FireDeadline",
             "ReleaseHeldCommand",
-            "DeliverHeldResult"
+            "DeliverHeldResult",
+            "LeaveBarrier"
           ]
         }
       },
@@ -621,6 +622,34 @@
               },
               "max_steps": {
                 "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "LeaveBarrier"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "fault"
+            ],
+            "properties": {
+              "kind": {
+                "const": "LeaveBarrier"
+              },
+              "fault": {
+                "$ref": "primitives.schema.json#/$defs/name"
               }
             }
           }

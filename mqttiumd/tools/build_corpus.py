@@ -619,6 +619,47 @@ HELD = scenario(
         ],
     )
 )
+# LeaveBarrier: QABS-A holds the adapter at the barrier of the applied
+# commit, inspects there, then leaves the barrier.
+QABS_A = json.loads((ROOT / "tests/scenarios/qabs/QABS-A.json").read_text())
+LEAVE = next(i for i, step in enumerate(QABS_A["steps"]) if step["kind"] == "LeaveBarrier")
+
+
+def qabs_a(edit):
+    value = copy.deepcopy(QABS_A)
+    edit(value)
+    return value
+
+
+bad(
+    "scenario-leave-of-a-held-command.json",
+    "held-item-mismatch",
+    f"/steps/{LEAVE}/fault",
+    "LeaveBarrier names a fault that holds a command, not the adapter at a barrier.",
+    qabs_a(setter(["steps", LEAVE, "fault"], "held_fence")),
+)
+bad(
+    "scenario-leave-before-the-barrier.json",
+    "step-order-invalid",
+    f"/steps/{LEAVE - 2}",
+    "LeaveBarrier comes before any step drove the broker to the barrier.",
+    qabs_a(lambda v: v["steps"].insert(LEAVE - 2, v["steps"].pop(LEAVE))),
+)
+bad(
+    "scenario-leave-twice.json",
+    "step-order-invalid",
+    f"/steps/{LEAVE + 1}",
+    "The adapter leaves a barrier once.",
+    qabs_a(lambda v: v["steps"].insert(LEAVE + 1, copy.deepcopy(v["steps"][LEAVE]))),
+)
+bad(
+    "scenario-leave-of-an-undeclared-fault.json",
+    "binding-undefined",
+    f"/steps/{LEAVE}/fault",
+    "LeaveBarrier names a fault that is not declared.",
+    qabs_a(setter(["steps", LEAVE, "fault"], "applied")),
+)
+
 RELEASE, DELIVER = 6, 11
 
 

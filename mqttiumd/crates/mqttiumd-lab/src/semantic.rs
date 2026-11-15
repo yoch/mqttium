@@ -197,11 +197,13 @@ fn acts_on(action: &str) -> Option<Option<&'static str>> {
 }
 
 /// What a fault keeps until a step hands it over, if its action holds
-/// anything.
+/// anything. A barrier keeps the adapter where it stopped until
+/// `LeaveBarrier`.
 fn held_item(action: &str) -> Option<&'static str> {
     match action {
         "hold_command" => Some("command"),
         "delay_result" => Some("result"),
+        "barrier" => Some("barrier"),
         _ => None,
     }
 }
@@ -439,9 +441,10 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
                     }
                 }
             }
-            "ReleaseHeldCommand" | "DeliverHeldResult" => {
+            "ReleaseHeldCommand" | "DeliverHeldResult" | "LeaveBarrier" => {
                 let wanted = match kind {
                     "ReleaseHeldCommand" => "command",
+                    "LeaveBarrier" => "barrier",
                     _ => "result",
                 };
                 let name = text(step, "fault");

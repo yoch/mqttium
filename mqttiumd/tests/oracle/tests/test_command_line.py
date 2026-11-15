@@ -36,7 +36,8 @@ class CommandLine(unittest.TestCase):
             ("obligation-destination-changed", "p1-02", "FAIL", 1),
             ("trace-cut-before-footer", "p1-02", "INCONCLUSIVE", 2),
             ("fault-hit-twice", "p1-02", "INCONCLUSIVE", 2),
-            ("p1-02b-good", "p1-02b", "OUT_OF_SCOPE", 3),
+            ("p1-02b-good", "p1-02b", "PASS", 0),
+            ("core-without-bytes-against-the-full-scenario", "p1-02", "OUT_OF_SCOPE", 3),
         ]:
             with self.subTest(trace):
                 found, output = self.judge(trace, scenario)

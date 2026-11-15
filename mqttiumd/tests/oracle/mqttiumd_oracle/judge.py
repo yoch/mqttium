@@ -1106,6 +1106,47 @@ def refusal_carries_the_reason_of_its_rejection(run):
     return Status(_worst(statuses), reasons)
 
 
+def terminal_knowledge_never_regresses(run):
+    """Knowledge of an operation never goes back (record 0001, step 6; DEM-MU-05).
+
+    Once the core consumed a terminal result of an operation, a later
+    unknown result of it changes nothing: no record follows from it as
+    its cause, and the operation is never resolved again.
+    """
+    trace = run.trace
+    followers = {}
+    for record in trace.records:
+        for parent in record.parents:
+            followers.setdefault(parent, []).append(record)
+    reasons = []
+    for origin in sorted(
+        {record.origin for record in trace.records if record.origin[0] == "broker-core"}
+    ):
+        terminal = {}
+        for record in trace.records:
+            if record.origin != origin or record.kind != "StoreResultDelivered":
+                continue
+            operation = _key(record.payload["operation_id"])
+            if record.payload["outcome"] in ("Committed", "RejectedCertain"):
+                terminal.setdefault(operation, record)
+            elif record.payload["outcome"] == "PendingOrUnknown" and operation in terminal:
+                for follower in followers.get(record.key, []):
+                    reasons.append(
+                        f"record {follower.sequence} ({follower.kind}) follows from the unknown "
+                        f"answer of record {record.sequence}, after the terminal one of record "
+                        f"{terminal[operation].sequence}"
+                    )
+        for record in trace.of_kind("ResolveSubmitted"):
+            operation = _key(record.payload["operation_id"])
+            known = terminal.get(operation)
+            if known is not None and record.origin[1] == origin[1] and trace.before(known, record):
+                reasons.append(
+                    f"record {record.sequence}: {operation} is resolved again after the "
+                    f"terminal result of record {known.sequence}"
+                )
+    return Status(FAIL if reasons else PASS, reasons)
+
+
 def one_grant_per_opened_epoch(run):
     """At most one creation authority per opened epoch (DEM-012, record 0011).
 
@@ -1163,6 +1204,7 @@ ASSERTIONS = {
     "no_pubrec_observed_before_crash": no_pubrec_observed_before_crash,
     "broker_inputs_have_provenance": broker_inputs_have_provenance,
     "one_grant_per_opened_epoch": one_grant_per_opened_epoch,
+    "terminal_knowledge_never_regresses": terminal_knowledge_never_regresses,
     "all_required_faults_hit": all_required_faults_hit,
     "trace_complete": trace_complete,
 }

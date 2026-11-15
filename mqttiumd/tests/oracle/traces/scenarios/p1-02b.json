@@ -150,7 +150,7 @@
     "same_required_obligations_at_both_checkpoints",
     "same_recipe_for_op_A",
     "no_positive_ack_before_confirmed_commit",
-    "no_pubrec_observed_before_crash",
+    "terminal_knowledge_never_regresses",
     "broker_inputs_have_provenance",
     "all_required_faults_hit",
     "trace_complete"

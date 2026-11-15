@@ -43,7 +43,7 @@
         "same_required_obligations_at_both_checkpoints": "PASS",
         "same_recipe_for_op_A": "PASS",
         "no_positive_ack_before_confirmed_commit": "PASS",
-        "no_pubrec_observed_before_crash": "OUT_OF_SCOPE",
+        "terminal_knowledge_never_regresses": "PASS",
         "broker_inputs_have_provenance": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
@@ -1038,6 +1038,74 @@
       "why": "K1: the adapter hands over a result that no result of the store precedes."
     },
     {
+      "name": "late-unknown-resolved-again",
+      "scenario": "tests/oracle/traces/scenarios/p1-02b.json",
+      "trace": "tests/oracle/traces/late-unknown-resolved-again/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "terminal_knowledge_never_regresses": "FAIL",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS"
+      },
+      "why": "DEM-MU-05: an unknown answer arriving after the commit makes the core resolve again."
+    },
+    {
+      "name": "late-unknown-acknowledged-again",
+      "scenario": "tests/oracle/traces/scenarios/p1-02b.json",
+      "trace": "tests/oracle/traces/late-unknown-acknowledged-again/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "terminal_knowledge_never_regresses": "FAIL",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS"
+      },
+      "why": "DEM-MU-05: an unknown answer arriving after the commit makes the core acknowledge again."
+    },
+    {
+      "name": "operation-resolved-again-after-its-commit",
+      "scenario": "tests/oracle/traces/scenarios/p1-02b.json",
+      "trace": "tests/oracle/traces/operation-resolved-again-after-its-commit/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "terminal_knowledge_never_regresses": "FAIL",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS"
+      },
+      "why": "DEM-MU-05: after the commit is known, the operation is resolved again."
+    },
+    {
+      "name": "p1-02b-good-unknown-before-the-commit",
+      "scenario": "tests/oracle/traces/scenarios/p1-02b.json",
+      "trace": "tests/oracle/traces/p1-02b-good-unknown-before-the-commit/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "terminal_knowledge_never_regresses": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS"
+      },
+      "why": "An unknown answer consumed before any terminal one may be followed: nothing regressed."
+    },
+    {
       "name": "epoch-granted-twice",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/epoch-granted-twice/trace.jsonl",
@@ -1165,7 +1233,7 @@
         "same_required_obligations_at_both_checkpoints": "PASS",
         "same_recipe_for_op_A": "PASS",
         "no_positive_ack_before_confirmed_commit": "PASS",
-        "no_pubrec_observed_before_crash": "OUT_OF_SCOPE",
+        "terminal_knowledge_never_regresses": "PASS",
         "broker_inputs_have_provenance": "FAIL",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
