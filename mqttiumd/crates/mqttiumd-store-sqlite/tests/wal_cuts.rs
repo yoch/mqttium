@@ -148,6 +148,11 @@ fn every_cut_of_the_wal_of_a_commit_recovers_before_or_after_it() {
     if let Some(directory) = &artifact_directory {
         std::fs::write(directory.join("reference-before.db"), &database).expect("base image");
         std::fs::write(directory.join("target-transaction.wal"), &wal).expect("associated WAL");
+        std::fs::write(
+            directory.join("target-command.txt"),
+            format!("{admission:#?}\n"),
+        )
+        .expect("exact target command");
         for (name, state) in [("before", &before), ("after", &after)] {
             std::fs::write(
                 directory.join(format!("{name}.durable-state.txt")),
@@ -214,7 +219,7 @@ fn every_cut_of_the_wal_of_a_commit_recovers_before_or_after_it() {
             "cut_bytes": cut.to_string(), "recovered": result,
             "quick_check": "ok (required by SqliteStore::open)",
             "accounts_match": true, "full_state_matches_reference": true,
-            "frame_boundary": cut >= WAL_HEADER && (cut - WAL_HEADER) % frame == 0,
+            "frame_boundary": cut >= WAL_HEADER && (cut - WAL_HEADER).is_multiple_of(frame),
             "new_epoch_opened": false,
         }));
     }
