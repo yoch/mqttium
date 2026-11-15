@@ -31,6 +31,96 @@ use mqttiumd_contract::packet::Qos;
 /// fact is built within this budget.
 pub const MAX_CLIENT_ID_BYTES: usize = 65_535;
 
+/// Stable causes of a failed durable read. A failure establishes neither
+/// absence nor a rejection and never authorises executing an uncertain command.
+/// Driver details and offending durable values are deliberately not carried.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadError {
+    InvalidData,
+    LimitExceeded,
+    Unavailable,
+    Io,
+    AllocationFailed,
+}
+
+impl ReadError {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidData => "InvalidData",
+            Self::LimitExceeded => "LimitExceeded",
+            Self::Unavailable => "Unavailable",
+            Self::Io => "Io",
+            Self::AllocationFailed => "AllocationFailed",
+        }
+    }
+}
+
+/// The read whose result was unavailable, including failures before Started.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadPhase {
+    Open,
+    Ledger,
+    Opening,
+    Snapshot,
+    Inspect,
+    Recovery,
+}
+
+impl ReadPhase {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Ledger => "Ledger",
+            Self::Opening => "Opening",
+            Self::Snapshot => "Snapshot",
+            Self::Inspect => "Inspect",
+            Self::Recovery => "Recovery",
+        }
+    }
+}
+
+/// Independent limits on rows, copied field bytes and aggregate logical bytes.
+/// Checks precede application-owned copies; field-specific limits still apply.
+/// These bound the reader's work, not SQLite's internal page cache or allocator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReadBudget {
+    pub max_rows: usize,
+    pub max_bytes: usize,
+    pub max_field_bytes: usize,
+}
+
+impl ReadBudget {
+    pub const SNAPSHOT: Self = Self {
+        max_rows: 65_536,
+        max_bytes: 32 * 1024 * 1024,
+        max_field_bytes: 8 * 1024 * 1024,
+    };
+
+    pub const PAGE: Self = Self {
+        max_rows: 4_096,
+        max_bytes: 1024 * 1024,
+        max_field_bytes: 1024 * 1024,
+    };
+
+    pub fn check_field(self, bytes: usize) -> Result<(), ReadError> {
+        if bytes > self.max_field_bytes || bytes > self.max_bytes {
+            Err(ReadError::LimitExceeded)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn check_totals(self, rows: usize, bytes: usize) -> Result<(), ReadError> {
+        if rows > self.max_rows || bytes > self.max_bytes {
+            Err(ReadError::LimitExceeded)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// The durable limits of a data set, fixed when it is created.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Limits {
@@ -298,10 +388,20 @@ pub enum RecoveryRefused {
     FrontierMoved,
     /// A page of zero facts makes no progress.
     EmptyPage,
-    /// A page, or a fact on it, could not be built within its budget.
-    /// Nothing is said about the facts after it: the inventory is not
-    /// complete, and it is not presented as complete.
-    AllocationFailed,
+    /// The inventory remains incomplete. The exact durable-read cause is
+    /// preserved; a size refusal is not an allocation failure.
+    Read(ReadError),
+}
+
+impl RecoveryRefused {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::FrontierMoved => "FrontierMoved",
+            Self::EmptyPage => "EmptyPage",
+            Self::Read(error) => error.code(),
+        }
+    }
 }
 
 /// The writer of a store. Each method is one step in the single order
@@ -309,13 +409,13 @@ pub enum RecoveryRefused {
 pub trait DurableStore {
     /// The incarnation of the data set and the last epoch opened in it:
     /// what start-up reads before it opens anything.
-    fn ledger(&self) -> EpochLedger;
+    fn ledger(&self) -> Result<EpochLedger, ReadError>;
 
     /// Opens the epoch after the one the command expects and closes
     /// every older one, atomically, or changes nothing. The command
     /// that opened the last epoch, presented again, gets the same
     /// commit; see `EpochLedger::open` for every other case.
-    fn open_epoch(&mut self, command: &OpenEpoch) -> OpeningOutcome;
+    fn open_epoch(&mut self, command: &OpenEpoch) -> Result<OpeningOutcome, ReadError>;
 
     /// Applies a frozen command.
     fn apply(&mut self, command: &Command) -> Applied;
@@ -323,7 +423,7 @@ pub trait DurableStore {
     /// What is established about `operation`, read and nothing written:
     /// `None` when it is absent from a space that can still execute, the
     /// case in which `resolve_and_fence` would write a fence.
-    fn established(&self, operation: OperationId) -> Option<StoreOutcome>;
+    fn established(&self, operation: OperationId) -> Result<Option<StoreOutcome>, ReadError>;
 
     /// Reports what is established about `operation`. When it is absent
     /// from a space that can still execute, a durable fence is
@@ -340,10 +440,23 @@ pub trait DurableStore {
         &self,
         cursor: Option<RecoveryCursor>,
         limit: usize,
+    ) -> Result<RecoveryPage, RecoveryRefused> {
+        self.recover_with_budget(cursor, limit, ReadBudget::PAGE)
+    }
+
+    fn recover_with_budget(
+        &self,
+        cursor: Option<RecoveryCursor>,
+        limit: usize,
+        budget: ReadBudget,
     ) -> Result<RecoveryPage, RecoveryRefused>;
 
     /// The durable state, for inspection.
-    fn snapshot(&self) -> DurableState;
+    fn snapshot(&self) -> Result<DurableState, ReadError> {
+        self.snapshot_with_budget(ReadBudget::SNAPSHOT)
+    }
+
+    fn snapshot_with_budget(&self, budget: ReadBudget) -> Result<DurableState, ReadError>;
 }
 
 /// Whether the durable medium accepts writes. Controlled by the bench:
