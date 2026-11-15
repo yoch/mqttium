@@ -416,3 +416,29 @@ fn the_recovery_order_cases_hold_for_the_contract() {
         assert_eq!(Value::Array(found), case["refused"], "{}", case["name"]);
     }
 }
+
+/// A `.json` file of the schema directory that is not a schema is refused
+/// when the contracts are opened, as the oracle refuses it: it would be
+/// hashed into the contract digest and never read as a rule.
+#[test]
+fn a_file_of_the_schema_directory_that_is_not_a_schema_is_refused() {
+    let base = std::env::temp_dir().join(format!("mqttiumd-l3-schema-dir-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    for directory in ["contracts/v1", "contracts/schema/v1"] {
+        fs::create_dir_all(base.join(directory)).expect("directory");
+        for entry in fs::read_dir(root().join(directory)).expect("listing") {
+            let entry = entry.expect("entry");
+            if entry.path().is_file() {
+                fs::copy(entry.path(), base.join(directory).join(entry.file_name())).expect("copy");
+            }
+        }
+    }
+    assert!(Workspace::open(&base, Path::new("contracts/v1")).is_ok());
+    fs::write(base.join("contracts/schema/v1/notes.json"), b"{}\n").expect("write");
+    let refused = Workspace::open(&base, Path::new("contracts/v1"));
+    let _ = fs::remove_dir_all(&base);
+    let diagnostic = refused
+        .err()
+        .expect("a foreign file in the schema directory is refused");
+    assert_eq!(diagnostic.code, code::SCHEMA_NOT_LOCAL, "{diagnostic:?}");
+}

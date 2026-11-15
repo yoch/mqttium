@@ -88,6 +88,15 @@ class Bounds(unittest.TestCase):
                 Contracts.open(directory)
             self.assertNotIn("profiles.json", reads)
 
+    def test_a_file_of_the_schema_directory_that_is_not_a_schema_is_refused(self):
+        # As the Rust reader refuses it: hashed, it would never be read as a rule.
+        with tempfile.TemporaryDirectory() as directory:
+            shutil.copytree(ROOT / "contracts", f"{directory}/contracts")
+            with open(f"{directory}/contracts/schema/v1/notes.json", "wb") as stream:
+                stream.write(b'{"$schema": "https://json-schema.org/draft/2020-12/schema"}\n')
+            with self.assertRaises(ContractsUnreadable):
+                Contracts.open(directory)
+
 
 if __name__ == "__main__":
     unittest.main()
