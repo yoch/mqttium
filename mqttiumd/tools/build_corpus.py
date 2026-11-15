@@ -632,6 +632,13 @@ def qabs_a(edit):
 
 
 bad(
+    "scenario-fence-fault-of-a-command-nobody-selected.json",
+    "fault-match-invalid",
+    "/faults/1/match",
+    "A fence fault names the resolved operation by its command, which an earlier fault must select.",
+    qabs_a(setter(["faults", 1, "match", "command_kind"], "ReleaseInbound")),
+)
+bad(
     "scenario-leave-of-a-held-command.json",
     "held-item-mismatch",
     f"/steps/{LEAVE}/fault",

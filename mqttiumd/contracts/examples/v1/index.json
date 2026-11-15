@@ -413,6 +413,12 @@
       "why": "A scenario requires a known perimeter."
     },
     {
+      "file": "contracts/examples/v1/invalid/scenario-fence-fault-of-a-command-nobody-selected.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/1/match",
+      "why": "A fence fault names the resolved operation by its command, which an earlier fault must select."
+    },
+    {
       "file": "contracts/examples/v1/invalid/scenario-leave-of-a-held-command.json",
       "code": "held-item-mismatch",
       "pointer": "/steps/8/fault",
