@@ -196,6 +196,11 @@ pub struct Collector {
     sequences: BTreeMap<(Origin, u64), u64>,
     refusals: Vec<Refusal>,
     closed: bool,
+    /// The last record of each origin of the process under test, and the
+    /// last record of each origin outside it: what the supervisor and the
+    /// peers had read when they acted.
+    last_in_process: BTreeMap<Origin, Cause>,
+    last_outside: BTreeMap<Origin, Cause>,
 }
 
 impl Collector {
@@ -213,6 +218,8 @@ impl Collector {
             sequences: BTreeMap::new(),
             refusals: Vec::new(),
             closed: false,
+            last_in_process: BTreeMap::new(),
+            last_outside: BTreeMap::new(),
         }
     }
 
@@ -278,8 +285,25 @@ impl Collector {
         let incarnation = self.incarnation(channel);
         let sequence = self.next_sequence(channel);
         let record_sequence = self.count;
+        // The supervisor and the peers name what they had read when they
+        // acted: the last record of each origin of the process under test,
+        // and the last record of the other origin outside it. They never name a record
+        // that was not written before. The order of records of one origin
+        // is the order of that origin already.
+        let mut parents = parents.to_vec();
+        if !channel.in_process() && kind != "TraceHeader" && kind != "TraceFooter" {
+            if channel == Origin::BenchSupervisor {
+                parents.extend(self.last_in_process.values().copied());
+            }
+            parents.extend(
+                self.last_outside
+                    .iter()
+                    .filter(|(origin, _)| **origin != channel)
+                    .map(|(_, cause)| *cause),
+            );
+        }
         let mut unique: Vec<Value> = Vec::new();
-        for parent in parents {
+        for parent in &parents {
             let parent = parent.to_json();
             if !unique.contains(&parent) {
                 unique.push(parent);
@@ -310,11 +334,17 @@ impl Collector {
         self.lines.extend_from_slice(&line);
         self.count += 1;
         self.sequences.insert((channel, incarnation), sequence + 1);
-        Ok(Cause {
+        let cause = Cause {
             origin: channel,
             incarnation,
             sequence,
-        })
+        };
+        if channel.in_process() {
+            self.last_in_process.insert(channel, cause);
+        } else if kind != "TraceHeader" && kind != "TraceFooter" {
+            self.last_outside.insert(channel, cause);
+        }
+        Ok(cause)
     }
 
     /// Writes a record that the component of `channel` states.
@@ -474,6 +504,91 @@ mod tests {
             collector.accept(Origin::FaultInjector, &ahead),
             Err(Refusal::OutOfSequence { .. })
         ));
+    }
+
+    fn loop_kinds() -> KindTable {
+        let rule = |kind: &str, origin: &str| {
+            json!({"if": {"properties": {"kind": {"const": kind}}},
+                   "then": {"properties": {"origin_component": {"enum": [origin]}}}})
+        };
+        KindTable::from_schema(&json!({"allOf": [
+            rule("StoreCommitStable", "store-evidence"),
+            rule("FaultHit", "fault-injector"),
+            rule("PeerPacketSent", "peer"),
+            rule("PeerConnectionClosed", "peer"),
+            rule("BrokerCrashed", "bench-supervisor"),
+            rule("TraceHeader", "bench-supervisor"),
+            rule("TraceFooter", "bench-supervisor"),
+        ]}))
+        .expect("a table")
+    }
+
+    fn parents_of(trace: &[u8], kind: &str) -> Vec<(String, String)> {
+        let text = std::str::from_utf8(trace).unwrap();
+        let record: serde_json::Value = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|record| record["kind"] == kind)
+            .unwrap();
+        record["causal_parents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|parent| {
+                (
+                    parent["origin_component"].as_str().unwrap().to_owned(),
+                    parent["origin_sequence"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_supervisor_names_what_it_had_read_and_a_peer_names_no_record_of_the_child() {
+        let mut collector = Collector::new("run", loop_kinds(), 1 << 20);
+        let commit = collector
+            .emit(Origin::StoreEvidence, "StoreCommitStable", &[], json!({}))
+            .unwrap();
+        collector
+            .emit(Origin::FaultInjector, "FaultHit", &[], json!({}))
+            .unwrap();
+        collector
+            .emit(Origin::FaultInjector, "FaultHit", &[], json!({}))
+            .unwrap();
+        let closed = collector
+            .emit(Origin::Peer, "PeerPacketSent", &[], json!({}))
+            .unwrap();
+        collector
+            .emit(Origin::BenchSupervisor, "BrokerCrashed", &[], json!({}))
+            .unwrap();
+        collector
+            .emit(Origin::Peer, "PeerConnectionClosed", &[commit], json!({}))
+            .unwrap();
+        let (trace, refusals) = collector.finish(true);
+        assert!(refusals.is_empty());
+        // The last record of each origin of the child, not only the last
+        // record of the child: the order of arrival between two origins
+        // is not a causality. And the last record of the peer.
+        let mut crashed = parents_of(&trace, "BrokerCrashed");
+        crashed.sort();
+        assert_eq!(
+            crashed,
+            [
+                ("fault-injector".to_owned(), "1".to_owned()),
+                ("peer".to_owned(), closed.sequence.to_string()),
+                ("store-evidence".to_owned(), "0".to_owned()),
+            ]
+        );
+        // A peer names the supervisor record it acted on, and the parents
+        // of its own action; it adds no record of the child.
+        assert_eq!(
+            parents_of(&trace, "PeerConnectionClosed"),
+            [
+                ("store-evidence".to_owned(), "0".to_owned()),
+                ("bench-supervisor".to_owned(), "0".to_owned()),
+            ]
+        );
+        assert!(parents_of(&trace, "PeerPacketSent").is_empty());
     }
 
     #[test]
