@@ -1140,6 +1140,40 @@
       "why": "An unknown answer consumed before any terminal one may be followed: nothing regressed."
     },
     {
+      "name": "command-submitted-that-the-core-did-not-emit",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/command-submitted-that-the-core-did-not-emit/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS"
+      },
+      "why": "K1: the adapter submits a command that no record of the core causes."
+    },
+    {
+      "name": "resolution-submitted-that-the-core-did-not-emit",
+      "scenario": "tests/oracle/traces/scenarios/p1-02b.json",
+      "trace": "tests/oracle/traces/resolution-submitted-that-the-core-did-not-emit/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "terminal_knowledge_never_regresses": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS"
+      },
+      "why": "K1: the adapter submits a resolution caused by the bench, not by the core."
+    },
+    {
       "name": "epoch-granted-twice",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/epoch-granted-twice/trace.jsonl",

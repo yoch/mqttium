@@ -2073,6 +2073,34 @@ case(
     events=unknown_before_the_commit,
 )
 
+
+def submitted_from_nothing(events):
+    # The adapter submits the release with no record of the core as its
+    # cause: nothing shows the core emitted that effect.
+    events[at(events, "release.submitted")]["parents"] = []
+
+
+case(
+    "command-submitted-that-the-core-did-not-emit",
+    "K1: the adapter submits a command that no record of the core causes.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=submitted_from_nothing,
+)
+
+
+def resolved_from_the_bench(events):
+    events[at(events, "resolve.2")]["parents"] = ["header"]
+
+
+case(
+    "resolution-submitted-that-the-core-did-not-emit",
+    "K1: the adapter submits a resolution caused by the bench, not by the core.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    base=p1_02b,
+    scenario="p1-02b",
+    events=resolved_from_the_bench,
+)
+
 # ------------------------------------------ the opening of an epoch
 GRANT = "one_grant_per_opened_epoch"
 
