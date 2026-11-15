@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bench;
 pub mod diagnostic;
 pub mod files;
 pub mod manifest;
