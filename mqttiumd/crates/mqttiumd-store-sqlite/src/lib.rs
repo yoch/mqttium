@@ -46,6 +46,7 @@
 #![forbid(unsafe_code)]
 
 mod codec;
+mod reader;
 mod schema;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -74,9 +75,10 @@ use mqttiumd_contract::outcome::{
 use mqttiumd_contract::packet::{Qos, SharedBytes};
 use mqttiumd_store_api::{
     Accounts, AdminCommand, AdminDone, AdminRefused, Applied, Decision, Durability, DurableState,
-    DurableStore, InboundRecord, Limits, MAX_CLIENT_ID_BYTES, ObligationRecord, OperationRecord,
-    PayloadRecord, PublicationRecord, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved,
-    RouteTarget, SessionRecord, SessionState,
+    DurableStore, InboundRecord, Limits, MAX_CLIENT_ID_BYTES, MAX_RECOVERY_INVENTORY_ROWS,
+    ObligationRecord, OperationRecord, PayloadRecord, PublicationRecord, ReadBudget, ReadError,
+    RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved, RouteTarget, SessionRecord,
+    SessionState,
 };
 
 use codec::{
@@ -169,6 +171,8 @@ pub enum OpenError {
     SchemaVersion(i64),
     /// The file names another format, or a durable value does not decode.
     Corrupt,
+    /// A bounded semantic read refused the file without exposing its value.
+    Read(ReadError),
     /// `PRAGMA quick_check` found the file damaged; its first lines.
     Integrity(String),
     /// A setting read back is not the one that was set.
@@ -183,6 +187,25 @@ pub enum OpenError {
     /// The lock file could not be opened, or the lock could not be asked
     /// for (not that it is held: that is `WriterAlive`).
     WriterLock(std::io::Error),
+}
+
+impl OpenError {
+    /// Stable behaviour code, without parsing driver text or copying a value.
+    #[must_use]
+    pub fn read_error(&self) -> ReadError {
+        match self {
+            Self::Read(error) => *error,
+            Self::Sql(error) => reader::sql_error(error),
+            Self::WriterAlive => ReadError::Unavailable,
+            Self::WriterLock(error) => match error.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+                    ReadError::Unavailable
+                }
+                _ => ReadError::Io,
+            },
+            _ => ReadError::InvalidData,
+        }
+    }
 }
 
 impl From<rusqlite::Error> for OpenError {
@@ -203,6 +226,23 @@ impl From<Corrupt> for OpenError {
 enum Fault {
     Sql(rusqlite::Error),
     Corrupt,
+    Read(ReadError),
+}
+
+impl Fault {
+    fn read_error(&self) -> ReadError {
+        match self {
+            Self::Sql(error) => reader::sql_error(error),
+            Self::Corrupt => ReadError::InvalidData,
+            Self::Read(error) => *error,
+        }
+    }
+}
+
+impl From<ReadError> for Fault {
+    fn from(error: ReadError) -> Self {
+        Self::Read(error)
+    }
 }
 
 impl From<rusqlite::Error> for Fault {
@@ -268,14 +308,14 @@ type Guard<T> = Result<T, Abort<RejectReason>>;
 /// Builds one recovered fact from a row; an inner error is a fact that
 /// cannot be built within its budget, in its place.
 type BuildFact<'a> =
-    dyn Fn(&rusqlite::Row<'_>) -> Result<Result<RecoveredFact, RecoveryRefused>, Fault> + 'a;
+    dyn FnMut(&rusqlite::Row<'_>) -> Result<Result<RecoveredFact, RecoveryRefused>, Fault> + 'a;
 
 fn refused<T>(reason: RejectReason) -> Guard<T> {
     Err(Abort::Refused(reason))
 }
 
 fn blob(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Vec<u8>> {
-    row.get(index)
+    reader::copy_blob(row, index, ReadBudget::SNAPSHOT.max_field_bytes)
 }
 
 fn read_meta(conn: &Connection) -> Result<Meta, Fault> {
@@ -288,18 +328,19 @@ fn read_meta(conn: &Connection) -> Result<Meta, Fault> {
                 used_payload_bytes, used_references, used_exchange_slots, used_receipt_slots
            FROM meta WHERE one = 1",
     )?;
-    let row = statement.query_row([], |row| {
-        let mut blobs = Vec::with_capacity(20);
-        for index in 1..21 {
-            if index == 3 {
-                blobs.push(row.get::<_, Option<Vec<u8>>>(index)?.unwrap_or_default());
-            } else {
-                blobs.push(blob(row, index)?);
-            }
+    let mut rows = statement.query([])?;
+    let row = rows.next()?.ok_or(Fault::Corrupt)?;
+    let format = match row.get_ref(0)? {
+        rusqlite::types::ValueRef::Text(bytes) if bytes == FORMAT.as_bytes() => FORMAT,
+        _ => return Err(Fault::Corrupt),
+    };
+    let mut b: [&[u8]; 20] = [&[]; 20];
+    for index in 1..21 {
+        if index == 3 && matches!(row.get_ref(index)?, rusqlite::types::ValueRef::Null) {
+            continue;
         }
-        Ok((row.get::<_, String>(0)?, blobs))
-    })?;
-    let (format, b) = row;
+        b[index - 1] = reader::borrow_blob(row, index, if index == 3 { 24 } else { 8 })?;
+    }
     if format != FORMAT {
         return Err(Fault::Corrupt);
     }
@@ -428,8 +469,8 @@ enum Established {
 fn decision_of(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<DecisionColumns> {
     Ok(DecisionColumns {
         decision: row.get(first)?,
-        publication: row.get(first + 1)?,
-        exchange: row.get(first + 2)?,
+        publication: reader::optional_blob(row, first + 1, 32)?,
+        exchange: reader::optional_blob(row, first + 2, 16)?,
         reason: row.get(first + 3)?,
         resource: row.get(first + 4)?,
     })
@@ -941,7 +982,7 @@ fn stage_admin(
                     if targets.len() > meta.limits.max_route_targets {
                         return Err(Abort::Fault);
                     }
-                    targets.push((blob(row, 0)?, blob_u64(&blob(row, 1)?)?));
+                    targets.push((blob(row, 0)?, blob_u64(reader::borrow_blob(row, 1, 8)?)?));
                 }
             }
             let target = session.to_be_bytes();
@@ -1173,20 +1214,29 @@ fn quick_check(conn: &Connection) -> Result<Vec<String>, OpenError> {
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             if report.len() < 8 {
-                report.push(row.get::<_, String>(0)?);
+                let value = row.get_ref(0)?;
+                let ok = matches!(value, rusqlite::types::ValueRef::Text(bytes) if bytes == b"ok");
+                report.push(
+                    if ok {
+                        "ok"
+                    } else {
+                        "SQLite integrity check rejected the image"
+                    }
+                    .to_owned(),
+                );
             }
         }
         Ok(report)
     };
     match run() {
         Ok(report) => Ok(report),
-        Err(error @ rusqlite::Error::SqliteFailure(failure, _))
+        Err(rusqlite::Error::SqliteFailure(failure, _))
             if matches!(
                 failure.code,
                 rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
             ) =>
         {
-            Ok(vec![error.to_string()])
+            Ok(vec!["SQLite integrity check rejected the image".to_owned()])
         }
         Err(error) => Err(OpenError::Sql(error)),
     }
@@ -1197,8 +1247,6 @@ pub struct SqliteStore {
     conn: Connection,
     settings: Settings,
     durability: Durability,
-    /// The ledger as of the last transaction; refreshed after each one.
-    ledger: EpochLedger,
     /// The writer's lock, held while the store lives. Declared last: the
     /// fields drop in order, so the connection is closed, and its last
     /// checkpoint done, before another writer can take the lock.
@@ -1214,7 +1262,7 @@ impl std::fmt::Debug for SqliteStore {
         f.debug_struct("SqliteStore")
             .field("settings", &self.settings)
             .field("durability", &self.durability)
-            .field("ledger", &self.ledger)
+            .field("ledger", &"decoded on each read")
             .finish_non_exhaustive()
     }
 }
@@ -1267,7 +1315,7 @@ impl SqliteStore {
     /// its durable values are decoded.
     pub fn open(path: &Path) -> Result<Self, OpenError> {
         if !path.exists() {
-            return Err(OpenError::Corrupt);
+            return Err(OpenError::Read(ReadError::Unavailable));
         }
         let lock = writer_lock(path)?;
         let conn = connect(path)?;
@@ -1288,24 +1336,30 @@ impl SqliteStore {
     /// and the connection is closed, before this returns: the inspector
     /// holds nothing that would keep the writer's checkpoint back. It does
     /// not take the writer's lock, and reads while a writer lives.
-    pub fn inspect(path: &Path) -> Result<DurableState, OpenError> {
-        if !path.exists() {
-            return Err(OpenError::Corrupt);
-        }
+    pub fn inspect(path: &Path) -> Result<DurableState, ReadError> {
+        Self::inspect_with_budget(path, ReadBudget::SNAPSHOT)
+    }
+
+    /// Bounded inspection uses the same frozen read and budget as the writer.
+    pub fn inspect_with_budget(path: &Path, budget: ReadBudget) -> Result<DurableState, ReadError> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        // A reader may wait briefly for the writer's index of the WAL.
-        conn.busy_timeout(std::time::Duration::from_secs(1))?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        )
+        .map_err(|error| reader::sql_error(&error))?;
+        conn.busy_timeout(std::time::Duration::from_secs(1))
+            .map_err(|error| reader::sql_error(&error))?;
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|error| reader::sql_error(&error))?;
         if version != SCHEMA_VERSION {
-            return Err(OpenError::SchemaVersion(version));
+            return Err(ReadError::InvalidData);
         }
-        let read = conn.unchecked_transaction()?;
-        let state = read_snapshot(&read).map_err(|_| OpenError::Corrupt)?;
-        read.commit()?;
-        drop(conn);
+        let read = conn
+            .unchecked_transaction()
+            .map_err(|error| reader::sql_error(&error))?;
+        let state = read_snapshot(&read, budget).map_err(|fault| fault.read_error())?;
+        read.commit().map_err(|error| reader::sql_error(&error))?;
         Ok(state)
     }
 
@@ -1320,12 +1374,11 @@ impl SqliteStore {
         if settings.user_version != SCHEMA_VERSION {
             return Err(OpenError::SchemaVersion(settings.user_version));
         }
-        let meta = read_meta(&conn).map_err(|_| OpenError::Corrupt)?;
+        read_meta(&conn).map_err(|fault| OpenError::Read(fault.read_error()))?;
         Ok(Self {
             conn,
             settings,
             durability: Durability::Available,
-            ledger: meta.ledger,
             #[cfg(feature = "kill-points")]
             kill_hook: kill_points::Shared::default(),
             #[cfg(feature = "kill-points")]
@@ -1334,13 +1387,9 @@ impl SqliteStore {
         })
     }
 
-    /// The durable state, or why it could not be read: a value that does
-    /// not decode is `OpenError::Corrupt`, as for `inspect`.
-    pub fn try_snapshot(&self) -> Result<DurableState, OpenError> {
-        self.read_snapshot().map_err(|fault| match fault {
-            Fault::Corrupt => OpenError::Corrupt,
-            Fault::Sql(error) => OpenError::Sql(error),
-        })
+    /// The durable state, with a stable read cause rather than a panic.
+    pub fn try_snapshot(&self) -> Result<DurableState, ReadError> {
+        self.snapshot()
     }
 
     /// Sets the function the store calls at each kill point, or removes it.
@@ -1470,10 +1519,6 @@ impl SqliteStore {
             tx.commit().map_err(|_| None)?;
             Ok(Ok(value))
         })();
-        // What is durable now, whatever happened.
-        if let Ok(meta) = read_meta(&self.conn) {
-            self.ledger = meta.ledger;
-        }
         match result {
             Ok(Ok(value)) => Txn::Committed(value),
             Ok(Err(refusal)) => Txn::Refused(refusal),
@@ -1500,34 +1545,59 @@ impl SqliteStore {
         }
     }
 
-    fn read_ledger(&self) -> EpochLedger {
-        read_meta(&self.conn).map_or(self.ledger, |meta| meta.ledger)
+    fn read_ledger(&self) -> Result<EpochLedger, ReadError> {
+        read_meta(&self.conn)
+            .map(|meta| meta.ledger)
+            .map_err(|fault| fault.read_error())
     }
 
     /// The recovery inventory from `start`, at most `count` facts, in the
     /// order of record 0014, each section read with its own bounded query.
     fn inventory(
-        &self,
+        conn: &Connection,
         meta: &Meta,
         start: usize,
         count: usize,
-    ) -> Result<Vec<Result<RecoveredFact, RecoveryRefused>>, Fault> {
+        budget: ReadBudget,
+    ) -> Result<(Vec<Result<RecoveredFact, RecoveryRefused>>, bool), Fault> {
+        let mut total_rows = 3usize;
+        for table in ["routes", "sessions", "inbound", "operations", "fences"] {
+            let count: i64 = conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM (SELECT 1 FROM {table} LIMIT {})",
+                    MAX_RECOVERY_INVENTORY_ROWS + 1
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            total_rows = total_rows
+                .checked_add(usize::try_from(count).map_err(|_| Fault::Corrupt)?)
+                .ok_or(ReadError::LimitExceeded)?;
+            if total_rows > MAX_RECOVERY_INVENTORY_ROWS {
+                return Err(Fault::Read(ReadError::LimitExceeded));
+            }
+        }
         let mut out = Vec::new();
+        out.try_reserve_exact(count)
+            .map_err(|_| ReadError::AllocationFailed)?;
+        let mut meter = reader::Meter::new(budget);
         let mut position = 0usize;
         let wanted = |out: &mut Vec<_>, position: &mut usize| {
             let take = *position >= start && out.len() < count;
-            *position = position.saturating_add(1);
-            take
+            *position = position.checked_add(1).ok_or(ReadError::LimitExceeded)?;
+            Ok::<bool, ReadError>(take)
         };
-        let refused = |_| RecoveryRefused::AllocationFailed;
+        let refused = |_| RecoveryRefused::Read(ReadError::LimitExceeded);
         let incarnation = meta.ledger.incarnation();
         let open = meta.ledger.open_epoch();
         if let Some(epoch) = open
-            && wanted(&mut out, &mut position)
+            && wanted(&mut out, &mut position)?
         {
+            meter.charge(128)?;
             out.push(Ok(RecoveredFact::Epoch { incarnation, epoch }));
         }
-        if wanted(&mut out, &mut position) {
+        if wanted(&mut out, &mut position)? {
+            meter.charge(128)?;
             let bound = |value: usize| u32::try_from(value).map_err(refused);
             out.push((|| {
                 Ok(RecoveredFact::Limits {
@@ -1539,7 +1609,8 @@ impl SqliteStore {
                 })
             })());
         }
-        if wanted(&mut out, &mut position) {
+        if wanted(&mut out, &mut position)? {
+            meter.charge(128)?;
             out.push(Ok(RecoveredFact::RouteTable {
                 revision: meta.route_revision,
             }));
@@ -1550,13 +1621,15 @@ impl SqliteStore {
         let section = |sql: &str,
                        out: &mut Vec<_>,
                        position: &mut usize,
-                       build: &BuildFact<'_>|
+                       build: &mut BuildFact<'_>|
          -> Result<(), Fault> {
             let skip = start.saturating_sub(*position);
             let room = count.saturating_sub(out.len());
-            let total: i64 = self
-                .conn
-                .prepare_cached(&format!("SELECT count(*) FROM ({sql})"))?
+            let total: i64 = conn
+                .prepare_cached(&format!(
+                    "SELECT count(*) FROM ({sql} LIMIT {})",
+                    MAX_RECOVERY_INVENTORY_ROWS + 1
+                ))?
                 .query_row(
                     params![
                         active,
@@ -1566,10 +1639,11 @@ impl SqliteStore {
                     |row| row.get(0),
                 )?;
             let total = usize::try_from(total).map_err(|_| Fault::Corrupt)?;
+            if total > MAX_RECOVERY_INVENTORY_ROWS {
+                return Err(Fault::Read(ReadError::LimitExceeded));
+            }
             if room > 0 && skip < total {
-                let mut statement = self
-                    .conn
-                    .prepare_cached(&format!("{sql} LIMIT ?3 OFFSET ?4"))?;
+                let mut statement = conn.prepare_cached(&format!("{sql} LIMIT ?3 OFFSET ?4"))?;
                 let limit = i64::try_from(room).map_err(|_| Fault::Corrupt)?;
                 let offset = i64::try_from(skip).map_err(|_| Fault::Corrupt)?;
                 let mut rows = statement.query(params![
@@ -1583,7 +1657,12 @@ impl SqliteStore {
                     out.push(build(row)?);
                 }
             }
-            *position = position.saturating_add(total);
+            *position = position
+                .checked_add(total)
+                .ok_or(ReadError::LimitExceeded)?;
+            if *position > MAX_RECOVERY_INVENTORY_ROWS {
+                return Err(Fault::Read(ReadError::LimitExceeded));
+            }
             Ok(())
         };
         // ?1 is the code of an active session and ?2 the open epoch, in
@@ -1594,18 +1673,25 @@ impl SqliteStore {
               WHERE ?1 = ?1 AND ?2 = ?2 ORDER BY r.topic, r.position",
             &mut out,
             &mut position,
-            &|row| {
-                let topic = blob(row, 0)?;
-                let target =
-                    SessionId::from_be_slice(&blob(row, 1)?).map_err(|_| Fault::Corrupt)?;
+            &mut |row| {
+                let topic =
+                    reader::borrow_blob(row, 0, max_topic_bytes.min(budget.max_field_bytes))?;
+                budget.check_field(topic.len())?;
+                meter.charge(
+                    128usize
+                        .checked_add(topic.len())
+                        .ok_or(ReadError::LimitExceeded)?,
+                )?;
+                let target = SessionId::from_be_slice(reader::borrow_blob(row, 1, 8)?)
+                    .map_err(|_| Fault::Corrupt)?;
                 let max_qos = code_qos(row.get(2)?)?;
-                let revision: Option<Vec<u8>> = row.get(3)?;
+                let revision = reader::optional_blob(row, 3, 8)?;
                 let state: Option<i64> = row.get(4)?;
                 let Some(revision) = revision.filter(|_| state == Some(active)) else {
-                    return Ok(Err(RecoveryRefused::AllocationFailed));
+                    return Ok(Err(RecoveryRefused::Read(ReadError::InvalidData)));
                 };
-                let Ok(topic) = SharedBytes::copy_from(&topic, max_topic_bytes) else {
-                    return Ok(Err(RecoveryRefused::AllocationFailed));
+                let Ok(topic) = SharedBytes::copy_from(topic, max_topic_bytes) else {
+                    return Ok(Err(RecoveryRefused::Read(ReadError::LimitExceeded)));
                 };
                 Ok(Ok(RecoveredFact::Route {
                     topic,
@@ -1619,17 +1705,24 @@ impl SqliteStore {
             "SELECT id, client_id, revision FROM sessions WHERE state = ?1 AND ?2 = ?2 ORDER BY id",
             &mut out,
             &mut position,
-            &|row| {
-                let session =
-                    SessionId::from_be_slice(&blob(row, 0)?).map_err(|_| Fault::Corrupt)?;
-                let Ok(client_id) = SharedBytes::copy_from(&blob(row, 1)?, MAX_CLIENT_ID_BYTES)
-                else {
-                    return Ok(Err(RecoveryRefused::AllocationFailed));
+            &mut |row| {
+                let session = SessionId::from_be_slice(reader::borrow_blob(row, 0, 8)?)
+                    .map_err(|_| Fault::Corrupt)?;
+                let bytes =
+                    reader::borrow_blob(row, 1, MAX_CLIENT_ID_BYTES.min(budget.max_field_bytes))?;
+                budget.check_field(bytes.len())?;
+                meter.charge(
+                    128usize
+                        .checked_add(bytes.len())
+                        .ok_or(ReadError::LimitExceeded)?,
+                )?;
+                let Ok(client_id) = SharedBytes::copy_from(bytes, MAX_CLIENT_ID_BYTES) else {
+                    return Ok(Err(RecoveryRefused::Read(ReadError::LimitExceeded)));
                 };
                 Ok(Ok(RecoveredFact::Session {
                     session,
                     client_id,
-                    revision: Revision::new(blob_u64(&blob(row, 2)?)?),
+                    revision: Revision::new(blob_u64(reader::borrow_blob(row, 2, 8)?)?),
                 }))
             },
         )?;
@@ -1638,16 +1731,17 @@ impl SqliteStore {
               WHERE ?1 = ?1 AND ?2 = ?2 ORDER BY session, packet_id",
             &mut out,
             &mut position,
-            &|row| {
+            &mut |row| {
+                meter.charge(128)?;
                 let packet: i64 = row.get(0)?;
                 let packet_id = u16::try_from(packet)
                     .ok()
                     .and_then(InboundPacketId::new)
                     .ok_or(Fault::Corrupt)?;
                 Ok(Ok(RecoveredFact::InboundExchange {
-                    exchange: blob_exchange(&blob(row, 1)?)?,
+                    exchange: blob_exchange(reader::borrow_blob(row, 1, 16)?)?,
                     packet_id,
-                    publication: PublicationId::from_be_slice(&blob(row, 2)?)
+                    publication: PublicationId::from_be_slice(reader::borrow_blob(row, 2, 32)?)
                         .map_err(|_| Fault::Corrupt)?,
                     phase: code_inbound_phase(row.get(3)?)?,
                 }))
@@ -1660,9 +1754,10 @@ impl SqliteStore {
               WHERE ?1 = ?1 AND substr(id, 9, 8) != ?2 ORDER BY id",
             &mut out,
             &mut position,
-            &|row| {
-                let operation =
-                    OperationId::from_be_slice(&blob(row, 0)?).map_err(|_| Fault::Corrupt)?;
+            &mut |row| {
+                meter.charge(128)?;
+                let operation = OperationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
+                    .map_err(|_| Fault::Corrupt)?;
                 let knowledge = match decision_of(row, 1)?.decode()? {
                     Decision::Committed(facts) => Knowledge::Committed(facts),
                     Decision::Rejected(reason) => Knowledge::RejectedCertain(reason),
@@ -1677,23 +1772,30 @@ impl SqliteStore {
             "SELECT id FROM fences WHERE ?1 = ?1 AND substr(id, 9, 8) != ?2 ORDER BY id",
             &mut out,
             &mut position,
-            &|row| {
-                let operation =
-                    OperationId::from_be_slice(&blob(row, 0)?).map_err(|_| Fault::Corrupt)?;
+            &mut |row| {
+                meter.charge(128)?;
+                let operation = OperationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
+                    .map_err(|_| Fault::Corrupt)?;
                 Ok(Ok(RecoveredFact::Operation {
                     operation,
                     knowledge: Knowledge::RejectedCertain(RejectReason::Fenced),
                 }))
             },
         )?;
-        Ok(out)
+        if start > position {
+            return Err(Fault::Corrupt);
+        }
+        let consumed = start
+            .checked_add(out.len())
+            .ok_or(ReadError::LimitExceeded)?;
+        Ok((out, position > consumed))
     }
 
-    fn read_snapshot(&self) -> Result<DurableState, Fault> {
+    fn read_snapshot(&self, budget: ReadBudget) -> Result<DurableState, Fault> {
         // One read transaction for the whole state, even on the writer's
         // own connection: a state read in several snapshots is a trap.
         let read = self.conn.unchecked_transaction()?;
-        let state = read_snapshot(&read)?;
+        let state = read_snapshot(&read, budget)?;
         read.commit()?;
         Ok(state)
     }
@@ -1701,9 +1803,10 @@ impl SqliteStore {
 
 /// Every table of the file, decoded, as one `DurableState`. The caller
 /// holds the read transaction.
-fn read_snapshot(conn: &Connection) -> Result<DurableState, Fault> {
+fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, Fault> {
     {
         let meta = read_meta(conn)?;
+        reader::snapshot(conn, &meta, budget)?;
         let mut sessions = BTreeMap::new();
         {
             let mut statement =
@@ -1711,10 +1814,11 @@ fn read_snapshot(conn: &Connection) -> Result<DurableState, Fault> {
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 sessions.insert(
-                    SessionId::from_be_slice(&blob(row, 0)?).map_err(|_| Fault::Corrupt)?,
+                    SessionId::from_be_slice(reader::borrow_blob(row, 0, 8)?)
+                        .map_err(|_| Fault::Corrupt)?,
                     SessionRecord {
                         client_id: blob(row, 1)?,
-                        revision: Revision::new(blob_u64(&blob(row, 2)?)?),
+                        revision: Revision::new(blob_u64(reader::borrow_blob(row, 2, 8)?)?),
                         state: code_session_state(row.get(3)?)?,
                     },
                 );
@@ -1727,7 +1831,7 @@ fn read_snapshot(conn: &Connection) -> Result<DurableState, Fault> {
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 routes.entry(blob(row, 0)?).or_default().push(RouteTarget {
-                    session: SessionId::from_be_slice(&blob(row, 1)?)
+                    session: SessionId::from_be_slice(reader::borrow_blob(row, 1, 8)?)
                         .map_err(|_| Fault::Corrupt)?,
                     qos: code_qos(row.get(2)?)?,
                 });
@@ -1741,7 +1845,8 @@ fn read_snapshot(conn: &Connection) -> Result<DurableState, Fault> {
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 operations.insert(
-                    OperationId::from_be_slice(&blob(row, 0)?).map_err(|_| Fault::Corrupt)?,
+                    OperationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
+                        .map_err(|_| Fault::Corrupt)?,
                     OperationRecord {
                         recipe: blob(row, 1)?,
                         decision: decision_of(row, 2)?.decode()?,
@@ -1755,7 +1860,8 @@ fn read_snapshot(conn: &Connection) -> Result<DurableState, Fault> {
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 fences.insert(
-                    OperationId::from_be_slice(&blob(row, 0)?).map_err(|_| Fault::Corrupt)?,
+                    OperationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
+                        .map_err(|_| Fault::Corrupt)?,
                 );
             }
         }
@@ -1767,16 +1873,17 @@ fn read_snapshot(conn: &Connection) -> Result<DurableState, Fault> {
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 publications.insert(
-                    PublicationId::from_be_slice(&blob(row, 0)?).map_err(|_| Fault::Corrupt)?,
+                    PublicationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
+                        .map_err(|_| Fault::Corrupt)?,
                     PublicationRecord {
-                        operation: OperationId::from_be_slice(&blob(row, 1)?)
+                        operation: OperationId::from_be_slice(reader::borrow_blob(row, 1, 32)?)
                             .map_err(|_| Fault::Corrupt)?,
-                        source: SessionId::from_be_slice(&blob(row, 2)?)
+                        source: SessionId::from_be_slice(reader::borrow_blob(row, 2, 8)?)
                             .map_err(|_| Fault::Corrupt)?,
                         topic: blob(row, 3)?,
                         qos: code_qos(row.get(4)?)?,
                         retain: row.get::<_, i64>(5)? == 1,
-                        payload: PayloadId::from_be_slice(&blob(row, 6)?)
+                        payload: PayloadId::from_be_slice(reader::borrow_blob(row, 6, 32)?)
                             .map_err(|_| Fault::Corrupt)?,
                     },
                 );
@@ -1788,10 +1895,11 @@ fn read_snapshot(conn: &Connection) -> Result<DurableState, Fault> {
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 payloads.insert(
-                    PayloadId::from_be_slice(&blob(row, 0)?).map_err(|_| Fault::Corrupt)?,
+                    PayloadId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
+                        .map_err(|_| Fault::Corrupt)?,
                     PayloadRecord {
                         bytes: blob(row, 1)?,
-                        references: blob_u64(&blob(row, 2)?)?,
+                        references: blob_u64(reader::borrow_blob(row, 2, 8)?)?,
                     },
                 );
             }
@@ -1806,14 +1914,14 @@ fn read_snapshot(conn: &Connection) -> Result<DurableState, Fault> {
                 let index: i64 = row.get(1)?;
                 obligations.insert(
                     DeliveryId {
-                        publication: PublicationId::from_be_slice(&blob(row, 0)?)
+                        publication: PublicationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
                             .map_err(|_| Fault::Corrupt)?,
                         index: u32::try_from(index).map_err(|_| Fault::Corrupt)?,
                     },
                     ObligationRecord {
-                        target: SessionId::from_be_slice(&blob(row, 2)?)
+                        target: SessionId::from_be_slice(reader::borrow_blob(row, 2, 8)?)
                             .map_err(|_| Fault::Corrupt)?,
-                        target_revision: Revision::new(blob_u64(&blob(row, 3)?)?),
+                        target_revision: Revision::new(blob_u64(reader::borrow_blob(row, 3, 8)?)?),
                         qos: code_qos(row.get(4)?)?,
                         cause: code_cause(row.get(5)?)?,
                         phase: code_obligation_phase(row.get(6)?)?,
@@ -1830,15 +1938,16 @@ fn read_snapshot(conn: &Connection) -> Result<DurableState, Fault> {
                 let packet: i64 = row.get(1)?;
                 inbound.insert(
                     (
-                        SessionId::from_be_slice(&blob(row, 0)?).map_err(|_| Fault::Corrupt)?,
+                        SessionId::from_be_slice(reader::borrow_blob(row, 0, 8)?)
+                            .map_err(|_| Fault::Corrupt)?,
                         u16::try_from(packet)
                             .ok()
                             .and_then(InboundPacketId::new)
                             .ok_or(Fault::Corrupt)?,
                     ),
                     InboundRecord {
-                        exchange: blob_exchange(&blob(row, 2)?)?,
-                        publication: PublicationId::from_be_slice(&blob(row, 3)?)
+                        exchange: blob_exchange(reader::borrow_blob(row, 2, 16)?)?,
+                        publication: PublicationId::from_be_slice(reader::borrow_blob(row, 3, 32)?)
                             .map_err(|_| Fault::Corrupt)?,
                         phase: code_inbound_phase(row.get(4)?)?,
                     },
@@ -1866,20 +1975,20 @@ fn read_snapshot(conn: &Connection) -> Result<DurableState, Fault> {
 }
 
 impl DurableStore for SqliteStore {
-    fn ledger(&self) -> EpochLedger {
+    fn ledger(&self) -> Result<EpochLedger, ReadError> {
         self.read_ledger()
     }
 
-    fn open_epoch(&mut self, command: &OpenEpoch) -> OpeningOutcome {
+    fn open_epoch(&mut self, command: &OpenEpoch) -> Result<OpeningOutcome, ReadError> {
         // The decision is the contract's; only an opening writes.
-        if let LedgerOpening::Opens { ledger } = self.read_ledger().open(command) {
+        if let LedgerOpening::Opens { ledger } = self.read_ledger()?.open(command) {
             let _written = self.transact(|_, meta| {
                 meta.ledger = ledger;
                 Ok::<(), Abort<()>>(())
             });
         }
         // The answer comes from what is durable now.
-        OpeningOutcome::read(&self.read_ledger(), command)
+        Ok(OpeningOutcome::read(&self.read_ledger()?, command))
     }
 
     fn apply(&mut self, command: &Command) -> Applied {
@@ -1972,16 +2081,11 @@ impl DurableStore for SqliteStore {
         }
     }
 
-    fn established(&self, operation: OperationId) -> Option<StoreOutcome> {
-        let Ok(meta) = read_meta(&self.conn) else {
-            // Nothing could be read: absence is not established, and no
-            // fence may be written on it.
-            return Some(StoreOutcome::PendingOrUnknown);
-        };
-        match established(&self.conn, &meta, operation) {
-            Ok(Established::Outcome(outcome)) => Some(outcome),
-            Ok(Established::Absent(_)) => None,
-            Err(_) => Some(StoreOutcome::PendingOrUnknown),
+    fn established(&self, operation: OperationId) -> Result<Option<StoreOutcome>, ReadError> {
+        let meta = read_meta(&self.conn).map_err(|fault| fault.read_error())?;
+        match established(&self.conn, &meta, operation).map_err(|fault| fault.read_error())? {
+            Established::Outcome(outcome) => Ok(Some(outcome)),
+            Established::Absent(_) => Ok(None),
         }
     }
 
@@ -2022,15 +2126,25 @@ impl DurableStore for SqliteStore {
         }
     }
 
-    fn recover(
+    fn recover_with_budget(
         &self,
         cursor: Option<RecoveryCursor>,
         limit: usize,
+        budget: ReadBudget,
     ) -> Result<RecoveryPage, RecoveryRefused> {
+        let refused = RecoveryRefused::Read;
         if limit == 0 {
             return Err(RecoveryRefused::EmptyPage);
         }
-        let meta = read_meta(&self.conn).map_err(|_| RecoveryRefused::AllocationFailed)?;
+        let minimum = limit
+            .checked_mul(128)
+            .ok_or_else(|| refused(ReadError::LimitExceeded))?;
+        budget.check_totals(limit, minimum).map_err(refused)?;
+        let read = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| refused(reader::sql_error(&error)))?;
+        let meta = read_meta(&read).map_err(|fault| refused(fault.read_error()))?;
         let revision = meta.revision;
         let start = match cursor {
             Some(cursor) if cursor.revision() != revision => {
@@ -2039,39 +2153,30 @@ impl DurableStore for SqliteStore {
             Some(cursor) => cursor.position(),
             None => 0,
         };
-        let mut facts =
-            BoundedVec::with_capacity(limit).map_err(|_| RecoveryRefused::AllocationFailed)?;
-        // One more than the page, to know whether a next page exists.
-        let wanted = limit
-            .checked_add(1)
-            .ok_or(RecoveryRefused::AllocationFailed)?;
-        let read = self
-            .inventory(&meta, start, wanted)
-            .map_err(|_| RecoveryRefused::AllocationFailed)?;
-        let mut read = read.into_iter();
-        let mut position = start;
-        while !facts.is_full() {
-            let Some(fact) = read.next() else {
-                return Ok(RecoveryPage { facts, next: None });
-            };
-            if facts.try_push(fact?).is_err() {
-                return Err(RecoveryRefused::AllocationFailed);
-            }
-            position = position
-                .checked_add(1)
-                .ok_or(RecoveryRefused::AllocationFailed)?;
+        if start > MAX_RECOVERY_INVENTORY_ROWS {
+            return Err(refused(ReadError::LimitExceeded));
         }
-        let next = read
-            .next()
-            .is_some()
-            .then(|| RecoveryCursor::new(revision, position));
+        let mut facts =
+            BoundedVec::with_capacity(limit).map_err(|_| refused(ReadError::AllocationFailed))?;
+        let (inventory, more) = Self::inventory(&read, &meta, start, limit, budget)
+            .map_err(|fault| refused(fault.read_error()))?;
+        let count = inventory.len();
+        for fact in inventory {
+            facts
+                .try_push(fact?)
+                .map_err(|_| refused(ReadError::LimitExceeded))?;
+        }
+        let position = start
+            .checked_add(count)
+            .ok_or_else(|| refused(ReadError::LimitExceeded))?;
+        let next = more.then(|| RecoveryCursor::new(revision, position));
+        read.commit()
+            .map_err(|error| refused(reader::sql_error(&error)))?;
         Ok(RecoveryPage { facts, next })
     }
 
-    fn snapshot(&self) -> DurableState {
-        // The interface has no error here. A caller that must not stop on
-        // a value that does not decode calls `try_snapshot` or `inspect`.
-        self.try_snapshot()
-            .expect("the durable state of the SQLite store decodes")
+    fn snapshot_with_budget(&self, budget: ReadBudget) -> Result<DurableState, ReadError> {
+        self.read_snapshot(budget)
+            .map_err(|fault| fault.read_error())
     }
 }

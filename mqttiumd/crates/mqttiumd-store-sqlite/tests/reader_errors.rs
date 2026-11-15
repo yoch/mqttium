@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mqttiumd_lab::store::conformance::World;
-use mqttiumd_store_api::{DurableStore, MAX_CLIENT_ID_BYTES, RecoveryRefused};
+use mqttiumd_store_api::{DurableStore, MAX_CLIENT_ID_BYTES, ReadError, RecoveryRefused};
 use mqttiumd_store_sqlite::SqliteStore;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -40,20 +40,36 @@ fn an_invalid_route_never_panics_or_claims_an_allocation_failure() {
     change(&path, "UPDATE routes SET qos = 99");
     let store = SqliteStore::open(&path).expect("physical opening succeeds");
     let snapshot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.snapshot()));
-    assert!(snapshot.is_ok(), "an invalid durable route must be a typed read refusal, not a panic");
-    assert_ne!(store.recover(None, 64), Err(RecoveryRefused::AllocationFailed),
-        "invalid durable data is not an allocation failure");
+    assert_eq!(
+        snapshot.expect("a read refusal must not panic"),
+        Err(ReadError::InvalidData)
+    );
+    assert_eq!(store.try_snapshot(), Err(ReadError::InvalidData));
+    assert_eq!(SqliteStore::inspect(&path), Err(ReadError::InvalidData));
+    assert_eq!(
+        store.recover(None, 64),
+        Err(RecoveryRefused::Read(ReadError::InvalidData)),
+        "invalid durable data is not an allocation failure"
+    );
 }
 
 #[test]
 fn an_oversized_client_id_is_refused_before_a_snapshot_is_materialised() {
     let path = fixture("oversized-client");
-    change(&path, &format!(
-        "UPDATE sessions SET client_id = zeroblob({})", MAX_CLIENT_ID_BYTES + 1
-    ));
+    change(
+        &path,
+        &format!(
+            "UPDATE sessions SET client_id = zeroblob({})",
+            MAX_CLIENT_ID_BYTES + 1
+        ),
+    );
     let store = SqliteStore::open(&path).expect("physical opening succeeds");
-    assert!(store.try_snapshot().is_err(),
-        "a snapshot must enforce MAX_CLIENT_ID_BYTES before copying the field");
+    assert_eq!(store.try_snapshot(), Err(ReadError::LimitExceeded));
+    assert_eq!(SqliteStore::inspect(&path), Err(ReadError::LimitExceeded));
+    assert_eq!(
+        store.recover(None, 64),
+        Err(RecoveryRefused::Read(ReadError::LimitExceeded))
+    );
 }
 
 #[test]
@@ -64,16 +80,29 @@ fn an_invalid_next_page_does_not_replace_the_first_valid_page() {
     // Epoch, limits, route-table header fit in the first page. The route
     // on the following page is invalid; lookahead may not decode it early.
     let first = store.recover(None, 3);
-    assert!(first.is_ok(), "the valid first page must remain observable: {first:?}");
+    assert!(
+        first.is_ok(),
+        "the valid first page must remain observable: {first:?}"
+    );
     let first = first.expect("checked");
     assert_eq!(first.facts.len(), 3);
-    assert!(first.next.is_some(), "the failed route belongs to a later page");
+    assert!(
+        first.next.is_some(),
+        "the failed route belongs to a later page"
+    );
+    assert_eq!(
+        store.recover(first.next, 3),
+        Err(RecoveryRefused::Read(ReadError::InvalidData))
+    );
 }
 
 #[test]
 fn an_unreasonable_page_request_is_a_limit_not_an_allocation_failure() {
     let path = fixture("oversized-page");
     let store = SqliteStore::open(&path).expect("healthy store opens");
-    assert_ne!(store.recover(None, usize::MAX), Err(RecoveryRefused::AllocationFailed),
-        "an invalid requested bound must be refused before any reservation");
+    assert_eq!(
+        store.recover(None, usize::MAX),
+        Err(RecoveryRefused::Read(ReadError::LimitExceeded)),
+        "an invalid requested bound must be refused before any reservation"
+    );
 }

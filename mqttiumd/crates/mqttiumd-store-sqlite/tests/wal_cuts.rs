@@ -83,7 +83,7 @@ fn every_cut_of_the_wal_of_a_commit_recovers_before_or_after_it() {
         exchange(&mut world, n);
         exchange(&mut reference, n);
     }
-    let before = reference.store.snapshot();
+    let before = reference.store.snapshot().expect("healthy snapshot");
     assert_eq!(world.store.try_snapshot().expect("decodes"), before);
     // Everything so far into the database, and the WAL reset: the WAL
     // will then hold the admission alone.
@@ -103,7 +103,7 @@ fn every_cut_of_the_wal_of_a_commit_recovers_before_or_after_it() {
     let admission = world.admission(8, 4, b"cut payload", &[world.b, world.c]);
     assert!(world.store.apply(&admission).committed_now);
     assert!(reference.store.apply(&admission).committed_now);
-    let after = reference.store.snapshot();
+    let after = reference.store.snapshot().expect("healthy snapshot");
     let wal = std::fs::read(with_suffix(&path, "-wal")).expect("the WAL");
     let page = u64::try_from(world.store.effective_settings().page_size).expect("positive");
     let frame = FRAME_HEADER + page;

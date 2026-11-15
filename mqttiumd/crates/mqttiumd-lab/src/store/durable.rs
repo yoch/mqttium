@@ -135,6 +135,230 @@ enum Established {
     Absent(EpochPhase),
 }
 
+/// A raw inventory reference never allocates its dynamic fields.
+enum FactRef<'a> {
+    Epoch(StoreIncarnation, RunEpoch),
+    Limits,
+    Table,
+    Route(&'a [u8], &'a RouteTarget),
+    Session(SessionId, &'a SessionRecord),
+    Inbound(mqttiumd_contract::ids::InboundPacketId, &'a InboundRecord),
+    Operation(OperationId, &'a OperationRecord),
+    Fence(OperationId),
+}
+
+struct ReadMeter {
+    budget: ReadBudget,
+    rows: usize,
+    bytes: usize,
+}
+impl ReadMeter {
+    fn new(budget: ReadBudget) -> Self {
+        Self {
+            budget,
+            rows: 0,
+            bytes: 0,
+        }
+    }
+    fn charge(&mut self, bytes: usize) -> Result<(), ReadError> {
+        self.rows = self.rows.checked_add(1).ok_or(ReadError::LimitExceeded)?;
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(ReadError::LimitExceeded)?;
+        self.budget.check_totals(self.rows, self.bytes)
+    }
+    fn field(&self, bytes: usize, maximum: usize) -> Result<(), ReadError> {
+        if bytes > maximum {
+            return Err(ReadError::LimitExceeded);
+        }
+        self.budget.check_field(bytes)
+    }
+}
+
+impl FactRef<'_> {
+    fn build(
+        self,
+        state: &DurableState,
+        meter: &mut ReadMeter,
+    ) -> Result<RecoveredFact, ReadError> {
+        let dynamic = match self {
+            Self::Route(topic, _) => topic.len(),
+            Self::Session(_, record) => record.client_id.len(),
+            _ => 0,
+        };
+        meter.charge(
+            128usize
+                .checked_add(dynamic)
+                .ok_or(ReadError::LimitExceeded)?,
+        )?;
+        Ok(match self {
+            Self::Epoch(incarnation, epoch) => RecoveredFact::Epoch { incarnation, epoch },
+            Self::Limits => RecoveredFact::Limits {
+                max_targets_per_admission: u32::try_from(state.limits.max_targets_per_admission)
+                    .map_err(|_| ReadError::LimitExceeded)?,
+                max_topic_bytes: u32::try_from(state.limits.max_topic_bytes)
+                    .map_err(|_| ReadError::LimitExceeded)?,
+                max_payload_bytes: PayloadBytes::new(
+                    u64::try_from(state.limits.max_payload_bytes)
+                        .map_err(|_| ReadError::LimitExceeded)?,
+                ),
+            },
+            Self::Table => RecoveredFact::RouteTable {
+                revision: state.route_revision,
+            },
+            Self::Route(topic, target) => {
+                meter.field(topic.len(), state.limits.max_topic_bytes)?;
+                let session = state
+                    .sessions
+                    .get(&target.session)
+                    .filter(|record| record.state == SessionState::Active)
+                    .ok_or(ReadError::InvalidData)?;
+                RecoveredFact::Route {
+                    topic: SharedBytes::copy_from(topic, state.limits.max_topic_bytes)
+                        .map_err(|_| ReadError::LimitExceeded)?,
+                    target: target.session,
+                    target_revision: session.revision,
+                    max_qos: target.qos,
+                }
+            }
+            Self::Session(session, record) => {
+                meter.field(record.client_id.len(), MAX_CLIENT_ID_BYTES)?;
+                RecoveredFact::Session {
+                    session,
+                    client_id: SharedBytes::copy_from(&record.client_id, MAX_CLIENT_ID_BYTES)
+                        .map_err(|_| ReadError::LimitExceeded)?,
+                    revision: record.revision,
+                }
+            }
+            Self::Inbound(packet_id, marker) => RecoveredFact::InboundExchange {
+                exchange: marker.exchange,
+                packet_id,
+                publication: marker.publication,
+                phase: marker.phase,
+            },
+            Self::Operation(operation, record) => RecoveredFact::Operation {
+                operation,
+                knowledge: match record.decision {
+                    Decision::Committed(facts) => Knowledge::Committed(facts),
+                    Decision::Rejected(reason) => Knowledge::RejectedCertain(reason),
+                },
+            },
+            Self::Fence(operation) => RecoveredFact::Operation {
+                operation,
+                knowledge: Knowledge::RejectedCertain(RejectReason::Fenced),
+            },
+        })
+    }
+}
+
+fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
+    let mut rows = 3usize;
+    for size in [
+        state.routes.len(),
+        state.sessions.len(),
+        state.inbound.len(),
+        state.operations.len(),
+        state.fences.len(),
+    ] {
+        if size > MAX_RECOVERY_INVENTORY_ROWS {
+            return Err(ReadError::LimitExceeded);
+        }
+    }
+    for size in [
+        state.sessions.len(),
+        state.inbound.len(),
+        state.operations.len(),
+        state.fences.len(),
+    ] {
+        rows = rows.checked_add(size).ok_or(ReadError::LimitExceeded)?;
+    }
+    for targets in state.routes.values() {
+        rows = rows
+            .checked_add(targets.len())
+            .ok_or(ReadError::LimitExceeded)?;
+        if rows > MAX_RECOVERY_INVENTORY_ROWS {
+            return Err(ReadError::LimitExceeded);
+        }
+    }
+    if rows > MAX_RECOVERY_INVENTORY_ROWS {
+        Err(ReadError::LimitExceeded)
+    } else {
+        Ok(())
+    }
+}
+
+fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadError> {
+    let mut meter = ReadMeter::new(budget);
+    budget.check_field(8)?;
+    meter.charge(256)?;
+    for record in state.sessions.values() {
+        meter.field(record.client_id.len(), MAX_CLIENT_ID_BYTES)?;
+        meter.charge(
+            152usize
+                .checked_add(record.client_id.len())
+                .ok_or(ReadError::LimitExceeded)?,
+        )?;
+    }
+    for (topic, targets) in &state.routes {
+        meter.field(topic.len(), state.limits.max_topic_bytes)?;
+        for _ in targets {
+            meter.charge(
+                144usize
+                    .checked_add(topic.len())
+                    .ok_or(ReadError::LimitExceeded)?,
+            )?;
+        }
+    }
+    for record in state.operations.values() {
+        meter.field(32, 32)?;
+        meter.field(record.recipe.len(), budget.max_field_bytes)?;
+        let decision_bytes = match record.decision {
+            Decision::Committed(CommitFacts::PublicationAdmitted { .. }) => 56,
+            Decision::Committed(CommitFacts::InboundReleased { .. }) => 24,
+            Decision::Rejected(RejectReason::CapacityExceeded(_)) => 24,
+            Decision::Rejected(_) => 16,
+        };
+        meter.charge(
+            160usize
+                .checked_add(decision_bytes)
+                .and_then(|n| n.checked_add(record.recipe.len()))
+                .ok_or(ReadError::LimitExceeded)?,
+        )?;
+    }
+    for _ in &state.fences {
+        meter.field(32, 32)?;
+        meter.charge(160)?;
+    }
+    for record in state.publications.values() {
+        meter.field(32, 32)?;
+        meter.field(record.topic.len(), state.limits.max_topic_bytes)?;
+        meter.charge(
+            248usize
+                .checked_add(record.topic.len())
+                .ok_or(ReadError::LimitExceeded)?,
+        )?;
+    }
+    for record in state.payloads.values() {
+        meter.field(32, 32)?;
+        meter.field(record.bytes.len(), state.limits.max_payload_bytes)?;
+        meter.charge(
+            168usize
+                .checked_add(record.bytes.len())
+                .ok_or(ReadError::LimitExceeded)?,
+        )?;
+    }
+    for _ in state.obligations.values() {
+        meter.field(32, 32)?;
+        meter.charge(208)?;
+    }
+    for _ in state.inbound.values() {
+        meter.field(32, 32)?;
+        meter.charge(200)?;
+    }
+    Ok(())
+}
+
 /// The steps of the deterministic store on its staged copy. A trait of
 /// this module because `DurableState` is a type of `mqttiumd-store-api`.
 trait Staging {
@@ -149,7 +373,7 @@ trait Staging {
     fn stage_release(&mut self, release: &ReleaseInbound) -> Guard<CommitFacts>;
     fn end_obligation(&mut self, delivery: DeliveryId) -> Result<(), AdminRefused>;
     fn stage_admin(&mut self, command: AdminCommand) -> Result<AdminDone, AdminRefused>;
-    fn inventory(&self) -> impl Iterator<Item = Result<RecoveredFact, RecoveryRefused>> + '_;
+    fn inventory(&self) -> impl Iterator<Item = FactRef<'_>>;
 }
 
 impl Staging for DurableState {
@@ -568,105 +792,52 @@ impl Staging for DurableState {
     /// established about the operations of older epochs. A fact that
     /// cannot be built within its budget is an error in its place, never
     /// the end of the inventory.
-    fn inventory(&self) -> impl Iterator<Item = Result<RecoveredFact, RecoveryRefused>> + '_ {
+    fn inventory(&self) -> impl Iterator<Item = FactRef<'_>> {
         let incarnation = self.ledger.incarnation();
         let open = self.ledger.open_epoch();
         let older = move |operation: &OperationId| Some(operation.epoch()) != open;
-        let epoch = open.map(|epoch| Ok(RecoveredFact::Epoch { incarnation, epoch }));
-        let refused = |_| RecoveryRefused::AllocationFailed;
-        let bound = |value: usize| u32::try_from(value).map_err(refused);
-        let limits = (|| {
-            Ok(RecoveredFact::Limits {
-                max_targets_per_admission: bound(self.limits.max_targets_per_admission)?,
-                max_topic_bytes: bound(self.limits.max_topic_bytes)?,
-                max_payload_bytes: PayloadBytes::new(
-                    u64::try_from(self.limits.max_payload_bytes).map_err(refused)?,
-                ),
-            })
-        })();
-        let table = Ok(RecoveredFact::RouteTable {
-            revision: self.route_revision,
-        });
-        let max_topic_bytes = self.limits.max_topic_bytes;
-        let routes = self.routes.iter().flat_map(move |(topic, targets)| {
-            targets.iter().map(move |target| {
-                // A route names an active session; its revision is the
-                // one an admission must carry.
-                let session = self
-                    .sessions
-                    .get(&target.session)
-                    .filter(|record| record.state == SessionState::Active)
-                    .ok_or(RecoveryRefused::AllocationFailed)?;
-                Ok(RecoveredFact::Route {
-                    topic: SharedBytes::copy_from(topic, max_topic_bytes)
-                        .map_err(|_| RecoveryRefused::AllocationFailed)?,
-                    target: target.session,
-                    target_revision: session.revision,
-                    max_qos: target.qos,
-                })
-            })
+        let epoch = open.map(|epoch| FactRef::Epoch(incarnation, epoch));
+        let routes = self.routes.iter().flat_map(|(topic, targets)| {
+            targets
+                .iter()
+                .map(move |target| FactRef::Route(topic, target))
         });
         let sessions = self
             .sessions
             .iter()
             .filter(|(_, record)| record.state == SessionState::Active)
-            .map(|(session, record)| {
-                let client_id = SharedBytes::copy_from(&record.client_id, MAX_CLIENT_ID_BYTES)
-                    .map_err(|_| RecoveryRefused::AllocationFailed)?;
-                Ok(RecoveredFact::Session {
-                    session: *session,
-                    client_id,
-                    revision: record.revision,
-                })
-            });
-        let inbound = self.inbound.iter().map(|((_, packet_id), marker)| {
-            Ok(RecoveredFact::InboundExchange {
-                exchange: marker.exchange,
-                packet_id: *packet_id,
-                publication: marker.publication,
-                phase: marker.phase,
-            })
-        });
-        let receipts = self
+            .map(|(session, record)| FactRef::Session(*session, record));
+        let inbound = self
+            .inbound
+            .iter()
+            .map(|((_, packet), marker)| FactRef::Inbound(*packet, marker));
+        let operations = self
             .operations
             .iter()
             .filter(move |(operation, _)| older(operation))
-            .map(|(operation, record)| {
-                Ok(RecoveredFact::Operation {
-                    operation: *operation,
-                    knowledge: match record.decision {
-                        Decision::Committed(facts) => Knowledge::Committed(facts),
-                        Decision::Rejected(reason) => Knowledge::RejectedCertain(reason),
-                    },
-                })
-            });
+            .map(|(operation, record)| FactRef::Operation(*operation, record));
         let fences = self
             .fences
             .iter()
             .filter(move |operation| older(operation))
-            .map(|operation| {
-                Ok(RecoveredFact::Operation {
-                    operation: *operation,
-                    knowledge: Knowledge::RejectedCertain(RejectReason::Fenced),
-                })
-            });
+            .map(|operation| FactRef::Fence(*operation));
         epoch
             .into_iter()
-            .chain([limits, table])
+            .chain([FactRef::Limits, FactRef::Table])
             .chain(routes)
             .chain(sessions)
             .chain(inbound)
-            .chain(receipts)
+            .chain(operations)
             .chain(fences)
     }
 }
 
 impl DurableStore for MemoryStore {
-    fn ledger(&self) -> EpochLedger {
-        self.committed.ledger
+    fn ledger(&self) -> Result<EpochLedger, ReadError> {
+        Ok(self.committed.ledger)
     }
 
-    fn open_epoch(&mut self, command: &OpenEpoch) -> OpeningOutcome {
+    fn open_epoch(&mut self, command: &OpenEpoch) -> Result<OpeningOutcome, ReadError> {
         // The decision is the contract's: the same function decides for
         // every store. Only an opening writes; the command that opened
         // the last epoch, presented again, reads its own result.
@@ -679,7 +850,7 @@ impl DurableStore for MemoryStore {
         }
         // The answer comes from what is durable now, never from the
         // decision to open.
-        OpeningOutcome::read(&self.committed.ledger, command)
+        Ok(OpeningOutcome::read(&self.committed.ledger, command))
     }
 
     fn apply(&mut self, command: &Command) -> Applied {
@@ -768,11 +939,11 @@ impl DurableStore for MemoryStore {
         }
     }
 
-    fn established(&self, operation: OperationId) -> Option<StoreOutcome> {
-        match self.committed.established(operation) {
+    fn established(&self, operation: OperationId) -> Result<Option<StoreOutcome>, ReadError> {
+        Ok(match self.committed.established(operation) {
             Established::Outcome(outcome) => Some(outcome),
             Established::Absent(_) => None,
-        }
+        })
     }
 
     fn resolve_and_fence(&mut self, operation: OperationId) -> Resolved {
@@ -812,14 +983,25 @@ impl DurableStore for MemoryStore {
         }
     }
 
-    fn recover(
+    fn recover_with_budget(
         &self,
         cursor: Option<RecoveryCursor>,
         limit: usize,
+        budget: ReadBudget,
     ) -> Result<RecoveryPage, RecoveryRefused> {
+        let refused = RecoveryRefused::Read;
         if limit == 0 {
             return Err(RecoveryRefused::EmptyPage);
         }
+        budget
+            .check_totals(
+                limit,
+                limit
+                    .checked_mul(128)
+                    .ok_or_else(|| refused(ReadError::LimitExceeded))?,
+            )
+            .map_err(refused)?;
+        check_inventory_bound(&self.committed).map_err(refused)?;
         let revision = self.committed.revision;
         let start = match cursor {
             Some(cursor) if cursor.revision() != revision => {
@@ -828,22 +1010,30 @@ impl DurableStore for MemoryStore {
             Some(cursor) => cursor.position(),
             None => 0,
         };
+        if start > MAX_RECOVERY_INVENTORY_ROWS {
+            return Err(refused(ReadError::LimitExceeded));
+        }
+        let total = self.committed.inventory().count();
+        if start > total {
+            return Err(refused(ReadError::InvalidData));
+        }
         let mut facts =
-            BoundedVec::with_capacity(limit).map_err(|_| RecoveryRefused::AllocationFailed)?;
-        // One pass over the inventory per page, from where the cursor
-        // stands; the fact after the page tells whether there is a next.
+            BoundedVec::with_capacity(limit).map_err(|_| refused(ReadError::AllocationFailed))?;
+        let mut meter = ReadMeter::new(budget);
+        // Skip borrowed raw entries, not built facts: no old page is copied.
         let mut inventory = self.committed.inventory().skip(start);
         let mut position = start;
         while !facts.is_full() {
-            let Some(fact) = inventory.next() else {
+            let Some(raw) = inventory.next() else {
                 return Ok(RecoveryPage { facts, next: None });
             };
-            if facts.try_push(fact?).is_err() {
-                return Err(RecoveryRefused::AllocationFailed);
-            }
+            let fact = raw.build(&self.committed, &mut meter).map_err(refused)?;
+            facts
+                .try_push(fact)
+                .map_err(|_| refused(ReadError::LimitExceeded))?;
             position = position
                 .checked_add(1)
-                .ok_or(RecoveryRefused::AllocationFailed)?;
+                .ok_or_else(|| refused(ReadError::LimitExceeded))?;
         }
         let next = inventory
             .next()
@@ -852,7 +1042,8 @@ impl DurableStore for MemoryStore {
         Ok(RecoveryPage { facts, next })
     }
 
-    fn snapshot(&self) -> DurableState {
-        self.committed.clone()
+    fn snapshot_with_budget(&self, budget: ReadBudget) -> Result<DurableState, ReadError> {
+        check_snapshot(&self.committed, budget)?;
+        Ok(self.committed.clone())
     }
 }
