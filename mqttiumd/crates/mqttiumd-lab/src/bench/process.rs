@@ -51,7 +51,7 @@ use crate::store::adapter::{
     StoreEvent, WorkId, startup_nonce,
 };
 use crate::store::durable::DurableStore;
-use crate::store::evidence::{Cause as EvidenceCause, TraceWriter, recovered_fact, store_outcome};
+use crate::store::evidence::{Cause as EvidenceCause, TraceWriter, outcome_fields, recovered_fact};
 
 /// Why the run cannot go on. The trace is then declared incomplete.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -137,19 +137,15 @@ fn connection_json(connection: ConnectionKey) -> Value {
     })
 }
 
-/// The payload of `StoreResultDelivered` for the result the core took,
-/// or `None` for a violation, which the format has no outcome for.
-fn delivered_json(effect: EffectId, operation: OperationId, reply: &StoreReply) -> Option<Value> {
-    let (name, rejected) = store_outcome(*reply)?;
+/// The payload of `StoreResultDelivered` for the result the core took: the
+/// same outcome fields as the hand-over, a violation included.
+fn delivered_json(effect: EffectId, operation: OperationId, reply: &StoreReply) -> Value {
     let mut payload = json!({
         "effect_id": effect_json(effect),
         "operation_id": operation_json(operation),
-        "outcome": name,
     });
-    if let Some(rejected) = rejected {
-        payload["reject_reason"] = json!(rejected);
-    }
-    Some(payload)
+    outcome_fields(*reply).write_into(&mut payload);
+    payload
 }
 
 /// The payload of `OpeningReplyDelivered`: the whole command the reply
@@ -881,7 +877,23 @@ impl<S: DurableStore> Process<S> {
             StepOutcome::Exhausted { exhaustion, .. } => {
                 Err(Stop::new(format!("the core is exhausted: {exhaustion:?}")))
             }
-            StepOutcome::Fatal(fault) => Err(Stop::new(format!("core fault: {fault:?}"))),
+            StepOutcome::Fatal(fault) => {
+                // The core consumed the input and stopped on it: a result
+                // it took (a violation, for one) was delivered all the same.
+                if let Some(pending) = pending {
+                    collector
+                        .emit(
+                            Origin::BrokerCore,
+                            pending.kind,
+                            &pending.parents,
+                            pending.payload,
+                        )
+                        .map_err(|refusal| {
+                            Stop::new(format!("the collector refused a record: {refusal}"))
+                        })?;
+                }
+                Err(Stop::new(format!("core fault: {fault:?}")))
+            }
         }
     }
 
@@ -1129,9 +1141,9 @@ impl<S: DurableStore> Process<S> {
         };
         let id = WorkId::Effect(*effect);
         let parent = books.handed.remove(&id);
-        let pending = delivered_json(*effect, *operation, reply).map(|payload| Pending {
+        let pending = Some(Pending {
             kind: "StoreResultDelivered",
-            payload,
+            payload: delivered_json(*effect, *operation, reply),
             parents: parent.into_iter().collect(),
         });
         if barrier {
