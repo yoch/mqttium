@@ -93,6 +93,17 @@ jobs:
         run: tools/run_loop_mutants.sh
       - name: The loop rejects its mutants on the SQLite store
         run: tools/run_loop_mutants.sh --backend sqlite
+      # A result qualifies only for a run whose binary was rebuilt from the
+      # archive the campaign keeps (record 0017). The step fails unless the
+      # oracle writes a qualifying PASS that `validate` accepts and that
+      # stands at `recompute`, and unless a second build of the archive
+      # gives the binary the manifest names.
+      - name: A rebuilt campaign qualifies on both stores
+        run: |
+          for backend in sim-store sqlite; do
+            tools/run_qualifying_campaign.sh tests/scenarios/p1/P1-02.json \
+              "$RUNNER_TEMP/campaigns/qualifying/$backend" 1 "$backend"
+          done
       - name: Keep the campaign directories
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

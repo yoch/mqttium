@@ -47,6 +47,19 @@ campaign. On both, a crash of a scenario is simulated inside one
 process: the adapter is dropped and the store recovered or reopened. No
 process is killed and nothing is shown about `fsync` or power loss.
 
+A result of the oracle is qualifying only for a run whose binary the
+runner rebuilt from an archive of the recorded content, kept in the
+campaign (`run --rebuild`, record 0017); any other result is provisional
+and never PASS. The script below plays such a run on a clean checkout,
+has the oracle produce the result, requires it to be qualifying, accepted
+by `validate` and standing at `recompute`, and rebuilds the binary a
+second time from the archive to compare it with the one the manifest
+names. The campaign directory must be outside the work tree:
+
+```bash
+tools/run_qualifying_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02-q 1 sqlite
+```
+
 The loop is shown to reject a defect by mutations kept as diffs under
 `tests/mutants/loop/` (`*.mutant`: the root `.gitignore` ignores `*.patch`
 and `*.diff`). The script applies each one in a temporary worktree, never
