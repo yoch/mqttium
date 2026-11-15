@@ -736,6 +736,8 @@ def _run_manifest(contracts, document, out):
     _u64(document, "/artifact/bytes", out)
     for index in range(len(document["contracts"])):
         _u64(document, f"/contracts/{index}/bytes", out)
+    if "built_from" in document["artifact"]:
+        _u64(document, "/artifact/built_from/source/bytes", out)
     for pointer in ("/scenario/bytes", "/fixture/bytes", "/scheduler/version", "/scheduler/seed"):
         _u64(document, pointer, out)
     paths = [entry["path"] for entry in document["contracts"]]

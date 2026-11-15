@@ -65,6 +65,7 @@
     "contracts/examples/v1/valid/run-result-provisional-nothing-evaluated.json",
     "contracts/examples/v1/valid/run-manifest-content-only.json",
     "contracts/examples/v1/valid/run-manifest-with-oracle-and-generators.json",
+    "contracts/examples/v1/valid/run-manifest-built-from-its-source.json",
     "contracts/examples/v1/valid/toy.catalog.json",
     "contracts/examples/v1/valid/toy.transitions.complete.json",
     "contracts/examples/v1/valid/toy.transitions.seed-with-hole.json",
@@ -1282,6 +1283,30 @@
       "code": "schema-violation",
       "pointer": "/oracle",
       "why": "An identity names the files it is the digest of."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-built-from-nothing.json",
+      "code": "schema-violation",
+      "pointer": "/artifact/built_from",
+      "why": "A binary built from a source names that source."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-built-from-without-its-command.json",
+      "code": "schema-violation",
+      "pointer": "/artifact/built_from",
+      "why": "A binary built from a source says how it was built."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-built-from-a-source-too-large.json",
+      "code": "u64-out-of-range",
+      "pointer": "/artifact/built_from/source/bytes",
+      "why": "The size of the source is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-built-from-a-source-outside.json",
+      "code": "schema-violation",
+      "pointer": "/artifact/built_from/source/path",
+      "why": "The source is a file of the campaign, named by a relative path."
     },
     {
       "file": "contracts/examples/v1/invalid/toy.transitions.hole.json",
