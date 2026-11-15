@@ -1414,6 +1414,419 @@ mod tests {
         }
     }
 
+    /// The rule of a cell that covers one guard point, given as
+    /// (dimension, value) pairs. Panics unless exactly one rule covers it.
+    fn rule_at<'a>(
+        registry: &'a Value,
+        state: &str,
+        event: &str,
+        point: &[(&str, &str)],
+    ) -> &'a Value {
+        let covering: Vec<&Value> = items(registry, "rules")
+            .iter()
+            .filter(|rule| text(rule, "state_class") == state && text(rule, "event_class") == event)
+            .filter(|rule| {
+                point.iter().all(|(dimension, value)| {
+                    match rule["guard_partition"].get(*dimension) {
+                        None => true,
+                        Some(values) => values
+                            .as_array()
+                            .is_some_and(|values| values.iter().any(|item| item == value)),
+                    }
+                })
+            })
+            .collect();
+        assert_eq!(
+            covering.len(),
+            1,
+            "{state} x {event} {point:?}: {} rules",
+            covering.len()
+        );
+        covering[0]
+    }
+
+    /// One obligation the specification puts on a cell: the disposition,
+    /// the next state, effects that must be required and effects that must
+    /// be forbidden.
+    struct Expected {
+        state: &'static str,
+        event: &'static str,
+        point: &'static [(&'static str, &'static str)],
+        disposition: &'static str,
+        next: &'static str,
+        required: &'static [&'static str],
+        forbidden: &'static [&'static str],
+    }
+
+    fn check_expectations(expectations: &[Expected]) {
+        let (registry, report) = p1_registry();
+        assert!(report.is_accepted(), "{:?}", report.diagnostics);
+        for expected in expectations {
+            let Expected {
+                state,
+                event,
+                point,
+                ..
+            } = expected;
+            let rule = rule_at(&registry, state, event, point);
+            let context = format!("{state} x {event} {point:?} ({})", text(rule, "id"));
+            assert_eq!(text(rule, "disposition"), expected.disposition, "{context}");
+            assert_eq!(text(rule, "next_state_class"), expected.next, "{context}");
+            assert_eq!(
+                names(rule, "required_effects"),
+                expected.required,
+                "{context}"
+            );
+            for effect in expected.forbidden {
+                assert!(
+                    names(rule, "forbidden_effects").contains(effect),
+                    "{context}: {effect} must be forbidden"
+                );
+            }
+        }
+    }
+
+    const SUFFICIENT: (&str, &str) = ("effect_capacity", "sufficient");
+    const INSUFFICIENT: (&str, &str) = ("effect_capacity", "insufficient");
+    const CURRENT: (&str, &str) = ("identity", "current");
+    const STALE: (&str, &str) = ("identity", "stale");
+    const COMMITTED: (&str, &str) = ("outcome", "committed");
+    const REJECTED: (&str, &str) = ("outcome", "rejected_certain");
+    const UNKNOWN: (&str, &str) = ("outcome", "unknown");
+    const RETIRED: (&str, &str) = ("outcome", "retired");
+
+    /// ARC-011, ADM-005, ADM-006, ACK-001, DEM-010: what the inbound QoS 2
+    /// machine owes outside the nominal path.
+    #[test]
+    fn the_inbound_machine_follows_the_specification_off_the_nominal_path() {
+        check_expectations(&[
+            // An unknown PUBREL never makes a publication (ARC-011).
+            Expected {
+                state: "Absent",
+                event: "Pubrel",
+                point: &[SUFFICIENT],
+                disposition: "REJECT",
+                next: "Absent",
+                required: &["EmitPubcompNotFound"],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+            Expected {
+                state: "Absent",
+                event: "Pubrel",
+                point: &[INSUFFICIENT],
+                disposition: "DEFER",
+                next: "Absent",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcompNotFound"],
+            },
+            // A late return of an old operation does not touch the slot.
+            Expected {
+                state: "Absent",
+                event: "AdmissionResult",
+                point: &[STALE, COMMITTED, SUFFICIENT],
+                disposition: "IGNORE_STALE",
+                next: "Absent",
+                required: &[],
+                forbidden: &["Persist", "EmitPubrec"],
+            },
+            Expected {
+                state: "Absent",
+                event: "ReleaseResult",
+                point: &[STALE, COMMITTED, SUFFICIENT],
+                disposition: "IGNORE_STALE",
+                next: "Absent",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+            // A certain refusal ends the exchange without distribution and
+            // answers as the protocol says (ARC-011).
+            Expected {
+                state: "AdmissionPending",
+                event: "AdmissionResult",
+                point: &[CURRENT, REJECTED, SUFFICIENT],
+                disposition: "TRANSITION",
+                next: "Absent",
+                required: &["EmitPubrecRefusal"],
+                forbidden: &["Persist", "EmitPubrec"],
+            },
+            Expected {
+                state: "AdmissionPending",
+                event: "AdmissionResult",
+                point: &[CURRENT, REJECTED, INSUFFICIENT],
+                disposition: "DEFER",
+                next: "AdmissionPending",
+                required: &[],
+                forbidden: &["EmitPubrecRefusal", "EmitPubrec"],
+            },
+            // An unknown result keeps the operation and reconciles.
+            Expected {
+                state: "AdmissionPending",
+                event: "AdmissionResult",
+                point: &[CURRENT, UNKNOWN, SUFFICIENT],
+                disposition: "TRANSITION",
+                next: "AdmissionPending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubrec", "EmitPubrecRefusal"],
+            },
+            // The commit of an older exchange does not acknowledge this one.
+            Expected {
+                state: "AdmissionPending",
+                event: "AdmissionResult",
+                point: &[STALE, COMMITTED, SUFFICIENT],
+                disposition: "IGNORE_STALE",
+                next: "AdmissionPending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubrec"],
+            },
+            // PUBREL never creates the initial distribution (ADM-005).
+            Expected {
+                state: "AdmissionPending",
+                event: "Pubrel",
+                point: &[SUFFICIENT],
+                disposition: "CLOSE",
+                next: "AdmissionPending",
+                required: &["CloseConnection"],
+                forbidden: &["Persist", "EmitPubcomp", "EmitPubcompNotFound"],
+            },
+            // Terminal knowledge never regresses; a contradiction is a fault.
+            Expected {
+                state: "AwaitPubrel",
+                event: "AdmissionResult",
+                point: &[CURRENT, COMMITTED, SUFFICIENT],
+                disposition: "IGNORE_STALE",
+                next: "AwaitPubrel",
+                required: &[],
+                forbidden: &["Persist", "EmitPubrec"],
+            },
+            Expected {
+                state: "AwaitPubrel",
+                event: "AdmissionResult",
+                point: &[CURRENT, REJECTED, SUFFICIENT],
+                disposition: "FAULT",
+                next: "AwaitPubrel",
+                required: &[],
+                forbidden: &["Persist", "EmitPubrec", "EmitPubrecRefusal"],
+            },
+            Expected {
+                state: "ReleasePending",
+                event: "AdmissionResult",
+                point: &[CURRENT, REJECTED, INSUFFICIENT],
+                disposition: "FAULT",
+                next: "ReleasePending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+            // A replayed PUBREL asks for no second release (ADM-005).
+            Expected {
+                state: "ReleasePending",
+                event: "Pubrel",
+                point: &[SUFFICIENT],
+                disposition: "TRANSITION",
+                next: "ReleasePending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+            // No second admission during the exchange (ADM-006).
+            Expected {
+                state: "ReleasePending",
+                event: "PublishQos2",
+                point: &[("connection", "same"), SUFFICIENT],
+                disposition: "CLOSE",
+                next: "ReleasePending",
+                required: &["CloseConnection"],
+                forbidden: &["Persist", "EmitPubrec"],
+            },
+            // A refused release is prepared again under a new identity
+            // (DEM-009); PUBCOMP still waits for a commit (ACK-001).
+            Expected {
+                state: "ReleasePending",
+                event: "ReleaseResult",
+                point: &[CURRENT, REJECTED, SUFFICIENT],
+                disposition: "TRANSITION",
+                next: "ReleasePending",
+                required: &["Persist"],
+                forbidden: &["EmitPubcomp"],
+            },
+            Expected {
+                state: "ReleasePending",
+                event: "ReleaseResult",
+                point: &[CURRENT, UNKNOWN, INSUFFICIENT],
+                disposition: "TRANSITION",
+                next: "ReleasePending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+            Expected {
+                state: "ReleasePending",
+                event: "ReleaseResult",
+                point: &[STALE, COMMITTED, SUFFICIENT],
+                disposition: "IGNORE_STALE",
+                next: "ReleasePending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+        ]);
+    }
+
+    /// V3-006, DEM-009, DEM-010: an identity is executed at most once, a
+    /// different recipe under it is a fault, and nothing reopens.
+    #[test]
+    fn the_command_machine_never_executes_an_identity_twice() {
+        let mut expectations = Vec::new();
+        for state in [
+            "Submitted",
+            "Indeterminate",
+            "Committed",
+            "RejectedCertain",
+            "Consumed",
+            "ReceiptClosed",
+        ] {
+            expectations.push(Expected {
+                state,
+                event: "Submit",
+                point: &[SUFFICIENT],
+                disposition: "REJECT",
+                next: state,
+                required: &[],
+                forbidden: &["Persist"],
+            });
+        }
+        for state in [
+            "Submitted",
+            "Indeterminate",
+            "Committed",
+            "RejectedCertain",
+            "Consumed",
+        ] {
+            expectations.push(Expected {
+                state,
+                event: "Replay",
+                point: &[("recipe", "different")],
+                disposition: "FAULT",
+                next: state,
+                required: &[],
+                forbidden: &["Persist"],
+            });
+        }
+        for (state, disposition) in [
+            ("Submitted", "IGNORE_STALE"),
+            ("Indeterminate", "IGNORE_STALE"),
+            ("Committed", "IGNORE_STALE"),
+            ("Consumed", "IGNORE_STALE"),
+            ("RejectedCertain", "REJECT"),
+        ] {
+            expectations.push(Expected {
+                state,
+                event: "Replay",
+                point: &[("recipe", "same")],
+                disposition,
+                next: state,
+                required: &[],
+                forbidden: &["Persist"],
+            });
+        }
+        // An identity whose result was collected is closed, not guessed.
+        for state in ["Submitted", "Indeterminate"] {
+            expectations.push(Expected {
+                state,
+                event: "StoreResult",
+                point: &[RETIRED],
+                disposition: "TRANSITION",
+                next: "ReceiptClosed",
+                required: &[],
+                forbidden: &["Persist"],
+            });
+        }
+        for outcome in [COMMITTED, REJECTED, UNKNOWN, RETIRED] {
+            let point: &'static [(&str, &str)] = Box::leak(Box::new([outcome]));
+            expectations.push(Expected {
+                state: "ReceiptClosed",
+                event: "StoreResult",
+                point,
+                disposition: "IGNORE_STALE",
+                next: "ReceiptClosed",
+                required: &[],
+                forbidden: &["Persist"],
+            });
+        }
+        expectations.push(Expected {
+            state: "Consumed",
+            event: "StoreResult",
+            point: &[REJECTED],
+            disposition: "FAULT",
+            next: "Consumed",
+            required: &[],
+            forbidden: &["Persist"],
+        });
+        expectations.push(Expected {
+            state: "RejectedCertain",
+            event: "StoreResult",
+            point: &[REJECTED],
+            disposition: "IGNORE_STALE",
+            next: "RejectedCertain",
+            required: &[],
+            forbidden: &["Persist"],
+        });
+        for event in ["StoreResult", "ResultTimeout", "Replay"] {
+            expectations.push(Expected {
+                state: "Prepared",
+                event,
+                point: &[],
+                disposition: "UNREACHABLE",
+                next: "Prepared",
+                required: &[],
+                forbidden: &["Persist"],
+            });
+        }
+        check_expectations(&expectations);
+    }
+
+    /// A result is current only for a state that waits for it.
+    #[test]
+    fn a_state_that_waits_for_no_operation_has_no_current_result() {
+        let (registry, _) = p1_registry();
+        for (state, event) in [
+            ("Absent", "AdmissionResult"),
+            ("Absent", "ReleaseResult"),
+            ("AdmissionPending", "ReleaseResult"),
+            ("AwaitPubrel", "ReleaseResult"),
+        ] {
+            for outcome in [COMMITTED, REJECTED, UNKNOWN, RETIRED] {
+                for capacity in [SUFFICIENT, INSUFFICIENT] {
+                    let rule = rule_at(&registry, state, event, &[CURRENT, outcome, capacity]);
+                    assert_eq!(
+                        text(rule, "disposition"),
+                        "UNREACHABLE",
+                        "{state} x {event}"
+                    );
+                    let rule = rule_at(&registry, state, event, &[STALE, outcome, capacity]);
+                    assert_eq!(
+                        text(rule, "disposition"),
+                        "IGNORE_STALE",
+                        "{state} x {event}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The registry leaves one cell for the change that declares it
+    /// complete.
+    #[test]
+    fn one_cell_is_left_for_the_change_that_declares_the_registry_complete() {
+        let (_, report) = p1_registry();
+        let holes: Vec<&String> = report
+            .notes
+            .iter()
+            .filter(|note| note.starts_with("registry hole"))
+            .collect();
+        assert_eq!(holes.len(), 1, "{holes:?}");
+        assert!(
+            holes[0].contains("command ReceiptClosed x Replay"),
+            "{holes:?}"
+        );
+    }
+
     /// ADR 0001, "Guards": a deadline for an operation that became terminal
     /// is ignored as stale; for an unresolved one it starts a resolution
     /// and arms the next deadline.
