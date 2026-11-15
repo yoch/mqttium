@@ -97,6 +97,10 @@ class Contracts:
         for path, data in content.items():
             if path.parent != schema_directory:
                 continue
+            # Every file of the schema directory is hashed into the digest,
+            # so every one must be a schema the readers load by its name.
+            if not path.name.endswith(".schema.json"):
+                raise ContractsUnreadable(f"{path.name}: in the schema directory, not a schema")
             try:
                 schema = parse(data)
             except Refused as refusal:
