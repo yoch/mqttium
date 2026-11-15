@@ -590,8 +590,8 @@ def route_fact(topic, target, qos=1):
 ROUTE_FACTS = [
     {
         "kind": "Limits",
-        "max_targets_per_admission": 4,
-        "max_topic_bytes": 256,
+        "max_targets_per_admission": "4",
+        "max_topic_bytes": "256",
         "max_payload_bytes": "1024",
     },
     {"kind": "RouteTable", "revision": "1"},

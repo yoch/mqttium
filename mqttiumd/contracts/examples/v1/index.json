@@ -680,10 +680,16 @@
       "why": "The QoS of a route is 0, 1 or 2."
     },
     {
-      "file": "contracts/examples/v1/invalid/trace-record-recovered-limit-of-targets-as-text.json",
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-limit-of-targets-as-a-number.json",
       "code": "schema-violation",
       "pointer": "/payload/facts/1/max_targets_per_admission",
-      "why": "A 32-bit bound is a JSON integer; only 64-bit quantities are decimal strings."
+      "why": "A bound is a decimal string, in a trace as in a snapshot: one quantity, one encoding."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-topic-limit-over-32-bits.json",
+      "code": "u32-out-of-range",
+      "pointer": "/payload/facts/1/max_topic_bytes",
+      "why": "The bound on a topic is a 32-bit quantity."
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-recovered-payload-limit-overflow.json",
@@ -786,6 +792,12 @@
       "code": "u64-out-of-range",
       "pointer": "/payload/operation_id/sequence",
       "why": "Identity components are 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-target-limit-over-32-bits.json",
+      "code": "u32-out-of-range",
+      "pointer": "/account/limits/max_targets_per_admission",
+      "why": "The bound on the targets of an admission is a 32-bit quantity, in a snapshot as in a trace."
     },
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-unknown-table.json",
