@@ -1,0 +1,21 @@
+diff --git a/mqttiumd/crates/mqttiumd-lab/src/bench/child.rs b/mqttiumd/crates/mqttiumd-lab/src/bench/child.rs
+index 1ffc13cf..e4710238 100644
+--- a/mqttiumd/crates/mqttiumd-lab/src/bench/child.rs
++++ b/mqttiumd/crates/mqttiumd-lab/src/bench/child.rs
+@@ -915,7 +915,15 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
+                     if process.is_some() || u64::from(rank) != arguments.rank {
+                         return Err(stop("a start-up of another rank, or a second one"));
+                     }
+-                    let store = mqttiumd_store_sqlite::SqliteStore::open(&arguments.store)
++                    // MUTANT N2: the restarted child opens another file, a copy
++                    // of the data set taken before anything was committed.
++                    let other = arguments.store.with_file_name("other.sqlite");
++                    if arguments.rank == 0 {
++                        std::fs::copy(&arguments.store, &other)
++                            .map_err(|error| stop(format!("copy: {error}")))?;
++                    }
++                    let opened = if arguments.rank == 0 { &arguments.store } else { &other };
++                    let store = mqttiumd_store_sqlite::SqliteStore::open(opened)
+                         .map_err(|error| {
+                             stop(format!("{}: {error:?}", arguments.store.display()))
+                         })?;
