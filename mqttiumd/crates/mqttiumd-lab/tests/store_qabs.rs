@@ -529,3 +529,38 @@ fn qabs_c_through_the_fence_point_refuses_one_fence_and_nothing_else() {
     assert_eq!(outcome(deliver(&mut bench, again)), committed);
     assert_eq!(bench.store.hits(refuse), 1);
 }
+
+/// Only a resolution that reads an absence reaches the fence point. One
+/// that finds a receipt or a fence answers what is established, and the
+/// fault armed there waits for the first one that does read an absence.
+#[test]
+fn a_resolution_that_finds_its_operation_does_not_reach_the_fence_point() {
+    let mut bench = bench();
+    let refuse = at_the_fence(&mut bench, FaultAction::RefuseFence);
+    let command = bench.admission(1, 7, b"payload", &[bench.b]);
+    let admitted = persist(&mut bench, 1, &command);
+    enter(&mut bench, admitted);
+    let committed = outcome(deliver(&mut bench, admitted));
+    let fenced = operation_id(bench.epoch, 5);
+    assert!(bench.store.store_mut().resolve_and_fence(fenced).fenced_now);
+
+    let found = resolve(&mut bench, 2, command.recipe.operation());
+    enter(&mut bench, found);
+    assert_eq!(outcome(deliver(&mut bench, found)), committed);
+    let already = resolve(&mut bench, 3, fenced);
+    enter(&mut bench, already);
+    assert_eq!(
+        outcome(deliver(&mut bench, already)),
+        StoreOutcome::RejectedCertain(RejectReason::Fenced)
+    );
+    assert_eq!(bench.store.hits(refuse), 0);
+
+    let missing = operation_id(bench.epoch, 6);
+    let absent = resolve(&mut bench, 4, missing);
+    enter(&mut bench, absent);
+    assert_eq!(
+        outcome(deliver(&mut bench, absent)),
+        StoreOutcome::PendingOrUnknown
+    );
+    assert_eq!(bench.store.hits(refuse), 1);
+}

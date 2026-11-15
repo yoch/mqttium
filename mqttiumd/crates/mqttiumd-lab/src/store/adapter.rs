@@ -329,9 +329,6 @@ struct Transit {
     ticket: u64,
     work: Work,
     held: bool,
-    /// A resolution that was held at the fence point: when it enters the
-    /// writer again it does not reach the point a second time.
-    past_fence: bool,
 }
 
 /// The inbound exchange slot a command comes from.
@@ -595,7 +592,6 @@ impl<S: DurableStore> SimStore<S> {
             ticket,
             work,
             held,
-            past_fence: false,
         });
     }
 
@@ -711,17 +707,17 @@ impl<S: DurableStore> SimStore<S> {
         let id = transit.id;
         let (kind, operation, source) = describe(&transit.work);
         // A resolution that reads an absence reaches the fence point
-        // before its fence is written.
+        // before its fence is written. A held fence that enters the
+        // writer again reads again, and passes the point again if the
+        // operation is still absent: the fault that held it fired once,
+        // and no other fault can select the same passage (see `arm`).
         let mut refuse_fence = false;
         if let Work::Resolve(resolved) = &transit.work
-            && !transit.past_fence
             && self.store.established(*resolved).is_none()
-            && false
         {
             match self.pass(FaultPoint::FenceTransit, id, kind, operation, source) {
                 Some(FaultAction::HoldCommand) => {
                     transit.held = true;
-                    transit.past_fence = true;
                     self.transit.push_back(transit);
                     return Performed::Held(FaultPoint::FenceTransit);
                 }
