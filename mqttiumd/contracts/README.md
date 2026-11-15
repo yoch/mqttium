@@ -223,6 +223,15 @@ result a step handed over.
 A record says what its emitter claims. Checking a trace as a whole, and
 the assertion `broker_inputs_have_provenance`, is the oracle's work.
 
+### The oracle and the generators of a campaign
+
+A run manifest may name, apart from the lab binary, the `oracle` that
+judges the campaign and the `generators` that wrote its inputs (V3-002).
+Each is `{sha256, files}`: the files with their digest and size, in path
+order and once each, and the digest of one `<sha256>  <path>` line per
+file, as the contract digest is. Both readers refuse a digest that is
+not that of the files listed, and files out of order (`evidence-mismatch`).
+
 ### Store snapshots
 
 `InspectDurableState` writes one document of the format

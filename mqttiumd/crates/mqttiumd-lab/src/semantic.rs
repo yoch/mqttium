@@ -1288,6 +1288,36 @@ fn run_manifest(document: &Value, out: &mut Vec<Diagnostic>) {
             "contract files are listed once each, in path order",
         ));
     }
+    // The oracle and the generators are identified the same way.
+    for member in ["oracle", "generators"] {
+        let Some(identity) = document.get(member) else {
+            continue;
+        };
+        let files = items(identity, "files");
+        for index in 0..files.len() {
+            u64_at(document, &format!("/{member}/files/{index}/bytes"), out);
+        }
+        let paths: Vec<&str> = files.iter().map(|file| text(file, "path")).collect();
+        if let Some(index) = paths.windows(2).position(|pair| pair[0] >= pair[1]) {
+            out.push(Diagnostic::new(
+                code::EVIDENCE_MISMATCH,
+                format!("/{member}/files/{}", index + 1),
+                "the files of an identity are listed once each, in path order",
+            ));
+        }
+        let listed = contracts_digest(
+            files
+                .iter()
+                .map(|file| (text(file, "sha256"), text(file, "path"))),
+        );
+        if listed != text(identity, "sha256") {
+            out.push(Diagnostic::new(
+                code::EVIDENCE_MISMATCH,
+                format!("/{member}/sha256"),
+                format!("the listed files have the digest {listed}"),
+            ));
+        }
+    }
     // The digest must be the digest of the files the manifest lists.
     let listed = contracts_digest(
         items(document, "contracts")

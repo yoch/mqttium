@@ -728,6 +728,33 @@ def _run_manifest(contracts, document, out):
                 )
             )
             break
+    # The oracle and the generators are identified the same way.
+    for member in ("oracle", "generators"):
+        identity = document.get(member)
+        if identity is None:
+            continue
+        for index in range(len(identity["files"])):
+            _u64(document, f"/{member}/files/{index}/bytes", out)
+        files = [entry["path"] for entry in identity["files"]]
+        for index in range(1, len(files)):
+            if files[index - 1] >= files[index]:
+                out.append(
+                    Diagnostic(
+                        "evidence-mismatch",
+                        f"/{member}/files/{index}",
+                        "the files of an identity are listed once each, in path order",
+                    )
+                )
+                break
+        digest = contracts_digest((entry["sha256"], entry["path"]) for entry in identity["files"])
+        if digest != identity["sha256"]:
+            out.append(
+                Diagnostic(
+                    "evidence-mismatch",
+                    f"/{member}/sha256",
+                    f"the listed files have the digest {digest}",
+                )
+            )
     listed = contracts_digest((entry["sha256"], entry["path"]) for entry in document["contracts"])
     if listed != document["contracts_digest"]:
         out.append(
