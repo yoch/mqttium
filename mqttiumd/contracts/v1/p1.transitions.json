@@ -3,7 +3,7 @@
   "schema_version": 1,
   "id": "p1",
   "catalog": "contracts/v1/p1.catalog.json",
-  "status": "seed",
+  "status": "complete",
   "rules": [
     {
       "id": "inbound_qos2.absent.publish.admit",
@@ -2743,6 +2743,31 @@
         "MU-09"
       ],
       "justification": "DEM-010: an answer after collection reopens nothing. The detail of the collected result is gone, so no later answer can be judged against it."
+    },
+    {
+      "id": "command.receipt_closed.replay.refuse",
+      "machine": "command",
+      "state_class": "ReceiptClosed",
+      "event_class": "Replay",
+      "guard_partition": {},
+      "disposition": "REJECT",
+      "next_state_class": "ReceiptClosed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-09"
+      ],
+      "justification": "V3-006: an old command presented after its receipt was closed is not executed again, and no precise result that was collected is invented. Its recipe can no longer be compared, so the refusal does not depend on it."
     }
   ]
 }

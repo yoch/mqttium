@@ -21,7 +21,7 @@ it. The examples illustrate the contract and are not part of the digest.
 | `v1/assertions.json` | Assertion names, their meaning and the requirements they serve |
 | `v1/requirements.json` | Every identifier the specification defines, each with its source: a chapter or an accepted decision record |
 | `v1/p1.catalog.json` | Vocabulary of the transition registry: machines, state classes, event classes, guard dimensions, effects |
-| `v1/p1.transitions.json` | Transition registry of P1. Status `seed`: its holes are listed, not hidden |
+| `v1/p1.transitions.json` | Transition registry of P1. Status `complete`: every guard point of every cell has exactly one rule |
 | `examples/v1/index.json` | Every example, and for each invalid one the code and pointer it must be refused with |
 
 ## Rules every v1 document follows
