@@ -96,6 +96,24 @@ fn reply(sim: &mut Sim, id: WorkId) -> OpeningReply {
 }
 
 /// The whole path of one opening that commits. Returns the grant.
+/// Takes the store's reply to the attempt in flight and checks that
+/// what `observe` returns is what happened to the stage.
+fn take(opening: &mut EpochOpening, reply: OpeningReply) -> OpeningStage {
+    let before = opening.stage();
+    let observed = opening
+        .observe(reply)
+        .expect("a reply to the command in flight, and no contradiction");
+    let after = opening.stage();
+    match observed {
+        Observed::Advanced(stage) => {
+            assert_eq!(stage, after);
+            assert_ne!(before, after);
+        }
+        Observed::Unchanged => assert_eq!(before, after),
+    }
+    after
+}
+
 fn open_and_hand_over(sim: &mut Sim, opening: &mut EpochOpening) -> EpochGrant {
     let id = attempt(sim, opening);
     let reply = reply(sim, id);
@@ -170,7 +188,7 @@ fn a_duplicated_reply_gives_no_second_authority() {
     assert_eq!(sim.hits(duplicate), 1, "the injection was not reached");
 
     let first = reply(&mut sim, id);
-    opening.observe(first).expect("the answer");
+    take(&mut opening, first);
     // The second copy answers no attempt in flight: the dispatcher
     // refuses it and records it.
     assert_eq!(
@@ -392,7 +410,7 @@ fn the_late_reply_of_an_abandoned_attempt_gives_no_authority() {
     assert!(opening.hand_over().is_err());
 
     let current = reply(&mut sim, second);
-    opening.observe(current).expect("the answer");
+    take(&mut opening, current);
     assert_eq!(
         opening.hand_over().expect("committed").epoch(),
         RunEpoch::new(2)
@@ -452,7 +470,13 @@ fn an_exhausted_epoch_counter_refuses_the_opening_for_good() {
     // No sequence of commands reaches the last epoch: this state is
     // written directly, for this test only.
     let mut durable = memory(INCARNATION, fixture_limits()).snapshot();
-    durable.ledger = EpochLedger::from_durable(INCARNATION, RunEpoch::new(u64::MAX - 1), None);
+    let opener = OpeningAttempt {
+        startup: startup_nonce(SEED, u64::MAX),
+        ticket: OpeningTicket::new(1),
+    };
+    durable.ledger =
+        EpochLedger::from_durable(INCARNATION, RunEpoch::new(u64::MAX - 1), Some(opener))
+            .expect("an epoch and its opener");
     let mut sim = SimStore::new(MemoryStore::reopen(durable), LIMITS);
 
     let mut last = opening_for(&sim);
@@ -460,7 +484,7 @@ fn an_exhausted_epoch_counter_refuses_the_opening_for_good() {
     assert_eq!(grant.epoch(), RunEpoch::new(u64::MAX));
 
     let before = sim.store().snapshot();
-    let mut opening = opening_for(&sim);
+    let mut opening = sim.begin_opening(startup_nonce(SEED, 1));
     let id = attempt(&mut sim, &mut opening);
     let refused = reply(&mut sim, id);
     let exhausted = OpeningRejection::EpochsExhausted;
@@ -577,7 +601,7 @@ fn a_restart_is_not_confused_with_the_process_that_died() {
             enter(&mut sim, id);
             let rejected = reply(&mut sim, id);
             assert_eq!(rejected.outcome, MOVED);
-            opening.observe(rejected).expect("its own reply");
+            take(&mut opening, rejected);
             // The reply to the dead process's command, should it ever
             // reach this one, answers nothing here.
             assert_eq!(opening.observe(stray(committed(1))), refused);
@@ -588,7 +612,7 @@ fn a_restart_is_not_confused_with_the_process_that_died() {
         } else {
             enter(&mut sim, id);
             let own = reply(&mut sim, id);
-            opening.observe(own).expect("its own reply");
+            take(&mut opening, own);
             let grant = opening.hand_over().expect("committed");
             assert_eq!(grant.epoch(), RunEpoch::new(1));
             let before = sim.store().snapshot();
@@ -625,7 +649,7 @@ fn an_opening_delivered_twice_to_the_writer_is_one_opening() {
 
     let first = reply(&mut sim, id);
     assert_eq!(first.outcome, again);
-    opening.observe(first).expect("the answer");
+    take(&mut opening, first);
     let grant = opening.hand_over().expect("committed");
     assert_eq!(
         opening.observe(OpeningReply {
@@ -666,14 +690,16 @@ fn an_attempt_held_past_a_later_opening_is_superseded() {
     assert_eq!(late.outcome, OpeningOutcome::Superseded);
     assert_eq!(
         opening.observe(late),
-        Ok(Observed::Advanced(OpeningStage::Superseded))
+        Ok(Observed::Advanced(OpeningStage::Superseded {
+            commit_seen: false
+        }))
     );
     assert!(opening.hand_over().is_err());
     assert_eq!(ledger(&sim).open_epoch(), Some(RunEpoch::new(2)));
     // The value it read is stale for good: it must read again.
     assert_eq!(
         opening.submit(RunEpoch::new(0)),
-        Err(SubmitRefused::ConditionUnchanged)
+        Err(SubmitRefused::StaleRead)
     );
     let grant = open_and_hand_over(&mut sim, &mut opening);
     assert_eq!(grant.epoch(), RunEpoch::new(3));
@@ -716,7 +742,7 @@ fn two_live_processes_never_hold_the_same_epoch() {
         let mut grants = Vec::new();
         for index in [order[1], order[0]] {
             let answer = reply(&mut sim, submitted[index].0);
-            openings[index].observe(answer).expect("its own reply");
+            take(&mut openings[index], answer);
             if let Ok(grant) = openings[index].hand_over() {
                 grants.push((index, grant));
             }
@@ -731,34 +757,129 @@ fn two_live_processes_never_hold_the_same_epoch() {
     }
 }
 
-/// The precondition of the trusted draw, made visible in the bench: if
-/// a restart drew the nonce of its predecessor, their commands would be
-/// one command and both would be answered the same commit.
+/// The precondition of the nonce, where the store sees it broken. A
+/// restart drew the nonce of the process that opened the open epoch.
+/// It reads that epoch and asks for the next one under an identity
+/// that already designates the command of its predecessor. The store
+/// opens nothing, the epoch of the first grant stays open, and the
+/// restart stops for good.
 #[test]
-fn a_restart_that_reused_a_nonce_would_share_the_epoch_of_its_predecessor() {
+fn a_restart_that_reused_the_nonce_of_the_opener_opens_nothing() {
+    let mut sim = started();
+    let reused = startup_nonce(SEED, 0);
+    let mut predecessor = sim.begin_opening(reused);
+    let held = open_and_hand_over(&mut sim, &mut predecessor);
+    assert_eq!(held.epoch(), RunEpoch::new(1));
+    let before = sim.store().snapshot();
+
+    let mut successor = sim.begin_opening(reused);
+    let (id, command) = submit(&mut sim, &mut successor);
+    assert_eq!(command.after, held.epoch());
+    assert_eq!(Some(command.attempt), ledger(&sim).opened_by());
+    enter(&mut sim, id);
+    let answer = reply(&mut sim, id);
+    let stopped = OpeningRejection::AttemptReused;
+    assert_eq!(answer.outcome, OpeningOutcome::RejectedCertain(stopped));
+    assert_eq!(
+        take(&mut successor, answer),
+        OpeningStage::Rejected(stopped)
+    );
+    assert!(successor.hand_over().is_err());
+    assert_eq!(
+        successor.submit(ledger(&sim).last_opened()),
+        Err(SubmitRefused::Rejected(stopped))
+    );
+    // Nothing was written: the epoch of the first grant is still open.
+    assert_eq!(sim.store().snapshot(), before);
+    assert_eq!(ledger(&sim).open_epoch(), Some(held.epoch()));
+}
+
+/// The limit of that detection, named. A successor with the nonce of
+/// its predecessor that forms the very same command, on the same value
+/// read, is answered as the one that opened the epoch: the store
+/// cannot tell the two apart, and two grants exist for one epoch. That
+/// no two start-ups share a nonce is what the adapter owes.
+#[test]
+fn two_start_ups_with_one_nonce_and_one_condition_share_an_epoch() {
     let mut sim = started();
     let reused = startup_nonce(SEED, 0);
     let mut predecessor = sim.begin_opening(reused);
     let (first, command) = submit(&mut sim, &mut predecessor);
     enter(&mut sim, first);
     let answer = reply(&mut sim, first);
-    predecessor.observe(answer).expect("its own reply");
+    take(&mut predecessor, answer);
     let held = predecessor.hand_over().expect("committed");
 
-    // A successor with the same nonce forms the same command while the
-    // first one is still the last opening: the store cannot tell.
     let mut successor = sim.begin_opening(reused);
     let again = successor
         .submit(command.after)
         .expect("an attempt may start");
     assert_eq!(again, command);
     let outcome = sim.store_mut().open_epoch(&again);
-    successor
-        .observe(OpeningReply {
+    take(
+        &mut successor,
+        OpeningReply {
             command: again,
             outcome,
-        })
-        .expect("correlated");
+        },
+    );
     let shared = successor.hand_over().expect("committed");
     assert_eq!(shared.opened(), held.opened());
+}
+
+/// A grant was handed over, a later start-up opened the next epoch, and
+/// the first command reaches the writer once more. The store answers
+/// that its epoch is closed; the opening keeps that, takes no new
+/// attempt, and no recovered fact confirms the grant any more.
+#[test]
+fn a_grant_whose_epoch_the_store_reports_closed_is_never_confirmed_again() {
+    let mut sim = started();
+    let mut opening = opening_for(&sim);
+    let (id, command) = submit(&mut sim, &mut opening);
+    enter(&mut sim, id);
+    let answer = reply(&mut sim, id);
+    take(&mut opening, answer);
+    let grant = opening.hand_over().expect("committed");
+    assert_eq!(
+        opening.check_recovered(INCARNATION, grant.epoch()),
+        RecoveredEpochCheck::Confirms
+    );
+
+    let mut restart = sim.begin_opening(startup_nonce(SEED, 1));
+    let next = open_and_hand_over(&mut sim, &mut restart);
+    assert_eq!(next.epoch(), RunEpoch::new(2));
+
+    let outcome = sim.store_mut().open_epoch(&command);
+    assert_eq!(outcome, OpeningOutcome::Superseded);
+    let closed = OpeningStage::GrantSuperseded(grant.opened());
+    assert_eq!(
+        take(&mut opening, OpeningReply { command, outcome }),
+        closed
+    );
+    assert_eq!(
+        opening.submit(ledger(&sim).last_opened()),
+        Err(SubmitRefused::AlreadyOpened)
+    );
+    assert_eq!(opening.hand_over(), Err(HandOverRefused::AlreadyHandedOver));
+    assert_eq!(
+        opening.check_recovered(INCARNATION, grant.epoch()),
+        RecoveredEpochCheck::Closed
+    );
+    // The fact the store now recovers names the later epoch.
+    let page = sim.recover(None, 8).expect("a page");
+    let recovered = page
+        .facts
+        .as_slice()
+        .iter()
+        .find_map(|fact| match fact {
+            RecoveredFact::Epoch { incarnation, epoch } => Some((*incarnation, *epoch)),
+            _ => None,
+        })
+        .expect("an epoch is open");
+    assert_eq!(recovered, (INCARNATION, next.epoch()));
+    assert_eq!(
+        opening.check_recovered(recovered.0, recovered.1),
+        RecoveredEpochCheck::Foreign
+    );
+    assert_eq!(opening.stage(), closed);
 }

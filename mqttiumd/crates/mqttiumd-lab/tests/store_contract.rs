@@ -27,6 +27,11 @@ fn an_opening_delivered_again_returns_its_commit() {
 }
 
 #[test]
+fn the_opener_of_the_last_epoch_cannot_open_the_next_under_its_identity() {
+    conformance::the_opener_of_the_last_epoch_cannot_open_the_next_under_its_identity(&memory);
+}
+
+#[test]
 fn the_first_command_of_a_restart_is_not_its_predecessors() {
     conformance::the_first_command_of_a_restart_is_not_its_predecessors(&memory);
 }

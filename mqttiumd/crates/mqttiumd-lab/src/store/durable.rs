@@ -855,15 +855,16 @@ impl DurableStore for MemoryStore {
         // The decision is the contract's: the same function decides for
         // every store. Only an opening writes; the command that opened
         // the last epoch, presented again, reads its own result.
-        let decision = self.committed.ledger.open(command);
-        if let LedgerOpening::Opens { ledger, .. } = decision {
+        if let LedgerOpening::Opens { ledger } = self.committed.ledger.open(command) {
             let mut staged = self.committed.clone();
             staged.ledger = ledger;
-            if !self.commit(staged) {
-                return OpeningOutcome::Unknown;
-            }
+            // A write that fails leaves the ledger as it was, and the
+            // answer is read from it: no commit is reported.
+            let _written = self.commit(staged);
         }
-        OpeningOutcome::of(self.committed.ledger.incarnation(), decision)
+        // The answer comes from what is durable now, never from the
+        // decision to open.
+        OpeningOutcome::read(&self.committed.ledger, command)
     }
 
     fn apply(&mut self, command: &Command) -> Applied {

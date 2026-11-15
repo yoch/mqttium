@@ -80,8 +80,24 @@ fn create_session<S: DurableStore>(store: &mut S, client_id: &[u8]) -> SessionId
     }
 }
 
-/// The nonce of the start-up the builders speak for.
-pub const STARTUP: StartupNonce = StartupNonce::new([0xA5; 16]);
+/// The nonce of the first start-up the builders speak for.
+pub const STARTUP: StartupNonce = startup(0);
+
+/// The nonce of the start-up of rank `rank` among those the builders
+/// speak for. No two ranks share one: an attempt designates one
+/// command, and the store refuses the opener of the last epoch that
+/// asks for the next one under the same identity.
+#[must_use]
+pub const fn startup(rank: u64) -> StartupNonce {
+    let rank = rank.to_be_bytes();
+    let mut bytes = [0xA5; 16];
+    let mut index = 0;
+    while index < rank.len() {
+        bytes[8 + index] = rank[index];
+        index += 1;
+    }
+    StartupNonce::new(bytes)
+}
 
 /// The attempt numbered `ticket` of the start-up `startup`.
 #[must_use]
@@ -92,11 +108,12 @@ pub fn attempt(startup: StartupNonce, ticket: u64) -> OpeningAttempt {
     }
 }
 
-/// The command of a start-up that just read the ledger of `store`.
+/// The first command of a start-up that just read the ledger of
+/// `store`. Each value read is read by a start-up of its own.
 pub fn opening_command<S: DurableStore>(store: &S) -> OpenEpoch {
     let ledger = store.ledger();
     OpenEpoch {
-        attempt: attempt(STARTUP, 1),
+        attempt: attempt(startup(ledger.last_opened().get()), 1),
         incarnation: ledger.incarnation(),
         after: ledger.last_opened(),
     }
@@ -366,7 +383,7 @@ pub fn an_opening_that_expected_another_epoch_opens_nothing<S: DurableStore>(
     // Two attempts read the same value; one was held on its way.
     let held = opening_command(&store);
     let passing = OpenEpoch {
-        attempt: attempt(STARTUP, 2),
+        attempt: attempt(held.attempt.startup, 2),
         ..held
     };
     let first = OpeningOutcome::Committed(EpochOpened {
@@ -429,6 +446,36 @@ pub fn an_opening_delivered_again_returns_its_commit<S: DurableStore>(
         assert_eq!(store.open_epoch(&command), committed);
         assert_eq!(store.snapshot(), before);
     }
+}
+
+/// An attempt designates one command. The start-up that opened the
+/// last epoch and asks for the next one under the same identity broke
+/// the precondition of its nonce: the store opens nothing and says so
+/// for certain, and the first command is still answered as the opener.
+pub fn the_opener_of_the_last_epoch_cannot_open_the_next_under_its_identity<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut store = make(INCARNATION, fixture_limits());
+    open(&mut store);
+    let opener = opening_command(&store);
+    let committed = OpeningOutcome::Committed(EpochOpened {
+        incarnation: INCARNATION,
+        epoch: RunEpoch::new(2),
+    });
+    assert_eq!(store.open_epoch(&opener), committed);
+    let before = store.snapshot();
+    let reused = OpenEpoch {
+        after: RunEpoch::new(2),
+        ..opener
+    };
+    assert_eq!(
+        store.open_epoch(&reused),
+        OpeningOutcome::RejectedCertain(OpeningRejection::AttemptReused)
+    );
+    assert_eq!(store.snapshot(), before);
+    assert_eq!(store.open_epoch(&opener), committed);
+    // Any other identity opens the next epoch.
+    assert_eq!(open(&mut store), RunEpoch::new(3));
 }
 
 /// A restarted process starts its tickets again and reads the same
@@ -1207,6 +1254,7 @@ pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     opening_opens_the_next_epoch_and_closes_the_older_ones(make);
     an_opening_that_expected_another_epoch_opens_nothing(make);
     an_opening_delivered_again_returns_its_commit(make);
+    the_opener_of_the_last_epoch_cannot_open_the_next_under_its_identity(make);
     the_first_command_of_a_restart_is_not_its_predecessors(make);
     a_command_of_an_unopened_epoch_never_executes(make);
     an_admission_commits_everything_together(make);

@@ -16,25 +16,30 @@
 //! ```text
 //! Idle --submit--> Submitted --Committed--> Committed --hand_over--> HandedOver
 //!                   |  |  |  \--RejectedCertain--> Rejected --submit (unless definitive)--\
-//!                   |  |  \--Superseded--> Superseded --submit, on a higher value read--+--> Submitted
+//!                   |  |  \--Superseded--> Superseded --submit, on a read two higher----+--> Submitted
 //!                   |  \--Unknown (store)--\                                           |
 //!                   \--abandon (deadline)--+--> Unknown --submit----------------------/
+//!
+//! HandedOver --Superseded--> GrantSuperseded
 //!
 //! a commit that cannot answer the command, or a commit and a rejection
 //! of one attempt --> Faulted
 //! ```
 //!
 //! What a reply to the command in flight does, stage by reply. "same"
-//! leaves the stage as it is; "fault" moves to `Faulted`.
+//! leaves the stage as it is; "fault" moves to `Faulted`. `Superseded`
+//! keeps whether the commit of the attempt was reported.
 //!
 //! | Stage \\ reply | `Unknown` | `Superseded` | `Committed`, the answer | `Committed`, any other | `RejectedCertain` |
 //! | - | - | - | - | - | - |
 //! | `Submitted` | `Unknown` | `Superseded` | `Committed` | fault | `Rejected` |
 //! | `Unknown` | same | `Superseded` | `Committed` | fault | `Rejected` |
-//! | `Superseded` | same | same | same, no grant | fault | `Rejected` |
+//! | `Superseded`, no commit seen | same | same | `Superseded`, commit seen; no grant | fault | `Rejected` |
+//! | `Superseded`, commit seen | same | same | same | fault | fault |
 //! | `Rejected` | same | same | fault | fault | same, first reason kept |
-//! | `Committed` | same | `Superseded` | same | fault | fault |
-//! | `HandedOver` | same | same, reported to the caller | same | fault | fault |
+//! | `Committed` | same | `Superseded`, commit seen | same | fault | fault |
+//! | `HandedOver` | same | `GrantSuperseded` | same | fault | fault |
+//! | `GrantSuperseded` | same | same | same | fault | fault |
 //! | `Faulted` | refused | refused | refused | refused | refused |
 //!
 //! "The answer" is the commit for this data set and the epoch right
@@ -50,7 +55,9 @@
 //! - Once the command is recognised, a commit can only be for this data
 //!   set and the epoch right after the command's condition. Any other
 //!   commit, and a commit together with a rejection, is a fault that
-//!   stops start-up: the opening is `Faulted`, for good.
+//!   stops start-up: the opening is `Faulted`, for good. `Superseded`
+//!   between the two hides nothing: the stage keeps that the commit
+//!   was reported.
 //! - `hand_over` succeeds once, from `Committed`. The grant is moved to
 //!   the creator of owners and is neither `Clone` nor `Copy`.
 //! - An unknown outcome gives no grant, whether the store reported it or
@@ -58,14 +65,21 @@
 //!   an opening it assumes: it reads the last opened epoch again and
 //!   submits a new attempt on that condition. Reading the value to form a
 //!   condition adopts nothing: the grant still comes from the committed
-//!   reply to the new attempt.
+//!   reply to the new attempt. A value below what the store's replies
+//!   established is a stale read and is refused: one more than the
+//!   condition after `PredecessorMoved`, two more after `Superseded`.
 //! - An older attempt can never undo a newer one. The store opens an
 //!   epoch only while the last opened epoch is the one the command
 //!   expects (`EpochLedger::open`), so an attempt that was held on its
 //!   way and arrives after a later opening committed opens nothing.
-//! - Only `RejectedCertain` says that an attempt opened nothing. An
+//! - Only `RejectedCertain` says that a command opened nothing. An
 //!   attempt whose epoch is already closed is `Superseded`: no grant,
 //!   and nothing is claimed about what it did.
+//! - A store reports a commit only from the ledger that holds it
+//!   (`OpeningOutcome::read`): the decision to open is not a commit.
+//! - An attempt designates one command. The opener of the last epoch
+//!   that asks for the next one under the same identity is rejected
+//!   with `AttemptReused` and its start-up stops.
 //! - No function takes a recovered fact or a recovery page and returns a
 //!   grant; `check_recovered` compares a fact and borrows immutably.
 //! - When the process dies, this state and the grant die with it. The
@@ -79,7 +93,10 @@
 //! `EpochOpening::observe` is the entry point between the store adapter
 //! and this crate: a reply is plain data, and the type system does not
 //! prevent code from building one. The `StartupNonce` is drawn by the
-//! adapter, and that no two start-ups share one is its precondition.
+//! adapter, and that no two start-ups share one is its precondition:
+//! two start-ups with one nonce that read the same value form one
+//! command, both are answered with its commit, and nothing here can
+//! tell them apart.
 //! What is established here is that a given `EpochOpening` yields at
 //! most one grant, for the epoch that follows its own condition in its
 //! own data set, after a committed reply to its own command. That each
@@ -90,12 +107,13 @@
 //! A limit, stated: a grant that was handed over cannot be taken back.
 //! When a contradiction arrives afterwards the opening becomes `Faulted`
 //! and says that a grant is out; when the store reports the epoch of a
-//! grant superseded, `observe` says so. Stopping the holder is
-//! start-up's.
+//! grant superseded, the opening becomes `GrantSuperseded` and stays
+//! there. Stopping the holder is start-up's.
 
 use crate::capacity::Resource;
 use crate::command::{
-    LedgerOpening, OpenEpoch, OpeningAttempt, OpeningRejection, OpeningTicket, StartupNonce,
+    EpochLedger, LedgerOpening, OpenEpoch, OpeningAttempt, OpeningRejection, OpeningTicket,
+    StartupNonce,
 };
 use crate::ids::{ExchangeId, Exhausted, PublicationId, RunEpoch, StoreIncarnation};
 
@@ -237,7 +255,7 @@ pub struct EpochOpened {
 pub enum OpeningOutcome {
     /// The opening is durable: this attempt opened this epoch.
     Committed(EpochOpened),
-    /// No epoch was opened by this attempt, and none ever will be.
+    /// No epoch was opened by this command, and none ever will be.
     RejectedCertain(OpeningRejection),
     /// The epoch this attempt asked for is closed. The attempt can never
     /// open one; whether it had opened that one is not known any more.
@@ -249,18 +267,26 @@ pub enum OpeningOutcome {
 }
 
 impl OpeningOutcome {
-    /// The outcome a store reports for a decision of its ledger, once
-    /// the ledger of `Opens` is durable. A store that could not make it
-    /// durable reports `Unknown` instead.
+    /// What `ledger` establishes about `command`. Nothing is written.
+    ///
+    /// A store answers a command with this, read from the ledger that
+    /// is durable when it is done with the command: the one it wrote
+    /// after `EpochLedger::open` said `Opens`, or the one it left as it
+    /// was. `Committed` is built only from the data set and the epoch a
+    /// ledger holds, for the command that ledger records as the opener.
+    /// A ledger in which the command would open an epoch, and has not,
+    /// establishes nothing: a store that could not write, or did not,
+    /// has no commit to report.
     #[must_use]
-    pub const fn of(incarnation: StoreIncarnation, decision: LedgerOpening) -> Self {
-        match decision {
-            LedgerOpening::Opens { epoch, .. } | LedgerOpening::AlreadyOpened { epoch } => {
-                Self::Committed(EpochOpened { incarnation, epoch })
-            }
+    pub fn read(ledger: &EpochLedger, command: &OpenEpoch) -> Self {
+        match ledger.open(command) {
+            LedgerOpening::AlreadyOpened { epoch } => Self::Committed(EpochOpened {
+                incarnation: ledger.incarnation(),
+                epoch,
+            }),
+            LedgerOpening::Opens { .. } | LedgerOpening::Undecided => Self::Unknown,
             LedgerOpening::Rejected(reason) => Self::RejectedCertain(reason),
             LedgerOpening::Superseded => Self::Superseded,
-            LedgerOpening::Undecided => Self::Unknown,
         }
     }
 }
@@ -284,8 +310,10 @@ pub enum OpeningStage {
     /// start-up stopped waiting. No grant exists.
     Unknown,
     /// The epoch the last attempt asked for is closed. No grant exists,
-    /// and none will for this attempt, even if its commit shows up.
-    Superseded,
+    /// and none will for this attempt. `commit_seen` keeps that the
+    /// commit of this attempt was reported, before or after: a rejection
+    /// of the same attempt is then a contradiction.
+    Superseded { commit_seen: bool },
     /// The last attempt was certainly not committed. The first reason
     /// reported is kept.
     Rejected(OpeningRejection),
@@ -293,6 +321,10 @@ pub enum OpeningStage {
     Committed(EpochOpened),
     /// The grant of this opening was handed over. It never is again.
     HandedOver(EpochOpened),
+    /// The grant was handed over and the store then reported its epoch
+    /// closed. Terminal: no grant, no new attempt. The grant cannot be
+    /// taken back; its holder is to be stopped by start-up.
+    GrantSuperseded(EpochOpened),
     /// The replies to one attempt cannot all be true. Terminal: no
     /// grant, no new attempt. `handed_over` names the opening whose grant
     /// had already left when the fault was found, if any.
@@ -305,21 +337,25 @@ pub enum SubmitRefused {
     /// An attempt is already in flight; one is outstanding at a time.
     /// `abandon` it first to stop waiting for it.
     AwaitingReply,
-    /// This process already holds a committed opening. Opening again
-    /// would close the epoch its own owners live in.
+    /// This process already holds a committed opening, or handed over
+    /// its grant. Opening again would close the epoch its own owners
+    /// live in; when that epoch is already closed, the process stops
+    /// instead of opening another one around them.
     AlreadyOpened,
     /// The store answered with a reason that no new attempt can change.
     Rejected(OpeningRejection),
     /// The opening is faulted.
     Faulted,
-    /// The value read is lower than one this opening already read. The
-    /// last opened epoch of a data set never decreases: this is not the
-    /// same data set, or not a read of it.
+    /// The value read is lower than the one this opening read before.
+    /// The last opened epoch of a data set never decreases: this is not
+    /// the same data set, or not a read of it.
     LedgerRegressed,
-    /// The store answered that an epoch was opened after the value this
-    /// opening last read, and the value read now is still that one: the
-    /// read is stale, and a command on it could only be refused again.
-    ConditionUnchanged,
+    /// The value read is lower than what the store's replies to the last
+    /// attempt establish: the read is stale, and a command on it could
+    /// only be refused again. After `PredecessorMoved` the epoch after
+    /// the condition was opened; after `Superseded` it was also closed,
+    /// so the one after it was opened too.
+    StaleRead,
     /// The ticket counter reached its end; nothing wraps.
     TicketsExhausted,
 }
@@ -356,7 +392,10 @@ pub enum HandOverRefused {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct NotAwaiting(pub OpeningStage);
 
-/// What a correlated reply did to the opening.
+/// What a correlated reply did to the opening. To be looked at: an
+/// advance to `GrantSuperseded` is the only notice that the holder of
+/// the grant must be stopped, and the stage keeps it.
+#[must_use]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Observed {
     /// The reply taught something: the opening is now at this stage.
@@ -364,10 +403,6 @@ pub enum Observed {
     /// The reply repeats what is known, or is a late answer that lowers
     /// nothing. The stage did not move.
     Unchanged,
-    /// The store reports that the epoch of the grant already handed over
-    /// is closed. The stage did not move: the grant cannot be taken
-    /// back, and its holder is to be stopped by the caller.
-    GrantedEpochSuperseded(EpochOpened),
 }
 
 /// How a recovered `Epoch` fact relates to an opening. Reading a fact
@@ -380,6 +415,10 @@ pub enum RecoveredEpochCheck {
     /// this process opened, or holds a grant for: the inventory is not
     /// the one of this opening.
     Foreign,
+    /// The fact describes the epoch of the grant this process handed
+    /// over, and the store reported that epoch closed since. The fact
+    /// confirms nothing: the holder of the grant is to be stopped.
+    Closed,
     /// This process holds no committed opening and no grant. Whatever
     /// the fact says, it establishes nothing here.
     NotEstablished,
@@ -427,15 +466,15 @@ pub struct EpochOpening {
     incarnation: StoreIncarnation,
     /// What makes the attempts of this start-up its own.
     startup: StartupNonce,
-    /// The ticket of the last attempt; zero before the first one.
-    ticket: OpeningTicket,
     /// The command of the last attempt, the only one a reply may answer.
+    /// The last ticket issued and the last value read are its own.
     in_flight: Option<OpenEpoch>,
-    /// The highest value of the last opened epoch this opening read.
-    read: RunEpoch,
-    /// The store answered that an epoch was opened after `read`: the
-    /// next value read must be higher.
-    read_is_stale: bool,
+    /// The lowest value a read of the last opened epoch can return now:
+    /// the value last read, raised by what the store's replies to the
+    /// last attempt say was opened since. It never decreases, whatever
+    /// the stage does. `Err` when it is past the last epoch: no read
+    /// can be accepted any more.
+    floor: Result<RunEpoch, Exhausted>,
     stage: OpeningStage,
 }
 
@@ -447,10 +486,8 @@ impl EpochOpening {
         Self {
             incarnation,
             startup,
-            ticket: OpeningTicket::new(0),
             in_flight: None,
-            read: RunEpoch::new(0),
-            read_is_stale: false,
+            floor: Ok(RunEpoch::new(0)),
             stage: OpeningStage::Idle,
         }
     }
@@ -473,27 +510,34 @@ impl EpochOpening {
     ///
     /// After an unknown outcome, a superseded attempt or a rejection
     /// that is not definitive, this is the way forward, with the value
-    /// read again. Once the store answered that an epoch was opened
-    /// after the value last read, the value read again must be higher.
+    /// read again. That value is never lower than the one read before,
+    /// and never lower than what the store's replies established: one
+    /// more than the condition after `PredecessorMoved`, two more after
+    /// `Superseded`.
     pub fn submit(&mut self, last_opened: RunEpoch) -> Result<OpenEpoch, SubmitRefused> {
         match self.stage {
-            OpeningStage::Idle | OpeningStage::Unknown | OpeningStage::Superseded => {}
+            OpeningStage::Idle | OpeningStage::Unknown | OpeningStage::Superseded { .. } => {}
             OpeningStage::Rejected(reason) if !reason.is_definitive() => {}
             OpeningStage::Rejected(reason) => return Err(SubmitRefused::Rejected(reason)),
             OpeningStage::Submitted => return Err(SubmitRefused::AwaitingReply),
-            OpeningStage::Committed(_) | OpeningStage::HandedOver(_) => {
+            OpeningStage::Committed(_)
+            | OpeningStage::HandedOver(_)
+            | OpeningStage::GrantSuperseded(_) => {
                 return Err(SubmitRefused::AlreadyOpened);
             }
             OpeningStage::Faulted { .. } => return Err(SubmitRefused::Faulted),
         }
-        if last_opened < self.read {
+        let (read, last_ticket) = match self.in_flight {
+            Some(last) => (last.after, last.attempt.ticket),
+            None => (RunEpoch::new(0), OpeningTicket::new(0)),
+        };
+        if last_opened < read {
             return Err(SubmitRefused::LedgerRegressed);
         }
-        if self.read_is_stale && last_opened == self.read {
-            return Err(SubmitRefused::ConditionUnchanged);
+        if self.floor.map_or(true, |floor| last_opened < floor) {
+            return Err(SubmitRefused::StaleRead);
         }
-        let ticket = self
-            .ticket
+        let ticket = last_ticket
             .checked_next()
             .map_err(|Exhausted| SubmitRefused::TicketsExhausted)?;
         let command = OpenEpoch {
@@ -504,10 +548,8 @@ impl EpochOpening {
             incarnation: self.incarnation,
             after: last_opened,
         };
-        self.ticket = ticket;
-        self.read = last_opened;
-        self.read_is_stale = false;
         self.in_flight = Some(command);
+        self.floor = Ok(last_opened);
         self.stage = OpeningStage::Submitted;
         Ok(command)
     }
@@ -534,8 +576,10 @@ impl EpochOpening {
     /// repeated with another reason keeps the first one, as
     /// `Knowledge::observe` does. Two things differ from it: once the
     /// attempt is known superseded its commit yields no grant, and a
-    /// commit not yet handed over gives way to `Superseded`, because a
-    /// grant for a closed epoch is never handed over.
+    /// commit gives way to `Superseded`, because a grant for a closed
+    /// epoch is never handed over. Neither forgets the commit: a
+    /// rejection that follows is a contradiction, as it is without the
+    /// `Superseded` in between.
     pub fn observe(&mut self, reply: OpeningReply) -> Result<Observed, ReplyRefused> {
         if let OpeningStage::Faulted { .. } = self.stage {
             return Err(ReplyRefused::Faulted);
@@ -546,32 +590,43 @@ impl EpochOpening {
             });
         }
         let stage = self.stage;
+        let after = reply.command.after;
+        // What the reply says the last opened epoch is, at least.
+        let mut said = Ok(after);
         let next = match reply.outcome {
             OpeningOutcome::Unknown => match stage {
                 OpeningStage::Submitted => Some(OpeningStage::Unknown),
                 _ => None,
             },
-            OpeningOutcome::Superseded => match stage {
-                OpeningStage::Submitted | OpeningStage::Unknown | OpeningStage::Committed(_) => {
-                    Some(OpeningStage::Superseded)
+            OpeningOutcome::Superseded => {
+                said = after.checked_next().and_then(RunEpoch::checked_next);
+                match stage {
+                    OpeningStage::Submitted | OpeningStage::Unknown => {
+                        Some(OpeningStage::Superseded { commit_seen: false })
+                    }
+                    OpeningStage::Committed(_) => {
+                        Some(OpeningStage::Superseded { commit_seen: true })
+                    }
+                    OpeningStage::HandedOver(opened) => Some(OpeningStage::GrantSuperseded(opened)),
+                    _ => None,
                 }
-                OpeningStage::HandedOver(opened) => {
-                    return Ok(Observed::GrantedEpochSuperseded(opened));
-                }
-                _ => None,
-            },
+            }
             OpeningOutcome::Committed(opened) => {
                 // The command is ours: the only commit that answers it
                 // is this data set and the epoch after its condition.
                 let answers = opened.incarnation == self.incarnation
-                    && Ok(opened.epoch) == reply.command.after.checked_next();
+                    && Ok(opened.epoch) == after.checked_next();
                 match stage {
                     OpeningStage::Submitted | OpeningStage::Unknown if answers => {
                         Some(OpeningStage::Committed(opened))
                     }
-                    OpeningStage::Committed(_)
+                    OpeningStage::Superseded { commit_seen: false } if answers => {
+                        Some(OpeningStage::Superseded { commit_seen: true })
+                    }
+                    OpeningStage::Superseded { commit_seen: true }
+                    | OpeningStage::Committed(_)
                     | OpeningStage::HandedOver(_)
-                    | OpeningStage::Superseded
+                    | OpeningStage::GrantSuperseded(_)
                         if answers =>
                     {
                         None
@@ -579,22 +634,30 @@ impl EpochOpening {
                     _ => return Err(self.fault(reply.outcome)),
                 }
             }
-            OpeningOutcome::RejectedCertain(reason) => match stage {
-                OpeningStage::Submitted | OpeningStage::Unknown | OpeningStage::Superseded => {
-                    Some(OpeningStage::Rejected(reason))
+            OpeningOutcome::RejectedCertain(reason) => {
+                let next = match stage {
+                    OpeningStage::Submitted
+                    | OpeningStage::Unknown
+                    | OpeningStage::Superseded { commit_seen: false } => {
+                        Some(OpeningStage::Rejected(reason))
+                    }
+                    // Both say that nothing was opened; the first reason stays.
+                    OpeningStage::Rejected(_) => None,
+                    _ => return Err(self.fault(reply.outcome)),
+                };
+                if reason == OpeningRejection::PredecessorMoved {
+                    said = after.checked_next();
                 }
-                // Both say that nothing was opened; the first reason stays.
-                OpeningStage::Rejected(_) => None,
-                _ => return Err(self.fault(reply.outcome)),
-            },
+                next
+            }
+        };
+        self.floor = match (self.floor, said) {
+            (Ok(held), Ok(said)) => Ok(held.max(said)),
+            _ => Err(Exhausted),
         };
         let Some(next) = next else {
             return Ok(Observed::Unchanged);
         };
-        self.read_is_stale = matches!(
-            next,
-            OpeningStage::Superseded | OpeningStage::Rejected(OpeningRejection::PredecessorMoved)
-        );
         self.stage = next;
         Ok(Observed::Advanced(next))
     }
@@ -603,7 +666,9 @@ impl EpochOpening {
     fn fault(&mut self, reported: OpeningOutcome) -> ReplyRefused {
         let established = self.stage;
         let handed_over = match established {
-            OpeningStage::HandedOver(opened) => Some(opened),
+            OpeningStage::HandedOver(opened) | OpeningStage::GrantSuperseded(opened) => {
+                Some(opened)
+            }
             _ => None,
         };
         self.stage = OpeningStage::Faulted { handed_over };
@@ -622,7 +687,9 @@ impl EpochOpening {
                 self.stage = OpeningStage::HandedOver(opened);
                 Ok(EpochGrant { opened })
             }
-            OpeningStage::HandedOver(_) => Err(HandOverRefused::AlreadyHandedOver),
+            OpeningStage::HandedOver(_) | OpeningStage::GrantSuperseded(_) => {
+                Err(HandOverRefused::AlreadyHandedOver)
+            }
             stage => Err(HandOverRefused::NotCommitted(stage)),
         }
     }
@@ -630,31 +697,34 @@ impl EpochOpening {
     /// Compares a recovered `Epoch` fact with this opening. It borrows
     /// immutably: a fact read in a recovery page, however often, moves no
     /// stage and authorises nothing. A grant that is out is still
-    /// compared after a fault: its holder reads these pages.
+    /// compared after a fault: its holder reads these pages. Once its
+    /// epoch was reported closed, no fact confirms it.
     #[must_use]
     pub fn check_recovered(
         &self,
         incarnation: StoreIncarnation,
         epoch: RunEpoch,
     ) -> RecoveredEpochCheck {
-        match self.stage {
+        let (opened, matching) = match self.stage {
             OpeningStage::Committed(opened)
             | OpeningStage::HandedOver(opened)
             | OpeningStage::Faulted {
                 handed_over: Some(opened),
-            } => {
-                if opened == (EpochOpened { incarnation, epoch }) {
-                    RecoveredEpochCheck::Confirms
-                } else {
-                    RecoveredEpochCheck::Foreign
-                }
-            }
+            } => (opened, RecoveredEpochCheck::Confirms),
+            OpeningStage::GrantSuperseded(opened) => (opened, RecoveredEpochCheck::Closed),
             OpeningStage::Idle
             | OpeningStage::Submitted
             | OpeningStage::Unknown
-            | OpeningStage::Superseded
+            | OpeningStage::Superseded { .. }
             | OpeningStage::Rejected(_)
-            | OpeningStage::Faulted { handed_over: None } => RecoveredEpochCheck::NotEstablished,
+            | OpeningStage::Faulted { handed_over: None } => {
+                return RecoveredEpochCheck::NotEstablished;
+            }
+        };
+        if opened == (EpochOpened { incarnation, epoch }) {
+            matching
+        } else {
+            RecoveredEpochCheck::Foreign
         }
     }
 }
@@ -828,6 +898,28 @@ mod tests {
         OpeningReply { command, outcome }
     }
 
+    /// Takes a reply to the command in flight and checks that what
+    /// `observe` returns is what happened to the stage.
+    fn take(
+        opening: &mut EpochOpening,
+        command: OpenEpoch,
+        outcome: OpeningOutcome,
+    ) -> OpeningStage {
+        let before = opening.stage();
+        let observed = opening
+            .observe(reply(command, outcome))
+            .expect("a reply to the command in flight, and no contradiction");
+        let after = opening.stage();
+        match observed {
+            Observed::Advanced(stage) => {
+                assert_eq!(stage, after);
+                assert_ne!(before, after);
+            }
+            Observed::Unchanged => assert_eq!(before, after),
+        }
+        after
+    }
+
     fn fresh() -> EpochOpening {
         EpochOpening::new(DATA_SET, THIS_START)
     }
@@ -843,9 +935,7 @@ mod tests {
     /// An opening that holds the committed result of epoch 4.
     fn committed() -> (EpochOpening, OpenEpoch) {
         let (mut opening, command) = submitted();
-        opening
-            .observe(reply(command, COMMITTED_4))
-            .expect("the answer");
+        take(&mut opening, command, COMMITTED_4);
         (opening, command)
     }
 
@@ -858,6 +948,8 @@ mod tests {
     const MOVED: OpeningOutcome =
         OpeningOutcome::RejectedCertain(OpeningRejection::PredecessorMoved);
     const NO_GRANT_OUT: OpeningStage = OpeningStage::Faulted { handed_over: None };
+    const SUPERSEDED: OpeningStage = OpeningStage::Superseded { commit_seen: false };
+    const SUPERSEDED_AFTER_COMMIT: OpeningStage = OpeningStage::Superseded { commit_seen: true };
 
     fn uncorrelated(command: OpenEpoch) -> Result<Observed, ReplyRefused> {
         Err(ReplyRefused::Uncorrelated {
@@ -1002,9 +1094,7 @@ mod tests {
         assert_eq!(opening.stage(), OpeningStage::Submitted);
         assert!(opening.hand_over().is_err());
 
-        opening
-            .observe(reply(second, OpeningOutcome::Committed(opened(5))))
-            .expect("the answer");
+        take(&mut opening, second, OpeningOutcome::Committed(opened(5)));
         assert_eq!(
             opening.hand_over().expect("committed").epoch(),
             RunEpoch::new(5)
@@ -1022,9 +1112,7 @@ mod tests {
         opening.abandon().expect("awaiting");
         let newer = opening.submit(RunEpoch::new(3)).expect("a new attempt");
         assert_eq!(newer.after, older.after);
-        opening
-            .observe(reply(newer, COMMITTED_4))
-            .expect("the answer");
+        take(&mut opening, newer, COMMITTED_4);
         let grant = opening.hand_over().expect("committed");
         assert_eq!(opening.observe(reply(older, MOVED)), uncorrelated(older));
         assert_eq!(opening.stage(), OpeningStage::HandedOver(grant.opened()));
@@ -1052,9 +1140,7 @@ mod tests {
 
             // Start-up reads 4 and opens after it.
             let third = opening.submit(RunEpoch::new(4)).expect("not definitive");
-            opening
-                .observe(reply(third, OpeningOutcome::Committed(opened(5))))
-                .expect("the answer");
+            take(&mut opening, third, OpeningOutcome::Committed(opened(5)));
             assert_eq!(
                 opening.hand_over().expect("committed").epoch(),
                 RunEpoch::new(5)
@@ -1067,9 +1153,7 @@ mod tests {
         for by_the_store in [true, false] {
             let (mut opening, command) = submitted();
             if by_the_store {
-                opening
-                    .observe(reply(command, OpeningOutcome::Unknown))
-                    .expect("correlated");
+                take(&mut opening, command, OpeningOutcome::Unknown);
             } else {
                 opening.abandon().expect("awaiting");
             }
@@ -1104,12 +1188,10 @@ mod tests {
                 EXHAUSTED,
                 OpeningStage::Rejected(OpeningRejection::EpochsExhausted),
             ),
-            (OpeningOutcome::Superseded, OpeningStage::Superseded),
+            (OpeningOutcome::Superseded, SUPERSEDED),
         ] {
             let (mut settled, command) = submitted();
-            settled
-                .observe(reply(command, outcome))
-                .expect("correlated");
+            take(&mut settled, command, outcome);
             assert_eq!(
                 settled.observe(reply(command, OpeningOutcome::Unknown)),
                 Ok(Observed::Unchanged)
@@ -1180,9 +1262,7 @@ mod tests {
         }
         assert!(opening.hand_over().is_err());
         // Its own answer is still expected, and still honoured.
-        opening
-            .observe(reply(command, COMMITTED_4))
-            .expect("the answer");
+        take(&mut opening, command, COMMITTED_4);
         assert_eq!(opening.hand_over().expect("committed").opened(), opened(4));
     }
 
@@ -1295,9 +1375,7 @@ mod tests {
         // From a data set that had no epoch, the answer is epoch 1.
         let mut first = fresh();
         let command = first.submit(RunEpoch::new(0)).expect("idle");
-        first
-            .observe(reply(command, OpeningOutcome::Committed(opened(1))))
-            .expect("the answer");
+        take(&mut first, command, OpeningOutcome::Committed(opened(1)));
     }
 
     /// Two terminal results that disagree stop start-up: the opening is
@@ -1347,7 +1425,7 @@ mod tests {
 
         // A commit after a rejection is the same fault.
         let (mut rejected, command) = submitted();
-        rejected.observe(reply(command, MOVED)).expect("correlated");
+        take(&mut rejected, command, MOVED);
         assert!(matches!(
             rejected.observe(reply(command, COMMITTED_4)),
             Err(ReplyRefused::Contradictory { .. })
@@ -1402,46 +1480,34 @@ mod tests {
     /// store says so first, not when its commit was already here.
     #[test]
     fn a_superseded_attempt_gives_no_grant() {
-        // Superseded, then the late commit of the same attempt.
+        // Superseded, then the late commit of the same attempt: no
+        // grant, and the commit is remembered.
         let (mut opening, command) = submitted();
         assert_eq!(
             opening.observe(reply(command, OpeningOutcome::Superseded)),
-            Ok(Observed::Advanced(OpeningStage::Superseded))
+            Ok(Observed::Advanced(SUPERSEDED))
         );
         assert_eq!(
             opening.observe(reply(command, COMMITTED_4)),
-            Ok(Observed::Unchanged)
+            Ok(Observed::Advanced(SUPERSEDED_AFTER_COMMIT))
         );
-        assert_eq!(opening.stage(), OpeningStage::Superseded);
         assert_eq!(
             opening.hand_over(),
-            Err(HandOverRefused::NotCommitted(OpeningStage::Superseded))
+            Err(HandOverRefused::NotCommitted(SUPERSEDED_AFTER_COMMIT))
         );
 
         // The commit, then superseded before the hand-over.
         let (mut opening, command) = committed();
         assert_eq!(
             opening.observe(reply(command, OpeningOutcome::Superseded)),
-            Ok(Observed::Advanced(OpeningStage::Superseded))
+            Ok(Observed::Advanced(SUPERSEDED_AFTER_COMMIT))
         );
         assert!(opening.hand_over().is_err());
 
-        // After the hand-over the grant cannot be taken back: the
-        // caller is told, and the stage stays.
-        let (mut opening, command) = committed();
-        let grant = opening.hand_over().expect("committed");
-        assert_eq!(
-            opening.observe(reply(command, OpeningOutcome::Superseded)),
-            Ok(Observed::GrantedEpochSuperseded(grant.opened()))
-        );
-        assert_eq!(opening.stage(), OpeningStage::HandedOver(grant.opened()));
-        assert_eq!(opening.hand_over(), Err(HandOverRefused::AlreadyHandedOver));
-
-        // It is not a rejection, and a rejection may still follow it.
+        // It is not a rejection, and while no commit was seen a
+        // rejection may still follow it.
         let (mut opening, command) = submitted();
-        opening
-            .observe(reply(command, OpeningOutcome::Superseded))
-            .expect("correlated");
+        take(&mut opening, command, OpeningOutcome::Superseded);
         assert_eq!(
             opening.observe(reply(command, MOVED)),
             Ok(Observed::Advanced(OpeningStage::Rejected(
@@ -1451,6 +1517,107 @@ mod tests {
         assert_eq!(
             opening.observe(reply(command, OpeningOutcome::Superseded)),
             Ok(Observed::Unchanged)
+        );
+    }
+
+    /// A commit and a certain rejection of one attempt cannot both be
+    /// true. `Superseded` between them, or before them, changes nothing
+    /// to that: it says the epoch is closed, not that the commit was not
+    /// reported.
+    #[test]
+    fn a_rejection_after_a_commit_is_a_fault_whatever_came_between() {
+        let superseded = OpeningOutcome::Superseded;
+        for seen in [[COMMITTED_4, superseded], [superseded, COMMITTED_4]] {
+            for reported in [MOVED, EXHAUSTED] {
+                let (mut opening, command) = submitted();
+                for outcome in seen {
+                    take(&mut opening, command, outcome);
+                }
+                assert_eq!(opening.stage(), SUPERSEDED_AFTER_COMMIT, "{seen:?}");
+                assert_eq!(
+                    opening.observe(reply(command, reported)),
+                    Err(ReplyRefused::Contradictory {
+                        established: SUPERSEDED_AFTER_COMMIT,
+                        reported,
+                    }),
+                    "{seen:?} then {reported:?}"
+                );
+                assert_eq!(opening.stage(), NO_GRANT_OUT);
+                assert_eq!(
+                    opening.submit(RunEpoch::new(5)),
+                    Err(SubmitRefused::Faulted)
+                );
+            }
+        }
+        // The commit repeated after it was seen teaches nothing.
+        let (mut opening, command) = committed();
+        take(&mut opening, command, superseded);
+        assert_eq!(
+            opening.observe(reply(command, COMMITTED_4)),
+            Ok(Observed::Unchanged)
+        );
+    }
+
+    /// The store reports the epoch of a grant that already left closed.
+    /// The grant cannot be taken back, so the opening keeps what was
+    /// said: a caller that drops the return value still finds it in the
+    /// stage, and nothing confirms the grant any more.
+    #[test]
+    fn a_grant_whose_epoch_was_reported_closed_stays_marked() {
+        let (mut opening, command) = committed();
+        let grant = opening.hand_over().expect("committed");
+        let closed = OpeningStage::GrantSuperseded(grant.opened());
+        assert_eq!(
+            opening.observe(reply(command, OpeningOutcome::Superseded)),
+            Ok(Observed::Advanced(closed))
+        );
+        for again in [
+            OpeningOutcome::Superseded,
+            COMMITTED_4,
+            OpeningOutcome::Unknown,
+        ] {
+            assert_eq!(
+                opening.observe(reply(command, again)),
+                Ok(Observed::Unchanged)
+            );
+            assert_eq!(opening.stage(), closed);
+        }
+        assert_eq!(opening.hand_over(), Err(HandOverRefused::AlreadyHandedOver));
+        assert_eq!(opening.abandon(), Err(NotAwaiting(closed)));
+        // No other epoch is opened around the owners of the closed one.
+        for read in [4, 5, 6] {
+            assert_eq!(
+                opening.submit(RunEpoch::new(read)),
+                Err(SubmitRefused::AlreadyOpened)
+            );
+        }
+        assert_eq!(
+            opening.check_recovered(DATA_SET, RunEpoch::new(4)),
+            RecoveredEpochCheck::Closed
+        );
+        assert_eq!(
+            opening.check_recovered(DATA_SET, RunEpoch::new(5)),
+            RecoveredEpochCheck::Foreign
+        );
+        assert_eq!(
+            opening.check_recovered(StoreIncarnation::new(2), RunEpoch::new(4)),
+            RecoveredEpochCheck::Foreign
+        );
+        assert_eq!(opening.stage(), closed);
+
+        // A contradiction afterwards still records the grant that is out.
+        assert_eq!(
+            opening.observe(reply(command, MOVED)),
+            Err(ReplyRefused::Contradictory {
+                established: closed,
+                reported: MOVED,
+            })
+        );
+        assert_eq!(
+            opening.stage(),
+            OpeningStage::Faulted {
+                handed_over: Some(grant.opened())
+            }
         );
     }
 
@@ -1487,9 +1654,11 @@ mod tests {
             OpeningRejection::ForeignIncarnation,
         ] {
             let (mut opening, command) = submitted();
-            opening
-                .observe(reply(command, OpeningOutcome::RejectedCertain(reason)))
-                .expect("correlated");
+            take(
+                &mut opening,
+                command,
+                OpeningOutcome::RejectedCertain(reason),
+            );
             assert_eq!(
                 opening.hand_over(),
                 Err(HandOverRefused::NotCommitted(OpeningStage::Rejected(
@@ -1505,48 +1674,77 @@ mod tests {
 
         // The predecessor moved: start-up reads again and tries again.
         let (mut opening, command) = submitted();
-        opening.observe(reply(command, MOVED)).expect("correlated");
+        take(&mut opening, command, MOVED);
         assert!(opening.hand_over().is_err());
         let again = opening.submit(RunEpoch::new(4)).expect("not definitive");
         assert_ne!(again.attempt, command.attempt);
         assert_eq!(again.after, RunEpoch::new(4));
     }
 
-    /// The store answered that an epoch was opened after the value read.
-    /// A value read again that is not higher is a stale read: a command
-    /// on it could only be refused again, and start-up would loop.
+    /// The store's replies say what was opened after the value read: one
+    /// epoch when the predecessor moved, two when the attempt is
+    /// superseded, since the epoch it asked for was opened and closed. A
+    /// value read again below that is a stale read: a command on it
+    /// could only be refused again, and start-up would loop. The bound
+    /// is the ledger's and never comes down, whatever reply follows.
     #[test]
     fn after_the_store_says_the_condition_moved_the_next_read_must_be_higher() {
-        for outcome in [MOVED, OpeningOutcome::Superseded] {
+        let superseded = OpeningOutcome::Superseded;
+        // The replies to a command on epoch 3, and the lowest value
+        // that may be read afterwards.
+        let cases: [(&[OpeningOutcome], u64); 7] = [
+            (&[MOVED], 4),
+            (&[superseded], 5),
+            (&[COMMITTED_4, superseded], 5),
+            (&[superseded, COMMITTED_4], 5),
+            (&[superseded, MOVED], 5),
+            (&[MOVED, superseded], 5),
+            // An unknown outcome: the attempt may simply not have been
+            // applied, and the same value may be read again.
+            (&[OpeningOutcome::Unknown], 3),
+        ];
+        for (replies, lowest) in cases {
             let (mut opening, command) = submitted();
-            opening
-                .observe(reply(command, outcome))
-                .expect("correlated");
+            for outcome in replies {
+                take(&mut opening, command, *outcome);
+            }
             let stage = opening.stage();
             assert_eq!(
-                opening.submit(RunEpoch::new(3)),
-                Err(SubmitRefused::ConditionUnchanged),
-                "{outcome:?}"
-            );
-            assert_eq!(
                 opening.submit(RunEpoch::new(2)),
-                Err(SubmitRefused::LedgerRegressed)
+                Err(SubmitRefused::LedgerRegressed),
+                "{replies:?}"
             );
+            for stale in 3..lowest {
+                assert_eq!(
+                    opening.submit(RunEpoch::new(stale)),
+                    Err(SubmitRefused::StaleRead),
+                    "{replies:?}, read {stale}"
+                );
+            }
             // The refusals consumed no ticket and changed nothing.
             assert_eq!(opening.stage(), stage);
-            let next = opening.submit(RunEpoch::new(4)).expect("a higher read");
+            let next = opening
+                .submit(RunEpoch::new(lowest))
+                .expect("a read that is high enough");
+            assert_eq!(next.after, RunEpoch::new(lowest), "{replies:?}");
             assert_eq!(next.attempt.ticket.get(), command.attempt.ticket.get() + 1);
         }
-        // After an unknown outcome the same value may be read again: the
-        // attempt may simply not have been applied.
-        let (mut opening, _command) = submitted();
-        opening.abandon().expect("awaiting");
-        assert_eq!(
-            opening.submit(RunEpoch::new(2)),
-            Err(SubmitRefused::LedgerRegressed)
-        );
-        assert_eq!(opening.stage(), OpeningStage::Unknown);
-        assert!(opening.submit(RunEpoch::new(3)).is_ok());
+
+        // At the end of the epochs nothing wraps: a bound past the last
+        // epoch refuses every read.
+        for (outcome, accepted) in [(MOVED, Some(u64::MAX)), (superseded, None)] {
+            let mut opening = fresh();
+            let command = opening.submit(RunEpoch::new(u64::MAX - 1)).expect("idle");
+            take(&mut opening, command, outcome);
+            for read in [u64::MAX - 1, u64::MAX] {
+                let result = opening.submit(RunEpoch::new(read));
+                if accepted == Some(read) {
+                    assert!(result.is_ok(), "{outcome:?}, read {read}");
+                } else {
+                    assert_eq!(result, Err(SubmitRefused::StaleRead), "{outcome:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1556,9 +1754,7 @@ mod tests {
             opening.submit(RunEpoch::new(3)),
             Err(SubmitRefused::AwaitingReply)
         );
-        opening
-            .observe(reply(command, COMMITTED_4))
-            .expect("the answer");
+        take(&mut opening, command, COMMITTED_4);
         assert_eq!(
             opening.submit(RunEpoch::new(4)),
             Err(SubmitRefused::AlreadyOpened)
@@ -1620,16 +1816,17 @@ mod tests {
         Advance(OpeningStage),
         Same,
         Fault,
-        GrantSuperseded,
     }
 
     /// The table of the module documentation, cell by cell.
     #[test]
     fn every_stage_takes_every_reply_as_the_table_says() {
-        use Expect::{Advance, Fault, GrantSuperseded, Same};
+        use Expect::{Advance, Fault, Same};
         let moved = OpeningStage::Rejected(OpeningRejection::PredecessorMoved);
         let exhausted = OpeningStage::Rejected(OpeningRejection::EpochsExhausted);
         let held = OpeningStage::Committed(opened(4));
+        let out = OpeningStage::HandedOver(opened(4));
+        let closed = OpeningStage::GrantSuperseded(opened(4));
         let replies = [
             OpeningOutcome::Unknown,
             OpeningOutcome::Superseded,
@@ -1642,7 +1839,7 @@ mod tests {
                 OpeningStage::Submitted,
                 [
                     Advance(OpeningStage::Unknown),
-                    Advance(OpeningStage::Superseded),
+                    Advance(SUPERSEDED),
                     Advance(held),
                     Fault,
                     Advance(exhausted),
@@ -1652,52 +1849,62 @@ mod tests {
                 OpeningStage::Unknown,
                 [
                     Same,
-                    Advance(OpeningStage::Superseded),
+                    Advance(SUPERSEDED),
                     Advance(held),
                     Fault,
                     Advance(exhausted),
                 ],
             ),
             (
-                OpeningStage::Superseded,
-                [Same, Same, Same, Fault, Advance(exhausted)],
+                SUPERSEDED,
+                [
+                    Same,
+                    Same,
+                    Advance(SUPERSEDED_AFTER_COMMIT),
+                    Fault,
+                    Advance(exhausted),
+                ],
             ),
+            (SUPERSEDED_AFTER_COMMIT, [Same, Same, Same, Fault, Fault]),
             (moved, [Same, Same, Fault, Fault, Same]),
             (
                 held,
-                [Same, Advance(OpeningStage::Superseded), Same, Fault, Fault],
+                [Same, Advance(SUPERSEDED_AFTER_COMMIT), Same, Fault, Fault],
             ),
-            (
-                OpeningStage::HandedOver(opened(4)),
-                [Same, GrantSuperseded, Same, Fault, Fault],
-            ),
+            (out, [Same, Advance(closed), Same, Fault, Fault]),
+            (closed, [Same, Same, Same, Fault, Fault]),
         ];
         for (stage, row) in table {
             for (outcome, expected) in replies.into_iter().zip(row) {
                 // Reach the stage by the replies that lead to it.
                 let (mut opening, command) = submitted();
-                match stage {
-                    OpeningStage::Submitted => {}
-                    OpeningStage::Unknown => opening.abandon().expect("awaiting"),
-                    OpeningStage::Superseded => {
-                        opening
-                            .observe(reply(command, OpeningOutcome::Superseded))
-                            .expect("correlated");
+                let lead: &[OpeningOutcome] = match stage {
+                    OpeningStage::Submitted => &[],
+                    OpeningStage::Unknown => &[OpeningOutcome::Unknown],
+                    OpeningStage::Superseded { commit_seen: false } => {
+                        &[OpeningOutcome::Superseded]
                     }
-                    OpeningStage::Rejected(_) => {
-                        opening.observe(reply(command, MOVED)).expect("correlated");
+                    OpeningStage::Superseded { commit_seen: true } => {
+                        &[COMMITTED_4, OpeningOutcome::Superseded]
                     }
-                    OpeningStage::Committed(_) | OpeningStage::HandedOver(_) => {
-                        opening
-                            .observe(reply(command, COMMITTED_4))
-                            .expect("the answer");
-                        if let OpeningStage::HandedOver(_) = stage {
-                            let _grant = opening.hand_over().expect("committed");
-                        }
-                    }
+                    OpeningStage::Rejected(_) => &[MOVED],
+                    OpeningStage::Committed(_) | OpeningStage::HandedOver(_) => &[COMMITTED_4],
+                    OpeningStage::GrantSuperseded(_) => &[COMMITTED_4],
                     OpeningStage::Idle | OpeningStage::Faulted { .. } => {
                         panic!("not a row of the table")
                     }
+                };
+                for outcome in lead {
+                    take(&mut opening, command, *outcome);
+                }
+                let grant_out = match stage {
+                    OpeningStage::HandedOver(_) | OpeningStage::GrantSuperseded(_) => {
+                        Some(opening.hand_over().expect("committed").opened())
+                    }
+                    _ => None,
+                };
+                if stage == closed {
+                    take(&mut opening, command, OpeningOutcome::Superseded);
                 }
                 assert_eq!(opening.stage(), stage);
 
@@ -1715,14 +1922,6 @@ mod tests {
                         assert_eq!(result, Ok(Observed::Unchanged), "{stage:?} x {outcome:?}");
                         assert_eq!(opening.stage(), stage, "{stage:?} x {outcome:?}");
                     }
-                    GrantSuperseded => {
-                        assert_eq!(
-                            result,
-                            Ok(Observed::GrantedEpochSuperseded(opened(4))),
-                            "{stage:?} x {outcome:?}"
-                        );
-                        assert_eq!(opening.stage(), stage, "{stage:?} x {outcome:?}");
-                    }
                     Fault => {
                         assert_eq!(
                             result,
@@ -1732,8 +1931,11 @@ mod tests {
                             }),
                             "{stage:?} x {outcome:?}"
                         );
-                        assert!(
-                            matches!(opening.stage(), OpeningStage::Faulted { .. }),
+                        assert_eq!(
+                            opening.stage(),
+                            OpeningStage::Faulted {
+                                handed_over: grant_out
+                            },
                             "{stage:?} x {outcome:?}"
                         );
                         // The last row: a faulted opening refuses all.
@@ -1757,6 +1959,26 @@ mod tests {
         }
     }
 
+    /// A ledger whose last opened epoch is `epoch`, opened by an
+    /// attempt of some earlier start-up.
+    fn ledger_at(epoch: u64) -> EpochLedger {
+        let opener = OpeningAttempt {
+            startup: StartupNonce::new([9; 16]),
+            ticket: OpeningTicket::new(1),
+        };
+        EpochLedger::from_durable(DATA_SET, RunEpoch::new(epoch), Some(opener))
+            .expect("an epoch and its opener")
+    }
+
+    /// A store reduced to its ledger: it decides, writes what the
+    /// decision gives it, and answers from what is then durable.
+    fn apply(ledger: &mut EpochLedger, command: &OpenEpoch) -> OpeningOutcome {
+        if let LedgerOpening::Opens { ledger: next } = ledger.open(command) {
+            *ledger = next;
+        }
+        OpeningOutcome::read(ledger, command)
+    }
+
     /// Why the nonce is needed. Two processes are alive on one data set:
     /// the older one was only presumed dead. Both read epoch 3 and both
     /// issue ticket 1. The ledger commits one and rejects the other, in
@@ -1764,29 +1986,26 @@ mod tests {
     /// exactly one of them obtains a grant.
     #[test]
     fn two_live_openings_on_one_condition_yield_one_grant() {
-        use crate::command::EpochLedger;
         for ours_first in [true, false] {
-            let read = EpochLedger::from_durable(DATA_SET, RunEpoch::new(3), None);
+            let mut ledger = ledger_at(3);
             let mut openings = [fresh(), EpochOpening::new(DATA_SET, OTHER_START)];
             let commands = openings
                 .each_mut()
-                .map(|opening| opening.submit(read.last_opened()).expect("idle"));
+                .map(|opening| opening.submit(ledger.last_opened()).expect("idle"));
             assert_eq!(commands[0].attempt.ticket, commands[1].attempt.ticket);
             assert_ne!(commands[0], commands[1]);
 
             let order = if ours_first { [0, 1] } else { [1, 0] };
-            let LedgerOpening::Opens { ledger, .. } = read.open(&commands[order[0]]) else {
-                panic!("the first command to arrive does not open");
-            };
             let mut grants = Vec::new();
-            // Each command is delivered twice, the loser first.
-            for index in [order[1], order[0], order[1], order[0]] {
-                let outcome = OpeningOutcome::of(DATA_SET, ledger.open(&commands[index]));
-                let _ = openings[index].observe(reply(commands[index], outcome));
+            // Each command is delivered three times.
+            for index in [order[0], order[1], order[1], order[0], order[1], order[0]] {
+                let outcome = apply(&mut ledger, &commands[index]);
+                take(&mut openings[index], commands[index], outcome);
                 if let Ok(grant) = openings[index].hand_over() {
                     grants.push((index, grant));
                 }
             }
+            assert_eq!(ledger.open_epoch(), Some(RunEpoch::new(4)));
             assert_eq!(grants.len(), 1, "one epoch, one authority");
             assert_eq!(grants[0].0, order[0]);
             assert_eq!(grants[0].1.opened(), opened(4));
@@ -1797,58 +2016,137 @@ mod tests {
         }
     }
 
-    /// The precondition, made visible: that no two start-ups share a
-    /// nonce is what the adapter owes. If two do, their first commands
-    /// are one command, the ledger answers both the same commit, and
-    /// two grants exist for one epoch. Nothing here can detect it.
+    /// The precondition, where it is seen broken. A start-up drew the
+    /// nonce of the one that opened the open epoch. It reads that epoch
+    /// and asks for the next under an identity that already designates
+    /// another command. The store opens nothing, the epoch of the first
+    /// grant stays open, and the second start-up stops for good.
+    #[test]
+    fn a_start_up_that_reused_the_nonce_of_the_opener_opens_nothing() {
+        let mut ledger = ledger_at(3);
+        let mut first = fresh();
+        let opener = first.submit(ledger.last_opened()).expect("idle");
+        let outcome = apply(&mut ledger, &opener);
+        take(&mut first, opener, outcome);
+        let grant = first.hand_over().expect("committed");
+        assert_eq!(grant.opened(), opened(4));
+
+        let mut second = fresh();
+        let reused = second.submit(ledger.last_opened()).expect("idle");
+        assert_eq!(reused.attempt, opener.attempt);
+        assert_ne!(reused, opener);
+        let outcome = apply(&mut ledger, &reused);
+        let stopped = OpeningRejection::AttemptReused;
+        assert_eq!(outcome, OpeningOutcome::RejectedCertain(stopped));
+        assert_eq!(ledger.open_epoch(), Some(grant.epoch()));
+        assert_eq!(
+            second.observe(reply(reused, outcome)),
+            Ok(Observed::Advanced(OpeningStage::Rejected(stopped)))
+        );
+        assert_eq!(
+            second.hand_over(),
+            Err(HandOverRefused::NotCommitted(OpeningStage::Rejected(
+                stopped
+            )))
+        );
+        for read in [4, 5] {
+            assert_eq!(
+                second.submit(RunEpoch::new(read)),
+                Err(SubmitRefused::Rejected(stopped))
+            );
+        }
+        // The first start-up is still answered as the opener.
+        assert_eq!(apply(&mut ledger, &opener), COMMITTED_4);
+    }
+
+    /// The limit of that detection, named. Two start-ups with one nonce
+    /// that read the same value form one and the same command. The
+    /// ledger answers a command presented again as the one that opened
+    /// the epoch, so both are told they committed and two grants exist
+    /// for one epoch. Nothing here can tell them apart: that no two
+    /// start-ups share a nonce is what the adapter owes.
     #[test]
     fn two_start_ups_with_one_nonce_obtain_two_grants() {
-        use crate::command::EpochLedger;
-        let read = EpochLedger::from_durable(DATA_SET, RunEpoch::new(3), None);
+        let mut ledger = ledger_at(3);
         let mut openings = [fresh(), fresh()];
         let commands = openings
             .each_mut()
-            .map(|opening| opening.submit(read.last_opened()).expect("idle"));
-        assert_eq!(commands[0], commands[1], "the commands are told apart");
+            .map(|opening| opening.submit(ledger.last_opened()).expect("idle"));
+        assert_eq!(
+            commands[0], commands[1],
+            "one nonce and one condition make one command"
+        );
 
-        let LedgerOpening::Opens { ledger, .. } = read.open(&commands[0]) else {
-            panic!("not opened");
-        };
         let mut grants = Vec::new();
         for (opening, command) in openings.iter_mut().zip(commands) {
-            let outcome = OpeningOutcome::of(DATA_SET, ledger.open(&command));
-            opening
-                .observe(reply(command, outcome))
-                .expect("correlated");
+            let outcome = apply(&mut ledger, &command);
+            take(opening, command, outcome);
             grants.push(opening.hand_over().expect("committed"));
         }
         assert_eq!(grants[0].opened(), grants[1].opened());
     }
 
+    /// A commit is reported from a ledger that holds it, and from
+    /// nothing else: the data set and the epoch are the ledger's, and
+    /// the ledger names the command as its opener.
     #[test]
-    fn the_outcome_of_a_ledger_decision_never_calls_a_past_opening_a_rejection() {
-        use crate::command::EpochLedger;
-        let ledger = EpochLedger::fresh(DATA_SET);
+    fn a_commit_is_read_only_from_a_ledger_that_holds_it() {
+        let read = ledger_at(3);
+        let (_, command) = submitted();
+        // The command would open epoch 4 and has not: no commit.
+        let LedgerOpening::Opens { ledger: written } = read.open(&command) else {
+            panic!("not opened");
+        };
+        assert_eq!(
+            OpeningOutcome::read(&read, &command),
+            OpeningOutcome::Unknown
+        );
+        assert_eq!(OpeningOutcome::read(&written, &command), COMMITTED_4);
+
+        // A store that could not write answers from what is durable,
+        // and its start-up gets no grant.
+        let (mut opening, command) = submitted();
+        let durable = read;
+        take(
+            &mut opening,
+            command,
+            OpeningOutcome::read(&durable, &command),
+        );
+        assert_eq!(opening.stage(), OpeningStage::Unknown);
+        assert!(opening.hand_over().is_err());
+
+        // The data set of a commit is the ledger's own.
+        let elsewhere = StoreIncarnation::new(2);
+        let other_set = EpochLedger::from_durable(elsewhere, read.last_opened(), read.opened_by())
+            .expect("an epoch and its opener");
+        let there = OpenEpoch {
+            incarnation: elsewhere,
+            ..command
+        };
+        let LedgerOpening::Opens { ledger: written } = other_set.open(&there) else {
+            panic!("not opened");
+        };
+        assert_eq!(
+            OpeningOutcome::read(&written, &there),
+            OpeningOutcome::Committed(EpochOpened {
+                incarnation: elsewhere,
+                epoch: RunEpoch::new(4),
+            })
+        );
+        assert_eq!(
+            OpeningOutcome::read(&written, &command),
+            OpeningOutcome::RejectedCertain(OpeningRejection::ForeignIncarnation)
+        );
+    }
+
+    #[test]
+    fn the_outcome_read_from_a_ledger_never_calls_a_past_opening_a_rejection() {
+        let mut ledger = EpochLedger::fresh(DATA_SET);
         let (_, command) = submitted();
         let first = OpenEpoch {
             after: RunEpoch::new(0),
             ..command
         };
-        let LedgerOpening::Opens { ledger: one, epoch } = ledger.open(&first) else {
-            panic!("not opened");
-        };
-        assert_eq!(
-            OpeningOutcome::of(DATA_SET, ledger.open(&first)),
-            OpeningOutcome::Committed(EpochOpened {
-                incarnation: DATA_SET,
-                epoch
-            })
-        );
-        // Presented again: the same commit, not a rejection.
-        assert_eq!(
-            OpeningOutcome::of(DATA_SET, one.open(&first)),
-            OpeningOutcome::Committed(opened(1))
-        );
         let second = OpenEpoch {
             attempt: OpeningAttempt {
                 startup: OTHER_START,
@@ -1857,25 +2155,39 @@ mod tests {
             after: RunEpoch::new(1),
             ..first
         };
-        let LedgerOpening::Opens { ledger: two, .. } = one.open(&second) else {
-            panic!("not opened");
+        // A condition ahead of the ledger: nothing certain.
+        assert_eq!(apply(&mut ledger, &second), OpeningOutcome::Unknown);
+        assert_eq!(ledger, EpochLedger::fresh(DATA_SET));
+
+        assert_eq!(
+            apply(&mut ledger, &first),
+            OpeningOutcome::Committed(opened(1))
+        );
+        // Presented again: the same commit, not a rejection.
+        assert_eq!(
+            apply(&mut ledger, &first),
+            OpeningOutcome::Committed(opened(1))
+        );
+        // A rival on the same condition is the one certainly rejected.
+        let rival = OpenEpoch {
+            attempt: OpeningAttempt {
+                ticket: OpeningTicket::new(2),
+                ..second.attempt
+            },
+            ..first
         };
-        // Its epoch is closed now: superseded, still not a rejection.
+        assert_eq!(apply(&mut ledger, &rival), MOVED);
+
         assert_eq!(
-            OpeningOutcome::of(DATA_SET, two.open(&first)),
-            OpeningOutcome::Superseded
+            apply(&mut ledger, &second),
+            OpeningOutcome::Committed(opened(2))
         );
-        assert_eq!(
-            OpeningOutcome::of(DATA_SET, ledger.open(&second)),
-            OpeningOutcome::Unknown
-        );
-        assert_eq!(
-            OpeningOutcome::of(
-                DATA_SET,
-                LedgerOpening::Rejected(OpeningRejection::PredecessorMoved)
-            ),
-            MOVED
-        );
+        // Their epoch is closed now: superseded, still not a rejection,
+        // for the one that opened it and for the one that did not.
+        for command in [first, rival] {
+            assert_eq!(apply(&mut ledger, &command), OpeningOutcome::Superseded);
+        }
+        assert_eq!(ledger.open_epoch(), Some(RunEpoch::new(2)));
     }
 
     #[test]
@@ -1892,7 +2204,15 @@ mod tests {
         }
 
         let mut last = EpochOpening {
-            ticket: OpeningTicket::new(u64::MAX - 1),
+            in_flight: Some(OpenEpoch {
+                attempt: OpeningAttempt {
+                    startup: THIS_START,
+                    ticket: OpeningTicket::new(u64::MAX - 1),
+                },
+                incarnation: DATA_SET,
+                after: RunEpoch::new(3),
+            }),
+            floor: Ok(RunEpoch::new(3)),
             stage: OpeningStage::Unknown,
             ..fresh()
         };
@@ -1937,18 +2257,213 @@ mod tests {
         },
     }
 
-    /// Every sequence of five actions: two conditions, two tickets, the
-    /// replies of this start-up and of another one with the same
-    /// tickets, and every kind of outcome.
+    /// One state of the search: the opening, field by field, and what
+    /// an observer of the replies it took knows about the attempt in
+    /// flight. The observer never looks at the stage.
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct Explored {
+        in_flight: Option<OpenEpoch>,
+        floor: Result<RunEpoch, Exhausted>,
+        stage: OpeningStage,
+        /// Every command this opening made, oldest first.
+        commands: Vec<OpenEpoch>,
+        /// No reply was taken for the attempt and it was not abandoned.
+        awaiting: bool,
+        commit: Option<EpochOpened>,
+        /// The first rejection taken.
+        rejected: Option<OpeningRejection>,
+        moved: bool,
+        superseded: bool,
+        faulted: bool,
+        granted: Option<EpochOpened>,
+    }
+
+    impl Explored {
+        /// The lowest value the next read may have, as the replies
+        /// taken establish it.
+        fn lowest_read(&self) -> u64 {
+            let Some(last) = self.commands.last() else {
+                return 0;
+            };
+            last.after.get()
+                + if self.superseded {
+                    2
+                } else {
+                    u64::from(self.moved)
+                }
+        }
+
+        /// Applies one action to a copy of the opening, checks what it
+        /// did against the observer, and returns the state it leads to.
+        fn step(&self, action: Action) -> Self {
+            let mut opening = EpochOpening {
+                incarnation: DATA_SET,
+                startup: THIS_START,
+                in_flight: self.in_flight,
+                floor: self.floor,
+                stage: self.stage,
+            };
+            let mut next = self.clone();
+            let definitive = self.rejected.is_some_and(OpeningRejection::is_definitive);
+            // A grant is due: a commit, and nothing that takes it back.
+            let due = self.commit.is_some()
+                && self.rejected.is_none()
+                && !self.superseded
+                && !self.faulted
+                && self.granted.is_none();
+            match action {
+                Action::Submit(read) => {
+                    let regressed = self
+                        .commands
+                        .last()
+                        .is_some_and(|last| read < last.after.get());
+                    let expected = if self.faulted {
+                        Err(SubmitRefused::Faulted)
+                    } else if self.awaiting {
+                        Err(SubmitRefused::AwaitingReply)
+                    } else if self.granted.is_some() || due {
+                        Err(SubmitRefused::AlreadyOpened)
+                    } else if let (Some(reason), true) = (self.rejected, definitive) {
+                        Err(SubmitRefused::Rejected(reason))
+                    } else if regressed {
+                        Err(SubmitRefused::LedgerRegressed)
+                    } else if read < self.lowest_read() {
+                        Err(SubmitRefused::StaleRead)
+                    } else {
+                        Ok(())
+                    };
+                    let result = opening.submit(RunEpoch::new(read));
+                    assert_eq!(result.map(|_| ()), expected, "{self:?} then {action:?}");
+                    if let Ok(command) = result {
+                        assert!(!self.commands.contains(&command), "a command made twice");
+                        assert_eq!(command.after, RunEpoch::new(read));
+                        assert_eq!(command.incarnation, DATA_SET);
+                        next.commands.push(command);
+                        next.awaiting = true;
+                        next.commit = None;
+                        next.rejected = None;
+                        next.moved = false;
+                        next.superseded = false;
+                    }
+                }
+                Action::Abandon => {
+                    let result = opening.abandon();
+                    assert_eq!(result.is_ok(), self.awaiting && !self.faulted);
+                    next.awaiting &= result.is_err();
+                }
+                Action::HandOver => match opening.hand_over() {
+                    Ok(grant) => {
+                        assert!(due, "an unfounded grant: {self:?}");
+                        assert_eq!(Some(grant.opened()), self.commit);
+                        next.granted = Some(grant.opened());
+                    }
+                    Err(_) => assert!(!due, "a grant that is due was refused: {self:?}"),
+                },
+                Action::Reply {
+                    ticket,
+                    ours,
+                    outcome,
+                } => {
+                    // The command this reply claims to answer: one this
+                    // opening made, or the same one made by another
+                    // start-up.
+                    let Some(made) = self
+                        .commands
+                        .iter()
+                        .find(|command| command.attempt.ticket.get() == ticket)
+                    else {
+                        return next;
+                    };
+                    let command = if ours {
+                        *made
+                    } else {
+                        OpenEpoch {
+                            attempt: OpeningAttempt {
+                                startup: OTHER_START,
+                                ..made.attempt
+                            },
+                            ..*made
+                        }
+                    };
+                    let in_flight = self.commands.last() == Some(&command);
+                    let answer = EpochOpened {
+                        incarnation: DATA_SET,
+                        epoch: RunEpoch::new(command.after.get() + 1),
+                    };
+                    // The replies to one command cannot all be true.
+                    let contradicts = match outcome {
+                        OpeningOutcome::Committed(opened) => {
+                            opened != answer || self.rejected.is_some()
+                        }
+                        OpeningOutcome::RejectedCertain(_) => self.commit.is_some(),
+                        OpeningOutcome::Superseded | OpeningOutcome::Unknown => false,
+                    };
+                    match opening.observe(OpeningReply { command, outcome }) {
+                        Ok(_) => {
+                            assert!(in_flight, "a reply to another command was taken");
+                            assert!(!self.faulted, "a reply taken after a fault");
+                            assert!(!contradicts, "{self:?} took {outcome:?}");
+                            next.awaiting = false;
+                            match outcome {
+                                OpeningOutcome::Committed(opened) => next.commit = Some(opened),
+                                OpeningOutcome::RejectedCertain(reason) => {
+                                    next.rejected = self.rejected.or(Some(reason));
+                                    next.moved |= reason == OpeningRejection::PredecessorMoved;
+                                }
+                                OpeningOutcome::Superseded => next.superseded = true,
+                                OpeningOutcome::Unknown => {}
+                            }
+                        }
+                        Err(ReplyRefused::Uncorrelated { attempt }) => {
+                            assert_eq!(attempt, command.attempt);
+                            assert!(!self.faulted && !in_flight, "{self:?} refused {outcome:?}");
+                        }
+                        Err(ReplyRefused::Contradictory { .. }) => {
+                            assert!(in_flight && !self.faulted);
+                            assert!(contradicts, "a fault without a cause: {self:?}");
+                            next.faulted = true;
+                        }
+                        Err(ReplyRefused::Faulted) => assert!(self.faulted),
+                    }
+                }
+            }
+            next.in_flight = opening.in_flight;
+            next.floor = opening.floor;
+            next.stage = opening.stage;
+            // What the stage says is what the observer saw.
+            assert_eq!(
+                matches!(next.stage, OpeningStage::Faulted { .. }),
+                next.faulted
+            );
+            if next.superseded && !next.faulted {
+                assert!(
+                    !matches!(
+                        next.stage,
+                        OpeningStage::Committed(_) | OpeningStage::HandedOver(_)
+                    ),
+                    "an epoch known closed is still presented as held: {next:?}"
+                );
+            }
+            next
+        }
+    }
+
+    /// Every state an opening can reach within four attempts, by any
+    /// sequence of actions of any length: four conditions, the replies
+    /// of this start-up and of another one with the same tickets, and
+    /// every kind of outcome. The search stops when no action leads to
+    /// a state not yet seen; the bound is the number of attempts, not
+    /// the number of actions.
     ///
-    /// Each refusal is told apart. A reply is taken only when it is to
-    /// the command in flight; a commit that is taken is the one answer
-    /// to that command; a fault is reported exactly when the replies to
-    /// one command cannot all be true; an opening hands over at most one
-    /// grant, founded on such a commit, and none once it is faulted or
-    /// its attempt is known superseded.
+    /// Each refusal of `submit` is the one the replies call for. A
+    /// reply is taken only when it is to the command in flight; a fault
+    /// is reported exactly when the replies to one command cannot all
+    /// be true, whatever came between them; an opening hands over
+    /// exactly the grant that is due, once; and a read below what the
+    /// store established is refused.
     #[test]
-    fn no_sequence_of_actions_yields_two_grants_or_an_unfounded_one() {
+    fn no_reachable_state_within_four_attempts_breaks_the_opening() {
+        const ATTEMPTS: usize = 4;
         let elsewhere = EpochOpened {
             incarnation: StoreIncarnation::new(2),
             epoch: RunEpoch::new(4),
@@ -1956,150 +2471,79 @@ mod tests {
         let mut actions = vec![
             Action::Submit(3),
             Action::Submit(4),
+            Action::Submit(5),
+            Action::Submit(6),
             Action::Abandon,
             Action::HandOver,
         ];
         for outcome in [
             COMMITTED_4,
             OpeningOutcome::Committed(opened(5)),
-            OpeningOutcome::Committed(opened(0)),
+            OpeningOutcome::Committed(opened(6)),
+            OpeningOutcome::Committed(opened(7)),
             OpeningOutcome::Committed(elsewhere),
             EXHAUSTED,
             MOVED,
             OpeningOutcome::Superseded,
             OpeningOutcome::Unknown,
         ] {
-            for (ticket, ours) in [(1, true), (2, true), (1, false)] {
-                actions.push(Action::Reply {
-                    ticket,
-                    ours,
-                    outcome,
-                });
-            }
-        }
-        const DEPTH: u32 = 4;
-        let base = actions.len();
-        let (mut granted_runs, mut faulted_runs, mut foreign_refusals) = (0u32, 0u32, 0u32);
-        for run in 0..base.pow(DEPTH) {
-            let mut code = run;
-            let mut opening = fresh();
-            let mut commands: Vec<OpenEpoch> = Vec::new();
-            // What the replies taken for the command in flight said.
-            let mut commit: Option<EpochOpened> = None;
-            let mut rejected = false;
-            let mut superseded = false;
-            let mut faulted = false;
-            let mut grants = Vec::new();
-            for _ in 0..DEPTH {
-                let action = actions[code % base];
-                code /= base;
-                match action {
-                    Action::Submit(last_opened) => {
-                        if let Ok(command) = opening.submit(RunEpoch::new(last_opened)) {
-                            assert!(!faulted, "an attempt after a fault");
-                            assert!(grants.is_empty(), "an attempt after a grant");
-                            commands.push(command);
-                            (commit, rejected, superseded) = (None, false, false);
-                        }
-                    }
-                    Action::Abandon => {
-                        let _ = opening.abandon();
-                    }
-                    Action::Reply {
+            for ticket in 1..=4 {
+                for ours in [true, false] {
+                    actions.push(Action::Reply {
                         ticket,
                         ours,
                         outcome,
-                    } => {
-                        // The command this reply claims to answer: one
-                        // this opening made, or the same one made by
-                        // another start-up.
-                        let Some(made) = commands
-                            .iter()
-                            .find(|command| command.attempt.ticket.get() == ticket)
-                        else {
-                            continue;
-                        };
-                        let command = if ours {
-                            *made
-                        } else {
-                            OpenEpoch {
-                                attempt: OpeningAttempt {
-                                    startup: OTHER_START,
-                                    ..made.attempt
-                                },
-                                ..*made
-                            }
-                        };
-                        let in_flight = commands.last() == Some(&command);
-                        let answer = EpochOpened {
-                            incarnation: DATA_SET,
-                            epoch: RunEpoch::new(command.after.get() + 1),
-                        };
-                        match opening.observe(OpeningReply { command, outcome }) {
-                            Ok(_) => {
-                                assert!(in_flight, "a reply to another command was taken");
-                                assert!(!faulted, "a reply taken after a fault");
-                                match outcome {
-                                    OpeningOutcome::Committed(opened) => {
-                                        assert_eq!(opened, answer, "an impossible commit");
-                                        assert!(!rejected, "a commit taken after a rejection");
-                                        commit = Some(opened);
-                                    }
-                                    OpeningOutcome::RejectedCertain(_) => {
-                                        assert!(
-                                            commit.is_none() || superseded,
-                                            "a rejection taken after a commit"
-                                        );
-                                        rejected = true;
-                                    }
-                                    OpeningOutcome::Superseded => superseded = true,
-                                    OpeningOutcome::Unknown => {}
-                                }
-                            }
-                            Err(ReplyRefused::Uncorrelated { attempt }) => {
-                                assert_eq!(attempt, command.attempt);
-                                assert!(!in_flight, "the reply in flight was refused");
-                                foreign_refusals += u32::from(!ours);
-                            }
-                            Err(ReplyRefused::Contradictory { .. }) => {
-                                assert!(in_flight && !faulted);
-                                let impossible = matches!(
-                                    outcome,
-                                    OpeningOutcome::Committed(opened) if opened != answer
-                                );
-                                let disagrees = match outcome {
-                                    OpeningOutcome::Committed(_) => rejected,
-                                    OpeningOutcome::RejectedCertain(_) => {
-                                        commit.is_some() && !superseded
-                                    }
-                                    _ => false,
-                                };
-                                assert!(impossible || disagrees, "a fault without a cause");
-                                faulted = true;
-                            }
-                            Err(ReplyRefused::Faulted) => assert!(faulted),
-                        }
+                    });
+                }
+            }
+        }
+        let start = fresh();
+        let mut seen = vec![Explored {
+            in_flight: start.in_flight,
+            floor: start.floor,
+            stage: start.stage,
+            commands: Vec::new(),
+            awaiting: false,
+            commit: None,
+            rejected: None,
+            moved: false,
+            superseded: false,
+            faulted: false,
+            granted: None,
+        }];
+        // Breadth first: `seen[from..]` is the frontier of one depth.
+        let (mut from, mut frontiers, mut transitions) = (0, 0u32, 0u32);
+        while from < seen.len() {
+            let until = seen.len();
+            for index in from..until {
+                let state = seen[index].clone();
+                for action in &actions {
+                    if matches!(action, Action::Submit(_)) && state.commands.len() == ATTEMPTS {
+                        continue;
                     }
-                    Action::HandOver => {
-                        if let Ok(grant) = opening.hand_over() {
-                            assert!(!faulted, "a grant after a fault");
-                            assert!(!superseded, "a grant for an epoch known closed");
-                            assert!(!rejected, "a grant after a rejection");
-                            assert_eq!(Some(grant.opened()), commit, "an unfounded grant");
-                            grants.push(grant);
-                        }
+                    let next = state.step(*action);
+                    transitions += 1;
+                    if !seen.contains(&next) {
+                        seen.push(next);
                     }
                 }
             }
-            assert!(grants.len() <= 1, "two grants from one opening");
-            granted_runs += u32::from(!grants.is_empty());
-            faulted_runs += u32::from(faulted);
+            from = until;
+            frontiers += 1;
         }
-        assert!(granted_runs > 0, "the search never reached a hand-over");
-        assert!(faulted_runs > 0, "the search never reached a fault");
-        assert!(
-            foreign_refusals > 0,
-            "no reply of another start-up was tried"
-        );
+        let reached = |wanted: fn(&Explored) -> bool| seen.iter().any(wanted);
+        assert!(reached(|state| state.granted.is_some() && state.superseded));
+        assert!(reached(|state| state.faulted && state.granted.is_some()));
+        assert!(reached(|state| state.commit.is_some()
+            && state.superseded
+            && state.faulted));
+        assert!(reached(
+            |state| state.commands.len() == ATTEMPTS && state.granted.is_some()
+        ));
+        // The size of what was searched, pinned so that a change of
+        // the machine or of the search shows: the states, the actions
+        // applied to them, and the frontiers. The farthest state is
+        // eleven actions away from the start.
+        assert_eq!((seen.len(), transitions, frontiers), (1795, 136_370, 12));
     }
 }
