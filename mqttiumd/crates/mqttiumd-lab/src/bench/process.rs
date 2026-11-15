@@ -392,7 +392,6 @@ pub struct Process {
     /// Kept for the life of the process: the one creator of boxes.
     authority: OwnerAuthority,
     owner: Owner,
-    outbox: Outbox,
     writer: TraceWriter<'static>,
     timer: Timer,
     transport: Transport,
@@ -718,8 +717,8 @@ impl Process {
         let outbox = authority
             .create_outbox(OWNER, settings.effect_slots, settings.reservations)
             .map_err(|refused| Stop::new(format!("no effect box: {refused:?}")))?;
-        let owner = Owner::new(settings.owner, &outbox)
-            .map_err(|refused| Stop::new(format!("no owner: {refused:?}")))?;
+        let owner = Owner::new(settings.owner, outbox)
+            .map_err(|refused| Stop::new(format!("no owner: {:?}", refused.reason)))?;
 
         // The faults of the scenario act on the broker's work; they are
         // armed once the epoch is open.
@@ -746,7 +745,6 @@ impl Process {
             store: sim,
             authority,
             owner,
-            outbox,
             writer,
             timer: Timer::default(),
             transport: Transport::default(),
@@ -762,6 +760,24 @@ impl Process {
     #[must_use]
     pub fn epoch(&self) -> RunEpoch {
         self.epoch
+    }
+
+    /// Creates an owner the way start-up does: a box from the authority
+    /// of this process, then the owner on it. The process is the one
+    /// creator of owners; this is how a composition test asks it for a
+    /// second owner of an identity it already holds.
+    pub fn create_owner(&mut self, owner: LogicalOwnerId) -> Result<Owner, String> {
+        let outbox = self
+            .authority
+            .create_outbox(
+                owner,
+                self.settings.effect_slots,
+                self.settings.reservations,
+            )
+            .map_err(|refused| format!("{refused:?}"))?;
+        let mut config = self.settings.owner;
+        config.account = AccountId::new(owner.get().saturating_add(1));
+        Owner::new(config, outbox).map_err(|refused| format!("{:?}", refused.reason))
     }
 
     /// The owners the authority of this process keeps active.
@@ -840,7 +856,7 @@ impl Process {
         let grant = TurnGrant {
             work_limit: WorkUnits::new(self.settings.work_limit),
         };
-        match self.owner.step(input, grant, &mut self.outbox) {
+        match self.owner.step(input, grant) {
             StepOutcome::Applied { .. } => {
                 let cause = match pending {
                     Some(pending) => Some(
@@ -858,7 +874,7 @@ impl Process {
                     None => None,
                 };
                 if let Some(cause) = cause {
-                    for effect in self.outbox.pending() {
+                    for effect in self.owner.outbox().into_iter().flat_map(Outbox::pending) {
                         books.published_by.entry(effect.id()).or_insert(cause);
                     }
                 }
@@ -889,7 +905,7 @@ impl Process {
             books,
             stop: None,
         };
-        let _report = self.outbox.dispatch(&mut sink);
+        let _report = self.owner.dispatch(&mut sink);
         match sink.stop {
             Some(stop) => Err(stop),
             None => Ok(()),
@@ -899,7 +915,7 @@ impl Process {
     /// Whether an effect still waits in the box, or an input for room.
     #[must_use]
     pub fn busy(&self) -> bool {
-        !self.outbox.is_empty() || self.parked.is_some()
+        self.owner.outbox().is_some_and(|outbox| !outbox.is_empty()) || self.parked.is_some()
     }
 
     /// After each choice: the parked input again, then the box.
