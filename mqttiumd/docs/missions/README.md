@@ -72,7 +72,7 @@ One lot per branch and per session. A lot changes only the paths it owns.
 | Lot | Owns | Mission |
 | - | - | - |
 | L1 Inbound core | `crates/mqttiumd-core/` except `src/credits.rs`; in `crates/mqttiumd-contract/src/`: `effects.rs`, `step.rs`, `ids.rs`, `capacity.rs`, `packet.rs` | [L1](L1-inbound-core.md) |
-| L2 Deterministic store | `crates/mqttiumd-lab/src/store/`, `crates/mqttiumd-lab/tests/store_*.rs`; in `crates/mqttiumd-contract/src/`: `command.rs`, `outcome.rs` | [L2](L2-deterministic-store.md) |
+| L2 Deterministic store | `crates/mqttiumd-lab/src/store/`, `crates/mqttiumd-lab/tests/store_*.rs`; in `crates/mqttiumd-contract/src/`: `command.rs`, `outcome.rs`, `opening.rs` | [L2](L2-deterministic-store.md) |
 | L3 Oracle, traces, registry | `contracts/`, `tests/oracle/`, `tests/scenarios/`, `tests/fixtures/`, `tools/build_corpus.py`, `tools/check_schemas.py`; the validation code of `crates/mqttiumd-lab/src/` (`semantic.rs`, `schemas.rs`, `strict.rs`, `workspace.rs`, `diagnostic.rs`); in `crates/mqttiumd-lab/tests/`: `contracts.rs`, `qualifying.rs`, `requirements.rs`, `support/`, and new files named `oracle_*.rs`, `trace_*.rs`, `scenario_*.rs`, `registry_*.rs` | [L3](L3-oracle-traces-registry.md) |
 | L5 Model M1 | `models/`, the model step of the workflow | [L5](L5-model-m1.md) |
 | L6 Pilot proof | `crates/mqttiumd-core/src/credits.rs`, `proofs/` | [L6](L6-pilot-proof.md) |
