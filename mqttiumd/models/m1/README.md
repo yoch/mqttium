@@ -265,7 +265,7 @@ states and is inconclusive. `Dests = {B, C}`, `NumOps = 2` and
 ## Correspondence (draft, completed with L4)
 
 Model actions against the rules of `contracts/v1/p1.transitions.json`
-(status `complete`, 92 rules, at the integration head `88c92a0`) and the
+(status `complete`, 92 rules, at the integration head `0d99de4`) and the
 steps of the scenarios. A dash means that nothing exists yet on that
 side. The last column names the deterministic test that replays the action
 on the real core, or the lot that owes it: no replay exists yet, and the
@@ -326,7 +326,9 @@ not an edit on either side (DEM-025). One is open:
   sends that PUBLISH again before it observed the refusal, which M1b
   reaches after a connection reset: under the rule the replay would open
   a new admission with a new identity. Which one is intended is not
-  decided here; the model keeps its predicate until it is.
+  decided here: the integration owner lists it in record 0013 (proposed),
+  for the owner of the repository to decide. Neither this lot nor the
+  core changes anything until then; the model keeps its predicate.
 
 ## Witnesses and scenarios
 
