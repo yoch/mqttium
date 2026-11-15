@@ -35,6 +35,23 @@ class Traces(unittest.TestCase):
                 reasons = {name: status.reasons for name, status in detail.items()}
                 self.assertEqual(found, case["expected"], reasons)
 
+    def test_a_run_of_the_specified_scenario_owes_what_every_run_owes(self):
+        # P1-02 as the specification writes it does not list the provenance
+        # of broker inputs. The oracle decides it all the same.
+        scenario = "tests/scenarios/p1/P1-02.json"
+        listed = json.loads((ROOT / scenario).read_text())["assertions"]
+        self.assertNotIn("broker_inputs_have_provenance", listed)
+        for trace, expected in [
+            ("p1-02-good", "PASS"),
+            ("provenance-result-answers-no-effect", "FAIL"),
+            ("provenance-page-holds-a-fact-nobody-read", "FAIL"),
+        ]:
+            with self.subTest(trace):
+                run = Run.load(self.contracts, scenario, f"tests/oracle/traces/{trace}/trace.jsonl")
+                found = {name: status.status for name, status in judge(run).items()}
+                self.assertEqual(found["broker_inputs_have_provenance"], expected)
+                self.assertEqual(set(found), {*listed, "broker_inputs_have_provenance"})
+
     def test_every_refusal_states_its_reason(self):
         for case in INDEX:
             with self.subTest(case["name"]):
