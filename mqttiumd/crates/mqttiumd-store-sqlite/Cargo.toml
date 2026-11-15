@@ -32,7 +32,7 @@ serde_json = "1"
 [features]
 # The kill points of the bench (plan L7-kill-inside-a-transaction). Off by
 # default; a build of the product never enables it.
-kill-points = []
+kill-points = ["rusqlite/hooks"]
 
 [[test]]
 name = "kill_points"

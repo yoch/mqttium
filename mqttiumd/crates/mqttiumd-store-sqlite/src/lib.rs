@@ -103,13 +103,10 @@ pub mod kill_points {
         /// the meta row one revision later, `COMMIT` not called yet. The
         /// transaction is open and holds the engine's write lock.
         CommitPrepared,
-        /// `store.commit.logged`: the engine's WAL hook, inside `COMMIT`.
-        /// The commit frame is written and synced, so the commit is
-        /// durable; `COMMIT` has not returned. Before any checkpoint.
+        /// `store.commit.logged`: the engine's WAL hook after the commit
+        /// and after release of SQLite's write lock. With WAL and FULL,
+        /// the commit is durable; `COMMIT` has not returned to the adapter.
         CommitLogged,
-        /// The same commit, after the checkpoint the store's WAL hook ran
-        /// because the WAL reached the threshold: only on such a commit.
-        CommitCheckpointed,
     }
 
     /// Called at each point the store passes. It may block, for the bench
@@ -148,6 +145,10 @@ pub struct Settings {
     /// `PRAGMA wal_autocheckpoint`, in pages: the engine's checkpoint of
     /// the WAL into the database. Commits are not grouped otherwise.
     pub wal_autocheckpoint: i64,
+    /// Who, if anyone, checkpoints the WAL on this connection. Normal
+    /// builds use `sqlite-autocheckpoint`; an armed kill hook uses
+    /// `disabled-while-kill-hook-armed`, with no checkpoint in its callback.
+    pub checkpoint_policy: &'static str,
     /// Whether this build carries the kill points of the bench (feature
     /// `kill-points`). A build of the product must say false.
     pub kill_points: bool,
@@ -1153,6 +1154,7 @@ fn settle(conn: &Connection) -> Result<Settings, OpenError> {
         user_version,
         page_size,
         wal_autocheckpoint,
+        checkpoint_policy: "sqlite-autocheckpoint",
         kill_points: cfg!(feature = "kill-points"),
     })
 }
@@ -1197,6 +1199,8 @@ pub struct SqliteStore {
     /// checkpoint done, before another writer can take the lock.
     #[cfg(feature = "kill-points")]
     kill_hook: kill_points::Shared,
+    #[cfg(feature = "kill-points")]
+    autocheckpoint_before_hook: Option<i64>,
     _writer_lock: File,
 }
 
@@ -1319,6 +1323,8 @@ impl SqliteStore {
             ledger: meta.ledger,
             #[cfg(feature = "kill-points")]
             kill_hook: kill_points::Shared::default(),
+            #[cfg(feature = "kill-points")]
+            autocheckpoint_before_hook: None,
             _writer_lock: lock,
         })
     }
@@ -1333,10 +1339,63 @@ impl SqliteStore {
     }
 
     /// Sets the function the store calls at each kill point, or removes it.
+    ///
+    /// Installation order is explicit: disable SQLite's autocheckpoint,
+    /// read back zero, then install the WAL hook. The hook reports the
+    /// committed transaction and performs no checkpoint. Removing it first
+    /// removes the WAL callback, then restores the saved autocheckpoint
+    /// threshold. A PRAGMA alone cannot prove the callback is installed;
+    /// the kill-point tests observe actual callback invocations.
     #[cfg(feature = "kill-points")]
     pub fn set_kill_hook(&mut self, hook: Option<kill_points::Hook>) -> Result<(), OpenError> {
-        if let Ok(mut held) = self.kill_hook.lock() {
-            *held = hook;
+        use kill_points::{KillPoint, pass};
+        let armed = hook.is_some();
+        if armed {
+            let threshold = self
+                .autocheckpoint_before_hook
+                .unwrap_or(self.settings.wal_autocheckpoint);
+            self.conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+            let read_back: i64 = self
+                .conn
+                .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
+            if read_back != 0 {
+                return Err(OpenError::Setting {
+                    name: "wal_autocheckpoint",
+                    read_back: read_back.to_string(),
+                });
+            }
+            *self
+                .kill_hook
+                .lock()
+                .expect("kill callback is not poisoned") = hook;
+            let shared = std::sync::Arc::clone(&self.kill_hook);
+            self.conn.wal_hook(Some(
+                move |_wal: &mut rusqlite::hooks::Wal, _frames: std::ffi::c_int| {
+                    pass(&shared, KillPoint::CommitLogged);
+                    Ok(())
+                },
+            ))?;
+            self.autocheckpoint_before_hook = Some(threshold);
+            self.settings.wal_autocheckpoint = read_back;
+            self.settings.checkpoint_policy = "disabled-while-kill-hook-armed";
+        } else {
+            self.conn.wal_hook(
+                None::<fn(&mut rusqlite::hooks::Wal, std::ffi::c_int) -> rusqlite::Result<()>>,
+            )?;
+            *self
+                .kill_hook
+                .lock()
+                .expect("kill callback is not poisoned") = None;
+            let threshold = self
+                .autocheckpoint_before_hook
+                .unwrap_or(self.settings.wal_autocheckpoint);
+            self.conn
+                .pragma_update(None, "wal_autocheckpoint", threshold)?;
+            self.settings.wal_autocheckpoint =
+                self.conn
+                    .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
+            self.autocheckpoint_before_hook = None;
+            self.settings.checkpoint_policy = "sqlite-autocheckpoint";
         }
         Ok(())
     }

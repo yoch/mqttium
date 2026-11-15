@@ -4,15 +4,15 @@
 //! - K1 `store.commit.prepared`: every row of a command written, `COMMIT`
 //!   not called. The file recovers to the state before the command and
 //!   the command, submitted again, is decided as a first submission.
-//! - K2b `store.commit.logged`: inside `COMMIT`, the commit frame durable,
-//!   `COMMIT` not returned; before, then after, the checkpoint the store's
-//!   WAL hook runs at the threshold. The file recovers to the state after
+//! - K2b `store.commit.logged`: after the commit and SQLite write-lock
+//!   release, before `COMMIT` returns; no checkpoint while the hook is
+//!   armed. The file recovers to the state after
 //!   the command and the command, submitted again, is answered from the
 //!   durable record without a second effect.
 //!
 //! Run with `cargo test -p mqttiumd-store-sqlite --features kill-points`.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -52,15 +52,11 @@ fn fresh_path() -> PathBuf {
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     for suffix in ["", "-wal", "-shm", ".writer-lock"] {
-        let _ = std::fs::remove_file(with_suffix(&path, suffix));
+        let mut file = path.clone().into_os_string();
+        file.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(file));
     }
     path
-}
-
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut file = path.to_path_buf().into_os_string();
-    file.push(suffix);
-    PathBuf::from(file)
 }
 
 fn roomy() -> Limits {
@@ -116,19 +112,14 @@ fn point_name(point: KillPoint) -> &'static str {
     match point {
         KillPoint::CommitPrepared => "store.commit.prepared",
         KillPoint::CommitLogged => "store.commit.logged",
-        KillPoint::CommitCheckpointed => "store.commit.logged-after-checkpoint",
     }
 }
 
 fn named(name: &str) -> KillPoint {
-    [
-        KillPoint::CommitPrepared,
-        KillPoint::CommitLogged,
-        KillPoint::CommitCheckpointed,
-    ]
-    .into_iter()
-    .find(|point| point_name(*point) == name)
-    .expect("a known point")
+    [KillPoint::CommitPrepared, KillPoint::CommitLogged]
+        .into_iter()
+        .find(|point| point_name(*point) == name)
+        .expect("a known point")
 }
 
 /// Not a test of its own: the body of the child process, run only when
@@ -192,9 +183,22 @@ impl Holder {
             .spawn()
             .expect("the child process");
         let stdout = child.stdout.take().expect("its output");
-        let mut lines = BufReader::new(stdout).lines().map_while(Result::ok);
-        let said = lines.find(|line| line.contains(AT) || line.ends_with(NO_POINT));
+        // Own the child before any fallible wait: a timeout or closed pipe
+        // must still kill and reap it. Both the output and the wait are bounded.
         let holder = Self { child };
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let mut lines = BufReader::new(stdout)
+                .take(4096)
+                .lines()
+                .map_while(Result::ok);
+            let said = lines.find(|line| line.contains(AT) || line.ends_with(NO_POINT));
+            let _ = sender.send(said);
+        });
+        let said = receiver
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("kill point reported within 15 seconds");
+        reader.join().expect("the bounded reader ended");
         let prefix = format!("{AT}{} ", point_name(point));
         let index = said
             .as_deref()
@@ -233,6 +237,12 @@ fn killed_at(point: KillPoint, durable: bool) -> usize {
     for command in &commands[..cut] {
         let _ = reference.store.apply(command);
     }
+    let before = reference.store.snapshot();
+    let mut after_cut = crate::reference();
+    for command in &commands[..=cut] {
+        let _ = after_cut.store.apply(command);
+    }
+    let after = after_cut.store.snapshot();
     if durable {
         assert!(reference.store.apply(&commands[cut]).committed_now);
     }
@@ -240,11 +250,11 @@ fn killed_at(point: KillPoint, durable: bool) -> usize {
     // No intervention between the kill and the restart: `open` takes the
     // writer's lock the kernel released, and runs `PRAGMA quick_check`.
     let mut store = SqliteStore::open(&path).expect("opened after the kill");
-    let after = store.try_snapshot().expect("decodes");
-    assert_eq!(accounts_match_what_is_held(&after), Ok(()));
+    let recovered = store.try_snapshot().expect("decodes");
+    assert_eq!(accounts_match_what_is_held(&recovered), Ok(()));
     assert_eq!(
-        after,
-        reference.store.snapshot(),
+        recovered,
+        if durable { after } else { before },
         "the whole durable state is the prefix{}",
         if durable { " and the command cut" } else { "" }
     );
@@ -270,46 +280,54 @@ fn a_kill_once_the_commit_is_logged_recovers_the_command() {
     assert_eq!(killed_at(KillPoint::CommitLogged, true), 0);
 }
 
+/// The installed callback actually runs, with checkpoint disabled while
+/// armed, and removing it restores the prior threshold.
 #[test]
-fn a_kill_after_the_checkpoint_inside_commit_recovers_the_command() {
-    // The first command whose commit reaches the threshold of the WAL.
-    let cut = killed_at(KillPoint::CommitCheckpointed, true);
-    assert!(cut > 0, "the threshold is reached after some commits");
-}
-
-/// While the WAL points are armed, the store's WAL hook checkpoints as
-/// the engine would have: the WAL stays within the threshold and one
-/// commit, and each checkpoint is passed once.
-#[test]
-fn the_wal_hook_keeps_the_checkpoint_of_the_engine() {
+fn the_wal_hook_runs_with_checkpoint_disabled_then_restores_the_threshold() {
     let path = fresh_path();
     let mut world = store_world(&path);
-    let threshold = world.store.effective_settings().wal_autocheckpoint;
-    let page = world.store.effective_settings().page_size;
-    let checkpoints = Arc::new(AtomicU64::new(0));
-    let counted = Arc::clone(&checkpoints);
+    let threshold = world
+        .store
+        .set_wal_autocheckpoint_for_measurement(16)
+        .expect("set");
+    let hits = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&hits);
     world
         .store
         .set_kill_hook(Some(Box::new(move |point| {
-            if point == KillPoint::CommitCheckpointed {
+            if point == KillPoint::CommitLogged {
                 counted.fetch_add(1, Ordering::SeqCst);
             }
         })))
         .expect("armed");
-    let wal = with_suffix(&path, "-wal");
-    let mut largest = 0;
-    for command in commands(&world).iter().take(800) {
+    assert_eq!(world.store.effective_settings().wal_autocheckpoint, 0);
+    assert_eq!(
+        world.store.effective_settings().checkpoint_policy,
+        "disabled-while-kill-hook-armed"
+    );
+    for command in commands(&world).iter().take(20) {
         assert!(world.store.apply(command).committed_now);
-        largest = largest.max(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0));
     }
-    let frame = u64::try_from(page).expect("positive") + 24;
-    let bound = 32 + (u64::try_from(threshold).expect("positive") + 64) * frame;
-    assert!(checkpoints.load(Ordering::SeqCst) > 0, "a checkpoint ran");
-    assert!(largest <= bound, "WAL {largest} bytes, bound {bound}");
-    // Disarmed: the engine's own checkpoint is back, at the same threshold.
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        20,
+        "the actual WAL callback ran for every commit"
+    );
     world.store.set_kill_hook(None).expect("disarmed");
     assert_eq!(
         world.store.effective_settings().wal_autocheckpoint,
         threshold
+    );
+    assert_eq!(
+        world.store.effective_settings().checkpoint_policy,
+        "sqlite-autocheckpoint"
+    );
+    for command in commands(&world).iter().skip(20).take(2) {
+        assert!(world.store.apply(command).committed_now);
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        20,
+        "no kill callback after removal"
     );
 }
