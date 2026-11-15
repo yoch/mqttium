@@ -13,6 +13,18 @@ from . import test_judge_rules as rules
 ADMISSION, corpus = rules.ADMISSION, rules.corpus
 
 
+def sqlite_lifecycle(events):
+    """The real child reports startup, then separately reads recovery pages.
+
+    Its startup record observes the new core incarnation; no bench record
+    is invented as a cause of a subsequent product recovery page.
+    """
+    events[corpus.at(events, "header")]["payload"]["backend"] = "sqlite"
+    restarted = events.pop(corpus.at(events, "restart"))
+    restarted["parents"] = ["recovery.grant"]
+    corpus.insert_after(events, "recovery.grant", [restarted])
+
+
 class RecoveredAdmissions(unittest.TestCase):
     """The two evidence sources are reconciled by durable OperationId."""
 
@@ -28,6 +40,47 @@ class RecoveredAdmissions(unittest.TestCase):
             edit(events)
 
         return judge.judge(self.run_of(history, edit_states))[ADMISSION]
+
+    def test_sqlite_recovery_uses_the_observed_startup_identity(self):
+        result = self.recovered(sqlite_lifecycle)
+        self.assertEqual(result.status, "PASS")
+
+    def test_sqlite_recovery_requires_an_unambiguous_matching_startup(self):
+        for problem in ("wrong-epoch", "wrong-incarnation", "absent", "contradictory-core", "reused-epoch"):
+            with self.subTest(problem=problem):
+                def edit(events):
+                    sqlite_lifecycle(events)
+                    if problem == "wrong-epoch":
+                        events[corpus.at(events, "restart")]["payload"]["run_epoch"] = "3"
+                    elif problem == "wrong-incarnation":
+                        for label in ("recovery.read", "recovery.in"):
+                            events[corpus.at(events, label)]["inc"] = 3
+                    elif problem == "absent":
+                        del events[corpus.at(events, "restart")]
+                    elif problem == "contradictory-core":
+                        events[corpus.at(events, "restart")]["parents"] = ["boot.grant"]
+                    else:
+                        duplicate = copy.deepcopy(events[corpus.at(events, "restart")])
+                        duplicate["label"] = "restart.reused"
+                        corpus.insert_after(events, "restart", [duplicate])
+
+                self.assertEqual(self.recovered(edit).status, "INCONCLUSIVE")
+
+    def test_sqlite_recovery_requires_the_original_observed_publication_source(self):
+        for problem in ("no-submission", "no-publish-source"):
+            with self.subTest(problem=problem):
+                def edit(events):
+                    sqlite_lifecycle(events)
+                    if problem == "no-submission":
+                        del events[corpus.at(events, "admit.submitted")]
+                        for event in events:
+                            event["parents"] = [parent for parent in event["parents"] if parent != "admit.submitted"]
+                    else:
+                        events[corpus.at(events, "admit.submitted")]["parents"] = []
+
+                result = self.recovered(edit)
+                self.assertEqual(result.status, "INCONCLUSIVE")
+                self.assertTrue(any("PUBLISH source" in reason for reason in result.reasons))
 
     def test_an_admission_visible_only_at_recovery_counts(self):
         self.assertEqual(self.recovered().status, "PASS")

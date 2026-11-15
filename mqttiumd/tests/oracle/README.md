@@ -313,3 +313,18 @@ record before the point. K1 compares obligations after retransmission and
 at the end; K2b/K3 compare them immediately after recovery and at the end.
 Full durable-state equality against the deterministic store belongs to
 the separate store tests; this assertion does not claim to calculate it.
+
+On SQLite, recovery after a kill is associated through lifecycle identity:
+exactly one supervisor `BrokerRecovered.run_epoch`, ordered after the
+kill, names the new child's core incarnation; that rank matches the page's
+origin incarnation and `run_epoch`. A missing, reused or contradictory
+startup identity leaves the attribution inconclusive. This process startup
+rank is distinct from the epoch inside a durable operation identity. The
+oracle still requires the exact matching page read before delivery. It
+does not infer a product cause from collector order, and does not change
+`Trace.before` when kill and recovery pages are causally unordered.
+The original `CommandSubmitted` with the same durable operation identity
+and its causally observed peer PUBLISH identify the exchange for an
+admission found only at SQLite recovery. The peer's local history locates
+that PUBLISH within its exchange, independently of the unordered recovery
+page. Missing or ambiguous submission/source evidence is inconclusive.
