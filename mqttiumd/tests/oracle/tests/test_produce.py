@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 import shutil
+import tarfile
 import unittest
 from unittest import mock
 
@@ -29,6 +30,7 @@ BARE = "contracts/examples/v1/valid/run-manifest-content-only.json"
 
 
 ORACLE = "tests/oracle/mqttiumd_oracle"
+REMAPPED = "--remap-path-prefix=/tmp/mqttiumd-source-0123456789abcdef=/mqttiumd-source"
 
 
 def running_oracle():
@@ -223,7 +225,7 @@ class Campaign(unittest.TestCase):
         (self.campaign / path).parent.mkdir(parents=True, exist_ok=True)
         (self.campaign / path).write_bytes(data)
 
-    def produce(self, built_from=None, **checkout):
+    def produce(self, built_from=None, rustflags=None, **checkout):
         manifest = json.loads((ROOT / FULL).read_text())
         scenario = json.loads((ROOT / SCENARIO).read_text())
         manifest.update(
@@ -244,6 +246,8 @@ class Campaign(unittest.TestCase):
         manifest["checkout"].update(checkout)
         if built_from is not None:
             manifest["artifact"]["built_from"] = built_from
+        if rustflags is not None:
+            manifest["artifact"]["built_with"]["rustflags"] = rustflags
         (self.campaign / "manifest.json").write_text(json.dumps(manifest))
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(io.StringIO()):
@@ -269,16 +273,46 @@ class Campaign(unittest.TestCase):
             reason for reason in self.result["reasons"] if reason.startswith("not qualifying: ")
         ]
 
-    def rebuilt(self, data=b"the source of the binary\n"):
+    def archive(self, replace=None, drop=(), extra=None):
+        """A source.tar as run --rebuild writes it: the checkout, members named ``./<path>``.
+
+        It holds the contract files of the campaign and the files of the
+        running oracle; ``replace`` changes the content of members, ``drop``
+        leaves members out, ``extra`` adds members.
+        """
+        members = {path: (self.campaign / path).read_bytes() for path in self.contracts.files}
+        members.update(
+            {entry["path"]: (ROOT / entry["path"]).read_bytes() for entry in running_oracle()}
+        )
+        members.update(extra or {})
+        members.update(replace or {})
+        for path in drop:
+            members.pop(path)
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            directory = tarfile.TarInfo("./")
+            directory.type = tarfile.DIRTYPE
+            archive.addfile(directory)
+            for path, data in sorted(members.items()):
+                info = tarfile.TarInfo(f"./{path}")
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+        return buffer.getvalue()
+
+    def rebuilt(self, data=None):
         """A built_from member naming ``source.tar`` as the campaign keeps it."""
-        self.keep("source.tar", data)
+        self.keep("source.tar", self.archive() if data is None else data)
         return {
             "source": self.cite("source.tar"),
             "build": "cargo build --locked --offline -p mqttiumd-lab --bin mqttiumd-lab",
         }
 
+    def produce_rebuilt(self, data=None, rustflags=REMAPPED, **checkout):
+        member = self.rebuilt(data)
+        return self.produce(member, rustflags=rustflags, **checkout)
+
     def test_a_complete_run_qualifies_and_stands(self):
-        self.assertEqual(self.produce(self.rebuilt()), [])
+        self.assertEqual(self.produce_rebuilt(), [])
         self.assertEqual(self.result["qualification"], "qualifying")
         self.assertEqual((self.result["verdict"], self.result["exit_code"]), ("PASS", 0))
         self.assertEqual(self.contracts.check_file("run-result.json"), [])
@@ -288,16 +322,16 @@ class Campaign(unittest.TestCase):
         member = self.rebuilt()
         (self.campaign / "source.tar").unlink()
         self.assertEqual(
-            self.produce(member),
+            self.produce(member, rustflags=REMAPPED),
             ["not qualifying: the source the manifest names, source.tar, is not in the campaign"],
         )
 
     def test_a_source_that_differs_is_named(self):
-        member = self.rebuilt()
+        member = self.rebuilt(b"the source of the binary\n")
         # The same size, other bytes: only the digest tells them apart.
         self.keep("source.tar", b"the source of the binarY\n")
         self.assertEqual(
-            self.produce(member),
+            self.produce(member, rustflags=REMAPPED),
             [
                 "not qualifying: source.tar of the campaign is not the source the manifest "
                 "names: its digest or its size differs"
@@ -344,6 +378,61 @@ class Campaign(unittest.TestCase):
             "not qualifying: the modified path crates/x.rs is not kept in the run directory",
             unmet,
         )
+
+    def test_a_build_whose_paths_are_not_remapped_is_named(self):
+        self.assertEqual(
+            self.produce_rebuilt(rustflags=""),
+            [
+                "not qualifying: a binary rebuilt from its source is built with "
+                "--remap-path-prefix=<dir>=/mqttiumd-source, and these rustflags are not"
+            ],
+        )
+
+    def test_an_archive_without_a_contract_file_is_named(self):
+        path = "contracts/v1/assertions.json"
+        self.assertEqual(
+            self.produce_rebuilt(self.archive(drop=[path])),
+            [f"not qualifying: source.tar does not hold {path} as the manifest lists it"],
+        )
+
+    def test_an_archive_with_another_oracle_is_named(self):
+        path = f"{ORACLE}/judge.py"
+        self.assertEqual(
+            self.produce_rebuilt(self.archive(replace={path: b"another judge\n"})),
+            [f"not qualifying: source.tar does not hold {path} as the manifest lists it"],
+        )
+
+    def test_an_untracked_file_kept_is_the_one_the_archive_holds(self):
+        self.keep("modified/untracked/tools/probe.txt", b"probe\n")
+        kept = self.produce_rebuilt(
+            self.archive(extra={"tools/probe.txt": b"probe\n"}),
+            tree_state="modified",
+            modified_paths=["tools/probe.txt"],
+        )
+        self.assertEqual(kept, [])
+        other = self.produce_rebuilt(
+            self.archive(extra={"tools/probe.txt": b"other\n"}),
+            tree_state="modified",
+            modified_paths=["tools/probe.txt"],
+        )
+        self.assertEqual(
+            other,
+            [
+                "not qualifying: source.tar does not hold the untracked tools/probe.txt "
+                "the campaign keeps"
+            ],
+        )
+
+    def test_an_archive_that_cannot_be_read_is_named(self):
+        self.assertEqual(
+            self.produce_rebuilt(b"not an archive at all\n"),
+            ["not qualifying: source.tar is not an archive the oracle can read"],
+        )
+
+    def test_an_archive_of_too_many_members_is_refused_before_it_is_read_whole(self):
+        with mock.patch.object(results, "MAX_SOURCE_MEMBERS", 3):
+            unmet = self.produce_rebuilt()
+        self.assertEqual(unmet, ["not qualifying: source.tar has more than 3 members"])
 
 
 if __name__ == "__main__":

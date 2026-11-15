@@ -24,17 +24,32 @@ archive in the campaign as `source.tar`, and states the link in
 - `run-manifest` gains `artifact.built_from`, optional, written only by a
   run whose binary the bench rebuilt from a source it keeps:
   `{"source": {"path", "sha256", "bytes"}, "build": <text>}`. `source` is
-  a file of the campaign, named by a relative path; `build` is the command
-  that built it. Both are required when the member is present. The member
-  is named `build`, not `method`, because the bench already writes that
-  text under that name in `campaign.json`.
+  the archive of the checkout, named by a path relative to the campaign
+  directory (`source.tar` today); its members are the files of the
+  checkout as `./<path>`. `build` is the text of the build command
+  (`rebuild::build_command()` of lot L4): it names placeholders (`<dir>`)
+  and describes the build, it is not run as it stands; the one execution
+  is `tools/check_campaign_binary.sh`. Both are required when the member
+  is present. The member is named `build`, not `method`, because the bench
+  already writes that text under that name in `campaign.json`. No other
+  member is added: the revision is `checkout.revision`.
 - The size of the source is range-checked as every 64-bit member.
-- `mqttiumd_oracle produce` counts the link as established when the member
-  is present, the archive is in the campaign, and its digest and size are
-  those of the member. Without the member, the result stays provisional
-  with the reason that nothing ties the binary to the recorded content.
-  When the member names an archive that is missing or differs, the reason
-  says so.
+- `mqttiumd_oracle produce` counts the link as established when:
+  - the member is present, the archive is in the campaign, and its digest
+    and size are those of the member;
+  - the binary was built with its paths remapped:
+    `artifact.built_with.rustflags` starts with `--remap-path-prefix=` and
+    ends with `=/mqttiumd-source`;
+  - read member by member as a stream, never extracted, with at most
+    100 000 members and each member hashed by chunks, the archive holds
+    each contract file and each oracle file the manifest lists, at its
+    path, with the same digest;
+  - for each path of `checkout.modified_paths` that the campaign keeps as
+    an untracked file (`modified/untracked/<path>`), the archive holds the
+    same content at that path.
+  Without the member, the result stays provisional with the reason that
+  nothing ties the binary to the recorded content; each other failure has
+  its own reason.
 
 ## What a qualifying result then establishes, and what it does not
 
@@ -43,20 +58,27 @@ archive in the campaign as `source.tar`, and states the link in
   trace are the files it cites; the oracle that judged is the one the
   manifest identifies; the modified content of the tree is kept; and the
   campaign holds an archive with the digest the manifest names as the
-  source of its binary.
+  source of its binary, built with its paths remapped, which holds the
+  contract and oracle files of the run and the untracked files the
+  campaign keeps.
 - Declared by the bench, and checkable outside the oracle: that the
   binary which ran is the one that archive builds.
   `tools/check_campaign_binary.sh` rebuilds it with the locked
   dependencies and compares digests; the oracle does not build anything,
   needs no toolchain, and does not run that check.
-- Not established: that a build of the same archive on another machine,
-  or with another toolchain, gives the same binary.
+- Not established by the oracle:
+  - that the archive is the recorded revision with its modifications:
+    the revision is not checkable without git, and a modified tracked
+    file is kept as a patch, which the oracle does not apply, so only the
+    untracked files kept are compared with the archive;
+  - that the binary which ran is the one the archive builds (the bench's
+    declaration, checked by `tools/check_campaign_binary.sh`);
+  - that a build of the same archive on another machine, or with another
+    toolchain, gives the same binary.
 
-## Open
+## Done
 
-A bounded check of the archive that the oracle could make without a
-toolchain is proposed, not decided: each contract file and each oracle
-file the manifest lists is found in the archive, at its path, with the
-same digest, read member by member with a bound on the number of members
-and on the size of each. It would tie the archive to the contracts and
-the oracle of the run, not to the binary.
+The bounded check of the archive that the first version of this record
+left open is part of the decision above, both parts: the contract and
+oracle files, and the untracked files kept. The check of tracked files is
+limited as said: the campaign keeps their patch, not the files.
