@@ -748,3 +748,52 @@ fn a_submission_has_the_causes_the_caller_gives() {
     let plain = TraceWriter::new("plain", 1, 1, &names).write(&events[..1]);
     assert_eq!(plain.records[0]["causal_parents"], serde_json::json!([]));
 }
+
+/// A recipe presented again under the same operation with other content
+/// is a violation. Its result is written as `StoreResultReady` with the
+/// outcome `Violation` and its kind, without a `reject_reason`, and
+/// handed over with the same content, caused by it.
+#[test]
+fn a_violation_is_written_as_produced_then_handed_over() {
+    let mut bench = adapter_bench();
+    let command = bench.admission(1, 7, b"payload", &[bench.b]);
+    let first = submit(
+        &mut bench,
+        1,
+        Effect::Persist {
+            command: command.clone(),
+        },
+    );
+    perform(&mut bench, StoreAction::EnterWriter(first));
+    perform(&mut bench, StoreAction::DeliverResult(first));
+    let other = altered(&command, |admit| admit.retain = true);
+    let second = submit(&mut bench, 2, Effect::Persist { command: other });
+    perform(&mut bench, StoreAction::EnterWriter(second));
+    perform(&mut bench, StoreAction::DeliverResult(second));
+    let events = bench.store.take_events();
+    let names: [&str; 0] = [];
+    let written = TraceWriter::new("violation", 1, 1, &names).write(&events);
+    let workspace = workspace();
+    for record in &written.records {
+        accepted(&workspace, record);
+    }
+    let violation = serde_json::json!("Violation");
+    let ready: Vec<_> = of_kind(&written.records, "StoreResultReady")
+        .into_iter()
+        .filter(|record| record["payload"]["outcome"] == violation)
+        .collect();
+    let handed: Vec<_> = of_kind(&written.records, "StoreResultHandedOver")
+        .into_iter()
+        .filter(|record| record["payload"]["outcome"] == violation)
+        .collect();
+    assert_eq!(ready.len(), 1, "{:#?}", written.unwritten);
+    assert_eq!(handed.len(), 1);
+    assert_eq!(ready[0]["payload"]["violation"], "RecipeMismatch");
+    assert!(ready[0]["payload"].get("reject_reason").is_none());
+    assert_eq!(handed[0]["payload"], ready[0]["payload"]);
+    assert_eq!(
+        handed[0]["causal_parents"],
+        serde_json::json!([reference(ready[0])])
+    );
+    assert!(written.unwritten.is_empty(), "{:#?}", written.unwritten);
+}
