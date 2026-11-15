@@ -15,7 +15,9 @@ Exit codes of `run.sh` that the cases expect:
     5  a recorded digest differs from the sources
     6  the harnesses Kani ran are not the listed ones
     7  a harness was not verified with all its witnesses
+    8  the proof reaches a source file whose digest is not recorded
     9  the function allocated
+    10 a file of the proof workspace lifts the ban on `unsafe`
 
 Exit code of this script: 0 when every case gives its expected verdict.
 """
@@ -208,6 +210,30 @@ def case_timeout_kills_the_whole_group(copy: Path) -> list[str]:
     return problems
 
 
+def case_reached_file_not_recorded(copy: Path) -> list[str]:
+    """A source file the proof reaches is missing from the record."""
+    edit(copy, Path("proofs/credits/prooflib.py"),
+         '    Path("crates/mqttiumd-contract/src/ids.rs"),\n', "")
+    code, output = run(copy, *RUN, "--record")
+    return expect_code(code, 8, output)
+
+
+def case_second_file_allows_unsafe(copy: Path) -> list[str]:
+    """A second file of the proof workspace allows `unsafe`."""
+    path = copy / "proofs/preflight/src/lib.rs"
+    path.write_text("#![allow(unsafe_code)]\n" + path.read_text())
+    code, output = run(copy, *RUN)
+    return expect_code(code, 10, output)
+
+
+def case_unsafe_in_a_harness(copy: Path) -> list[str]:
+    """A harness uses `unsafe` behind an `allow` of its own."""
+    append_harness(copy, "    #[allow(unsafe_code)]\n    fn stray() -> u8 {\n"
+                         "        unsafe { core::ptr::read(&1u8) }\n    }\n")
+    code, output = run(copy, *RUN, "--record")
+    return expect_code(code, 10, output)
+
+
 def case_unmodified_copy_passes(copy: Path) -> list[str]:
     """The unmodified copy passes: the script does not refuse everything."""
     code, output = run(copy, *RUN)
@@ -233,6 +259,9 @@ CASES = [
     case_mutant_not_found_is_reported,
     case_timeout_is_reported,
     case_timeout_kills_the_whole_group,
+    case_reached_file_not_recorded,
+    case_second_file_allows_unsafe,
+    case_unsafe_in_a_harness,
     case_unmodified_copy_passes,
 ]
 
