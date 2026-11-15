@@ -28,6 +28,15 @@ fn a_rebuilt_campaign_holds_the_source_of_its_binary_and_that_source_builds_it_a
         campaign["built_from"]["source"]["sha256"],
         mqttiumd_lab::manifest::sha256_hex(&tar).as_str()
     );
+    // The recorded command replays a rebuilt run as a rebuilt run, and
+    // says what such a replay establishes.
+    let replay = campaign["commands"]["replay"].as_str().expect("a command");
+    assert!(replay.contains(" --rebuild "), "{replay}");
+    assert!(replay.contains(" --backend sim-store "), "{replay}");
+    let scope = campaign["commands"]["replay_scope"]
+        .as_str()
+        .expect("a scope");
+    assert!(scope.contains("check_campaign_binary.sh"), "{scope}");
     // The manifest ties the binary to that source (decision 0017): the
     // archive as a file of the campaign, and the command that built it.
     let manifest: serde_json::Value =
@@ -61,12 +70,32 @@ fn a_rebuilt_campaign_holds_the_source_of_its_binary_and_that_source_builds_it_a
         .current_dir(&root)
         .output()
         .expect("the check runs");
+    // The check builds where it looks, with the flags the run recorded,
+    // whatever the caller exported (finding R4 of the second audit): a
+    // build directory of the caller, and flags that would replace the
+    // recorded ones, must change nothing.
+    let elsewhere = bench_support::fresh("exported-target");
+    let exported = Command::new(root.join("tools/check_campaign_binary.sh"))
+        .arg(&out)
+        .current_dir(&root)
+        .env("CARGO_TARGET_DIR", &elsewhere)
+        .env("CARGO_ENCODED_RUSTFLAGS", "--cfg=inherited_from_the_caller")
+        .output()
+        .expect("the check runs");
+    let built_elsewhere = elsewhere.exists();
+    let _ = std::fs::remove_dir_all(&elsewhere);
     let _ = std::fs::remove_dir_all(&out);
+    for (name, check) in [("plain", &check), ("exported", &exported)] {
+        assert!(
+            check.status.success(),
+            "{name}: {}{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
     assert!(
-        check.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
+        !built_elsewhere,
+        "the check built in the caller's directory"
     );
 }
 
