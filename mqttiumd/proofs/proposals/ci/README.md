@@ -61,13 +61,25 @@ Notes for the owner of the workflow:
   change of lot L1 to the two contract files turns this job red until
   the change is reviewed and recorded: that is its purpose, and the
   owner of the workflow should know it before making the job required.
-- What `tools/install-tools.sh kani` leaves on disk: `~/.kani`, 485 MB
-  (the Kani bundle with CBMC); the nightly toolchain it installs under
-  `~/.rustup/toolchains`, 594 MB, which `~/.kani` links to; and
+- A cold installation, measured once in this cloud container with a new
+  `HOME`, `CARGO_HOME` and `RUSTUP_HOME` (rustup's self-update disabled):
+
+  | Step | Time |
+  | - | - |
+  | `rustup toolchain install 1.97.0 --profile minimal` | 10 s |
+  | `tools/install-tools.sh kani` | 19 s |
+  | `proofs/preflight.sh` | 1 s |
+  | `proofs/credits/run.sh` | 44 s |
+
+  The preflight and the proof passed from that installation. The times
+  are those of this container and its network; a runner of the workflow
+  was not measured, so the timeout of the job should stay wide.
+- What that installation leaves on disk: `~/.kani`, 485 MB (the Kani
+  bundle with CBMC); the nightly toolchain under `~/.rustup/toolchains`,
+  which `~/.kani` links to, 1.5 GB in the new home (594 MB in the home
+  this lot was developed in; the difference was not investigated);
   `~/.cargo/bin/kani` and `~/.cargo/bin/cargo-kani`, under 1 MB each.
-  The time of a cold installation and the size of the download itself
-  were not measured: here the tools were installed once, before any
-  timing.
+  The size of the downloads themselves was not measured.
 - What can be cached, keyed on `KANI_VERSION` of the installer:
   `~/.kani`, the two binaries, and the toolchain
   `nightly-2026-08-21-x86_64-unknown-linux-gnu` of `~/.rustup`. The
