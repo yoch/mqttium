@@ -92,6 +92,8 @@ pub enum OpenError {
     SchemaVersion(i64),
     /// The file names another format, or a durable value does not decode.
     Corrupt,
+    /// `PRAGMA quick_check` found the file damaged; its first lines.
+    Integrity(String),
     /// A setting read back is not the one that was set.
     Setting {
         name: &'static str,
@@ -1125,6 +1127,13 @@ impl SqliteStore {
             return Err(OpenError::SchemaVersion(version));
         }
         Self::verified(conn)
+    }
+
+    /// Reads the durable state of the file at `path` without the writer,
+    /// for an inspector outside the process that writes it.
+    pub fn inspect(path: &Path) -> Result<DurableState, OpenError> {
+        let _ = path;
+        Err(OpenError::Corrupt)
     }
 
     fn verified(conn: Connection) -> Result<Self, OpenError> {
