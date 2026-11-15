@@ -1702,10 +1702,14 @@ impl SqliteStore {
             },
         )?;
         section(
-            "SELECT id, client_id, revision FROM sessions WHERE state = ?1 AND ?2 = ?2 ORDER BY id",
+            "SELECT id, client_id, revision, state FROM sessions
+              WHERE (state = ?1 OR state NOT IN (1, 2)) AND ?2 = ?2 ORDER BY id",
             &mut out,
             &mut position,
             &mut |row| {
+                if code_session_state(row.get(3)?)? != SessionState::Active {
+                    return Err(Fault::Corrupt);
+                }
                 let session = SessionId::from_be_slice(reader::borrow_blob(row, 0, 8)?)
                     .map_err(|_| Fault::Corrupt)?;
                 let bytes =
