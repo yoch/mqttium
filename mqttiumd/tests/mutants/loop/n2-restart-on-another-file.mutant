@@ -1,8 +1,7 @@
 diff --git a/mqttiumd/crates/mqttiumd-lab/src/bench/child.rs b/mqttiumd/crates/mqttiumd-lab/src/bench/child.rs
-index 1ffc13cf..e4710238 100644
 --- a/mqttiumd/crates/mqttiumd-lab/src/bench/child.rs
 +++ b/mqttiumd/crates/mqttiumd-lab/src/bench/child.rs
-@@ -915,7 +915,15 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
+@@ -1340,7 +1340,15 @@
                      if process.is_some() || u64::from(rank) != arguments.rank {
                          return Err(stop("a start-up of another rank, or a second one"));
                      }
@@ -17,5 +16,5 @@ index 1ffc13cf..e4710238 100644
 +                    let opened = if arguments.rank == 0 { &arguments.store } else { &other };
 +                    let store = mqttiumd_store_sqlite::SqliteStore::open(opened)
                          .map_err(|error| {
-                             stop(format!("{}: {error:?}", arguments.store.display()))
-                         })?;
+                             Stop::read(
+                                 error.read_error(),
