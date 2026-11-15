@@ -11,6 +11,12 @@
 //! `u32` for the slot, both lease states. Coherent and incoherent accounts
 //! are both in range unless a harness says otherwise.
 //!
+//! A failed assertion ends its path, as a panic does, so a later assertion
+//! is only examined where the earlier ones hold. Within a harness the
+//! assertions on the state therefore come first and the assertion on the
+//! returned value last: a mutation of the state is reported as such, not
+//! hidden behind a wrong return value.
+//!
 //! Each assertion and each cover carries a name, `P<n>` or `W<n>`, that
 //! `proofs/credits/PROOF.md` lists and `proofs/credits/run.sh` looks for.
 //! A cover is a witness of non-vacuity: the run fails unless every one is
@@ -123,54 +129,50 @@ mod harnesses {
         let after = plain(&lease, &account);
 
         if !names(key, before) {
+            assert!(same(before, after), "P1b: a stale key mutates nothing");
             assert!(
                 result == Ok(ReleaseOutcome::Stale),
                 "P1a: a key that is not current is stale"
             );
-            assert!(same(before, after), "P1b: a stale key mutates nothing");
             kani::cover!(true, "W1a: a stale key is reached");
         } else if before.account != before.lease_account {
+            assert!(same(before, after), "P1d: a wrong account mutates nothing");
             assert!(
                 result == Err(ReleaseError::WrongAccount),
                 "P1c: a wrong account is an explicit error"
             );
-            assert!(same(before, after), "P1d: a wrong account mutates nothing");
             kani::cover!(true, "W1b: a wrong account is reached");
         } else if !before.held {
-            assert!(
-                result == Ok(ReleaseOutcome::AlreadyReleased),
-                "P1e: a released lease is reported as already released"
-            );
             assert!(
                 same(before, after),
                 "P1f: a repeated release subtracts nothing"
             );
+            assert!(
+                result == Ok(ReleaseOutcome::AlreadyReleased),
+                "P1e: a released lease is reported as already released"
+            );
             kani::cover!(true, "W1c: a repeated release is reached");
         } else if before.cost_bytes > before.used_bytes {
-            assert!(
-                result == Err(ReleaseError::CostExceedsUsage(Resource::PayloadBytes)),
-                "P1g: bytes above the usage are an explicit error"
-            );
             assert!(
                 same(before, after),
                 "P1h: bytes above the usage change neither dimension"
             );
+            assert!(
+                result == Err(ReleaseError::CostExceedsUsage(Resource::PayloadBytes)),
+                "P1g: bytes above the usage are an explicit error"
+            );
             kani::cover!(true, "W1d: bytes above the usage are reached");
         } else if before.cost_slots > before.used_slots {
-            assert!(
-                result == Err(ReleaseError::CostExceedsUsage(Resource::ExchangeSlots)),
-                "P1i: slots above the usage are an explicit error"
-            );
             assert!(
                 same(before, after),
                 "P1j: slots above the usage change neither dimension"
             );
+            assert!(
+                result == Err(ReleaseError::CostExceedsUsage(Resource::ExchangeSlots)),
+                "P1i: slots above the usage are an explicit error"
+            );
             kani::cover!(true, "W1e: slots above the usage are reached");
         } else {
-            assert!(
-                result == Ok(ReleaseOutcome::Released),
-                "P1k: a current key on a held lease releases"
-            );
             let expected = Plain {
                 held: false,
                 used_bytes: before.used_bytes - before.cost_bytes,
@@ -180,6 +182,10 @@ mod harnesses {
             assert!(
                 same(expected, after),
                 "P1l: both dimensions are reduced by the exact cost, the lease is released, nothing else changes"
+            );
+            assert!(
+                result == Ok(ReleaseOutcome::Released),
+                "P1k: a current key on a held lease releases"
             );
             kani::cover!(true, "W1f: an exact release is reached");
         }
@@ -198,12 +204,12 @@ mod harnesses {
         let result = release_if_current(&mut lease, &mut account, key);
 
         assert!(
-            result == Ok(ReleaseOutcome::Stale),
-            "P2a: the result of a stale key is Stale"
-        );
-        assert!(
             same(before, plain(&lease, &account)),
             "P2b: a stale key changes neither the lease nor the account"
+        );
+        assert!(
+            result == Ok(ReleaseOutcome::Stale),
+            "P2a: the result of a stale key is Stale"
         );
         let same_account = key.account.get() == before.lease_account;
         let same_slot = key.slot == before.lease_slot;
@@ -259,11 +265,11 @@ mod harnesses {
             "P3a: a second call with the same key changes nothing"
         );
         if first == Ok(ReleaseOutcome::Released) {
+            assert!(!between.held, "P3c: a released lease is not held");
             assert!(
                 second == Ok(ReleaseOutcome::AlreadyReleased),
                 "P3b: a release that is repeated is reported as already released"
             );
-            assert!(!between.held, "P3c: a released lease is not held");
         }
         kani::cover!(
             first == Ok(ReleaseOutcome::Released)
@@ -292,12 +298,12 @@ mod harnesses {
         let result = release_if_current(&mut lease, &mut account, key);
 
         assert!(
-            result == Err(ReleaseError::WrongAccount),
-            "P4a: the result of a wrong account is WrongAccount"
-        );
-        assert!(
             same(before, plain(&lease, &account)),
             "P4b: a wrong account changes neither the lease nor the account"
+        );
+        assert!(
+            result == Err(ReleaseError::WrongAccount),
+            "P4a: the result of a wrong account is WrongAccount"
         );
         kani::cover!(
             before.held
@@ -328,10 +334,6 @@ mod harnesses {
         let after = plain(&lease, &account);
 
         assert!(
-            matches!(result, Err(ReleaseError::CostExceedsUsage(_))),
-            "P5a: a cost above a usage is an explicit error"
-        );
-        assert!(
             after.used_bytes == before.used_bytes,
             "P5b: the bytes in use are unchanged"
         );
@@ -341,6 +343,10 @@ mod harnesses {
         );
         assert!(after.held, "P5d: the lease is still held");
         assert!(same(before, after), "P5e: nothing at all changed");
+        assert!(
+            matches!(result, Err(ReleaseError::CostExceedsUsage(_))),
+            "P5a: a cost above a usage is an explicit error"
+        );
         kani::cover!(
             !bytes_short && slots_short && before.cost_bytes > 0,
             "W5a: the bytes fit, are not zero, and the slots do not fit"
@@ -377,10 +383,6 @@ mod harnesses {
         let after = plain(&lease, &account);
 
         assert!(
-            result == Ok(ReleaseOutcome::Released),
-            "P6a: the result is Released"
-        );
-        assert!(
             after.used_bytes == before.used_bytes - before.cost_bytes,
             "P6b: the bytes in use are reduced by the exact cost"
         );
@@ -399,6 +401,10 @@ mod harnesses {
             "P6e: limits, identities and the recorded cost are unchanged"
         );
         assert!(account.is_coherent(), "P6f: the account stays coherent");
+        assert!(
+            result == Ok(ReleaseOutcome::Released),
+            "P6a: the result is Released"
+        );
         kani::cover!(
             before.cost_bytes == u64::MAX && before.cost_slots == u64::MAX,
             "W6a: both costs are the largest integer"
@@ -456,14 +462,14 @@ mod harnesses {
         let result = release_if_current(&mut second, &mut account, old_key);
 
         assert!(
-            result == Ok(ReleaseOutcome::Stale),
-            "P7b: the old key is stale for the reservation that reused the slot"
-        );
-        assert!(
             same(before, plain(&second, &account)),
             "P7c: the new reservation and its account are unchanged"
         );
         assert!(before.held, "P7d: the new reservation is still held");
+        assert!(
+            result == Ok(ReleaseOutcome::Stale),
+            "P7b: the old key is stale for the reservation that reused the slot"
+        );
         kani::cover!(
             before.cost_bytes > 0 && before.cost_slots > 0,
             "W7a: the new reservation has a cost in both dimensions"
