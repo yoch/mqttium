@@ -167,9 +167,9 @@ certain would be false; both counterexamples are tests of the ledger.
 - Lot L4 wires start-up through this path and stops the holder of a grant
   whose epoch was reported closed.
 
-## What the reviews leave open
+## Reviews
 
-Four points on the revision merged into the integration branch
-(`7941f334`), all in what a faulted opening does with later replies and in
-what `observe` reports. They are the open condition of the reception of
-lot L2; see `../reception/open-conditions.md`.
+Five code reviews of the contract. The four points the fifth left open
+were corrected on `2b53633b` and read by the integration owner; no point
+of a review of the contract is open. The deterministic store that
+exercises it by its real path is reviewed apart.
