@@ -1,0 +1,25 @@
+# Proof crates of mqttiumd (lot L6, DEM-021).
+#
+# This is a workspace of its own, on purpose: the proof crates depend on the
+# production crates by path and are analysed under the compiler that the
+# proof tool brings, while the product workspace one level up stays on the
+# toolchain of rust-toolchain.toml and never learns a proof attribute
+# (ADR 0007). Nothing here is built by `cargo build --workspace` of the
+# product.
+[workspace]
+resolver = "3"
+members = ["preflight"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+mqttiumd-core = { path = "../crates/mqttiumd-core" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(kani)"] }
