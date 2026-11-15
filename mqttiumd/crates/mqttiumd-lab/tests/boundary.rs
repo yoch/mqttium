@@ -694,6 +694,31 @@ fn a_repetition_does_not_assemble_a_call_or_an_attribute() {
 }
 
 #[test]
+fn a_macro_definition_has_a_known_structure() {
+    // The rules on `!` and on fragments apply inside definitions the test
+    // recognises. Anything else that holds a macro variable is refused.
+    let sources = [
+        "macro_rules! odd { ($a:ident) -> { $a } }",
+        "macro_rules! odd { ($a:ident) => $a; }",
+        "macro_rules! odd;",
+        "pub const D: &str = $write!(\"CARGO_MANIFEST_DIR\");",
+        "fn f() { let _ = $x; }",
+    ];
+    assert_eq!(accepted(&sources), Vec::<&str>::new());
+    // Both delimiters of a definition, and several rules, are understood.
+    for source in [
+        "macro_rules! two { ($a:ident) => { $a }; ($a:ident, $b:literal) => { $b }; }",
+        "macro_rules! round (($a:ident) => { $a });",
+    ] {
+        assert_eq!(
+            violations(source),
+            Vec::<String>::new(),
+            "refused: {source}"
+        );
+    }
+}
+
+#[test]
 fn ordinary_macros_are_still_accepted() {
     for source in [
         // An ordinary invocation of a listed macro.
