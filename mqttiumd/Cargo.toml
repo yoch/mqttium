@@ -4,6 +4,7 @@ members = [
     "crates/mqttiumd-contract",
     "crates/mqttiumd-core",
     "crates/mqttiumd-lab",
+    "crates/mqttiumd-store-sqlite",
 ]
 
 [workspace.package]

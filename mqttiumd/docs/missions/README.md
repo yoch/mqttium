@@ -101,6 +101,7 @@ One lot per branch and per session. A lot changes only the paths it owns.
 | L4 Bench runner (second wave) | `crates/mqttiumd-lab/src/bench/`, the `run` command of `crates/mqttiumd-lab/src/main.rs`, `crates/mqttiumd-lab/tests/bench_*.rs`, `tests/scenarios/p1/P1-02b.json` (the vocabulary stays with L3) | [L4](L4-bench-runner.md) |
 | L5 Model M1 | `models/`, the model step of the workflow | [L5](L5-model-m1.md) |
 | L6 Pilot proof | `crates/mqttiumd-core/src/credits.rs`, `proofs/` | [L6](L6-pilot-proof.md) |
+| L7 SQLite store (second wave) | `crates/mqttiumd-store-sqlite/`, `tools/measure_writer.*` and its report | [L7](L7-sqlite-store.md) |
 
 Shared by all, changed only through the integration owner:
 `Cargo.toml`, `Cargo.lock`, `.github/workflows/mqttiumd.yml`, `AGENTS.md`,

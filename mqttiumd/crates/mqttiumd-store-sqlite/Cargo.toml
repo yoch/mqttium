@@ -1,0 +1,25 @@
+[package]
+name = "mqttiumd-store-sqlite"
+description = "The SQLite store of mqttiumd: one file, one writer, WAL and synchronous FULL read back (DEM-011)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+mqttiumd-contract.workspace = true
+# The interface of the store and its contract tests. A move of the
+# interface to a crate of its own is proposed to the integration owner.
+mqttiumd-lab = { path = "../mqttiumd-lab" }
+# `bundled` compiles the SQLite amalgamation pinned by libsqlite3-sys: the
+# same engine on every machine and in CI, whatever the system provides
+# (DEM-011). The binding holds the `unsafe`; this crate forbids it.
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled", "cache"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# Writes a foreign schema version into a file, for the refusal test.
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled", "cache"] }
