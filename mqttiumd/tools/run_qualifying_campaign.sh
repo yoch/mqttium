@@ -2,7 +2,7 @@
 # Runs one campaign whose result can qualify, and checks that it does
 # (record 0017). Run from the mqttiumd directory, on a clean checkout:
 #
-#   tools/run_qualifying_campaign.sh <scenario> <empty campaign directory> [seed] [sim-store|sqlite]
+#   tools/run_qualifying_campaign.sh <scenario> <empty campaign directory> [seed] [sim-store|sqlite] [in-process|child]
 #
 # 1. `run --rebuild` builds the lab binary from an archive of the recorded
 #    content, kept in the campaign as source.tar, and plays the scenario
@@ -20,19 +20,20 @@
 # campaign was written.
 set -euo pipefail
 
-if [[ $# -lt 2 || $# -gt 4 ]]; then
-    echo "usage: tools/run_qualifying_campaign.sh <scenario> <empty campaign directory> [seed] [sim-store|sqlite]" >&2
+if [[ $# -lt 2 || $# -gt 5 ]]; then
+    echo "usage: tools/run_qualifying_campaign.sh <scenario> <empty campaign directory> [seed] [sim-store|sqlite] [in-process|child]" >&2
     exit 2
 fi
 scenario=$1
 out=$2
 seed=${3:-1}
 backend=${4:-sim-store}
+process=${5:-in-process}
 result=qualifying-run-result.json
 
 if ! cargo run -q -p mqttiumd-lab --locked -- run \
     --contracts contracts/v1 --scenario "$scenario" --seed "$seed" --backend "$backend" \
-    --rebuild --out "$out"; then
+    --process "$process" --rebuild --out "$out"; then
     echo "no campaign was written" >&2
     exit 2
 fi

@@ -60,6 +60,22 @@ names. The campaign directory must be outside the work tree:
 tools/run_qualifying_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02-q 1 sqlite
 ```
 
+By default the process under test runs inside the runner and a crash is
+simulated. On the SQLite store it can run in a child process
+(`--process child`, the fifth argument of the two scripts above): the
+supervisor then kills that child with SIGKILL where the scenario crashes
+the broker, waits for its end by that signal, and starts another child on
+the same database file. The script below plays such a run rebuilt from
+its source, which must qualify, and plays it again under `strace` to keep
+the kernel's account of the kill; `tools/check_campaign_kill.py` checks
+both. It shows the loss of the process after a commit, outside any
+transaction, and the recovery; nothing about a transaction cut by a kill,
+`fsync` or a power loss:
+
+```bash
+tools/run_killed_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02-killed
+```
+
 Only `recompute` says that a result is evidence: it recomputes the
 assertions and the faults from the trace and checks again every condition
 of a qualifying run, so a qualifying result whose source archive, oracle
