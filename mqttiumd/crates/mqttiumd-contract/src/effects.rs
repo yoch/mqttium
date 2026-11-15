@@ -774,6 +774,11 @@ impl OwnerAuthority {
     /// Creates the box of `owner`, with exactly `capacity` slots and up to
     /// `max_reservations` reservations at a time, and records it; or
     /// changes nothing and says why.
+    ///
+    /// Both dimensions are non-zero by type, like the slots of a
+    /// reservation. The caller takes `capacity` from the effect slots of
+    /// its profile (an `EffectSlots` quantity) and converts it once, when
+    /// it creates the owner.
     pub fn create_outbox(
         &mut self,
         owner: LogicalOwnerId,
@@ -1598,7 +1603,8 @@ mod authority_tests {
     use super::*;
     use crate::command::StartupNonce;
     use crate::outcome::{
-        EpochOpened, EpochOpening, HandOverRefused, OpeningOutcome, OpeningReply,
+        EpochOpened, EpochOpening, HandOverRefused, Observed, OpeningOutcome, OpeningReply,
+        OpeningStage,
     };
 
     const INCARNATION: u64 = 7;
@@ -1662,14 +1668,19 @@ mod authority_tests {
         let last_opened = RunEpoch::new(epoch - 1);
         let mut opening = EpochOpening::new(incarnation, StartupNonce::new([1; 16]));
         let command = opening.submit(last_opened).expect("nothing in flight");
+        let committed = EpochOpened {
+            incarnation,
+            epoch: RunEpoch::new(epoch),
+        };
         let reply = OpeningReply {
             command,
-            outcome: OpeningOutcome::Committed(EpochOpened {
-                incarnation,
-                epoch: RunEpoch::new(epoch),
-            }),
+            outcome: OpeningOutcome::Committed(committed),
         };
-        opening.observe(reply).expect("the reply of this attempt");
+        assert_eq!(
+            opening.observe(reply),
+            Ok(Observed::Advanced(OpeningStage::Committed(committed))),
+            "the reply of this attempt"
+        );
         let grant = opening.hand_over().expect("committed");
         (opening, grant)
     }
