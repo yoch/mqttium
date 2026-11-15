@@ -102,6 +102,9 @@ pub enum OpenError {
         read_back: String,
     },
     Sql(rusqlite::Error),
+    /// Another `SqliteStore` holds the writer's lock of this file, in this
+    /// process or another: refused at once, without waiting.
+    WriterAlive,
 }
 
 impl From<rusqlite::Error> for OpenError {
