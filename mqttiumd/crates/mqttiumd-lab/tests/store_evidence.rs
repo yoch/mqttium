@@ -13,12 +13,14 @@ use mqttiumd_contract::ids::{
     EffectId, EffectSeq, LogicalOwnerId, OperationId, Revision, StoreIncarnation,
 };
 use mqttiumd_lab::store::adapter::{
-    AdapterLimits, FaultAction, FaultPoint, FaultSpec, Performed, SimStore, StoreAction,
+    AdapterLimits, Answer, FaultAction, FaultPoint, FaultSpec, Performed, SimStore, StoreAction,
     StoreEvent, WorkId, WorkKind,
 };
 use mqttiumd_lab::store::conformance::{World, altered, fixture_limits, operation_id};
 use mqttiumd_lab::store::durable::{AdminCommand, DurableStore, Limits, MemoryStore};
-use mqttiumd_lab::store::evidence::{SnapshotContext, TraceWriter, snapshot};
+use mqttiumd_lab::store::evidence::{
+    SnapshotContext, TraceWriter, recovered_fact, snapshot, store_outcome,
+};
 use mqttiumd_lab::workspace::Workspace;
 
 fn workspace() -> Workspace {
@@ -364,4 +366,112 @@ fn the_evidence_of_a_run_is_written_as_accepted_trace_records() {
         *expected += 1;
     }
     assert!(next.len() >= 4, "{next:?}");
+}
+
+/// The public forms of a recovered fact and of a result's outcome are
+/// exactly what `TraceWriter` writes, so that the records of the core
+/// (lot L4) and of the store have one writing of each.
+#[test]
+fn the_public_forms_are_what_the_trace_writer_writes() {
+    let mut bench = World::new(&memory).wrap(|store| {
+        SimStore::new(
+            store,
+            AdapterLimits {
+                operations_in_flight: 4,
+                result_slots: 8,
+                faults: 4,
+                events: 256,
+            },
+        )
+    });
+    // A commit, a fence of an absence, a rejection after it.
+    let command = bench.admission(1, 7, b"payload", &[bench.b, bench.c]);
+    let admitted = submit(
+        &mut bench,
+        1,
+        Effect::Persist {
+            command: command.clone(),
+        },
+    );
+    perform(&mut bench, StoreAction::EnterWriter(admitted));
+    perform(&mut bench, StoreAction::DeliverResult(admitted));
+    let absent = operation_id(bench.epoch, 9);
+    let fenced = resolve(&mut bench, 2, absent);
+    perform(&mut bench, StoreAction::EnterWriter(fenced));
+    perform(&mut bench, StoreAction::DeliverResult(fenced));
+    let late = altered(&bench.admission(9, 8, b"p", &[bench.b]), |_| {});
+    let rejected = submit(&mut bench, 3, Effect::Persist { command: late });
+    perform(&mut bench, StoreAction::EnterWriter(rejected));
+    let mut cursor = None;
+    loop {
+        let page = bench.store.recover(cursor, 3).expect("a page");
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    let events = bench.store.take_events();
+    let names: [&str; 0] = [];
+    let written = TraceWriter::new("public-forms", 1, 1, &names).write(&events);
+
+    let mut facts = Vec::new();
+    let mut outcomes = Vec::new();
+    for event in &events {
+        match event {
+            StoreEvent::RecoveryPageRead { facts: page, .. } => {
+                facts.extend(page.iter().map(recovered_fact));
+            }
+            StoreEvent::ResultReady {
+                answer: Answer::Operation { reply, .. },
+                ..
+            } => {
+                let (outcome, reason) = store_outcome(*reply).expect("an outcome");
+                outcomes.push((outcome.to_owned(), reason.map(str::to_owned)));
+            }
+            _ => {}
+        }
+    }
+    let of_kind = |kind: &str| {
+        written
+            .records
+            .iter()
+            .filter(|record| record["kind"] == kind)
+            .collect::<Vec<_>>()
+    };
+    let written_facts: Vec<Value> = of_kind("RecoveryPageRead")
+        .iter()
+        .flat_map(|record| {
+            record["payload"]["facts"]
+                .as_array()
+                .expect("facts")
+                .clone()
+        })
+        .collect();
+    assert!(!facts.is_empty());
+    assert_eq!(written_facts, facts);
+    let written_outcomes: Vec<(String, Option<String>)> = of_kind("StoreResultReady")
+        .iter()
+        .map(|record| {
+            (
+                record["payload"]["outcome"]
+                    .as_str()
+                    .expect("an outcome")
+                    .to_owned(),
+                record["payload"]["reject_reason"]
+                    .as_str()
+                    .map(str::to_owned),
+            )
+        })
+        .collect();
+    assert_eq!(written_outcomes, outcomes);
+    let kinds: Vec<_> = outcomes
+        .iter()
+        .map(|(outcome, _)| outcome.as_str())
+        .collect();
+    assert_eq!(kinds, ["Committed", "RejectedCertain", "RejectedCertain"]);
+    assert!(
+        outcomes
+            .iter()
+            .any(|(_, reason)| reason.as_deref() == Some("Fenced"))
+    );
 }
