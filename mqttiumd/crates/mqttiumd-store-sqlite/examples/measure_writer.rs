@@ -50,6 +50,9 @@ struct Options {
     ops: u64,
     warmup: u64,
     memory: bool,
+    /// For the experiment of report 0002 only: another
+    /// `wal_autocheckpoint`, in pages. The store keeps its default.
+    wal_autocheckpoint: Option<i64>,
 }
 
 fn options() -> Options {
@@ -60,6 +63,7 @@ fn options() -> Options {
         ops: 2000,
         warmup: 100,
         memory: false,
+        wal_autocheckpoint: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -71,6 +75,9 @@ fn options() -> Options {
             "--ops" => options.ops = value().parse().expect("operations"),
             "--warmup" => options.warmup = value().parse().expect("operations"),
             "--memory" => options.memory = true,
+            "--wal-autocheckpoint" => {
+                options.wal_autocheckpoint = Some(value().parse().expect("pages"));
+            }
             other => panic!("unknown flag {other}"),
         }
     }
@@ -254,7 +261,31 @@ fn usage() -> Value {
     })
 }
 
-fn measure<S: DurableStore>(store: &mut S, options: &Options) -> Value {
+/// The slowest admissions, in microseconds, with their place in the
+/// window, and how many exceed fixed thresholds.
+fn tail(latencies: &[Duration]) -> Value {
+    let mut ranked: Vec<(usize, Duration)> = latencies.iter().copied().enumerate().collect();
+    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    let over = |micros: u64| {
+        latencies
+            .iter()
+            .filter(|latency| **latency > Duration::from_micros(micros))
+            .count()
+    };
+    json!({
+        "slowest": ranked
+            .iter()
+            .take(10)
+            .map(|(index, latency)| json!({"step": index, "us": latency.as_secs_f64() * 1e6}))
+            .collect::<Vec<_>>(),
+        "over_1ms": over(1_000),
+        "over_2ms": over(2_000),
+        "over_4ms": over(4_000),
+        "over_10ms": over(10_000),
+    })
+}
+
+fn measure<S: DurableStore>(store: &mut S, options: &Options, wal: Option<&PathBuf>) -> Value {
     let (producer, targets, route_revision, epoch) = prepare(store, options.fanout);
     let payload = vec![0x5A; options.payload];
     for n in 1..=options.warmup {
@@ -267,6 +298,9 @@ fn measure<S: DurableStore>(store: &mut S, options: &Options) -> Value {
     let before = usage();
     let mut admit = Vec::with_capacity(options.ops as usize);
     let mut free = Vec::with_capacity(options.ops as usize);
+    // The largest the WAL file grew, sampled after each step, outside the
+    // timed transactions; the sampling is in the window.
+    let mut wal_max = 0u64;
     let started = Instant::now();
     for n in options.warmup + 1..=options.warmup + options.ops {
         admit.push(committed(
@@ -274,14 +308,22 @@ fn measure<S: DurableStore>(store: &mut S, options: &Options) -> Value {
             &admission(epoch, route_revision, producer, &targets, n, &payload),
         ));
         free.push(committed(store, &release(epoch, producer, n)));
+        if let Some(wal) = wal {
+            wal_max = wal_max.max(std::fs::metadata(wal).map_or(0, |m| m.len()));
+        }
     }
     let window = started.elapsed();
+    let admission_tail = tail(&admit);
+    let release_tail = tail(&free);
     let after = usage();
     json!({
         "window_s": window.as_secs_f64(),
         "transactions_per_second": (2 * options.ops) as f64 / window.as_secs_f64(),
         "admit_publication": summary(admit),
         "release_inbound": summary(free),
+        "admit_publication_tail": admission_tail,
+        "release_inbound_tail": release_tail,
+        "wal_max_bytes": wal.map(|_| wal_max),
         "usage_before": before,
         "usage_after": after,
     })
@@ -294,6 +336,7 @@ fn main() {
         "fanout": options.fanout,
         "ops": options.ops,
         "warmup": options.warmup,
+        "wal_autocheckpoint_set": options.wal_autocheckpoint,
         "one_transaction_per_command": true,
     });
     let report = if options.memory {
@@ -303,7 +346,7 @@ fn main() {
             "qualifies": "nothing",
             "backend": "memory (the deterministic store: no medium, no transaction)",
             "parameters": parameters,
-            "result": measure(&mut store, &options),
+            "result": measure(&mut store, &options, None),
         })
     } else {
         std::fs::create_dir_all(&options.dir).expect("the directory");
@@ -315,8 +358,16 @@ fn main() {
         ));
         let mut store =
             SqliteStore::create(&path, INCARNATION, limits(&options)).expect("a new store");
+        if let Some(pages) = options.wal_autocheckpoint {
+            store
+                .set_wal_autocheckpoint_for_measurement(pages)
+                .expect("the setting");
+        }
         let settings = store.effective_settings().clone();
-        let result = measure(&mut store, &options);
+        let mut wal = path.clone().into_os_string();
+        wal.push("-wal");
+        let wal = PathBuf::from(wal);
+        let result = measure(&mut store, &options, Some(&wal));
         let size = |suffix: &str| {
             let mut file = path.clone().into_os_string();
             file.push(suffix);

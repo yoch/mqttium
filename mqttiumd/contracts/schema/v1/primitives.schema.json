@@ -246,7 +246,14 @@
         "Committed",
         "RejectedCertain",
         "PendingOrUnknown",
-        "RetiredOutcomeUnavailable"
+        "RetiredOutcomeUnavailable",
+        "Violation"
+      ]
+    },
+    "store_violation": {
+      "description": "The contract violation a store reports instead of an outcome (StoreViolation).",
+      "enum": [
+        "RecipeMismatch"
       ]
     },
     "verdict": {

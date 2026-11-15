@@ -33,7 +33,9 @@
     "contracts/examples/v1/valid/trace-record-opening-reply-rejected.json",
     "contracts/examples/v1/valid/trace-record-opening-abandoned.json",
     "contracts/examples/v1/valid/trace-record-epoch-grant-handed-over.json",
+    "contracts/examples/v1/valid/trace-record-step-blocked.json",
     "contracts/examples/v1/valid/trace-record-store-result-rejected.json",
+    "contracts/examples/v1/valid/trace-record-store-result-violation.json",
     "contracts/examples/v1/valid/trace-record-store-result-delivered-rejected.json",
     "contracts/examples/v1/valid/trace-record-store-fence-stable.json",
     "contracts/examples/v1/valid/trace-record-deadline-armed.json",
@@ -412,6 +414,12 @@
       "why": "A scenario requires a known perimeter."
     },
     {
+      "file": "contracts/examples/v1/invalid/scenario-fence-fault-of-a-command-nobody-selected.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/1/match",
+      "why": "A fence fault names the resolved operation by its command, which an earlier fault must select."
+    },
+    {
       "file": "contracts/examples/v1/invalid/scenario-leave-of-a-held-command.json",
       "code": "held-item-mismatch",
       "pointer": "/steps/8/fault",
@@ -692,6 +700,54 @@
       "code": "schema-violation",
       "pointer": "/payload",
       "why": "What the adapter hands over is the result the store produced, reason included."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-for-an-unknown-cause.json",
+      "code": "schema-violation",
+      "pointer": "/payload/cause",
+      "why": "A run stops because nothing was eligible or because its budget ran out."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/step",
+      "why": "The index of a step is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-deadlines-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/armed_deadlines",
+      "why": "The count of armed deadlines is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-without-what-waits.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A stopped run says what still waits: the deadlines armed and not fired."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-without-what-is-held.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A stopped run says which faults still hold an item."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-naming-a-fault-twice.json",
+      "code": "schema-violation",
+      "pointer": "/payload/holding_faults",
+      "why": "Each fault that holds an item is named once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-violation-without-its-kind.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A violation says which one: the store reports no outcome, a violation of the contract."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-commit-with-a-violation.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "Only a violation names a violation."
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-rejection-without-its-reason.json",
@@ -1373,6 +1429,12 @@
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-epoch-grant-handed-over-stated-by-store-evidence.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-stated-by-broker-core.json",
       "code": "schema-violation",
       "pointer": "/origin_component",
       "why": "A kind of record is stated by its one origin; another may not state it."

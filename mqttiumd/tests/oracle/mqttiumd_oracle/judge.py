@@ -36,6 +36,7 @@ PASS, FAIL, INCONCLUSIVE, OUT_OF_SCOPE = "PASS", "FAIL", "INCONCLUSIVE", "OUT_OF
 # observed. Within these, a status says itself whether its reason is of
 # that kind (``Status.stands``).
 MONOTONE = {
+    "scenario_reaches_its_end",
     "fenced_operation_never_executed",
     "one_admission_per_observed_inbound_exchange",
     "same_required_obligations_at_both_checkpoints",
@@ -1115,6 +1116,48 @@ def refusal_carries_the_reason_of_its_rejection(run):
     return Status(_worst(statuses), reasons)
 
 
+def scenario_reaches_its_end(run):
+    """The run reached the last step of its scenario (point d of the second wave).
+
+    A DriveUntil step asserts that the awaited event comes with no
+    stimulus beyond what the scenario has already injected. The bench
+    says why it stopped earlier. Nothing eligible while the wait is unmet
+    refutes that assertion for this run: a FAIL, which no missing record
+    undoes, and which does not say the product is stuck for ever. A
+    budget of steps that ran out establishes nothing. What still waited
+    at the stop is reported for diagnosis; the status depends on the
+    cause alone.
+    """
+
+    def waiting(payload):
+        held = payload["holding_faults"]
+        faults = f"faults holding an item: {', '.join(held)}" if held else "no fault holds an item"
+        return f"{payload['armed_deadlines']} deadlines armed and not fired, {faults}"
+
+    blocks = run.trace.of_kind("StepBlocked")
+    stuck = [record for record in blocks if record.payload["cause"] == "quiescent"]
+    if stuck:
+        return Status(
+            FAIL,
+            [
+                f"record {record.sequence}: nothing was eligible and the wait of step "
+                f"{record.payload['step']} ({record.payload['step_kind']}) was unmet, which "
+                "refutes for this run that the awaited event comes with no further stimulus; "
+                f"{waiting(record.payload)}"
+                for record in stuck
+            ],
+        )
+    if blocks:
+        return Status(
+            INCONCLUSIVE,
+            [
+                f"record {record.sequence}: the budget of steps ran out; {waiting(record.payload)}"
+                for record in blocks
+            ],
+        )
+    return Status(PASS)
+
+
 def terminal_knowledge_never_regresses(run):
     """Knowledge of an operation never goes back (record 0001, step 6; DEM-MU-05).
 
@@ -1214,6 +1257,7 @@ ASSERTIONS = {
     "broker_inputs_have_provenance": broker_inputs_have_provenance,
     "one_grant_per_opened_epoch": one_grant_per_opened_epoch,
     "terminal_knowledge_never_regresses": terminal_knowledge_never_regresses,
+    "scenario_reaches_its_end": scenario_reaches_its_end,
     "all_required_faults_hit": all_required_faults_hit,
     "trace_complete": trace_complete,
 }

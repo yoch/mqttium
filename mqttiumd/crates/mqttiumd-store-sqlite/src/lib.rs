@@ -27,7 +27,9 @@ mod schema;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 
 use mqttiumd_contract::capacity::{
     BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References, Resource,
@@ -92,6 +94,8 @@ pub enum OpenError {
     SchemaVersion(i64),
     /// The file names another format, or a durable value does not decode.
     Corrupt,
+    /// `PRAGMA quick_check` found the file damaged; its first lines.
+    Integrity(String),
     /// A setting read back is not the one that was set.
     Setting {
         name: &'static str,
@@ -1051,6 +1055,34 @@ fn settle(conn: &Connection) -> Result<Settings, OpenError> {
     })
 }
 
+/// `PRAGMA quick_check`: its first lines, `["ok"]` for a sound file. A
+/// damage the check itself trips over is a report too, not an SQL error.
+fn quick_check(conn: &Connection) -> Result<Vec<String>, OpenError> {
+    let run = || -> rusqlite::Result<Vec<String>> {
+        let mut report = Vec::new();
+        let mut statement = conn.prepare("PRAGMA quick_check")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            if report.len() < 8 {
+                report.push(row.get::<_, String>(0)?);
+            }
+        }
+        Ok(report)
+    };
+    match run() {
+        Ok(report) => Ok(report),
+        Err(error @ rusqlite::Error::SqliteFailure(failure, _))
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            ) =>
+        {
+            Ok(vec![error.to_string()])
+        }
+        Err(error) => Err(OpenError::Sql(error)),
+    }
+}
+
 /// The SQLite store. The connection is the only writer of its file.
 pub struct SqliteStore {
     conn: Connection,
@@ -1127,8 +1159,44 @@ impl SqliteStore {
         Self::verified(conn)
     }
 
+    /// Reads the durable state of the file at `path` without the writer,
+    /// for an inspector outside the process that writes it.
+    ///
+    /// The file is opened read-only (`SQLITE_OPEN_READ_ONLY`, the flag of
+    /// `mode=ro`; never `immutable`, which would read without locks while
+    /// the WAL changes). No pragma that writes is set and no checkpoint is
+    /// run. The whole state is read in one read transaction, which ends,
+    /// and the connection is closed, before this returns: the inspector
+    /// holds nothing that would keep the writer's checkpoint back.
+    pub fn inspect(path: &Path) -> Result<DurableState, OpenError> {
+        if !path.exists() {
+            return Err(OpenError::Corrupt);
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        // A reader may wait briefly for the writer's index of the WAL.
+        conn.busy_timeout(std::time::Duration::from_secs(1))?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Err(OpenError::SchemaVersion(version));
+        }
+        let read = conn.unchecked_transaction()?;
+        let state = read_snapshot(&read).map_err(|_| OpenError::Corrupt)?;
+        read.commit()?;
+        drop(conn);
+        Ok(state)
+    }
+
     fn verified(conn: Connection) -> Result<Self, OpenError> {
         let settings = settle(&conn)?;
+        // Before an epoch is opened: every page of the file is checked,
+        // not only those opening reads.
+        let report = quick_check(&conn)?;
+        if report != ["ok"] {
+            return Err(OpenError::Integrity(report.join("\n")));
+        }
         if settings.user_version != SCHEMA_VERSION {
             return Err(OpenError::SchemaVersion(settings.user_version));
         }
@@ -1145,6 +1213,19 @@ impl SqliteStore {
     #[must_use]
     pub fn effective_settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// For a measurement only: sets `PRAGMA wal_autocheckpoint` on the
+    /// writer's connection and reads it back into the settings. A store
+    /// keeps the engine's default otherwise; nothing in the product calls
+    /// this.
+    pub fn set_wal_autocheckpoint_for_measurement(&mut self, pages: i64) -> Result<i64, OpenError> {
+        self.conn.pragma_update(None, "wal_autocheckpoint", pages)?;
+        let read_back: i64 = self
+            .conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
+        self.settings.wal_autocheckpoint = read_back;
+        Ok(read_back)
     }
 
     /// Sets whether the medium accepts writes. While it fails, every
@@ -1401,8 +1482,20 @@ impl SqliteStore {
     }
 
     fn read_snapshot(&self) -> Result<DurableState, Fault> {
-        let meta = read_meta(&self.conn)?;
-        let conn = &self.conn;
+        // One read transaction for the whole state, even on the writer's
+        // own connection: a state read in several snapshots is a trap.
+        let read = self.conn.unchecked_transaction()?;
+        let state = read_snapshot(&read)?;
+        read.commit()?;
+        Ok(state)
+    }
+}
+
+/// Every table of the file, decoded, as one `DurableState`. The caller
+/// holds the read transaction.
+fn read_snapshot(conn: &Connection) -> Result<DurableState, Fault> {
+    {
+        let meta = read_meta(conn)?;
         let mut sessions = BTreeMap::new();
         {
             let mut statement =

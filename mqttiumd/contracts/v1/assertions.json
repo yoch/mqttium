@@ -123,6 +123,14 @@
       "requirements": [
         "DEM-010"
       ]
+    },
+    {
+      "name": "scenario_reaches_its_end",
+      "meaning": "The run reached the last step of its scenario. A DriveUntil step asserts that the awaited event comes with no stimulus beyond what the scenario has already injected; a run the bench stopped because no action was eligible and the wait was unmet refutes that assertion for this run, and fails. It does not establish that the product is stuck for ever. A run stopped by its budget of steps concludes nothing.",
+      "every_run": true,
+      "requirements": [
+        "DEM-017"
+      ]
     }
   ]
 }
