@@ -17,8 +17,9 @@ Run from the ``mqttiumd`` directory::
     python tools/build_corpus.py           # rewrite the derived files
     python tools/build_corpus.py --check   # fail if a derived file is not up to date
 
-After editing a chapter digest, a decision record, the base scenario or the fixture, run it
-without ``--check`` and commit the result. Standard library only.
+After editing a chapter digest, a decision record, the base scenario, the fixture or the
+fault or assertion catalogue (invalid examples are edits of them), run it without ``--check`` and commit the
+result. Standard library only.
 """
 
 from __future__ import annotations
@@ -147,6 +148,9 @@ def rule(
 BASE = json.loads((ROOT / "tests/scenarios/p1/P1-02.json").read_text())
 valid = [
     "tests/scenarios/p1/P1-02.json",
+    "tests/scenarios/qabs/QABS-A.json",
+    "tests/scenarios/qabs/QABS-B.json",
+    "tests/scenarios/qabs/QABS-C.json",
     "tests/fixtures/p1/three-persistent-sessions.json",
 ]
 invalid = []
@@ -173,8 +177,8 @@ def bad(name, code, pointer, why, value=None, raw=None):
     )
 
 
-def scenario(edit):
-    value = copy.deepcopy(BASE)
+def scenario(edit, base=None):
+    value = copy.deepcopy(BASE if base is None else base)
     edit(value)
     return value
 
@@ -386,6 +390,13 @@ bad(
     scenario(setter(["steps", 7, "exchange"], "pub_B")),
 )
 bad(
+    "scenario-exchange-used-before-binding.json",
+    "binding-undefined",
+    "/steps/1/exchange",
+    "An exchange is resumed only after the step that binds it, not merely somewhere in the file.",
+    scenario(lambda v: v["steps"].insert(1, copy.deepcopy(v["steps"][7]))),
+)
+bad(
     "scenario-binding-undefined-fault.json",
     "binding-undefined",
     "/steps/2/binding",
@@ -509,8 +520,341 @@ ok(
     scenario(setter(["budgets", "max_trace_bytes"], "18446744073709551615")),
 )
 ok(
+    "scenario-core-without-bytes.json",
+    scenario(
+        lambda v: v.update(
+            perimeter="core-without-bytes",
+            assertions=[
+                name
+                for name in BASE["assertions"]
+                if name
+                not in (
+                    "no_pubrec_observed_before_crash",
+                    "one_admission_per_observed_inbound_exchange",
+                )
+            ],
+        )
+    ),
+)
+schema_case(
+    "unknown-perimeter", ["perimeter"], "everything", "A scenario requires a known perimeter."
+)
+ok(
     "scenario-qos0-publish.json",
     scenario(lambda v: (v["steps"][1].pop("packet_id"), v["steps"][1].update(qos=0))),
+)
+
+# The steps of P1-02b (ADR 0001): no crash, a held command, a held result and
+# two deadlines. `tests/scenarios/p1/P1-02b.json` itself comes with lot L4;
+# this document only fixes the shape of the steps.
+MATCH_A = {"command_kind": "AdmitPublication", "publication_binding": "pub_A"}
+
+
+def fault(fid, point, action, **extra):
+    match = {**MATCH_A, **extra.pop("match", {})}
+    return {
+        "id": fid,
+        "point": point,
+        "match": match,
+        "occurrence": "1",
+        "action": action,
+        **extra,
+        "expected_hits": "1",
+    }
+
+
+def drive_fault(binding):
+    return {"kind": "DriveUntil", "event": "FaultHit", "binding": binding, "max_steps": "512"}
+
+
+HELD = scenario(
+    lambda v: v.update(
+        id="P1-02b",
+        faults=[
+            fault(
+                "held_admission",
+                "store.command.transit",
+                "hold_command",
+                bind_operation_as="op_A",
+            ),
+            fault(
+                "held_unknown",
+                "store.result.ready",
+                "delay_result",
+                match={"result_of": "ResolveAndFence"},
+            ),
+            fault(
+                "lost_admission_result",
+                "store.result.ready",
+                "drop_result",
+                match={"result_of": "Persist"},
+            ),
+            # The first resolution reads the absence and cannot write its
+            # fence: that, not the held command, is why it answers unknown.
+            fault("refused_fence", "store.fence.transit", "refuse_fence"),
+        ],
+        steps=[
+            BASE["steps"][0],
+            BASE["steps"][1],
+            drive_fault("held_admission"),
+            {"kind": "FireDeadline", "max_steps": "512"},
+            drive_fault("refused_fence"),
+            drive_fault("held_unknown"),
+            {"kind": "ReleaseHeldCommand", "fault": "held_admission"},
+            drive_fault("lost_admission_result"),
+            {"kind": "InspectDurableState", "checkpoint": "after_commit"},
+            {"kind": "FireDeadline", "max_steps": "512"},
+            BASE["steps"][8],
+            {"kind": "DeliverHeldResult", "fault": "held_unknown", "max_steps": "512"},
+            BASE["steps"][9],
+            BASE["steps"][10],
+            BASE["steps"][11],
+        ],
+        assertions=[
+            name for name in BASE["assertions"] if name != "no_pubrec_observed_before_crash"
+        ],
+    )
+)
+RELEASE, DELIVER = 6, 11
+
+
+def held(edit):
+    return scenario(edit, HELD)
+
+
+def swap(first, second):
+    def edit(value):
+        steps = value["steps"]
+        steps[first], steps[second] = steps[second], steps[first]
+
+    return edit
+
+
+ok("scenario-held-command-and-result.json", HELD)
+bad(
+    "scenario-release-before-hold.json",
+    "step-order-invalid",
+    "/steps/2",
+    "A command is released only after the step that reached its hold.",
+    held(swap(2, RELEASE)),
+)
+bad(
+    "scenario-release-twice.json",
+    "step-order-invalid",
+    f"/steps/{RELEASE + 1}",
+    "A held command is released once.",
+    held(lambda v: v["steps"].insert(RELEASE + 1, copy.deepcopy(v["steps"][RELEASE]))),
+)
+bad(
+    "scenario-second-wait-on-a-holding-fault.json",
+    "step-order-invalid",
+    f"/steps/{RELEASE + 1}",
+    "A fault that holds something holds one item in the life of a scenario: it is waited for once.",
+    held(lambda v: v["steps"].insert(RELEASE + 1, drive_fault("held_admission"))),
+)
+bad(
+    "scenario-holding-fault-expected-twice.json",
+    "held-item-mismatch",
+    "/faults/0/expected_hits",
+    "A fault that holds something is reached once: a second item would have no step to release it.",
+    held(setter(["faults", 0, "expected_hits"], "2")),
+)
+ok(
+    "scenario-hold-reached-after-a-restart.json",
+    held(
+        lambda v: v["steps"].__setitem__(
+            slice(2, 2), [BASE["steps"][4], BASE["steps"][5], BASE["steps"][0]]
+        )
+    ),
+)
+ok(
+    "scenario-command-held-to-the-end.json",
+    held(
+        lambda v: v.update(
+            faults=v["faults"][:1],
+            steps=[*v["steps"][:3], {"kind": "InspectDurableState", "checkpoint": "held"}],
+        )
+    ),
+)
+bad(
+    "scenario-wait-for-a-fault-never-expected.json",
+    "step-order-invalid",
+    "/steps/7",
+    "A scenario does not wait for an injection it announces will never be reached.",
+    held(setter(["faults", 2, "expected_hits"], "0")),
+)
+bad(
+    "scenario-two-faults-select-one-result.json",
+    "fault-match-invalid",
+    "/faults/2/match",
+    "Without result_of the delay counts over every result of the operation: its second may be the "
+    "first of the Persist, which another fault drops.",
+    held(
+        lambda v: (
+            v["faults"][1]["match"].pop("result_of"),
+            v["faults"][1].update(occurrence="2"),
+        )
+    ),
+)
+bad(
+    "scenario-two-faults-select-one-occurrence.json",
+    "fault-match-invalid",
+    "/faults/4/match",
+    "Two faults name the same occurrence of the same result: only one could act.",
+    held(
+        lambda v: v["faults"].append(
+            {**copy.deepcopy(v["faults"][2]), "id": "duplicated", "action": "duplicate_result"}
+        )
+    ),
+)
+bad(
+    "scenario-release-of-a-refused-fence.json",
+    "held-item-mismatch",
+    f"/steps/{RELEASE}/fault",
+    "A refused fence is not written and not kept: nothing is left to release.",
+    held(setter(["steps", RELEASE, "fault"], "refused_fence")),
+)
+bad(
+    "scenario-refuse-fence-where-no-fence-waits.json",
+    "fault-action-unknown",
+    "/faults/3/action",
+    "Only the point where a fence waits offers to refuse it.",
+    held(setter(["faults", 3, "point"], "store.commit.applied")),
+)
+bad(
+    "scenario-two-faults-one-without-binding.json",
+    "fault-match-invalid",
+    "/faults/4/match",
+    "A fault without a publication binding counts over every publication: its second command "
+    "may be the first of the publication another fault names.",
+    held(
+        lambda v: v["faults"].append(
+            {
+                "id": "any_admission",
+                "point": "store.command.transit",
+                "match": {"command_kind": "AdmitPublication"},
+                "occurrence": "2",
+                "action": "hold_command",
+                "expected_hits": "1",
+            }
+        )
+    ),
+)
+bad(
+    "scenario-deliver-while-crashed.json",
+    "step-order-invalid",
+    f"/steps/{DELIVER + 1}",
+    "One misplaced step is one diagnostic: the hand-over is not judged again while the broker is down.",
+    held(
+        lambda v: (
+            v["steps"].insert(DELIVER, BASE["steps"][4]),
+            v["steps"].insert(DELIVER + 2, BASE["steps"][5]),
+            v["steps"].insert(DELIVER + 3, BASE["steps"][0]),
+        )
+    ),
+)
+bad(
+    "scenario-deliver-after-crash.json",
+    "step-order-invalid",
+    f"/steps/{DELIVER + 2}",
+    "A crash destroys what the broker process held; nothing is left to deliver.",
+    held(
+        lambda v: v["steps"].__setitem__(
+            slice(DELIVER, DELIVER), [BASE["steps"][4], BASE["steps"][5]]
+        )
+    ),
+)
+bad(
+    "scenario-release-undeclared-fault.json",
+    "binding-undefined",
+    f"/steps/{RELEASE}/fault",
+    "ReleaseHeldCommand names a fault that is not declared.",
+    held(setter(["steps", RELEASE, "fault"], "held_release")),
+)
+bad(
+    "scenario-release-of-a-held-result.json",
+    "held-item-mismatch",
+    f"/steps/{RELEASE}/fault",
+    "The fault delays a result; it holds no command to release.",
+    held(setter(["steps", RELEASE, "fault"], "held_unknown")),
+)
+bad(
+    "scenario-deliver-of-a-dropped-result.json",
+    "held-item-mismatch",
+    f"/steps/{DELIVER}/fault",
+    "A dropped result is gone; only a delayed result can be delivered.",
+    held(setter(["steps", DELIVER, "fault"], "lost_admission_result")),
+)
+bad(
+    "scenario-result-of-on-a-command-point.json",
+    "fault-match-invalid",
+    "/faults/0/match/result_of",
+    "The point carries a command; `result_of` selects among results.",
+    held(setter(["faults", 0, "match", "result_of"], "Persist")),
+)
+bad(
+    "scenario-result-of-unknown-effect.json",
+    "schema-violation",
+    "/faults/1/match/result_of",
+    "Only Persist and ResolveAndFence are answered by a store result.",
+    held(setter(["faults", 1, "match", "result_of"], "LoadWork")),
+)
+bad(
+    "scenario-fire-deadline-without-budget.json",
+    "schema-violation",
+    "/steps/3",
+    "Firing a deadline is bounded like every step that drives the broker.",
+    held(lambda v: v["steps"][3].pop("max_steps")),
+)
+bad(
+    "scenario-fire-deadline-budget-exceeded.json",
+    "budget-exceeded",
+    "/steps/3/max_steps",
+    "The new steps obey the scenario budget.",
+    held(setter(["steps", 3, "max_steps"], "8192")),
+)
+
+# fault catalogue
+FAULTS = json.loads((V1 / "fault-points.json").read_text())
+# The catalogue is a source: it is listed by its own path, like the fixture.
+valid.append("contracts/v1/fault-points.json")
+bad(
+    "fault-catalog-result-action-on-a-command-point.json",
+    "fault-action-unknown",
+    "/points/0/actions/1",
+    "A point that carries a command cannot delay a result.",
+    (lambda v: (v["points"][0]["actions"].append("delay_result"), v)[1])(copy.deepcopy(FAULTS)),
+)
+bad(
+    "fault-catalog-refuse-fence-on-a-result-point.json",
+    "fault-action-unknown",
+    "/points/3/actions/3",
+    "A fence is a command of the writer: a point that carries a result cannot refuse one.",
+    (lambda v: (v["points"][3]["actions"].append("refuse_fence"), v)[1])(copy.deepcopy(FAULTS)),
+)
+bad(
+    "fault-catalog-action-nobody-defines.json",
+    "fault-action-unknown",
+    "/points/0/actions/0",
+    "The actions of an injection point are a closed vocabulary.",
+    (lambda v: (v["points"][0].update(actions=["teleport"]), v)[1])(copy.deepcopy(FAULTS)),
+)
+bad(
+    "fault-catalog-point-without-carries.json",
+    "schema-violation",
+    "/points/0",
+    "Every injection point says whether a command or a result passes through it.",
+    (lambda v: (v["points"][0].pop("carries"), v)[1])(copy.deepcopy(FAULTS)),
+)
+
+# assertion catalogue
+ASSERTION_CATALOG = json.loads((V1 / "assertions.json").read_text())
+bad(
+    "assertion-catalog-entry-without-every-run.json",
+    "schema-violation",
+    "/assertions/0",
+    "Every assertion says whether every run owes it or only the scenarios that list it.",
+    (lambda v: (v["assertions"][0].pop("every_run", None), v)[1])(copy.deepcopy(ASSERTION_CATALOG)),
 )
 
 # fixture
@@ -554,6 +898,10 @@ bad(
 
 # trace records
 OP = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "1"}
+EFFECT = {"epoch": "1", "owner": "0", "sequence": "1"}
+RESOLVE = {"epoch": "1", "owner": "0", "sequence": "3"}
+PUBLICATION = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "1"}
+PUBLISH_HEX = "3416000a70312f6578616d706c650007007061796c6f6164"
 
 
 def record(sequence, origin, origin_sequence, kind, payload, parents=()):
@@ -575,14 +923,21 @@ def record(sequence, origin, origin_sequence, kind, payload, parents=()):
     )
 
 
-ok(
-    "trace-record-header.json",
-    record(
-        0, "bench-supervisor", 0, "TraceHeader", {"scenario_id": "P1-02", "backend": "sim-store"}
-    ),
+HEADER = record(
+    0,
+    "bench-supervisor",
+    0,
+    "TraceHeader",
+    {"scenario_id": "P1-02", "backend": "sim-store", "perimeter": "full"},
 )
+ok("trace-record-header.json", HEADER)
 commit = record(
-    5, "store-evidence", 0, "StoreCommitStable", {"operation_id": OP}, [("store-adapter", 0)]
+    5,
+    "store-evidence",
+    0,
+    "StoreCommitStable",
+    {"operation_id": OP, "command_kind": "AdmitPublication"},
+    [("store-adapter", 0)],
 )
 ok("trace-record-store-commit-stable.json", commit)
 ok(
@@ -592,8 +947,14 @@ ok(
         "fault-injector",
         0,
         "FaultHit",
-        {"fault_id": "lost_admission_result", "point": "store.result.ready", "occurrence": "1"},
-        [("store-evidence", 0)],
+        {
+            "fault_id": "lost_admission_result",
+            "point": "store.result.ready",
+            "occurrence": "1",
+            "operation_id": OP,
+            "effect_id": EFFECT,
+        },
+        [("store-evidence", 1)],
     ),
 )
 ok(
@@ -603,12 +964,493 @@ ok(
         "peer",
         3,
         "PeerPacketObserved",
-        {"client": "producer", "packet_kind": "PUBREC", "packet_id": 7, "bytes_hex": "5004000700"},
+        {
+            "client": "producer",
+            "packet_kind": "PUBREC",
+            "packet_id": 7,
+            "reason_code": 0,
+            "bytes_hex": "50020007",
+        },
     ),
 )
 ok(
     "trace-record-footer.json",
     record(31, "bench-supervisor", 4, "TraceFooter", {"record_count": "32", "complete": True}),
+)
+
+# What a client sent, what the transport received and what the core consumed:
+# the oracle builds its own identity of an exchange from the first, and the
+# provenance of broker inputs (ADR 0003) from the chain.
+PEER_PUBLISH = record(
+    3,
+    "peer",
+    2,
+    "PeerPacketSent",
+    {
+        "client": "producer",
+        "packet_kind": "PUBLISH",
+        "packet_id": 7,
+        "dup": False,
+        "bytes_hex": PUBLISH_HEX,
+    },
+)
+ok(
+    "trace-record-peer-connection-opened.json",
+    record(1, "peer", 0, "PeerConnectionOpened", {"client": "producer"}),
+)
+ok("trace-record-peer-packet-sent.json", PEER_PUBLISH)
+ok(
+    "trace-record-peer-connection-closed.json",
+    record(30, "peer", 5, "PeerConnectionClosed", {"client": "producer"}),
+)
+ok(
+    "trace-record-client-bytes-received.json",
+    record(
+        4,
+        "transport",
+        1,
+        "ClientBytesReceived",
+        {"connection_generation": "1", "bytes_hex": PUBLISH_HEX},
+        [("peer", 2)],
+    ),
+)
+DELIVERED_PACKET = record(
+    5,
+    "broker-core",
+    1,
+    "PacketDelivered",
+    {"connection_generation": "1", "ingress_order": "1", "packet_kind": "PUBLISH", "packet_id": 7},
+    [("transport", 1)],
+)
+ok("trace-record-packet-delivered.json", DELIVERED_PACKET)
+ok(
+    "trace-record-resolve-submitted.json",
+    record(
+        9,
+        "store-adapter",
+        1,
+        "ResolveSubmitted",
+        {"effect_id": RESOLVE, "operation_id": OP},
+    ),
+)
+ok(
+    "trace-record-store-result-ready.json",
+    record(
+        7,
+        "store-evidence",
+        1,
+        "StoreResultReady",
+        {
+            "effect_id": EFFECT,
+            "operation_id": OP,
+            "outcome": "Committed",
+        },
+        [("store-evidence", 0)],
+    ),
+)
+ok(
+    "trace-record-store-fence-stable.json",
+    record(
+        10, "store-evidence", 2, "StoreFenceStable", {"operation_id": OP}, [("store-adapter", 1)]
+    ),
+)
+ARMED = record(
+    8,
+    "timer",
+    0,
+    "DeadlineArmed",
+    {"effect_id": {"epoch": "1", "owner": "0", "sequence": "2"}, "token": "1", "after": "30"},
+)
+ok("trace-record-deadline-armed.json", ARMED)
+FIRED = record(
+    11, "broker-core", 2, "DeadlineDelivered", {"token": "1", "now": "30"}, [("timer", 0)]
+)
+ok("trace-record-deadline-delivered.json", FIRED)
+PAGE = {
+    "run_epoch": "2",
+    "page": "0",
+    "last": True,
+    "facts": [
+        {"kind": "Epoch", "incarnation": "1", "epoch": "2"},
+        {
+            "kind": "Session",
+            "session": "1",
+            "client_id_hex": "70312d70726f6475636572",
+            "revision": "1",
+        },
+        {
+            "kind": "InboundExchange",
+            "exchange": {"session": "1", "generation": "1"},
+            "packet_id": 7,
+            "publication": PUBLICATION,
+            "phase": "AwaitPubrel",
+        },
+        {"kind": "Operation", "operation_id": OP, "knowledge": "Committed"},
+    ],
+}
+PAGE_READ = record(14, "store-adapter", 2, "RecoveryPageRead", PAGE)
+ok("trace-record-recovery-page-read.json", PAGE_READ)
+ok(
+    "trace-record-recovery-page-delivered.json",
+    record(15, "broker-core", 3, "RecoveryPageDelivered", PAGE, [("store-adapter", 2)]),
+)
+
+
+# An inventory with the limits, the route table and its routes (record
+# 0014). Routes are in the order of their topic bytes: a prefix first, a
+# byte 0xff after every ASCII byte, and two targets of one topic together.
+def route(topic, target, qos=1):
+    return {
+        "kind": "Route",
+        "topic_hex": topic.hex(),
+        "target": str(target),
+        "target_revision": "1",
+        "max_qos": qos,
+    }
+
+
+PAGE_FULL = {
+    "run_epoch": "2",
+    "page": "0",
+    "last": True,
+    "facts": [
+        {"kind": "Epoch", "incarnation": "1", "epoch": "2"},
+        {
+            "kind": "Limits",
+            "max_targets_per_admission": 4,
+            "max_topic_bytes": 256,
+            "max_payload_bytes": "1024",
+        },
+        {"kind": "RouteTable", "revision": "1"},
+        route(b"p1", 2),
+        route(b"p1/example", 2),
+        route(b"p1/example", 3, qos=2),
+        route(b"\xff", 3, qos=0),
+        *PAGE["facts"][1:],
+    ],
+}
+FULL_READ = record(14, "store-adapter", 2, "RecoveryPageRead", PAGE_FULL)
+ok("trace-record-recovery-page-with-routes-and-limits.json", FULL_READ)
+ok(
+    "trace-record-recovery-page-of-routes-only.json",
+    record(
+        15,
+        "store-adapter",
+        3,
+        "RecoveryPageRead",
+        {"run_epoch": "2", "page": "1", "last": False, "facts": [route(b"p1/z", 2)]},
+    ),
+)
+REFUSED = record(
+    16,
+    "dispatcher",
+    0,
+    "InputRefused",
+    {
+        "input": "StoreResult",
+        "effect_id": EFFECT,
+        "operation_id": OP,
+        "reason": "no-effect-in-flight",
+    },
+)
+ok("trace-record-input-refused.json", REFUSED)
+ok(
+    "trace-record-held-item-released.json",
+    record(
+        12,
+        "fault-injector",
+        1,
+        "HeldItemReleased",
+        {"fault_id": "held_admission"},
+        [("fault-injector", 0)],
+    ),
+)
+ELIGIBLE = record(
+    18,
+    "broker-core",
+    4,
+    "FrameEligible",
+    {
+        "effect_id": {"epoch": "1", "owner": "0", "sequence": "4"},
+        "connection": {"session": "1", "generation": "1"},
+        "packet_kind": "PUBREC",
+        "packet_id": 7,
+        "reason": "Success",
+    },
+    [("broker-core", 3)],
+)
+ok("trace-record-frame-eligible.json", ELIGIBLE)
+ok(
+    "trace-record-frame-eligible-refusal-without-quota.json",
+    {**ELIGIBLE, "payload": {**ELIGIBLE["payload"], "reason": "ImplementationSpecificError"}},
+)
+ok(
+    "trace-record-frame-eligible-connack.json",
+    record(
+        2,
+        "broker-core",
+        0,
+        "FrameEligible",
+        {
+            "effect_id": {"epoch": "1", "owner": "0", "sequence": "0"},
+            "connection": {"session": "1", "generation": "1"},
+            "packet_kind": "CONNACK",
+            "session_present": True,
+        },
+    ),
+)
+
+
+def edited(base, edit):
+    value = copy.deepcopy(base)
+    edit(value)
+    return value
+
+
+def dropped(*path):
+    def edit(value):
+        *parents, last = path
+        for key in parents:
+            value = value[key]
+        del value[last]
+
+    return edit
+
+
+def trace_case(name, base, pointer, why, edit, code="schema-violation"):
+    bad(f"trace-record-{name}.json", code, pointer, why, edited(base, edit))
+
+
+trace_case(
+    "recovery-page-from-the-bench",
+    PAGE_READ,
+    "/origin_component",
+    "A recovery page is read by the store adapter; no other origin may state one (ADR 0003).",
+    setter(["origin_component"], "bench-supervisor"),
+)
+trace_case(
+    "input-refused-by-the-core",
+    REFUSED,
+    "/origin_component",
+    "The dispatcher refuses an input before the core sees it; the core cannot record it.",
+    setter(["origin_component"], "broker-core"),
+)
+trace_case(
+    "recovered-fact-unknown-kind",
+    PAGE_READ,
+    "/payload/facts/3/kind",
+    "Recovered facts are a closed union: a remembered binding is not one of them.",
+    setter(["payload", "facts", 3], {"kind": "RememberedOperation", "operation_id": OP}),
+)
+trace_case(
+    "recovered-operation-without-knowledge",
+    PAGE_READ,
+    "/payload/facts/3",
+    "A recovered operation states what the store knows of it.",
+    dropped("payload", "facts", 3, "knowledge"),
+)
+trace_case(
+    "peer-publish-without-dup",
+    PEER_PUBLISH,
+    "/payload",
+    "A PUBLISH that a client sent says whether it is a retransmission.",
+    dropped("payload", "dup"),
+)
+trace_case(
+    "peer-packet-sent-of-a-broker-kind",
+    PEER_PUBLISH,
+    "/payload/packet_kind",
+    "A client of the subset sends CONNECT, PUBLISH and PUBREL; PUBREC comes from the broker.",
+    setter(["payload", "packet_kind"], "PUBREC"),
+)
+trace_case(
+    "frame-eligible-pubrec-without-reason",
+    ELIGIBLE,
+    "/payload",
+    "A PUBREC is positive or not: the record carries its reason.",
+    dropped("payload", "reason"),
+)
+trace_case(
+    "deadline-token-overflow",
+    ARMED,
+    "/payload/token",
+    "A deadline token is 64-bit.",
+    setter(["payload", "token"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "packet-delivered-ingress-order-overflow",
+    DELIVERED_PACKET,
+    "/payload/ingress_order",
+    "The ingress order is 64-bit.",
+    setter(["payload", "ingress_order"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "recovery-page-fact-overflow",
+    PAGE_READ,
+    "/payload/facts/1/revision",
+    "Identity components inside a recovered fact are 64-bit as well.",
+    setter(["payload", "facts", 1, "revision"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "recovered-facts-rank-decreases",
+    FULL_READ,
+    "/payload/facts/8/kind",
+    "The facts of a page are in the order of the inventory: a route never follows a session.",
+    setter(["payload", "facts", 8], route(b"p1/z", 2)),
+    code="rows-out-of-order",
+)
+trace_case(
+    "recovered-epoch-twice",
+    FULL_READ,
+    "/payload/facts/1/kind",
+    "An inventory holds its epoch once.",
+    setter(["payload", "facts", 1], PAGE_FULL["facts"][0]),
+    code="duplicate-name",
+)
+trace_case(
+    "recovered-limits-twice",
+    FULL_READ,
+    "/payload/facts/2/kind",
+    "An inventory holds its limits once.",
+    setter(["payload", "facts", 2], PAGE_FULL["facts"][1]),
+    code="duplicate-name",
+)
+trace_case(
+    "recovered-routes-unsorted",
+    FULL_READ,
+    "/payload/facts/5/topic_hex",
+    "Routes are sorted by the bytes of their topic: a prefix comes before what it prefixes.",
+    setter(["payload", "facts", 5, "topic_hex"], b"p1".hex()),
+    code="rows-out-of-order",
+)
+trace_case(
+    "recovered-route-qos-3",
+    FULL_READ,
+    "/payload/facts/3/max_qos",
+    "The QoS of a route is 0, 1 or 2.",
+    setter(["payload", "facts", 3, "max_qos"], 3),
+)
+trace_case(
+    "recovered-limit-of-targets-as-text",
+    FULL_READ,
+    "/payload/facts/1/max_targets_per_admission",
+    "A 32-bit bound is a JSON integer; only 64-bit quantities are decimal strings.",
+    setter(["payload", "facts", 1, "max_targets_per_admission"], "4"),
+)
+trace_case(
+    "recovered-payload-limit-overflow",
+    FULL_READ,
+    "/payload/facts/1/max_payload_bytes",
+    "The bound on a payload is 64-bit.",
+    setter(["payload", "facts", 1, "max_payload_bytes"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "recovered-route-target-overflow",
+    FULL_READ,
+    "/payload/facts/4/target",
+    "The session a route targets is a 64-bit identity.",
+    setter(["payload", "facts", 4, "target"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "recovered-route-target-revision-overflow",
+    FULL_READ,
+    "/payload/facts/4/target_revision",
+    "The revision of a route target is 64-bit.",
+    setter(["payload", "facts", 4, "target_revision"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+OVER = "18446744073709551616"
+for case_name, base, path in [
+    ("deadline-time-overflow", FIRED, ["payload", "now"]),
+    ("deadline-delay-overflow", ARMED, ["payload", "after"]),
+    ("recovery-page-number-overflow", PAGE_READ, ["payload", "page"]),
+    (
+        "packet-delivered-connection-overflow",
+        DELIVERED_PACKET,
+        ["payload", "connection_generation"],
+    ),
+]:
+    trace_case(
+        case_name,
+        base,
+        "".join(f"/{key}" for key in path),
+        "Every 64-bit member of a payload is range-checked, whatever its name.",
+        setter(path, OVER),
+        code="u64-out-of-range",
+    )
+
+ok(
+    "trace-record-store-fence-refused.json",
+    record(
+        10,
+        "store-evidence",
+        2,
+        "StoreFenceRefused",
+        {"effect_id": RESOLVE, "operation_id": OP},
+        [("fault-injector", 1)],
+    ),
+)
+
+INSPECTED = record(
+    13,
+    "bench-supervisor",
+    1,
+    "DurableStateInspected",
+    {
+        "checkpoint": "after_commit_before_crash",
+        "snapshot": {
+            "path": "runs/p1-02-example/after_commit_before_crash.snapshot.json",
+            "sha256": "7" * 64,
+            "bytes": "2048",
+        },
+    },
+)
+ok("trace-record-durable-state-inspected.json", INSPECTED)
+trace_case(
+    "durable-state-inspected-by-the-core",
+    INSPECTED,
+    "/origin_component",
+    "The core never reads the store for the oracle: an inspection belongs to the bench.",
+    setter(["origin_component"], "broker-core"),
+)
+trace_case(
+    "durable-state-inspected-size-overflow",
+    INSPECTED,
+    "/payload/snapshot/bytes",
+    "The size of a cited snapshot is 64-bit.",
+    setter(["payload", "snapshot", "bytes"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "durable-state-inspected-without-digest",
+    INSPECTED,
+    "/payload/snapshot",
+    "A snapshot is cited by path, digest and size, like any evidence.",
+    dropped("payload", "snapshot", "sha256"),
+)
+
+ok(
+    "trace-record-header-core-without-bytes.json",
+    edited(HEADER, setter(["payload", "perimeter"], "core-without-bytes")),
+)
+trace_case(
+    "header-without-perimeter",
+    HEADER,
+    "/payload",
+    "A run says what it exercised: a run without bytes must not be read as a full one.",
+    dropped("payload", "perimeter"),
+)
+trace_case(
+    "header-unknown-perimeter",
+    HEADER,
+    "/payload/perimeter",
+    "Perimeters are a closed set.",
+    setter(["payload", "perimeter"], "mostly-full"),
 )
 
 
@@ -640,12 +1482,470 @@ bad(
     rec(setter(["payload"], {"record_count": "1", "complete": True})),
 )
 bad(
+    "trace-record-store-commit-without-command-kind.json",
+    "schema-violation",
+    "/payload",
+    "Hidden truth says what was committed, not only that something was.",
+    rec(dropped("payload", "command_kind")),
+)
+bad(
     "trace-record-operation-overflow.json",
     "u64-out-of-range",
     "/payload/operation_id/sequence",
     "Identity components are 64-bit.",
     rec(setter(["payload", "operation_id", "sequence"], "18446744073709551616")),
 )
+
+
+# store snapshots: what InspectDurableState writes and the oracle reads
+SESSIONS = [("1", "p1-producer"), ("2", "p1-b"), ("3", "p1-c")]
+PAYLOAD = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "1"}
+
+
+def be(value, width=8):
+    """`value` as `width` big-endian bytes, in hexadecimal."""
+    return value.to_bytes(width, "big").hex()
+
+
+def scoped(sequence):
+    """A scoped identity of incarnation 1, epoch 1, owner 0."""
+    return be(1) + be(1) + be(0) + be(sequence)
+
+
+# The canonical recipe of the admission, byte for byte (`MQDR`, format 1).
+RECIPE_HEX = "".join(
+    [
+        b"MQDR".hex() + be(1, 2) + be(1, 1),
+        scoped(1) + scoped(1) + scoped(1),  # operation, request, publication
+        be(1) + be(1) + be(7, 2) + be(1),  # source: session, revision, packet, generation
+        be(1) + be(2, 1) + be(0, 1),  # route revision, QoS, retain
+        be(10, 2) + b"p1/example".hex(),
+        scoped(1) + be(7),  # payload identity and length
+        be(7) + be(2) + be(1) + be(1),  # costs
+        be(2, 2),
+        be(2) + be(1) + be(0, 4) + be(1, 1) + be(1, 1),  # target b
+        be(3) + be(1) + be(1, 4) + be(1, 1) + be(1, 1),  # target c
+    ]
+)
+SIZES = ("payload_bytes", "references", "exchange_slots", "receipt_slots")
+LIMITS = {name: fixture["capacities"][name] for name in SIZES} | {
+    "max_targets_per_admission": fixture["capacities"]["max_targets_per_admission"],
+    "max_topic_bytes": fixture["capacities"]["max_topic_bytes"],
+    "max_payload_bytes": fixture["capacities"]["max_payload_bytes"],
+    "max_sessions": "8",
+    "max_route_targets": "8",
+}
+EXCHANGE = {"session": "1", "generation": "1"}
+snapshot = env(
+    "mqttiumd.store-snapshot",
+    run_id="p1-02-example",
+    checkpoint="after_commit_before_crash",
+    backend="sim-store",
+    meta={
+        "incarnation": "1",
+        "last_opened_epoch": "1",
+        "opened_by": {"startup_hex": "a7" * 16, "ticket": "1"},
+        "collected_through": "0",
+        "state_revision": "1",
+        "next_session": "4",
+    },
+    sessions=[
+        {
+            "session": number,
+            "client_id_hex": client_id.encode().hex(),
+            "revision": "1",
+            "state": "Active",
+        }
+        for number, client_id in SESSIONS
+    ],
+    route_table={
+        "revision": "1",
+        "routes": [
+            {
+                "topic_hex": b"p1/example".hex(),
+                "targets": [{"session": "2", "qos": 1}, {"session": "3", "qos": 1}],
+            }
+        ],
+    },
+    operations=[
+        {
+            "operation_id": OP,
+            "recipe_hex": RECIPE_HEX,
+            "decision": {
+                "kind": "Committed",
+                "facts": {
+                    "kind": "PublicationAdmitted",
+                    "publication_id": PUBLICATION,
+                    "exchange": EXCHANGE,
+                },
+            },
+        }
+    ],
+    fences=[],
+    payloads=[
+        {
+            "payload_id": PAYLOAD,
+            "length": "7",
+            "sha256": hashlib.sha256(b"payload").hexdigest(),
+            "references": "2",
+        }
+    ],
+    publications=[
+        {
+            "publication_id": PUBLICATION,
+            "operation_id": OP,
+            "source_session": "1",
+            "topic_hex": b"p1/example".hex(),
+            "qos": 2,
+            "retain": False,
+            "payload_id": PAYLOAD,
+        }
+    ],
+    obligations=[
+        {
+            "publication_id": PUBLICATION,
+            "index": index,
+            "session": target,
+            "target_revision": "1",
+            "cause": "LiveExact",
+            "effective_qos": 1,
+            "phase": "Queued",
+        }
+        for index, target in enumerate(["2", "3"])
+    ],
+    inbound_exchanges=[
+        {
+            "exchange": EXCHANGE,
+            "packet_id": 7,
+            "publication_id": PUBLICATION,
+            "phase": "AwaitPubrel",
+        }
+    ],
+    account={
+        "used": {
+            "payload_bytes": "7",
+            "references": "2",
+            "exchange_slots": "1",
+            "receipt_slots": "1",
+        },
+        "limits": LIMITS,
+    },
+)
+ok("store-snapshot-after-commit.json", snapshot)
+ok(
+    "store-snapshot-empty.json",
+    env(
+        "mqttiumd.store-snapshot",
+        run_id="p1-02-example",
+        checkpoint="initial",
+        backend="sqlite",
+        meta={
+            "incarnation": "1",
+            "last_opened_epoch": "0",
+            "opened_by": None,
+            "collected_through": "0",
+            "state_revision": "0",
+            "next_session": "1",
+        },
+        sessions=[],
+        route_table={"revision": "0", "routes": []},
+        operations=[],
+        fences=[],
+        payloads=[],
+        publications=[],
+        obligations=[],
+        inbound_exchanges=[],
+        account={"used": dict.fromkeys(SIZES, "0"), "limits": LIMITS},
+    ),
+)
+# A snapshot shows what the store holds, sound or not: an obligation without
+# its publication is a finding for the oracle, not a malformed document.
+ok(
+    "store-snapshot-orphan-obligation.json",
+    edited(snapshot, lambda v: v.update(publications=[])),
+)
+REFUSED_OP = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "2"}
+ok(
+    "store-snapshot-refused-and-fenced.json",
+    edited(
+        snapshot,
+        lambda v: (
+            v["operations"].append(
+                {
+                    "operation_id": REFUSED_OP,
+                    "recipe_hex": RECIPE_HEX,
+                    "decision": {
+                        "kind": "RejectedCertain",
+                        "reason": "CapacityExceeded",
+                        "resource": "references",
+                    },
+                }
+            ),
+            v["fences"].append(
+                {"operation_id": {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "3"}}
+            ),
+            v["sessions"][2].update(state="Terminal"),
+            # A publication outlives its payload once its obligations ended.
+            v.update(payloads=[], obligations=[]),
+        ),
+    ),
+)
+
+
+def snap_case(name, code, pointer, why, edit):
+    bad(f"store-snapshot-{name}.json", code, pointer, why, edited(snapshot, edit))
+
+
+def twice(table, index=0, **changes):
+    """Repeat one row of a table, with ``changes``, right after itself."""
+
+    def edit(value):
+        rows = value[table]
+        rows.insert(index + 1, {**copy.deepcopy(rows[index]), **changes})
+
+    return edit
+
+
+snap_case(
+    "unknown-table",
+    "schema-violation",
+    "",
+    "The tables of a snapshot are a closed set.",
+    lambda v: v.update(wills=[]),
+)
+snap_case(
+    "without-fences",
+    "schema-violation",
+    "",
+    "Every table is present, even empty: an absent table is not an empty one.",
+    dropped("fences"),
+)
+snap_case(
+    "decision-unknown-outcome",
+    "schema-violation",
+    "/operations/0/decision/kind",
+    "A receipt records a terminal decision; an unknown outcome is not a durable fact.",
+    setter(["operations", 0, "decision"], {"kind": "PendingOrUnknown"}),
+)
+snap_case(
+    "commit-without-facts",
+    "schema-violation",
+    "/operations/0/decision",
+    "A committed receipt says what was committed.",
+    dropped("operations", 0, "decision", "facts"),
+)
+snap_case(
+    "rejection-without-reason",
+    "schema-violation",
+    "/operations/0/decision",
+    "A certain rejection is recorded with its reason: that is what keeps it rejected.",
+    setter(["operations", 0, "decision"], {"kind": "RejectedCertain"}),
+)
+snap_case(
+    "recipe-not-hex",
+    "schema-violation",
+    "/operations/0/recipe_hex",
+    "A recipe is its exact canonical bytes.",
+    setter(["operations", 0, "recipe_hex"], "MQDR"),
+)
+snap_case(
+    "obligation-without-cause",
+    "schema-violation",
+    "/obligations/0",
+    "The cause of an obligation stays inspectable (DEM-011).",
+    dropped("obligations", 0, "cause"),
+)
+snap_case(
+    "opening-attempt-without-ticket",
+    "schema-violation",
+    "/meta/opened_by",
+    "The attempt that opened the last epoch is its start-up nonce and its ticket.",
+    dropped("meta", "opened_by", "ticket"),
+)
+snap_case(
+    "startup-nonce-too-short",
+    "schema-violation",
+    "/meta/opened_by",
+    "A start-up nonce is sixteen bytes.",
+    setter(["meta", "opened_by", "startup_hex"], "a7" * 15),
+)
+snap_case(
+    "session-state-unknown",
+    "schema-violation",
+    "/sessions/0/state",
+    "A session is active or terminal; a deleted one stays, terminal.",
+    setter(["sessions", 0, "state"], "Deleted"),
+)
+snap_case(
+    "operation-listed-twice",
+    "duplicate-name",
+    "/operations/1/operation_id",
+    "An OperationId designates one recipe: one row.",
+    twice("operations"),
+)
+snap_case(
+    "obligation-listed-twice",
+    "duplicate-name",
+    "/obligations/1",
+    "A DeliveryId designates one obligation, whatever destination a second row claims.",
+    twice("obligations", session="1"),
+)
+snap_case(
+    "inbound-slot-listed-twice",
+    "duplicate-name",
+    "/inbound_exchanges/1",
+    "A session has one inbound exchange per Packet Identifier.",
+    twice("inbound_exchanges", exchange={"session": "1", "generation": "2"}),
+)
+snap_case(
+    "session-listed-twice",
+    "duplicate-name",
+    "/sessions/1/session",
+    "A SessionId designates one session.",
+    twice("sessions", client_id_hex="7a"),
+)
+snap_case(
+    "route-listed-twice",
+    "duplicate-name",
+    "/route_table/routes/1/topic_hex",
+    "An exact topic has one route.",
+    lambda v: v["route_table"]["routes"].append(copy.deepcopy(v["route_table"]["routes"][0])),
+)
+snap_case(
+    "fence-listed-twice",
+    "duplicate-name",
+    "/fences/1/operation_id",
+    "An identity is fenced once.",
+    lambda v: v.update(fences=[{"operation_id": OP}, {"operation_id": OP}]),
+)
+snap_case(
+    "publication-listed-twice",
+    "duplicate-name",
+    "/publications/1/publication_id",
+    "A PublicationId designates one publication.",
+    twice("publications"),
+)
+snap_case(
+    "payload-listed-twice",
+    "duplicate-name",
+    "/payloads/1/payload_id",
+    "A PayloadId designates one payload.",
+    twice("payloads"),
+)
+
+
+# The type of a key comes from the schema, never from how its value looks:
+# topic bytes made of decimal digits only are still bytes.
+def routes(*topics):
+    def edit(value):
+        value["route_table"]["routes"] = [
+            {"topic_hex": topic.encode().hex(), "targets": []} for topic in topics
+        ]
+
+    return edit
+
+
+ok("store-snapshot-routes-in-byte-order.json", edited(snapshot, routes("a/b", "aa", "b", "p")))
+ok(
+    "store-snapshot-long-digit-topics.json",
+    edited(snapshot, routes("tttttttttttt", "tttttttttttu")),
+)
+snap_case(
+    "digit-topics-out-of-byte-order",
+    "rows-out-of-order",
+    "/route_table/routes/1/topic_hex",
+    "6161 comes before 62 as bytes, whatever the two read as decimal numbers.",
+    routes("b", "aa"),
+)
+snap_case(
+    "long-digit-topic-listed-twice",
+    "duplicate-name",
+    "/route_table/routes/1/topic_hex",
+    "Twenty-four hexadecimal digits are bytes, not a number too large to compare.",
+    routes("tttttttttttt", "tttttttttttt"),
+)
+snap_case(
+    "empty-topic-listed-twice",
+    "duplicate-name",
+    "/route_table/routes/1/topic_hex",
+    "The empty byte string is a key like another.",
+    routes("", ""),
+)
+# Two stores in the same state write the same bytes: rows are in key order.
+snap_case(
+    "sessions-out-of-order",
+    "rows-out-of-order",
+    "/sessions/1/session",
+    "Sessions are listed in the numeric order of their SessionId.",
+    lambda v: v["sessions"].reverse(),
+)
+snap_case(
+    "sessions-in-text-order",
+    "rows-out-of-order",
+    "/sessions/3/session",
+    "The order is numeric: 10 comes after 3, not between 1 and 2.",
+    lambda v: (
+        v["sessions"].append({**v["sessions"][0], "session": "10", "client_id_hex": "7a"}),
+        v["sessions"].sort(key=lambda row: row["session"]),
+    ),
+)
+snap_case(
+    "obligations-out-of-order",
+    "rows-out-of-order",
+    "/obligations/1",
+    "Obligations are listed by publication, then index.",
+    lambda v: v["obligations"].reverse(),
+)
+snap_case(
+    "operations-out-of-order",
+    "rows-out-of-order",
+    "/operations/1/operation_id",
+    "Operations are listed by incarnation, epoch, owner, sequence.",
+    lambda v: v["operations"].insert(
+        0, {**copy.deepcopy(v["operations"][0]), "operation_id": REFUSED_OP}
+    ),
+)
+snap_case(
+    "payload-length-overflow",
+    "u64-out-of-range",
+    "/payloads/0/length",
+    "Sizes are 64-bit.",
+    setter(["payloads", 0, "length"], OVER),
+)
+snap_case(
+    "obligation-session-overflow",
+    "u64-out-of-range",
+    "/obligations/1/session",
+    "Identities inside a list are range-checked as well.",
+    setter(["obligations", 1, "session"], OVER),
+)
+for path in (
+    ["meta", "last_opened_epoch"],
+    ["meta", "opened_by", "ticket"],
+    ["meta", "collected_through"],
+    ["meta", "state_revision"],
+    ["meta", "next_session"],
+    ["route_table", "revision"],
+    ["payloads", 0, "references"],
+    ["publications", 0, "source_session"],
+    ["obligations", 0, "target_revision"],
+    ["account", "used", "references"],
+    ["account", "limits", "payload_bytes"],
+    ["account", "limits", "exchange_slots"],
+    ["account", "limits", "receipt_slots"],
+    ["account", "limits", "max_targets_per_admission"],
+    ["account", "limits", "max_topic_bytes"],
+    ["account", "limits", "max_payload_bytes"],
+    ["account", "limits", "max_sessions"],
+    ["account", "limits", "max_route_targets"],
+):
+    snap_case(
+        "overflow-" + "-".join(str(part).replace("_", "-") for part in path),
+        "u64-out-of-range",
+        "".join(f"/{part}" for part in path),
+        "Every 64-bit member of a snapshot is range-checked.",
+        setter(path, OVER),
+    )
 
 
 # run results. Qualifying results name files by digest, so their examples
