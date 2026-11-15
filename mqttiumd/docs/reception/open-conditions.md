@@ -16,7 +16,6 @@ with its failing test first.
 | - | - | - | - |
 | **F2, integrity of snapshots: what is left.** Corrected in the judge (lot L3, `6c5bf2d`): at each checkpoint an obligation names a publication the store holds and a publication a payload it holds; a publication whose positive PUBREC a peer observed before an inspection is held with the length and digest of the bytes the client sent, which the oracle decodes itself; the three counterexamples of the audit are traces that fail. Left, asked by the integrator and not yet answered: the obligations a committed publication owes are derived from the fixture (one per route target), so that a snapshot whose obligations are all gone while publications and payloads stay is refused; and the limit is stated for a later perimeter in which an obligation is legitimately settled | L3 | G0 |
 | **F3, progress of resolutions: what is left.** Corrected in the core (lot L1, `2255bf7`): an operation retains its command, its two latest resolutions and its four latest landmark resolutions, those whose rank is a power of two, so that an answer delayed by any finite number of resolutions meets a landmark still retained; at most seven effect identifiers per operation; the invariants are in the documentation of `Answers`. Left: the scenario of the runner with a steady delay; the correspondence of this retention rule with the model M1 | L4 for the scenario; L1 with L5 for the model | S0 for the scenario; G1 for the model |
-| **F4, two owners from one box: what is left.** Corrected in the core (lot L1, `a607861`): `Owner::new` takes the box by value and keeps it, the authority creates no second box for an active identity, and `Owner::renew_box` replaces a box with the counters and the state kept. Left: a composition test that goes through the real start-up path of the runner (opening of an epoch, grant, `OwnerAuthority::from_grant`, `create_outbox`, `Owner::new`) | L4 | S0 |
 | **F5, a causal cycle is accepted.** With A1 before A2 by local order, A2 before B and B before A1 by explicit causes, `trace.py` declares the trace complete and confirms the three relations | The union of the local order and the explicit causes is checked acyclic; `before` is computed from that same relation; a negative test of the cycle, a positive test of transitivity across both kinds of order, independent records left unordered; within the reading budgets | L3 | Qualification of a trace with a partial order |
 | **K1, the provenance of a result.** Changing a `StoreResultReady` from Committed to PendingOrUnknown while its `StoreResultDelivered` stays Committed still passes | The chain from the result the store produced, to the result the adapter handed over, to the result the core consumed is closed on content and identities, with the transformations a fault is allowed; the counterexample is refused for that reason; legitimate losses, duplicates and delays stay representable | L3, with L2 for the records | G0 |
 
@@ -55,7 +54,7 @@ observed in the checkout. It does not connect the two.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| `tests/scenarios/p1/P1-02b.json` and its run on the deterministic store | L4 | S0 |
+| P1-02b is judged PASS on the deterministic store. The scenario exists and the runner plays it (15 steps, the four faults reached, the course of record 0015), but the oracle answers OUT_OF_SCOPE: the scenario, in the form of the corpus of lot L3, lists `no_pubrec_observed_before_crash`, which does not apply without a crash. The verdict rule is not changed and the assertion is not dropped without naming what protects the property: lot L3 names the assertion that carries "no positive acknowledgement before a confirmed commit" on a live process, adds the assertion that terminal knowledge never regresses (record 0001), and aligns the corpus and the scenario | L3, then L4 | S0 |
 
 ## Effect boxes and transitions (ADR 0006): reception of L1
 
@@ -65,7 +64,7 @@ another lot's part.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| **Creation authority, the real path** (ADR 0009). The trusted entry point that constructs an authority is stated; start-up is wired through it, and composition tests go through that path, not through a helper that builds an authority directly | L4 | S0 |
+| **Creation authority, the real path** (ADR 0009). Done for the bench: `Process::start` of the runner opens an epoch, takes the grant, builds the authority with `OwnerAuthority::from_grant`, creates the box and the owner, and `bench_composition.rs` shows through that path that a second box for the active owner is refused, before and after a simulated crash and a new epoch. Left: the same for the start-up of the broker binary, which does not exist yet; the authority of the bench holds one owner | The lot that writes the broker binary | S1 |
 | **Creation authority on SQLite** (ADR 0009). The opening of an epoch and its results realised on the SQLite store, with the same contract tests | L7 | S0 on SQLite |
 
 ## Pilot proof (DEM-021): reception of L6
