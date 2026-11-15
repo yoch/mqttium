@@ -368,6 +368,15 @@ clone, and the file-mode and line-ending settings of the repository. The
 contract files are listed once each, in path order, which is the order
 their digest is defined by.
 
+`artifact.built_from` is present only when the bench rebuilt the binary
+from a source it keeps in the campaign (`run --rebuild`, record 0017):
+`source` names that archive as a file of the campaign, by relative path,
+digest and size, and `build` is the command that built it. It is the
+bench's declaration that the binary which ran is the one this source
+builds; `tools/check_campaign_binary.sh` checks it by building the source
+again and comparing digests, outside the oracle. That a build on another
+machine gives the same binary is not established.
+
 ## Example corpus
 
 The examples and their index are derived: `../tools/build_corpus.py` writes

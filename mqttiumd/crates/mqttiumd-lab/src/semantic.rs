@@ -1289,6 +1289,9 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
 
 fn run_manifest(document: &Value, out: &mut Vec<Diagnostic>) {
     u64_at(document, "/artifact/bytes", out);
+    if document.pointer("/artifact/built_from").is_some() {
+        u64_at(document, "/artifact/built_from/source/bytes", out);
+    }
     for index in 0..items(document, "contracts").len() {
         u64_at(document, &format!("/contracts/{index}/bytes"), out);
     }
