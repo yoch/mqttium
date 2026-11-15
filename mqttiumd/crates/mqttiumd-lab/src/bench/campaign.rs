@@ -63,6 +63,9 @@ pub struct Request {
     /// The durable store the campaign runs on: `sim-store`, or `sqlite`
     /// once lot L7 provides it.
     pub backend: String,
+    /// The packed source this binary was built from by `run --rebuild`,
+    /// copied into the campaign as `source.tar`.
+    pub built_from: Option<PathBuf>,
 }
 
 /// What a campaign left, for the command line.
@@ -393,6 +396,11 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     let contracts = relative(&request.contracts)?;
     let scenario_path = relative(&request.scenario)?;
 
+    // The source the binary was built from, when it was rebuilt.
+    if let Some(tar) = &request.built_from {
+        let bytes = fs::read(tar).map_err(|error| io(tar, error))?;
+        write(out, "source.tar", &bytes)?;
+    }
     // One read of every input, into the campaign; then the campaign is
     // the root the run reads.
     copy_contracts(root, Path::new(&contracts), out)?;
@@ -577,6 +585,9 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         fixture_path.clone(),
     ];
     paths.extend(outcome.snapshots.iter().map(|(path, _)| path.clone()));
+    if request.built_from.is_some() {
+        paths.push("source.tar".to_owned());
+    }
     paths.extend(modified.iter().cloned());
     let (contract_dir, schema_dir) = files::contract_directories(Path::new(&contracts))?;
     for directory in [&contract_dir, &schema_dir] {
@@ -603,6 +614,13 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
             "start_up": "the real path: EpochOpening through the store adapter, EpochGrant, OwnerAuthority::from_grant, one box for owner 0, Owner::new",
         },
         "backend_settings": backend_settings,
+        "built_from": match request.built_from {
+            Some(_) => json!({
+                "source": artifact(out, "source.tar")?,
+                "build": super::rebuild::build_command(),
+            }),
+            None => Value::Null,
+        },
         "lab": run_manifest["artifact"].clone(),
         "contracts_digest": workspace.contracts_digest(),
         "oracle": oracle,
@@ -620,7 +638,10 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         "modified": modified,
         "commands": {"replay": replay, "judge": judge},
         "limits": [
-            "the binary is identified by its digest; that it was built from the recorded revision and modifications is not established",
+            match request.built_from {
+                Some(_) => "the binary that ran was built by run --rebuild from source.tar of this campaign; that a build elsewhere gives the same digest is not established".to_owned(),
+                None => "the binary is identified by its digest; that it was built from the recorded revision and modifications is not established: run --rebuild establishes it".to_owned(),
+            },
             "a fault at the fence point, or on the result of a resolution, selects every resolution: the store adapter gives a resolution no source",
             "the authority of the runner keeps one owner active: S0 runs owner 0 only",
         ],

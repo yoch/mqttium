@@ -10,7 +10,9 @@
 //! - `process`: the process under test, the real core and the
 //!   deterministic store, started by the real path;
 //! - `runner`: the supervisor, the peers and the scheduler of choices;
-//! - `campaign`: the directory, its manifest and its inventory.
+//! - `campaign`: the directory, its manifest and its inventory;
+//! - `rebuild`: a campaign whose binary is built from the content it
+//!   records.
 //!
 //! Nothing here computes a verdict.
 
@@ -19,5 +21,6 @@ pub mod campaign;
 pub mod collector;
 pub mod mqtt;
 pub mod process;
+pub mod rebuild;
 pub mod runner;
 pub mod scenario;

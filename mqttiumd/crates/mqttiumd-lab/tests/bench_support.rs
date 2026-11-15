@@ -73,6 +73,7 @@ pub fn run_scenario(scenario: &str, seed: u64, name: &str) -> Campaign {
         seed,
         run_id: Some("bench-test".to_owned()),
         backend: "sim-store".to_owned(),
+        built_from: None,
     };
     let report = execute(&request).unwrap_or_else(|error| panic!("{scenario}: {error}"));
     Campaign { out, report }

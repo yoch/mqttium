@@ -18,7 +18,7 @@ const USAGE: &str = "\
 usage:
   mqttiumd-lab validate --contracts <dir> [--scenario <file>]... [--file <file>]... [--root <dir>]
   mqttiumd-lab manifest [--contracts <dir>] [--root <dir>]
-  mqttiumd-lab run --contracts <dir> --scenario <file> --out <dir> [--seed <n>] [--run-id <slug>] [--backend sim-store|sqlite] [--root <dir>]
+  mqttiumd-lab run --contracts <dir> --scenario <file> --out <dir> [--seed <n>] [--run-id <slug>] [--backend sim-store|sqlite] [--rebuild] [--root <dir>]
 
 Paths are relative to --root, which defaults to the current directory.
 Exit codes: 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 3 OUT_OF_SCOPE (DEM-023).
@@ -38,6 +38,8 @@ struct Arguments {
     seed: Option<u64>,
     run_id: Option<String>,
     backend: Option<String>,
+    rebuild: bool,
+    built_from: Option<PathBuf>,
 }
 
 fn parse(arguments: &[String]) -> Result<Arguments, String> {
@@ -49,9 +51,15 @@ fn parse(arguments: &[String]) -> Result<Arguments, String> {
         seed: None,
         run_id: None,
         backend: None,
+        rebuild: false,
+        built_from: None,
     };
     let mut rest = arguments.iter();
     while let Some(flag) = rest.next() {
+        if flag == "--rebuild" {
+            parsed.rebuild = true;
+            continue;
+        }
         let value = rest.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--root" => parsed.root = PathBuf::from(value),
@@ -66,6 +74,7 @@ fn parse(arguments: &[String]) -> Result<Arguments, String> {
             }
             "--run-id" => parsed.run_id = Some(value.clone()),
             "--backend" => parsed.backend = Some(value.clone()),
+            "--built-from" => parsed.built_from = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown option {flag}")),
         }
     }
@@ -136,7 +145,11 @@ fn run(arguments: &Arguments) -> Result<bool, String> {
             .backend
             .clone()
             .unwrap_or_else(|| "sim-store".to_owned()),
+        built_from: arguments.built_from.clone(),
     };
+    if arguments.rebuild {
+        return rebuilt(arguments, &request);
+    }
     let report = campaign::execute(&request)?;
     println!("contracts sha256:{}", report.contracts_digest);
     println!(
@@ -153,6 +166,53 @@ fn run(arguments: &Arguments) -> Result<bool, String> {
     println!("no verdict: judge it with");
     println!("  {}", report.judge);
     Ok(true)
+}
+
+/// `run --rebuild`: builds the binary from the source of the run, then
+/// has that binary run the campaign.
+fn rebuilt(arguments: &Arguments, request: &campaign::Request) -> Result<bool, String> {
+    let work = std::env::temp_dir().join(format!("mqttiumd-rebuild-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let outcome = (|| {
+        let built = mqttiumd_lab::bench::rebuild::rebuild(
+            &request.root,
+            &work,
+            &[request.out.clone(), work.clone()],
+        )?;
+        println!(
+            "rebuilt from {} (revision {})",
+            built.tar.display(),
+            built.revision
+        );
+        let mut command = std::process::Command::new(&built.binary);
+        command.arg("run");
+        let mut pass = |flag: &str, value: &Path| {
+            command.arg(flag).arg(value);
+        };
+        if let Some(contracts) = &arguments.contracts {
+            pass("--contracts", contracts);
+        }
+        pass("--scenario", &request.scenario);
+        pass("--out", &request.out);
+        pass("--root", &request.root);
+        pass("--built-from", &built.tar);
+        command
+            .args(["--seed", &request.seed.to_string()])
+            .args(["--backend", &request.backend]);
+        if let Some(run_id) = &request.run_id {
+            command.args(["--run-id", run_id]);
+        }
+        let status = command
+            .status()
+            .map_err(|error| format!("{}: {error}", built.binary.display()))?;
+        if status.success() {
+            Ok(true)
+        } else {
+            Err("the rebuilt binary wrote no campaign".to_owned())
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&work);
+    outcome
 }
 
 fn main() -> ExitCode {
