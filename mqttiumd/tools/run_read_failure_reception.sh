@@ -32,6 +32,9 @@ python3 -m unittest discover -t tests/oracle -s tests/oracle/tests \
 MQTTIUMD_READ_RECEPTION_OUT="$out/cases" \
     cargo test --locked -p mqttiumd-lab --test bench_read_failures \
     -- --exact read_failure_reception --nocapture >"$out/vertical-readers.log" 2>&1
+cargo test --locked -p mqttiumd-lab --test bench_read_failures \
+    -- --exact a_collector_refusal_cannot_erase_a_confirmed_sigkill --nocapture \
+    >"$out/kill-collector.log" 2>&1
 
 python3 - "$out" <<'PY'
 import hashlib
