@@ -52,7 +52,12 @@ class Traces(unittest.TestCase):
                 self.assertEqual(found["broker_inputs_have_provenance"], expected)
                 self.assertEqual(
                     set(found),
-                    {*listed, "broker_inputs_have_provenance", "one_grant_per_opened_epoch"},
+                    {
+                        *listed,
+                        "broker_inputs_have_provenance",
+                        "one_grant_per_opened_epoch",
+                        "scenario_reaches_its_end",
+                    },
                 )
 
     def test_every_refusal_states_its_reason(self):

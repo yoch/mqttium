@@ -1,0 +1,34 @@
+{
+  "format": "mqttiumd.trace-record",
+  "schema_version": 1,
+  "run_id": "p1-02-example",
+  "record_sequence": "7",
+  "origin_component": "store-evidence",
+  "origin_incarnation": "1",
+  "origin_sequence": "1",
+  "causal_parents": [
+    {
+      "origin_component": "store-evidence",
+      "origin_incarnation": "1",
+      "origin_sequence": "0"
+    }
+  ],
+  "time_domain": "logical-step",
+  "time_value": "7",
+  "kind": "StoreResultReady",
+  "payload": {
+    "effect_id": {
+      "epoch": "1",
+      "owner": "0",
+      "sequence": "1"
+    },
+    "operation_id": {
+      "incarnation": "1",
+      "epoch": "1",
+      "owner": "0",
+      "sequence": "1"
+    },
+    "outcome": "Committed",
+    "violation": "RecipeMismatch"
+  }
+}
