@@ -17,8 +17,8 @@ use crate::capacity::{
 use crate::command::Command;
 use crate::ids::{
     ConnectionGeneration, ConnectionKey, ContinuationId, DeadlineToken, EffectId, ExchangeId,
-    InboundPacketId, LogicalDuration, LogicalOwnerId, LogicalTime, OperationId, PublicationId,
-    Revision, RunEpoch, SessionId, StoreIncarnation,
+    InboundPacketId, LogicalDuration, LogicalOwnerId, LogicalTime, OperationId, OutboxSerial,
+    PublicationId, Revision, RunEpoch, SessionId, StoreIncarnation,
 };
 use crate::outcome::{Knowledge, StoreReply};
 use crate::packet::{InboundPacket, OutboundFrame, SharedBytes};
@@ -222,21 +222,49 @@ pub trait EffectSink {
     fn try_submit(&mut self, effect: OwnedEffect) -> SubmitResult;
 }
 
-/// Identity of an effect box: its owner and the run epoch that created it.
+/// Identity of an effect box: the data set and run epoch of the authority
+/// that created it, and the serial that authority gave it (ADR 0009).
 ///
-/// The identity is supplied by whoever creates the box. It tells apart the
-/// boxes of different owners and epochs; it does not tell apart two boxes
-/// created with the same pair. This primitive therefore has a
-/// precondition: one box per owner and per epoch.
+/// The serial alone tells apart every box of one authority, including the
+/// successive boxes of one owner. The owner is kept beside it to say whose
+/// box this is; it adds nothing to the uniqueness.
 ///
-/// Lot L0 leaves that precondition to the creator on purpose. Lot L1 must
-/// turn it into an established invariant, with a creation authority (an
-/// owner factory, an arena or a construction token that cannot be
-/// duplicated) and its tests; see the open conditions.
+/// Only an [`OwnerAuthority`] builds an identity. Two authorities issued
+/// for the same incarnation and epoch would give equal identities: what
+/// prevents that is the rule of issuance stated on
+/// [`OwnerAuthority::issue_for_opened_epoch`], not this type.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct OutboxId {
-    pub owner: LogicalOwnerId,
-    pub epoch: RunEpoch,
+    incarnation: StoreIncarnation,
+    epoch: RunEpoch,
+    owner: LogicalOwnerId,
+    serial: OutboxSerial,
+}
+
+impl OutboxId {
+    /// The data set of the authority that created the box.
+    #[must_use]
+    pub const fn incarnation(self) -> StoreIncarnation {
+        self.incarnation
+    }
+
+    /// The run epoch of the authority that created the box.
+    #[must_use]
+    pub const fn epoch(self) -> RunEpoch {
+        self.epoch
+    }
+
+    /// The owner the box was created for.
+    #[must_use]
+    pub const fn owner(self) -> LogicalOwnerId {
+        self.owner
+    }
+
+    /// The serial of the box under its authority.
+    #[must_use]
+    pub const fn serial(self) -> OutboxSerial {
+        self.serial
+    }
 }
 
 /// Key of the slots reserved in one effect box.
@@ -315,7 +343,10 @@ pub struct Outbox {
 impl Outbox {
     /// Preallocates a box of exactly `capacity` slots that can hold up to
     /// `max_reservations` reservations at a time.
-    pub fn with_capacity(
+    ///
+    /// Private: a box is created by an [`OwnerAuthority`] and by nothing
+    /// else (ADR 0009).
+    fn with_capacity(
         id: OutboxId,
         capacity: EffectSlots,
         max_reservations: u32,
@@ -362,6 +393,13 @@ impl Outbox {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
+    }
+
+    /// Whether a reservation is live: slots reserved and not yet published
+    /// or released.
+    #[must_use]
+    pub fn has_live_reservations(&self) -> bool {
+        self.reserved > 0 || self.records.as_slice().iter().any(|record| record.held)
     }
 
     /// The waiting effects, oldest first.
@@ -506,6 +544,174 @@ impl Outbox {
     }
 }
 
+/// Why an authority refuses to create a box. Nothing changed: the table of
+/// active owners, the boxes that exist and the next serial are as before.
+///
+/// When several refusals hold at once the first of this order is reported:
+/// `SerialsExhausted`, `OwnerAlreadyActive`, `TableFull`,
+/// `AllocationFailed`. The definitive one comes first so that it is never
+/// reported as a wait that a retirement could end.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CreateRefused {
+    /// The serial counter reached its end. Definitive: nothing wraps, no
+    /// retirement frees a serial, and this authority creates no box again.
+    SerialsExhausted,
+    /// The owner holds a live box. Retiring that box lifts the refusal.
+    OwnerAlreadyActive,
+    /// The bounded table of the authority has no free entry. Retiring a
+    /// box lifts the refusal.
+    TableFull,
+    /// Memory could not be obtained. Recoverable: the caller may try again.
+    AllocationFailed,
+}
+
+/// Why an authority refuses to retire a box.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RetireRefusal {
+    /// The box was created by an authority of another incarnation or epoch.
+    ForeignAuthority,
+    /// The box is not the exact active entry of its owner, serial included.
+    NotActiveEntry,
+    /// The box still holds an effect no adapter accepted.
+    PendingEffects,
+    /// The box still holds a live reservation.
+    LiveReservations,
+}
+
+/// A retirement that was refused: the same box and the reason. The
+/// authority is unchanged.
+#[derive(Debug)]
+pub struct RetireRefused {
+    pub outbox: Outbox,
+    pub reason: RetireRefusal,
+}
+
+/// One entry of the table of active owners.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ActiveBox {
+    owner: LogicalOwnerId,
+    serial: OutboxSerial,
+}
+
+/// The creation authority for effect boxes (ADR 0009): a construction
+/// token held by the one component that creates owners.
+///
+/// It is neither `Clone` nor `Copy`. It gives each box a serial from a
+/// checked counter that is never reused, and keeps, in a bounded table,
+/// which owner holds which live box.
+///
+/// Invariant, under the precondition of
+/// [`OwnerAuthority::issue_for_opened_epoch`]: at any time an owner has at
+/// most one live box, and no two boxes ever created share an identity, so
+/// a reservation key is accepted by the box that issued it and by no other.
+#[derive(Debug)]
+pub struct OwnerAuthority {
+    incarnation: StoreIncarnation,
+    epoch: RunEpoch,
+    /// Owners that hold a live box, in no particular order.
+    active: BoundedVec<ActiveBox>,
+    /// The serial of the next box, or `None` once the last one was used.
+    next_serial: Option<OutboxSerial>,
+}
+
+impl OwnerAuthority {
+    /// Issues the authority of one opened run epoch, able to keep up to
+    /// `max_owners` owners active at a time.
+    ///
+    /// This is the trusted entry point of ADR 0009: the one function that
+    /// constructs an authority. The type cannot count its own
+    /// constructions, so the guarantee rests on this precondition:
+    ///
+    /// > It is called at most once per live opening of the epoch
+    /// > `(incarnation, epoch)`, by the component that submitted the
+    /// > opening and received its committed result in this process.
+    ///
+    /// A replayed fact, a duplicated reply, a further recovery page or an
+    /// opening whose outcome is unknown gives no call. The state that
+    /// controls the hand-over belongs to the contract of opening an epoch.
+    pub fn issue_for_opened_epoch(
+        incarnation: StoreIncarnation,
+        epoch: RunEpoch,
+        max_owners: u32,
+    ) -> Result<Self, AllocationFailed> {
+        let table = usize::try_from(max_owners).map_err(|_| AllocationFailed)?;
+        Ok(Self {
+            incarnation,
+            epoch,
+            active: BoundedVec::with_capacity(table)?,
+            next_serial: Some(OutboxSerial::new(0)),
+        })
+    }
+
+    /// The data set this authority was issued for.
+    #[must_use]
+    pub fn incarnation(&self) -> StoreIncarnation {
+        self.incarnation
+    }
+
+    /// The run epoch this authority was issued for.
+    #[must_use]
+    pub fn epoch(&self) -> RunEpoch {
+        self.epoch
+    }
+
+    /// Number of owners that hold a live box.
+    #[must_use]
+    pub fn active_owners(&self) -> usize {
+        self.active.len()
+    }
+
+    /// The identity of the live box of `owner`, if it holds one.
+    #[must_use]
+    pub fn active_box(&self, owner: LogicalOwnerId) -> Option<OutboxId> {
+        self.active
+            .as_slice()
+            .iter()
+            .find(|entry| entry.owner == owner)
+            .map(|entry| OutboxId {
+                incarnation: self.incarnation,
+                epoch: self.epoch,
+                owner,
+                serial: entry.serial,
+            })
+    }
+
+    /// Creates the box of `owner`, with exactly `capacity` slots and up to
+    /// `max_reservations` reservations at a time, and records it; or
+    /// changes nothing and says why.
+    pub fn create_outbox(
+        &mut self,
+        owner: LogicalOwnerId,
+        capacity: EffectSlots,
+        max_reservations: u32,
+    ) -> Result<Outbox, CreateRefused> {
+        // Interface only: the precondition of lot L0 behind the authority.
+        // Nothing is recorded and the serial does not advance yet.
+        let serial = self.next_serial.ok_or(CreateRefused::SerialsExhausted)?;
+        let id = OutboxId {
+            incarnation: self.incarnation,
+            epoch: self.epoch,
+            owner,
+            serial,
+        };
+        Outbox::with_capacity(id, capacity, max_reservations)
+            .map_err(|_| CreateRefused::AllocationFailed)
+    }
+
+    /// Retires a box: its owner is no longer active and may be given a new
+    /// box, with a new serial. On a refusal the same box comes back and the
+    /// authority is unchanged.
+    ///
+    /// An empty box does not mean that its owner is at rest: replies to
+    /// effects already accepted still belong to the owner, and retiring
+    /// the box does not end its life cycle.
+    pub fn retire(&mut self, outbox: Outbox) -> Result<(), RetireRefused> {
+        // Interface only: no condition is checked yet.
+        let _ = outbox;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,12 +735,18 @@ mod tests {
         NonZeroUsize::new(count).expect("at least one slot")
     }
 
-    fn outbox_of(owner: u64, capacity: u64) -> Outbox {
-        let id = OutboxId {
-            owner: LogicalOwnerId::new(owner),
+    /// An identity for the tests of the box as a primitive.
+    fn box_id(owner: u64) -> OutboxId {
+        OutboxId {
+            incarnation: StoreIncarnation::new(1),
             epoch: RunEpoch::new(1),
-        };
-        Outbox::with_capacity(id, EffectSlots::new(capacity), 4).expect("small")
+            owner: LogicalOwnerId::new(owner),
+            serial: OutboxSerial::new(owner),
+        }
+    }
+
+    fn outbox_of(owner: u64, capacity: u64) -> Outbox {
+        Outbox::with_capacity(box_id(owner), EffectSlots::new(capacity), 4).expect("small")
     }
 
     /// The accounting invariant, recomputed from the reservation table.
@@ -726,22 +938,6 @@ mod tests {
     }
 
     #[test]
-    fn two_boxes_with_one_identity_are_not_told_apart() {
-        // The stated limit of this primitive: one box per owner and epoch
-        // is a precondition until lot L1 provides a creation authority.
-        let mut first = outbox_of(1, 2);
-        let mut twin = outbox_of(1, 2);
-        let key = first.reserve(slots(1)).expect("room");
-        let _own = twin.reserve(slots(1)).expect("room");
-        assert_eq!(
-            twin.publish(key, effect(0)),
-            Ok(()),
-            "the twin cannot detect the foreign key"
-        );
-        assert_invariant(&twin);
-    }
-
-    #[test]
     fn a_key_is_stale_once_its_reservation_is_released() {
         let mut outbox = outbox_of(0, 2);
         let key = outbox.reserve(slots(2)).expect("room");
@@ -828,11 +1024,7 @@ mod tests {
 
     #[test]
     fn a_full_reservation_table_is_a_stated_need() {
-        let id = OutboxId {
-            owner: LogicalOwnerId::new(0),
-            epoch: RunEpoch::new(1),
-        };
-        let mut outbox = Outbox::with_capacity(id, EffectSlots::new(8), 2).expect("small");
+        let mut outbox = Outbox::with_capacity(box_id(0), EffectSlots::new(8), 2).expect("small");
         let first = outbox.reserve(slots(1)).expect("room");
         let _second = outbox.reserve(slots(1)).expect("room");
         let before = snapshot(&outbox);
@@ -869,7 +1061,7 @@ mod tests {
 
     #[test]
     fn a_deadline_is_dispatched_only_after_the_persist_it_watches() {
-        use crate::ids::{DeadlineToken, OperationId, OperationSeq, StoreIncarnation};
+        use crate::ids::{DeadlineToken, OperationId, OperationSeq};
 
         // Refuses store effects and accepts everything else.
         struct StoreBusy(Vec<OwnedEffect>);
