@@ -109,6 +109,16 @@ an absence. There:
 A held command does not by itself prevent a fence: a store fences whenever
 it can write the fence.
 
+**What selects a resolution.** A store that reads an absence does not
+know the command of the operation: neither its kind nor its publication.
+At `store.fence.transit`, `match.command_kind` and
+`match.publication_binding` name the resolved operation by its command as
+the bench knows it, from the fault that selected that command earlier in
+the scenario (`store.command.transit` in QABS-A, B and C). The runner of
+the bench maps the selection to the operation; the store is handed only
+the identity. No semantic rule yet refuses a scenario whose fence fault
+names a command no earlier fault selected.
+
 **One fault per item.** Two faults of a scenario never select the same
 command or result. Two selections on one point, for one command kind, with
 compatible publication bindings and compatible `result_of`, are refused
