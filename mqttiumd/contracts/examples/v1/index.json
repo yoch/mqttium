@@ -33,6 +33,7 @@
     "contracts/examples/v1/valid/trace-record-opening-reply-rejected.json",
     "contracts/examples/v1/valid/trace-record-opening-abandoned.json",
     "contracts/examples/v1/valid/trace-record-epoch-grant-handed-over.json",
+    "contracts/examples/v1/valid/trace-record-step-blocked.json",
     "contracts/examples/v1/valid/trace-record-store-result-rejected.json",
     "contracts/examples/v1/valid/trace-record-store-result-delivered-rejected.json",
     "contracts/examples/v1/valid/trace-record-store-fence-stable.json",
@@ -692,6 +693,18 @@
       "code": "schema-violation",
       "pointer": "/payload",
       "why": "What the adapter hands over is the result the store produced, reason included."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-for-an-unknown-cause.json",
+      "code": "schema-violation",
+      "pointer": "/payload/cause",
+      "why": "A run stops because nothing was eligible or because its budget ran out."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/step",
+      "why": "The index of a step is 64-bit."
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-rejection-without-its-reason.json",
@@ -1373,6 +1386,12 @@
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-epoch-grant-handed-over-stated-by-store-evidence.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-stated-by-broker-core.json",
       "code": "schema-violation",
       "pointer": "/origin_component",
       "why": "A kind of record is stated by its one origin; another may not state it."

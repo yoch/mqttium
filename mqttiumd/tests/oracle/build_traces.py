@@ -2101,6 +2101,53 @@ case(
     events=resolved_from_the_bench,
 )
 
+# ---------------------------------------------- a run that stopped (d)
+END = "scenario_reaches_its_end"
+
+
+def blocked(cause):
+    def edit(events):
+        events.append(
+            ev(
+                "blocked",
+                "bench-supervisor",
+                "StepBlocked",
+                {"step": "19", "step_kind": "DriveUntil", "cause": cause},
+            )
+        )
+
+    return edit
+
+
+case(
+    "run-blocked-with-nothing-eligible",
+    "The bench stopped: nothing was eligible and the awaited event never happened. The product is stuck.",
+    {END: "FAIL"},
+    events=blocked("quiescent"),
+)
+case(
+    "run-stopped-by-its-budget",
+    "The bench stopped because the steps ran out: nothing is established about the product.",
+    {END: "INCONCLUSIVE"},
+    events=blocked("budget"),
+)
+
+
+def stuck_and_cut(events):
+    # The run stops right after the crash; the bench declares the trace
+    # incomplete, and says the product was stuck.
+    del events[at(events, "restart") :]
+    blocked("quiescent")(events)
+
+
+case(
+    "run-blocked-on-a-cut-trace",
+    "The product was stuck and the trace is incomplete: the block stands, nothing else is concluded.",
+    {**ALL_INCONCLUSIVE, END: "FAIL"},
+    events=stuck_and_cut,
+    raw=lambda records: records[-1]["payload"].update(complete=False),
+)
+
 # ------------------------------------------ the opening of an epoch
 GRANT = "one_grant_per_opened_epoch"
 

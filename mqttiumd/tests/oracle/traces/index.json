@@ -1174,6 +1174,60 @@
       "why": "K1: the adapter submits a resolution caused by the bench, not by the core."
     },
     {
+      "name": "run-blocked-with-nothing-eligible",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/run-blocked-with-nothing-eligible/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "FAIL"
+      },
+      "why": "The bench stopped: nothing was eligible and the awaited event never happened. The product is stuck."
+    },
+    {
+      "name": "run-stopped-by-its-budget",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/run-stopped-by-its-budget/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "INCONCLUSIVE"
+      },
+      "why": "The bench stopped because the steps ran out: nothing is established about the product."
+    },
+    {
+      "name": "run-blocked-on-a-cut-trace",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/run-blocked-on-a-cut-trace/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "INCONCLUSIVE",
+        "same_required_obligations_at_both_checkpoints": "INCONCLUSIVE",
+        "same_recipe_for_op_A": "INCONCLUSIVE",
+        "no_positive_ack_before_confirmed_commit": "INCONCLUSIVE",
+        "no_pubrec_observed_before_crash": "INCONCLUSIVE",
+        "broker_inputs_have_provenance": "INCONCLUSIVE",
+        "all_required_faults_hit": "INCONCLUSIVE",
+        "trace_complete": "INCONCLUSIVE",
+        "one_grant_per_opened_epoch": "INCONCLUSIVE",
+        "scenario_reaches_its_end": "FAIL"
+      },
+      "why": "The product was stuck and the trace is incomplete: the block stands, nothing else is concluded."
+    },
+    {
       "name": "epoch-granted-twice",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/epoch-granted-twice/trace.jsonl",

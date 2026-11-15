@@ -1174,6 +1174,17 @@ ok(
         [("broker-core", 0)],
     ),
 )
+# A run that stopped before its last step says why (the bench): no action
+# was eligible and the awaited event had not happened, or the budget of
+# steps ran out.
+BLOCKED = record(
+    9,
+    "bench-supervisor",
+    3,
+    "StepBlocked",
+    {"step": "19", "step_kind": "DriveUntil", "cause": "quiescent"},
+)
+ok("trace-record-step-blocked.json", BLOCKED)
 REJECTED = record(
     7,
     "store-evidence",
@@ -1482,6 +1493,21 @@ trace_case(
     "/payload",
     "What the adapter hands over is the result the store produced, reason included.",
     setter(["payload", "outcome"], "RejectedCertain"),
+)
+trace_case(
+    "step-blocked-for-an-unknown-cause",
+    BLOCKED,
+    "/payload/cause",
+    "A run stops because nothing was eligible or because its budget ran out.",
+    setter(["payload", "cause"], "timeout"),
+)
+trace_case(
+    "step-blocked-overflow",
+    BLOCKED,
+    "/payload/step",
+    "The index of a step is 64-bit.",
+    setter(["payload", "step"], "18446744073709551616"),
+    code="u64-out-of-range",
 )
 trace_case(
     "rejection-without-its-reason",
@@ -2633,6 +2659,7 @@ for kind_name, origin in [
     ("opening-reply-delivered", "store-adapter"),
     ("opening-abandoned", "bench-supervisor"),
     ("epoch-grant-handed-over", "store-evidence"),
+    ("step-blocked", "broker-core"),
 ]:
     trace_case(
         f"{kind_name}-stated-by-{origin}",
