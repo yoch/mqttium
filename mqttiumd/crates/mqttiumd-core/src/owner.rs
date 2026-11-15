@@ -235,19 +235,33 @@ struct Limits {
 }
 
 /// The effects whose results the owner applies to one operation (ADR 0001,
-/// audit F3). A result that names another effect does not answer it.
+/// audit F3). The invariants, for the correspondence with model M1:
 ///
-/// - Bound: the command that proposed the operation, its
-///   `RECENT_RESOLUTIONS` latest resolutions and its `LANDMARK_RESOLUTIONS`
-///   latest landmarks, the resolutions whose rank is a power of two.
-/// - Progress: a resolution is emitted at each deadline, whatever is
-///   retained. If the answer of every resolution arrives at most `k`
-///   resolutions later, `k` finite and unknown, and finitely many answers
-///   are lost, the first landmark `p >= k` whose answer is not lost is
-///   still retained when it arrives: it arrives by rank `p + k <= 2p`, and
-///   a landmark is retained up to rank `p * 2^LANDMARK_RESOLUTIONS`.
-/// - The answer of a resolution no longer retained is absorbed; a later
-///   one answers again.
+/// - I1, bound. An operation in flight, and a terminated operation the
+///   owner retains, keep at most `1 + RECENT_RESOLUTIONS +
+///   LANDMARK_RESOLUTIONS` effect identifiers: the `Persist` that proposed
+///   it, its `RECENT_RESOLUTIONS` latest resolutions, and its
+///   `LANDMARK_RESOLUTIONS` latest landmarks, the resolutions whose rank
+///   among those of the operation is a power of two.
+/// - I2, nothing forged. A result is applied to an operation only when its
+///   `EffectId` is of the owner and of its run epoch, was issued, and is
+///   one the operation retains. Another effect (a frame, a deadline, a
+///   resolution of another operation, a resolution no longer retained) is
+///   absorbed and changes nothing; an effect of another epoch, or never
+///   issued, is a fault.
+/// - I3, progress. One resolution is emitted at each deadline of an
+///   unresolved operation, whatever is retained. If the answer of each
+///   resolution arrives at most `k` resolutions later, `k` finite and
+///   unknown, in any order, and finitely many answers are lost, the first
+///   landmark `p >= k` whose answer is not lost is still retained when it
+///   arrives: it arrives by rank `p + k <= 2p`, and a landmark is retained
+///   up to rank `p * 2^LANDMARK_RESOLUTIONS`.
+/// - I4, monotonic knowledge. A repeated result changes nothing. A result
+///   that contradicts what the operation established is a fault while the
+///   operation is retained; beyond the retained terminated operations it
+///   is absorbed (`OwnerConfig::retained_operations`).
+/// - I5, consumed. A terminated operation never goes through the
+///   application path again; its late results only meet the check of I4.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Answers {
     persist: EffectId,
@@ -510,6 +524,86 @@ impl Draft {
 
 /// One logical owner: its sessions, its routes, its inbound exchanges and
 /// the counters of the identities it issues.
+///
+/// The start-up path builds an owner from the authority of its run epoch
+/// and the one box it creates for that owner:
+///
+/// ```
+/// # use core::num::{NonZeroU32, NonZeroUsize};
+/// # use mqttiumd_core::contract::capacity::PayloadBytes;
+/// # use mqttiumd_core::contract::command::StartupNonce;
+/// # use mqttiumd_core::contract::effects::OwnerAuthority;
+/// # use mqttiumd_core::contract::ids::{
+/// #     AccountId, LogicalDuration, LogicalOwnerId, RunEpoch, StoreIncarnation,
+/// # };
+/// # use mqttiumd_core::contract::outcome::{
+/// #     EpochOpened, EpochOpening, OpeningOutcome, OpeningReply,
+/// # };
+/// # use mqttiumd_core::owner::{Owner, OwnerConfig};
+/// # let one = NonZeroU32::new(1).unwrap();
+/// # let incarnation = StoreIncarnation::new(1);
+/// # let mut opening = EpochOpening::new(incarnation, StartupNonce::new([1; 16]));
+/// # let command = opening.submit(RunEpoch::new(1)).unwrap();
+/// # let committed = EpochOpened { incarnation, epoch: RunEpoch::new(2) };
+/// # let outcome = OpeningOutcome::Committed(committed);
+/// # let _ = opening.observe(OpeningReply { command, outcome }).unwrap();
+/// # let grant = opening.hand_over().unwrap();
+/// # let config = OwnerConfig {
+/// #     max_sessions: one,
+/// #     max_routes: one,
+/// #     max_exchanges: one,
+/// #     account: AccountId::new(1),
+/// #     payload_bytes: PayloadBytes::new(16),
+/// #     resolution_delay: LogicalDuration::new(5),
+/// #     retained_operations: one,
+/// #     remembered_connections: one,
+/// # };
+/// let mut authority = OwnerAuthority::from_grant(grant, one).unwrap();
+/// let slots = NonZeroUsize::new(8).unwrap();
+/// let outbox = authority.create_outbox(LogicalOwnerId::new(4), slots, one).unwrap();
+/// let owner = Owner::new(config, outbox).unwrap();
+/// # let _ = owner;
+/// ```
+///
+/// The owner takes its box: no second owner can be built from it (audit
+/// F4). This does not compile:
+///
+/// ```compile_fail,E0382
+/// # use core::num::{NonZeroU32, NonZeroUsize};
+/// # use mqttiumd_core::contract::capacity::PayloadBytes;
+/// # use mqttiumd_core::contract::command::StartupNonce;
+/// # use mqttiumd_core::contract::effects::OwnerAuthority;
+/// # use mqttiumd_core::contract::ids::{
+/// #     AccountId, LogicalDuration, LogicalOwnerId, RunEpoch, StoreIncarnation,
+/// # };
+/// # use mqttiumd_core::contract::outcome::{
+/// #     EpochOpened, EpochOpening, OpeningOutcome, OpeningReply,
+/// # };
+/// # use mqttiumd_core::owner::{Owner, OwnerConfig};
+/// # let one = NonZeroU32::new(1).unwrap();
+/// # let incarnation = StoreIncarnation::new(1);
+/// # let mut opening = EpochOpening::new(incarnation, StartupNonce::new([1; 16]));
+/// # let command = opening.submit(RunEpoch::new(1)).unwrap();
+/// # let committed = EpochOpened { incarnation, epoch: RunEpoch::new(2) };
+/// # let outcome = OpeningOutcome::Committed(committed);
+/// # let _ = opening.observe(OpeningReply { command, outcome }).unwrap();
+/// # let grant = opening.hand_over().unwrap();
+/// # let config = OwnerConfig {
+/// #     max_sessions: one,
+/// #     max_routes: one,
+/// #     max_exchanges: one,
+/// #     account: AccountId::new(1),
+/// #     payload_bytes: PayloadBytes::new(16),
+/// #     resolution_delay: LogicalDuration::new(5),
+/// #     retained_operations: one,
+/// #     remembered_connections: one,
+/// # };
+/// let mut authority = OwnerAuthority::from_grant(grant, one).unwrap();
+/// let slots = NonZeroUsize::new(8).unwrap();
+/// let outbox = authority.create_outbox(LogicalOwnerId::new(4), slots, one).unwrap();
+/// let owner = Owner::new(config, outbox).unwrap();
+/// let twin = Owner::new(config, outbox).unwrap();
+/// ```
 #[derive(Debug)]
 pub struct Owner {
     id: LogicalOwnerId,
@@ -4855,5 +4949,110 @@ mod tests {
         absorbed(&mut world, foreign);
         assert_eq!(world.phase(7), PENDING);
         assert_eq!(world.sent(committed(&first)), ["EmitPubrec"]);
+    }
+
+    // F3, I3: the answer of the first landmark p >= k is lost; the next
+    // landmark, 2p, makes the exchange progress. With a lag of 4 and every
+    // answer below rank 8 lost, the landmark 8 answers by rank 12; with
+    // every answer below rank 16 lost, the landmark 16 answers by rank 20.
+    #[test]
+    fn the_next_landmark_progresses_when_the_answer_of_one_is_lost() {
+        let below = |rank: usize| (1..rank).collect::<Vec<_>>();
+        assert_eq!(resolve_with_lag(4, &below(8), &[], 64), Some(12));
+        assert_eq!(resolve_with_lag(4, &below(16), &[], 64), Some(20));
+        // And with the lag of the counterexample, nothing lost, the first
+        // landmark answers as soon as its answer arrives.
+        assert_eq!(resolve_with_lag(4, &[], &[], 24), Some(5));
+    }
+
+    /// Like `resolve_with_lag`, with every answer delivered, but in an
+    /// order that is not the order of the resolutions: once more than `lag`
+    /// answers wait, one of the older half of them, chosen by `seed`, is
+    /// delivered. The answers delivered are rarely among the latest, so the
+    /// recent resolutions alone do not make progress.
+    fn resolve_out_of_order(lag: usize, seed: u64, limit: usize) -> Option<usize> {
+        let mut world = World::admission_pending();
+        let admission = world.flights[0];
+        let mut token = admission.deadline;
+        let mut waiting: Vec<EffectId> = Vec::new();
+        let mut state = seed;
+        for emitted in 1..=limit {
+            world.applied(deadline(token));
+            let effects = world.drain();
+            let Effect::ArmDeadline { token: next, .. } = effects[1].1 else {
+                panic!("a deadline")
+            };
+            token = next;
+            waiting.push(effects[0].0);
+            while waiting.len() > lag {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let older = waiting.len().div_ceil(2);
+                let pick = usize::try_from(state >> 33).expect("small") % older;
+                let effect = waiting.remove(pick);
+                world.applied(Input::StoreResult {
+                    effect,
+                    operation: admission.operation,
+                    reply: StoreReply::Outcome(StoreOutcome::Committed(admission.facts)),
+                });
+                if world.phase(7) == AWAIT {
+                    assert_eq!(kinds(&world.drain()), ["EmitPubrec"]);
+                    return Some(emitted);
+                }
+                assert!(world.drain().is_empty());
+            }
+        }
+        None
+    }
+
+    // F3: every answer arrives, out of order, each after a finite number of
+    // newer resolutions.
+    #[test]
+    fn resolutions_progress_when_their_answers_arrive_out_of_order() {
+        for lag in [1, 4, 7, 20] {
+            for seed in 0..16 {
+                assert!(
+                    resolve_out_of_order(lag, seed, 8 * (lag + 2)).is_some(),
+                    "lag {lag}, seed {seed}"
+                );
+            }
+        }
+    }
+
+    // F3, I4: a resolution answers RejectedCertain(Fenced), the admission
+    // ends refused, then an earlier resolution still retained answers
+    // Committed. Two terminal results disagree: the owner stops.
+    #[test]
+    fn a_late_commit_after_a_refusal_of_one_admission_is_a_fault() {
+        let mut world = World::admission_pending();
+        let admission = world.flights[0];
+        let mut token = admission.deadline;
+        let mut resolutions = Vec::new();
+        for _ in 0..2 {
+            world.applied(deadline(token));
+            let effects = world.drain();
+            let Effect::ArmDeadline { token: next, .. } = effects[1].1 else {
+                panic!("a deadline")
+            };
+            resolutions.push(effects[0].0);
+            token = next;
+        }
+        let answer = |effect: EffectId, outcome: StoreOutcome| Input::StoreResult {
+            effect,
+            operation: admission.operation,
+            reply: StoreReply::Outcome(outcome),
+        };
+        let fenced = StoreOutcome::RejectedCertain(RejectReason::Fenced);
+        assert_eq!(
+            world.sent(answer(resolutions[1], fenced)),
+            ["EmitPubrecRefusal"]
+        );
+        assert_eq!(world.phase(7), None);
+        let late = answer(resolutions[0], StoreOutcome::Committed(admission.facts));
+        let fault = CoreFault::ContradictoryOutcome {
+            operation: admission.operation,
+        };
+        faulted(&mut world, late, fault);
     }
 }
