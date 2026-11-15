@@ -31,7 +31,8 @@ use mqttiumd_contract::packet::{Qos, SharedBytes};
 
 use super::durable::{
     Accounts, AdminCommand, AdminDone, AdminRefused, Decision, DurableState, DurableStore, Limits,
-    MAX_CLIENT_ID_BYTES, ObligationPhase, RecoveryRefused, Resolved, SessionState,
+    MAX_CLIENT_ID_BYTES, ObligationPhase, ReadBudget, ReadError, RecoveryRefused, Resolved,
+    SessionState,
 };
 
 /// The incarnation every check creates its data set with.
@@ -111,7 +112,7 @@ pub fn attempt(startup: StartupNonce, ticket: u64) -> OpeningAttempt {
 /// The first command of a start-up that just read the ledger of
 /// `store`. Each value read is read by a start-up of its own.
 pub fn opening_command<S: DurableStore>(store: &S) -> OpenEpoch {
-    let ledger = store.ledger();
+    let ledger = store.ledger().expect("healthy durable ledger");
     OpenEpoch {
         attempt: attempt(startup(ledger.last_opened().get()), 1),
         incarnation: ledger.incarnation(),
@@ -122,7 +123,7 @@ pub fn opening_command<S: DurableStore>(store: &S) -> OpenEpoch {
 /// Opens the next epoch, on the value just read, and returns it.
 pub fn open<S: DurableStore>(store: &mut S) -> RunEpoch {
     let command = opening_command(store);
-    match store.open_epoch(&command) {
+    match store.open_epoch(&command).expect("healthy epoch read") {
         OpeningOutcome::Committed(EpochOpened { incarnation, epoch }) => {
             assert_eq!(incarnation, INCARNATION);
             epoch
@@ -369,13 +370,28 @@ pub fn opening_opens_the_next_epoch_and_closes_the_older_ones<S: DurableStore>(
     make: &dyn Fn(StoreIncarnation, Limits) -> S,
 ) {
     let mut store = make(INCARNATION, fixture_limits());
-    assert_eq!(store.ledger().incarnation(), INCARNATION);
-    assert_eq!(store.ledger().open_epoch(), None);
-    assert_eq!(store.snapshot().ledger, store.ledger());
+    assert_eq!(
+        store
+            .ledger()
+            .expect("healthy durable ledger")
+            .incarnation(),
+        INCARNATION
+    );
+    assert_eq!(
+        store.ledger().expect("healthy durable ledger").open_epoch(),
+        None
+    );
+    assert_eq!(
+        store.snapshot().expect("healthy durable snapshot").ledger,
+        store.ledger().expect("healthy durable ledger")
+    );
     assert_eq!(open(&mut store), RunEpoch::new(1));
     assert_eq!(open(&mut store), RunEpoch::new(2));
-    let ledger = store.ledger();
-    assert_eq!(ledger, store.snapshot().ledger);
+    let ledger = store.ledger().expect("healthy durable ledger");
+    assert_eq!(
+        ledger,
+        store.snapshot().expect("healthy durable snapshot").ledger
+    );
     assert_eq!(ledger.incarnation(), INCARNATION);
     assert_eq!(ledger.open_epoch(), Some(RunEpoch::new(2)));
     assert_eq!(ledger.phase_of(RunEpoch::new(1)), EpochPhase::Closed);
@@ -400,23 +416,38 @@ pub fn an_opening_that_expected_another_epoch_opens_nothing<S: DurableStore>(
         incarnation: INCARNATION,
         epoch: RunEpoch::new(1),
     });
-    assert_eq!(store.open_epoch(&passing), first);
-    assert_eq!(store.ledger().opened_by(), Some(passing.attempt));
-    let before = store.snapshot();
+    assert_eq!(
+        store.open_epoch(&passing).expect("healthy epoch read"),
+        first
+    );
+    assert_eq!(
+        store.ledger().expect("healthy durable ledger").opened_by(),
+        Some(passing.attempt)
+    );
+    let before = store.snapshot().expect("healthy durable snapshot");
     // Another attempt opened the epoch the held one asked for: it is
     // rejected for certain.
     let moved = OpeningOutcome::RejectedCertain(OpeningRejection::PredecessorMoved);
-    assert_eq!(store.open_epoch(&held), moved);
-    assert_eq!(store.snapshot(), before);
+    assert_eq!(store.open_epoch(&held).expect("healthy epoch read"), moved);
+    assert_eq!(store.snapshot().expect("healthy durable snapshot"), before);
 
     // Once a later opening closed that epoch the store no longer knows
     // who had opened it: both attempts are superseded, neither is
     // called a rejection.
     open(&mut store);
-    let before = store.snapshot();
-    assert_eq!(store.open_epoch(&held), OpeningOutcome::Superseded);
-    assert_eq!(store.open_epoch(&passing), OpeningOutcome::Superseded);
-    assert_eq!(store.ledger().open_epoch(), Some(RunEpoch::new(2)));
+    let before = store.snapshot().expect("healthy durable snapshot");
+    assert_eq!(
+        store.open_epoch(&held).expect("healthy epoch read"),
+        OpeningOutcome::Superseded
+    );
+    assert_eq!(
+        store.open_epoch(&passing).expect("healthy epoch read"),
+        OpeningOutcome::Superseded
+    );
+    assert_eq!(
+        store.ledger().expect("healthy durable ledger").open_epoch(),
+        Some(RunEpoch::new(2))
+    );
 
     // A condition ahead of the store could still come true: nothing
     // certain is said, and nothing is opened.
@@ -424,17 +455,20 @@ pub fn an_opening_that_expected_another_epoch_opens_nothing<S: DurableStore>(
         after: RunEpoch::new(7),
         ..opening_command(&store)
     };
-    assert_eq!(store.open_epoch(&ahead), OpeningOutcome::Unknown);
+    assert_eq!(
+        store.open_epoch(&ahead).expect("healthy epoch read"),
+        OpeningOutcome::Unknown
+    );
     // A command for another data set opens nothing here.
     let elsewhere = OpenEpoch {
         incarnation: StoreIncarnation::new(2),
         ..opening_command(&store)
     };
     assert_eq!(
-        store.open_epoch(&elsewhere),
+        store.open_epoch(&elsewhere).expect("healthy epoch read"),
         OpeningOutcome::RejectedCertain(OpeningRejection::ForeignIncarnation)
     );
-    assert_eq!(store.snapshot(), before);
+    assert_eq!(store.snapshot().expect("healthy durable snapshot"), before);
 }
 
 /// The command that opened the last epoch, delivered again, gets the
@@ -450,11 +484,17 @@ pub fn an_opening_delivered_again_returns_its_commit<S: DurableStore>(
         incarnation: INCARNATION,
         epoch: RunEpoch::new(2),
     });
-    assert_eq!(store.open_epoch(&command), committed);
-    let before = store.snapshot();
+    assert_eq!(
+        store.open_epoch(&command).expect("healthy epoch read"),
+        committed
+    );
+    let before = store.snapshot().expect("healthy durable snapshot");
     for _delivery in 0..3 {
-        assert_eq!(store.open_epoch(&command), committed);
-        assert_eq!(store.snapshot(), before);
+        assert_eq!(
+            store.open_epoch(&command).expect("healthy epoch read"),
+            committed
+        );
+        assert_eq!(store.snapshot().expect("healthy durable snapshot"), before);
     }
 }
 
@@ -472,18 +512,24 @@ pub fn the_opener_of_the_last_epoch_cannot_open_the_next_under_its_identity<S: D
         incarnation: INCARNATION,
         epoch: RunEpoch::new(2),
     });
-    assert_eq!(store.open_epoch(&opener), committed);
-    let before = store.snapshot();
+    assert_eq!(
+        store.open_epoch(&opener).expect("healthy epoch read"),
+        committed
+    );
+    let before = store.snapshot().expect("healthy durable snapshot");
     let reused = OpenEpoch {
         after: RunEpoch::new(2),
         ..opener
     };
     assert_eq!(
-        store.open_epoch(&reused),
+        store.open_epoch(&reused).expect("healthy epoch read"),
         OpeningOutcome::RejectedCertain(OpeningRejection::AttemptReused)
     );
-    assert_eq!(store.snapshot(), before);
-    assert_eq!(store.open_epoch(&opener), committed);
+    assert_eq!(store.snapshot().expect("healthy durable snapshot"), before);
+    assert_eq!(
+        store.open_epoch(&opener).expect("healthy epoch read"),
+        committed
+    );
     // Any other identity opens the next epoch.
     assert_eq!(open(&mut store), RunEpoch::new(3));
 }
@@ -513,13 +559,34 @@ pub fn the_first_command_of_a_restart_is_not_its_predecessors<S: DurableStore>(
             epoch: RunEpoch::new(1),
         });
         let moved = OpeningOutcome::RejectedCertain(OpeningRejection::PredecessorMoved);
-        assert_eq!(store.open_epoch(&first), committed);
-        assert_eq!(store.open_epoch(&second), moved);
+        assert_eq!(
+            store.open_epoch(&first).expect("healthy epoch read"),
+            committed
+        );
+        assert_eq!(
+            store.open_epoch(&second).expect("healthy epoch read"),
+            moved
+        );
         // Each one again, in the other order: the same answers.
-        assert_eq!(store.open_epoch(&second), moved);
-        assert_eq!(store.open_epoch(&first), committed);
-        assert_eq!(store.ledger().last_opened(), RunEpoch::new(1));
-        assert_eq!(store.ledger().opened_by(), Some(first.attempt));
+        assert_eq!(
+            store.open_epoch(&second).expect("healthy epoch read"),
+            moved
+        );
+        assert_eq!(
+            store.open_epoch(&first).expect("healthy epoch read"),
+            committed
+        );
+        assert_eq!(
+            store
+                .ledger()
+                .expect("healthy durable ledger")
+                .last_opened(),
+            RunEpoch::new(1)
+        );
+        assert_eq!(
+            store.ledger().expect("healthy durable ledger").opened_by(),
+            Some(first.attempt)
+        );
     }
 }
 
@@ -544,7 +611,14 @@ pub fn a_command_of_an_unopened_epoch_never_executes<S: DurableStore>(
     let applied = world.store.apply(&early);
     assert_eq!(outcome(applied.reply), rejected);
     assert!(!applied.committed_now);
-    assert!(world.store.snapshot().publications.is_empty());
+    assert!(
+        world
+            .store
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .publications
+            .is_empty()
+    );
 }
 
 /// An admission commits publication, payload, obligations, inbound
@@ -559,7 +633,7 @@ pub fn an_admission_commits_everything_together<S: DurableStore>(
     assert_eq!(outcome(applied.reply), StoreOutcome::Committed(facts));
     assert!(applied.committed_now);
 
-    let state = world.store.snapshot();
+    let state = world.store.snapshot().expect("healthy durable snapshot");
     let publication = publication_id(world.epoch, 1);
     let record = &state.publications[&publication];
     assert_eq!(record.source, world.producer);
@@ -610,11 +684,14 @@ pub fn a_repeated_command_returns_its_result_without_a_second_effect<S: DurableS
     let mut world = World::new(make);
     let command = world.admission(1, 7, b"payload", &[world.b, world.c]);
     let first = world.store.apply(&command);
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy durable snapshot");
     let second = world.store.apply(&command);
     assert_eq!(second.reply, first.reply);
     assert!(!second.committed_now);
-    assert_eq!(world.store.snapshot(), before);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        before
+    );
 }
 
 /// A guard that fails leaves no admitted subset, whichever guard it is
@@ -626,14 +703,14 @@ pub fn a_failed_guard_leaves_no_admitted_subset<S: DurableStore>(
 
     // The last target names a revision the session does not have.
     let mut world = World::new(make);
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy durable snapshot");
     let stale = altered(
         &world.admission(1, 7, b"payload", &[world.b, world.c]),
         |admit| admit.targets.as_mut_slice()[1].session_revision = Revision::new(9),
     );
     assert_eq!(outcome(world.store.apply(&stale).reply), precondition);
     assert_eq!(
-        without_receipts(world.store.snapshot()),
+        without_receipts(world.store.snapshot().expect("healthy durable snapshot")),
         without_receipts(before)
     );
 
@@ -643,23 +720,26 @@ pub fn a_failed_guard_leaves_no_admitted_subset<S: DurableStore>(
     let mut tight = fixture_limits();
     tight.receipt_slots = ReceiptSlots::new(0);
     let mut world = World::with_limits(make, tight);
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy durable snapshot");
     let command = world.admission(1, 7, b"payload", &[world.b, world.c]);
     assert_eq!(
         outcome(world.store.apply(&command).reply),
         StoreOutcome::PendingOrUnknown
     );
-    assert_eq!(world.store.snapshot(), before);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        before
+    );
 
     // The inbound slot is taken by an earlier admission: a newcomer on
     // the same packet, under a fresh exchange, admits nothing.
     let mut world = World::new(make);
     let first = world.admission(1, 7, b"payload", &[world.b, world.c]);
     assert!(world.store.apply(&first).committed_now);
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy durable snapshot");
     let hidden = world.admission(2, 7, b"payload", &[world.b, world.c]);
     assert_eq!(outcome(world.store.apply(&hidden).reply), precondition);
-    let after = world.store.snapshot();
+    let after = world.store.snapshot().expect("healthy durable snapshot");
     assert_eq!(after.publications, before.publications);
     assert_eq!(after.obligations, before.obligations);
     assert_eq!(after.payloads, before.payloads);
@@ -703,18 +783,28 @@ pub fn each_account_is_checked<S: DurableStore>(make: &dyn Fn(StoreIncarnation, 
             outcome(world.store.apply(&command).reply),
             StoreOutcome::RejectedCertain(RejectReason::CapacityExceeded(resource))
         );
-        assert_eq!(world.store.snapshot().accounts, Accounts::RECEIPT);
+        assert_eq!(
+            world
+                .store
+                .snapshot()
+                .expect("healthy durable snapshot")
+                .accounts,
+            Accounts::RECEIPT
+        );
     }
     let mut limits = fixture_limits();
     limits.receipt_slots = ReceiptSlots::new(0);
     let mut world = World::with_limits(make, limits);
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy durable snapshot");
     let command = world.admission(1, 7, b"payload", &[world.b, world.c]);
     assert_eq!(
         outcome(world.store.apply(&command).reply),
         StoreOutcome::PendingOrUnknown
     );
-    assert_eq!(world.store.snapshot(), before);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        before
+    );
     // An account at its limit exactly is not exceeded.
     let mut limits = fixture_limits();
     limits.payload_bytes = PayloadBytes::new(7);
@@ -750,16 +840,19 @@ pub fn a_rejection_stays_a_rejection_after_quota_is_released<S: DurableStore>(
             .admin(AdminCommand::DeleteSession { session: world.c }),
         Ok(AdminDone::SessionDeleted)
     );
-    let released = world.store.snapshot();
+    let released = world.store.snapshot().expect("healthy durable snapshot");
     assert_eq!(released.accounts.references, References::new(1));
     // `c` left the route with its session.
     world.route_revision = released.route_revision;
 
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy durable snapshot");
     let again = world.store.apply(&refused);
     assert_eq!(outcome(again.reply), rejected);
     assert!(!again.committed_now);
-    assert_eq!(world.store.snapshot(), before);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        before
+    );
     assert_eq!(
         world.store.resolve_and_fence(operation_id(world.epoch, 2)),
         settled(rejected)
@@ -780,7 +873,7 @@ pub fn another_recipe_under_the_same_operation_is_a_violation<S: DurableStore>(
     let mut world = World::new(make);
     let command = world.admission(1, 7, b"payload", &[world.b, world.c]);
     assert!(world.store.apply(&command).committed_now);
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy durable snapshot");
 
     let changes: [fn(&mut AdmitPublication); 4] = [
         |admit| {
@@ -796,7 +889,10 @@ pub fn another_recipe_under_the_same_operation_is_a_violation<S: DurableStore>(
         let applied = world.store.apply(&other);
         assert_eq!(applied.reply, violation);
         assert!(!applied.committed_now);
-        assert_eq!(world.store.snapshot(), before);
+        assert_eq!(
+            world.store.snapshot().expect("healthy durable snapshot"),
+            before
+        );
     }
     // The same recipe with other payload bytes of the same length.
     let other_bytes = Command {
@@ -804,7 +900,10 @@ pub fn another_recipe_under_the_same_operation_is_a_violation<S: DurableStore>(
         payload: Some(SharedBytes::copy_from(b"PAYLOAD", 1024).expect("fits")),
     };
     assert_eq!(world.store.apply(&other_bytes).reply, violation);
-    assert_eq!(world.store.snapshot(), before);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        before
+    );
 
     // After a rejection as well.
     let rejected = altered(&world.admission(2, 8, b"payload", &[world.b]), |admit| {
@@ -814,10 +913,13 @@ pub fn another_recipe_under_the_same_operation_is_a_violation<S: DurableStore>(
         world.store.apply(&rejected).reply,
         StoreReply::Outcome(StoreOutcome::RejectedCertain(_))
     ));
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy durable snapshot");
     let repaired = world.admission(2, 8, b"payload", &[world.b]);
     assert_eq!(world.store.apply(&repaired).reply, violation);
-    assert_eq!(world.store.snapshot(), before);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        before
+    );
 }
 
 /// `ResolveAndFence` returns the result of a committed operation, and
@@ -846,13 +948,16 @@ pub fn resolve_returns_a_commit_and_fences_an_absence<S: DurableStore>(
             fenced_now: true
         }
     );
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy durable snapshot");
     assert!(before.fences.contains(&operation_id(world.epoch, 2)));
 
     let late = world.store.apply(&absent);
     assert_eq!(outcome(late.reply), fenced);
     assert!(!late.committed_now);
-    assert_eq!(world.store.snapshot(), before);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        before
+    );
     // The fence is established once.
     assert_eq!(
         world.store.resolve_and_fence(operation_id(world.epoch, 2)),
@@ -861,7 +966,10 @@ pub fn resolve_returns_a_commit_and_fences_an_absence<S: DurableStore>(
             fenced_now: false
         }
     );
-    assert_eq!(world.store.snapshot(), before);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        before
+    );
 }
 
 /// `ReleaseInbound` ends the exchange of a committed admission once,
@@ -883,7 +991,15 @@ pub fn a_release_ends_the_inbound_exchange<S: DurableStore>(
         outcome(world.store.apply(&world.release(3, 7, 99)).reply),
         precondition
     );
-    assert_eq!(world.store.snapshot().inbound.len(), 1);
+    assert_eq!(
+        world
+            .store
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .inbound
+            .len(),
+        1
+    );
 
     let release = world.release(4, 7, 1);
     let released = StoreOutcome::Committed(CommitFacts::InboundReleased {
@@ -895,7 +1011,7 @@ pub fn a_release_ends_the_inbound_exchange<S: DurableStore>(
     let applied = world.store.apply(&release);
     assert_eq!(outcome(applied.reply), released);
     assert!(applied.committed_now);
-    let state = world.store.snapshot();
+    let state = world.store.snapshot().expect("healthy durable snapshot");
     assert!(state.inbound.is_empty());
     assert_eq!(state.accounts.exchange_slots, ExchangeSlots::ZERO);
     // The release creates no distribution and ends none.
@@ -905,7 +1021,10 @@ pub fn a_release_ends_the_inbound_exchange<S: DurableStore>(
     let again = world.store.apply(&release);
     assert_eq!(outcome(again.reply), released);
     assert!(!again.committed_now);
-    assert_eq!(world.store.snapshot(), state);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        state
+    );
 
     // A second release of the exchange, under a new identity, finds no
     // slot to end.
@@ -969,7 +1088,7 @@ pub fn a_release_holds_the_slot_of_its_receipt<S: DurableStore>(
     assert!(world.store.apply(&command).committed_now);
     let applied = world.store.apply(&world.release(2, 7, 1));
     assert_eq!(outcome(applied.reply), inbound_released(&world));
-    let state = world.store.snapshot();
+    let state = world.store.snapshot().expect("healthy durable snapshot");
     let held = state.operations.len() + state.fences.len();
     assert_eq!(held, 2);
     assert_eq!(
@@ -989,13 +1108,16 @@ pub fn a_release_without_a_receipt_slot_changes_nothing<S: DurableStore>(
     let mut world = World::with_limits(make, limits);
     let command = world.admission(1, 7, b"payload", &[world.b]);
     assert!(world.store.apply(&command).committed_now);
-    let full = world.store.snapshot();
+    let full = world.store.snapshot().expect("healthy durable snapshot");
     assert_eq!(full.inbound.len(), 1);
     let applied = world.store.apply(&world.release(2, 7, 1));
     assert_eq!(outcome(applied.reply), StoreOutcome::PendingOrUnknown);
     assert!(!applied.committed_now);
     assert!(!applied.wrote);
-    assert_eq!(world.store.snapshot(), full);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        full
+    );
 }
 
 /// Collecting a closed epoch gives back exactly the slots its receipts
@@ -1019,7 +1141,7 @@ pub fn collecting_an_epoch_gives_back_the_slots_of_its_releases<S: DurableStore>
             .admin(AdminCommand::CollectClosedEpochs { through: closed }),
         Ok(AdminDone::Collected)
     );
-    let state = world.store.snapshot();
+    let state = world.store.snapshot().expect("healthy durable snapshot");
     assert!(state.operations.is_empty());
     assert_eq!(state.accounts.receipt_slots, ReceiptSlots::ZERO);
 }
@@ -1033,7 +1155,7 @@ pub fn deleting_the_producer_deletes_no_obligation_of_another_session<S: Durable
     let mut world = World::new(make);
     let command = world.admission(1, 7, b"payload", &[world.b, world.c]);
     assert!(world.store.apply(&command).committed_now);
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy durable snapshot");
 
     assert_eq!(
         world.store.admin(AdminCommand::DeleteSession {
@@ -1041,7 +1163,7 @@ pub fn deleting_the_producer_deletes_no_obligation_of_another_session<S: Durable
         }),
         Ok(AdminDone::SessionDeleted)
     );
-    let state = world.store.snapshot();
+    let state = world.store.snapshot().expect("healthy durable snapshot");
     assert_eq!(
         state.sessions[&world.producer].state,
         SessionState::Terminal
@@ -1062,7 +1184,7 @@ pub fn deleting_the_producer_deletes_no_obligation_of_another_session<S: Durable
             .admin(AdminCommand::DeleteSession { session: world.b }),
         Ok(AdminDone::SessionDeleted)
     );
-    let state = world.store.snapshot();
+    let state = world.store.snapshot().expect("healthy durable snapshot");
     let left: Vec<_> = state
         .obligations
         .values()
@@ -1079,7 +1201,7 @@ pub fn deleting_the_producer_deletes_no_obligation_of_another_session<S: Durable
             .admin(AdminCommand::DeleteSession { session: world.c }),
         Ok(AdminDone::SessionDeleted)
     );
-    let state = world.store.snapshot();
+    let state = world.store.snapshot().expect("healthy durable snapshot");
     assert!(state.obligations.is_empty());
     assert!(state.payloads.is_empty());
     assert_eq!(state.accounts.references, References::ZERO);
@@ -1106,7 +1228,7 @@ pub fn an_older_epoch_is_not_entered_again<S: DurableStore>(
 
     let new_epoch = open(&mut world.store);
     assert!(new_epoch > old_epoch);
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy durable snapshot");
 
     let repeated = world.store.apply(&committed);
     assert_eq!(
@@ -1123,14 +1245,25 @@ pub fn an_older_epoch_is_not_entered_again<S: DurableStore>(
         world.store.resolve_and_fence(operation_id(old_epoch, 2)),
         settled(closed)
     );
-    assert_eq!(world.store.snapshot(), before);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        before
+    );
 
     // The same request prepared in the new epoch is admitted, and the
     // obligations of the older epoch are still there.
     world.epoch = new_epoch;
     let prepared_again = world.admission(2, 8, b"payload", &[world.b]);
     assert!(world.store.apply(&prepared_again).committed_now);
-    assert_eq!(world.store.snapshot().obligations.len(), 3);
+    assert_eq!(
+        world
+            .store
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .obligations
+            .len(),
+        3
+    );
 }
 
 /// The fourth outcome: once the receipts of a closed epoch are
@@ -1159,7 +1292,7 @@ pub fn a_collected_identity_is_retired_not_rejected<S: DurableStore>(
             .admin(AdminCommand::CollectClosedEpochs { through: old_epoch }),
         Ok(AdminDone::Collected)
     );
-    let state = world.store.snapshot();
+    let state = world.store.snapshot().expect("healthy durable snapshot");
     assert!(state.operations.is_empty());
     assert_eq!(state.accounts.receipt_slots, ReceiptSlots::ZERO);
     // Collecting receipts ends no responsibility.
@@ -1175,7 +1308,10 @@ pub fn a_collected_identity_is_retired_not_rejected<S: DurableStore>(
             settled(retired)
         );
     }
-    assert_eq!(world.store.snapshot(), state);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        state
+    );
 }
 
 /// An identity of another data set never executes here.
@@ -1189,14 +1325,17 @@ pub fn an_identity_of_another_data_set_is_refused<S: DurableStore>(
         OWNER,
         OperationSeq::new(1),
     );
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy durable snapshot");
     assert_eq!(
         world.store.resolve_and_fence(foreign),
         settled(StoreOutcome::RejectedCertain(
             RejectReason::PreconditionFailed
         ))
     );
-    assert_eq!(world.store.snapshot(), before);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        before
+    );
 }
 
 /// Recovery reads bounded pages from durable state only: the epoch, the
@@ -1322,7 +1461,7 @@ pub fn administration_refusals_change_nothing<S: DurableStore>(
     limits.max_sessions = 3;
     limits.max_route_targets = 2;
     let mut world = World::with_limits(make, limits);
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy durable snapshot");
     let refusals = [
         (
             AdminCommand::CreateSession {
@@ -1381,7 +1520,10 @@ pub fn administration_refusals_change_nothing<S: DurableStore>(
             Err(refusal),
             "{command:?}"
         );
-        assert_eq!(world.store.snapshot(), before);
+        assert_eq!(
+            world.store.snapshot().expect("healthy durable snapshot"),
+            before
+        );
     }
 }
 
@@ -1407,7 +1549,7 @@ pub fn an_admission_without_targets_holds_no_payload_bytes<S: DurableStore>(
             StoreOutcome::Committed(admitted(&command)),
             "round {round}"
         );
-        let state = world.store.snapshot();
+        let state = world.store.snapshot().expect("healthy durable snapshot");
         assert_eq!(state.accounts.payload_bytes, PayloadBytes::ZERO);
         assert!(state.payloads.is_empty());
         let release = world.release(admit + 1, packet, admit);
@@ -1426,7 +1568,12 @@ pub fn an_admission_without_targets_holds_no_payload_bytes<S: DurableStore>(
     let kept = world.admission(10, 10, &payload, &[world.b]);
     assert!(world.store.apply(&kept).committed_now);
     assert_eq!(
-        world.store.snapshot().accounts.payload_bytes,
+        world
+            .store
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .accounts
+            .payload_bytes,
         PayloadBytes::new(1000)
     );
 }
@@ -1466,14 +1613,17 @@ pub fn a_client_id_longer_than_mqtt_allows_is_refused<S: DurableStore>(
     make: &dyn Fn(StoreIncarnation, Limits) -> S,
 ) {
     let mut world = World::new(make);
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy durable snapshot");
     assert_eq!(
         world.store.admin(AdminCommand::CreateSession {
             client_id: vec![b'x'; MAX_CLIENT_ID_BYTES + 1],
         }),
         Err(AdminRefused::ClientIdTooLong)
     );
-    assert_eq!(world.store.snapshot(), before);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        before
+    );
     assert!(matches!(
         world.store.admin(AdminCommand::CreateSession {
             client_id: vec![b'x'; MAX_CLIENT_ID_BYTES],
@@ -1506,7 +1656,7 @@ pub fn what_is_established_in_epoch_zero_is_never_collected<S: DurableStore>(
             .admin(AdminCommand::CollectClosedEpochs { through: closed }),
         Ok(AdminDone::Collected)
     );
-    let state = world.store.snapshot();
+    let state = world.store.snapshot().expect("healthy durable snapshot");
     assert!(state.fences.contains(&fenced));
     assert!(state.operations.contains_key(&early.recipe.operation()));
     // The same answers, and no second fence.
@@ -1520,7 +1670,10 @@ pub fn what_is_established_in_epoch_zero_is_never_collected<S: DurableStore>(
         rejected_fence
     );
     assert_eq!(outcome(world.store.apply(&early).reply), precondition);
-    assert_eq!(world.store.snapshot(), state);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        state
+    );
 }
 
 /// Every receipt and every fence holds one receipt slot, whatever it
@@ -1533,7 +1686,14 @@ pub fn every_receipt_and_fence_holds_a_receipt_slot<S: DurableStore>(
     let mut limits = fixture_limits();
     limits.receipt_slots = ReceiptSlots::new(3);
     let mut world = World::with_limits(make, limits);
-    let slots = |world: &World<S>| world.store.snapshot().accounts.receipt_slots;
+    let slots = |world: &World<S>| {
+        world
+            .store
+            .snapshot()
+            .expect("healthy durable snapshot")
+            .accounts
+            .receipt_slots
+    };
     let ahead = world.epoch.checked_next().expect("not the last epoch");
     let fenced = StoreOutcome::RejectedCertain(RejectReason::Fenced);
     let precondition = StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed);
@@ -1567,14 +1727,17 @@ pub fn every_receipt_and_fence_holds_a_receipt_slot<S: DurableStore>(
     assert_eq!(slots(&world), ReceiptSlots::new(3));
 
     // No slot is left.
-    let full = world.store.snapshot();
+    let full = world.store.snapshot().expect("healthy durable snapshot");
     let resolved = world.store.resolve_and_fence(operation_id(world.epoch, 4));
     assert_eq!(resolved.outcome, StoreOutcome::PendingOrUnknown);
     assert!(!resolved.fenced_now);
     let applied = world.store.apply(&future(5, 9));
     assert_eq!(outcome(applied.reply), StoreOutcome::PendingOrUnknown);
     assert!(!applied.wrote);
-    assert_eq!(world.store.snapshot(), full);
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        full
+    );
 
     // Collecting the closed epoch gives back the slots of its fence and
     // of its receipt; the receipt of the epoch now open stays.
@@ -1662,6 +1825,100 @@ pub fn recovered_facts_follow_the_order_of_an_inventory<S: DurableStore>(
     }
 }
 
+/// Snapshot refusals preserve durable state and distinguish a configured
+/// bound from an allocation failure. The healthy explicit/default reads agree.
+pub fn snapshot_limits_refuse_without_changing_the_store<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let world = World::new(make);
+    let before = world.store.snapshot().expect("healthy durable snapshot");
+    assert_eq!(
+        world.store.snapshot_with_budget(ReadBudget::SNAPSHOT),
+        Ok(before.clone())
+    );
+    for budget in [
+        ReadBudget {
+            max_rows: 0,
+            ..ReadBudget::SNAPSHOT
+        },
+        ReadBudget {
+            max_bytes: 0,
+            ..ReadBudget::SNAPSHOT
+        },
+        ReadBudget {
+            max_field_bytes: 1,
+            ..ReadBudget::SNAPSHOT
+        },
+    ] {
+        assert_eq!(
+            world.store.snapshot_with_budget(budget),
+            Err(ReadError::LimitExceeded),
+            "snapshot budget {budget:?}"
+        );
+        assert_eq!(
+            world.store.snapshot().expect("healthy durable snapshot"),
+            before
+        );
+    }
+}
+
+/// Refusing a page does not claim that inventory ended. The same cursor can
+/// still read its next valid fact, and neither refusal nor inspection writes.
+pub fn recovery_limits_refuse_without_claiming_the_inventory_ends<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let world = World::new(make);
+    let before = world.store.snapshot().expect("healthy durable snapshot");
+    assert_eq!(
+        world.store.recover(None, 0),
+        Err(RecoveryRefused::EmptyPage)
+    );
+    assert_eq!(
+        world.store.recover(None, usize::MAX),
+        Err(RecoveryRefused::Read(ReadError::LimitExceeded))
+    );
+    let first = world
+        .store
+        .recover_with_budget(None, 3, ReadBudget::PAGE)
+        .expect("metadata page");
+    assert_eq!(first.facts.as_slice().len(), 3);
+    let cursor = first
+        .next
+        .expect("the inventory includes routes and sessions");
+    for budget in [
+        ReadBudget {
+            max_rows: 0,
+            ..ReadBudget::PAGE
+        },
+        ReadBudget {
+            max_bytes: 0,
+            ..ReadBudget::PAGE
+        },
+        ReadBudget {
+            max_field_bytes: 1,
+            ..ReadBudget::PAGE
+        },
+    ] {
+        assert_eq!(
+            world.store.recover_with_budget(Some(cursor), 1, budget),
+            Err(RecoveryRefused::Read(ReadError::LimitExceeded)),
+            "recovery budget {budget:?}"
+        );
+    }
+    let next = world
+        .store
+        .recover(Some(cursor), 1)
+        .expect("the refused fact remains readable");
+    assert!(matches!(
+        next.facts.as_slice(),
+        [RecoveredFact::Route { .. }]
+    ));
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        before
+    );
+}
+
 /// Every check of this module, in order.
 pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     opening_opens_the_next_epoch_and_closes_the_older_ones(make);
@@ -1693,4 +1950,6 @@ pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     what_is_established_in_epoch_zero_is_never_collected(make);
     every_receipt_and_fence_holds_a_receipt_slot(make);
     recovered_facts_follow_the_order_of_an_inventory(make);
+    snapshot_limits_refuse_without_changing_the_store(make);
+    recovery_limits_refuse_without_claiming_the_inventory_ends(make);
 }

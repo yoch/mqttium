@@ -6,7 +6,7 @@
 use mqttiumd_contract::ids::StoreIncarnation;
 use mqttiumd_lab::store::conformance::{self, World};
 use mqttiumd_lab::store::durable::{
-    DurableStore, Limits, MAX_CLIENT_ID_BYTES, MemoryStore, RecoveryRefused,
+    DurableStore, Limits, MAX_CLIENT_ID_BYTES, MemoryStore, ReadError, RecoveryRefused,
 };
 
 fn memory(incarnation: StoreIncarnation, limits: Limits) -> MemoryStore {
@@ -167,7 +167,7 @@ fn every_receipt_and_fence_holds_a_receipt_slot() {
 #[test]
 fn a_fact_that_cannot_be_built_is_not_the_end_of_the_inventory() {
     let world = World::new(&memory);
-    let mut durable = world.store.snapshot();
+    let mut durable = world.store.snapshot().expect("healthy durable snapshot");
     let record = durable.sessions.get_mut(&world.b).expect("b exists");
     record.client_id = vec![b'x'; MAX_CLIENT_ID_BYTES + 1];
     let reopened = MemoryStore::reopen(durable);
@@ -179,15 +179,25 @@ fn a_fact_that_cannot_be_built_is_not_the_end_of_the_inventory() {
     let next = first.next.expect("the inventory goes on");
     assert_eq!(
         reopened.recover(Some(next), 4),
-        Err(RecoveryRefused::AllocationFailed)
+        Err(RecoveryRefused::Read(ReadError::LimitExceeded))
     );
     assert_eq!(
         reopened.recover(None, 64),
-        Err(RecoveryRefused::AllocationFailed)
+        Err(RecoveryRefused::Read(ReadError::LimitExceeded))
     );
 }
 
 #[test]
 fn recovered_facts_follow_the_order_of_an_inventory() {
     conformance::recovered_facts_follow_the_order_of_an_inventory(&memory);
+}
+
+#[test]
+fn snapshot_limits_refuse_without_changing_the_store() {
+    conformance::snapshot_limits_refuse_without_changing_the_store(&memory);
+}
+
+#[test]
+fn recovery_limits_refuse_without_claiming_the_inventory_ends() {
+    conformance::recovery_limits_refuse_without_claiming_the_inventory_ends(&memory);
 }
