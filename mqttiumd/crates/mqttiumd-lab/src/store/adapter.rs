@@ -27,12 +27,12 @@ use std::collections::{BTreeMap, VecDeque};
 
 use mqttiumd_contract::command::{Command, OpenEpoch, OpeningTicket, Recipe};
 use mqttiumd_contract::effects::{
-    Effect, EffectSink, Input, OwnedEffect, SubmitBlock, SubmitResult,
+    Effect, EffectSink, Input, OwnedEffect, RecoveredFact, SubmitBlock, SubmitResult,
 };
 use mqttiumd_contract::ids::{EffectId, InboundPacketId, OperationId, SessionId};
 use mqttiumd_contract::outcome::{OpeningOutcome, OpeningReply, StoreReply};
 
-use super::durable::DurableStore;
+use super::durable::{DurableStore, RecoveryCursor, RecoveryPage, RecoveryRefused};
 
 /// A named injection point of the fault catalogue.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -172,7 +172,7 @@ pub enum FaultRefused {
 
 /// Evidence recorded by the adapter, in order. Lot L3 owns the trace
 /// records these are written as.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum StoreEvent {
     /// The adapter took the work; it is in transit.
     CommandSubmitted {
@@ -185,6 +185,8 @@ pub enum StoreEvent {
         id: WorkId,
         operation: Option<OperationId>,
     },
+    /// The writer made a fence durable for this operation.
+    FenceStable { id: WorkId, operation: OperationId },
     /// A result exists on the store side.
     ResultReady { id: WorkId, answer: Answer },
     /// The result was handed to the core.
@@ -201,6 +203,13 @@ pub enum StoreEvent {
     UncorrelatedResult {
         id: WorkId,
         operation: Option<OperationId>,
+    },
+    /// The adapter read one page of the recovery inventory. `page`
+    /// counts from zero within one inventory.
+    RecoveryPageRead {
+        page: u64,
+        last: bool,
+        facts: Vec<RecoveredFact>,
     },
 }
 
@@ -605,7 +614,7 @@ impl<S: DurableStore> SimStore<S> {
             Work::Resolve(operation) => (
                 Answer::Operation {
                     operation: *operation,
-                    reply: StoreReply::Outcome(self.store.resolve_and_fence(*operation)),
+                    reply: StoreReply::Outcome(self.store.resolve_and_fence(*operation).outcome),
                 },
                 false,
             ),
@@ -718,6 +727,17 @@ impl<S: DurableStore> SimStore<S> {
             Answer::Operation { operation, reply },
             None,
         )
+    }
+
+    /// Reads one page of the recovery inventory through the adapter,
+    /// which is the only builder of recovery facts (ADR 0003).
+    pub fn recover(
+        &mut self,
+        cursor: Option<RecoveryCursor>,
+        limit: usize,
+    ) -> Result<RecoveryPage, RecoveryRefused> {
+        // Skeleton: the read leaves no evidence.
+        self.store.recover(cursor, limit)
     }
 
     /// Leaves a barrier and goes on from the point it stopped at.

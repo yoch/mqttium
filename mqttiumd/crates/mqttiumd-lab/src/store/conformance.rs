@@ -30,7 +30,7 @@ use mqttiumd_contract::packet::{Qos, SharedBytes};
 
 use super::durable::{
     Accounts, AdminCommand, AdminDone, AdminRefused, Decision, DurableState, DurableStore, Limits,
-    ObligationPhase, RecoveryRefused, SessionState,
+    ObligationPhase, RecoveryRefused, Resolved, SessionState,
 };
 
 /// The incarnation every check creates its data set with.
@@ -283,6 +283,14 @@ fn outcome(reply: StoreReply) -> StoreOutcome {
     match reply {
         StoreReply::Outcome(outcome) => outcome,
         StoreReply::Violation(violation) => panic!("violation {violation:?}"),
+    }
+}
+
+/// An outcome that was already established: no fence was written.
+fn settled(outcome: StoreOutcome) -> Resolved {
+    Resolved {
+        outcome,
+        fenced_now: false,
     }
 }
 
@@ -544,7 +552,7 @@ pub fn a_rejection_stays_a_rejection_after_quota_is_released<S: DurableStore>(
     assert_eq!(world.store.snapshot(), before);
     assert_eq!(
         world.store.resolve_and_fence(operation_id(world.epoch, 2)),
-        rejected
+        settled(rejected)
     );
 
     // A new preparation of the same request gets a new identity.
@@ -613,14 +621,20 @@ pub fn resolve_returns_a_commit_and_fences_an_absence<S: DurableStore>(
     assert!(world.store.apply(&committed).committed_now);
     assert_eq!(
         world.store.resolve_and_fence(operation_id(world.epoch, 1)),
-        StoreOutcome::Committed(admitted(&committed))
+        Resolved {
+            outcome: StoreOutcome::Committed(admitted(&committed)),
+            fenced_now: false
+        }
     );
 
     let absent = world.admission(2, 8, b"payload", &[world.b]);
     let fenced = StoreOutcome::RejectedCertain(RejectReason::Fenced);
     assert_eq!(
         world.store.resolve_and_fence(operation_id(world.epoch, 2)),
-        fenced
+        Resolved {
+            outcome: fenced,
+            fenced_now: true
+        }
     );
     let before = world.store.snapshot();
     assert!(before.fences.contains(&operation_id(world.epoch, 2)));
@@ -629,9 +643,13 @@ pub fn resolve_returns_a_commit_and_fences_an_absence<S: DurableStore>(
     assert_eq!(outcome(late.reply), fenced);
     assert!(!late.committed_now);
     assert_eq!(world.store.snapshot(), before);
+    // The fence is established once.
     assert_eq!(
         world.store.resolve_and_fence(operation_id(world.epoch, 2)),
-        fenced
+        Resolved {
+            outcome: fenced,
+            fenced_now: false
+        }
     );
     assert_eq!(world.store.snapshot(), before);
 }
@@ -784,7 +802,7 @@ pub fn an_older_epoch_is_not_entered_again<S: DurableStore>(
     assert!(!late.committed_now);
     assert_eq!(
         world.store.resolve_and_fence(operation_id(old_epoch, 2)),
-        closed
+        settled(closed)
     );
     assert_eq!(world.store.snapshot(), before);
 
@@ -835,7 +853,7 @@ pub fn a_collected_identity_is_retired_not_rejected<S: DurableStore>(
         assert!(!applied.committed_now);
         assert_eq!(
             world.store.resolve_and_fence(command.recipe.operation()),
-            retired
+            settled(retired)
         );
     }
     assert_eq!(world.store.snapshot(), state);
@@ -855,7 +873,9 @@ pub fn an_identity_of_another_data_set_is_refused<S: DurableStore>(
     let before = world.store.snapshot();
     assert_eq!(
         world.store.resolve_and_fence(foreign),
-        StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed)
+        settled(StoreOutcome::RejectedCertain(
+            RejectReason::PreconditionFailed
+        ))
     );
     assert_eq!(world.store.snapshot(), before);
 }

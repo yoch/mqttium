@@ -133,6 +133,17 @@ fn release(bench: &mut Bench, held: WorkId) {
     );
 }
 
+/// The operations for which the writer made a fence durable.
+fn fences(events: &[StoreEvent]) -> Vec<(WorkId, OperationId)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            StoreEvent::FenceStable { id, operation } => Some((*id, *operation)),
+            _ => None,
+        })
+        .collect()
+}
+
 fn commits(events: &[StoreEvent]) -> usize {
     events
         .iter()
@@ -166,7 +177,9 @@ fn qabs_a_the_command_commits_before_the_fence() {
     assert_eq!(state.publications.len(), 1);
     assert_eq!(state.obligations.len(), 2);
     assert!(state.fences.is_empty());
-    assert_eq!(commits(&bench.store.take_events()), 1);
+    let events = bench.store.take_events();
+    assert_eq!(commits(&events), 1);
+    assert_eq!(fences(&events), []);
 }
 
 #[test]
@@ -190,7 +203,19 @@ fn qabs_b_the_fence_commits_before_the_command_is_delivered() {
     assert_eq!(bench.store.store().snapshot(), after_fence);
     assert!(after_fence.publications.is_empty());
     assert!(after_fence.obligations.is_empty());
-    assert_eq!(commits(&bench.store.take_events()), 0);
+    let events = bench.store.take_events();
+    assert_eq!(commits(&events), 0);
+    // The fence was made durable once, by the resolution, and the
+    // evidence of it precedes the result that announces the rejection.
+    assert_eq!(fences(&events), [(fence, operation)]);
+    let position =
+        |wanted: &dyn Fn(&StoreEvent) -> bool| events.iter().position(wanted).expect("recorded");
+    assert!(
+        position(&|event| matches!(event, StoreEvent::FenceStable { .. }))
+            < position(
+                &|event| matches!(event, StoreEvent::ResultReady { id, .. } if *id == fence)
+            )
+    );
 }
 
 #[test]
@@ -208,6 +233,7 @@ fn qabs_c_no_fence_can_be_established_and_no_rejection_is_invented() {
         "no certain rejection without a fence"
     );
     assert!(bench.store.store().snapshot().fences.is_empty());
+    assert_eq!(fences(&bench.store.take_events()), []);
 
     // Why it had to stay unknown: the command is still held, and once
     // the medium is back it commits.
@@ -329,7 +355,7 @@ fn the_store_never_contradicts_a_terminal_result() {
                 }
                 Step::Resolve(index) => {
                     let operation = operation_id(first_epoch, index as u64 + 1);
-                    observe(index, world.store.resolve_and_fence(operation));
+                    observe(index, world.store.resolve_and_fence(operation).outcome);
                 }
                 Step::Fail => world.store.set_durability(Durability::Failing),
                 Step::Restore => world.store.set_durability(Durability::Available),

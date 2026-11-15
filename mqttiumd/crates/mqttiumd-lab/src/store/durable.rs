@@ -217,6 +217,16 @@ pub struct Applied {
     pub committed_now: bool,
 }
 
+/// What `ResolveAndFence` established.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Resolved {
+    pub outcome: StoreOutcome,
+    /// Whether this call is the one that made the fence durable. False
+    /// when the outcome was already established, and when no fence
+    /// could be written.
+    pub fenced_now: bool,
+}
+
 /// A position in the recovery inventory of one state revision.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RecoveryCursor {
@@ -254,7 +264,7 @@ pub trait DurableStore {
     /// from a space that can still execute, a durable fence is
     /// established before a certain rejection is announced; when the
     /// fence cannot be established the outcome stays unknown.
-    fn resolve_and_fence(&mut self, operation: OperationId) -> StoreOutcome;
+    fn resolve_and_fence(&mut self, operation: OperationId) -> Resolved;
 
     /// Applies an administration command.
     fn admin(&mut self, command: AdminCommand) -> Result<AdminDone, AdminRefused>;
@@ -926,8 +936,8 @@ impl DurableStore for MemoryStore {
         }
     }
 
-    fn resolve_and_fence(&mut self, operation: OperationId) -> StoreOutcome {
-        match self.committed.established(operation) {
+    fn resolve_and_fence(&mut self, operation: OperationId) -> Resolved {
+        let outcome = match self.committed.established(operation) {
             Established::Outcome(outcome) => outcome,
             Established::Absent(_) => {
                 let mut staged = self.committed.clone();
@@ -938,6 +948,11 @@ impl DurableStore for MemoryStore {
                     StoreOutcome::PendingOrUnknown
                 }
             }
+        };
+        // Skeleton: never says that it fenced.
+        Resolved {
+            outcome,
+            fenced_now: false,
         }
     }
 

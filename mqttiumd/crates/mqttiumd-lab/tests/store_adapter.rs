@@ -740,3 +740,47 @@ fn evidence_that_cannot_be_kept_is_reported_as_lost() {
     assert!(bench.store.evidence_lost());
     assert_eq!(bench.store.take_events().len(), 2);
 }
+
+#[test]
+fn recovery_pages_read_through_the_adapter_leave_their_evidence() {
+    let mut bench = bench();
+    let command = bench.admission(1, 7, b"payload", &[bench.b, bench.c]);
+    assert!(bench.store.store_mut().apply(&command).committed_now);
+    open(bench.store.store_mut());
+    bench.store.take_events();
+
+    let whole = bench.store.store().recover(None, 64).expect("one page");
+    let mut cursor = None;
+    let mut read = Vec::new();
+    let mut pages = 0u64;
+    loop {
+        let page = bench.store.recover(cursor, 4).expect("a page");
+        let last = page.next.is_none();
+        assert_eq!(
+            bench.store.take_events(),
+            [StoreEvent::RecoveryPageRead {
+                page: pages,
+                last,
+                facts: page.facts.as_slice().to_vec(),
+            }]
+        );
+        read.extend_from_slice(page.facts.as_slice());
+        pages += 1;
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(read, whole.facts.as_slice());
+    assert!(pages > 1, "the inventory fits one page: nothing was paged");
+
+    // A new inventory starts again at page zero, and a refused read
+    // leaves no page behind.
+    let first = bench.store.recover(None, 4).expect("a page");
+    assert!(matches!(
+        bench.store.take_events().as_slice(),
+        [StoreEvent::RecoveryPageRead { page: 0, .. }]
+    ));
+    assert!(bench.store.recover(first.next, 0).is_err());
+    assert!(bench.store.take_events().is_empty());
+}
