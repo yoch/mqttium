@@ -619,3 +619,126 @@ fn read_failure_reception() {
         fs::remove_dir_all(out).unwrap();
     }
 }
+
+#[test]
+fn a_collector_refusal_cannot_erase_a_confirmed_sigkill() {
+    let root = bench_support::root().canonicalize().unwrap();
+    let out = bench_support::fresh("kill-receipt-collector-refusal");
+    fs::create_dir_all(&out).unwrap();
+    copy_inputs(&root, &out);
+    let scenario = Scenario::read(&read_json(&out.join(SCENARIO))).unwrap();
+    let fixture = read_json(&out.join(FIXTURE));
+    let database = out.join("store/case.sqlite");
+    let mut backend = Sqlite::new(database.clone());
+    let Setup {
+        settings,
+        population,
+        store,
+    } = Setup::from_fixture(
+        &mut backend,
+        &fixture,
+        "kill-receipt-refusal",
+        1,
+        scenario.faults.len(),
+    )
+    .unwrap();
+    let mut schema = read_json(&out.join("contracts/schema/v1/trace-record.schema.json"));
+    // Only the surviving collector is changed. The real child reads the
+    // unmodified contracts and executes the complete P1-02 admission path.
+    schema["allOf"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|rule| rule.pointer("/if/properties/kind/const") != Some(&json!("BrokerKilled")));
+    let collector = Collector::new(
+        settings.run_id,
+        KindTable::from_schema(&schema).unwrap(),
+        scenario.max_trace_bytes,
+    );
+    let config = Config {
+        executable: executable(&out),
+        campaign: out.clone(),
+        contracts: "contracts/v1".to_owned(),
+        scenario: SCENARIO.to_owned(),
+        seed: 1,
+        run_id: settings.run_id.to_owned(),
+        store: database.clone(),
+        sessions: population
+            .clients
+            .iter()
+            .map(|(name, _, session)| (name.clone(), *session))
+            .collect(),
+        silence: Duration::from_secs(2),
+        recovery_page: 64,
+    };
+    let outcome = run(Plan {
+        scenario: &scenario,
+        backend,
+        settings,
+        population,
+        store,
+        collector,
+        child: Some(config),
+    });
+    let pids: Vec<u32> = fs::read_to_string(out.join("pids.txt"))
+        .unwrap()
+        .lines()
+        .map(|line| line.parse().unwrap())
+        .collect();
+    assert_eq!(
+        pids.len(),
+        1,
+        "collection failure must not restart the child"
+    );
+    assert!(
+        !Path::new(&format!("/proc/{}", pids[0])).exists(),
+        "the killed child was reaped"
+    );
+    let reopened =
+        SqliteStore::open(&database).expect("the killed child's writer lock is released");
+    let durable = mqttiumd_store_api::DurableStore::snapshot(&reopened).unwrap();
+    assert_eq!(
+        durable.publications.len(),
+        1,
+        "the real committed admission survives"
+    );
+    drop(reopened);
+    assert_eq!(
+        outcome.kills.len(),
+        1,
+        "collector refusal must not erase an already confirmed termination"
+    );
+    assert_eq!(outcome.kills[0].pid, pids[0]);
+    assert_eq!(outcome.kills[0].wait_signal, 9);
+    assert_eq!(outcome.kills[0].signal_sent, "SIGKILL");
+    assert!(outcome.stopped.is_some());
+    assert!(
+        outcome
+            .refused
+            .iter()
+            .any(|reason| reason.contains("BrokerKilled"))
+    );
+    fs::write(out.join("trace.jsonl"), &outcome.trace).unwrap();
+    for (path, bytes) in &outcome.snapshots {
+        let target = out.join(path);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(target, bytes).unwrap();
+    }
+    let records: Vec<Value> = outcome
+        .trace
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert_eq!(records.last().unwrap()["payload"]["complete"], false);
+    assert!(
+        records
+            .iter()
+            .all(|record| record["kind"] != "BrokerKilled" && record["kind"] != "BrokerRecovered")
+    );
+    let verdict = judge(&root, &out);
+    assert_eq!(
+        verdict["verdict"], "INCONCLUSIVE",
+        "a missing kill observation cannot qualify positively"
+    );
+    fs::remove_dir_all(out).unwrap();
+}
