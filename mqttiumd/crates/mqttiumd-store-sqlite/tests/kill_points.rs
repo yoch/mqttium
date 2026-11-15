@@ -331,3 +331,35 @@ fn the_wal_hook_runs_with_checkpoint_disabled_then_restores_the_threshold() {
         "no kill callback after removal"
     );
 }
+
+/// An autocheckpoint PRAGMA replaces SQLite's single WAL callback. An
+/// armed store must refuse that reconfiguration, preserving the kill point.
+#[test]
+fn changing_the_autocheckpoint_cannot_replace_an_armed_kill_hook() {
+    let path = fresh_path();
+    let mut world = store_world(&path);
+    let hits = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&hits);
+    world
+        .store
+        .set_kill_hook(Some(Box::new(move |point| {
+            if point == KillPoint::CommitLogged {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        })))
+        .expect("armed");
+    assert!(
+        world
+            .store
+            .set_wal_autocheckpoint_for_measurement(16)
+            .is_err(),
+        "changing the autocheckpoint would remove the armed WAL callback"
+    );
+    assert_eq!(world.store.effective_settings().wal_autocheckpoint, 0);
+    assert!(world.store.apply(&commands(&world)[0]).committed_now);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the WAL callback still runs"
+    );
+}
