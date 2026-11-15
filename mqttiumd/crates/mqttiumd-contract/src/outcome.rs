@@ -87,9 +87,11 @@
 //!   authority in the older one.
 //!
 //! Trusted code, named as ADR 0009 requires. `EpochOpening::hand_over`
-//! is the one function that constructs an `EpochGrant`. The rule lot L1
-//! realises is that the creation authority is constructed by consuming a
-//! grant and in no other way; nothing in this crate enforces it yet.
+//! is the one function that constructs an `EpochGrant`. That the
+//! creation authority is constructed by consuming a grant, and in no
+//! other way, is the rule lot L1 realises in `effects.rs` with
+//! `OwnerAuthority::from_grant`, its only constructor. This module
+//! issues the grant; what consumes it is not in this file.
 //! `EpochOpening::observe` is the entry point between the store adapter
 //! and this crate: a reply is plain data, and the type system does not
 //! prevent code from building one. The `StartupNonce` is drawn by the
