@@ -42,6 +42,13 @@ jobs:
           channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           rustc --version --verbose
+      # The Rust vertical receipt calls the independent oracle through its
+      # normal CLI, so its pinned interpreter/dependencies precede cargo test.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+      - name: Install the oracle used by the Rust vertical tests
+        run: python -m pip install --disable-pip-version-check -r tests/oracle/requirements.txt
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -62,9 +69,6 @@ jobs:
           --scenario tests/scenarios/p1/P1-02.json
       # A second, unrelated JSON Schema implementation must read the schema
       # files the same way. Versions are pinned in tools/requirements.txt.
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
-        with:
-          python-version: "3.13"
       - name: Derived contract files are up to date
         run: python tools/build_corpus.py --check
       # Installs nothing: fake tools on a private PATH.
@@ -78,7 +82,6 @@ jobs:
       # a run. Its corpus of traces is derived; its tests judge that corpus.
       - name: Oracle
         run: |
-          python -m pip install --disable-pip-version-check -r tests/oracle/requirements.txt
           python tests/oracle/build_traces.py --check
           python -m unittest discover -t tests/oracle -s tests/oracle/tests
       # A successful receipt of a read failure is distinct from a qualifying
