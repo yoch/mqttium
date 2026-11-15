@@ -20,14 +20,32 @@ runs in CI. See "What is not done".
 
 | | |
 | - | - |
-| Digest of `credits.rs` | `sha256:49669d713e09854672a29a7e180dd4ccfbc8caaa6cf1cce228cccd16fc9082f1` |
-| Digest of the text of the function | `sha256:f1f4d430f508faa837db8c82d3ecb841bfc9c72f4a18c62f2a67969a83bd5cd1` |
-| Recorded in | `BODY.sha256`; `run.sh` fails when the source differs |
+| Text of the function | `sha256:f1f4d430f508faa837db8c82d3ecb841bfc9c72f4a18c62f2a67969a83bd5cd1` |
+| `crates/mqttiumd-core/src/credits.rs` | `sha256:cd9e17b4a221265bfab203232e57e54521adb40943ad812e586342e852ce7f22` |
+| `crates/mqttiumd-contract/src/capacity.rs` | `sha256:c077c49e51e37ca75da271ac0c6aca2b701dd1cfa15dbc1a3cf0847ada1c4e36` |
+| `crates/mqttiumd-contract/src/ids.rs` | `sha256:9191193c38f5a57d5ac40fa7b3956c531ad8db0366121bf338b0ba38891dfe11` |
+| `proofs/credits/src/lib.rs`, the harnesses | `sha256:cff057a4624567777a460fb728f6283b48272400e5197eb11633013aa859f605` |
+| `proofs/credits/harnesses.txt` | `sha256:54f85cc0270a7956d07fceaa2914f5741982b6567503d3fd380cdeca64c17ca1` |
+| `proofs/credits/tests/no_allocation.rs` | `sha256:f63b2706874092e4de47409d38d0efe883b9ed813d8c4dc7979d935f0d16e558` |
+| Recorded in | `BODY.sha256`; `run.sh` fails with exit 5 when any of them differs |
 | Call site in the product | None yet. Lot L1 calls it and writes no second variant (DEM-024) |
 
 The text of the function is from its `pub fn` line to the first closing
-brace in column one. After a change of the source, review it, run
-`run.sh --record` and update this file.
+brace in column one.
+
+The record covers every source file the proof analyses, not the function
+alone. The two files of the contract crate hold what the body calls:
+`checked_sub` and the derived comparison of `LeaseKey`. `run.sh` uses the
+coverage of the tool to check that no harness reaches another source file
+of the product, so the list cannot fall short without failing the run.
+The standard library is not recorded: it belongs to the compiler Kani
+brings, which the preflight pins.
+
+A consequence for lot L1, which owns `capacity.rs` and `ids.rs`: any
+change of those two files makes `run.sh` fail until the change is
+reviewed and recorded with `run.sh --record`, which writes the record
+last, after the proof passed on the new content. That is the purpose:
+a change of what the proof analyses asks for a look at the proof.
 
 ## Commands
 
@@ -38,9 +56,20 @@ All from `mqttiumd/`.
 | `tools/install-tools.sh kani verus` | Installs the pinned tools |
 | `proofs/preflight.sh` | The tool `PATH` selects, its version, a true property verified, a false one refuted |
 | `proofs/preflight-selftest.sh` | Fake tools first on `PATH` are refused; the real preflight passes |
-| `proofs/credits/run.sh` | The preflight, the digests, the eleven harnesses with their witnesses, the coverage |
+| `proofs/credits/run.sh` | The preflight, the allocation test, the twelve harnesses with their witnesses, the coverage, the digests. `--record` records the digests after a pass |
 | `python3 proofs/credits/mutants.py` | The control run and the twelve mutants |
+| `python3 proofs/credits/selftest.py` | Breaks one thing the scripts check, per case, and expects the refusal |
 | `python3 proofs/credits/verus-trial.py` | The limited Verus trial |
+
+`run.sh` is a wrapper of `run.py`. `prooflib.py` is the one place that
+locates the function, computes the digests, reads the tool's output and
+defines the mutants; the four scripts import it.
+
+The proof crates are a workspace of their own, so that the product
+workspace and its lock file carry nothing of the proof. The price:
+`cargo test --workspace` and `cargo clippy --workspace` at the root of
+`mqttiumd/` do not see `proofs/`. The commands above are the only
+verification of this directory; they count only where they run.
 
 ## Properties
 
@@ -61,6 +90,7 @@ a witness of non-vacuity (a cover property).
 | Incoherent account, release | Exact, by the right key only | `p9_incoherent_account_release_is_exact` | P9a, P9b, P9c |
 | Coherent account | `used <= limit` preserved by every outcome | `p10_coherence_is_preserved` | P10a |
 | Reserve then release | The account as it was | `p11_reserve_then_release_restores_the_account` | P11a, P11b |
+| The precondition, broken on purpose | What the function then does | `p12_a_second_record_of_a_held_lease_is_released_too` | P12a, P12b; see "Preconditions and assumptions" |
 
 A failed assertion ends its path, as a panic does: a later assertion is
 examined only where the earlier ones hold. So each harness asserts the
@@ -74,8 +104,24 @@ fails; they are among the checks counted below.
 
 ## Preconditions and assumptions
 
-The function has no precondition: `p1`, `p3` and `p11` assume nothing about
-the lease, the account or the key.
+The function has one precondition, and the harnesses cannot establish
+it: **each held lease has one record.** An account counts usage and does
+not know its leases, so the function cannot tell a second record of a
+held lease from the first. `LeaseRecord` is not `Clone`, but `from_parts`
+and the getters can rebuild a record; recovery calls `from_parts` once
+per durable row, and nothing else does outside this proof crate.
+
+Harness `p12` builds the state the precondition forbids, a second record
+of the same held lease, and shows what follows: each release is exact on
+its own, both succeed while the usage covers the cost twice (W12a), and
+the cost of one lease then has left the account twice (P12b). The usage
+is undercounted and the account will admit more than its limit. `p3`
+does not cover this: it repeats the release on the same record. The
+owner of the lease table, lot L1, owes the guarantee that each record
+exists once; it is proposed as an open condition.
+
+Nothing else is required of the arguments: `p1`, `p3` and `p11` assume
+nothing about the lease, the account or the key.
 
 | Harness | `kani::assume` | Why it does not hide an error path |
 | - | - | - |
@@ -89,10 +135,13 @@ the lease, the account or the key.
 | `p8`, `p9` | The account is incoherent (`used > limit` in a dimension) | W8a to W8d: every refusal is reached; W9a, W9b: a release leaves the account incoherent, or makes it coherent; W9c, W9d: each dimension over its limit alone |
 | `p10` | The account is coherent | W10a: a release; W10b: a refusal |
 | `p11` | `reserve` succeeds | W11a: a cost in both dimensions |
+| `p12` | None; the second record copies the first | W12a: both releases succeed; W12b: the second is refused only when the usage no longer covers the cost |
 
-`run.sh` requires, for each harness, exactly the number of witnesses of
-`harnesses.txt`, all satisfied. An assumption that made a branch
-unreachable would fail the run.
+`run.sh` runs the tool on the whole proof crate with no filter and takes
+the harnesses from the tool's own report: they must be exactly those of
+`harnesses.txt`, each with exactly its listed number of witnesses, all
+satisfied. A harness nobody listed fails the run, and so does an
+assumption that makes a branch unreachable.
 
 ## Bounds
 
@@ -121,9 +170,16 @@ What the result rests on, and is not proved here:
   one, the proof under Kani's. The two checks complete each other; neither
   shows that the two compilers agree.
 - The harness reads the state through the public getters.
-- "Does not allocate, does no IO" is a check of the source by `run.sh`
-  (the module names no path into `alloc` or `std`, no collection, no
-  formatting macro) in a `no_std` crate. It is not a Kani property.
+- "Does not allocate" is a test, not a Kani property:
+  `tests/no_allocation.rs` installs a counting global allocator, calls
+  the function once per outcome and `reserve` once per outcome, and
+  requires zero allocations; a control shows the counter sees one. It
+  runs under the product toolchain, in the test profile, on the calls it
+  makes. The proof shows these are all the outcomes; it does not show
+  that no input allocates.
+- "Does no IO" has no check of its own. The crate is `no_std` and the
+  boundary test of the product refuses what could reach a file or a
+  socket (ADR 0007).
 - `Account::reserve` is exercised by `p7` and `p11` only. It is not the
   function of the pilot proof.
 - The moment of the call. This proof protects the calculation and its
@@ -136,13 +192,13 @@ A result belongs to an exact content.
 
 | | |
 | - | - |
-| Revision | `b0d6b940` on branch `claude/mqttiumd-l6-pilot-proof`: the lot merged with the contract chain `74ea7f4..9465451`, which sits on `642b376` of the integration branch. Later commits change this file and `proofs/proposals/` only |
+| Revision | `dbddded0` on branch `claude/mqttiumd-l6-pilot-proof`: the lot merged with the contract chain `74ea7f4..574fb9d`, which sits on `642b376` of the integration branch. Later commits change this file and `proofs/proposals/` only |
 | Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb`, unchanged by the lot |
 | Where | A cloud container, local run. Not CI |
 | Tool | `/root/.cargo/bin/cargo-kani`, as `PATH` selects it: Kani Rust Verifier 0.68.0 (cargo plugin), CBMC 6.11.0 |
 | Compiler the tool brings | `rustc 1.100.0-nightly (8925ea358 2026-08-20)`, toolchain `nightly-2026-08-21-x86_64-unknown-linux-gnu` |
 | Target | `x86_64-unknown-linux-gnu` |
-| Options | `cargo kani -p mqttiumd-proof-credits --harness <name>`, defaults. Coverage: `--coverage -Z source-coverage` on `p1` |
+| Options | `cargo kani -p mqttiumd-proof-credits`, defaults, no harness filter. Coverage: the same with `--coverage -Z source-coverage` |
 | Product toolchain, for the unit tests | `1.97.0`, `rust-toolchain.toml` |
 
 `proofs/credits/run.sh`: PASS.
@@ -160,40 +216,68 @@ A result belongs to an exact content.
 | `p9_incoherent_account_release_is_exact` | verified | 271 | 4 of 4 |
 | `p10_coherence_is_preserved` | verified | 237 | 2 of 2 |
 | `p11_reserve_then_release_restores_the_account` | verified | 305 | 1 of 1 |
+| `p12_a_second_record_of_a_held_lease_is_released_too` | verified | 253 | 2 of 2 |
 
-Eleven harnesses verified, none failed; 39 of 39 witnesses satisfied; 12
-of 12 regions of the function covered under `p1`. The whole run, preflight
-included, takes about twenty seconds, from an empty build directory as
-well.
+Twelve harnesses run by the tool, twelve listed, all verified; 41 of 41
+witnesses satisfied; 12 of 12 regions of the function covered under `p1`;
+4 source files reached, all recorded; 3 allocation tests passed. The
+whole run, preflight included, takes 44 seconds from an empty build
+directory.
 
 Also run on that revision: `cargo fmt --check`, `cargo clippy --workspace
 --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`
-(151 passed, 17 of them in `credits`), `validate`, each on the product
-workspace; `cargo fmt --check` and `cargo clippy` on the `proofs/`
-workspace; `proofs/preflight-selftest.sh` (four fake tools refused, the
-real preflight passes); `tools/test-install-tools.sh` and
-`tools/install-tools.sh kani verus` with the corrected installer of the
-integration branch (both tools present).
+(152 passed, 18 of them in `credits`), `validate`,
+`python tools/build_corpus.py --check` and `tools/test-install-tools.sh`
+on the product workspace; `cargo fmt --check` and `cargo clippy` on the
+`proofs/` workspace; `proofs/preflight-selftest.sh` (four fake tools
+refused, the real preflight passes).
 
-The proof crates are a workspace of their own, so that the product
-workspace and its lock file carry nothing of the proof. The price:
-`cargo test --workspace` and `cargo clippy --workspace` at the root of
-`mqttiumd/` do not see `proofs/`. The scripts of the table of commands
-are the only verification of this directory; they count only where they
-run.
+## What a PASS of the scripts is worth
+
+`python3 proofs/credits/selftest.py`: 13 of 13 cases as expected, about
+four minutes. Each case copies the sources, breaks one thing and expects
+the script of the copy to refuse by the exit code of that check.
+
+| Case | Expected |
+| - | - |
+| The function allocates through `BoundedVec`, a type no search for `Vec` sees | `run.sh` exit 9 |
+| The function allocates with `.to_vec()`, which names no type | exit 9 |
+| An unlisted harness behind a second attribute | exit 6 |
+| An unlisted harness declared `pub fn` | exit 6 |
+| A listed harness that the source no longer holds | exit 6 |
+| `checked_sub` changes in the contract crate | exit 5 |
+| An assertion of a harness is weakened, and still passes | exit 5 |
+| An unknown argument | exit 2 |
+| `--record` on a body that is not proved | exit 7, `BODY.sha256` untouched |
+| A mutant whose text is gone | Its row says inconclusive; the report says FAIL |
+| The mutants exceed their time limit | Inconclusive rows, the report says FAIL |
+| A command exceeds its limit after starting a child | The child is killed with it |
+| The unmodified copy | `run.sh` exit 0 |
+
+Most of these were found by the integration owner's review of the
+scripts. Before the corrections, 10 of the 12 cases then written failed:
+the scripts printed PASS. The self-test was committed in that state
+(`cc7ada3`), then the corrections (`144a6d3`).
+
+Two things the self-test does not show. The exit code 8 (coverage) has
+no case of its own. And the first form of the timeout case passed
+whatever the script did, so it was replaced; the present one was seen to
+fail when only the direct child is killed.
 
 ## Mutants
 
-`python3 proofs/credits/mutants.py`: PASS, about two minutes. The sources
+`python3 proofs/credits/mutants.py`: PASS, about two and a half minutes. The sources
 are copied to a temporary directory; the production tree is not touched.
-The control run comes first: the unmodified copy gives eleven harnesses
-verified and seventeen unit tests passed.
+The control run comes first: the unmodified copy gives twelve harnesses
+verified and eighteen unit tests passed.
 
 A mutant is caught only when its text was found exactly once in the
 function, the mutated crate still builds with the product toolchain, every
 harness ran to a verdict within the time limit, the checks it aims at
 fail, the checks it must leave alone hold, and its unit test fails. A
-compilation failure or a timeout is reported as inconclusive.
+compilation failure or a timeout is reported as inconclusive: the mutant
+keeps its row and the run fails. On a timeout the whole process group of
+the tool is killed.
 
 | Mutant | What it does | Checks aimed at, all failed | Other failed checks | A unit test that fails |
 | - | - | - | - | - |
@@ -202,12 +286,12 @@ compilation failure or a timeout is reported as inconclusive.
 | `account-guard-dropped` | Any account pays for the lease | P4b, P4a | P1c, P1d, P9a | `a_wrong_account_is_an_explicit_error_and_changes_nothing` |
 | `release-repeated` | A released lease is subtracted again | P3a, P3b | P1e, P1f, P9a | `a_repeated_release_subtracts_nothing_more` |
 | `state-not-released` | The usage is reduced and the lease stays held | P6d, P3a, P3c | P1l, P9c | `a_current_key_subtracts_both_dimensions_exactly_and_releases` |
-| `bytes-check-dropped` | The bytes are subtracted unchecked and wrap | P5b | P1g, P1h, P9b, P10a | `bytes_above_usage_change_neither_dimension` |
-| `slots-check-dropped` | The slots are subtracted unchecked and wrap | P5c | P5b, P1j, P9b, P10a | `slots_above_usage_change_neither_dimension` |
+| `bytes-check-dropped` | The bytes are subtracted unchecked and wrap | P5b | P1g, P1h, P9b, P10a, P12a | `bytes_above_usage_change_neither_dimension` |
+| `slots-check-dropped` | The slots are subtracted unchecked and wrap | P5c | P5b, P1j, P9b, P10a, P12a | `slots_above_usage_change_neither_dimension` |
 | `bytes-subtracted-before-slots-checked` | One dimension is written before the other is checked | P5b | P1j, P3a, P8a | `slots_above_usage_change_neither_dimension` |
 | `state-written-before-checks` | The lease is marked released before the checks. P5b and P5c still hold | P5d | P1h, P1j, P8a | `bytes_above_usage_change_neither_dimension` |
-| `slots-not-subtracted` | Only the bytes are given back. P6b still holds | P6c | P1l, P9c, P11b | `a_current_key_subtracts_both_dimensions_exactly_and_releases` |
-| `bytes-subtracted-from-the-limit` | The cost is taken from the limit | P6b | P1g, P1h, P1i, P1l, P5b, P5c, P5d, P9b, P9c, P11b | `a_current_key_subtracts_both_dimensions_exactly_and_releases` |
+| `slots-not-subtracted` | Only the bytes are given back. P6b still holds | P6c | P1l, P9c, P11b, P12a, P12b | `a_current_key_subtracts_both_dimensions_exactly_and_releases` |
+| `bytes-subtracted-from-the-limit` | The cost is taken from the limit | P6b | P1g, P1h, P1i, P1l, P5b, P5c, P5d, P9b, P9c, P11b, P12a, P12b | `a_current_key_subtracts_both_dimensions_exactly_and_releases` |
 | `account-checked-before-the-key` | The first two guards are swapped. P2b still holds | P2a | P1a | `an_old_key_of_another_account_is_stale_not_a_fault` |
 
 Twelve mutants, twelve caught by the check aimed at and by a unit test;
@@ -312,8 +396,12 @@ inconclusive, so a stale mutant cannot count as caught.
 - **Not in CI.** The workflow is a shared file. Until a job installs the
   pinned tools and runs `proofs/credits/run.sh`, every result above is a
   local run.
-- **The contract change is not reviewed yet.** The chain
-  `74ea7f4..9465451` waits for the integration owner.
+- **The contract change is not merged yet.** The chain
+  `74ea7f4..574fb9d` waits for the integration owner, with the decision
+  text on the order of the guards, `reserve`, the unchecked constructors
+  and the precondition.
+- **The precondition is not enforced anywhere.** One record per held
+  lease is owed by the lease table of lot L1; no test of L1 shows it yet.
 - **Human time** of the maintenance trial.
 - The open condition "Pilot proof" of
   `docs/reception/open-conditions.md` stays open.
