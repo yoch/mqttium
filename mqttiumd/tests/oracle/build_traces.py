@@ -1552,6 +1552,27 @@ case(
 )
 
 
+case(
+    "obligations-gone-at-both-checkpoints",
+    "F2: publications and payloads are held and equal at both checkpoints, and no obligation is.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=without("obligations"),
+)
+
+
+def one_obligation_gone(states):
+    for state in states.values():
+        state["obligations"].pop()
+
+
+case(
+    "one-obligation-gone-at-both-checkpoints",
+    "F2: the acknowledged publication carries one obligation of the two its routes require, at both checkpoints.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=one_obligation_gone,
+)
+
+
 def everything_gone(states):
     for state in states.values():
         for table in ("publications", "payloads", "obligations"):

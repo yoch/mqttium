@@ -630,6 +630,40 @@
       "why": "The client's PUBLISH carries a property; the payload the store holds is still what it sent."
     },
     {
+      "name": "obligations-gone-at-both-checkpoints",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/obligations-gone-at-both-checkpoints/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "FAIL",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS"
+      },
+      "why": "F2: publications and payloads are held and equal at both checkpoints, and no obligation is."
+    },
+    {
+      "name": "one-obligation-gone-at-both-checkpoints",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/one-obligation-gone-at-both-checkpoints/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "FAIL",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS"
+      },
+      "why": "F2: the acknowledged publication carries one obligation of the two its routes require, at both checkpoints."
+    },
+    {
       "name": "acknowledged-publication-gone",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/acknowledged-publication-gone/trace.jsonl",
