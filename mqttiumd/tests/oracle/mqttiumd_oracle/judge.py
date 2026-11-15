@@ -711,7 +711,10 @@ def broker_inputs_have_provenance(run):
         # the order it received them: the order holds from page to page,
         # and a route belongs to the table that precedes it. How often and
         # in what order the adapter read them is not what the core was given.
+        # A route is listed once, and when the inventory closes every
+        # route targets a session it recovers (the rules of the core).
         inventory, table = InventoryOrder(), False
+        routes, sessions = {}, set()
         for page in side("broker-core", incarnation, "RecoveryPageDelivered"):
             for index, fact in enumerate(page.payload["facts"]):
                 refusal = inventory.admit(fact)
@@ -721,6 +724,19 @@ def broker_inputs_have_provenance(run):
                     table = True
                 elif fact["kind"] == "Route" and not table:
                     blame(page, f"fact {index} is a route and no route table precedes it")
+                elif fact["kind"] == "Route":
+                    route = (fact["topic_hex"], int(fact["target"]))
+                    if route in routes:
+                        blame(page, f"fact {index} repeats the route of {routes[route]}")
+                    routes.setdefault(route, f"record {page.sequence}, fact {index}")
+                elif fact["kind"] == "Session":
+                    sessions.add(int(fact["session"]))
+            if page.payload["last"]:
+                for (_, target), where in routes.items():
+                    if target not in sessions:
+                        blame(
+                            page, f"the route of {where} targets {target}, which is not recovered"
+                        )
         used = set()
         expected = 0
         for record in side("broker-core", incarnation, "RecoveryPageDelivered"):

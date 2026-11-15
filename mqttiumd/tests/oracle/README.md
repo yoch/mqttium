@@ -83,7 +83,10 @@ The pages the core received during one recovery are one inventory
 order of the facts from page to page, and requires a route table before
 the first route; a page out of
 place fails `broker_inputs_have_provenance`, since no store of the
-contract hands such an inventory to a core. It does not require that an
+contract hands such an inventory to a core. It also applies the two rules
+the core applies to a whole inventory: a route, topic and target, is
+listed once, and at the page that closes the inventory every route
+targets a session the inventory recovers. It does not require that an
 inventory holds an epoch, limits or a table when it has no route: record
 0014 leaves that open.
 
