@@ -727,6 +727,12 @@ impl<O: Clone> Sequencer<O> {
         Ok(batch.into_values().collect())
     }
 
+    /// Whether no frame waits to be ordered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.batch.is_empty() && self.duplicate.is_none()
+    }
+
     /// The first emission number the next action may carry.
     #[must_use]
     pub const fn next(&self) -> u64 {
