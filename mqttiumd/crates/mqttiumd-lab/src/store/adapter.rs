@@ -726,12 +726,12 @@ impl<S: DurableStore> SimStore<S> {
                     reply,
                 }))
             }
-            (WorkId::Opening(attempt), Answer::Opening { command, outcome })
-                if command.attempt == attempt =>
-            {
+            // An opening is identified by the attempt of the command its
+            // answer carries: the adapter builds both from one command.
+            (WorkId::Opening(_), Answer::Opening { command, outcome }) => {
                 Some(Delivery::Opening(OpeningReply { command, outcome }))
             }
-            (WorkId::Effect(_) | WorkId::Opening(_), Answer::Opening { .. })
+            (WorkId::Effect(_), Answer::Opening { .. })
             | (WorkId::Opening(_), Answer::Operation { .. }) => None,
         };
         let (Some(delivery), true) = (delivery, self.awaited.get(&id) == Some(&operation)) else {

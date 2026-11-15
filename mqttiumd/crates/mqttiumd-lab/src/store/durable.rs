@@ -863,19 +863,7 @@ impl DurableStore for MemoryStore {
                 return OpeningOutcome::Unknown;
             }
         }
-        // Skeleton: whatever does not open is called a moved
-        // predecessor, as before the second review.
-        match decision {
-            LedgerOpening::Opens { .. } => {
-                OpeningOutcome::of(self.committed.ledger.incarnation(), decision)
-            }
-            LedgerOpening::Rejected(reason) => OpeningOutcome::RejectedCertain(reason),
-            LedgerOpening::AlreadyOpened { .. }
-            | LedgerOpening::Superseded
-            | LedgerOpening::Undecided => OpeningOutcome::RejectedCertain(
-                mqttiumd_contract::command::OpeningRejection::PredecessorMoved,
-            ),
-        }
+        OpeningOutcome::of(self.committed.ledger.incarnation(), decision)
     }
 
     fn apply(&mut self, command: &Command) -> Applied {
