@@ -42,6 +42,7 @@ MONOTONE = {
     "one_admission_per_observed_inbound_exchange",
     "same_required_obligations_at_both_checkpoints",
     "same_recipe_for_op_A",
+    "no_positive_ack_before_confirmed_commit",
 }
 
 
@@ -884,15 +885,23 @@ def no_positive_ack_before_confirmed_commit(run):
     one.
     """
     slots = run.slots()
-    statuses, reasons = [], []
+    statuses, reasons, established = [], [], False
+    reads = run.trace.of_kind("RecoveryPageRead")
     for origin in sorted(
         {record.origin for record in run.trace.records if record.origin[0] == "broker-core"}
     ):
         learned = {"PUBREC": {}, "PUBCOMP": {}}
         unattributed = False
+        pending, next_page, inventory_epoch = {}, 0, None
+        inventory, inventory_valid = InventoryOrder(), True
+        sources = set()
+        next_record, prefix_complete = 0, True
         for record in run.trace.records:
             if record.origin != origin:
                 continue
+            if record.origin_sequence != next_record:
+                prefix_complete = False
+            next_record = record.origin_sequence + 1
             payload = record.payload
             if record.kind == "StoreResultDelivered" and payload["outcome"] == "Committed":
                 known = slots.get(_key(payload["operation_id"]))
@@ -903,10 +912,34 @@ def no_positive_ack_before_confirmed_commit(run):
                 else:
                     learned["PUBCOMP"][known[1:]] = record
             elif record.kind == "RecoveryPageDelivered":
+                # A partial recovery cannot make the owner ready. Facts
+                # become usable only when its contiguous inventory closes,
+                # and only if the adapter's read corroborates each page.
+                number = int(payload["page"])
+                if number == 0:
+                    pending, next_page = {}, 0
+                    inventory_epoch = payload["run_epoch"]
+                    inventory, inventory_valid = InventoryOrder(), True
+                    sources = set()
+                inventory_valid &= number == next_page and payload["run_epoch"] == inventory_epoch
+                next_page += 1
+                source = next((read for read in reads
+                               if read.origin[1] == origin[1]
+                               and read.key not in sources and read.payload == payload
+                               and run.trace.before(read, record) is True), None)
+                if source is None:
+                    unattributed = True
+                    inventory_valid = False
+                else:
+                    sources.add(source.key)
                 for fact in payload["facts"]:
+                    inventory_valid &= inventory.admit(fact) is None
                     if fact["kind"] == "InboundExchange" and fact["phase"] == "AwaitPubrel":
                         slot = (int(fact["exchange"]["session"]), fact["packet_id"])
-                        learned["PUBREC"][slot] = record
+                        pending[slot] = record
+                if payload["last"] and inventory_valid:
+                    learned["PUBREC"].update(pending)
+                    pending = {}
             elif record.kind == "FrameEligible" and payload["packet_kind"] in learned:
                 if payload["reason"] != "Success":
                     continue
@@ -925,11 +958,12 @@ def no_positive_ack_before_confirmed_commit(run):
                     )
                 else:
                     statuses.append(FAIL)
+                    established |= prefix_complete
                     reasons.append(
                         f"record {record.sequence}: {kind} of Packet Identifier {slot[1]} is "
                         "eligible before the core knew of a commit"
                     )
-    return Status(_worst(statuses), reasons)
+    return Status(_worst(statuses), reasons, stands=established)
 
 
 def no_pubrec_observed_before_crash(run):
