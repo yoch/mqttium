@@ -60,7 +60,8 @@ class Traces(unittest.TestCase):
                         self.assertTrue(status.reasons, name)
 
     def test_every_assertion_has_a_good_trace_and_a_faulty_trace_of_its_own(self):
-        assertions = set(INDEX[0]["expected"])
+        assertions = {name for case in INDEX for name in case["expected"]}
+        self.assertIn("fenced_operation_never_executed", assertions)
         accepted = {name: 0 for name in assertions}
         refused_alone = {name: 0 for name in assertions}
         for case in INDEX:

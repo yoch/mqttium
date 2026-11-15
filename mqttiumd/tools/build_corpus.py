@@ -148,6 +148,9 @@ def rule(
 BASE = json.loads((ROOT / "tests/scenarios/p1/P1-02.json").read_text())
 valid = [
     "tests/scenarios/p1/P1-02.json",
+    "tests/scenarios/qabs/QABS-A.json",
+    "tests/scenarios/qabs/QABS-B.json",
+    "tests/scenarios/qabs/QABS-C.json",
     "tests/fixtures/p1/three-persistent-sessions.json",
 ]
 invalid = []
@@ -586,12 +589,16 @@ HELD = scenario(
                 "drop_result",
                 match={"result_of": "Persist"},
             ),
+            # The first resolution reads the absence and cannot write its
+            # fence: that, not the held command, is why it answers unknown.
+            fault("refused_fence", "store.fence.transit", "refuse_fence"),
         ],
         steps=[
             BASE["steps"][0],
             BASE["steps"][1],
             drive_fault("held_admission"),
             {"kind": "FireDeadline", "max_steps": "512"},
+            drive_fault("refused_fence"),
             drive_fault("held_unknown"),
             {"kind": "ReleaseHeldCommand", "fault": "held_admission"},
             drive_fault("lost_admission_result"),
@@ -608,7 +615,7 @@ HELD = scenario(
         ],
     )
 )
-RELEASE, DELIVER = 5, 10
+RELEASE, DELIVER = 6, 11
 
 
 def held(edit):
@@ -672,7 +679,7 @@ ok(
 bad(
     "scenario-wait-for-a-fault-never-expected.json",
     "step-order-invalid",
-    "/steps/6",
+    "/steps/7",
     "A scenario does not wait for an injection it announces will never be reached.",
     held(setter(["faults", 2, "expected_hits"], "0")),
 )
@@ -692,13 +699,27 @@ bad(
 bad(
     "scenario-two-faults-select-one-occurrence.json",
     "fault-match-invalid",
-    "/faults/3/match",
+    "/faults/4/match",
     "Two faults name the same occurrence of the same result: only one could act.",
     held(
         lambda v: v["faults"].append(
             {**copy.deepcopy(v["faults"][2]), "id": "duplicated", "action": "duplicate_result"}
         )
     ),
+)
+bad(
+    "scenario-release-of-a-refused-fence.json",
+    "held-item-mismatch",
+    f"/steps/{RELEASE}/fault",
+    "A refused fence is not written and not kept: nothing is left to release.",
+    held(setter(["steps", RELEASE, "fault"], "refused_fence")),
+)
+bad(
+    "scenario-refuse-fence-on-a-command-in-transit.json",
+    "fault-action-unknown",
+    "/faults/0/action",
+    "Only the point where a fence waits offers to refuse it.",
+    held(setter(["faults", 0, "action"], "refuse_fence")),
 )
 bad(
     "scenario-deliver-while-crashed.json",
@@ -784,6 +805,13 @@ bad(
     "/points/0/actions/1",
     "A point that carries a command cannot delay a result.",
     (lambda v: (v["points"][0]["actions"].append("delay_result"), v)[1])(copy.deepcopy(FAULTS)),
+)
+bad(
+    "fault-catalog-refuse-fence-on-a-result-point.json",
+    "fault-action-unknown",
+    "/points/2/actions/3",
+    "A fence is a command of the writer: a point that carries a result cannot refuse one.",
+    (lambda v: (v["points"][2]["actions"].append("refuse_fence"), v)[1])(copy.deepcopy(FAULTS)),
 )
 bad(
     "fault-catalog-action-nobody-defines.json",
@@ -1215,6 +1243,18 @@ for case_name, base, path in [
         setter(path, OVER),
         code="u64-out-of-range",
     )
+
+ok(
+    "trace-record-store-fence-refused.json",
+    record(
+        10,
+        "store-evidence",
+        2,
+        "StoreFenceRefused",
+        {"effect_id": RESOLVE, "operation_id": OP},
+        [("fault-injector", 1)],
+    ),
+)
 
 INSPECTED = record(
     13,

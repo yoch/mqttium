@@ -154,6 +154,38 @@ fn a_scenario_with_one_misplaced_step_gets_one_diagnostic() {
     }
 }
 
+/// DEM-018: the three orders of QABS are scenarios of their own, each
+/// with the injections that produce its order.
+#[test]
+fn the_qabs_scenarios_are_accepted_and_differ_by_their_injections() {
+    let workspace = workspace();
+    let mut actions = Vec::new();
+    for letter in ["A", "B", "C"] {
+        let file = format!("tests/scenarios/qabs/QABS-{letter}.json");
+        let report = workspace.check_file(Path::new(&file));
+        assert!(report.is_accepted(), "{file}: {:?}", report.diagnostics);
+        let bytes = fs::read(root().join(&file)).expect("scenario");
+        let scenario: Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(scenario["id"], format!("QABS-{letter}"));
+        let fence: Vec<String> = scenario["faults"]
+            .as_array()
+            .expect("faults")
+            .iter()
+            .filter(|fault| fault["point"] == "store.fence.transit")
+            .map(|fault| fault["action"].as_str().expect("action").to_owned())
+            .collect();
+        actions.push(fence);
+    }
+    assert_eq!(
+        actions,
+        [
+            vec!["hold_command"],
+            vec!["hold_command"],
+            vec!["refuse_fence"]
+        ]
+    );
+}
+
 #[test]
 fn every_example_file_is_indexed_exactly_once() {
     let index = index();

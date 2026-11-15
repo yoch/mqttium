@@ -3,6 +3,9 @@
   "schema_version": 1,
   "valid": [
     "tests/scenarios/p1/P1-02.json",
+    "tests/scenarios/qabs/QABS-A.json",
+    "tests/scenarios/qabs/QABS-B.json",
+    "tests/scenarios/qabs/QABS-C.json",
     "tests/fixtures/p1/three-persistent-sessions.json",
     "contracts/examples/v1/valid/scenario-u64-max.json",
     "contracts/examples/v1/valid/scenario-core-without-bytes.json",
@@ -32,6 +35,7 @@
     "contracts/examples/v1/valid/trace-record-held-item-released.json",
     "contracts/examples/v1/valid/trace-record-frame-eligible.json",
     "contracts/examples/v1/valid/trace-record-frame-eligible-connack.json",
+    "contracts/examples/v1/valid/trace-record-store-fence-refused.json",
     "contracts/examples/v1/valid/trace-record-durable-state-inspected.json",
     "contracts/examples/v1/valid/trace-record-header-core-without-bytes.json",
     "contracts/examples/v1/valid/store-snapshot-after-commit.json",
@@ -401,13 +405,13 @@
     {
       "file": "contracts/examples/v1/invalid/scenario-release-twice.json",
       "code": "step-order-invalid",
-      "pointer": "/steps/6",
+      "pointer": "/steps/7",
       "why": "A held command is released once."
     },
     {
       "file": "contracts/examples/v1/invalid/scenario-second-wait-on-a-holding-fault.json",
       "code": "step-order-invalid",
-      "pointer": "/steps/6",
+      "pointer": "/steps/7",
       "why": "A fault that holds something holds one item in the life of a scenario: it is waited for once."
     },
     {
@@ -419,7 +423,7 @@
     {
       "file": "contracts/examples/v1/invalid/scenario-wait-for-a-fault-never-expected.json",
       "code": "step-order-invalid",
-      "pointer": "/steps/6",
+      "pointer": "/steps/7",
       "why": "A scenario does not wait for an injection it announces will never be reached."
     },
     {
@@ -431,37 +435,49 @@
     {
       "file": "contracts/examples/v1/invalid/scenario-two-faults-select-one-occurrence.json",
       "code": "fault-match-invalid",
-      "pointer": "/faults/3/match",
+      "pointer": "/faults/4/match",
       "why": "Two faults name the same occurrence of the same result: only one could act."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-release-of-a-refused-fence.json",
+      "code": "held-item-mismatch",
+      "pointer": "/steps/6/fault",
+      "why": "A refused fence is not written and not kept: nothing is left to release."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-refuse-fence-on-a-command-in-transit.json",
+      "code": "fault-action-unknown",
+      "pointer": "/faults/0/action",
+      "why": "Only the point where a fence waits offers to refuse it."
     },
     {
       "file": "contracts/examples/v1/invalid/scenario-deliver-while-crashed.json",
       "code": "step-order-invalid",
-      "pointer": "/steps/11",
+      "pointer": "/steps/12",
       "why": "One misplaced step is one diagnostic: the hand-over is not judged again while the broker is down."
     },
     {
       "file": "contracts/examples/v1/invalid/scenario-deliver-after-crash.json",
       "code": "step-order-invalid",
-      "pointer": "/steps/12",
+      "pointer": "/steps/13",
       "why": "A crash destroys what the broker process held; nothing is left to deliver."
     },
     {
       "file": "contracts/examples/v1/invalid/scenario-release-undeclared-fault.json",
       "code": "binding-undefined",
-      "pointer": "/steps/5/fault",
+      "pointer": "/steps/6/fault",
       "why": "ReleaseHeldCommand names a fault that is not declared."
     },
     {
       "file": "contracts/examples/v1/invalid/scenario-release-of-a-held-result.json",
       "code": "held-item-mismatch",
-      "pointer": "/steps/5/fault",
+      "pointer": "/steps/6/fault",
       "why": "The fault delays a result; it holds no command to release."
     },
     {
       "file": "contracts/examples/v1/invalid/scenario-deliver-of-a-dropped-result.json",
       "code": "held-item-mismatch",
-      "pointer": "/steps/10/fault",
+      "pointer": "/steps/11/fault",
       "why": "A dropped result is gone; only a delayed result can be delivered."
     },
     {
@@ -493,6 +509,12 @@
       "code": "fault-action-unknown",
       "pointer": "/points/0/actions/1",
       "why": "A point that carries a command cannot delay a result."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/fault-catalog-refuse-fence-on-a-result-point.json",
+      "code": "fault-action-unknown",
+      "pointer": "/points/2/actions/3",
+      "why": "A fence is a command of the writer: a point that carries a result cannot refuse one."
     },
     {
       "file": "contracts/examples/v1/invalid/fault-catalog-action-nobody-defines.json",

@@ -39,6 +39,15 @@ ASSERTIONS = [
     "all_required_faults_hit",
     "trace_complete",
 ]
+QABS_ASSERTIONS = [
+    "one_admission_per_observed_inbound_exchange",
+    "no_positive_ack_before_confirmed_commit",
+    "fenced_operation_never_executed",
+    "certain_rejection_has_a_closure",
+    "all_required_faults_hit",
+    "trace_complete",
+    "broker_inputs_have_provenance",
+]
 
 
 def dump(value) -> bytes:
@@ -661,7 +670,20 @@ def p1_02b():
                 {"effect_id": effect(1, resolve_1 + 1), "token": "2", "after": "30"},
                 ["deadline.1"],
             ),
-            # The command is still held: no fence can be established.
+            # The resolution read the absence; an injection refuses its fence.
+            fault_hit(
+                "refused_fence",
+                "store.fence.transit",
+                "resolve.1",
+                effect_id=effect(1, resolve_1),
+            ),
+            ev(
+                "fence.refused",
+                "store-evidence",
+                "StoreFenceRefused",
+                {"effect_id": effect(1, resolve_1), "operation_id": OP_ADMIT},
+                ["hit.refused_fence"],
+            ),
             ev(
                 "unknown.ready",
                 "store-evidence",
@@ -825,6 +847,8 @@ def case(
     data=None,
     files=lambda files: None,
     assertions=ASSERTIONS,
+    states_of=None,
+    scenario_path=None,
 ):
     """One trace of the corpus.
 
@@ -835,7 +859,7 @@ def case(
     run = name
     history = base()
     events(history)
-    states = (p1_02_snapshots if base is p1_02 else p1_02b_snapshots)(run)
+    states = (states_of or (p1_02_snapshots if base is p1_02 else p1_02b_snapshots))(run)
     snapshots(states)
     records = render(run, history, states)
     raw(records)
@@ -853,7 +877,7 @@ def case(
     INDEX.append(
         {
             "name": name,
-            "scenario": f"{BASE}/scenarios/{scenario}.json",
+            "scenario": scenario_path or f"{BASE}/scenarios/{scenario}.json",
             "trace": f"{BASE}/{run}/trace.jsonl",
             "expected": statuses,
             "why": why,
@@ -1559,6 +1583,269 @@ case(
     scenario="p1-02-core",
     events=provenance_without_bytes,
     assertions=CORE_ASSERTIONS,
+)
+
+# ------------------------------------------------------------------------ QABS
+# DEM-018: a command held before the writer, a resolution that reads its
+# absence, and the fence of that resolution ordered against the command.
+RESOLVE_1 = 3
+
+
+def refusal_out(tag, cause):
+    """The core makes a refusing PUBREC eligible and the client observes it."""
+    events = ack_out(tag, 1, 1, 6, "PUBREC", "5003000780", cause)
+    events[0]["payload"]["reason"] = "QuotaExceeded"
+    events[2]["payload"]["reason_code"] = 0x80
+    return events
+
+
+def qabs_start(scenario):
+    """Up to the hold of the admission and the first deadline."""
+    return (
+        [header(scenario)]
+        + recovery(1, BOOT_FACTS, "boot")
+        + connect("c1", 1, 1, 0)
+        + packet_in("publish", 1, 1, 1, "PUBLISH", PUBLISH_HEX, dup=False)
+        + persist("admit", 1, 1, OP_ADMIT, "AdmitPublication", "publish.in", 1)
+        + [
+            fault_hit("held_admission", "store.command.transit", "admit.submitted"),
+            ev(
+                "deadline.1",
+                "broker-core",
+                "DeadlineDelivered",
+                {"token": "1", "now": "30"},
+                ["admit.armed"],
+            ),
+            ev(
+                "resolve.1",
+                "store-adapter",
+                "ResolveSubmitted",
+                {"effect_id": effect(1, RESOLVE_1), "operation_id": OP_ADMIT},
+                ["deadline.1"],
+            ),
+            ev(
+                "armed.2",
+                "timer",
+                "DeadlineArmed",
+                {"effect_id": effect(1, RESOLVE_1 + 1), "token": "2", "after": "30"},
+                ["deadline.1"],
+            ),
+        ]
+    )
+
+
+def released(fault):
+    return ev(
+        f"released.{fault}",
+        "fault-injector",
+        "HeldItemReleased",
+        {"fault_id": fault},
+        [f"hit.{fault}"],
+    )
+
+
+def ready(label, effect_sequence, outcome, cause):
+    return ev(
+        label,
+        "store-evidence",
+        "StoreResultReady",
+        {"effect_id": effect(1, effect_sequence), "operation_id": OP_ADMIT, "outcome": outcome},
+        [cause],
+    )
+
+
+def held_fence_hit():
+    return fault_hit(
+        "held_fence", "store.fence.transit", "resolve.1", effect_id=effect(1, RESOLVE_1)
+    )
+
+
+def qabs_a():
+    """The command commits before the fence: the resolution finds it committed."""
+    return (
+        qabs_start("QABS-A")
+        + [
+            held_fence_hit(),
+            released("held_admission"),
+            ev(
+                "admit.stable",
+                "store-evidence",
+                "StoreCommitStable",
+                {"operation_id": OP_ADMIT, "command_kind": "AdmitPublication"},
+                ["released.held_admission"],
+            ),
+            fault_hit("admission_applied", "store.commit.applied", "admit.stable"),
+            ready("admit.ready", 1, "Committed", "admit.stable"),
+            inspected("after_commit"),
+            delivered("admit", 1, 1, OP_ADMIT),
+            # The held fence enters the writer, reads again and writes nothing.
+            released("held_fence"),
+            ready("resolved.ready", RESOLVE_1, "Committed", "released.held_fence"),
+            delivered("resolved", 1, RESOLVE_1, OP_ADMIT),
+        ]
+        + ack_out("pubrec", 1, 1, 6, "PUBREC", PUBREC_HEX, "admit.delivered")
+        + packet_in("pubrel", 1, 1, 2, "PUBREL", PUBREL_HEX)
+        + persist("release", 1, 8, OP_RELEASE_B, "ReleaseInbound", "pubrel.in", 3)
+        + committed("release", 1, 8, OP_RELEASE_B, "ReleaseInbound")
+        + [delivered("release", 1, 8, OP_RELEASE_B)]
+        + ack_out("pubcomp", 1, 1, 10, "PUBCOMP", PUBCOMP_HEX, "release.delivered")
+        + [inspected("final")]
+    )
+
+
+def qabs_a_snapshots(run):
+    return {
+        "after_commit": snapshot(run, "after_commit", [FIRST]),
+        "final": snapshot(run, "final", [FIRST], [(OP_RELEASE_B, 1)], open_exchange=False),
+    }
+
+
+def qabs_b():
+    """The fence commits before the command: a certain refusal, and no later effect."""
+    return (
+        qabs_start("QABS-B")
+        + [
+            held_fence_hit(),
+            released("held_fence"),
+            ev(
+                "fence.stable",
+                "store-evidence",
+                "StoreFenceStable",
+                {"operation_id": OP_ADMIT},
+                ["released.held_fence"],
+            ),
+            ready("fenced.ready", RESOLVE_1, "RejectedCertain", "fence.stable"),
+            delivered("fenced", 1, RESOLVE_1, OP_ADMIT, outcome="RejectedCertain"),
+        ]
+        + refusal_out("refusal", "fenced.delivered")
+        + [
+            # The old command is put back in circulation: refused, no effect.
+            released("held_admission"),
+            ready("late.ready", 1, "RejectedCertain", "released.held_admission"),
+            fault_hit("late_rejection", "store.result.ready", "late.ready"),
+            inspected("final"),
+        ]
+    )
+
+
+def empty_snapshot(run, checkpoint, fences=()):
+    state = snapshot(run, checkpoint, [FIRST], open_exchange=False)
+    for table in ("operations", "payloads", "publications", "obligations"):
+        state[table] = []
+    state["fences"] = [{"operation_id": operation} for operation in fences]
+    state["account"]["used"] = dict.fromkeys(state["account"]["used"], "0")
+    state["meta"]["state_revision"] = str(len(fences))
+    return state
+
+
+def qabs_b_snapshots(run):
+    return {"final": empty_snapshot(run, "final", [OP_ADMIT])}
+
+
+def qabs_c():
+    """The command stays held and the fence cannot be written: the outcome is unknown."""
+    return qabs_start("QABS-C") + [
+        fault_hit(
+            "refused_fence", "store.fence.transit", "resolve.1", effect_id=effect(1, RESOLVE_1)
+        ),
+        ev(
+            "fence.refused",
+            "store-evidence",
+            "StoreFenceRefused",
+            {"effect_id": effect(1, RESOLVE_1), "operation_id": OP_ADMIT},
+            ["hit.refused_fence"],
+        ),
+        ready("unknown.ready", RESOLVE_1, "PendingOrUnknown", "fence.refused"),
+        fault_hit(
+            "unknown_answer",
+            "store.result.consume",
+            "unknown.ready",
+            effect_id=effect(1, RESOLVE_1),
+        ),
+        delivered(
+            "unknown", 1, RESOLVE_1, OP_ADMIT, outcome="PendingOrUnknown", cause="unknown.ready"
+        ),
+        inspected("unknown"),
+    ]
+
+
+def qabs_c_snapshots(run):
+    return {"unknown": empty_snapshot(run, "unknown")}
+
+
+def qabs(name, why, expected=None, *, letter, **options):
+    base, states = {
+        "A": (qabs_a, qabs_a_snapshots),
+        "B": (qabs_b, qabs_b_snapshots),
+        "C": (qabs_c, qabs_c_snapshots),
+    }[letter]
+    listed = json.loads((ROOT / f"tests/scenarios/qabs/QABS-{letter}.json").read_text())
+    case(
+        name,
+        why,
+        expected,
+        base=base,
+        states_of=states,
+        scenario_path=f"tests/scenarios/qabs/QABS-{letter}.json",
+        assertions=listed["assertions"],
+        **options,
+    )
+
+
+qabs("qabs-a-good", "QABS-A: the command commits before the fence; one effect.", letter="A")
+qabs("qabs-b-good", "QABS-B: the fence commits first; the old command is refused.", letter="B")
+qabs("qabs-c-good", "QABS-C: no fence can be written; the outcome stays unknown.", letter="C")
+
+
+def executed_after_fence(events):
+    # The fenced command commits all the same, before the client learns of
+    # the refusal.
+    for label in ("released.held_admission", "late.ready", "hit.late_rejection"):
+        events.insert(at(events, "refusal"), events.pop(at(events, label)))
+    stable = ev(
+        "late.stable",
+        "store-evidence",
+        "StoreCommitStable",
+        {"operation_id": OP_ADMIT, "command_kind": "AdmitPublication"},
+        ["released.held_admission"],
+    )
+    events.insert(at(events, "late.ready"), stable)
+    late = events[at(events, "late.ready")]
+    late["payload"] = dict(late["payload"], outcome="Committed")
+    late["parents"] = ["late.stable"]
+
+
+def executed_state(states):
+    run = states["final"]["run_id"]
+    committed_state = snapshot(run, "final", [FIRST])
+    committed_state["fences"] = [{"operation_id": OP_ADMIT}]
+    states["final"] = committed_state
+
+
+qabs(
+    "fenced-command-executed",
+    "A command is committed after the fence that made it definitively not executable.",
+    {"fenced_operation_never_executed": "FAIL"},
+    letter="B",
+    events=executed_after_fence,
+    snapshots=executed_state,
+)
+
+
+def invented_rejection(events):
+    # DEM-MU-01: an absence that was read is reported as a certain refusal,
+    # with no fence to make it one.
+    for label in ("unknown.ready", "unknown.delivered"):
+        event = events[at(events, label)]
+        event["payload"] = dict(event["payload"], outcome="RejectedCertain")
+
+
+qabs(
+    "certain-rejection-without-a-fence",
+    "DEM-MU-01: the store answers a certain refusal though its fence was refused.",
+    {"certain_rejection_has_a_closure": "FAIL"},
+    letter="C",
+    events=invented_rejection,
 )
 
 OUTPUTS["index.json"] = dump({"traces": INDEX})

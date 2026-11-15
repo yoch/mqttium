@@ -43,6 +43,17 @@
       "occurrence": "1",
       "action": "drop_result",
       "expected_hits": "1"
+    },
+    {
+      "id": "refused_fence",
+      "point": "store.fence.transit",
+      "match": {
+        "command_kind": "AdmitPublication",
+        "publication_binding": "pub_A"
+      },
+      "occurrence": "1",
+      "action": "refuse_fence",
+      "expected_hits": "1"
     }
   ],
   "steps": [
@@ -70,6 +81,12 @@
     },
     {
       "kind": "FireDeadline",
+      "max_steps": "512"
+    },
+    {
+      "kind": "DriveUntil",
+      "event": "FaultHit",
+      "binding": "refused_fence",
       "max_steps": "512"
     },
     {

@@ -744,6 +744,83 @@
         "trace_complete": "PASS"
       },
       "why": "Without bytes the provenance of results is still checked."
+    },
+    {
+      "name": "qabs-a-good",
+      "scenario": "tests/scenarios/qabs/QABS-A.json",
+      "trace": "tests/oracle/traces/qabs-a-good/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "fenced_operation_never_executed": "PASS",
+        "certain_rejection_has_a_closure": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "broker_inputs_have_provenance": "PASS"
+      },
+      "why": "QABS-A: the command commits before the fence; one effect."
+    },
+    {
+      "name": "qabs-b-good",
+      "scenario": "tests/scenarios/qabs/QABS-B.json",
+      "trace": "tests/oracle/traces/qabs-b-good/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "fenced_operation_never_executed": "PASS",
+        "certain_rejection_has_a_closure": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "broker_inputs_have_provenance": "PASS"
+      },
+      "why": "QABS-B: the fence commits first; the old command is refused."
+    },
+    {
+      "name": "qabs-c-good",
+      "scenario": "tests/scenarios/qabs/QABS-C.json",
+      "trace": "tests/oracle/traces/qabs-c-good/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "fenced_operation_never_executed": "PASS",
+        "certain_rejection_has_a_closure": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "broker_inputs_have_provenance": "PASS"
+      },
+      "why": "QABS-C: no fence can be written; the outcome stays unknown."
+    },
+    {
+      "name": "fenced-command-executed",
+      "scenario": "tests/scenarios/qabs/QABS-B.json",
+      "trace": "tests/oracle/traces/fenced-command-executed/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "fenced_operation_never_executed": "FAIL",
+        "certain_rejection_has_a_closure": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "broker_inputs_have_provenance": "PASS"
+      },
+      "why": "A command is committed after the fence that made it definitively not executable."
+    },
+    {
+      "name": "certain-rejection-without-a-fence",
+      "scenario": "tests/scenarios/qabs/QABS-C.json",
+      "trace": "tests/oracle/traces/certain-rejection-without-a-fence/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "fenced_operation_never_executed": "PASS",
+        "certain_rejection_has_a_closure": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "broker_inputs_have_provenance": "PASS"
+      },
+      "why": "DEM-MU-01: the store answers a certain refusal though its fence was refused."
     }
   ]
 }
