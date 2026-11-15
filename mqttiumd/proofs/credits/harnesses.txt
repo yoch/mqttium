@@ -13,3 +13,4 @@ p8_incoherent_account_refusal_mutates_nothing 4
 p9_incoherent_account_release_is_exact 4
 p10_coherence_is_preserved 2
 p11_reserve_then_release_restores_the_account 1
+p12_a_second_record_of_a_held_lease_is_released_too 2

@@ -17,6 +17,10 @@
 //! returned value last: a mutation of the state is reported as such, not
 //! hidden behind a wrong return value.
 //!
+//! One precondition of the function is not a property the harnesses can
+//! establish: each held lease has one record. `p12` builds the state the
+//! precondition forbids and shows what the function then does.
+//!
 //! Each assertion and each cover carries a name, `P<n>` or `W<n>`, that
 //! `proofs/credits/PROOF.md` lists and `proofs/credits/run.sh` looks for.
 //! A cover is a witness of non-vacuity: the run fails unless every one is
@@ -636,6 +640,56 @@ mod harnesses {
         kani::cover!(
             charged,
             "W11a: the reservation had a cost in both dimensions"
+        );
+    }
+    /// P12. The precondition, shown rather than assumed away. The function
+    /// requires one record per held lease: an account does not know its
+    /// leases. Here a second record of the same held lease is built with
+    /// `from_parts`, which is what the precondition forbids. Each release
+    /// is exact on its own, and nothing in the function can refuse the
+    /// second: when both succeed the cost has left the account twice.
+    /// W12a shows that this happens; the owner of the lease table, not
+    /// this function, has to make it impossible.
+    #[kani::proof]
+    fn p12_a_second_record_of_a_held_lease_is_released_too() {
+        let mut account = any_account();
+        let mut first = any_lease();
+        let mut second = LeaseRecord::from_parts(first.key(), first.cost(), first.state());
+        let key = first.key();
+        let before = plain(&first, &account);
+
+        let first_result = release_if_current(&mut first, &mut account, key);
+        let second_result = release_if_current(&mut second, &mut account, key);
+        let after = plain(&second, &account);
+
+        if first_result == Ok(ReleaseOutcome::Released)
+            && second_result == Ok(ReleaseOutcome::Released)
+        {
+            assert!(
+                before.cost_bytes <= before.used_bytes
+                    && before.cost_bytes <= before.used_bytes - before.cost_bytes
+                    && before.cost_slots <= before.used_slots
+                    && before.cost_slots <= before.used_slots - before.cost_slots,
+                "P12a: two releases happen only while the usage covers the cost twice"
+            );
+            assert!(
+                after.used_bytes == before.used_bytes - before.cost_bytes - before.cost_bytes
+                    && after.used_slots
+                        == before.used_slots - before.cost_slots - before.cost_slots,
+                "P12b: the cost of the one lease has left the account twice"
+            );
+        }
+        kani::cover!(
+            first_result == Ok(ReleaseOutcome::Released)
+                && second_result == Ok(ReleaseOutcome::Released)
+                && before.cost_bytes > 0
+                && before.cost_slots > 0,
+            "W12a: a second record of a held lease is released as well"
+        );
+        kani::cover!(
+            first_result == Ok(ReleaseOutcome::Released)
+                && matches!(second_result, Err(ReleaseError::CostExceedsUsage(_))),
+            "W12b: the second release is refused only when the usage no longer covers it"
         );
     }
 }
