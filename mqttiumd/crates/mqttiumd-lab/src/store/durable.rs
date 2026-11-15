@@ -301,6 +301,11 @@ pub trait DurableStore {
     /// Applies a frozen command.
     fn apply(&mut self, command: &Command) -> Applied;
 
+    /// What is established about `operation`, read and nothing written:
+    /// `None` when it is absent from a space that can still execute, the
+    /// case in which `resolve_and_fence` would write a fence.
+    fn established(&self, operation: OperationId) -> Option<StoreOutcome>;
+
     /// Reports what is established about `operation`. When it is absent
     /// from a space that can still execute, a durable fence is
     /// established before a certain rejection is announced; when the
@@ -1044,6 +1049,13 @@ impl DurableStore for MemoryStore {
             // The staged copy, with whatever rows it already held, is
             // dropped here.
             Err(reason) => rejected(self.commit_rejection(operation, canonical, reason)),
+        }
+    }
+
+    fn established(&self, operation: OperationId) -> Option<StoreOutcome> {
+        match self.committed.established(operation) {
+            Established::Outcome(outcome) => Some(outcome),
+            Established::Absent(_) => None,
         }
     }
 

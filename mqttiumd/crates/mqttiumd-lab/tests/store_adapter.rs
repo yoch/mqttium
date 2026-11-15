@@ -127,26 +127,42 @@ fn a_fault_is_armed_only_with_an_action_its_point_allows() {
     });
     let points = [
         FaultPoint::CommandTransit,
+        FaultPoint::FenceTransit,
         FaultPoint::CommitApplied,
         FaultPoint::ResultReady,
         FaultPoint::ResultConsume,
     ];
     let actions = [
         FaultAction::HoldCommand,
+        FaultAction::RefuseFence,
         FaultAction::Barrier,
         FaultAction::DropResult,
         FaultAction::DelayResult,
         FaultAction::DuplicateResult,
     ];
-    // The pairs of `contracts/v1/fault-points.json`, and no other.
-    let catalogue = [
-        ("store.command.transit", "hold_command"),
-        ("store.commit.applied", "barrier"),
-        ("store.result.ready", "drop_result"),
-        ("store.result.ready", "delay_result"),
-        ("store.result.ready", "duplicate_result"),
-        ("store.result.consume", "barrier"),
-    ];
+    // The pairs of `contracts/v1/fault-points.json`, read from the file,
+    // and no other.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../contracts/v1/fault-points.json"
+    );
+    let file: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("the catalogue")).expect("JSON");
+    let mut catalogue = Vec::new();
+    for point in file["points"].as_array().expect("points") {
+        let name = point["point"].as_str().expect("a name").to_owned();
+        for action in point["actions"].as_array().expect("actions") {
+            catalogue.push((name.clone(), action.as_str().expect("a name").to_owned()));
+        }
+    }
+    let named: Vec<_> = points.iter().map(|point| point.name()).collect();
+    for (point, _) in &catalogue {
+        assert!(named.contains(&point.as_str()), "{point} is not realised");
+    }
+    let catalogue: Vec<(&str, &str)> = catalogue
+        .iter()
+        .map(|(point, action)| (point.as_str(), action.as_str()))
+        .collect();
     let mut allowed = Vec::new();
     for point in points {
         for action in actions {

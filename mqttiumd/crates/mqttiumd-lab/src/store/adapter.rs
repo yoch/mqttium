@@ -33,15 +33,21 @@ use mqttiumd_contract::effects::{
     Effect, EffectSink, Input, OwnedEffect, RecoveredFact, SubmitBlock, SubmitResult,
 };
 use mqttiumd_contract::ids::{EffectId, InboundPacketId, OperationId, SessionId};
-use mqttiumd_contract::outcome::{EpochOpening, OpeningOutcome, OpeningReply, StoreReply};
+use mqttiumd_contract::outcome::{
+    EpochOpening, OpeningOutcome, OpeningReply, StoreOutcome, StoreReply,
+};
 
-use super::durable::{DurableStore, RecoveryCursor, RecoveryPage, RecoveryRefused};
+use super::durable::{DurableStore, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved};
 
 /// A named injection point of the fault catalogue.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum FaultPoint {
     /// The adapter accepted a command that has not entered the writer.
     CommandTransit,
+    /// A resolution read the absence of its operation in the writer, and
+    /// its fence has not been written. A resolution that finds a receipt,
+    /// a fence or a retired identity does not reach it.
+    FenceTransit,
     /// The transaction is committed and no result exists yet.
     CommitApplied,
     /// The result is ready on the store side and not delivered.
@@ -56,6 +62,7 @@ impl FaultPoint {
     pub const fn name(self) -> &'static str {
         match self {
             Self::CommandTransit => "store.command.transit",
+            Self::FenceTransit => "store.fence.transit",
             Self::CommitApplied => "store.commit.applied",
             Self::ResultReady => "store.result.ready",
             Self::ResultConsume => "store.result.consume",
@@ -67,6 +74,7 @@ impl FaultPoint {
     pub const fn actions(self) -> &'static [FaultAction] {
         match self {
             Self::CommandTransit => &[FaultAction::HoldCommand],
+            Self::FenceTransit => &[FaultAction::HoldCommand, FaultAction::RefuseFence],
             Self::CommitApplied | Self::ResultConsume => &[FaultAction::Barrier],
             Self::ResultReady => &[
                 FaultAction::DropResult,
@@ -80,8 +88,14 @@ impl FaultPoint {
 /// What a fault does when it is reached.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FaultAction {
-    /// The command stays in transit until it is released.
+    /// The command stays in transit until it is released. At the fence
+    /// point it is the fence that is held; once released it reads again
+    /// when it enters the writer, and fences only an operation that is
+    /// still absent.
     HoldCommand,
+    /// The write of this one fence is impossible; the store stays
+    /// available for everything else. The resolution answers unknown.
+    RefuseFence,
     /// The adapter stops at the point until it is resumed or crashed.
     Barrier,
     /// The result is lost on its way to the core.
@@ -98,6 +112,7 @@ impl FaultAction {
     pub const fn name(self) -> &'static str {
         match self {
             Self::HoldCommand => "hold_command",
+            Self::RefuseFence => "refuse_fence",
             Self::Barrier => "barrier",
             Self::DropResult => "drop_result",
             Self::DelayResult => "delay_result",
@@ -209,6 +224,10 @@ pub enum StoreEvent {
     },
     /// The writer made a fence durable for this operation.
     FenceStable { id: WorkId, operation: OperationId },
+    /// The fence of this resolution was refused by an injection. It is
+    /// recorded where `FenceStable` would be, so that a refusal is never
+    /// inferred from a missing record.
+    FenceRefused { id: WorkId, operation: OperationId },
     /// A result exists on the store side.
     ResultReady { id: WorkId, answer: Answer },
     /// The result was handed to the core.
@@ -265,6 +284,9 @@ pub enum Performed {
     Executed,
     /// A barrier was reached: the adapter is stopped at this point.
     Halted(FaultPoint),
+    /// The work reached a point that holds it: it is back in transit,
+    /// held, and has not changed the store.
+    Held(FaultPoint),
     /// A held command or a delayed result was released.
     Released,
     /// The result was handed over. `barrier` tells that the adapter
@@ -307,6 +329,9 @@ struct Transit {
     ticket: u64,
     work: Work,
     held: bool,
+    /// A resolution that was held at the fence point: when it enters the
+    /// writer again it does not reach the point a second time.
+    past_fence: bool,
 }
 
 /// The inbound exchange slot a command comes from.
@@ -570,6 +595,7 @@ impl<S: DurableStore> SimStore<S> {
             ticket,
             work,
             held,
+            past_fence: false,
         });
     }
 
@@ -681,9 +707,28 @@ impl<S: DurableStore> SimStore<S> {
     }
 
     /// Runs one command in the writer and makes its result ready.
-    fn run(&mut self, transit: Transit) -> Performed {
+    fn run(&mut self, mut transit: Transit) -> Performed {
         let id = transit.id;
         let (kind, operation, source) = describe(&transit.work);
+        // A resolution that reads an absence reaches the fence point
+        // before its fence is written.
+        let mut refuse_fence = false;
+        if let Work::Resolve(resolved) = &transit.work
+            && !transit.past_fence
+            && self.store.established(*resolved).is_none()
+            && false
+        {
+            match self.pass(FaultPoint::FenceTransit, id, kind, operation, source) {
+                Some(FaultAction::HoldCommand) => {
+                    transit.held = true;
+                    transit.past_fence = true;
+                    self.transit.push_back(transit);
+                    return Performed::Held(FaultPoint::FenceTransit);
+                }
+                Some(FaultAction::RefuseFence) => refuse_fence = true,
+                _ => {}
+            }
+        }
         let origin = Origin {
             id,
             ticket: transit.ticket,
@@ -707,7 +752,18 @@ impl<S: DurableStore> SimStore<S> {
                 )
             }
             Work::Resolve(operation) => {
-                let resolved = self.store.resolve_and_fence(*operation);
+                let resolved = if refuse_fence {
+                    self.record(StoreEvent::FenceRefused {
+                        id,
+                        operation: *operation,
+                    });
+                    Resolved {
+                        outcome: StoreOutcome::PendingOrUnknown,
+                        fenced_now: false,
+                    }
+                } else {
+                    self.store.resolve_and_fence(*operation)
+                };
                 if resolved.fenced_now {
                     self.record(StoreEvent::FenceStable {
                         id,
@@ -785,7 +841,8 @@ impl<S: DurableStore> SimStore<S> {
                 self.ready.push_back(ready(false));
                 self.ready.push_back(ready(false));
             }
-            Some(FaultAction::HoldCommand | FaultAction::Barrier) | None => {
+            Some(FaultAction::HoldCommand | FaultAction::Barrier | FaultAction::RefuseFence)
+            | None => {
                 self.ready.push_back(ready(false));
             }
         }

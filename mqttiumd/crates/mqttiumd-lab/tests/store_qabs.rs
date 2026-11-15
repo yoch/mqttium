@@ -10,8 +10,8 @@ use mqttiumd_contract::effects::{Effect, EffectSink, Input, OwnedEffect, SubmitR
 use mqttiumd_contract::ids::{EffectId, EffectSeq, LogicalOwnerId, OperationId, StoreIncarnation};
 use mqttiumd_contract::outcome::{CommitFacts, Knowledge, RejectReason, StoreOutcome, StoreReply};
 use mqttiumd_lab::store::adapter::{
-    AdapterLimits, Delivery, FaultAction, FaultPoint, FaultSpec, Performed, SimStore, StoreAction,
-    StoreEvent, WorkId, WorkKind,
+    AdapterLimits, Delivery, FaultAction, FaultId, FaultPoint, FaultSpec, Performed, SimStore,
+    StoreAction, StoreEvent, WorkId, WorkKind,
 };
 use mqttiumd_lab::store::conformance::{World, opening_command, operation_id};
 use mqttiumd_lab::store::durable::{AdminCommand, Durability, DurableStore, Limits, MemoryStore};
@@ -391,4 +391,141 @@ fn the_store_never_contradicts_a_terminal_result() {
         terminal_runs > 0,
         "the search never reached a terminal result"
     );
+}
+
+/// Arms a fault at the fence point, for resolutions.
+fn at_the_fence(bench: &mut Bench, action: FaultAction) -> FaultId {
+    bench
+        .store
+        .arm(FaultSpec {
+            point: FaultPoint::FenceTransit,
+            action,
+            kind: Some(WorkKind::ResolveAndFence),
+            source: None,
+            occurrence: 1,
+        })
+        .expect("allowed")
+}
+
+/// The resolution reads the absence and stops at the fence point,
+/// held; what it carries has not entered the writer again.
+fn fence_held(bench: &mut Bench, operation: OperationId) -> (WorkId, FaultId) {
+    let hold = at_the_fence(bench, FaultAction::HoldCommand);
+    let fence = resolve(bench, 2, operation);
+    assert_eq!(
+        bench.store.perform(StoreAction::EnterWriter(fence)),
+        Ok(Performed::Held(FaultPoint::FenceTransit))
+    );
+    assert_eq!(bench.store.hits(hold), 1, "the fence point was not reached");
+    assert!(bench.store.store().snapshot().fences.is_empty());
+    assert!(
+        bench
+            .store
+            .eligible()
+            .contains(&StoreAction::ReleaseCommand(fence))
+    );
+    (fence, hold)
+}
+
+/// QABS-A through the fence point: the held fence enters the writer
+/// after the command committed. It reads again: the operation is no
+/// longer absent, so no fence is written and the commit is reported.
+#[test]
+fn qabs_a_through_the_fence_point_reads_again_before_it_writes() {
+    let (mut bench, command, held) = held_command_and_absent_read();
+    let operation = command.recipe.operation();
+    let (fence, hold) = fence_held(&mut bench, operation);
+
+    release(&mut bench, held);
+    enter(&mut bench, held);
+    release(&mut bench, fence);
+    enter(&mut bench, fence);
+    let resolved = outcome(deliver(&mut bench, fence));
+    assert!(
+        matches!(resolved, StoreOutcome::Committed(_)),
+        "{resolved:?}"
+    );
+    assert_eq!(outcome(deliver(&mut bench, held)), resolved);
+    let state = bench.store.store().snapshot();
+    assert!(state.fences.is_empty());
+    assert_eq!(state.publications.len(), 1);
+    let events = bench.store.take_events();
+    assert_eq!(fences(&events), []);
+    // Released once, it is not reached a second time.
+    assert_eq!(bench.store.hits(hold), 1);
+}
+
+/// QABS-B through the fence point: the held fence enters the writer
+/// before the command. It fences; the command is refused afterwards with
+/// no effect.
+#[test]
+fn qabs_b_through_the_fence_point_fences_before_the_command() {
+    let (mut bench, command, held) = held_command_and_absent_read();
+    let operation = command.recipe.operation();
+    let (fence, _) = fence_held(&mut bench, operation);
+
+    release(&mut bench, fence);
+    enter(&mut bench, fence);
+    let fenced = StoreOutcome::RejectedCertain(RejectReason::Fenced);
+    assert_eq!(outcome(deliver(&mut bench, fence)), fenced);
+    release(&mut bench, held);
+    enter(&mut bench, held);
+    assert_eq!(outcome(deliver(&mut bench, held)), fenced);
+    let state = bench.store.store().snapshot();
+    assert!(state.fences.contains(&operation));
+    assert!(state.publications.is_empty());
+    assert_eq!(fences(&bench.store.take_events()), [(fence, operation)]);
+}
+
+/// QABS-C through the fence point: `refuse_fence` makes the write of
+/// that one fence impossible while the store stays available. The
+/// resolution answers unknown, the trace says the fence was refused
+/// where it would say it was stable, the held command then commits, and
+/// a second resolution finds it and does not reach the point.
+#[test]
+fn qabs_c_through_the_fence_point_refuses_one_fence_and_nothing_else() {
+    let (mut bench, command, held) = held_command_and_absent_read();
+    let operation = command.recipe.operation();
+    let refuse = at_the_fence(&mut bench, FaultAction::RefuseFence);
+    let fence = resolve(&mut bench, 2, operation);
+    let _ = bench.store.take_events();
+    enter(&mut bench, fence);
+    assert_eq!(
+        outcome(deliver(&mut bench, fence)),
+        StoreOutcome::PendingOrUnknown
+    );
+    assert_eq!(bench.store.hits(refuse), 1);
+    let events = bench.store.take_events();
+    assert_eq!(fences(&events), []);
+    let refused = events
+        .iter()
+        .position(|event| {
+            *event
+                == StoreEvent::FenceRefused {
+                    id: fence,
+                    operation,
+                }
+        })
+        .expect("the refusal is recorded");
+    let hit = events
+        .iter()
+        .position(|event| matches!(event, StoreEvent::FaultHit { fault, .. } if *fault == refuse))
+        .expect("the hit is recorded");
+    let ready = events
+        .iter()
+        .position(|event| matches!(event, StoreEvent::ResultReady { id, .. } if *id == fence))
+        .expect("a result");
+    assert!(hit < refused && refused < ready, "{events:?}");
+    assert!(bench.store.store().snapshot().fences.is_empty());
+
+    // The store is available: the held command commits.
+    release(&mut bench, held);
+    enter(&mut bench, held);
+    let committed = outcome(deliver(&mut bench, held));
+    assert!(matches!(committed, StoreOutcome::Committed(_)));
+    // A second resolution finds the receipt before the point.
+    let again = resolve(&mut bench, 3, operation);
+    enter(&mut bench, again);
+    assert_eq!(outcome(deliver(&mut bench, again)), committed);
+    assert_eq!(bench.store.hits(refuse), 1);
 }
