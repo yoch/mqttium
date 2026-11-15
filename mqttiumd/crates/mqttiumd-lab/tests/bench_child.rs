@@ -57,11 +57,44 @@ fn the_child_gives_the_same_evidence_as_the_in_process_runner() {
         assert_eq!(child.stopped, None, "{scenario}");
         assert_eq!(local.stopped, None, "{scenario}");
         let read = |out: &PathBuf, path: &str| std::fs::read(out.join(path)).unwrap();
+        // The same records, but for what only a child process states: the
+        // broker of the header and one BrokerKilled per kill (decision
+        // 0019). Their numbers shift; their order, origins and contents do
+        // not.
+        let child_trace = records(&read(&child_out, "trace.jsonl"));
+        let local_trace = records(&read(&local_out, "trace.jsonl"));
         assert_eq!(
-            read(&child_out, "trace.jsonl"),
-            read(&local_out, "trace.jsonl"),
+            child_trace[0]["payload"]["broker"], "child-process",
+            "{scenario}: the header"
+        );
+        assert!(
+            local_trace[0]["payload"].get("broker").is_none(),
+            "{scenario}: an in-process header names no broker"
+        );
+        assert!(
+            local_trace
+                .iter()
+                .all(|record| record["kind"] != "BrokerKilled")
+        );
+        assert_eq!(
+            projection(&child_trace),
+            projection(&local_trace),
             "{scenario}: the trace"
         );
+        let killed = child_trace
+            .iter()
+            .filter(|record| record["kind"] == "BrokerKilled")
+            .count();
+        assert_eq!(child_trace.len(), local_trace.len() + killed, "{scenario}");
+        let manifest = |out: &PathBuf| -> serde_json::Value {
+            serde_json::from_slice(&read(out, "run-manifest.json")).unwrap()
+        };
+        assert_eq!(
+            manifest(&child_out)["broker"],
+            "child-process",
+            "{scenario}"
+        );
+        assert!(manifest(&local_out).get("broker").is_none(), "{scenario}");
         assert_eq!(
             read(&child_out, "choices.log"),
             read(&local_out, "choices.log"),
@@ -93,6 +126,33 @@ fn the_child_gives_the_same_evidence_as_the_in_process_runner() {
         let _ = std::fs::remove_dir_all(&child_out);
         let _ = std::fs::remove_dir_all(&local_out);
     }
+}
+
+fn records(trace: &[u8]) -> Vec<serde_json::Value> {
+    trace
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect()
+}
+
+/// Each record by its origin, kind and payload, without BrokerKilled, the
+/// broker of the header and the record count of the footer.
+fn projection(trace: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    trace
+        .iter()
+        .filter(|record| record["kind"] != "BrokerKilled")
+        .map(|record| {
+            let mut payload = record["payload"].clone();
+            if let Some(payload) = payload.as_object_mut() {
+                payload.remove("broker");
+                if record["kind"] == "TraceFooter" {
+                    payload.remove("record_count");
+                }
+            }
+            serde_json::json!([record["origin_component"], record["kind"], payload])
+        })
+        .collect()
 }
 
 /// Runs a campaign in child mode through the binary of the lab, since the
@@ -255,6 +315,20 @@ fn the_crash_of_a_child_is_a_real_sigkill_and_the_next_child_reads_the_same_file
             .any(|kind| kind == "BrokerRecovered")
     );
     assert_eq!(kinds.last().unwrap(), "TraceFooter");
+    // The kill is a record of the trace, from the observed wait status,
+    // written just before the crash; no process identifier is in it.
+    let all = records(trace.as_bytes());
+    let killed_records: Vec<&serde_json::Value> = all
+        .iter()
+        .filter(|record| record["kind"] == "BrokerKilled")
+        .collect();
+    assert_eq!(killed_records.len(), 1);
+    assert_eq!(kinds[crashed - 1], "BrokerKilled");
+    assert_eq!(killed_records[0]["origin_component"], "bench-supervisor");
+    assert_eq!(
+        killed_records[0]["payload"],
+        serde_json::json!({"signal_sent": "SIGKILL", "wait_status": {"signal": 9}})
+    );
     // Replayed, it runs in a child again: the recorded command says so.
     let replay = campaign["commands"]["replay"].as_str().unwrap();
     assert!(replay.contains(" --process child"), "{replay}");
