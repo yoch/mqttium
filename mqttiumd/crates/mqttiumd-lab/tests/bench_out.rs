@@ -19,6 +19,7 @@ fn request(out: PathBuf) -> Request {
         run_id: Some("bench-test".to_owned()),
         backend: "sim-store".to_owned(),
         built_from: None,
+        process: "in-process".to_owned(),
     }
 }
 
