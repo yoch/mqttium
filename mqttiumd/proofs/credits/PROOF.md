@@ -9,10 +9,10 @@ content, under which assumptions, with which tool, and what is not proved.
 The harnesses, the scripts and their output are the evidence; this file is
 the guide to them.
 
-**State: not received.** The runs recorded here are local. Two conditions
-of the reception are not met yet: the call site of lot L1 is not on the
-integration branch, and the job `pilot proof` of the `mqttiumd` workflow
-has not been read green on an exact revision. See "What is not done".
+**State: not received.** The proof runs in CI: the job `pilot proof` of
+the `mqttiumd` workflow was read green on an exact revision (see "The run
+in CI"). One condition of the reception is not met yet: the call site of
+lot L1 is not on the integration branch. See "What is not done".
 
 ## The function
 
@@ -239,6 +239,34 @@ on the product workspace; `cargo fmt --check` and `cargo clippy` on the
 `proofs/` workspace; `proofs/preflight-selftest.sh` (four fake tools
 refused, the real preflight passes).
 
+## The run in CI
+
+Job `pilot proof` of `.github/workflows/mqttiumd.yml`, on revision
+`69e211cba1fd7b7dfcf2fb5bb29dbfc858de8e3e` of pull request 649: success
+(run 43692794802, job 132746762586, runner `ubuntu-24.04`, no cache).
+The code under `crates/` and `proofs/` at that revision is the one of
+the local run above.
+
+| Step | Result | Time on the runner |
+| - | - | - |
+| Install the pinned toolchain | success | 9 s |
+| `tools/install-tools.sh kani` | success | 12 s |
+| `proofs/preflight-selftest.sh` | success | 3 s |
+| `proofs/credits/run.sh` | success | 29 s |
+| `python3 proofs/credits/mutants.py` | 12 of 12 caught, 0 inconclusive | 97 s |
+| `python3 proofs/credits/selftest.py` | 16 of 16 cases as expected | 201 s |
+| `fmt` and `clippy` on `proofs/` | success | under 1 s |
+
+The whole job took six minutes. The runner was faster than the container
+this lot was developed in for every step (there: 40 to 50 s, 148 to
+175 s and 295 to 357 s for the last three long steps); no other
+difference was seen. The mutants' table and the self-test's lines were
+read in the job log; the output of `run.sh` in that log was not read
+line by line, only its exit status.
+
+A later revision is a new content: the job runs again on it, and its
+result is read there before it is claimed.
+
 ## What a PASS of the scripts is worth
 
 `python3 proofs/credits/selftest.py`: 16 of 16 cases as expected, about
@@ -404,10 +432,6 @@ inconclusive, so a stale mutant cannot count as caught.
 
 - **The call site is not merged.** Lot L1 wrote it on its own branch;
   the reception names it on the integration branch, on an exact revision.
-- **Not read green in CI.** The job `pilot proof` of
-  `.github/workflows/mqttiumd.yml` installs the pinned Kani and runs the
-  commands of this file. Until it is read green on an exact revision,
-  every result above is a local run.
 - **Human time** of the maintenance trial.
 - The open condition "Pilot proof" of
   `docs/reception/open-conditions.md` stays open.
