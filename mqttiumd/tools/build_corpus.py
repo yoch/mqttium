@@ -509,6 +509,26 @@ ok(
     scenario(setter(["budgets", "max_trace_bytes"], "18446744073709551615")),
 )
 ok(
+    "scenario-core-without-bytes.json",
+    scenario(
+        lambda v: v.update(
+            perimeter="core-without-bytes",
+            assertions=[
+                name
+                for name in BASE["assertions"]
+                if name
+                not in (
+                    "no_pubrec_observed_before_crash",
+                    "one_admission_per_observed_inbound_exchange",
+                )
+            ],
+        )
+    ),
+)
+schema_case(
+    "unknown-perimeter", ["perimeter"], "everything", "A scenario requires a known perimeter."
+)
+ok(
     "scenario-qos0-publish.json",
     scenario(lambda v: (v["steps"][1].pop("packet_id"), v["steps"][1].update(qos=0))),
 )
@@ -750,12 +770,14 @@ def record(sequence, origin, origin_sequence, kind, payload, parents=()):
     )
 
 
-ok(
-    "trace-record-header.json",
-    record(
-        0, "bench-supervisor", 0, "TraceHeader", {"scenario_id": "P1-02", "backend": "sim-store"}
-    ),
+HEADER = record(
+    0,
+    "bench-supervisor",
+    0,
+    "TraceHeader",
+    {"scenario_id": "P1-02", "backend": "sim-store", "perimeter": "full"},
 )
+ok("trace-record-header.json", HEADER)
 commit = record(
     5,
     "store-evidence",
@@ -1124,6 +1146,25 @@ trace_case(
     "/payload/snapshot",
     "A snapshot is cited by path, digest and size, like any evidence.",
     dropped("payload", "snapshot", "sha256"),
+)
+
+ok(
+    "trace-record-header-core-without-bytes.json",
+    edited(HEADER, setter(["payload", "perimeter"], "core-without-bytes")),
+)
+trace_case(
+    "header-without-perimeter",
+    HEADER,
+    "/payload",
+    "A run says what it exercised: a run without bytes must not be read as a full one.",
+    dropped("payload", "perimeter"),
+)
+trace_case(
+    "header-unknown-perimeter",
+    HEADER,
+    "/payload/perimeter",
+    "Perimeters are a closed set.",
+    setter(["payload", "perimeter"], "mostly-full"),
 )
 
 
