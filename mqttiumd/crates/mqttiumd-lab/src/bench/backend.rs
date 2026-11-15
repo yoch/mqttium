@@ -81,6 +81,9 @@ impl Backend for Memory {
     }
 }
 
+/// How the inspector of the SQLite backend reads the durable state.
+const INSPECTOR: &str = "SqliteStore::inspect: a connection of its own opened read-only (mode=ro, never immutable), one read transaction, closed before the snapshot is written; no checkpoint; never the writer's connection";
+
 /// The SQLite store of lot L7, in one file of the campaign.
 #[derive(Clone, Debug)]
 pub struct Sqlite {
@@ -148,12 +151,19 @@ impl Backend for Sqlite {
         Ok(store)
     }
 
-    fn inspect(&self, store: &Self::Store) -> Result<DurableState, String> {
-        Ok(store.snapshot())
+    fn inspect(&self, _store: &Self::Store) -> Result<DurableState, String> {
+        // Without the writer: a connection of its own, read-only, one read
+        // transaction, closed before the answer; never a checkpoint.
+        mqttiumd_store_sqlite::SqliteStore::inspect(&self.path)
+            .map_err(|error| format!("{}: {error:?}", self.path.display()))
     }
 
     fn describe(&self) -> Value {
-        self.settings.clone().unwrap_or(Value::Null)
+        let mut settings = self.settings.clone().unwrap_or(Value::Null);
+        if let Some(settings) = settings.as_object_mut() {
+            settings.insert("inspector".to_owned(), json!(INSPECTOR));
+        }
+        settings
     }
 
     fn crash(&self) -> &'static str {
