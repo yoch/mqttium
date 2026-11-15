@@ -411,6 +411,30 @@
       "why": "A scenario requires a known perimeter."
     },
     {
+      "file": "contracts/examples/v1/invalid/scenario-leave-of-a-held-command.json",
+      "code": "held-item-mismatch",
+      "pointer": "/steps/8/fault",
+      "why": "LeaveBarrier names a fault that holds a command, not the adapter at a barrier."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-leave-before-the-barrier.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/6",
+      "why": "LeaveBarrier comes before any step drove the broker to the barrier."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-leave-twice.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/9",
+      "why": "The adapter leaves a barrier once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-leave-of-an-undeclared-fault.json",
+      "code": "binding-undefined",
+      "pointer": "/steps/8/fault",
+      "why": "LeaveBarrier names a fault that is not declared."
+    },
+    {
       "file": "contracts/examples/v1/invalid/scenario-release-before-hold.json",
       "code": "step-order-invalid",
       "pointer": "/steps/2",

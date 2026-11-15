@@ -107,3 +107,12 @@ class Traces(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Scenarios(unittest.TestCase):
+    def test_the_p1_02b_of_the_corpus_is_the_scenario_the_bench_plays(self):
+        # Lot L4 plays tests/scenarios/p1/P1-02b.json; the corpus judges its
+        # hand-made traces against the same scenario.
+        played = json.loads((ROOT / "tests/scenarios/p1/P1-02b.json").read_text())
+        judged = json.loads((ORACLE / "traces/scenarios/p1-02b.json").read_text())
+        self.assertEqual(played, judged)
