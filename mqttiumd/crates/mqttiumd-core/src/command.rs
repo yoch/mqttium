@@ -85,8 +85,55 @@ impl CommandPhase {
     /// The verdict of the registry for `event` in this phase.
     #[must_use]
     pub const fn on(self, event: CommandEvent) -> Verdict {
-        let _ = event;
-        Verdict::Unreachable
+        use CommandEvent::{Replay, ResultTimeout, StoreResult, Submit};
+        use OutcomeClass as Class;
+        use Verdict::{Fault, IgnoreStale, Reject, Transition, Unreachable};
+        match (self, event) {
+            // Nothing was presented to the store yet: only a submission
+            // can follow.
+            (Self::Prepared, Submit) => Transition(Self::Submitted),
+            (Self::Prepared, StoreResult(_) | ResultTimeout | Replay { .. }) => Unreachable,
+
+            // A submission freezes the recipe and the identity, once.
+            (_, Submit) => Reject,
+
+            // The receipt is closed: nothing can be compared any more, so
+            // nothing is a contradiction and nothing is executed again.
+            (Self::ReceiptClosed, StoreResult(_) | ResultTimeout) => IgnoreStale,
+            (Self::ReceiptClosed, Replay { .. }) => Reject,
+
+            // One identity, one recipe.
+            (_, Replay { same_recipe: false }) => Fault,
+            (Self::RejectedCertain, Replay { same_recipe: true }) => Reject,
+            (_, Replay { same_recipe: true }) => IgnoreStale,
+
+            // While the outcome is open, a result settles it or leaves it
+            // open, and a deadline starts a resolution.
+            (Self::Submitted | Self::Indeterminate, StoreResult(class)) => match class {
+                Class::Committed => Transition(Self::Committed),
+                Class::RejectedCertain => Transition(Self::RejectedCertain),
+                Class::Unknown => Transition(Self::Indeterminate),
+                Class::Retired => Transition(Self::ReceiptClosed),
+            },
+            (Self::Submitted | Self::Indeterminate, ResultTimeout) => {
+                Transition(Self::Indeterminate)
+            }
+
+            // Knowledge is monotonic: a terminal result is never replaced
+            // by a later unknown one, and two terminal results that
+            // disagree are a fault.
+            (Self::Committed | Self::Consumed, StoreResult(class)) => match class {
+                Class::RejectedCertain => Fault,
+                Class::Committed | Class::Unknown | Class::Retired => IgnoreStale,
+            },
+            (Self::RejectedCertain, StoreResult(class)) => match class {
+                Class::Committed => Fault,
+                Class::RejectedCertain | Class::Unknown | Class::Retired => IgnoreStale,
+            },
+            (Self::Committed | Self::RejectedCertain | Self::Consumed, ResultTimeout) => {
+                IgnoreStale
+            }
+        }
     }
 }
 
