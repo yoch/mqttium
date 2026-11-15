@@ -883,3 +883,49 @@ fn a_grant_whose_epoch_the_store_reports_closed_is_never_confirmed_again() {
     );
     assert_eq!(opening.stage(), closed);
 }
+
+/// The command of an opening, submitted again after its reply was
+/// delivered, runs in the writer a second time and writes nothing. The
+/// evidence does not say that a second commit became durable, and a
+/// barrier placed after the commit of an opening is not reached.
+#[test]
+fn an_opening_run_again_by_the_writer_leaves_no_second_commit_in_the_evidence() {
+    let commits = |events: &[StoreEvent]| {
+        events
+            .iter()
+            .filter(|event| matches!(event, StoreEvent::CommitStable { .. }))
+            .count()
+    };
+    let mut sim = started();
+    let mut opening = opening_for(&sim);
+    let (id, command) = submit(&mut sim, &mut opening);
+    enter(&mut sim, id);
+    let first = reply(&mut sim, id);
+    take(&mut opening, first);
+    assert_eq!(commits(&sim.take_events()), 1);
+    let before = sim.store().snapshot();
+
+    sim.arm(opening_fault(
+        FaultPoint::CommitApplied,
+        FaultAction::Barrier,
+    ))
+    .expect("allowed");
+    sim.submit_opening(command).expect("room");
+    assert_eq!(
+        sim.perform(StoreAction::EnterWriter(id)),
+        Ok(Performed::Executed),
+        "nothing was committed: the point after the commit is not reached"
+    );
+    let again = reply(&mut sim, id);
+    assert_eq!(again.outcome, committed(1));
+    assert_eq!(sim.store().snapshot(), before);
+    let events = sim.take_events();
+    assert_eq!(commits(&events), 0, "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StoreEvent::FaultHit { .. })),
+        "{events:?}"
+    );
+    assert_eq!(opening.observe(again), Ok(Observed::Unchanged));
+}
