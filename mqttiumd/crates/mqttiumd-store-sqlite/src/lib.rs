@@ -103,11 +103,30 @@ pub mod kill_points {
         /// the meta row one revision later, `COMMIT` not called yet. The
         /// transaction is open and holds the engine's write lock.
         CommitPrepared,
+        /// `store.commit.logged`: the engine's WAL hook, inside `COMMIT`.
+        /// The commit frame is written and synced, so the commit is
+        /// durable; `COMMIT` has not returned. Before any checkpoint.
+        CommitLogged,
+        /// The same commit, after the checkpoint the store's WAL hook ran
+        /// because the WAL reached the threshold: only on such a commit.
+        CommitCheckpointed,
     }
 
     /// Called at each point the store passes. It may block, for the bench
     /// to kill the process there; it must not call the store.
     pub type Hook = Box<dyn FnMut(KillPoint) + Send>;
+
+    /// The hook, shared with the engine's WAL hook.
+    pub(crate) type Shared = std::sync::Arc<std::sync::Mutex<Option<Hook>>>;
+
+    /// Calls the hook, if one is set, at `point`.
+    pub(crate) fn pass(shared: &Shared, point: KillPoint) {
+        if let Ok(mut hook) = shared.lock()
+            && let Some(hook) = hook.as_mut()
+        {
+            hook(point);
+        }
+    }
 }
 
 /// What the engine says about itself and about the settings in force,
@@ -1177,7 +1196,7 @@ pub struct SqliteStore {
     /// fields drop in order, so the connection is closed, and its last
     /// checkpoint done, before another writer can take the lock.
     #[cfg(feature = "kill-points")]
-    kill_hook: Option<kill_points::Hook>,
+    kill_hook: kill_points::Shared,
     _writer_lock: File,
 }
 
@@ -1299,7 +1318,7 @@ impl SqliteStore {
             durability: Durability::Available,
             ledger: meta.ledger,
             #[cfg(feature = "kill-points")]
-            kill_hook: None,
+            kill_hook: kill_points::Shared::default(),
             _writer_lock: lock,
         })
     }
@@ -1315,8 +1334,11 @@ impl SqliteStore {
 
     /// Sets the function the store calls at each kill point, or removes it.
     #[cfg(feature = "kill-points")]
-    pub fn set_kill_hook(&mut self, hook: Option<kill_points::Hook>) {
-        self.kill_hook = hook;
+    pub fn set_kill_hook(&mut self, hook: Option<kill_points::Hook>) -> Result<(), OpenError> {
+        if let Ok(mut held) = self.kill_hook.lock() {
+            *held = hook;
+        }
+        Ok(())
     }
 
     /// The engine and the settings in force, read back at opening.
@@ -1369,9 +1391,7 @@ impl SqliteStore {
             // K1 `store.commit.prepared`: every row written, `COMMIT` not
             // called; the transaction is open.
             #[cfg(feature = "kill-points")]
-            if let Some(hook) = self.kill_hook.as_mut() {
-                hook(kill_points::KillPoint::CommitPrepared);
-            }
+            kill_points::pass(&self.kill_hook, kill_points::KillPoint::CommitPrepared);
             if failing {
                 return Err(None);
             }
