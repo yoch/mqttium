@@ -1568,7 +1568,7 @@
     },
     {
       "name": "provenance-result-handed-over-only-through-the-bench",
-      "scenario": "tests/oracle/traces/scenarios/p1-02-duplicate.json",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/provenance-result-handed-over-only-through-the-bench/trace.jsonl",
       "expected": {
         "one_admission_per_observed_inbound_exchange": "PASS",
@@ -1582,7 +1582,7 @@
         "one_grant_per_opened_epoch": "PASS",
         "scenario_reaches_its_end": "PASS"
       },
-      "why": "K1: the copy follows the store's result only through the supervisor's inspection: the store did not produce it."
+      "why": "K1: the handover follows the store's result only through a record of a peer: the store did not produce it."
     },
     {
       "name": "provenance-duplicate-reaches-the-core",

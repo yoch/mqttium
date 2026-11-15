@@ -2438,16 +2438,21 @@ case(
 
 
 def handed_after_the_bench(events):
-    duplicate_handed_over(events)
-    bench_between(events, ["copy.refused", "copy.handed"])
-    events[at(events, "copy.refused")]["parents"] = ["copy.handed"]
+    # The only path from the store's result to the adapter's handover goes
+    # through a record of a peer: the store did not produce what the adapter
+    # handed over, it only happened before.
+    insert_after(
+        events,
+        "release.ready",
+        [ev("watcher", "peer", "PeerConnectionOpened", {"client": "watcher"}, ["release.ready"])],
+    )
+    events[at(events, "release.delivered.handed")]["parents"] = ["watcher"]
 
 
 case(
     "provenance-result-handed-over-only-through-the-bench",
-    "K1: the copy follows the store's result only through the supervisor's inspection: the store did not produce it.",
+    "K1: the handover follows the store's result only through a record of a peer: the store did not produce it.",
     {"broker_inputs_have_provenance": "FAIL"},
-    scenario="p1-02-duplicate",
     events=handed_after_the_bench,
 )
 

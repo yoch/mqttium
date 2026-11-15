@@ -63,6 +63,26 @@ its records and causes; `before` is computed from that same relation, and
 two records it does not order stay unordered unless the run has a total
 order (the simulated store).
 
+A parent does not mean the same thing for every origin. For a record of
+the product (the core, the transport, the timer, the store adapter, the
+store's evidence, the dispatcher, the fault injector) it is a cause. For a
+record of the bench supervisor it is what the supervisor had read when it
+acted; for a record of a peer, what the peer observed and the supervisor
+record it acted on. The parents of a record of the bench order it
+(`before`); they never make it a cause of the product. `causes` is the
+order relation restricted to the product: it never includes nor crosses a
+record of the bench. The assertions that ask why a record of the product
+exists read `causes`: the source of a result the adapter hands over and
+the injection that duplicates it (K1), the injection that excuses a
+refused input, the rejection a refusing PUBREC answers, the committed
+reply a grant follows. Those that ask only what came first read `before`:
+the closure before a refusal, the commit before an inspection, the crash
+before an observed PUBREC, a resolution after a terminal result.
+`terminal_knowledge_never_regresses` counts as a reaction to a late
+unknown answer only a record of the product that names it among its
+parents: an inspection, a crash or a packet the bench orders after it is
+no regression of the product.
+
 Nothing concluded from an incomplete trace is a PASS. A FAIL stands on an
 incomplete trace only where no missing record could undo it (two admissions
 for one exchange, obligations or a recipe that changed between two

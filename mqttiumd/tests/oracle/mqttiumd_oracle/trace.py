@@ -37,6 +37,11 @@ class Record:
         return (*self.origin, self.origin_sequence)
 
 
+# The origins of the bench: they drive the product and observe it. The
+# parents of their records order them; they cause nothing in the product.
+BENCH = frozenset({"bench-supervisor", "peer"})
+
+
 @dataclass
 class Trace:
     records: list = field(default_factory=list)
@@ -49,6 +54,7 @@ class Trace:
     # Why the trace is not complete.
     incomplete: list = field(default_factory=list)
     _ancestors: dict = field(default_factory=dict)
+    _causes: dict = field(default_factory=dict)
     _by_key: dict = field(default_factory=dict)
     # Key of a record -> key of the record its origin stated just before.
     _previous: dict = field(default_factory=dict)
@@ -86,6 +92,28 @@ class Trace:
                 found.add(key)
                 pending.extend(self._predecessors(key))
             self._ancestors[record.key] = found
+        return found
+
+    def causes(self, record):
+        """Keys of the records of the product that ``record`` follows from.
+
+        The relation of ``ancestors`` restricted to the product: a record
+        of the bench (``BENCH``) is never a cause and is never crossed. Its
+        parents say what the supervisor had read when it acted, or what a
+        peer observed: an order (``before``), never a cause of the product.
+        """
+        found = self._causes.get(record.key)
+        if found is None:
+            found = set()
+            pending = self._predecessors(record.key)
+            while pending:
+                key = pending.pop()
+                cause = self._by_key.get(key)
+                if key in found or (cause is not None and cause.origin[0] in BENCH):
+                    continue
+                found.add(key)
+                pending.extend(self._predecessors(key))
+            self._causes[record.key] = found
         return found
 
     def before(self, first, second):

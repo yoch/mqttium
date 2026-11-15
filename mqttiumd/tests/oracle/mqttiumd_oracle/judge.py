@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from . import recipe as recipes
 from .semantic import InventoryOrder
 from .strict import Refused, parse
-from .trace import Trace
+from .trace import BENCH, Trace
 from .trace import lines_of
 from .trace import read as read_trace
 
@@ -828,7 +828,7 @@ def broker_inputs_have_provenance(run):
                 blame(record, "the core consumed a result the store adapter did not hand over")
         handed_from = {}
         for record in side("store-adapter", incarnation, "StoreResultHandedOver"):
-            causes = trace.ancestors(record)
+            causes = trace.causes(record)
             sources = [
                 ready
                 for ready in produced
@@ -849,11 +849,10 @@ def broker_inputs_have_provenance(run):
             handed_from.setdefault(source.key, []).append(record)
         for source, handovers in handed_from.items():
             duplicated = any(
-                hit.payload["fault_id"] in duplicating
-                and source in trace.ancestors(hit) | {hit.key}
+                hit.payload["fault_id"] in duplicating and source in trace.causes(hit) | {hit.key}
                 for hit in trace.of_kind("FaultHit")
             ) or any(
-                hit.payload["fault_id"] in duplicating and hit.key in trace.ancestors(handover)
+                hit.payload["fault_id"] in duplicating and hit.key in trace.causes(handover)
                 for hit in trace.of_kind("FaultHit")
                 for handover in handovers
             )
@@ -985,7 +984,7 @@ def broker_inputs_have_provenance(run):
                 ordered(frame, record, "the frame it writes")
 
     for record in trace.of_kind("InputRefused"):
-        causes = [by_key[key] for key in trace.ancestors(record) if key in by_key]
+        causes = [by_key[key] for key in trace.causes(record) if key in by_key]
         if not any(
             cause.kind == "FaultHit" and cause.payload["fault_id"] in duplicating
             for cause in causes
@@ -1095,7 +1094,7 @@ def refusal_carries_the_reason_of_its_rejection(run):
             continue
         causes = [
             by_key[key]
-            for key in run.trace.ancestors(frame)
+            for key in run.trace.causes(frame)
             if key in by_key
             and by_key[key].kind == "StoreResultDelivered"
             and by_key[key].origin == frame.origin
@@ -1162,12 +1161,19 @@ def terminal_knowledge_never_regresses(run):
     """Knowledge of an operation never goes back (record 0001, step 6; DEM-MU-05).
 
     Once the core consumed a terminal result of an operation, a later
-    unknown result of it changes nothing: no record follows from it as
-    its cause, and the operation is never resolved again.
+    unknown result of it changes nothing: no record of the product names
+    it as its cause, and the operation is never resolved again. A record
+    of the bench that names it says the bench had read it: an order, no
+    reaction.
     """
     trace = run.trace
+    # A reaction is a record of the product that names the answer among its
+    # parents; the bench orders its records after what it read, and that
+    # is no reaction.
     followers = {}
     for record in trace.records:
+        if record.origin[0] in BENCH:
+            continue
         for parent in record.parents:
             followers.setdefault(parent, []).append(record)
     reasons = []
@@ -1226,7 +1232,7 @@ def one_grant_per_opened_epoch(run):
         seen.setdefault(epoch, grant.sequence)
         replies = [
             by_key[key]
-            for key in trace.ancestors(grant)
+            for key in trace.causes(grant)
             if key in by_key
             and by_key[key].kind == "OpeningReplyDelivered"
             and by_key[key].origin == grant.origin
