@@ -62,6 +62,19 @@
           "meaning": "The canonical bytes differ."
         }
       ]
+    },
+    {
+      "name": "connection",
+      "values": [
+        {
+          "value": "resumed",
+          "meaning": "The packet arrives on a connection established after the one that carried the PUBLISH of the exchange."
+        },
+        {
+          "value": "same",
+          "meaning": "The packet arrives on the connection that already carried a PUBLISH of the exchange, or no earlier PUBLISH of the exchange exists."
+        }
+      ]
     }
   ],
   "event_classes": [
@@ -69,6 +82,7 @@
       "name": "PublishQos2",
       "meaning": "A validated QoS 2 PUBLISH carrying the Packet Identifier of the slot.",
       "guard_dimensions": [
+        "connection",
         "effect_capacity"
       ]
     },
@@ -113,8 +127,10 @@
     },
     {
       "name": "ResultTimeout",
-      "meaning": "The deadline armed for the result of this operation is reached.",
-      "guard_dimensions": []
+      "meaning": "The deadline armed for the result of this operation is delivered to the core.",
+      "guard_dimensions": [
+        "effect_capacity"
+      ]
     },
     {
       "name": "Replay",

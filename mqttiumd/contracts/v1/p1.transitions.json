@@ -65,6 +65,72 @@
       ]
     },
     {
+      "id": "inbound_qos2.admission_pending.publish.replay_after_reconnect",
+      "machine": "inbound_qos2",
+      "state_class": "AdmissionPending",
+      "event_class": "PublishQos2",
+      "guard_partition": {
+        "connection": [
+          "resumed"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "AdmissionPending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ADM-006",
+        "ACK-001",
+        "ARC-011",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-02b"
+      ],
+      "mutations": [
+        "DEM-MU-04",
+        "MU-01"
+      ],
+      "justification": "ADR 0001: the replay creates no command and no acknowledgement. The pending resolution continues, and PUBREC goes to the connection that is current when it completes."
+    },
+    {
+      "id": "inbound_qos2.admission_pending.publish.repeat_on_live_connection",
+      "machine": "inbound_qos2",
+      "state_class": "AdmissionPending",
+      "event_class": "PublishQos2",
+      "guard_partition": {
+        "connection": [
+          "same"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "AdmissionPending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ADM-006",
+        "ACK-001",
+        "ARC-011",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-02b"
+      ],
+      "mutations": [
+        "DEM-MU-04",
+        "MU-01"
+      ],
+      "justification": "ADR 0001: a client may not resend on a live connection (MQTT 5, section 4.4), and nothing it sends can restart a stalled admission. The packet is absorbed like a replay: the exchange already owns its admission, and the only answer owed is the PUBREC of its resolution."
+    },
+    {
       "id": "inbound_qos2.admission_pending.committed.authorize",
       "machine": "inbound_qos2",
       "state_class": "AdmissionPending",
@@ -490,24 +556,63 @@
       "machine": "command",
       "state_class": "Submitted",
       "event_class": "ResultTimeout",
-      "guard_partition": {},
+      "guard_partition": {
+        "effect_capacity": [
+          "sufficient"
+        ]
+      },
       "disposition": "TRANSITION",
       "next_state_class": "Indeterminate",
-      "required_effects": [],
+      "required_effects": [
+        "ResolveAndFence",
+        "ArmDeadline"
+      ],
       "forbidden_effects": [
         "Persist"
       ],
       "resource_delta_class": "none",
       "requirements": [
         "V3-006",
-        "IO-001"
+        "IO-001",
+        "DEM-010"
       ],
       "witnesses": [
-        "P1-02"
+        "P1-02",
+        "P1-02b"
       ],
       "mutations": [
         "MU-02",
         "DEM-MU-01"
+      ],
+      "justification": "ADR 0001: the deadline starts a resolution and arms the next deadline in the same transition, so that a resolution whose answer is held or lost is followed by another."
+    },
+    {
+      "id": "command.submitted.timeout.defer",
+      "machine": "command",
+      "state_class": "Submitted",
+      "event_class": "ResultTimeout",
+      "guard_partition": {
+        "effect_capacity": [
+          "insufficient"
+        ]
+      },
+      "disposition": "DEFER",
+      "next_state_class": "Submitted",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "ResolveAndFence",
+        "ArmDeadline"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-006"
+      ],
+      "witnesses": [
+        "P1-19"
+      ],
+      "mutations": [
+        "MU-25"
       ]
     },
     {
@@ -587,6 +692,69 @@
       ],
       "mutations": [
         "DEM-MU-01"
+      ]
+    },
+    {
+      "id": "command.indeterminate.timeout",
+      "machine": "command",
+      "state_class": "Indeterminate",
+      "event_class": "ResultTimeout",
+      "guard_partition": {
+        "effect_capacity": [
+          "sufficient"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "Indeterminate",
+      "required_effects": [
+        "ResolveAndFence",
+        "ArmDeadline"
+      ],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "IO-002",
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-02b"
+      ],
+      "mutations": [
+        "MU-02",
+        "DEM-MU-01"
+      ],
+      "justification": "ADR 0001: each further deadline of an unresolved operation starts another resolution under a new EffectId and arms the next deadline."
+    },
+    {
+      "id": "command.indeterminate.timeout.defer",
+      "machine": "command",
+      "state_class": "Indeterminate",
+      "event_class": "ResultTimeout",
+      "guard_partition": {
+        "effect_capacity": [
+          "insufficient"
+        ]
+      },
+      "disposition": "DEFER",
+      "next_state_class": "Indeterminate",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "ResolveAndFence",
+        "ArmDeadline"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-006"
+      ],
+      "witnesses": [
+        "P1-19"
+      ],
+      "mutations": [
+        "MU-25"
       ]
     },
     {
@@ -710,6 +878,114 @@
       ],
       "witnesses": [],
       "mutations": []
+    },
+    {
+      "id": "command.committed.timeout.stale",
+      "machine": "command",
+      "state_class": "Committed",
+      "event_class": "ResultTimeout",
+      "guard_partition": {},
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "Committed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "ResolveAndFence",
+        "ArmDeadline"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-02b"
+      ],
+      "mutations": [
+        "DEM-MU-05"
+      ],
+      "justification": "ADR 0001: a deadline for an operation that became terminal is ignored as stale. Its token is never reused."
+    },
+    {
+      "id": "command.rejected.timeout.stale",
+      "machine": "command",
+      "state_class": "RejectedCertain",
+      "event_class": "ResultTimeout",
+      "guard_partition": {},
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "RejectedCertain",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "ResolveAndFence",
+        "ArmDeadline"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-02b"
+      ],
+      "mutations": [
+        "DEM-MU-05"
+      ],
+      "justification": "ADR 0001: a deadline for an operation that became terminal is ignored as stale. Its token is never reused."
+    },
+    {
+      "id": "command.consumed.timeout.stale",
+      "machine": "command",
+      "state_class": "Consumed",
+      "event_class": "ResultTimeout",
+      "guard_partition": {},
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "Consumed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "ResolveAndFence",
+        "ArmDeadline"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-02b"
+      ],
+      "mutations": [
+        "DEM-MU-05"
+      ],
+      "justification": "ADR 0001: a deadline for an operation that became terminal is ignored as stale. Its token is never reused."
+    },
+    {
+      "id": "command.receipt_closed.timeout.stale",
+      "machine": "command",
+      "state_class": "ReceiptClosed",
+      "event_class": "ResultTimeout",
+      "guard_partition": {},
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "ReceiptClosed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "ResolveAndFence",
+        "ArmDeadline"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-02b"
+      ],
+      "mutations": [
+        "DEM-MU-05"
+      ],
+      "justification": "ADR 0001: a deadline for an operation that became terminal is ignored as stale. Its token is never reused."
     }
   ]
 }
