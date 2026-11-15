@@ -236,3 +236,14 @@ fn the_actual_unix_reader_accepts_a_clean_eof_after_real_kill() {
         9
     );
 }
+
+#[test]
+fn a_duplicate_empty_end_cannot_complete_a_second_action() {
+    let (mut child, sender, mut collector, mut books) = fixture();
+    sender.send(Arrival::Report(Report::EndOfAction { last_emission: None })).unwrap();
+    sender.send(Arrival::Report(Report::EndOfAction { last_emission: None })).unwrap();
+    drop(sender);
+    let first = child.act(&Action::Settle, &mut collector, &mut books);
+    let second = child.act(&Action::Settle, &mut collector, &mut books);
+    assert!(first.is_err() || second.is_err(), "two actions were accepted from one repeated empty terminator");
+}
