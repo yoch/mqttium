@@ -5,10 +5,12 @@ on:
     branches: [main]
     paths:
       - "mqttiumd/**"
+      - "tools/formal/**"
       - ".github/workflows/mqttiumd.yml"
   pull_request:
     paths:
       - "mqttiumd/**"
+      - "tools/formal/**"
       - ".github/workflows/mqttiumd.yml"
 
 permissions:
@@ -67,6 +69,30 @@ jobs:
           python -m pip install --disable-pip-version-check -r tests/oracle/requirements.txt
           python tests/oracle/build_traces.py --check
           python -m unittest discover -t tests/oracle -s tests/oracle/tests
+
+  models:
+    name: models
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+      # The runner image provides a JDK; run_tlc.py pins and hash-checks TLC.
+      - run: java -version
+      - name: Model files are consistent
+        run: python models/check_models.py
+      - name: Model-check every directory of models
+        run: |
+          set -euo pipefail
+          for directory in models/*/; do
+            python ../tools/formal/run_tlc.py --models-dir "$directory" --list
+            python ../tools/formal/run_tlc.py --models-dir "$directory"
+          done
 
   # Everything under mqttiumd/proofs/ is a workspace of its own: the checks
   # of the `contracts` job do not see it, and this job is its only

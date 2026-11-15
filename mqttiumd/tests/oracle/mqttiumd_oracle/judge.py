@@ -822,9 +822,49 @@ def certain_rejection_has_a_closure(run):
     return Status(_worst(statuses), reasons)
 
 
+def refusal_carries_the_reason_of_its_rejection(run):
+    """A refusing PUBREC says why the admission was refused (ARC-011).
+
+    The rejection a frame answers is the latest certain rejection among its
+    causes, delivered to the same incarnation of the core. Its reason gives,
+    through the transition catalogue, the reason the frame must carry.
+    """
+    table = run.contracts.catalogs["refusal_reasons"]
+    if table is None:
+        return Status(INCONCLUSIVE, ["no transition catalogue states the reasons of a refusal"])
+    by_key = {record.key: record for record in run.trace.records}
+    statuses, reasons = [], []
+    for frame in run.trace.of_kind("FrameEligible"):
+        payload = frame.payload
+        if payload["packet_kind"] != "PUBREC" or payload["reason"] == "Success":
+            continue
+        causes = [
+            by_key[key]
+            for key in run.trace.ancestors(frame)
+            if key in by_key
+            and by_key[key].kind == "StoreResultDelivered"
+            and by_key[key].origin == frame.origin
+            and by_key[key].payload["outcome"] == "RejectedCertain"
+        ]
+        if not causes:
+            statuses.append(FAIL)
+            reasons.append(f"record {frame.sequence}: a refusing PUBREC answers no rejection")
+            continue
+        rejection = max(causes, key=lambda record: record.origin_sequence)
+        owed = table[rejection.payload["reject_reason"]]
+        if payload["reason"] != owed:
+            statuses.append(FAIL)
+            reasons.append(
+                f"record {frame.sequence}: the PUBREC carries {payload['reason']}; "
+                f"a rejection for {rejection.payload['reject_reason']} owes {owed}"
+            )
+    return Status(_worst(statuses), reasons)
+
+
 ASSERTIONS = {
     "fenced_operation_never_executed": fenced_operation_never_executed,
     "certain_rejection_has_a_closure": certain_rejection_has_a_closure,
+    "refusal_carries_the_reason_of_its_rejection": refusal_carries_the_reason_of_its_rejection,
     "one_admission_per_observed_inbound_exchange": one_admission_per_observed_inbound_exchange,
     "same_required_obligations_at_both_checkpoints": same_required_obligations_at_both_checkpoints,
     "same_recipe_for_op_A": same_recipe_for_op_A,

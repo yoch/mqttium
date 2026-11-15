@@ -187,5 +187,11 @@
         "Replay"
       ]
     }
-  ]
+  ],
+  "refusal_reasons": {
+    "PreconditionFailed": "ImplementationSpecificError",
+    "CapacityExceeded": "QuotaExceeded",
+    "Fenced": "ImplementationSpecificError",
+    "EpochClosed": "ImplementationSpecificError"
+  }
 }

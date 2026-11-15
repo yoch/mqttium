@@ -1075,6 +1075,7 @@
         "no_positive_ack_before_confirmed_commit": "PASS",
         "fenced_operation_never_executed": "PASS",
         "certain_rejection_has_a_closure": "PASS",
+        "refusal_carries_the_reason_of_its_rejection": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS"
@@ -1105,6 +1106,7 @@
         "no_positive_ack_before_confirmed_commit": "PASS",
         "fenced_operation_never_executed": "FAIL",
         "certain_rejection_has_a_closure": "PASS",
+        "refusal_carries_the_reason_of_its_rejection": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS"
@@ -1120,6 +1122,7 @@
         "no_positive_ack_before_confirmed_commit": "PASS",
         "fenced_operation_never_executed": "FAIL",
         "certain_rejection_has_a_closure": "PASS",
+        "refusal_carries_the_reason_of_its_rejection": "PASS",
         "all_required_faults_hit": "PASS",
         "trace_complete": "PASS",
         "broker_inputs_have_provenance": "PASS"
@@ -1140,6 +1143,86 @@
         "broker_inputs_have_provenance": "PASS"
       },
       "why": "DEM-MU-01: the store answers a certain refusal though its fence was refused."
+    },
+    {
+      "name": "refusal-with-a-quota-for-a-fence",
+      "scenario": "tests/scenarios/qabs/QABS-B.json",
+      "trace": "tests/oracle/traces/refusal-with-a-quota-for-a-fence/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "fenced_operation_never_executed": "PASS",
+        "certain_rejection_has_a_closure": "PASS",
+        "refusal_carries_the_reason_of_its_rejection": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "broker_inputs_have_provenance": "PASS"
+      },
+      "why": "The admission is refused because it was fenced, and the PUBREC says a quota is the cause."
+    },
+    {
+      "name": "refusal-for-lack-of-capacity",
+      "scenario": "tests/scenarios/qabs/QABS-B.json",
+      "trace": "tests/oracle/traces/refusal-for-lack-of-capacity/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "fenced_operation_never_executed": "PASS",
+        "certain_rejection_has_a_closure": "PASS",
+        "refusal_carries_the_reason_of_its_rejection": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "broker_inputs_have_provenance": "PASS"
+      },
+      "why": "The admission is refused for lack of capacity: the PUBREC says a quota is the cause."
+    },
+    {
+      "name": "refusal-for-lack-of-capacity-without-the-quota",
+      "scenario": "tests/scenarios/qabs/QABS-B.json",
+      "trace": "tests/oracle/traces/refusal-for-lack-of-capacity-without-the-quota/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "fenced_operation_never_executed": "PASS",
+        "certain_rejection_has_a_closure": "PASS",
+        "refusal_carries_the_reason_of_its_rejection": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "broker_inputs_have_provenance": "PASS"
+      },
+      "why": "The admission is refused for lack of capacity, and the PUBREC hides that a quota is the cause."
+    },
+    {
+      "name": "refusal-answering-no-rejection",
+      "scenario": "tests/scenarios/qabs/QABS-B.json",
+      "trace": "tests/oracle/traces/refusal-answering-no-rejection/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "fenced_operation_never_executed": "PASS",
+        "certain_rejection_has_a_closure": "PASS",
+        "refusal_carries_the_reason_of_its_rejection": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "broker_inputs_have_provenance": "PASS"
+      },
+      "why": "The PUBREC refuses, and no certain rejection is among its causes."
+    },
+    {
+      "name": "refusal-answering-an-unknown-outcome",
+      "scenario": "tests/scenarios/qabs/QABS-B.json",
+      "trace": "tests/oracle/traces/refusal-answering-an-unknown-outcome/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "fenced_operation_never_executed": "PASS",
+        "certain_rejection_has_a_closure": "PASS",
+        "refusal_carries_the_reason_of_its_rejection": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "broker_inputs_have_provenance": "PASS"
+      },
+      "why": "The PUBREC refuses, and the result among its causes is an unknown outcome, not a rejection."
     },
     {
       "name": "certain-rejection-without-a-fence-on-a-cut-trace",
@@ -1165,6 +1248,7 @@
         "no_positive_ack_before_confirmed_commit": "INCONCLUSIVE",
         "fenced_operation_never_executed": "FAIL",
         "certain_rejection_has_a_closure": "INCONCLUSIVE",
+        "refusal_carries_the_reason_of_its_rejection": "INCONCLUSIVE",
         "all_required_faults_hit": "INCONCLUSIVE",
         "trace_complete": "INCONCLUSIVE",
         "broker_inputs_have_provenance": "INCONCLUSIVE"
