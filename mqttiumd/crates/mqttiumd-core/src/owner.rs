@@ -35,7 +35,7 @@ use crate::contract::command::{
 use crate::contract::effects::{
     CloseReason, CreateRefused, DispatchReport, Effect, EffectReservation, EffectSink, FactRank,
     FrameProgress, Input, Outbox, OwnedEffect, OwnerAuthority, RecoveredFact, RecoveryOrder,
-    RetireRefusal,
+    ReplaceRefusal, RetireRefusal,
 };
 use crate::contract::ids::{
     AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, DeliveryId, EffectId, EffectSeq,
@@ -130,8 +130,8 @@ pub enum RenewRefused {
     BoxTooSmall { capacity: usize, needed: usize },
     /// The box could not be retired; the owner keeps it. Nothing changed.
     Retire(RetireRefusal),
-    /// The box was retired and the new one was not created: the owner has
-    /// no box until a renewal succeeds. Its counters and state are kept.
+    /// The new box could not be created. The owner keeps its box and the
+    /// authority is unchanged: the identity stays taken (review R2).
     Create(CreateRefused),
 }
 
@@ -255,7 +255,11 @@ struct Limits {
 ///   unknown, in any order, and finitely many answers are lost, the first
 ///   landmark `p >= k` whose answer is not lost is still retained when it
 ///   arrives: it arrives by rank `p + k <= 2p`, and a landmark is retained
-///   up to rank `p * 2^LANDMARK_RESOLUTIONS`.
+///   up to rank `p * 2^LANDMARK_RESOLUTIONS`. The bound `k` is uniform: it
+///   holds for every resolution of the operation, and it is measured in
+///   newer resolutions, not in time. Delays that are each finite but have
+///   no common bound are outside I3, and the exchange may then stay
+///   unresolved.
 /// - I4, monotonic knowledge. A repeated result changes nothing. A result
 ///   that contradicts what the operation established is a fault while the
 ///   operation is retained; beyond the retained terminated operations it
@@ -626,9 +630,8 @@ pub struct Owner {
     /// The latest connections that were closed; see `OwnerConfig`.
     closed: BoundedQueue<ConnectionGeneration>,
     resolution_delay: LogicalDuration,
-    /// The one box of this owner; `None` after a renewal whose creation
-    /// failed.
-    outbox: Option<Outbox>,
+    /// The one box of this owner. A renewal replaces it in place.
+    outbox: Outbox,
 }
 
 fn table<T>(bound: NonZeroU32) -> Result<BoundedVec<T>, AllocationFailed> {
@@ -730,32 +733,30 @@ impl Owner {
             finished,
             closed,
             resolution_delay: config.resolution_delay,
-            outbox: Some(outbox),
+            outbox,
         })
     }
 
-    /// The box of the owner, if it has one.
+    /// The box of the owner. It is always present: a renewal replaces it
+    /// in place, and a refused renewal keeps it (review R2). The `Option`
+    /// is kept so that the callers written against the earlier form go on
+    /// compiling.
     #[must_use]
     pub fn outbox(&self) -> Option<&Outbox> {
-        self.outbox.as_ref()
+        Some(&self.outbox)
     }
 
-    /// Hands the effects of the box to `sink`, in order (an owner without
-    /// a box has none).
+    /// Hands the effects of the box to `sink`, in order.
     pub fn dispatch(&mut self, sink: &mut dyn EffectSink) -> DispatchReport {
-        match self.outbox.as_mut() {
-            Some(outbox) => outbox.dispatch(sink),
-            None => DispatchReport {
-                accepted: 0,
-                blocked: None,
-            },
-        }
+        self.outbox.dispatch(sink)
     }
 
-    /// Replaces the box of the owner: retires it under `authority`, then
-    /// creates one for the same identity (ADR 0009). The counters and the
-    /// state of the owner are kept. The retirement is refused while an
-    /// effect waits or a reservation lives, and the owner keeps its box.
+    /// Replaces the box of the owner under `authority` by a new one for
+    /// the same identity, at once (ADR 0009, review R2): the owner keeps a
+    /// box and its identity stays taken throughout. The counters and the
+    /// state of the owner are kept. On any refusal the owner keeps its box
+    /// and the authority is unchanged; the replacement is refused while an
+    /// effect waits or a reservation lives.
     pub fn renew_box(
         &mut self,
         authority: &mut OwnerAuthority,
@@ -771,18 +772,12 @@ impl Owner {
                 needed: MAX_TRANSITION_SLOTS,
             });
         }
-        if let Some(outbox) = self.outbox.take()
-            && let Err(refused) = authority.retire(outbox)
-        {
-            let reason = refused.reason;
-            self.outbox = Some(refused.outbox);
-            return Err(RenewRefused::Retire(reason));
-        }
-        let outbox = authority
-            .create_outbox(self.id, capacity, max_reservations)
-            .map_err(RenewRefused::Create)?;
-        self.outbox = Some(outbox);
-        Ok(())
+        authority
+            .replace_outbox(&mut self.outbox, capacity, max_reservations)
+            .map_err(|refusal| match refusal {
+                ReplaceRefusal::Retire(reason) => RenewRefused::Retire(reason),
+                ReplaceRefusal::Create(reason) => RenewRefused::Create(reason),
+            })
     }
 
     /// The owner.
@@ -838,23 +833,12 @@ impl Owner {
     ///
     /// A refusal keeps the input, the state, the identity counters, the
     /// account, the reservations held and the content of the box as they
-    /// were. An owner without a box, after a renewal that could not create
-    /// one, hands every input back as `Exhausted(ReservationTable)` until
-    /// a renewal succeeds.
+    /// were.
     pub fn step(&mut self, input: Input, grant: TurnGrant) -> StepOutcome {
-        let Some(mut outbox) = self.outbox.take() else {
-            return StepOutcome::Exhausted {
-                input,
-                exhaustion: Exhaustion::ReservationTable,
-                work_used: WorkUnits::ZERO,
-            };
-        };
-        let outcome = self.step_into(input, grant, &mut outbox);
-        self.outbox = Some(outbox);
-        outcome
+        self.step_into(input, grant)
     }
 
-    fn step_into(&mut self, input: Input, grant: TurnGrant, outbox: &mut Outbox) -> StepOutcome {
+    fn step_into(&mut self, input: Input, grant: TurnGrant) -> StepOutcome {
         let plan = match self.plan(&input, grant) {
             Ok(plan) => plan,
             Err(Refusal { stop, work_used }) => {
@@ -878,12 +862,12 @@ impl Owner {
         // reservation for all the slots of the plan.
         let reservation = match NonZeroUsize::new(plan.effects.count) {
             None => None,
-            Some(slots) => match outbox.reserve(slots) {
+            Some(slots) => match self.outbox.reserve(slots) {
                 Ok(key) => Some(key),
                 Err(refusal) => return StepOutcome::reservation_refused(input, refusal, work_used),
             },
         };
-        match self.apply(plan, input, reservation, outbox) {
+        match self.apply(plan, input, reservation) {
             Ok(progress) => StepOutcome::Applied {
                 work_used,
                 progress,
@@ -1735,7 +1719,6 @@ impl Owner {
         plan: Plan,
         input: Input,
         reservation: Option<EffectReservation>,
-        outbox: &mut Outbox,
     ) -> Result<Progress, CoreFault> {
         plan.stamp.check(self.id, self.revision)?;
         let Plan {
@@ -1747,7 +1730,8 @@ impl Owner {
             ..
         } = plan;
         let reserved = match reservation {
-            Some(key) => outbox
+            Some(key) => self
+                .outbox
                 .remaining(key)
                 .map_err(|_| CoreFault::ReservationOverrun)?,
             None => 0,
@@ -1769,7 +1753,7 @@ impl Owner {
 
         if let Some(key) = reservation {
             for effect in effects.items.into_iter().flatten() {
-                outbox
+                self.outbox
                     .publish(key, effect)
                     .map_err(|_| CoreFault::ReservationOverrun)?;
             }
@@ -2328,12 +2312,12 @@ mod tests {
 
         /// The box of the owner.
         fn held(&self) -> &Outbox {
-            self.owner.outbox().expect("a box")
+            &self.owner.outbox
         }
 
         /// The box of the owner, to squeeze it in a test.
         fn outbox(&mut self) -> &mut Outbox {
-            self.owner.outbox.as_mut().expect("a box")
+            &mut self.owner.outbox
         }
 
         fn step(&mut self, input: Input) -> StepOutcome {
@@ -2570,10 +2554,7 @@ mod tests {
             input: Input,
             reservation: Option<EffectReservation>,
         ) -> Result<Progress, CoreFault> {
-            let mut outbox = self.outbox.take().expect("a box");
-            let applied = self.apply(plan, input, reservation, &mut outbox);
-            self.outbox = Some(outbox);
-            applied
+            self.apply(plan, input, reservation)
         }
     }
 
@@ -2701,50 +2682,6 @@ mod tests {
         );
     }
 
-    // A renewal whose creation fails leaves the owner without a box: every
-    // input is handed back, nothing changes, and a later renewal resumes.
-    #[test]
-    fn an_owner_without_a_box_hands_every_input_back_until_a_renewal() {
-        let mut world = World::connected();
-        // No allocator provides a box this large.
-        let unobtainable = nonzero(isize::MAX as usize / core::mem::size_of::<OwnedEffect>());
-        assert_eq!(
-            world
-                .owner
-                .renew_box(&mut world.authority, unobtainable, bound(1)),
-            Err(RenewRefused::Create(CreateRefused::AllocationFailed))
-        );
-        assert!(world.owner.outbox().is_none());
-        let counters = world.owner.counters;
-        let revision = world.owner.revision();
-        assert_eq!(
-            world.owner.step(publish(7), GRANT),
-            StepOutcome::Exhausted {
-                input: publish(7),
-                exhaustion: Exhaustion::ReservationTable,
-                work_used: WorkUnits::ZERO,
-            }
-        );
-        let mut sink = Taking(Vec::new());
-        assert_eq!(
-            world.owner.dispatch(&mut sink),
-            DispatchReport {
-                accepted: 0,
-                blocked: None,
-            }
-        );
-        assert_eq!(world.owner.counters, counters);
-        assert_eq!(world.owner.revision(), revision);
-        assert_eq!(world.phase(7), None);
-        assert_eq!(
-            world
-                .owner
-                .renew_box(&mut world.authority, nonzero(CAPACITY), bound(ENTRIES)),
-            Ok(())
-        );
-        let _ = world.submit(publish(7));
-    }
-
     // ----- The plan of ADR 0006 -----
 
     #[test]
@@ -2823,12 +2760,7 @@ mod tests {
             );
         }
         assert_eq!(owner.revision(), world.owner.revision());
-        let key = owner
-            .outbox
-            .as_mut()
-            .expect("a box")
-            .reserve(nonzero(2))
-            .expect("free");
+        let key = owner.outbox.reserve(nonzero(2)).expect("free");
         assert_eq!(
             owner.apply_held(plan, publish(7), Some(key)),
             Err(CoreFault::StalePlan)
