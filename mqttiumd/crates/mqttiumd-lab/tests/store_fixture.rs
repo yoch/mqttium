@@ -204,6 +204,12 @@ fn a_fixture_the_reader_cannot_use_is_refused() {
         edited(|fixture| fixture["sessions"][0]["client_id"] = json!(7)),
         edited(|fixture| fixture["routes"][0]["targets"][0]["qos"] = json!(3)),
         edited(|fixture| fixture["routes"][0]["topic"] = json!(null)),
+        // One more session than the schema allows: refused before any
+        // of them is read.
+        edited(|fixture| {
+            let one = fixture["sessions"][0].clone();
+            fixture["sessions"] = Value::Array(vec![one; 65]);
+        }),
     ];
     for fixture in &malformed {
         assert!(
