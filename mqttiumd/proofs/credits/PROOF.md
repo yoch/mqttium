@@ -1,7 +1,8 @@
 # The pilot proof of `release_if_current`
 
 Lot L6. Requirements DEM-021, V3-019, ARC-027, RES-001; decision records
-0006 and 0007.
+0006 and 0007, and record 0010 (proposed), which holds the decisions of
+this lot on the interface of `credits.rs`.
 
 This file is the record of the proof: what is proved, on which exact
 content, under which assumptions, with which tool, and what is not proved.
@@ -56,7 +57,7 @@ All from `mqttiumd/`.
 | `tools/install-tools.sh kani verus` | Installs the pinned tools |
 | `proofs/preflight.sh` | The tool `PATH` selects, its version, a true property verified, a false one refuted |
 | `proofs/preflight-selftest.sh` | Fake tools first on `PATH` are refused; the real preflight passes |
-| `proofs/credits/run.sh` | The preflight, the allocation test, the twelve harnesses with their witnesses, the coverage, the digests. `--record` records the digests after a pass |
+| `proofs/credits/run.sh` | The preflight, the check that one file alone uses `unsafe`, the allocation test, the twelve harnesses with their witnesses, the coverage, the digests. `--record` records the digests after a pass |
 | `python3 proofs/credits/mutants.py` | The control run and the twelve mutants |
 | `python3 proofs/credits/selftest.py` | Breaks one thing the scripts check, per case, and expects the refusal |
 | `python3 proofs/credits/verus-trial.py` | The limited Verus trial |
@@ -177,6 +178,11 @@ What the result rests on, and is not proved here:
   runs under the product toolchain, in the test profile, on the calls it
   makes. The proof shows these are all the outcomes; it does not show
   that no input allocates.
+- That test is the only file of `proofs/` that lifts the ban on `unsafe`:
+  a global allocator cannot be written without it. The proof workspace
+  denies `unsafe` everywhere else, and `run.sh` fails (exit 10) when any
+  other Rust file under `proofs/` names it. The product crates forbid
+  `unsafe` and are not concerned.
 - "Does no IO" has no check of its own. The crate is `no_std` and the
   boundary test of the product refuses what could reach a file or a
   socket (ADR 0007).
@@ -192,7 +198,7 @@ A result belongs to an exact content.
 
 | | |
 | - | - |
-| Revision | `dbddded0` on branch `claude/mqttiumd-l6-pilot-proof`: the lot merged with the contract chain `74ea7f4..574fb9d`, which sits on `642b376` of the integration branch. Later commits change this file and `proofs/proposals/` only |
+| Revision | `a5786183` on branch `claude/mqttiumd-l6-pilot-proof`, which contains the integration branch at `2399750` (the contract chain `74ea7f4..574fb9d` merged there by `1e3ecd3`, and record 0010). Later commits change this file and `proofs/proposals/` only |
 | Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb`, unchanged by the lot |
 | Where | A cloud container, local run. Not CI |
 | Tool | `/root/.cargo/bin/cargo-kani`, as `PATH` selects it: Kani Rust Verifier 0.68.0 (cargo plugin), CBMC 6.11.0 |
@@ -222,7 +228,7 @@ Twelve harnesses run by the tool, twelve listed, all verified; 41 of 41
 witnesses satisfied; 12 of 12 regions of the function covered under `p1`;
 4 source files reached, all recorded; 3 allocation tests passed. The
 whole run, preflight included, takes 44 seconds from an empty build
-directory.
+directory, and 40 seconds here on a warm one.
 
 Also run on that revision: `cargo fmt --check`, `cargo clippy --workspace
 --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`
@@ -234,8 +240,8 @@ refused, the real preflight passes).
 
 ## What a PASS of the scripts is worth
 
-`python3 proofs/credits/selftest.py`: 13 of 13 cases as expected, about
-four minutes. Each case copies the sources, breaks one thing and expects
+`python3 proofs/credits/selftest.py`: 16 of 16 cases as expected, about
+five minutes. Each case copies the sources, breaks one thing and expects
 the script of the copy to refuse by the exit code of that check.
 
 | Case | Expected |
@@ -252,6 +258,9 @@ the script of the copy to refuse by the exit code of that check.
 | A mutant whose text is gone | Its row says inconclusive; the report says FAIL |
 | The mutants exceed their time limit | Inconclusive rows, the report says FAIL |
 | A command exceeds its limit after starting a child | The child is killed with it |
+| A source file the proof reaches is taken out of the record | exit 8 |
+| A second file of `proofs/` allows `unsafe` | exit 10 |
+| A harness uses `unsafe` behind an `allow` of its own | exit 10 |
 | The unmodified copy | `run.sh` exit 0 |
 
 Most of these were found by the integration owner's review of the
@@ -259,10 +268,11 @@ scripts. Before the corrections, 10 of the 12 cases then written failed:
 the scripts printed PASS. The self-test was committed in that state
 (`cc7ada3`), then the corrections (`144a6d3`).
 
-Two things the self-test does not show. The exit code 8 (coverage) has
-no case of its own. And the first form of the timeout case passed
-whatever the script did, so it was replaced; the present one was seen to
-fail when only the direct child is killed.
+The two cases for `unsafe` were committed failing as well (`0904456`),
+then their correction (`a5786183`). One thing the self-test does not
+show: the first form of the timeout case passed whatever the script did,
+so it was replaced; the present one was seen to fail when only the
+direct child is killed.
 
 ## Mutants
 
@@ -396,12 +406,15 @@ inconclusive, so a stale mutant cannot count as caught.
 - **Not in CI.** The workflow is a shared file. Until a job installs the
   pinned tools and runs `proofs/credits/run.sh`, every result above is a
   local run.
-- **The contract change is not merged yet.** The chain
-  `74ea7f4..574fb9d` waits for the integration owner, with the decision
-  text on the order of the guards, `reserve`, the unchecked constructors
-  and the precondition.
+- **Record 0010 is proposed, not accepted.** The interface is on the
+  integration branch; the owner of the repository accepts the record.
 - **The precondition is not enforced anywhere.** One record per held
-  lease is owed by the lease table of lot L1; no test of L1 shows it yet.
+  lease is owed by the lease table of lot L1, as an open condition; no
+  test of L1 shows it yet.
+- **The record will go stale.** Lot L1 has changes to `capacity.rs` and
+  `ids.rs` on its branch. When they reach the integration branch
+  `run.sh` fails with exit 5 until lot L6 runs the proof on the new
+  content and records it.
 - **Human time** of the maintenance trial.
 - The open condition "Pilot proof" of
   `docs/reception/open-conditions.md` stays open.

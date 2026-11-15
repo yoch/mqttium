@@ -44,14 +44,14 @@ merged. It has not been run in CI: only its commands were run, locally.
 Notes for the owner of the workflow:
 
 - The job inherits `defaults.run.working-directory: mqttiumd`.
-- Measured locally on `dbddded0`, tools already installed:
+- Measured locally on `a5786183`, tools already installed:
 
   | Step | Time |
   | - | - |
   | `proofs/preflight-selftest.sh` | 1 s |
-  | `proofs/credits/run.sh`, from an empty `proofs/target` | 44 s |
-  | `python3 proofs/credits/mutants.py` | 149 s |
-  | `python3 proofs/credits/selftest.py` | 245 s |
+  | `proofs/credits/run.sh`, from an empty `proofs/target` | 44 s (40 s warm) |
+  | `python3 proofs/credits/mutants.py` | 148 s |
+  | `python3 proofs/credits/selftest.py` | 295 s |
   | `fmt` and `clippy` on `proofs/` | a few seconds |
 
 - `run.sh` also builds and runs one test binary with the product
