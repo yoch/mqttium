@@ -1209,10 +1209,19 @@ def terminal_knowledge_never_regresses(run):
     return Status(FAIL if reasons else PASS, reasons)
 
 
-# The origins that run in the child process of a broker (record 0019). The
-# evidence of the store outlives the broker and is not one of them.
+# The origins that run in the child process of a broker (record 0019): all
+# but the bench's. The evidence of the store is written by the child and
+# changes incarnation with it.
 CHILD = frozenset(
-    {"broker-core", "transport", "timer", "store-adapter", "dispatcher", "fault-injector"}
+    {
+        "broker-core",
+        "transport",
+        "timer",
+        "store-adapter",
+        "store-evidence",
+        "dispatcher",
+        "fault-injector",
+    }
 )
 
 

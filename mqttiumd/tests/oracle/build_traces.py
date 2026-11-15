@@ -2148,6 +2148,12 @@ def killed(signal=9, claim=True, record=True):
         deepcopy_payloads(events)
         if claim:
             events[at(events, "header")]["payload"]["broker"] = "child-process"
+        if claim:
+            # The evidence of the store runs in the child: after the crash
+            # it is the restarted child's, of the next incarnation.
+            for event in events[at(events, "crash") :]:
+                if event["origin"] == "store-evidence":
+                    event["inc"] = 2
         if record:
             crash = at(events, "crash")
             frontier = [e["label"] for e in events[:crash] if e["origin"] in CHILD][-1]
