@@ -18,6 +18,30 @@
 //! A commit that fails is reported as not written. SQLite rolls back a
 //! transaction whose commit fails; the answer is then unknown, never a
 //! certain rejection, and the next command reads the durable state again.
+//!
+//! # The writer's lock
+//!
+//! `BEGIN IMMEDIATE` with no busy timeout serialises transactions; it does
+//! not make one process the owner of the store for its whole life. That is
+//! the writer's lock: an exclusive, non-blocking advisory lock
+//! (`File::try_lock`, `flock` on Linux) on a file beside the database,
+//! `<database>.writer-lock`. `SqliteStore::create` and `SqliteStore::open`
+//! take it before they touch the database and hold it for the whole life
+//! of the `SqliteStore`; it is released when the store is dropped, after
+//! its connection is closed, and by the kernel when the process dies, a
+//! `SIGKILL` included. A second writer while the first lives is refused at
+//! once with `OpenError::WriterAlive`, from this process or another.
+//! `SqliteStore::inspect` does not take it, and the database itself is not
+//! locked beyond what SQLite does: `locking_mode` stays `NORMAL`, so an
+//! inspector reads while the writer lives.
+//!
+//! The lock file is never removed by the store: a removal would let two
+//! writers lock two different files of the same name. Its existence alone
+//! means nothing; only the lock held on it does. What the lock does not
+//! guarantee: an advisory lock does not stop a program that ignores it
+//! (another SQLite client opening the database directly), and file
+//! systems over a network, where `flock` may not be shared between hosts,
+//! are outside its perimeter.
 
 #![forbid(unsafe_code)]
 
@@ -25,7 +49,8 @@ mod codec;
 mod schema;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::fs::{File, OpenOptions, TryLockError};
+use std::path::{Path, PathBuf};
 
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
@@ -105,6 +130,9 @@ pub enum OpenError {
     /// Another `SqliteStore` holds the writer's lock of this file, in this
     /// process or another: refused at once, without waiting.
     WriterAlive,
+    /// The lock file could not be opened, or the lock could not be asked
+    /// for (not that it is held: that is `WriterAlive`).
+    WriterLock(std::io::Error),
 }
 
 impl From<rusqlite::Error> for OpenError {
@@ -1002,6 +1030,32 @@ fn stage_admin(
 
 /// Opens a connection to `path` and checks, before anything is written,
 /// that its schema version is `expected` (0 for a file to create).
+/// The path of the writer's lock of the database at `path`.
+#[must_use]
+pub fn writer_lock_path(path: &Path) -> PathBuf {
+    let mut file = path.as_os_str().to_os_string();
+    file.push(".writer-lock");
+    PathBuf::from(file)
+}
+
+/// Takes the writer's lock of the database at `path`, without waiting.
+/// The lock file is created if it is missing and never truncated or
+/// removed.
+fn writer_lock(path: &Path) -> Result<File, OpenError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(writer_lock_path(path))
+        .map_err(OpenError::WriterLock)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(OpenError::WriterAlive),
+        Err(TryLockError::Error(error)) => Err(OpenError::WriterLock(error)),
+    }
+}
+
 fn connect(path: &Path) -> Result<Connection, OpenError> {
     let conn = Connection::open(path)?;
     // One writer: a busy database is an error, never a wait.
@@ -1093,6 +1147,10 @@ pub struct SqliteStore {
     durability: Durability,
     /// The ledger as of the last transaction; refreshed after each one.
     ledger: EpochLedger,
+    /// The writer's lock, held while the store lives. Declared last: the
+    /// fields drop in order, so the connection is closed, and its last
+    /// checkpoint done, before another writer can take the lock.
+    _writer_lock: File,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -1113,6 +1171,7 @@ impl SqliteStore {
         incarnation: StoreIncarnation,
         limits: Limits,
     ) -> Result<Self, OpenError> {
+        let lock = writer_lock(path)?;
         let mut conn = connect(path)?;
         let tables: i64 =
             conn.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))?;
@@ -1144,7 +1203,7 @@ impl SqliteStore {
         write_meta(&tx, &meta).map_err(|_| OpenError::Corrupt)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
-        Self::verified(conn)
+        Self::verified(conn, lock)
     }
 
     /// Opens an existing data set: its schema version is checked before
@@ -1154,12 +1213,13 @@ impl SqliteStore {
         if !path.exists() {
             return Err(OpenError::Corrupt);
         }
+        let lock = writer_lock(path)?;
         let conn = connect(path)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version != SCHEMA_VERSION {
             return Err(OpenError::SchemaVersion(version));
         }
-        Self::verified(conn)
+        Self::verified(conn, lock)
     }
 
     /// Reads the durable state of the file at `path` without the writer,
@@ -1170,7 +1230,8 @@ impl SqliteStore {
     /// the WAL changes). No pragma that writes is set and no checkpoint is
     /// run. The whole state is read in one read transaction, which ends,
     /// and the connection is closed, before this returns: the inspector
-    /// holds nothing that would keep the writer's checkpoint back.
+    /// holds nothing that would keep the writer's checkpoint back. It does
+    /// not take the writer's lock, and reads while a writer lives.
     pub fn inspect(path: &Path) -> Result<DurableState, OpenError> {
         if !path.exists() {
             return Err(OpenError::Corrupt);
@@ -1192,7 +1253,7 @@ impl SqliteStore {
         Ok(state)
     }
 
-    fn verified(conn: Connection) -> Result<Self, OpenError> {
+    fn verified(conn: Connection, lock: File) -> Result<Self, OpenError> {
         let settings = settle(&conn)?;
         // Before an epoch is opened: every page of the file is checked,
         // not only those opening reads.
@@ -1209,6 +1270,7 @@ impl SqliteStore {
             settings,
             durability: Durability::Available,
             ledger: meta.ledger,
+            _writer_lock: lock,
         })
     }
 
