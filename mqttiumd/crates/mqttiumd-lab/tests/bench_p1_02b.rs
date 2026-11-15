@@ -86,18 +86,22 @@ fn p1_02b_gives_the_same_trace_for_the_same_seed() {
 }
 
 /// P1-02b with an inspection of the supervisor between the delivery of the
-/// late unknown answer and the PUBREL of the peer: written below the root,
-/// in the ignored build directory, so that the campaign copies it like any
-/// scenario of the checkout. The case the oracle must judge PASS once
-/// `terminal_knowledge_never_regresses` follows only the causes of the
-/// product (lot L3): an inspection decided by the scenario is no reaction
-/// of the product to the unknown answer.
+/// late unknown answer and the PUBREL of the peer
+/// (`tests/scenarios/audit/P1-02b-interposed.json`). The oracle judges it
+/// PASS since `terminal_knowledge_never_regresses` follows only the causes
+/// of the product (lot L3): an inspection decided by the scenario is no
+/// reaction of the product to the unknown answer.
+const INTERPOSED: &str = "tests/scenarios/audit/P1-02b-interposed.json";
+
 #[test]
 fn an_inspection_after_the_late_unknown_answer_is_named_and_names_it() {
     let root = bench_support::root();
-    let mut scenario: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join(SCENARIO)).unwrap()).unwrap();
-    let steps = scenario["steps"].as_array_mut().unwrap();
+    let read = |path: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(root.join(path)).unwrap()).unwrap()
+    };
+    // The file is P1-02b with one more step, and nothing else.
+    let mut expected = read(SCENARIO);
+    let steps = expected["steps"].as_array_mut().unwrap();
     let pubrel = steps
         .iter()
         .position(|step| step["kind"] == "ClientSendPubrel")
@@ -107,19 +111,9 @@ fn an_inspection_after_the_late_unknown_answer_is_named_and_names_it() {
         pubrel,
         serde_json::json!({"kind": "InspectDurableState", "checkpoint": "after_late_unknown"}),
     );
-    scenario["id"] = serde_json::json!("P1-02B-INTERPOSED");
-    let relative = format!(
-        "target/bench-scenarios/P1-02b-interposed-{}.json",
-        std::process::id()
-    );
-    std::fs::create_dir_all(root.join("target/bench-scenarios")).unwrap();
-    std::fs::write(
-        root.join(&relative),
-        serde_json::to_vec_pretty(&scenario).unwrap(),
-    )
-    .unwrap();
-    let campaign = run_scenario(&relative, 1, "p102b-interposed");
-    let _ = std::fs::remove_file(root.join(&relative));
+    expected["id"] = serde_json::json!("P1-02B-INTERPOSED");
+    assert_eq!(read(INTERPOSED), expected);
+    let campaign = run_scenario(INTERPOSED, 1, "p102b-interposed");
     assert_eq!(campaign.report.stopped, None);
     let lines: Vec<serde_json::Value> = campaign
         .trace()
