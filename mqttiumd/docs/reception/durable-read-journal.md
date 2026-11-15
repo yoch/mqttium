@@ -75,6 +75,18 @@ Local evidence: `/workspace/mqttium-read-evidence/`. Archives and SHA-256:
 0004 and K2a/WAL scopes remain unchanged. Existing K2a/WAL final CI gates stay
 required; final CI evidence belongs to its own published SHA.
 
+Post-publication CI on `7072bed1` passed both Rust modes, models and the
+pilot proof, then stopped because three legacy control mutation patches no
+longer applied. Fixture-only commit `9d7df86e` refreshes N2/N5/N6 for the new
+protocol without changing production code or expected.json (SHA-256
+`0c270a3626109a31a3e78704d2d9957c54e33452991274fabe899f05647f9bd7`).
+The complete real loops were executed again: 5/5 deterministic-store mutants
+and 11/11 SQLite mutants were rejected for their expected verdict, assertion
+and reason. Patch or build failures are not counted as detections. Their
+additional logs are kept in `/workspace/mqttium-read-evidence/mutant-refresh/`.
+The final CI must repeat all gates on the updated published head and retain
+its own fresh qualifying transaction campaigns and bounded experiments.
+
 Next integration action: read final published HEAD and checks; investigate
 any actionable failure and receive that SHA's fresh CI artifacts. Next product
 increment: a minimal TCP CONNECT + durable QoS 1 exchange, PUBACK after commit,
