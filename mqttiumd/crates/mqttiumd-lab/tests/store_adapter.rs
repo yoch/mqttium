@@ -903,6 +903,13 @@ fn two_faults_that_may_select_one_passage_are_refused() {
             source: Some((bench.producer, packet(7))),
             ..fault(FaultPoint::ResultReady, FaultAction::DropResult)
         },
+        // Another occurrence, but counted over the passages of one
+        // source only: which fault acts would depend on the store.
+        FaultSpec {
+            source: Some((bench.producer, packet(7))),
+            occurrence: 2,
+            ..fault(FaultPoint::ResultReady, FaultAction::DropResult)
+        },
     ];
     for spec in overlapping {
         assert_eq!(
