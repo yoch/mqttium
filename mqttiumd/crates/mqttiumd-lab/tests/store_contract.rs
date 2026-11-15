@@ -191,3 +191,13 @@ fn a_fact_that_cannot_be_built_is_not_the_end_of_the_inventory() {
 fn recovered_facts_follow_the_order_of_an_inventory() {
     conformance::recovered_facts_follow_the_order_of_an_inventory(&memory);
 }
+
+#[test]
+fn snapshot_limits_refuse_without_changing_the_store() {
+    conformance::snapshot_limits_refuse_without_changing_the_store(&memory);
+}
+
+#[test]
+fn recovery_limits_refuse_without_claiming_the_inventory_ends() {
+    conformance::recovery_limits_refuse_without_claiming_the_inventory_ends(&memory);
+}

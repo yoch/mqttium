@@ -388,6 +388,49 @@ def _recovery_after_kill(run, page, kill):
     return True
 
 
+def _first_recovery_after_kill(run, kill):
+    """Select lifecycle evidence before considering whether any page exists.
+
+    The first restarted child may have failed before producing an inventory.
+    A later child's pages cannot replace that observation. The surviving
+    supervisor's local order orders its startup/kill records; no collector
+    order is added to the product relation.
+    """
+    trace = run.trace
+    starts = [
+        startup for startup in trace.of_kind("BrokerRecovered")
+        if trace.before(kill, startup) is True
+    ]
+    first = [
+        startup for startup in starts
+        if all(other.key == startup.key or trace.before(startup, other) is True
+               for other in starts)
+    ]
+    if len(first) != 1:
+        return None
+    startup = first[0]
+    if any(
+        other.key != kill.key
+        and trace.before(kill, other) is True
+        and trace.before(other, startup) is True
+        for other in trace.of_kind("BrokerKilled")
+    ):
+        # There was another child before this startup, with no matching
+        # startup observation. It cannot silently be skipped either.
+        return None
+    if trace.backend == "sqlite":
+        epoch = int(startup.payload["run_epoch"])
+        frontier = [parent[1] for parent in kill.parents if parent[0] in CHILD]
+        if not frontier or epoch <= max(frontier):
+            return None
+        same_rank = [record for record in trace.of_kind("BrokerRecovered")
+                     if int(record.payload["run_epoch"]) == epoch]
+        core = {parent[1] for parent in startup.parents if parent[0] == "broker-core"}
+        if len(same_rank) != 1 or core != {epoch}:
+            return None
+    return startup
+
+
 def one_admission_per_observed_inbound_exchange(run):
     exchanges, notes = run.exchanges()
     if notes:
@@ -1454,14 +1497,18 @@ def transactional_kill_matches_recovery(run):
             reasons.append(f"{fault['id']}: the interrupted command already has StoreResultReady")
         # Only the first new incarnation's complete inventory answers this
         # kill; another restart or a later retransmission cannot supply it.
+        startup = _first_recovery_after_kill(run, kill)
+        if startup is None:
+            statuses.append(INCONCLUSIVE)
+            reasons.append(f"{fault['id']}: no unambiguous first recovery after the kill")
+            continue
+        incarnation = int(startup.payload["run_epoch"])
         pages = [
             page for page in run.trace.of_kind("RecoveryPageDelivered")
-            if page.origin[1] > hit.origin[1]
+            if page.origin[1] == incarnation
+            and int(page.payload["run_epoch"]) == incarnation
             and _recovery_after_kill(run, page, kill) is True
         ]
-        if pages:
-            incarnation = min(page.origin[1] for page in pages)
-            pages = [page for page in pages if page.origin[1] == incarnation]
         pages.sort(key=lambda page: int(page.payload["page"]))
         complete = (
             bool(pages)
@@ -1481,7 +1528,7 @@ def transactional_kill_matches_recovery(run):
         )
         if not complete or not corroborated:
             statuses.append(INCONCLUSIVE)
-            reasons.append(f"{fault['id']}: no complete corroborated recovery inventory")
+            reasons.append(f"{fault['id']}: no complete corroborated recovery inventory for first startup {incarnation}")
             continue
         found = [
             fact["knowledge"] for page in pages for fact in page.payload["facts"]
@@ -1617,6 +1664,19 @@ def one_grant_per_opened_epoch(run):
     return Status(FAIL if reasons else PASS, reasons)
 
 
+def durable_reads_complete(run):
+    """A refusal to establish the state is missing evidence, never absence."""
+    failures = [record for record in run.trace.records
+                if record.kind in {"DurableReadFailed", "ProcessControlFailed"}]
+    if not failures:
+        return Status(PASS)
+    return Status(INCONCLUSIVE, [
+        f"record {record.sequence}: {record.kind} {record.payload['code']} "
+        f"during {record.payload['phase']} of process {record.payload['process_incarnation']}"
+        for record in failures[:64]
+    ])
+
+
 ASSERTIONS = {
     "fenced_operation_never_executed": fenced_operation_never_executed,
     "certain_rejection_has_a_closure": certain_rejection_has_a_closure,
@@ -1634,6 +1694,7 @@ ASSERTIONS = {
     "transactional_kill_matches_recovery": transactional_kill_matches_recovery,
     "all_required_faults_hit": all_required_faults_hit,
     "trace_complete": trace_complete,
+    "durable_reads_complete": durable_reads_complete,
 }
 
 
