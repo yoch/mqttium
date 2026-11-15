@@ -18,10 +18,10 @@
       "patch": "m2-result-altered-before-the-core.mutant",
       "mutation": "the dispatcher hands the core a certain rejection for lack of capacity where the store rejected for a fence",
       "scenario": "tests/scenarios/qabs/QABS-B.json",
-      "expect": "survives-known",
-      "finding": "K1",
-      "note": "Known survivor: the oracle does not yet close the chain from the result the store produced to the result the core consumed (finding K1, lot L3). Once K1 is merged this entry becomes rejected, with its assertion and reason.",
-      "verdict": "PASS"
+      "expect": "rejected",
+      "verdict": "FAIL",
+      "assertion": "broker_inputs_have_provenance",
+      "reason": "the core consumed a result the store adapter did not hand over"
     },
     {
       "id": "m3-positive-ack-too-early",
