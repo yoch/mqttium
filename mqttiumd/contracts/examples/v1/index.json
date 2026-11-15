@@ -1200,6 +1200,66 @@
       "code": "coverage-budget-exceeded",
       "pointer": "/catalog",
       "why": "65 536 guard points in one cell exceed the coverage budget; they are counted, never built."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-peer-connection-opened-stated-by-transport.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-peer-connection-closed-stated-by-broker-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-client-bytes-received-stated-by-peer.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-resolve-submitted-stated-by-broker-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-store-fence-stable-stated-by-store-adapter.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-store-fence-refused-stated-by-broker-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovery-page-delivered-stated-by-store-adapter.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-held-item-released-stated-by-bench-supervisor.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-fault-hit-stated-by-broker-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-peer-packet-observed-stated-by-transport.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
     }
   ]
 }

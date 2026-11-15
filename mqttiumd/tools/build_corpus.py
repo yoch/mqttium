@@ -156,9 +156,13 @@ valid = [
 invalid = []
 
 
+VALID = {}
+
+
 def ok(name, value):
     dump(EX / "valid" / name, value)
     valid.append(f"contracts/examples/v1/valid/{name}")
+    VALID[name] = value
 
 
 def bad(name, code, pointer, why, value=None, raw=None):
@@ -2395,6 +2399,27 @@ bad(
     ),
 )
 
+# Every kind of record is stated by one origin (ADR 0003): for each kind
+# the audit added, a valid record stated by another origin is refused.
+for kind_name, origin in [
+    ("peer-connection-opened", "transport"),
+    ("peer-connection-closed", "broker-core"),
+    ("client-bytes-received", "peer"),
+    ("resolve-submitted", "broker-core"),
+    ("store-fence-stable", "store-adapter"),
+    ("store-fence-refused", "broker-core"),
+    ("recovery-page-delivered", "store-adapter"),
+    ("held-item-released", "bench-supervisor"),
+    ("fault-hit", "broker-core"),
+    ("peer-packet-observed", "transport"),
+]:
+    trace_case(
+        f"{kind_name}-stated-by-{origin}",
+        VALID[f"trace-record-{kind_name}.json"],
+        "/origin_component",
+        "A kind of record is stated by its one origin; another may not state it.",
+        setter(["origin_component"], origin),
+    )
 dump(EX / "index.json", env("mqttiumd.example-index", valid=valid, invalid=invalid))
 
 
