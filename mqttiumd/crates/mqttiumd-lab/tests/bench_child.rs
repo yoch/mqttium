@@ -12,7 +12,9 @@ mod bench_support;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use mqttiumd_lab::bench::campaign::{Request, execute};
+use mqttiumd_lab::bench::campaign::Request;
+
+use bench_support::execute_apart as execute;
 use mqttiumd_lab::bench::child::{Child, Config};
 use mqttiumd_lab::bench::collector::{Collector, KindTable};
 use mqttiumd_lab::bench::process::Books;
@@ -158,6 +160,7 @@ fn projection(trace: &[serde_json::Value]) -> Vec<serde_json::Value> {
 /// Runs a campaign in child mode through the binary of the lab, since the
 /// test binary cannot be the child.
 fn execute_with_lab(request: &Request) -> ChildReport {
+    let _turn = bench_support::spawning();
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_mqttiumd-lab"))
         .args(["run", "--contracts", "contracts/v1"])
         .arg("--scenario")
@@ -232,7 +235,10 @@ fn a_child_that_never_speaks_stops_the_run_at_its_deadline() {
     let mut collector = Collector::new("silent", KindTable::from_schema(&schema).unwrap(), 1 << 20);
     let mut books = Books::new(0);
     let started = Instant::now();
-    let Err(stopped) = Child::spawn(&config, 0, &[], &mut collector, &mut books) else {
+    let Err(stopped) = ({
+        let _turn = bench_support::spawning();
+        Child::spawn(&config, 0, &[], &mut collector, &mut books)
+    }) else {
         panic!("a silent child started");
     };
     assert!(stopped.0.contains("did not connect"), "{}", stopped.0);
@@ -377,9 +383,15 @@ fn a_second_child_on_the_same_file_while_the_first_lives_is_refused() {
     }
     let mut books = Books::new(4);
     // A start-up of a rank the data set has not seen opens a new epoch.
-    let (first, _) = Child::spawn(&config, 7, &[], &mut first_collector, &mut books)
-        .expect("the first child starts");
-    let Err(refused) = Child::spawn(&config, 8, &[], &mut second_collector, &mut books) else {
+    let (first, _) = {
+        let _turn = bench_support::spawning();
+        Child::spawn(&config, 7, &[], &mut first_collector, &mut books)
+    }
+    .expect("the first child starts");
+    let Err(refused) = ({
+        let _turn = bench_support::spawning();
+        Child::spawn(&config, 8, &[], &mut second_collector, &mut books)
+    }) else {
         panic!("a second writer started on the same file");
     };
     assert!(refused.0.contains("WriterAlive"), "{}", refused.0);

@@ -5,6 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use mqttiumd_lab::bench::campaign::{Report, Request, execute};
 use serde_json::Value;
@@ -12,6 +13,24 @@ use serde_json::Value;
 /// The `mqttiumd` directory of the checkout.
 pub fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// A process this one forks holds a copy of each of its descriptors
+/// until it executes its program, the writer lock of an open SQLite store
+/// among them (`flock`). An in-process SQLite campaign restarts its store
+/// on the same file; a thread that spawns a process meanwhile can make
+/// that reopen meet its own lock (`WriterAlive`). Spawns share this lock;
+/// an in-process SQLite campaign holds it alone.
+static FORKS: RwLock<()> = RwLock::new(());
+
+/// Held while this test process spawns another one.
+pub fn spawning() -> RwLockReadGuard<'static, ()> {
+    FORKS.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Held while an in-process SQLite store is open in this test process.
+pub fn holding_the_writer_lock() -> RwLockWriteGuard<'static, ()> {
+    FORKS.write().unwrap_or_else(PoisonError::into_inner)
 }
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -81,8 +100,20 @@ pub fn run_scenario_on(scenario: &str, seed: u64, name: &str, backend: &str) -> 
         built_from: None,
         process: "in-process".to_owned(),
     };
-    let report = execute(&request).unwrap_or_else(|error| panic!("{scenario}: {error}"));
+    let report = execute_apart(&request).unwrap_or_else(|error| panic!("{scenario}: {error}"));
     Campaign { out, report }
+}
+
+/// Executes a campaign apart from the spawns of the other tests when it
+/// opens a SQLite store in this process, beside them otherwise.
+pub fn execute_apart(request: &Request) -> Result<Report, String> {
+    if request.backend == "sqlite" && request.process == "in-process" {
+        let _alone = holding_the_writer_lock();
+        execute(request)
+    } else {
+        let _turn = spawning();
+        execute(request)
+    }
 }
 
 /// One record of a trace, as the tests read it.

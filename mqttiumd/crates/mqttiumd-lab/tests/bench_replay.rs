@@ -14,7 +14,7 @@ use std::process::Command;
 
 use serde_json::Value;
 
-use bench_support::{fresh, root, run_scenario_on};
+use bench_support::{fresh, root, run_scenario_on, spawning};
 
 const SCENARIO: &str = "tests/scenarios/p1/P1-02.json";
 const PLACEHOLDER: &str = "<empty directory outside the work tree>";
@@ -38,11 +38,13 @@ fn the_recorded_command_replays_the_campaign_on(backend: &str) {
         .split(' ')
         .map(|argument| argument.replace('\u{1}', &out.display().to_string()))
         .collect();
+    let turn = spawning();
     let played = Command::new(env!("CARGO_BIN_EXE_mqttiumd-lab"))
         .args(&arguments)
         .current_dir(root())
         .output()
         .expect("the lab binary");
+    drop(turn);
     assert!(
         played.status.success(),
         "{command}: {}",
