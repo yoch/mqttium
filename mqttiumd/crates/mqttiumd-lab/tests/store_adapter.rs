@@ -128,6 +128,8 @@ fn a_fault_is_armed_only_with_an_action_its_point_allows() {
     let points = [
         FaultPoint::CommandTransit,
         FaultPoint::FenceTransit,
+        FaultPoint::CommitPrepared,
+        FaultPoint::CommitLogged,
         FaultPoint::CommitApplied,
         FaultPoint::ResultReady,
         FaultPoint::ResultConsume,
