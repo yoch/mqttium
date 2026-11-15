@@ -881,6 +881,153 @@
       "why": "The bytes a peer observed hold more than the one packet it says it decoded."
     },
     {
+      "name": "result-altered-between-the-store-and-the-core",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/result-altered-between-the-store-and-the-core/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "K1: the store produced an unknown outcome, and the core consumed a commit for it."
+    },
+    {
+      "name": "result-altered-between-the-adapter-and-the-core",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/result-altered-between-the-adapter-and-the-core/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "K1: the adapter handed over a refusal, and the core consumed a commit."
+    },
+    {
+      "name": "result-consumed-without-a-handover",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/result-consumed-without-a-handover/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "K1: the core consumed a result the store adapter never handed over."
+    },
+    {
+      "name": "result-handed-over-twice",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/result-handed-over-twice/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "K1: one result the store produced is handed over twice, and no injection duplicates it."
+    },
+    {
+      "name": "epoch-granted-twice",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/epoch-granted-twice/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "FAIL"
+      },
+      "why": "One opened epoch, two grants handed over."
+    },
+    {
+      "name": "epoch-granted-on-an-unknown-outcome",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/epoch-granted-on-an-unknown-outcome/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "FAIL"
+      },
+      "why": "The opening's outcome is unknown, and a grant is handed over all the same."
+    },
+    {
+      "name": "opening-reply-to-no-submission",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/opening-reply-to-no-submission/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "The core consumes an opening reply that answers no command the adapter submitted."
+    },
+    {
+      "name": "opening-committed-for-an-epoch-the-store-did-not-open",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/opening-committed-for-an-epoch-the-store-did-not-open/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "FAIL"
+      },
+      "why": "The core is told its command opened epoch 5; the store opened epoch 1 for that attempt."
+    },
+    {
+      "name": "p1-02-good-opening-abandoned-then-committed",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/p1-02-good-opening-abandoned-then-committed/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS"
+      },
+      "why": "The start-up abandons its opening, then receives its committed reply; the grant follows it."
+    },
+    {
       "name": "provenance-input-refused",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/provenance-input-refused/trace.jsonl",

@@ -562,8 +562,69 @@ def header(scenario):
     )
 
 
-def recovery(inc, facts, tag="recovery"):
+def attempt(epoch):
+    """The attempt that opens ``epoch``, as the snapshot names it in ``opened_by``."""
+    return {"startup_hex": f"{epoch:02x}" * 16, "ticket": "1"}
+
+
+def opening(inc, tag):
+    """Start-up opens epoch ``inc`` after ``inc - 1`` and hands over its grant."""
+    command = {"attempt": attempt(inc), "incarnation": "1", "after": str(inc - 1)}
     return [
+        ev(f"{tag}.opening", "store-adapter", "OpeningSubmitted", command, [], inc),
+        ev(
+            f"{tag}.opened",
+            "store-evidence",
+            "StoreEpochOpened",
+            {"incarnation": "1", "epoch": str(inc), "attempt": attempt(inc)},
+            [f"{tag}.opening"],
+        ),
+        ev(
+            f"{tag}.opening.reply",
+            "broker-core",
+            "OpeningReplyDelivered",
+            {**command, "outcome": "Committed", "epoch": str(inc)},
+            [f"{tag}.opening", f"{tag}.opened"],
+            inc,
+        ),
+        ev(
+            f"{tag}.grant",
+            "broker-core",
+            "EpochGrantHandedOver",
+            {"incarnation": "1", "epoch": str(inc)},
+            [f"{tag}.opening.reply"],
+            inc,
+        ),
+    ]
+
+
+def handed(history):
+    """Every result the core consumed is handed over by the store adapter first (K1)."""
+
+    def with_handovers():
+        events = history()
+        for index in range(len(events) - 1, -1, -1):
+            event = events[index]
+            if event["kind"] != "StoreResultDelivered":
+                continue
+            label = f"{event['label']}.handed"
+            handover = ev(
+                label,
+                "store-adapter",
+                "StoreResultHandedOver",
+                copy.deepcopy(event["payload"]),
+                list(event["parents"]),
+                event["inc"],
+            )
+            event["parents"] = [label]
+            events.insert(index, handover)
+        return events
+
+    return with_handovers
+
+
+def recovery(inc, facts, tag="recovery"):
+    return opening(inc, tag) + [
         ev(f"{tag}.read", "store-adapter", "RecoveryPageRead", page(inc, facts), [], inc),
         ev(
             f"{tag}.in",
@@ -660,6 +721,9 @@ def p1_02():
         + ack_out("pubcomp", 2, 2, 4, "PUBCOMP", PUBCOMP_HEX, "release.delivered")
         + [inspected("final")]
     )
+
+
+p1_02 = handed(p1_02)
 
 
 FIRST = (OP_ADMIT, PUB, PAYLOAD_ID, 1)
@@ -808,6 +872,9 @@ def p1_02b():
         + ack_out("pubcomp", 1, 1, 10, "PUBCOMP", PUBCOMP_HEX, "release.delivered")
         + [inspected("final")]
     )
+
+
+p1_02b = handed(p1_02b)
 
 
 def p1_02b_snapshots(run):
@@ -1762,6 +1829,142 @@ case(
 )
 
 
+# ---------------------------------------------- second wave, finding K1
+
+
+def result_changed_in_the_store(events):
+    # The store produced an unknown outcome; the core consumed a commit.
+    deepcopy_payloads(events)
+    events[at(events, "release.ready")]["payload"]["outcome"] = "PendingOrUnknown"
+
+
+case(
+    "result-altered-between-the-store-and-the-core",
+    "K1: the store produced an unknown outcome, and the core consumed a commit for it.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=result_changed_in_the_store,
+)
+
+
+def handover_altered(events):
+    deepcopy_payloads(events)
+    payload = events[at(events, "release.delivered.handed")]["payload"]
+    payload.update(outcome="RejectedCertain", reject_reason="Fenced")
+
+
+case(
+    "result-altered-between-the-adapter-and-the-core",
+    "K1: the adapter handed over a refusal, and the core consumed a commit.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=handover_altered,
+)
+
+
+def no_handover(events):
+    handover = events.pop(at(events, "release.delivered.handed"))
+    events[at(events, "release.delivered")]["parents"] = handover["parents"]
+
+
+case(
+    "result-consumed-without-a-handover",
+    "K1: the core consumed a result the store adapter never handed over.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=no_handover,
+)
+
+
+def handed_twice(events):
+    first = at(events, "release.delivered.handed")
+    events.insert(first + 1, dict(events[first], label="release.handed.again"))
+
+
+case(
+    "result-handed-over-twice",
+    "K1: one result the store produced is handed over twice, and no injection duplicates it.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=handed_twice,
+)
+
+# ------------------------------------------ the opening of an epoch
+GRANT = "one_grant_per_opened_epoch"
+
+
+def grant_twice(events):
+    first = at(events, "boot.grant")
+    events.insert(first + 1, dict(events[first], label="boot.grant.again"))
+
+
+case(
+    "epoch-granted-twice",
+    "One opened epoch, two grants handed over.",
+    {GRANT: "FAIL"},
+    events=grant_twice,
+)
+
+
+def grant_on_an_unknown(events):
+    deepcopy_payloads(events)
+    reply = events[at(events, "boot.opening.reply")]["payload"]
+    reply["outcome"] = "Unknown"
+    del reply["epoch"]
+
+
+case(
+    "epoch-granted-on-an-unknown-outcome",
+    "The opening's outcome is unknown, and a grant is handed over all the same.",
+    {GRANT: "FAIL"},
+    events=grant_on_an_unknown,
+)
+
+
+def reply_to_nothing(events):
+    events[at(events, "boot.opening.reply")]["parents"] = ["boot.opened"]
+
+
+case(
+    "opening-reply-to-no-submission",
+    "The core consumes an opening reply that answers no command the adapter submitted.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=reply_to_nothing,
+)
+
+
+def committed_another_epoch(events):
+    deepcopy_payloads(events)
+    events[at(events, "boot.opening.reply")]["payload"]["epoch"] = "5"
+    events[at(events, "boot.grant")]["payload"]["epoch"] = "5"
+
+
+case(
+    "opening-committed-for-an-epoch-the-store-did-not-open",
+    "The core is told its command opened epoch 5; the store opened epoch 1 for that attempt.",
+    {"broker_inputs_have_provenance": "FAIL", GRANT: "FAIL"},
+    events=committed_another_epoch,
+)
+
+
+def abandoned_then_committed(events):
+    # Start-up stops waiting, then the reply of the same attempt arrives
+    # before any new submission: it is honoured, and the grant is right.
+    reply = at(events, "boot.opening.reply")
+    events.insert(
+        reply,
+        ev(
+            "boot.abandoned",
+            "broker-core",
+            "OpeningAbandoned",
+            {"attempt": attempt(1)},
+            ["boot.opening"],
+        ),
+    )
+
+
+case(
+    "p1-02-good-opening-abandoned-then-committed",
+    "The start-up abandons its opening, then receives its committed reply; the grant follows it.",
+    events=abandoned_then_committed,
+)
+
 case(
     "provenance-input-refused",
     "The dispatcher refused a result that answered no effect in flight.",
@@ -2254,6 +2457,9 @@ def qabs_a():
     )
 
 
+qabs_a = handed(qabs_a)
+
+
 def qabs_a_snapshots(run):
     return {
         "after_commit": snapshot(run, "after_commit", [FIRST]),
@@ -2287,6 +2493,9 @@ def qabs_b():
             inspected("final"),
         ]
     )
+
+
+qabs_b = handed(qabs_b)
 
 
 def empty_snapshot(run, checkpoint, fences=()):
@@ -2328,6 +2537,9 @@ def qabs_c():
         ),
         inspected("unknown"),
     ]
+
+
+qabs_c = handed(qabs_c)
 
 
 def qabs_c_snapshots(run):
