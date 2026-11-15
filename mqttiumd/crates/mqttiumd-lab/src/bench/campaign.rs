@@ -271,6 +271,83 @@ fn narrow<T: TryFrom<u64>>(value: u64, name: &str) -> Result<T, String> {
     T::try_from(value).map_err(|_| format!("{name} does not fit"))
 }
 
+/// The process under test as a fixture sets it up: its settings, the
+/// data set installed through store commands, and the clients.
+pub struct Setup {
+    pub settings: Settings,
+    pub store: MemoryStore,
+    pub population: Population,
+}
+
+impl Setup {
+    /// Reads a fixture document (already validated) and installs it.
+    pub fn from_fixture(
+        fixture_document: &Value,
+        run_id: &str,
+        seed: u64,
+        faults: usize,
+    ) -> Result<Self, String> {
+        let plan = fixture::plan(fixture_document).map_err(|error| format!("{error:?}"))?;
+        let mut store = MemoryStore::create(plan.incarnation, plan.limits);
+        let installed =
+            fixture::install(&mut store, &plan).map_err(|error| format!("{error:?}"))?;
+        let population = Population {
+            clients: plan
+                .sessions
+                .iter()
+                .map(|session| {
+                    installed
+                        .sessions
+                        .get(&session.client)
+                        .map(|id| (session.client.clone(), session.client_id.clone(), *id))
+                        .ok_or_else(|| format!("{} has no session", session.client))
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        let limits = plan.limits;
+        let owner = owner_config(
+            narrow(limits.max_sessions as u64, "max_sessions")?,
+            narrow(limits.max_route_targets as u64, "max_route_targets")?,
+            narrow(limits.exchange_slots.get(), "exchange_slots")?,
+            limits.payload_bytes.get(),
+            RESOLUTION_DELAY,
+        )
+        .map_err(|Stop(reason)| reason)?;
+        let effect_slots: usize =
+            narrow(capacity(fixture_document, "effect_slots")?, "effect_slots")?;
+        let effect_slots = NonZeroUsize::new(effect_slots).ok_or("no effect slot")?;
+        let reservations = NonZeroU32::new(narrow(effect_slots.get() as u64, "reservations")?)
+            .ok_or("no reservation")?;
+        let leaked: &'static str = Box::leak(run_id.to_owned().into_boxed_str());
+        let settings = Settings {
+            run_id: leaked,
+            seed,
+            resolution_delay: RESOLUTION_DELAY,
+            work_limit: 4096,
+            recovery_page: 64,
+            effect_slots,
+            reservations,
+            adapter: AdapterLimits {
+                operations_in_flight: plan.operations_in_flight,
+                result_slots: plan.result_slots,
+                faults: faults.max(1),
+                events: 4096,
+            },
+            owner,
+            bounds: Bounds {
+                max_client_id: MAX_CLIENT_ID_BYTES,
+                max_topic: limits.max_topic_bytes,
+                max_payload: limits.max_payload_bytes,
+            },
+        };
+        Ok(Self {
+            settings,
+            store,
+            population,
+        })
+    }
+}
+
 /// Runs one campaign. An error is returned when nothing could be run;
 /// a run that stopped still leaves its directory.
 pub fn execute(request: &Request) -> Result<Report, String> {
@@ -320,61 +397,20 @@ pub fn execute(request: &Request) -> Result<Report, String> {
     }
     let fixture_bytes = fs::read(out.join(&fixture_path)).map_err(|error| io(out, error))?;
     let fixture_document = strict::parse(&fixture_bytes).map_err(|error| error.to_string())?;
-    let plan = fixture::plan(&fixture_document).map_err(|error| format!("{error:?}"))?;
-    let mut store = MemoryStore::create(plan.incarnation, plan.limits);
-    let installed = fixture::install(&mut store, &plan).map_err(|error| format!("{error:?}"))?;
-    let population = Population {
-        clients: plan
-            .sessions
-            .iter()
-            .map(|session| {
-                installed
-                    .sessions
-                    .get(&session.client)
-                    .map(|id| (session.client.clone(), session.client_id.clone(), *id))
-                    .ok_or_else(|| format!("{} has no session", session.client))
-            })
-            .collect::<Result<_, _>>()?,
-    };
-    let limits = plan.limits;
-    let owner = owner_config(
-        narrow(limits.max_sessions as u64, "max_sessions")?,
-        narrow(limits.max_route_targets as u64, "max_route_targets")?,
-        narrow(limits.exchange_slots.get(), "exchange_slots")?,
-        limits.payload_bytes.get(),
-        RESOLUTION_DELAY,
-    )
-    .map_err(|Stop(reason)| reason)?;
-    let effect_slots: usize = narrow(capacity(&fixture_document, "effect_slots")?, "effect_slots")?;
-    let effect_slots = NonZeroUsize::new(effect_slots).ok_or("no effect slot")?;
-    let reservations = NonZeroU32::new(narrow(effect_slots.get() as u64, "reservations")?)
-        .ok_or("no reservation")?;
     let run_id = request
         .run_id
         .clone()
         .unwrap_or_else(|| slug(&format!("{}-seed-{}", scenario.id, request.seed)));
-    let leaked: &'static str = Box::leak(run_id.clone().into_boxed_str());
-    let settings = Settings {
-        run_id: leaked,
-        seed: request.seed,
-        resolution_delay: RESOLUTION_DELAY,
-        work_limit: 4096,
-        recovery_page: 64,
-        effect_slots,
-        reservations,
-        adapter: AdapterLimits {
-            operations_in_flight: plan.operations_in_flight,
-            result_slots: plan.result_slots,
-            faults: scenario.faults.len().max(1),
-            events: 4096,
-        },
-        owner,
-        bounds: Bounds {
-            max_client_id: MAX_CLIENT_ID_BYTES,
-            max_topic: limits.max_topic_bytes,
-            max_payload: limits.max_payload_bytes,
-        },
-    };
+    let Setup {
+        settings,
+        store,
+        population,
+    } = Setup::from_fixture(
+        &fixture_document,
+        &run_id,
+        request.seed,
+        scenario.faults.len(),
+    )?;
     let schema_path = out.join(format!(
         "{}/trace-record.schema.json",
         files::contract_directories(Path::new(&contracts))?.1
