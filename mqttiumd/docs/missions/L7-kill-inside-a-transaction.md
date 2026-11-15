@@ -25,22 +25,32 @@ the guards and writes of the command, the meta row one revision later,
 | - | - | - | - |
 | K1 `store.commit.prepared` | in `transact`, after the meta row is written, before `tx.commit()` | store (L7) | yes |
 | K2a during `COMMIT`, before its commit frame is durable | inside the engine | nobody: no safe hook | no: random kills, and a WAL-cut emulation |
-| K2b `store.commit.logged` | the engine's WAL hook: the commit frame is written and synced, `COMMIT` has not returned | store (L7) | yes, with a cost below |
+| K2b `store.commit.logged` | the engine's WAL hook: the commit frame is written and synced, `COMMIT` has not returned; before, and after, the checkpoint the hook runs at the threshold | store (L7) | yes |
 | K3 `store.commit.applied` | the existing barrier of the adapter: `COMMIT` returned, no result exists | adapter (L2), exists | yes |
 
 Out of the production binary. K1 and K2b live behind a cargo feature
 `kill-points` of `mqttiumd-store-sqlite`, off by default, enabled only by
 the child build of the bench. The hook is a plain callback set on the
-store (`fn(KillPoint)`), compiled out without the feature; no `unsafe`:
-K2b uses rusqlite's safe `Connection::wal_hook` (feature `hooks`). The
-store records `kill_points: bool` in its effective settings, so the
-campaign manifest shows which build ran; a check fails a build of the
-product in which the feature is on (`cargo tree -e features`).
+store (`SqliteStore::set_kill_hook`), compiled out without the feature;
+no `unsafe`: K2b uses rusqlite's safe `Connection::wal_hook` (feature
+`hooks`, turned on by `kill-points` only). The store records
+`kill_points: bool` in its effective settings, so the campaign manifest
+shows which build ran; `tools/check_kill_points.sh` fails when a manifest
+of the workspace turns the feature on (`cargo tree -e normal,features`):
+it is only ever asked for on a command line.
 
-Cost of K2b. A WAL hook replaces the engine's autocheckpoint
-(`sqlite3_wal_autocheckpoint` is itself a WAL hook). A run armed at K2b
-has no automatic checkpoint, and says so; the checkpoint inside `COMMIT`
-is covered by K2a, not by K2b.
+The checkpoint at K2b. A WAL hook replaces the engine's autocheckpoint
+(`sqlite3_wal_autocheckpoint` is itself a WAL hook): measured, with a hook
+set the pragma reads 0 and the WAL grows past the threshold. The store's
+hook therefore checkpoints itself, as the engine's would: a passive
+checkpoint once the WAL holds `wal_autocheckpoint` frames, its error
+ignored. Measured, the WAL then stays at the size the engine gives
+without a hook, and a test bounds it to the threshold and one commit.
+K2b has two variants: killed before that checkpoint, and killed after it
+on the commit that reached the threshold, where the database file alone
+already holds the command. The hook is installed only while a kill hook
+is set; without one the engine's own autocheckpoint stands. A kill during
+the checkpoint itself is not a deterministic point: it belongs to K2a.
 
 ## What the child writes before the kill
 

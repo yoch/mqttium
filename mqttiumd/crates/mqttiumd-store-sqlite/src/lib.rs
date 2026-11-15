@@ -1333,10 +1333,44 @@ impl SqliteStore {
     }
 
     /// Sets the function the store calls at each kill point, or removes it.
+    ///
+    /// While a hook is set, the store holds the engine's WAL hook, which
+    /// passes `CommitLogged` on every commit. A WAL hook replaces the
+    /// engine's autocheckpoint (`sqlite3_wal_autocheckpoint` is itself one),
+    /// so the store's hook checkpoints as the engine would have: a passive
+    /// checkpoint once the WAL holds `wal_autocheckpoint` frames, its error
+    /// ignored as the engine ignores it, then `CommitCheckpointed`.
+    /// Removing the hook gives the engine its autocheckpoint back, at the
+    /// value read back at opening. A later call of
+    /// `set_wal_autocheckpoint_for_measurement` removes the WAL hook.
     #[cfg(feature = "kill-points")]
     pub fn set_kill_hook(&mut self, hook: Option<kill_points::Hook>) -> Result<(), OpenError> {
+        use kill_points::{KillPoint, pass};
+        let armed = hook.is_some();
         if let Ok(mut held) = self.kill_hook.lock() {
             *held = hook;
+        }
+        let threshold = self.settings.wal_autocheckpoint;
+        if armed {
+            let shared = std::sync::Arc::clone(&self.kill_hook);
+            self.conn.wal_hook(Some(
+                move |wal: &mut rusqlite::hooks::Wal, frames: std::ffi::c_int| {
+                    pass(&shared, KillPoint::CommitLogged);
+                    if threshold > 0 && i64::from(frames) >= threshold {
+                        // As the engine's own hook: passive, and an error
+                        // of the checkpoint is not an error of the commit.
+                        let _ = wal.checkpoint();
+                        pass(&shared, KillPoint::CommitCheckpointed);
+                    }
+                    Ok(())
+                },
+            ))?;
+        } else {
+            self.conn.wal_hook(
+                None::<fn(&mut rusqlite::hooks::Wal, std::ffi::c_int) -> rusqlite::Result<()>>,
+            )?;
+            self.conn
+                .pragma_update(None, "wal_autocheckpoint", threshold)?;
         }
         Ok(())
     }

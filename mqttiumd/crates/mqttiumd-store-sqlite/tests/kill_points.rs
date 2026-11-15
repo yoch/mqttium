@@ -221,9 +221,20 @@ impl Drop for Holder {
     }
 }
 
+/// What the database file holds on its own, without its WAL: read from a
+/// copy of that one file, taken before the kill. The copy only reads the
+/// live file; nothing is written to it or to its WAL.
+fn database_alone(path: &Path) -> mqttiumd_lab::store::durable::DurableState {
+    let copy = fresh_path();
+    std::fs::copy(path, &copy).expect("copied");
+    let alone = SqliteStore::open(&copy).expect("the database file alone opens");
+    alone.try_snapshot().expect("decodes")
+}
+
 /// Kills the child at `point` and reopens its file: what is durable
 /// equals the reference after the commands before the one cut, and that
-/// one too when `durable`. The command cut, submitted again, gets the
+/// one too when `durable`; after the checkpoint, the database file alone
+/// holds the command. The command cut, submitted again, gets the
 /// answer of the reference.
 fn killed_at(point: KillPoint, durable: bool) -> usize {
     let path = fresh_path();
@@ -233,6 +244,21 @@ fn killed_at(point: KillPoint, durable: bool) -> usize {
     for command in &commands[..cut] {
         let _ = reference.store.apply(command);
     }
+    let before = reference.store.snapshot();
+    let mut after_cut = crate::reference();
+    for command in &commands[..=cut] {
+        let _ = after_cut.store.apply(command);
+    }
+    let after = after_cut.store.snapshot();
+    // After the checkpoint, the database file holds the command on its
+    // own. Before it, the commits are in the WAL only: nothing to compare.
+    if point == KillPoint::CommitCheckpointed {
+        assert_eq!(
+            database_alone(&path),
+            after,
+            "the checkpoint copied the command into the database"
+        );
+    }
     if durable {
         assert!(reference.store.apply(&commands[cut]).committed_now);
     }
@@ -240,11 +266,11 @@ fn killed_at(point: KillPoint, durable: bool) -> usize {
     // No intervention between the kill and the restart: `open` takes the
     // writer's lock the kernel released, and runs `PRAGMA quick_check`.
     let mut store = SqliteStore::open(&path).expect("opened after the kill");
-    let after = store.try_snapshot().expect("decodes");
-    assert_eq!(accounts_match_what_is_held(&after), Ok(()));
+    let recovered = store.try_snapshot().expect("decodes");
+    assert_eq!(accounts_match_what_is_held(&recovered), Ok(()));
     assert_eq!(
-        after,
-        reference.store.snapshot(),
+        recovered,
+        if durable { after } else { before },
         "the whole durable state is the prefix{}",
         if durable { " and the command cut" } else { "" }
     );
