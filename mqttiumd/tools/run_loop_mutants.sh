@@ -2,8 +2,10 @@
 # Plays the mutations of the real loop (lot L4) and checks that the oracle
 # rejects each for its own reason. Run from the mqttiumd directory:
 #
-#   tools/run_loop_mutants.sh
+#   tools/run_loop_mutants.sh [--backend sim-store|sqlite]
 #
+# The runner plays every mutation on the backend given (sim-store when
+# none is); an entry that names `backends` is played only on those.
 # Each mutation of tests/mutants/loop/ is a unified diff named *.mutant
 # (the root .gitignore ignores *.patch and *.diff as review artefacts). It
 # is applied to a temporary worktree of the repository, never to the
@@ -17,6 +19,12 @@
 # reported, with the finding it waits for, and does not change the status.
 set -euo pipefail
 
+backend=sim-store
+if [[ ${1:-} == --backend ]]; then
+    backend=${2:?--backend needs a name}
+    shift 2
+fi
+[[ $# -eq 0 ]] || { echo "usage: $0 [--backend sim-store|sqlite]" >&2; exit 64; }
 here=$(pwd)
 expected=tests/mutants/loop/expected.json
 repository=$(git rev-parse --show-toplevel)
@@ -33,6 +41,10 @@ failures=0
 ids=$(python3 -c "import json,sys; print(' '.join(m['id'] for m in json.load(open(sys.argv[1]))['mutants']))" "$expected")
 for id in $ids; do
     field() { python3 -c "import json,sys; m=[m for m in json.load(open(sys.argv[1]))['mutants'] if m['id']==sys.argv[2]][0]; print(m.get(sys.argv[3],''))" "$expected" "$id" "$1"; }
+    if ! python3 -c "import json,sys; m=[m for m in json.load(open(sys.argv[1]))['mutants'] if m['id']==sys.argv[2]][0]; sys.exit(0 if sys.argv[3] in m.get('backends', [sys.argv[3]]) else 1)" "$expected" "$id" "$backend"; then
+        echo "$id: not played on $backend: $(field not_on)"
+        continue
+    fi
     patch="$here/tests/mutants/loop/$(field patch)"
     scenario=$(field scenario)
     tree="$work/tree-$id"
@@ -44,7 +56,7 @@ for id in $ids; do
     fi
     campaign="$work/campaign-$id"
     if ! (cd "$tree/mqttiumd" && CARGO_TARGET_DIR="$work/target" cargo run -q -p mqttiumd-lab --locked -- \
-        run --contracts contracts/v1 --scenario "$scenario" --out "$campaign" >/dev/null); then
+        run --contracts contracts/v1 --scenario "$scenario" --out "$campaign" --backend "$backend" >/dev/null); then
         echo "$id: no campaign was written"
         failures=$((failures + 1))
         continue
@@ -89,4 +101,4 @@ if [[ $failures -ne 0 ]]; then
     echo "$failures mutation(s) not rejected as expected"
     exit 1
 fi
-echo "every mutation expected to be rejected was rejected for its reason"
+echo "every mutation expected to be rejected was rejected for its reason on $backend"

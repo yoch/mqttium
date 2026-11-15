@@ -62,14 +62,33 @@ acknowledged.
 The frame size and the window are working values; the run manifest
 records them as effective parameters.
 
+## Causal parents of the supervisor and the peers
+
+> The supervisor names what it had read when it acted: the last record
+> of each origin of the process under test and the last record of the
+> peer; a peer names the last supervisor record it acted on and what it
+> observed on its connection; neither names a record it had not read.
+
+One record per origin of the child, not the last record of the child:
+the order of arrival between two origins is not a causality. A peer sees
+bytes only; it never names an internal record of the child, and what it
+observed it names through its own `PeerPacketObserved`. The header and
+the footer name nothing. The collector adds these parents; the in-process
+runner writes them today, the child protocol will keep them.
+
 ## Failure model
 
 Stated as a limit of S0, not as a property of the product, in this plan
 and in `failure_model`:
 
 > Kill of the process at a declared point, after the decisive record is
-> acknowledged; never in the middle of a transaction; no power loss, no
-> torn write.
+> acknowledged. The kernel and its page cache survive; nothing is shown
+> about fsync, power loss or torn writes.
+
+A kill of the process does not exercise `fsync`: what the process wrote
+is in the page cache, which survives it. "Never inside a transaction" is
+a restriction of the bench (a kill is allowed only in the states below),
+not a property of the store.
 
 | Backend | Crash |
 | - | - |
@@ -79,10 +98,11 @@ and in `failure_model`:
 A kill is allowed in two states only: the child waits for an action,
 with every record acknowledged and the window empty; or the child stands
 at a declared point (a barrier, a fault that holds) after the decisive
-record that describes it was acknowledged. A commit is reported as
-`StoreCommitStable` only once the SQLite writer has returned it; the
-effective `journal_mode` and `synchronous`, read back, go into the
-manifest (DEM-011).
+record that describes it was acknowledged. No inspector is open at a
+kill. A commit is reported as `StoreCommitStable` only after a `COMMIT`
+that succeeded; an error of `COMMIT` is an unknown outcome, never a
+certain rejection. The effective `journal_mode` and `synchronous`, read
+back, go into the manifest (DEM-011).
 
 ## Crash and restart
 
@@ -96,20 +116,34 @@ states their number and their origins, so that the refusal is in the
 trace and not only in a counter; the footer then declares the trace
 incomplete.
 
-Nothing opens the data set between the kill and the restart: recovering
-the WAL belongs to the restarted child. `RestartBroker` starts a new
-child with the next rank; its origins start a new incarnation, it opens
-a new epoch, and the supervisor writes `BrokerRecovered`.
+Between the kill and the restart nothing opens, copies, moves or deletes
+the database or its `-wal` and `-shm` files: recovering the WAL belongs
+to the restarted child. A proof drawn from a copy of the database
+without its `-wal` is false.
+
+`RestartBroker` starts a new child with the next rank. On SQLite the
+child, in this order: reads `user_version` before any write; sets
+`journal_mode` and `synchronous`, reads them back, and refuses to go on
+when they differ; reads back the engine version and the options, which
+the supervisor compares to the manifest; runs `PRAGMA quick_check`;
+decodes the meta row. The bench then starts the core: the incarnation is
+the one of the fixture, the recovery pages are read, and the new epoch
+opens (`EpochOpening`). One writer only: `busy_timeout = 0` and
+`BEGIN IMMEDIATE`, so that a second writer is refused instead of
+waiting. Its origins start a new incarnation, and the supervisor writes
+`BrokerRecovered`.
 
 ## Inspection
 
-The inspector reads without the writer. On SQLite it opens the data set
-read-only while the child is alive, reads one snapshot, and holds no read
-transaction open beyond it, so that it never blocks the checkpoint of
-the child's WAL (lot L7 confirms). Between a kill and the restart an
-inspection is refused on SQLite. On `sim-store` the child answers an
-inspection action with the durable state of its store, read without the
-writer.
+The inspector reads without the writer. On SQLite it uses
+`SqliteStore::inspect(path) -> Result<DurableState, OpenError>` of lot L7: the database
+opened with `mode=ro`, never `immutable=1`; one read transaction; the
+connection closed at once; never a checkpoint. No inspector is open at a
+kill, and between a kill and the restart an inspection is refused on
+SQLite. The in-process runner already reads this way, and states it in
+`backend_settings` of `campaign.json`. On `sim-store` the child answers
+an inspection action with the durable state of its store, read without
+the writer.
 
 ## Determinism
 

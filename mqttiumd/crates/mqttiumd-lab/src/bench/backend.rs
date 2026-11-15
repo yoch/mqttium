@@ -7,6 +7,8 @@
 //! the broker, and what the manifest must say about the engine. A backend
 //! states those four things and nothing else.
 
+use std::path::PathBuf;
+
 use serde_json::{Value, json};
 
 use mqttiumd_contract::ids::StoreIncarnation;
@@ -76,5 +78,95 @@ impl Backend for Memory {
 
     fn crash(&self) -> &'static str {
         "simulated: the process under test is dropped and its store reopened from its durable state, in the same operating-system process"
+    }
+}
+
+/// How the inspector of the SQLite backend reads the durable state.
+const INSPECTOR: &str = "SqliteStore::inspect: a connection of its own opened read-only (mode=ro, never immutable), one read transaction, closed before the snapshot is written; no checkpoint; never the writer's connection";
+
+/// The SQLite store of lot L7, in one file of the campaign.
+#[derive(Clone, Debug)]
+pub struct Sqlite {
+    /// The file of the data set.
+    pub path: PathBuf,
+    /// The settings the engine read back at the last opening.
+    settings: Option<Value>,
+}
+
+impl Sqlite {
+    /// The store of a campaign, in `path`, which does not exist yet.
+    #[must_use]
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            settings: None,
+        }
+    }
+
+    fn remember(&mut self, store: &mqttiumd_store_sqlite::SqliteStore) {
+        let settings = store.effective_settings();
+        self.settings = Some(json!({
+            "engine": "sqlite",
+            "sqlite_version": settings.sqlite_version,
+            "compile_options": settings.compile_options,
+            "journal_mode": settings.journal_mode,
+            "synchronous": settings.synchronous,
+            "user_version": settings.user_version,
+            "page_size": settings.page_size,
+            "wal_autocheckpoint": settings.wal_autocheckpoint,
+            "read_back": "after they were set, at each opening",
+        }));
+    }
+}
+
+impl Backend for Sqlite {
+    type Store = mqttiumd_store_sqlite::SqliteStore;
+
+    fn name(&self) -> &'static str {
+        "sqlite"
+    }
+
+    fn create(
+        &mut self,
+        incarnation: StoreIncarnation,
+        limits: Limits,
+    ) -> Result<Self::Store, String> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("{}: {error}", parent.display()))?;
+        }
+        let store = mqttiumd_store_sqlite::SqliteStore::create(&self.path, incarnation, limits)
+            .map_err(|error| format!("{}: {error:?}", self.path.display()))?;
+        self.remember(&store);
+        Ok(store)
+    }
+
+    fn reopen_after_crash(&mut self, store: Self::Store) -> Result<Self::Store, String> {
+        // The connection goes with the process; the next start-up opens
+        // the same file and finds what the engine made durable.
+        drop(store);
+        let store = mqttiumd_store_sqlite::SqliteStore::open(&self.path)
+            .map_err(|error| format!("{}: {error:?}", self.path.display()))?;
+        self.remember(&store);
+        Ok(store)
+    }
+
+    fn inspect(&self, _store: &Self::Store) -> Result<DurableState, String> {
+        // Without the writer: a connection of its own, read-only, one read
+        // transaction, closed before the answer; never a checkpoint.
+        mqttiumd_store_sqlite::SqliteStore::inspect(&self.path)
+            .map_err(|error| format!("{}: {error:?}", self.path.display()))
+    }
+
+    fn describe(&self) -> Value {
+        let mut settings = self.settings.clone().unwrap_or(Value::Null);
+        if let Some(settings) = settings.as_object_mut() {
+            settings.insert("inspector".to_owned(), json!(INSPECTOR));
+        }
+        settings
+    }
+
+    fn crash(&self) -> &'static str {
+        "simulated: the store adapter and its connection are dropped and the same file is opened again, in the same operating-system process; no process is killed"
     }
 }

@@ -372,11 +372,71 @@ impl<S: crate::store::durable::DurableStore> Setup<S> {
 /// Runs one campaign. An error is returned when nothing could be run;
 /// a run that stopped still leaves its directory.
 pub fn execute(request: &Request) -> Result<Report, String> {
+    refuse_inside_work_tree(&request.root, &request.out)?;
     match request.backend.as_str() {
         "sim-store" => execute_with(request, Memory),
-        "sqlite" => Err("the sqlite backend is not available yet: lot L7 provides it".to_owned()),
+        "sqlite" => execute_with(
+            request,
+            super::backend::Sqlite::new(request.out.join("store").join("mqttiumd.sqlite")),
+        ),
         other => Err(format!("unknown backend {other}: sim-store or sqlite")),
     }
+}
+
+/// A campaign is generated: it is never written inside the work tree of
+/// the repository that holds `root`, where it would be a modification of
+/// the checkout it describes. Nothing is created before the refusal. A
+/// root outside any repository has no work tree to protect.
+pub fn refuse_inside_work_tree(root: &Path, out: &Path) -> Result<(), String> {
+    let Ok(listed) = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(root)
+        .output()
+    else {
+        return Ok(());
+    };
+    if !listed.status.success() {
+        return Ok(());
+    }
+    let top = String::from_utf8(listed.stdout)
+        .map_err(|_| "the work tree is not a UTF-8 path".to_owned())?;
+    let top = Path::new(top.trim_end_matches('\n'));
+    let top = top.canonicalize().map_err(|error| io(top, error))?;
+    let absolute = if out.is_absolute() {
+        out.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("the current directory: {error}"))?
+            .join(out)
+    };
+    // The deepest part of the path that exists, resolved; the rest, which
+    // does not exist yet, appended as written.
+    let mut existing = absolute.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return Err(format!("{} cannot be resolved", out.display()));
+        };
+        missing.push(name.to_owned());
+        existing = parent;
+    }
+    let mut resolved = existing
+        .canonicalize()
+        .map_err(|error| io(existing, error))?;
+    for name in missing.iter().rev() {
+        if name == ".." || name == "." {
+            return Err(format!("{} cannot be resolved", out.display()));
+        }
+        resolved.push(name);
+    }
+    if resolved.starts_with(&top) {
+        return Err(format!(
+            "--out {} is inside the work tree of the repository ({}): a campaign is generated and is written outside it",
+            out.display(),
+            top.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Runs one campaign on `backend`.
@@ -479,7 +539,7 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
 
     let out_text = out.display().to_string();
     let replay = format!(
-        "cargo run -p mqttiumd-lab --locked -- run --contracts {contracts} --scenario {scenario_path} --seed {} --run-id {run_id} --out <empty directory>",
+        "cargo run -p mqttiumd-lab --locked -- run --contracts {contracts} --scenario {scenario_path} --seed {} --run-id {run_id} --out <empty directory outside the work tree>",
         request.seed
     );
     let judge = format!(
@@ -587,6 +647,15 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     paths.extend(outcome.snapshots.iter().map(|(path, _)| path.clone()));
     if request.built_from.is_some() {
         paths.push("source.tar".to_owned());
+    }
+    // The data set of a backend that keeps one in the campaign.
+    if let Ok(entries) = fs::read_dir(out.join("store")) {
+        let mut stored: Vec<String> = entries
+            .filter_map(Result::ok)
+            .map(|entry| format!("store/{}", entry.file_name().to_string_lossy()))
+            .collect();
+        stored.sort();
+        paths.extend(stored);
     }
     paths.extend(modified.iter().cloned());
     let (contract_dir, schema_dir) = files::contract_directories(Path::new(&contracts))?;

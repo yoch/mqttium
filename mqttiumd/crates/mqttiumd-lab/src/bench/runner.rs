@@ -149,6 +149,10 @@ struct Runner<'a, B: Backend> {
     /// The barriers a `LeaveBarrier` step left, by scenario fault.
     left_barriers: std::collections::BTreeSet<usize>,
     step_index: usize,
+    /// Why the step that stopped the run could not end, when it was a
+    /// wait: `quiescent` (nothing eligible, the wait unmet) or `budget`
+    /// (its `max_steps`, or the scenario's, ran out).
+    blocked: Option<&'static str>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -303,6 +307,37 @@ impl<B: Backend> Runner<'_, B> {
         Ok(())
     }
 
+    /// The stop of a step whose wait could not be met, for `cause`.
+    fn blocked(&mut self, cause: &'static str, reason: &str) -> Stop {
+        self.blocked = Some(cause);
+        Stop::new(reason)
+    }
+
+    /// The `StepBlocked` record of a run that stopped in a wait: the step,
+    /// why, and what still waited. Written at the stop, before the footer.
+    fn write_blocked(&mut self, cause: &'static str) -> Result<(), Stop> {
+        let step = &self.scenario.steps[self.step_index];
+        let armed = self
+            .process
+            .as_ref()
+            .map_or(0, super::process::Process::armed_deadlines);
+        let holding: Vec<&str> = self
+            .books
+            .held
+            .keys()
+            .map(|index| self.scenario.faults[*index].id.as_str())
+            .collect();
+        let payload = json!({
+            "step": self.step_index.to_string(),
+            "step_kind": step.kind(),
+            "cause": cause,
+            "armed_deadlines": armed.to_string(),
+            "holding_faults": holding,
+        });
+        self.emit(Origin::BenchSupervisor, "StepBlocked", &[], payload)?;
+        Ok(())
+    }
+
     /// One elementary choice, drawn among the eligible ones. Returns
     /// false when nothing is eligible.
     fn choose(&mut self, budget: &mut u64) -> Result<bool, Stop> {
@@ -311,10 +346,10 @@ impl<B: Backend> Runner<'_, B> {
             return Ok(false);
         }
         if *budget == 0 {
-            return Err(Stop::new("the step exhausted its max_steps"));
+            return Err(self.blocked("budget", "the step exhausted its max_steps"));
         }
         if self.elementary >= self.scenario.max_steps {
-            return Err(Stop::new("the run exhausted the max_steps of the scenario"));
+            return Err(self.blocked("budget", "the run exhausted the max_steps of the scenario"));
         }
         *budget -= 1;
         self.elementary += 1;
@@ -415,7 +450,8 @@ impl<B: Backend> Runner<'_, B> {
                 return Ok(());
             }
             if !self.choose(&mut budget)? {
-                return Err(Stop::new(
+                return Err(self.blocked(
+                    "quiescent",
                     "nothing is eligible and the awaited event did not happen",
                 ));
             }
@@ -574,7 +610,7 @@ impl<B: Backend> Runner<'_, B> {
                 let mut budget = *max_steps;
                 while self.process()?.busy() {
                     if !self.choose(&mut budget)? {
-                        return Err(Stop::new("an effect stays in the box"));
+                        return Err(self.blocked("quiescent", "an effect stays in the box"));
                     }
                 }
                 let process = self
@@ -595,7 +631,7 @@ impl<B: Backend> Runner<'_, B> {
                         .ok_or_else(|| Stop::new("the broker is not running"))?;
                     process.settle(&mut self.collector, &mut self.books)?;
                     if self.process()?.busy() && !self.choose(&mut budget)? {
-                        return Err(Stop::new("the deadline was not consumed"));
+                        return Err(self.blocked("quiescent", "the deadline was not consumed"));
                     }
                 }
                 Ok(())
@@ -630,7 +666,7 @@ impl<B: Backend> Runner<'_, B> {
                 let mut budget = *max_steps;
                 while self.process()?.busy() {
                     if !self.choose(&mut budget)? {
-                        return Err(Stop::new("the held result was not consumed"));
+                        return Err(self.blocked("quiescent", "the held result was not consumed"));
                     }
                 }
                 Ok(())
@@ -785,6 +821,7 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         awaited: vec![0; scenario.faults.len()],
         left_barriers: std::collections::BTreeSet::new(),
         step_index: 0,
+        blocked: None,
     };
     let mut stopped = header
         .err()
@@ -802,6 +839,7 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
                 stopped = Some(format!("step {index} ({}): {reason}", step.kind()));
                 break;
             }
+            runner.blocked = None;
             played += 1;
         }
     }
@@ -817,6 +855,19 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
             )
         })
         .collect();
+    // A wait that could not be met is a fact of the run, stated before the
+    // footer; the trace stays complete. Any other stop cuts it.
+    let mut complete = stopped.is_none();
+    if stopped.is_some()
+        && let Some(cause) = runner.blocked
+    {
+        match runner.write_blocked(cause) {
+            Ok(()) => complete = true,
+            Err(Stop(reason)) => {
+                stopped = stopped.map(|stopped| format!("{stopped}; StepBlocked: {reason}"));
+            }
+        }
+    }
     let Runner {
         collector,
         books,
@@ -825,7 +876,7 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         elementary,
         ..
     } = runner;
-    let (trace, refusals) = collector.finish(stopped.is_none());
+    let (trace, refusals) = collector.finish(complete);
     Outcome {
         trace,
         snapshots,
