@@ -105,6 +105,38 @@
       "verdict": "FAIL",
       "assertion": "one_admission_per_observed_inbound_exchange",
       "reason": "has 2 admissions"
+    },
+    {
+      "id": "n3-no-signal-the-child-exits",
+      "patch": "n3-no-signal-the-child-exits.mutant",
+      "mutation": "at CrashBroker the supervisor sends no signal: it closes the standard input of the child, which exits on its own",
+      "scenario": "tests/scenarios/p1/P1-02.json",
+      "backends": [
+        "sqlite"
+      ],
+      "process": "child",
+      "not_on": "the mutation is in the child process, which runs on sqlite only",
+      "expect": "rejected",
+      "verdict": "INCONCLUSIVE",
+      "assertion": "trace_complete",
+      "assertion_status": "INCONCLUSIVE",
+      "reason": "the footer does not declare the trace complete",
+      "stopped": "not by SIGKILL",
+      "note": "The supervisor's own check refuses a wait status that is not signal 9 with no exit code: the run stops at the crash and the trace is cut."
+    },
+    {
+      "id": "n4-exit-taken-for-a-kill",
+      "patch": "n4-exit-taken-for-a-kill.mutant",
+      "mutation": "at CrashBroker the supervisor sends no signal and takes whatever wait status it gets for a kill",
+      "scenario": "tests/scenarios/p1/P1-02.json",
+      "backends": [
+        "sqlite"
+      ],
+      "process": "child",
+      "not_on": "the mutation is in the child process, which runs on sqlite only",
+      "expect": "survives-known",
+      "finding": "decision 0019 (lot L3): the record BrokerKilled and the assertion that a run claiming a real kill shows one",
+      "note": "The trace says nothing of the kill yet: the oracle judges it PASS, and only campaign.json shows a wait status of signal 0. Once BrokerKilled is in the contract and the bench writes it from the observed status, the oracle must reject this run."
     }
   ]
 }
