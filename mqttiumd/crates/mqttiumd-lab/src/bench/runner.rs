@@ -761,7 +761,13 @@ impl<B: Backend> Runner<'_, B> {
                     // without it, read-only.
                     (Some(Broker::Child(_)), _) => self.backend.inspect(None),
                     (None, Some(store)) => self.backend.inspect(Some(store)),
-                    (None, None) if self.child.is_some() => self.backend.inspect(None),
+                    // A rule of the supervisor: between a kill and the
+                    // restart nothing opens the database.
+                    (None, None) if self.child.is_some() => {
+                        return Err(Stop::new(
+                            "between the kill and the restart nothing opens the database: an inspection there is refused",
+                        ));
+                    }
                     (None, None) => return Err(Stop::new("no data set to inspect")),
                 }
                 .map_err(Stop::new)?;
@@ -822,6 +828,18 @@ impl<B: Backend> Runner<'_, B> {
                         open.sort_by_key(|(generation, _)| generation.get());
                         let open = open.into_iter().map(|(_, name)| name).collect();
                         let killed = child.kill()?;
+                        // The kill as the wait status showed it, before the
+                        // crash (decision 0019); its process identifier goes
+                        // to campaign.json only.
+                        self.emit(
+                            Origin::BenchSupervisor,
+                            "BrokerKilled",
+                            &[],
+                            json!({
+                                "signal_sent": killed.signal_sent,
+                                "wait_status": {"signal": killed.wait_signal},
+                            }),
+                        )?;
                         self.kills.push(killed);
                         (None, open)
                     }
@@ -873,11 +891,16 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         mut collector,
         child,
     } = plan;
-    let header = json!({
+    let mut header = json!({
         "scenario_id": scenario.id,
         "backend": backend.name(),
         "perimeter": "full",
     });
+    // Where the broker runs (decision 0019); absent means in-process, so
+    // that an in-process trace does not change.
+    if child.is_some() {
+        header["broker"] = json!("child-process");
+    }
     let header = collector.emit(Origin::BenchSupervisor, "TraceHeader", &[], header);
     let clients = population
         .clients

@@ -36,6 +36,8 @@
     "contracts/examples/v1/valid/trace-record-opening-abandoned.json",
     "contracts/examples/v1/valid/trace-record-epoch-grant-handed-over.json",
     "contracts/examples/v1/valid/trace-record-step-blocked.json",
+    "contracts/examples/v1/valid/trace-record-broker-killed.json",
+    "contracts/examples/v1/valid/trace-record-header-of-a-child-process.json",
     "contracts/examples/v1/valid/trace-record-store-result-rejected.json",
     "contracts/examples/v1/valid/trace-record-store-result-violation.json",
     "contracts/examples/v1/valid/trace-record-store-result-delivered-rejected.json",
@@ -68,6 +70,7 @@
     "contracts/examples/v1/valid/run-result-provisional-nothing-evaluated.json",
     "contracts/examples/v1/valid/run-manifest-content-only.json",
     "contracts/examples/v1/valid/run-manifest-with-oracle-and-generators.json",
+    "contracts/examples/v1/valid/run-manifest-of-a-child-process.json",
     "contracts/examples/v1/valid/run-manifest-built-from-its-source.json",
     "contracts/examples/v1/valid/toy.catalog.json",
     "contracts/examples/v1/valid/toy.transitions.complete.json",
@@ -850,6 +853,54 @@
       "why": "Each fault that holds an item is named once."
     },
     {
+      "file": "contracts/examples/v1/invalid/trace-record-broker-killed-by-another-signal.json",
+      "code": "schema-violation",
+      "pointer": "/payload/signal_sent",
+      "why": "The supervisor kills the broker with SIGKILL, the one signal it cannot catch."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-broker-killed-that-exited.json",
+      "code": "schema-violation",
+      "pointer": "/payload/wait_status",
+      "why": "A status of a process that exited is no kill: it is not written by this record."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-broker-killed-by-signal-zero.json",
+      "code": "schema-violation",
+      "pointer": "/payload/wait_status/signal",
+      "why": "A signal number is from 1 to 64."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-broker-killed-by-signal-sixty-five.json",
+      "code": "schema-violation",
+      "pointer": "/payload/wait_status/signal",
+      "why": "A signal number is from 1 to 64."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-broker-killed-with-its-pid.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "The trace names no pid: the same seed gives the same bytes; the pid goes to campaign.json."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-broker-killed-without-its-status.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "The record states the status wait() returned."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-broker-killed-stated-by-the-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "Only the supervisor kills the broker."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-header-of-an-unknown-topology.json",
+      "code": "schema-violation",
+      "pointer": "/payload/broker",
+      "why": "A broker runs in the process of the bench or as a child process."
+    },
+    {
       "file": "contracts/examples/v1/invalid/trace-record-violation-without-its-kind.json",
       "code": "schema-violation",
       "pointer": "/payload",
@@ -1406,6 +1457,12 @@
       "code": "schema-violation",
       "pointer": "/oracle",
       "why": "An identity names the files it is the digest of."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-of-an-unknown-topology.json",
+      "code": "schema-violation",
+      "pointer": "/broker",
+      "why": "A broker runs in the process of the bench or as a child process."
     },
     {
       "file": "contracts/examples/v1/invalid/run-manifest-built-from-nothing.json",

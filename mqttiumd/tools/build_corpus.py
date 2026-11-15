@@ -1419,6 +1419,21 @@ BLOCKED = record(
     },
 )
 ok("trace-record-step-blocked.json", BLOCKED)
+# A real kill (record 0019): the broker runs as a child process, the
+# supervisor sends SIGKILL and records the status wait() returned, before
+# BrokerCrashed. The trace header says the run claims it.
+KILLED = record(
+    10,
+    "bench-supervisor",
+    4,
+    "BrokerKilled",
+    {"signal_sent": "SIGKILL", "wait_status": {"signal": 9}},
+    [("broker-core", 7)],
+)
+ok("trace-record-broker-killed.json", KILLED)
+CHILD_HEADER = copy.deepcopy(HEADER)
+CHILD_HEADER["payload"]["broker"] = "child-process"
+ok("trace-record-header-of-a-child-process.json", CHILD_HEADER)
 REJECTED = record(
     7,
     "store-evidence",
@@ -1788,6 +1803,62 @@ trace_case(
     "/payload/holding_faults",
     "Each fault that holds an item is named once.",
     setter(["payload", "holding_faults"], ["hold_result", "hold_result"]),
+)
+trace_case(
+    "broker-killed-by-another-signal",
+    KILLED,
+    "/payload/signal_sent",
+    "The supervisor kills the broker with SIGKILL, the one signal it cannot catch.",
+    setter(["payload", "signal_sent"], "SIGTERM"),
+)
+trace_case(
+    "broker-killed-that-exited",
+    KILLED,
+    "/payload/wait_status",
+    "A status of a process that exited is no kill: it is not written by this record.",
+    setter(["payload", "wait_status"], {"exited": 0}),
+)
+trace_case(
+    "broker-killed-by-signal-zero",
+    KILLED,
+    "/payload/wait_status/signal",
+    "A signal number is from 1 to 64.",
+    setter(["payload", "wait_status", "signal"], 0),
+)
+trace_case(
+    "broker-killed-by-signal-sixty-five",
+    KILLED,
+    "/payload/wait_status/signal",
+    "A signal number is from 1 to 64.",
+    setter(["payload", "wait_status", "signal"], 65),
+)
+trace_case(
+    "broker-killed-with-its-pid",
+    KILLED,
+    "/payload",
+    "The trace names no pid: the same seed gives the same bytes; the pid goes to campaign.json.",
+    lambda v: v["payload"].update(pid=4242),
+)
+trace_case(
+    "broker-killed-without-its-status",
+    KILLED,
+    "/payload",
+    "The record states the status wait() returned.",
+    dropped("payload", "wait_status"),
+)
+trace_case(
+    "broker-killed-stated-by-the-core",
+    KILLED,
+    "/origin_component",
+    "Only the supervisor kills the broker.",
+    setter(["origin_component"], "broker-core"),
+)
+trace_case(
+    "header-of-an-unknown-topology",
+    HEADER,
+    "/payload/broker",
+    "A broker runs in the process of the bench or as a child process.",
+    lambda v: v["payload"].update(broker="container"),
 )
 trace_case(
     "violation-without-its-kind",
@@ -2785,6 +2856,17 @@ bad(
     man(lambda v: v.update(oracle={"sha256": ORACLE["sha256"]})),
 )
 
+
+# Where the broker ran (record 0019): in the process of the bench, or as a
+# child process the supervisor can kill.
+ok("run-manifest-of-a-child-process.json", man(lambda v: v.update(broker="child-process")))
+bad(
+    "run-manifest-of-an-unknown-topology.json",
+    "schema-violation",
+    "/broker",
+    "A broker runs in the process of the bench or as a child process.",
+    man(lambda v: v.update(broker="container")),
+)
 
 # The binary tied to the source it was rebuilt from (run --rebuild).
 BUILT_FROM = {

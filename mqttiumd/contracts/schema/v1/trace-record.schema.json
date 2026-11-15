@@ -129,7 +129,8 @@
         "OpeningReplyDelivered",
         "OpeningAbandoned",
         "EpochGrantHandedOver",
-        "StepBlocked"
+        "StepBlocked",
+        "BrokerKilled"
       ]
     },
     "payload": {
@@ -952,6 +953,30 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "BrokerKilled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/BrokerKilled"
+          },
+          "origin_component": {
+            "enum": [
+              "bench-supervisor"
+            ]
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -978,6 +1003,13 @@
           "enum": [
             "full",
             "core-without-bytes"
+          ]
+        },
+        "broker": {
+          "description": "Where the broker ran (record 0019): in the process of the bench, or as a child process the supervisor kills for real. Absent means in-process.",
+          "enum": [
+            "in-process",
+            "child-process"
           ]
         }
       }
@@ -2312,6 +2344,37 @@
           "uniqueItems": true,
           "items": {
             "$ref": "primitives.schema.json#/$defs/name"
+          }
+        }
+      }
+    },
+    "BrokerKilled": {
+      "description": "The supervisor killed the broker, a child process, and wait() returned its status (record 0019). Written after that status and before BrokerCrashed; no pid: it goes to campaign.json.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "signal_sent",
+        "wait_status"
+      ],
+      "properties": {
+        "signal_sent": {
+          "enum": [
+            "SIGKILL"
+          ]
+        },
+        "wait_status": {
+          "description": "The status wait() returned: the process ended by this signal. A process that exited is no kill and is not written here.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "signal"
+          ],
+          "properties": {
+            "signal": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64
+            }
           }
         }
       }

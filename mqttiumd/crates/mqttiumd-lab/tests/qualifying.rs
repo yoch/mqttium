@@ -111,11 +111,12 @@ fn a_pass_with_only_out_of_scope_assertions_is_refused() {
 
 /// What every run owes, which P1-02, the text of the specification, does
 /// not all list (ADR 0003, DEM-MU-03, DEM-012).
-const EVERY_RUN: [&str; 4] = [
+const EVERY_RUN: [&str; 5] = [
     "trace_complete",
     "broker_inputs_have_provenance",
     "one_grant_per_opened_epoch",
     "scenario_reaches_its_end",
+    "broker_killed_for_real",
 ];
 
 #[test]

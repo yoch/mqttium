@@ -196,6 +196,13 @@
         "process"
       ]
     },
+    "broker": {
+      "description": "Where the broker ran (record 0019): in the process of the bench, or as a child process the supervisor kills for real. Absent means in-process. The trace header states the same.",
+      "enum": [
+        "in-process",
+        "child-process"
+      ]
+    },
     "scheduler": {
       "type": "object",
       "additionalProperties": false,

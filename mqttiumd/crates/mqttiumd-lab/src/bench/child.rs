@@ -140,6 +140,9 @@ pub struct Child {
     /// Kept for the life of the child, removed with it.
     _sockets: SocketDirectory,
     silence: Duration,
+    /// Whether the last action ended: every frame read, acknowledged,
+    /// ordered and kept in the trace.
+    ended: bool,
 }
 
 fn stop(reason: impl Into<String>) -> Stop {
@@ -260,13 +263,8 @@ impl Child {
         let reports = process.stdout.take().ok_or_else(|| stop("no stdout"))?;
         let (sender, received) = mpsc::channel();
         reader(reports, None, sender.clone());
-        let deadline = Instant::now() + config.silence;
-        for (origin, listener) in &listeners {
-            let stream = accept(listener, deadline)?;
-            reader(stream, Some(*origin), sender.clone());
-        }
-        drop(sender);
-        drop(listeners);
+        // From here every way out goes through `Drop for Child`, which makes
+        // sure the process does not outlive the run.
         let mut child = Self {
             process,
             pid,
@@ -281,7 +279,15 @@ impl Child {
             settings: Value::Null,
             _sockets: sockets,
             silence: config.silence,
+            ended: true,
         };
+        let deadline = Instant::now() + config.silence;
+        for (origin, listener) in &listeners {
+            let stream = accept(listener, deadline)?;
+            reader(stream, Some(*origin), sender.clone());
+        }
+        drop(sender);
+        drop(listeners);
         let rank = u32::try_from(rank).map_err(|_| stop("too many start-ups"))?;
         let mut startup = Vec::new();
         for report in child.act(&Action::Start { rank }, collector, books)? {
@@ -345,6 +351,7 @@ impl Child {
             .actions
             .as_mut()
             .ok_or_else(|| stop("the standard input of the child is closed"))?;
+        self.ended = false;
         write_frame(actions, &action.encode())
             .map_err(|refusal| stop(format!("the child does not read: {refusal}")))?;
         let mut reports = Vec::new();
@@ -408,6 +415,8 @@ impl Child {
                 .accept(origin, &record)
                 .map_err(|refusal| stop(format!("the collector refused a record: {refusal}")))?;
         }
+        // Every frame of the action is now in the trace.
+        self.ended = true;
         let mut others = Vec::new();
         let mut failure = None;
         for report in reports {
@@ -632,6 +641,25 @@ impl Child {
         if self.actions.is_none() {
             return Err(stop("the child is not driven any more"));
         }
+        // Drained, checked: the last action ended, nothing waits in the
+        // sequencer, and nothing waits unread on a descriptor.
+        if !self.ended || !self.sequencer.is_empty() {
+            return Err(stop(format!(
+                "the child {} is not drained: an action has not ended",
+                self.pid
+            )));
+        }
+        if let Ok(arrival) = self.received.try_recv() {
+            let what = match arrival {
+                Arrival::Evidence(origin, _) => format!("a record of {}", origin.name()),
+                Arrival::Report(_) => "a report".to_owned(),
+                Arrival::Broken(why) => why,
+            };
+            return Err(stop(format!(
+                "the child {} is not drained: {what} waits unread",
+                self.pid
+            )));
+        }
         self.process
             .kill()
             .map_err(|error| stop(format!("SIGKILL to the child {}: {error}", self.pid)))?;
@@ -697,10 +725,19 @@ impl Child {
 impl Drop for Child {
     fn drop(&mut self) {
         // The end of its standard input stops a child that reads an action;
-        // its exit is waited for, briefly, so that no child outlives the
-        // run unnoticed. Nothing here kills it.
+        // its exit is waited for, briefly. One that still lives is killed
+        // and waited for, so that no child outlives the run and keeps the
+        // writer lock, even a run stopped on an error. That kill is not a
+        // kill of the scenario: it enters neither `kills` nor the trace.
         drop(self.actions.take());
-        let _ = self.wait(Duration::from_secs(5));
+        if self.wait(Duration::from_secs(5)).is_err() {
+            eprintln!(
+                "mqttiumd-lab: the child {} did not exit when its standard input closed; it is killed so that it does not outlive the run",
+                self.pid
+            );
+            let _ = self.process.kill();
+            let _ = self.process.wait();
+        }
     }
 }
 

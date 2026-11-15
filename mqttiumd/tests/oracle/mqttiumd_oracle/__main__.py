@@ -105,7 +105,7 @@ def _produce(contracts, options) -> int:
     except (Refused, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return results.EXIT_CODES["INCONCLUSIVE"]
-    conditions = results.unmet(contracts, options.scenario, options.manifest)
+    conditions = results.unmet(contracts, options.scenario, options.manifest, options.trace)
     if conditions:
         result = results.provisional(result, conditions)
     if not contained(options.out):

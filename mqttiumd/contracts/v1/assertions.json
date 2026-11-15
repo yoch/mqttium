@@ -131,6 +131,14 @@
       "requirements": [
         "DEM-017"
       ]
+    },
+    {
+      "name": "broker_killed_for_real",
+      "meaning": "A run whose trace header claims a broker run as a child process shows its kill: every BrokerCrashed follows a BrokerKilled of that crash whose wait status is signal 9, and no record of the killed incarnation of the child comes after the kill. A missing BrokerKilled is missing evidence and concludes nothing; another signal, a record of the killed incarnation after the kill, or a kill recorded by a run that claims no child process fails. A run in-process that records no kill has nothing to show.",
+      "every_run": true,
+      "requirements": [
+        "FAIL-001"
+      ]
     }
   ]
 }

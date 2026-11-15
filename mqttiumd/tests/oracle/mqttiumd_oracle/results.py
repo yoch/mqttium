@@ -14,6 +14,7 @@ import tarfile
 
 
 from . import judge
+from .trace import lines_of
 from .semantic import reached as reached_by
 from .semantic import verdict_of
 from .strict import Diagnostic, Refused, parse
@@ -92,7 +93,7 @@ UNTIED_BINARY = (
 )
 
 
-def unmet(contracts, scenario_path, manifest_path):
+def unmet(contracts, scenario_path, manifest_path, trace_path=None):
     """The conditions of a qualifying run that the given files do not establish."""
     try:
         data = contracts.read(manifest_path)
@@ -130,8 +131,31 @@ def unmet(contracts, scenario_path, manifest_path):
         out += _oracle_unmet(manifest["oracle"]["files"])
     if manifest["checkout"]["tree_state"] != "clean":
         out += _kept_unmet(contracts, manifest["checkout"]["modified_paths"])
+    if trace_path is not None:
+        out += _broker_unmet(contracts, manifest, trace_path)
     out += _source_unmet(contracts, manifest)
     return out
+
+
+def _broker_unmet(contracts, manifest, trace_path):
+    """Whether the manifest and the trace header say the same of where the broker ran.
+
+    Record 0019: the judge reads the claim of the header; the manifest
+    states it for the campaign. Absent, both mean in-process.
+    """
+    claimed = manifest.get("broker", "in-process")
+    try:
+        with (contracts.root / trace_path).open("rb") as stream:
+            first = next(lines_of(stream), b"")
+        header = parse(first)
+        stated = header["payload"].get("broker", "in-process")
+    except (OSError, Refused, KeyError, TypeError):
+        return ["the header of the trace cannot be read"]
+    if claimed != stated:
+        return [
+            f"the manifest says the broker ran as a {claimed} and the trace header says {stated}"
+        ]
+    return []
 
 
 def _source_unmet(contracts, manifest):
@@ -399,7 +423,8 @@ def recompute(contracts, result_path):
     # R1: a qualifying result is evidence only while the conditions it was
     # produced under hold. They are checked again from the scenario and the
     # manifest it cites, as produce checks them; a broken one refuses it.
-    for condition in unmet(contracts, result["scenario"]["path"], result["manifest"]["path"]):
+    cited = (result["scenario"]["path"], result["manifest"]["path"], result["trace"]["path"])
+    for condition in unmet(contracts, *cited):
         out.append(
             Diagnostic(
                 "result-not-qualifying",
