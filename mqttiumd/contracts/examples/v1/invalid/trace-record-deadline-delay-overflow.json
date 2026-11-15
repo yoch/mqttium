@@ -1,0 +1,22 @@
+{
+  "format": "mqttiumd.trace-record",
+  "schema_version": 1,
+  "run_id": "p1-02-example",
+  "record_sequence": "8",
+  "origin_component": "timer",
+  "origin_incarnation": "1",
+  "origin_sequence": "0",
+  "causal_parents": [],
+  "time_domain": "logical-step",
+  "time_value": "8",
+  "kind": "DeadlineArmed",
+  "payload": {
+    "effect_id": {
+      "epoch": "1",
+      "owner": "0",
+      "sequence": "2"
+    },
+    "token": "1",
+    "after": "18446744073709551616"
+  }
+}

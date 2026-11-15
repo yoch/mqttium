@@ -1,0 +1,21 @@
+diff --git a/mqttiumd/crates/mqttiumd-lab/src/bench/runner.rs b/mqttiumd/crates/mqttiumd-lab/src/bench/runner.rs
+index b40b8350..39eabb4a 100644
+--- a/mqttiumd/crates/mqttiumd-lab/src/bench/runner.rs
++++ b/mqttiumd/crates/mqttiumd-lab/src/bench/runner.rs
+@@ -831,6 +831,8 @@ impl<B: Backend> Runner<'_, B> {
+                         // The kill as the wait status showed it, before the
+                         // crash (decision 0019); its process identifier goes
+                         // to campaign.json only.
++                        // MUTANT N5: the kill is not written in the trace.
++                        if false {
+                         self.emit(
+                             Origin::BenchSupervisor,
+                             "BrokerKilled",
+@@ -840,6 +842,7 @@ impl<B: Backend> Runner<'_, B> {
+                                 "wait_status": {"signal": killed.wait_signal},
+                             }),
+                         )?;
++                        }
+                         self.kills.push(killed);
+                         (None, open)
+                     }

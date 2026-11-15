@@ -5,6 +5,11 @@
 //! command is presented again; a digest may speed up a lookup but never
 //! replaces that comparison.
 //!
+//! `OpenEpoch` is the one command that is not a recipe: it opens the run
+//! epoch every `OperationId` is scoped by. It lives in `opening` with
+//! its durable state, the `EpochLedger`, and with what start-up does
+//! with the reply (ADR 0009); its types are re-exported here.
+//!
 //! Canonical layout, format 1. All integers are big-endian.
 //!
 //! ```text
@@ -497,6 +502,11 @@ pub struct Command {
     pub recipe: FrozenRecipe,
     pub payload: Option<SharedBytes>,
 }
+
+pub use crate::opening::{
+    EpochLedger, EpochPhase, LedgerIncoherent, LedgerOpening, OpenEpoch, OpeningAttempt,
+    OpeningRejection, OpeningTicket, StartupNonce,
+};
 
 #[cfg(test)]
 mod tests {

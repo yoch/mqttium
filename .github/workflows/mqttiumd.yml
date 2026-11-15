@@ -5,10 +5,12 @@ on:
     branches: [main]
     paths:
       - "mqttiumd/**"
+      - "tools/formal/**"
       - ".github/workflows/mqttiumd.yml"
   pull_request:
     paths:
       - "mqttiumd/**"
+      - "tools/formal/**"
       - ".github/workflows/mqttiumd.yml"
 
 permissions:
@@ -26,7 +28,7 @@ jobs:
   contracts:
     name: contracts
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -41,6 +43,16 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # The kill points of the SQLite store exist in a build with the feature
+      # `kill-points` only, which no manifest may turn on: a product build
+      # never carries them. The tests of the crate are run with it, among
+      # them a child killed with every row of a command written and COMMIT
+      # not called.
+      - name: Kill points stay out of the product and hold in the store
+        run: |
+          tools/check_kill_points.sh
+          cargo clippy -p mqttiumd-store-sqlite --all-targets --features kill-points --locked -- -D warnings
+          cargo test -p mqttiumd-store-sqlite --features kill-points --locked
       - name: Validate the contracts and scenario P1-02
         run: >-
           cargo run --quiet --locked -p mqttiumd-lab -- validate
@@ -53,7 +65,141 @@ jobs:
           python-version: "3.13"
       - name: Derived contract files are up to date
         run: python tools/build_corpus.py --check
+      # Installs nothing: fake tools on a private PATH.
+      - name: The installer recognises the pinned tools only
+        run: bash tools/test-install-tools.sh
       - name: Second schema reader
         run: |
           python -m pip install --disable-pip-version-check -r tools/requirements.txt
           python tools/check_schemas.py
+      # The oracle is a second reader of the semantic level and the judge of
+      # a run. Its corpus of traces is derived; its tests judge that corpus.
+      - name: Oracle
+        run: |
+          python -m pip install --disable-pip-version-check -r tests/oracle/requirements.txt
+          python tests/oracle/build_traces.py --check
+          python -m unittest discover -t tests/oracle -s tests/oracle/tests
+      # A campaign runs a scenario through the real core, a store and their
+      # adapters, and the oracle judges the directory the runner wrote. The
+      # step fails unless the oracle's verdict is PASS. On both stores the
+      # crash of a scenario is simulated inside one process: no process is
+      # killed.
+      - name: Campaigns on the deterministic store
+        run: |
+          for scenario in p1/P1-02 p1/P1-02b qabs/QABS-A qabs/QABS-B qabs/QABS-C audit/F3-steady-lag audit/P1-02b-interposed; do
+            tools/run_campaign.sh "tests/scenarios/$scenario.json" \
+              "$RUNNER_TEMP/campaigns/sim-store/$(basename "$scenario")"
+          done
+      - name: Campaigns on the SQLite store
+        run: |
+          for scenario in p1/P1-02 p1/P1-02b qabs/QABS-A qabs/QABS-B qabs/QABS-C audit/F3-steady-lag audit/P1-02b-interposed; do
+            tools/run_campaign.sh "tests/scenarios/$scenario.json" \
+              "$RUNNER_TEMP/campaigns/sqlite/$(basename "$scenario")" 1 sqlite
+          done
+      # The loop must reject a defect: each mutation of tests/mutants/loop
+      # is applied in a temporary worktree, played, and judged by the
+      # oracle of this tree, and must be refused for its own reason.
+      - name: The loop rejects its mutants on the deterministic store
+        run: tools/run_loop_mutants.sh
+      - name: The loop rejects its mutants on the SQLite store
+        run: tools/run_loop_mutants.sh --backend sqlite
+      # A result qualifies only for a run whose binary was rebuilt from the
+      # archive the campaign keeps (record 0017). The step fails unless the
+      # oracle writes a qualifying PASS that `validate` accepts and that
+      # stands at `recompute`, and unless a second build of the archive
+      # gives the binary the manifest names.
+      - name: A rebuilt campaign qualifies on both stores
+        run: |
+          for backend in sim-store sqlite; do
+            tools/run_qualifying_campaign.sh tests/scenarios/p1/P1-02.json \
+              "$RUNNER_TEMP/campaigns/qualifying/$backend" 1 "$backend"
+          done
+      # A qualifying result must not outlive its conditions (finding R1 of
+      # the second audit): on campaigns produced here, with this oracle,
+      # `recompute` lets the intact one stand and refuses each degraded
+      # copy for its own reason: the source archive missing or altered,
+      # another oracle than the one the manifest identifies, a kept
+      # modification missing.
+      - name: Recompute refuses a degraded qualifying campaign
+        run: tools/run_recompute_reception.sh "$RUNNER_TEMP/campaigns/recompute" sqlite
+      # The first real crash: P1-02 on SQLite with the core and the store
+      # in a child process, killed by SIGKILL after the commit and outside
+      # any transaction, then started again on the same file. The rebuilt
+      # run must qualify and stand at `recompute`; a second run, traced by
+      # strace when the runner has it, must show the kill and the wait
+      # status as the kernel reports them, with the same trace.
+      - name: A child killed by SIGKILL recovers on the same SQLite file
+        run: |
+          tools/run_killed_campaign.sh tests/scenarios/p1/P1-02.json \
+            "$RUNNER_TEMP/campaigns/killed"
+      - name: Keep the campaign directories
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-campaigns
+          path: ${{ runner.temp }}/campaigns
+          if-no-files-found: warn
+
+  models:
+    name: models
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+      # The runner image provides a JDK; run_tlc.py pins and hash-checks TLC.
+      - run: java -version
+      - name: Model files are consistent
+        run: python models/check_models.py
+      - name: Model-check every directory of models
+        run: |
+          set -euo pipefail
+          for directory in models/*/; do
+            python ../tools/formal/run_tlc.py --models-dir "$directory" --list
+            python ../tools/formal/run_tlc.py --models-dir "$directory"
+          done
+
+  # Everything under mqttiumd/proofs/ is a workspace of its own: the checks
+  # of the `contracts` job do not see it, and this job is its only
+  # verification. `run.sh` fails when a file the proof analyses differs
+  # from the digests recorded in proofs/credits/BODY.sha256: a change to
+  # those files is reviewed and recorded again before this job is green.
+  pilot-proof:
+    name: pilot proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose
+      # Kani brings its own compiler; it never builds the product.
+      - name: Install the pinned Kani
+        run: tools/install-tools.sh kani
+      - name: The preflight refuses a wrong tool
+        run: proofs/preflight-selftest.sh
+      # Runs the preflight first, then the allocation test, the harnesses
+      # with their witnesses, the coverage and the recorded digests.
+      - name: Pilot proof of release_if_current
+        run: proofs/credits/run.sh
+      - name: Mutants, each caught as aimed
+        run: python3 proofs/credits/mutants.py
+      # Breaks one thing per case in a copy and expects the scripts above
+      # to refuse it: what their PASS is worth.
+      - name: The proof scripts refuse what they claim to check
+        run: python3 proofs/credits/selftest.py
+      - name: The proof workspace is formatted and lint-clean
+        working-directory: mqttiumd/proofs
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
