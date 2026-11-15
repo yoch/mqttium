@@ -224,6 +224,126 @@ states and is inconclusive. `Dests = {B, C}`, `NumOps = 2` and
 | `M1b-mut-reset-keeps-attachment.cfg` | The old identity stays attached to the slot after the reset of the session | `AckedIsAdmitted` |
 | `M1b-mut-replay-readmits.cfg` | A replay while the admission is unresolved prepares a second command | `RefusedIsNotAdmitted` |
 
+## M1Answers
+
+The retention rule of the core (audit F3) and the hypothesis I3 under
+which an unresolved exchange leaves `AdmissionPending`. One operation in
+flight, whose command was accepted and whose result was lost. Unlike M1a
+and M1b, this model has the status `refinement`: its actions encode the
+predicates of `Answers` in `crates/mqttiumd-core/src/owner.rs`, and the
+deterministic tests of that file replay its witnesses (listed under
+`replays` in `M1Answers.json`).
+
+### What it encodes of the core
+
+| Core (`owner.rs`) | Model |
+| - | - |
+| `Answers::emitted`, the rank of the latest resolution | `n` |
+| `recent[rank % RECENT_RESOLUTIONS]` | `recent[m % R]` |
+| `landmarks[trailing_zeros(rank) % LANDMARK_RESOLUTIONS]`, for a power of two | `landmarks[Ctz(m) % L]` |
+| `Answers::names`: the Persist, `recent`, `landmarks` | `Held`, plus the Persist |
+| One resolution at each deadline of an unresolved operation | `EmitResolution` |
+| A result applied when its effect is named, absorbed otherwise | `AnswerArrives` |
+
+`RECENT_RESOLUTIONS = 2` and `LANDMARK_RESOLUTIONS = 4` in the core. The
+configurations use those values, and a reduced form (R = 1, L = 2) that
+keeps the shape "powers of two". The window depends on ranks only: the
+model has no time.
+
+### Hypothesis I3
+
+`Lag = "uniform"`: every answer arrives at most `K` newer resolutions
+after its own, `K` finite and the same for every resolution, in any
+order, with at most `MaxLoss` answers lost, `MaxUnknown` answers unknown
+(a refused fence) and `MaxDup` repeated. It is encoded as a guard on the
+environment, not as fairness: no resolution is emitted while an answer
+that would then be more than `K` resolutions old is still in transit.
+Under it, the first landmark `p >= K` whose answer is useful arrives by
+rank `p + K <= 2p` while it is still retained, so the exchange is
+resolved by rank `Bound = P0 * 2^(MaxLoss + MaxUnknown) + K`, `P0` the
+smallest power of two at least `K`. Every configuration emits past
+`Bound` (an `ASSUME` refuses one that does not).
+
+`Lag = "unbounded"` drops the guard: each delay is finite, with no common
+bound. That is another hypothesis, outside I3. Its configurations keep a
+counterexample: past `Bound`, with no answer lost or unknown, every
+answer whose rank is no longer retained has arrived and was absorbed,
+and the operation is still unresolved. The answers still in transit are
+only retained ones, each to arrive after its own eviction, so the
+pattern repeats at every rank. TLC shows that bounded prefix; the
+unbounded continuation is the deterministic test
+`review_individually_finite_delays_do_not_imply_a_uniform_lag_bound`,
+which plays it for 512 resolutions.
+
+### Properties
+
+| Property | Statement |
+| - | - |
+| `BoundedRetention` (I1) | At most `1 + R + L` effects are retained |
+| `RetentionMatchesSpec` | The rings hold exactly the `R` latest ranks and the `L` latest powers of two |
+| `NothingForged` (I2) | No answer is applied for a rank outside that window |
+| `ProgressWithinBound` (I3) | Past rank `Bound`, the exchange has left `AdmissionPending` |
+| `NoStarvationWithEveryEvictedAnswerDelivered` | The counterexample above is not reachable |
+| `LeavesAdmissionPending` | Temporal: eventually resolved, under `FairSpec` |
+
+`FairSpec` adds weak fairness on `EmitResolution` (the timer fires) and,
+for each rank, on its answer arriving or being lost. With the bound of
+the model, emission stops at `MaxRank`, so the temporal property is only
+claimed under I3, where `ProgressWithinBound` already excludes reaching
+the bound unresolved; it is not used to show the counterexample.
+
+### Configurations
+
+| Configuration | Lag | Constants | Declared |
+| - | - | - | - |
+| `M1Answers-i3.cfg` | uniform | R 2, L 4, K 4, one loss, one unknown, one duplicate | pass, all invariants |
+| `M1Answers-i3-reduced.cfg` | uniform | R 1, L 2, K 2, one loss, one unknown, one duplicate | pass, all invariants |
+| `M1Answers-i3-pair.cfg` | uniform | as `unbounded.cfg` | pass, all invariants |
+| `M1Answers-i3-pair-reduced.cfg` | uniform | as `unbounded-reduced.cfg` | pass, all invariants |
+| `M1Answers-i3-liveness.cfg` | uniform | as `i3.cfg` | pass `LeavesAdmissionPending` |
+| `M1Answers-unbounded.cfg` | unbounded | R 2, L 4, K 4, no loss, no unknown, one duplicate | violation `NoStarvationWithEveryEvictedAnswerDelivered` |
+| `M1Answers-unbounded-reduced.cfg` | unbounded | R 1, L 2, K 2, no loss, no unknown, one duplicate | violation `NoStarvationWithEveryEvictedAnswerDelivered` |
+| `M1Answers-reach-landmark-commit.cfg` | uniform | as `i3.cfg` | violation `NoLandmarkCommit`: an answer more than R resolutions late applied through its landmark |
+| `M1Answers-reach-next-landmark-after-loss.cfg` | uniform | as `i3.cfg` | violation `NoNextLandmarkAfterLoss` |
+| `M1Answers-reach-out-of-order.cfg` | uniform | as `i3.cfg` | violation `NoOutOfOrder` |
+| `M1Answers-mut-no-landmarks.cfg` | uniform | as `i3.cfg`, no landmark ring | violation `ProgressWithinBound` |
+| `M1Answers-mut-landmark-slot-by-rank.cfg` | uniform | as `i3.cfg`, slot `rank mod L` | violation `RetentionMatchesSpec` |
+| `M1Answers-mut-apply-any.cfg` | uniform | as `i3.cfg`, apply every answer | violation `NothingForged` |
+| `M1Answers-mut-keep-evicted.cfg` | uniform | as `i3.cfg`, evicted ranks kept | violation `BoundedRetention` |
+
+The two pairs differ by `Lag` only: the same constants pass under I3 and
+keep the counterexample without it.
+
+### What the model assumes of the runtime (open condition)
+
+These are assumptions on the queues and the scheduling of the runtime,
+not properties of the core. They are raised as an open condition.
+
+1. **The timer.** A deadline of an unresolved operation eventually fires,
+   and each one emits one resolution and arms the next deadline. That
+   needs the effect box to dispatch `ResolveAndFence` then `ArmDeadline`
+   in order and the timer adapter to accept the second; a box that stays
+   full holds the operation in `AdmissionPending` (M1a,
+   `M1a-live-path-no-rearm.cfg`, shows the cost of a deadline not armed
+   again).
+2. **I3 itself.** The answer of each resolution arrives, or is lost,
+   before `K` newer resolutions of the same operation are emitted, with
+   `K` uniform. In runtime terms the store writer and the result channel
+   must answer within a bounded number of deadline periods: their queues
+   bounded, and the deadline period not shrinking below the latency of a
+   loaded writer. A backlog that grows without bound relative to the
+   period of the deadlines breaks I3, and the exchange may then stay
+   unresolved (the unbounded configurations).
+3. **Finitely many useless answers.** At most `MaxLoss` answers are lost
+   and `MaxUnknown` are unknown (a refused write of the fence).
+4. **Order.** Answers may arrive in any order and be repeated; nothing is
+   assumed of FIFO delivery.
+5. **Not modelled.** The saturation of `emitted` at `u64::MAX`; the
+   bounded window of terminated operations (`retained_operations`, I4,
+   I5): once resolved the model applies nothing more, and a
+   contradicting result is the fault M1a checks (`KnowledgeSound`); the
+   effect box shared by several operations of one owner.
+
 ## Bounds and limits
 
 - Domain of the safety campaign of M1a: `Pubs = {a, b}`, `Dests = {B, C}`,
@@ -309,6 +429,9 @@ sidecar lists no test until one does.
 | `ResolveRead` (M1b) | Store side: first half of `ResolveAndFence` | QABS-A, B, C: the absent read | Not replayed yet; L4 (L2 for the store alone) |
 | `FenceEstablish` (M1b) | Store side: second half of `ResolveAndFence` | QABS-A (commit returned), QABS-B (fence established) | Not replayed yet; L4 (L2 for the store alone) |
 | `FenceAbandon` (M1b) | Store side | QABS-C | Not replayed yet; L4 (L2 for the store alone) |
+| `EmitResolution` (M1Answers) | `command.indeterminate.timeout`: a deadline of an unresolved operation emits one resolution and arms the next deadline (`ResolveAndFence`, then `ArmDeadline`); `Answers::with` retains it | `FireDeadline` (record 0015) | `crates/mqttiumd-core/src/owner.rs`: `an_operation_retains_a_bounded_number_of_answers`, `resolutions_whose_answers_arrive_after_four_newer_ones_still_commit` |
+| `AnswerArrives` (M1Answers) | `command.indeterminate.result.committed` and `.rejected` when retained (`Answers::names`); absorbed otherwise; a late answer after the end is `command.committed.result.duplicate` or a fault (I4) | `DeliverHeldResult` (record 0015) | `owner.rs`: `resolutions_progress_when_their_answers_arrive_out_of_order`, `resolutions_progress_under_a_finite_lag_with_losses_and_duplicates`, `a_late_commit_after_a_refusal_of_one_admission_is_a_fault` |
+| `AnswerLost` (M1Answers) | — | Fault `drop_result` at `store.result.ready` | `owner.rs`: `the_next_landmark_progresses_when_the_answer_of_one_is_lost` |
 | `Quiescent` | — | End of the run | Not an action of the product |
 
 Not in the model: the `defer` rules on effect capacity, PUBREL and the

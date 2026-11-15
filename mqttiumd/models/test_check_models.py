@@ -171,6 +171,35 @@ class CheckModels(unittest.TestCase):
 
         self.refused(sidecar("M1a.json", change_data), "unknown expectation 'maybe'")
 
+    # A replay names a test function that exists, in a file of 'tests'.
+    def test_a_replay_naming_a_missing_test_function_is_refused(self) -> None:
+        def change_data(data: dict) -> None:
+            data["replays"][0]["test"] = "a_test_that_does_not_exist"
+
+        self.refused(
+            sidecar("M1Answers.json", change_data),
+            "M1Answers: replay a_test_that_does_not_exist is not a test of "
+            "mqttiumd/crates/mqttiumd-core/src/owner.rs",
+        )
+
+    def test_a_replay_in_a_file_outside_tests_is_refused(self) -> None:
+        def change_data(data: dict) -> None:
+            data["replays"][0]["file"] = "mqttiumd/crates/mqttiumd-core/src/lib.rs"
+
+        self.refused(
+            sidecar("M1Answers.json", change_data),
+            "M1Answers: replay file mqttiumd/crates/mqttiumd-core/src/lib.rs is not in 'tests'",
+        )
+
+    def test_a_refinement_model_names_its_replays(self) -> None:
+        def change_data(data: dict) -> None:
+            del data["replays"]
+
+        self.refused(
+            sidecar("M1Answers.json", change_data),
+            "M1Answers: a refinement model names the test functions that replay it",
+        )
+
     def test_a_sidecar_that_is_not_an_object_is_refused(self) -> None:
         def change(root: Path) -> None:
             (root / "m1" / "Stray.json").write_text("[]", encoding="utf-8")
