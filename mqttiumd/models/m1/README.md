@@ -1,8 +1,10 @@
 # M1 — admission and authorisation of PUBREC
 
 TLA+ models of lot L5 (DEM-020, V3-018, ARC-027; decision records 0001 and
-0005). `M1a` is here. `M1b` (resets, session generations, capacity
-refusals, fences and the change of epoch) is not written yet.
+0005). `M1a` is the admission and the authorisation of PUBREC through a
+lost result, an unknown outcome and a crash. `M1b` adds resets, session
+generations, capacity refusals, the race between a fence and an
+application, and the change of epoch.
 
 A model is evidence for a design. It is not a proof of the Rust code, of
 SQLite or of the hardware.
@@ -18,14 +20,14 @@ python tools/formal/run_tlc.py --models-dir mqttiumd/models/m1 --list
 python tools/formal/run_tlc.py --models-dir mqttiumd/models/m1
 ```
 
-`M1a.json` is the sidecar: it declares the outcome TLC must give for every
-configuration. A configuration that fails for another reason than the one
-declared is a failure of the campaign, not a detection. Its status is
+`M1a.json` and `M1b.json` are the sidecars: each declares the outcome TLC
+must give for every configuration of its module. A configuration that fails for another reason than the one
+declared is a failure of the campaign, not a detection. Their status is
 `specification`: the actions encode the predicates of the specification
 and of the decision records, and no implementation exists yet to refine.
 
 `python models/check_models.py`, from `mqttiumd/`, checks without Java
-that the files, the sidecar and the correspondence table below agree.
+that the files, the sidecars and the correspondence table below agree.
 
 ## M1a
 
@@ -135,6 +137,79 @@ the property the mutation must break.
 | `M1a-mut-late-unknown.cfg` | A late unknown replaces a commit (DEM-MU-05) | `TerminalKnowledgeStable` |
 | `M1a-live-path-no-rearm.cfg` | The deadline is not armed again | `LivePathResolves` |
 
+## M1b
+
+One producer with one inbound slot, two destinations, two admission
+identities. The producer's session and each destination session have
+generations; an exchange is identified by the generation of the
+producer's session that opened it. M1b leaves the explicit hold of a
+command and the liveness properties to M1a.
+
+### What it adds
+
+| Addition | Actions | Predicates of the store or the core |
+| - | - | - |
+| Connection reset without a crash; replay of a PUBLISH while the admission is unresolved | `ConnectionReset`, `ClientReconnect`, `ClientResend`, `Receive` | A replay creates no command and no acknowledgement; PUBREC goes to the connection that is current when it is authorised |
+| Reset of the producer's session | `SourceSessionReset` | The inbound slot is removed, committed obligations stay, the old identity is detached from the slot and still reconciled; a command of the old exchange is refused |
+| Reset of a destination session; settlement of an obligation | `DestSessionReset`, `Settle` | A command whose target generation is no longer current is refused |
+| Durable capacity per destination | `ApplyCommand` | A full capacity is a certain rejection, durable: it stays after the capacity is free again |
+| Commands that outlive a crash of the core; the change of epoch | `Crash`, `Recover`, `ApplyCommand` | The store keeps the commands it accepted and may apply one while the core is down; after recovery a command of a closed epoch is refused. Closing an epoch teaches the core nothing about an identity that left no durable fact |
+| `ResolveAndFence` in two steps | `ResolveRead`, `FenceEstablish`, `FenceAbandon` | The fence is established only if the identity is still absent when the writer orders it: a command applied in between wins (QABS-A), otherwise the fence wins (QABS-B), or the fence is abandoned and the outcome stays unknown (QABS-C) |
+
+The store-side transport `tCmd` is not erased by a crash, unlike in M1a:
+this is what makes the change of epoch observable.
+
+### Invariants
+
+| Invariant | Statement |
+| - | - |
+| `OneAdmissionPerExchange` | At most one committed admission per exchange |
+| `AtomicObligations` | A committed identity has its publication and an obligation for every target that still exists; any other has none |
+| `DecisionExclusive` | An identity is never both committed and fenced |
+| `RefusalNeverExecutes` | An identity the core treated as rejected never executes, also after capacity is free again |
+| `AckedIsAdmitted` | The client holds an acknowledgement only for an admitted exchange |
+| `RefusedIsNotAdmitted` | The client holds a refusal only for an exchange that is not admitted |
+| `NoExecutionInClosedEpoch` | A command commits only in the epoch it was prepared in |
+| `NoStaleTarget` | No obligation exists for a destination session that is gone |
+| `ObligationsConserved` | An obligation for a session that still exists is removed only by its settlement |
+| `AccountsMatch`, `WithinCapacity` | The account of a destination equals its obligations and stays within its capacity |
+| `KnowledgeSound` | Committed knowledge agrees with the store; no contradiction was reported |
+
+### Configurations
+
+The fault kinds are checked in five groups, not all at once: the domain
+with every fault kind together was interrupted at 12.5 million distinct
+states and is inconclusive. `Dests = {B, C}`, `NumOps = 2` and
+`Capacity = 1` unless stated.
+
+| Configuration | Faults allowed (at most one of each) |
+| - | - |
+| `M1b-safety-epoch.cfg` | Crash, connection reset, lost result |
+| `M1b-safety-source.cfg` | Crash, reset of the producer's session, lost result |
+| `M1b-safety-connection.cfg` | Connection reset, reset of the producer's session, lost result |
+| `M1b-safety-destination.cfg` | Reset of a destination session, settlement, reset of the producer's session |
+| `M1b-safety-capacity.cfg` | Settlement, reset of the producer's session, lost result |
+
+| Configuration | Witness |
+| - | - |
+| `M1b-reach-replay-while-unknown.cfg` | A PUBLISH replayed after a connection reset while its outcome is unknown, acknowledged on the new connection by the one admission |
+| `M1b-reach-commit-before-fence.cfg` | QABS-A, then PUBREC observed |
+| `M1b-reach-fence-before-command.cfg` | QABS-B, then the refusal observed |
+| `M1b-reach-capacity-refusal.cfg` | A second exchange refused for capacity, observed by the peer |
+| `M1b-reach-stale-target-refusal.cfg` | A command refused because a target session was reset |
+| `M1b-reach-epoch-closed-refusal.cfg` | A command of the first epoch refused in the second while a new admission of the same exchange commits |
+| `M1b-reach-second-exchange.cfg` | After a reset of the producer's session, a new exchange admitted on the same slot, the first obligations kept (`Capacity = 2`) |
+
+| Configuration | Mutation | Counterexample for |
+| - | - | - |
+| `M1b-mut-fence-on-stale-read.cfg` | The fence is established on the absence read earlier | `DecisionExclusive` |
+| `M1b-mut-old-epoch-executes.cfg` | A command of a closed epoch is applied | `NoExecutionInClosedEpoch` |
+| `M1b-mut-stale-target.cfg` | Target generations are not checked at the commit | `NoStaleTarget` |
+| `M1b-mut-refusal-not-durable.cfg` | A refusal leaves no fence; the same command commits once capacity is free | `RefusalNeverExecutes` |
+| `M1b-mut-source-reset-drops.cfg` | The reset of the source removes its committed obligations | `ObligationsConserved` |
+| `M1b-mut-reset-keeps-attachment.cfg` | The old identity stays attached to the slot after the reset of the session | `AckedIsAdmitted` |
+| `M1b-mut-replay-readmits.cfg` | A replay while the admission is unresolved prepares a second command | `RefusedIsNotAdmitted` |
+
 ## Bounds and limits
 
 - Domain of the safety campaign: `Pubs = {a, b}`, `Dests = {B, C}`,
@@ -145,16 +220,19 @@ the property the mutation must break.
 - Identities are consumed in order and never reused; `dNextOp` stands for
   an identity made of the run epoch and a serial. Using up both suspends
   `Prepare` and removes nothing.
-- A crash erases the internal transport: no command of an old epoch
-  survives. The race between a fence, an application and the change of
-  epoch belongs to M1b.
-- A reconnect happens only after a crash. A replayed PUBLISH while the
-  outcome is unknown (record 0001) needs a reset without a crash: the
-  branch is written in `Receive` and is not reachable before M1b.
+- In M1a a crash erases the internal transport: no command of an old
+  epoch survives, and a reconnect happens only after a crash. The replay
+  of a PUBLISH while the outcome is unknown (record 0001) is written in
+  `Receive` of M1a and reached in M1b only.
+- M1b: one slot, so one exchange at a time; its fault kinds are combined
+  in groups; no liveness property; the delivery and acknowledgement of an
+  obligation are reduced to `Settle`; a reset of a session is one atomic
+  durable step.
 - The store may fence an absent identity or fail to; the model does not
   say why a fence cannot be established.
-- `RejectCommand` stands for every refusal of the store; capacities are
-  detailed by M1b.
+- In M1a `RejectCommand` stands for every refusal of the store; M1b
+  details the refusals for capacity, stale source, stale target and
+  closed epoch.
 - The atomicity of `ApplyCommand` is an assumption. The SQLite tests must
   discharge it.
 - PUBREL and PUBCOMP belong to M2. M1a does not cover the whole S0 path.
@@ -201,6 +279,13 @@ sidecar lists no test until one does.
 | `Recover` | — | `RestartBroker` | Not replayed yet; L4 |
 | `ClientReconnect` | — | `ClientResumeSession` | Not replayed yet; L4 |
 | `ClientResend` | — | `ClientResumeExchange` | Not replayed yet; L4 |
+| `ConnectionReset` (M1b) | — | — (no step closes a connection without a crash yet) | Not replayed yet; L4, after vocabulary by L3 |
+| `SourceSessionReset` (M1b) | — (session machines are outside the P1 registry seed) | — | Not replayed yet; L4, after a rule by L3 |
+| `DestSessionReset` (M1b) | — | — (the fixture keeps the destinations without reset) | Not replayed yet; L4, after a rule by L3 |
+| `Settle` (M1b) | — (outbound delivery, outside M1) | — | Not an admission step; owed by the lot of outbound delivery |
+| `ResolveRead` (M1b) | Store side: first half of `ResolveAndFence` | QABS-A, B, C: the absent read | Not replayed yet; L4 (L2 for the store alone) |
+| `FenceEstablish` (M1b) | Store side: second half of `ResolveAndFence` | QABS-A (commit returned), QABS-B (fence established) | Not replayed yet; L4 (L2 for the store alone) |
+| `FenceAbandon` (M1b) | Store side | QABS-C | Not replayed yet; L4 (L2 for the store alone) |
 | `Quiescent` | — | End of the run | Not an action of the product |
 
 Not in the model: the `defer` rules on effect capacity, PUBREL and the
@@ -219,3 +304,8 @@ The scenarios expected to replay each witness, once L4 runs them:
 | `M1a-mut-late-unknown.cfg` | P1-02b step 6, DEM-MU-05 |
 | `M1a-mut-ack-before-commit.cfg` | Assertion `no_positive_ack_before_confirmed_commit` |
 | `M1a-mut-recipe-change.cfg` | Assertion `same_recipe_for_op_A` |
+| `M1b-reach-commit-before-fence.cfg` | QABS-A |
+| `M1b-reach-fence-before-command.cfg`, `M1b-mut-fence-on-stale-read.cfg` | QABS-B |
+| `M1b-reach-replay-while-unknown.cfg`, `M1b-mut-replay-readmits.cfg` | The replay rows of record 0001, once L3 writes them |
+| `M1b-reach-epoch-closed-refusal.cfg`, `M1b-mut-old-epoch-executes.cfg` | No scenario yet; DEM-012 |
+| The other M1b configurations | No scenario yet |
