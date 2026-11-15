@@ -1,0 +1,56 @@
+{
+  "format": "mqttiumd.fixture",
+  "schema_version": 1,
+  "id": "three-persistent-sessions",
+  "profile": "p1-durable-mqtt5-without-expiry",
+  "store": {
+    "incarnation": "1"
+  },
+  "sessions": [
+    {
+      "client": "producer",
+      "client_id": "p1-producer",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "b",
+      "client_id": "p1-b",
+      "persistent": true,
+      "connected": false
+    },
+    {
+      "client": "c",
+      "client_id": "p1-c",
+      "persistent": true,
+      "connected": false
+    }
+  ],
+  "routes": [
+    {
+      "topic": "p1/example",
+      "targets": [
+        {
+          "client": "b",
+          "qos": 1
+        },
+        {
+          "client": "c",
+          "qos": 1
+        }
+      ]
+    }
+  ],
+  "capacities": {
+    "effect_slots": "8",
+    "result_slots": "8",
+    "store_operations_in_flight": "2",
+    "payload_bytes": "4096",
+    "references": "16",
+    "exchange_slots": "4",
+    "receipt_slots": "8",
+    "max_targets_per_admission": "4",
+    "max_topic_bytes": "4294967296",
+    "max_payload_bytes": "1024"
+  }
+}

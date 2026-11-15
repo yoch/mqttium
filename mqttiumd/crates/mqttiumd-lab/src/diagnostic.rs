@@ -25,6 +25,9 @@ pub mod code {
     pub const SCHEMA_NOT_LOCAL: &str = "schema-not-local";
     /// A decimal string denotes a value above `u64::MAX`.
     pub const U64_OUT_OF_RANGE: &str = "u64-out-of-range";
+    /// A decimal string of a 32-bit quantity denotes a value above
+    /// `u32::MAX`.
+    pub const U32_OUT_OF_RANGE: &str = "u32-out-of-range";
     /// A decimal string is not the canonical spelling of its value.
     pub const U64_NOT_CANONICAL: &str = "u64-not-canonical";
     /// A path is absolute or leaves the mqttiumd root.
@@ -87,7 +90,7 @@ pub mod code {
     pub const EVIDENCE_MISMATCH: &str = "evidence-mismatch";
 
     /// Every code, so that the example corpus can prove it exercises them.
-    pub const ALL: [&str; 37] = [
+    pub const ALL: [&str; 38] = [
         JSON_SYNTAX,
         DUPLICATE_KEY,
         NUMBER_NOT_INTEGER,
@@ -96,6 +99,7 @@ pub mod code {
         SCHEMA_VIOLATION,
         SCHEMA_NOT_LOCAL,
         U64_OUT_OF_RANGE,
+        U32_OUT_OF_RANGE,
         U64_NOT_CANONICAL,
         PATH_ESCAPE,
         FILE_UNREADABLE,

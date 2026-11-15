@@ -340,8 +340,8 @@ fn recovered_fact(fact: &RecoveredFact) -> Value {
             max_payload_bytes,
         } => json!({
             "kind": "Limits",
-            "max_targets_per_admission": max_targets_per_admission,
-            "max_topic_bytes": max_topic_bytes,
+            "max_targets_per_admission": decimal(u64::from(*max_targets_per_admission)),
+            "max_topic_bytes": decimal(u64::from(*max_topic_bytes)),
             "max_payload_bytes": decimal(max_payload_bytes.get()),
         }),
         RecoveredFact::RouteTable { revision } => json!({

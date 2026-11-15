@@ -80,7 +80,10 @@ class Rules(unittest.TestCase):
                         "packet_kind": kind,
                         "packet_id": 7,
                         "reason_code": code,
-                        "bytes_hex": "00",
+                        # The bytes the peer observed are the packet it states.
+                        "bytes_hex": {"PUBREC": "50", "PUBCOMP": "70"}[kind]
+                        + "030007"
+                        + f"{code:02x}",
                     }
                     events.append(corpus.ev(f"p{index}", "peer", "PeerPacketObserved", payload))
 
@@ -258,8 +261,18 @@ class Closures(unittest.TestCase):
         # The snapshot was taken before any fence could show: the trace is enough.
         self.assertEqual(self.status(edit_state=lambda state: state.update(fences=[])), "PASS")
 
+    @classmethod
+    def inspected_first(cls, events):
+        # The snapshot is inspected before the store answers: what it holds
+        # was established before the refusal.
+        cls.without_fence_record(events)
+        events.insert(
+            corpus.at(events, "fenced.ready"), events.pop(corpus.at(events, "inspect.final"))
+        )
+
     def test_a_receipt_of_rejection_closes_it(self):
-        # A refusal by a guard writes no fence; its receipt keeps it refused.
+        # A refusal by a guard writes no fence; its receipt, inspected before
+        # the refusal, keeps it refused.
         def receipt(state):
             state["fences"] = []
             state["operations"] = [
@@ -272,10 +285,14 @@ class Closures(unittest.TestCase):
                 }
             ]
 
-        self.assertEqual(self.status(self.without_fence_record, receipt), "PASS")
+        self.assertEqual(self.status(self.inspected_first, receipt), "PASS")
 
     def test_a_fence_the_snapshot_holds_closes_it(self):
-        self.assertEqual(self.status(self.without_fence_record), "PASS")
+        self.assertEqual(self.status(self.inspected_first), "PASS")
+
+    def test_a_fence_a_later_snapshot_holds_does_not_close_it(self):
+        # DEM-MU-01: the store refuses on an absence, the fence comes after.
+        self.assertEqual(self.status(self.without_fence_record), "FAIL")
 
     def test_nothing_written_closes_nothing(self):
         self.assertEqual(

@@ -893,6 +893,13 @@ bad(
     fix(setter(["capacities", "payload_bytes"], "99999999999999999999")),
 )
 bad(
+    "fixture-topic-limit-over-32-bits.json",
+    "u32-out-of-range",
+    "/capacities/max_topic_bytes",
+    "The bound on a topic is a 32-bit quantity, in a fixture as in a snapshot or a trace.",
+    fix(setter(["capacities", "max_topic_bytes"], "4294967296")),
+)
+bad(
     "fixture-session-not-persistent.json",
     "schema-violation",
     "/sessions/0/persistent",
@@ -1151,8 +1158,8 @@ PAGE_FULL = {
         {"kind": "Epoch", "incarnation": "1", "epoch": "2"},
         {
             "kind": "Limits",
-            "max_targets_per_admission": 4,
-            "max_topic_bytes": 256,
+            "max_targets_per_admission": "4",
+            "max_topic_bytes": "256",
             "max_payload_bytes": "1024",
         },
         {"kind": "RouteTable", "revision": "1"},
@@ -1389,11 +1396,19 @@ trace_case(
     setter(["payload", "facts", 3, "max_qos"], 3),
 )
 trace_case(
-    "recovered-limit-of-targets-as-text",
+    "recovered-limit-of-targets-as-a-number",
     FULL_READ,
     "/payload/facts/1/max_targets_per_admission",
-    "A 32-bit bound is a JSON integer; only 64-bit quantities are decimal strings.",
-    setter(["payload", "facts", 1, "max_targets_per_admission"], "4"),
+    "A bound is a decimal string, in a trace as in a snapshot: one quantity, one encoding.",
+    setter(["payload", "facts", 1, "max_targets_per_admission"], 4),
+)
+trace_case(
+    "recovered-topic-limit-over-32-bits",
+    FULL_READ,
+    "/payload/facts/1/max_topic_bytes",
+    "The bound on a topic is a 32-bit quantity.",
+    setter(["payload", "facts", 1, "max_topic_bytes"], "4294967296"),
+    code="u32-out-of-range",
 )
 trace_case(
     "recovered-payload-limit-overflow",
@@ -1762,6 +1777,13 @@ def twice(table, index=0, **changes):
 
 
 snap_case(
+    "target-limit-over-32-bits",
+    "u32-out-of-range",
+    "/account/limits/max_targets_per_admission",
+    "The bound on the targets of an admission is a 32-bit quantity, in a snapshot as in a trace.",
+    setter(["account", "limits", "max_targets_per_admission"], "4294967296"),
+)
+snap_case(
     "unknown-table",
     "schema-violation",
     "",
@@ -1988,8 +2010,6 @@ for path in (
     ["account", "limits", "payload_bytes"],
     ["account", "limits", "exchange_slots"],
     ["account", "limits", "receipt_slots"],
-    ["account", "limits", "max_targets_per_admission"],
-    ["account", "limits", "max_topic_bytes"],
     ["account", "limits", "max_payload_bytes"],
     ["account", "limits", "max_sessions"],
     ["account", "limits", "max_route_targets"],

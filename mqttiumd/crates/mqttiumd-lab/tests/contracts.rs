@@ -385,3 +385,66 @@ fn the_reasons_of_a_refusal_are_those_of_the_contract() {
         assert_eq!(stated, Some(reason.as_str()), "{name}");
     }
 }
+
+/// The cases of the order of a recovery inventory hold for the contract's
+/// rule. The oracle runs the same file through its own copy.
+#[test]
+fn the_recovery_order_cases_hold_for_the_contract() {
+    use mqttiumd_contract::effects::{OrderRefused, RecoveryOrder};
+    use mqttiumd_lab::semantic::representative_fact;
+
+    let path = root().join("crates/mqttiumd-lab/tests/support/recovery-order-cases.json");
+    let cases: Value = serde_json::from_slice(&fs::read(path).expect("cases")).expect("JSON");
+    let cases = cases["cases"].as_array().expect("cases");
+    assert!(cases.len() >= 10);
+    for case in cases {
+        let mut order = RecoveryOrder::new();
+        let mut found = Vec::new();
+        for (index, fact) in case["facts"].as_array().expect("facts").iter().enumerate() {
+            let kind = fact[0].as_str().expect("kind");
+            let topic = fact.get(1).and_then(Value::as_str).unwrap_or_default();
+            let fact = representative_fact(kind, topic).expect("a kind of fact");
+            if let Err(refusal) = order.admit(&fact) {
+                let name = match refusal {
+                    OrderRefused::RankDecreased { .. } => "RankDecreased",
+                    OrderRefused::Repeated(_) => "Repeated",
+                    OrderRefused::RoutesUnsorted => "RoutesUnsorted",
+                };
+                found.push(serde_json::json!([index, name]));
+            }
+        }
+        assert_eq!(Value::Array(found), case["refused"], "{}", case["name"]);
+    }
+}
+
+/// A `.json` file of the schema directory that is not a schema is refused
+/// when the contracts are opened, as the oracle refuses it: it would be
+/// hashed into the contract digest and never read as a rule.
+#[test]
+fn a_file_of_the_schema_directory_that_is_not_a_schema_is_refused() {
+    let base = std::env::temp_dir().join(format!("mqttiumd-l3-schema-dir-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    for directory in ["contracts/v1", "contracts/schema/v1"] {
+        fs::create_dir_all(base.join(directory)).expect("directory");
+        for entry in fs::read_dir(root().join(directory)).expect("listing") {
+            let entry = entry.expect("entry");
+            if entry.path().is_file() {
+                fs::copy(entry.path(), base.join(directory).join(entry.file_name())).expect("copy");
+            }
+        }
+    }
+    assert!(Workspace::open(&base, Path::new("contracts/v1")).is_ok());
+    // The foreign file is itself a valid local schema: only its place
+    // refuses it.
+    fs::write(
+        base.join("contracts/schema/v1/notes.json"),
+        b"{\"$schema\": \"https://json-schema.org/draft/2020-12/schema\"}\n",
+    )
+    .expect("write");
+    let refused = Workspace::open(&base, Path::new("contracts/v1"));
+    let _ = fs::remove_dir_all(&base);
+    let diagnostic = refused
+        .err()
+        .expect("a foreign file in the schema directory is refused");
+    assert_eq!(diagnostic.code, code::SCHEMA_NOT_LOCAL, "{diagnostic:?}");
+}

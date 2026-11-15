@@ -204,9 +204,18 @@ impl Workspace {
                     manifest::sha256_hex(&loaded.bytes),
                 ));
                 if is_schema {
-                    if name.ends_with(".schema.json") {
-                        schema_files.push((name, loaded.bytes.clone()));
+                    // Every file of the schema directory is hashed into the
+                    // digest, so every one must be a schema the readers load.
+                    if !name.ends_with(".schema.json") {
+                        return Err(Diagnostic::new(
+                            code::SCHEMA_NOT_LOCAL,
+                            "",
+                            format!(
+                                "{directory}/{name} is in the schema directory and is not a schema"
+                            ),
+                        ));
                     }
+                    schema_files.push((name, loaded.bytes.clone()));
                 } else {
                     contract_names.push(name);
                 }
