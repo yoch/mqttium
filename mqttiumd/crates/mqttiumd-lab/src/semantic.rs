@@ -1245,7 +1245,123 @@ fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnosti
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+
+    /// The rules of the P1 registry and the notes of its validation.
+    fn p1_registry() -> (Value, Report) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workspace = Workspace::open(&root, Path::new("contracts/v1")).expect("contracts");
+        let path = "contracts/v1/p1.transitions.json";
+        let bytes = std::fs::read(root.join(path)).expect("registry");
+        let document: Value = serde_json::from_slice(&bytes).expect("JSON");
+        let report = workspace.check_file(Path::new(path));
+        (document, report)
+    }
+
+    /// The rules of one cell, as (guard partition, disposition, required
+    /// effects, forbidden effects).
+    fn cell<'a>(
+        registry: &'a Value,
+        state: &str,
+        event: &str,
+    ) -> Vec<(&'a Value, &'a str, Vec<&'a str>, Vec<&'a str>)> {
+        items(registry, "rules")
+            .iter()
+            .filter(|rule| text(rule, "state_class") == state && text(rule, "event_class") == event)
+            .map(|rule| {
+                (
+                    &rule["guard_partition"],
+                    text(rule, "disposition"),
+                    names(rule, "required_effects"),
+                    names(rule, "forbidden_effects"),
+                )
+            })
+            .collect()
+    }
+
+    fn has_hole(report: &Report, cell: &str) -> bool {
+        report.notes.iter().any(|note| note.contains(cell))
+            || report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(cell))
+    }
+
+    /// ADR 0001, "Replayed PUBLISH": while the outcome of the admission is
+    /// unknown, a PUBLISH of the exchange creates no command and no
+    /// acknowledgement, after a reconnect and on a live connection.
+    #[test]
+    fn a_publish_replayed_while_the_outcome_is_unknown_admits_and_acknowledges_nothing() {
+        let (registry, report) = p1_registry();
+        assert!(report.is_accepted(), "{:?}", report.diagnostics);
+        assert!(!has_hole(
+            &report,
+            "inbound_qos2 AdmissionPending x PublishQos2"
+        ));
+        let rules = cell(&registry, "AdmissionPending", "PublishQos2");
+        let connections: BTreeSet<&str> = rules
+            .iter()
+            .flat_map(|(guard, ..)| names(guard, "connection"))
+            .collect();
+        assert_eq!(
+            connections,
+            BTreeSet::from(["resumed", "same"]),
+            "one row after a reconnect and one on a live connection"
+        );
+        for (guard, disposition, required, forbidden) in rules {
+            assert_eq!(disposition, "TRANSITION", "{guard}");
+            assert!(required.is_empty(), "{guard}: nothing is emitted");
+            assert!(forbidden.contains(&"Persist"), "{guard}: no command");
+            assert!(forbidden.contains(&"EmitPubrec"), "{guard}: no ack");
+        }
+    }
+
+    /// ADR 0001, "Guards": a deadline for an operation that became terminal
+    /// is ignored as stale; for an unresolved one it starts a resolution
+    /// and arms the next deadline.
+    #[test]
+    fn a_deadline_resolves_an_unresolved_operation_and_is_stale_for_a_terminal_one() {
+        let (registry, report) = p1_registry();
+        for state in ["Committed", "RejectedCertain", "Consumed", "ReceiptClosed"] {
+            assert!(!has_hole(
+                &report,
+                &format!("command {state} x ResultTimeout")
+            ));
+            let rules = cell(&registry, state, "ResultTimeout");
+            assert_eq!(rules.len(), 1, "{state}");
+            let (_, disposition, required, forbidden) = &rules[0];
+            assert_eq!(*disposition, "IGNORE_STALE", "{state}");
+            assert!(required.is_empty(), "{state}");
+            for effect in ["Persist", "ResolveAndFence", "ArmDeadline"] {
+                assert!(forbidden.contains(&effect), "{state}: {effect}");
+            }
+        }
+        for state in ["Submitted", "Indeterminate"] {
+            assert!(!has_hole(
+                &report,
+                &format!("command {state} x ResultTimeout")
+            ));
+            let rules = cell(&registry, state, "ResultTimeout");
+            let resolving: Vec<_> = rules
+                .iter()
+                .filter(|(guard, ..)| names(guard, "effect_capacity") == ["sufficient"])
+                .collect();
+            assert_eq!(resolving.len(), 1, "{state}");
+            let (_, disposition, required, forbidden) = resolving[0];
+            assert_eq!(*disposition, "TRANSITION", "{state}");
+            assert!(required.contains(&"ResolveAndFence"), "{state}");
+            assert!(required.contains(&"ArmDeadline"), "{state}");
+            assert!(forbidden.contains(&"Persist"), "{state}");
+            let deferred: Vec<_> = rules
+                .iter()
+                .filter(|(guard, ..)| names(guard, "effect_capacity") == ["insufficient"])
+                .collect();
+            assert_eq!(deferred.len(), 1, "{state}");
+            assert_eq!(deferred[0].1, "DEFER", "{state}");
+        }
+    }
 
     #[test]
     fn the_size_of_a_guard_domain_is_computed_without_building_it() {
