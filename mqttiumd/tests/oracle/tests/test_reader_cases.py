@@ -16,6 +16,8 @@ from mqttiumd_oracle.documents import MAX_DOCUMENT_BYTES, Contracts, ContractsUn
 
 from .support import ROOT
 
+EVERY_RUN = ("trace_complete", "broker_inputs_have_provenance", "one_grant_per_opened_epoch")
+
 SCENARIO = "tests/scenarios/p1/P1-02.json"
 SCRATCH = "target/oracle-tests"
 
@@ -75,7 +77,10 @@ class QualifyingResult(Scratch):
             "reasons": [],
             "assertions": [
                 {"name": name, "status": "PASS"}
-                for name in [*scenario["assertions"], "broker_inputs_have_provenance"]
+                for name in [
+                    *scenario["assertions"],
+                    *(owed for owed in EVERY_RUN if owed not in scenario["assertions"]),
+                ]
             ],
             "faults": [{"id": "lost_admission_result", "expected_hits": "1", "hits": "1"}],
             "scenario": self.cite(SCENARIO),
@@ -102,8 +107,9 @@ class QualifyingResult(Scratch):
         self.assertEqual(self.check(result), ["result-incomplete"])
 
     def test_an_assertion_every_run_owes_cannot_be_left_out(self):
-        # P1-02 lists neither; every run owes both (ADR 0003, DEM-MU-03).
-        for name in ("trace_complete", "broker_inputs_have_provenance"):
+        # P1-02 does not list them all; every run owes them (ADR 0003,
+        # DEM-MU-03, DEM-012).
+        for name in EVERY_RUN:
             with self.subTest(name):
                 result = self.passing()
                 kept = [entry for entry in result["assertions"] if entry["name"] != name]
