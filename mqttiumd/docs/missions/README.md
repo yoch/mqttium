@@ -13,27 +13,29 @@ close.
 
 | | |
 | - | - |
-| Base branch | `main`, after PR yoch/mqttium#647 (lot L0, with the amended record 0009) is merged |
-| Integrated revision | Not fixed yet. A commit cannot hold its own identifier: once L0 is merged, a change to this table alone records the revision of `main` that holds it |
-| Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb`. It depends on the content of the contract files only, so it is exact before the merge; the record of the revision repeats what `validate` prints on it |
+| Base branch | `main` |
+| Integrated revision | `874f298b4de7c3a13006cb1ff767dfb09e4031ac`, the merge of PR yoch/mqttium#647 (lot L0, with the amended record 0009) |
+| Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb`, as `validate` prints it on that revision |
 
-The wave starts from the commit of `main` that records the integrated
-revision. It differs from that revision by this table only. Every lot
+Every lot starts from the integrated revision. The commit that records it
+here differs from it by this file only, and changes no contract. Every lot
 names the revision it started from, and the contract digest it was
 verified against, in its report.
 
 ## Before the wave starts
 
-1. Lot L0 is received and merged into `main`.
+1. Lot L0 is received and merged into `main`. Done.
 2. Decision record 0009 (creation authority for owners and effect boxes)
    is accepted. Done, with amendments.
 3. The integrated revision and the contract digest are recorded above.
+   Done.
 
 ## Organisation
 
 One session and one branch per lot, and an integrator. The integrator
 writes no lot: it merges contract changes one at a time, keeps the shared
-files, and receives each lot on the revision actually proposed.
+files, reviews the code of each lot and receives it on the revision
+actually proposed.
 
 Each session starts with the interface the others wait for, then the
 implementations continue in parallel:
@@ -70,15 +72,16 @@ One lot per branch and per session. A lot changes only the paths it owns.
 | - | - | - |
 | L1 Inbound core | `crates/mqttiumd-core/` except `src/credits.rs`; in `crates/mqttiumd-contract/src/`: `effects.rs`, `step.rs`, `ids.rs`, `capacity.rs`, `packet.rs` | [L1](L1-inbound-core.md) |
 | L2 Deterministic store | `crates/mqttiumd-lab/src/store/`, `crates/mqttiumd-lab/tests/store_*.rs`; in `crates/mqttiumd-contract/src/`: `command.rs`, `outcome.rs` | [L2](L2-deterministic-store.md) |
-| L3 Oracle, traces, registry | `contracts/`, `tests/oracle/`, `tests/scenarios/`, `tests/fixtures/`, `tools/build_corpus.py`, `tools/check_schemas.py`; the validation code of `crates/mqttiumd-lab/src/` (`semantic.rs`, `schemas.rs`, `strict.rs`, `workspace.rs`, `diagnostic.rs`) | [L3](L3-oracle-traces-registry.md) |
+| L3 Oracle, traces, registry | `contracts/`, `tests/oracle/`, `tests/scenarios/`, `tests/fixtures/`, `tools/build_corpus.py`, `tools/check_schemas.py`; the validation code of `crates/mqttiumd-lab/src/` (`semantic.rs`, `schemas.rs`, `strict.rs`, `workspace.rs`, `diagnostic.rs`); in `crates/mqttiumd-lab/tests/`: `contracts.rs`, `qualifying.rs`, `requirements.rs`, `support/`, and new files named `oracle_*.rs`, `trace_*.rs`, `scenario_*.rs`, `registry_*.rs` | [L3](L3-oracle-traces-registry.md) |
 | L5 Model M1 | `models/`, the model step of the workflow | [L5](L5-model-m1.md) |
 | L6 Pilot proof | `crates/mqttiumd-core/src/credits.rs`, `proofs/` | [L6](L6-pilot-proof.md) |
 
 Shared by all, changed only through the integration owner:
 `Cargo.toml`, `Cargo.lock`, `.github/workflows/mqttiumd.yml`, `AGENTS.md`,
 `tools/install-tools.sh`,
-`docs/decisions/`, `docs/reception/open-conditions.md`,
-`crates/mqttiumd-lab/tests/boundary.rs`. In
+`docs/decisions/`, `docs/reception/open-conditions.md`, `docs/missions/`,
+`crates/mqttiumd-lab/tests/boundary.rs`,
+`crates/mqttiumd-lab/tests/review_l0.rs`. In
 `crates/mqttiumd-lab/src/lib.rs` and `crates/mqttiumd-core/src/lib.rs` a
 lot adds the line that declares its own module and nothing else. The
 remaining files of the bench (`main.rs`, `manifest.rs`, `files.rs`) wait
@@ -103,22 +106,50 @@ catalogue, the registry, the scenario or trace format, an injection point,
 or a list of `tests/boundary.rs`.
 
 1. The lot that needs it asks the owner of the file. The owner makes the
-   change, on its own small branch, apart from the rest of its lot.
+   change apart from the rest of its lot: a short chain of commits whose
+   parent is the head of the integration branch, and which holds nothing
+   else (see "How a change travels").
 2. The change carries a decision record when it decides something, the
    updated examples, and the rebuilt derived files
    (`python tools/build_corpus.py`).
 3. Its description gives the contract digest before and after, and names
    the lots it affects.
-4. The integration owner merges contract changes one at a time into the
-   base branch. The other lots then take the new base.
+4. The integration owner reviews the chain and merges contract changes
+   one at a time into the integration branch. The other lots then take
+   the new base.
 5. Two lots never change the same contract file independently.
+
+### How a change travels
+
+A session pushes to the branch of its lot and to no other. The
+integration branch is `claude/optimistic-feynman-fqh947`; it starts from
+`main` and holds, in order, the contract changes that were reviewed.
+
+1. The lot commits the change on top of the head of the integration
+   branch (`git fetch origin claude/optimistic-feynman-fqh947`), not on
+   top of its own lot work. Before a lot has pushed anything else, these
+   are simply the first commits of its branch.
+2. It makes the chain reachable from its own branch, by a merge when lot
+   work already exists, pushes, and sends the integration owner the
+   identifier of the last commit of the chain.
+3. The integration owner reviews that commit. A finding is fixed by new
+   commits on top of the chain, test first; nothing is rewritten.
+4. The integration owner merges the reviewed commit into the integration
+   branch and reads the checks on the result. The identifiers are kept,
+   so a lot that merges the integration branch later meets its own
+   commits again.
+5. The other lots merge the integration branch when they need the change.
+   The owner of the repository merges the integration branch into `main`.
+
+A lot may keep pushing its own work at any time. What it builds on a
+change that is not reviewed yet may have to follow a correction.
 
 Contract changes already known:
 
 | Change | Needed by | Made by |
 | - | - | - |
-| Creation authority, private `Outbox` constructor (record 0009) | L1, L2, L4, L7 | L1, first, with L2 for the opening of an epoch |
-| Contract of opening an epoch: durable states, results, hand-over of the authority (record 0009) | L1, L4, L7 | L2, first, with L1 |
+| Contract of opening an epoch: durable states, results, and the permit that hands the authority over (record 0009) | L1, L4, L7 | L2, first, with L1 |
+| Creation authority, built by consuming that permit; private `Outbox` constructor (record 0009) | L1, L2, L4, L7 | L1, after the change of L2 |
 | A refusal of `reserve` that says a table is definitively exhausted | L1 | L1 |
 | Credits types for `release_if_current` | L1, L6 | L6, first |
 | Routes and capacities among the recovered facts | L1, L2 | L1, with L2 |
@@ -127,6 +158,7 @@ Contract changes already known:
 | Store snapshot format | L2, L4 | L3, with L2 |
 | Registry rules: the 39 uncovered cells, and the rules of record 0001 | L1 | L3 |
 | Attribute and macro lists of the boundary, if a proof tool needs one | L6 | Integration owner, by decision |
+| `--models-dir` option of the client's TLC runner (a change to the client's tools, travelling the same way) | L5 | L5, first |
 
 ## Independence
 
@@ -150,7 +182,10 @@ Each mission lists its criteria. For every lot:
 - each control mutation is seen to fail its test, then reverted; a
   surviving mutation is reported and closed with a test;
 - the open conditions the lot closes are removed from
-  `../reception/open-conditions.md` in the same change.
+  `../reception/open-conditions.md` in the same change;
+- the integrator reviews the code of the proposed revision. A finding is a
+  defect like any other: it is reproduced by a test that fails, then
+  fixed, and the lot is received on the revision that holds the fix.
 
 A lot is received on the revision actually proposed. If the content changes
 afterwards, the evidence it touches is run again.
