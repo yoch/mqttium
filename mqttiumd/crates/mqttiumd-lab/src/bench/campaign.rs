@@ -644,6 +644,7 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
             },
             "a fault at the fence point, or on the result of a resolution, selects every resolution: the store adapter gives a resolution no source",
             "the authority of the runner keeps one owner active: S0 runs owner 0 only",
+            "the run reads only the copy of the contracts, the scenario and the fixture it makes in the campaign; a concurrent write to the checkout during the copy is not excluded",
         ],
         "artifacts": inventory,
     });
