@@ -915,6 +915,115 @@ pub fn a_release_ends_the_inbound_exchange<S: DurableStore>(
     );
 }
 
+/// Every account equals what the state holds: a receipt slot per receipt
+/// and per fence, an exchange slot per inbound marker, a reference per
+/// obligation, the bytes of the payloads kept. Returns the first account
+/// that differs.
+pub fn accounts_match_what_is_held(state: &DurableState) -> Result<(), &'static str> {
+    let count = |n: usize| u64::try_from(n).expect("a count fits u64");
+    let held = Accounts {
+        payload_bytes: PayloadBytes::new(
+            state
+                .payloads
+                .values()
+                .map(|payload| count(payload.bytes.len()))
+                .sum(),
+        ),
+        references: References::new(count(state.obligations.len())),
+        exchange_slots: ExchangeSlots::new(count(state.inbound.len())),
+        receipt_slots: ReceiptSlots::new(count(state.operations.len() + state.fences.len())),
+    };
+    let accounts = state.accounts;
+    if accounts.payload_bytes != held.payload_bytes {
+        return Err("payload bytes");
+    }
+    if accounts.references != held.references {
+        return Err("references");
+    }
+    if accounts.exchange_slots != held.exchange_slots {
+        return Err("exchange slots");
+    }
+    if accounts.receipt_slots != held.receipt_slots {
+        return Err("receipt slots");
+    }
+    Ok(())
+}
+
+fn inbound_released<S: DurableStore>(world: &World<S>) -> StoreOutcome {
+    StoreOutcome::Committed(CommitFacts::InboundReleased {
+        exchange: ExchangeId {
+            session: world.producer,
+            generation: ExchangeGeneration::new(1),
+        },
+    })
+}
+
+/// A release writes a receipt, and that receipt holds a receipt slot like
+/// every other: the slots counted are exactly the receipts and fences
+/// held (audit F1, case a).
+pub fn a_release_holds_the_slot_of_its_receipt<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut world = World::new(make);
+    let command = world.admission(1, 7, b"payload", &[world.b]);
+    assert!(world.store.apply(&command).committed_now);
+    let applied = world.store.apply(&world.release(2, 7, 1));
+    assert_eq!(outcome(applied.reply), inbound_released(&world));
+    let state = world.store.snapshot();
+    let held = state.operations.len() + state.fences.len();
+    assert_eq!(held, 2);
+    assert_eq!(
+        state.accounts.receipt_slots,
+        ReceiptSlots::new(u64::try_from(held).expect("small"))
+    );
+}
+
+/// With no receipt slot left, a release is not recorded, and nothing
+/// changes, the inbound marker included: no slot for its receipt, none
+/// for a rejection either (audit F1, case b).
+pub fn a_release_without_a_receipt_slot_changes_nothing<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut limits = fixture_limits();
+    limits.receipt_slots = ReceiptSlots::new(1);
+    let mut world = World::with_limits(make, limits);
+    let command = world.admission(1, 7, b"payload", &[world.b]);
+    assert!(world.store.apply(&command).committed_now);
+    let full = world.store.snapshot();
+    assert_eq!(full.inbound.len(), 1);
+    let applied = world.store.apply(&world.release(2, 7, 1));
+    assert_eq!(outcome(applied.reply), StoreOutcome::PendingOrUnknown);
+    assert!(!applied.committed_now);
+    assert!(!applied.wrote);
+    assert_eq!(world.store.snapshot(), full);
+}
+
+/// Collecting a closed epoch gives back exactly the slots its receipts
+/// held, the receipt of a release included (audit F1, case c).
+pub fn collecting_an_epoch_gives_back_the_slots_of_its_releases<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut world = World::new(make);
+    let command = world.admission(1, 7, b"payload", &[world.b]);
+    assert!(world.store.apply(&command).committed_now);
+    let release = world.release(2, 7, 1);
+    assert_eq!(
+        outcome(world.store.apply(&release).reply),
+        inbound_released(&world)
+    );
+    let closed = world.epoch;
+    open(&mut world.store);
+    assert_eq!(
+        world
+            .store
+            .admin(AdminCommand::CollectClosedEpochs { through: closed }),
+        Ok(AdminDone::Collected)
+    );
+    let state = world.store.snapshot();
+    assert!(state.operations.is_empty());
+    assert_eq!(state.accounts.receipt_slots, ReceiptSlots::ZERO);
+}
+
 /// Deleting the producing session deletes no obligation of another
 /// session; an obligation ends by its destination, with its accounts
 /// (DEM-011, MU-07).
@@ -1569,6 +1678,9 @@ pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     another_recipe_under_the_same_operation_is_a_violation(make);
     resolve_returns_a_commit_and_fences_an_absence(make);
     a_release_ends_the_inbound_exchange(make);
+    a_release_holds_the_slot_of_its_receipt(make);
+    a_release_without_a_receipt_slot_changes_nothing(make);
+    collecting_an_epoch_gives_back_the_slots_of_its_releases(make);
     deleting_the_producer_deletes_no_obligation_of_another_session(make);
     an_older_epoch_is_not_entered_again(make);
     a_collected_identity_is_retired_not_rejected(make);
