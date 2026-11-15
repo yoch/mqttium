@@ -1,0 +1,53 @@
+{
+  "format": "mqttiumd.fault-catalog",
+  "schema_version": 1,
+  "command_kinds": [
+    "AdmitPublication",
+    "ReleaseInbound"
+  ],
+  "points": [
+    {
+      "point": "store.command.transit",
+      "meaning": "The adapter accepted a command that has not entered the writer yet.",
+      "carries": "command",
+      "actions": [
+        "teleport"
+      ]
+    },
+    {
+      "point": "store.fence.transit",
+      "meaning": "A resolution read the absence of its operation in the writer and its fence has not been written yet. A resolution that finds a receipt, a fence or a retired identity does not reach the point. The store does not know the command of an absent operation: the selection names the resolved operation by the kind and binding of its command as the bench knows them, from the fault that selected that command earlier in the scenario.",
+      "carries": "command",
+      "actions": [
+        "hold_command",
+        "refuse_fence"
+      ]
+    },
+    {
+      "point": "store.commit.applied",
+      "meaning": "The transaction is committed and no result exists yet.",
+      "carries": "command",
+      "actions": [
+        "barrier"
+      ]
+    },
+    {
+      "point": "store.result.ready",
+      "meaning": "The result is ready on the store side and not delivered to the core.",
+      "carries": "result",
+      "actions": [
+        "drop_result",
+        "delay_result",
+        "duplicate_result"
+      ]
+    },
+    {
+      "point": "store.result.consume",
+      "meaning": "The result reached the core, which has not finished consuming it.",
+      "carries": "result",
+      "actions": [
+        "barrier"
+      ]
+    }
+  ]
+}

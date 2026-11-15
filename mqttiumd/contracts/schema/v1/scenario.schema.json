@@ -28,6 +28,13 @@
     "profile": {
       "$ref": "primitives.schema.json#/$defs/slug"
     },
+    "perimeter": {
+      "description": "The perimeter a run of this scenario must have; absent, `full`. A run of another perimeter concludes nothing about this scenario. What a run exercises. `full`: client bytes through the transport, with independent peers. `core-without-bytes`: the core is driven with validated packets; no transport and no peer observes anything.",
+      "enum": [
+        "full",
+        "core-without-bytes"
+      ]
+    },
     "initial_fixture": {
       "$ref": "primitives.schema.json#/$defs/relative_path"
     },
@@ -80,9 +87,7 @@
         "id",
         "point",
         "match",
-        "occurrence",
-        "action",
-        "expected_hits"
+        "action"
       ],
       "properties": {
         "id": {
@@ -103,22 +108,157 @@
             },
             "publication_binding": {
               "$ref": "primitives.schema.json#/$defs/binding"
+            },
+            "result_of": {
+              "description": "The effect whose store result the fault selects. Only on a point that carries a result; absent, any result about a matching operation counts.",
+              "enum": [
+                "Persist",
+                "ResolveAndFence"
+              ]
             }
           }
         },
         "occurrence": {
           "$ref": "primitives.schema.json#/$defs/u64"
         },
+        "from_occurrence": {
+          "description": "A repeated fault: every occurrence from this one on (record 0018). Exclusive of `occurrence`.",
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
         "action": {
           "$ref": "primitives.schema.json#/$defs/name"
+        },
+        "lag": {
+          "description": "Only on a repeated `delay_result`, and required there: each delayed answer is delivered once `lag` newer answers of the same selection are held.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
         },
         "bind_operation_as": {
           "$ref": "primitives.schema.json#/$defs/binding"
         },
         "expected_hits": {
           "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "expected_hits_at_least": {
+          "description": "Only on a repeated fault, and required there: how often it must at least be reached; how often it is reached depends on the product.",
+          "allOf": [
+            {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            {
+              "not": {
+                "const": "0"
+              }
+            }
+          ]
         }
-      }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "occurrence"
+          ]
+        },
+        {
+          "required": [
+            "from_occurrence"
+          ]
+        }
+      ],
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "occurrence"
+            ]
+          },
+          "then": {
+            "required": [
+              "expected_hits"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "expected_hits_at_least"
+                  ]
+                },
+                {
+                  "required": [
+                    "lag"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "from_occurrence"
+            ]
+          },
+          "then": {
+            "required": [
+              "expected_hits_at_least"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "expected_hits"
+                  ]
+                },
+                {
+                  "required": [
+                    "bind_operation_as"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "from_occurrence",
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "const": "delay_result"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "lag"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "not": {
+                  "const": "delay_result"
+                }
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "lag"
+              ]
+            }
+          }
+        }
+      ]
     },
     "step": {
       "type": "object",
@@ -135,7 +275,11 @@
             "CrashBroker",
             "RestartBroker",
             "ClientResumeExchange",
-            "ClientSendPubrel"
+            "ClientSendPubrel",
+            "FireDeadline",
+            "ReleaseHeldCommand",
+            "DeliverHeldResult",
+            "LeaveBarrier"
           ]
         }
       },
@@ -312,6 +456,10 @@
                     "binding": {
                       "$ref": "primitives.schema.json#/$defs/name"
                     },
+                    "fire_deadlines": {
+                      "description": "Whether the bench fires the armed deadlines, oldest first, while nothing else is eligible and the event has not happened, within max_steps (record 0018).",
+                      "type": "boolean"
+                    },
                     "max_steps": {
                       "$ref": "primitives.schema.json#/$defs/u64"
                     }
@@ -358,6 +506,10 @@
                     },
                     "packet_id": {
                       "$ref": "primitives.schema.json#/$defs/packet_id"
+                    },
+                    "fire_deadlines": {
+                      "description": "Whether the bench fires the armed deadlines, oldest first, while nothing else is eligible and the event has not happened, within max_steps (record 0018).",
+                      "type": "boolean"
                     },
                     "max_steps": {
                       "$ref": "primitives.schema.json#/$defs/u64"
@@ -516,6 +668,122 @@
               },
               "packet_id": {
                 "$ref": "primitives.schema.json#/$defs/packet_id"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "FireDeadline"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "max_steps"
+            ],
+            "properties": {
+              "kind": {
+                "const": "FireDeadline"
+              },
+              "max_steps": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ReleaseHeldCommand"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "fault"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ReleaseHeldCommand"
+              },
+              "fault": {
+                "$ref": "primitives.schema.json#/$defs/name"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "DeliverHeldResult"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "fault",
+              "max_steps"
+            ],
+            "properties": {
+              "kind": {
+                "const": "DeliverHeldResult"
+              },
+              "fault": {
+                "$ref": "primitives.schema.json#/$defs/name"
+              },
+              "max_steps": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "LeaveBarrier"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "fault"
+            ],
+            "properties": {
+              "kind": {
+                "const": "LeaveBarrier"
+              },
+              "fault": {
+                "$ref": "primitives.schema.json#/$defs/name"
               }
             }
           }

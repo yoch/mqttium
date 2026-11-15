@@ -12,6 +12,15 @@
         "pattern": "[\\n\\r]"
       }
     },
+    "u32": {
+      "description": "Canonical decimal string of an unsigned 32-bit value. The semantic pass also enforces the upper bound 4294967295.",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,9})$",
+      "maxLength": 10,
+      "not": {
+        "pattern": "[\\n\\r]"
+      }
+    },
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$",
@@ -130,6 +139,56 @@
         }
       }
     },
+    "publication_id": {
+      "description": "One internal publication, independent of any Packet Identifier.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch",
+        "owner",
+        "sequence"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "owner": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "sequence": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "payload_id": {
+      "description": "One durable immutable payload object.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch",
+        "owner",
+        "sequence"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "owner": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "sequence": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
     "effect_id": {
       "type": "object",
       "additionalProperties": false,
@@ -187,7 +246,14 @@
         "Committed",
         "RejectedCertain",
         "PendingOrUnknown",
-        "RetiredOutcomeUnavailable"
+        "RetiredOutcomeUnavailable",
+        "Violation"
+      ]
+    },
+    "store_violation": {
+      "description": "The contract violation a store reports instead of an outcome (StoreViolation).",
+      "enum": [
+        "RecipeMismatch"
       ]
     },
     "verdict": {
@@ -217,6 +283,15 @@
           "$ref": "primitives.schema.json#/$defs/u64"
         }
       }
+    },
+    "reject_reason": {
+      "description": "Why the store rejected an operation for certain, in the vocabulary of RejectReason.",
+      "enum": [
+        "PreconditionFailed",
+        "CapacityExceeded",
+        "Fenced",
+        "EpochClosed"
+      ]
     }
   }
 }

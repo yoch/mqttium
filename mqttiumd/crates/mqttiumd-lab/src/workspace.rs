@@ -13,17 +13,28 @@ use crate::files::{self, Loaded, Refusal};
 use crate::schemas::Schemas;
 use crate::{manifest, semantic, strict};
 
+/// One contractual injection point.
+#[derive(Default)]
+pub struct FaultPoint {
+    /// What passes through the point: `command` or `result`.
+    pub carries: String,
+    /// The actions the point offers.
+    pub actions: BTreeSet<String>,
+}
+
 /// The closed catalogues that documents refer to.
 #[derive(Default)]
 pub struct Catalogs {
     /// Injection point to the actions it offers.
-    pub fault_points: BTreeMap<String, BTreeSet<String>>,
+    pub fault_points: BTreeMap<String, FaultPoint>,
     /// Command kinds a fault may match.
     pub command_kinds: BTreeSet<String>,
     /// Profile identifiers.
     pub profiles: BTreeSet<String>,
     /// Assertion names.
     pub assertions: BTreeSet<String>,
+    /// Assertions every run owes, whether or not its scenario lists them.
+    pub every_run: BTreeSet<String>,
     /// Requirement, scenario, mutation, model, gate and lot identifiers.
     pub requirements: BTreeSet<String>,
 }
@@ -138,6 +149,12 @@ pub struct Workspace {
     schemas: Schemas,
     catalogs: Catalogs,
     contracts_digest: String,
+    /// The contract and schema files as they were read when the workspace
+    /// was opened, by resolved path. The digest is the digest of these
+    /// bytes, and these bytes are what the workspace interprets.
+    snapshot: BTreeMap<PathBuf, Vec<u8>>,
+    /// Names of the JSON files of the contract directory, in order.
+    contract_names: Vec<String>,
     active: ReferenceStack,
 }
 
@@ -165,14 +182,56 @@ impl Workspace {
             .map_err(|error| unreadable(format!("{}: {error}", root.display())))?;
         let (contract_dir, schema_dir) =
             files::contract_directories(contracts).map_err(unreadable)?;
-        let listed = manifest::contract_files(root, contracts).map_err(unreadable)?;
+        // One read of every contract and schema file: these bytes are
+        // hashed, and these bytes are interpreted.
+        let mut snapshot = BTreeMap::new();
+        let mut listing = Vec::new();
+        let mut schema_files = Vec::new();
+        let mut contract_names = Vec::new();
+        for (directory, is_schema) in [(&contract_dir, false), (&schema_dir, true)] {
+            let entries = fs::read_dir(root.join(directory))
+                .map_err(|error| unreadable(format!("{directory}: {error}")))?;
+            for entry in entries {
+                let entry = entry.map_err(|error| unreadable(format!("{directory}: {error}")))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.ends_with(".json") {
+                    continue;
+                }
+                let loaded = files::read_document(&canonical_root, &entry.path())
+                    .map_err(|(code, message)| Diagnostic::new(code, "", message))?;
+                listing.push((
+                    format!("{directory}/{name}"),
+                    manifest::sha256_hex(&loaded.bytes),
+                ));
+                if is_schema {
+                    // Every file of the schema directory is hashed into the
+                    // digest, so every one must be a schema the readers load.
+                    if !name.ends_with(".schema.json") {
+                        return Err(Diagnostic::new(
+                            code::SCHEMA_NOT_LOCAL,
+                            "",
+                            format!(
+                                "{directory}/{name} is in the schema directory and is not a schema"
+                            ),
+                        ));
+                    }
+                    schema_files.push((name, loaded.bytes.clone()));
+                } else {
+                    contract_names.push(name);
+                }
+                snapshot.insert(loaded.path, loaded.bytes);
+            }
+        }
+        listing.sort();
+        schema_files.sort();
+        contract_names.sort();
         let contracts_digest = manifest::contracts_digest(
-            listed
+            listing
                 .iter()
-                .map(|file| (file.sha256.as_str(), file.path.as_str())),
+                .map(|(path, sha256)| (sha256.as_str(), path.as_str())),
         );
         let contracts = root.join(contract_dir);
-        let schemas = Schemas::load(&canonical_root, &root.join(schema_dir))?;
+        let schemas = Schemas::from_bytes(&schema_files)?;
         let mut workspace = Self {
             root: root.to_path_buf(),
             canonical_root,
@@ -180,6 +239,8 @@ impl Workspace {
             schemas,
             catalogs: Catalogs::default(),
             contracts_digest,
+            snapshot,
+            contract_names,
             active: ReferenceStack::default(),
         };
 
@@ -219,13 +280,25 @@ impl Workspace {
                 .map(|point| {
                     (
                         point["point"].as_str().unwrap_or_default().to_owned(),
-                        strings(point, "actions", ""),
+                        FaultPoint {
+                            carries: point["carries"].as_str().unwrap_or_default().to_owned(),
+                            actions: strings(point, "actions", ""),
+                        },
                     )
                 })
                 .collect(),
             command_kinds: strings(faults, "command_kinds", ""),
             profiles: strings(profiles, "profiles", "id"),
             assertions: strings(assertions, "assertions", "name"),
+            every_run: assertions
+                .get("assertions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|entry| entry["every_run"] == true)
+                .filter_map(|entry| entry["name"].as_str())
+                .map(str::to_owned)
+                .collect(),
             requirements: strings(requirements, "entries", "id"),
         };
         Ok(workspace)
@@ -248,6 +321,22 @@ impl Workspace {
 
     /// Reads one document through the bounded, confined reader.
     fn read(&self, path: &Path) -> Result<Loaded, Refusal> {
+        // A contract file is the content the digest names, whatever the
+        // file holds now, even if it is gone.
+        let resolved = path
+            .canonicalize()
+            .ok()
+            .or_else(|| {
+                let relative = path.strip_prefix(&self.root).ok()?;
+                Some(self.canonical_root.join(relative))
+            })
+            .unwrap_or_else(|| path.to_path_buf());
+        if let Some(bytes) = self.snapshot.get(&resolved) {
+            return Ok(Loaded {
+                path: resolved,
+                bytes: bytes.clone(),
+            });
+        }
         files::read_document(&self.canonical_root, path)
     }
 
@@ -382,20 +471,10 @@ impl Workspace {
 
     /// Checks every JSON file of the contract directory, in name order.
     pub fn check_contracts(&self) -> Vec<(PathBuf, Report)> {
-        let mut files: Vec<PathBuf> = fs::read_dir(&self.contracts)
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "json")
-            })
-            .collect();
-        files.sort();
-        files
-            .into_iter()
-            .map(|path| {
+        self.contract_names
+            .iter()
+            .map(|name| {
+                let path = self.contracts.join(name);
                 let report = self.check_path(&path);
                 (path, report)
             })
@@ -405,9 +484,85 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
-    use super::{MAX_REFERENCE_DEPTH, REFERENCES, ReferenceStack, StackRefusal, is_contained};
+    use super::{
+        MAX_REFERENCE_DEPTH, REFERENCES, ReferenceStack, StackRefusal, Workspace, is_contained,
+    };
+
+    /// A copy of the contract directory and its schemas under a root of
+    /// its own, so that a test may change the files.
+    fn copy_of_the_contracts(name: &str) -> PathBuf {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = source.join("target/workspace-tests").join(name);
+        let _ = fs::remove_dir_all(&root);
+        for directory in ["contracts/v1", "contracts/schema/v1"] {
+            fs::create_dir_all(root.join(directory)).expect("directory");
+            for entry in fs::read_dir(source.join(directory)).expect("contracts") {
+                let entry = entry.expect("entry");
+                fs::copy(entry.path(), root.join(directory).join(entry.file_name())).expect("copy");
+            }
+        }
+        root
+    }
+
+    /// The digest names the rules that are applied: a contract file that
+    /// changes after the workspace was opened changes neither the digest
+    /// nor what is validated, and a workspace opened afterwards names
+    /// other contracts.
+    #[test]
+    fn the_bytes_that_are_hashed_are_the_bytes_that_are_interpreted() {
+        let root = copy_of_the_contracts("one-snapshot");
+        let contracts = Path::new("contracts/v1");
+        let workspace = Workspace::open(&root, contracts).expect("opens");
+        let digest = workspace.contracts_digest().to_owned();
+        let registry = Path::new("contracts/v1/p1.transitions.json");
+        assert!(workspace.check_file(registry).is_accepted());
+
+        // The catalogue of the registry is replaced by one without machines.
+        let catalog = root.join("contracts/v1/p1.catalog.json");
+        let changed = fs::read_to_string(&catalog)
+            .expect("catalogue")
+            .replace("\"inbound_qos2\"", "\"inbound_qos3\"");
+        fs::write(&catalog, changed).expect("write");
+        fs::write(root.join("contracts/v1/profiles.json"), "{}").expect("write");
+        fs::remove_file(root.join("contracts/v1/assertions.json")).expect("remove");
+
+        assert_eq!(workspace.contracts_digest(), digest);
+        let report = workspace.check_file(registry);
+        assert!(report.is_accepted(), "{:?}", report.diagnostics);
+        for (path, report) in workspace.check_contracts() {
+            assert!(
+                report.is_accepted(),
+                "{}: {:?}",
+                path.display(),
+                report.diagnostics
+            );
+        }
+        assert_eq!(workspace.check_contracts().len(), 6);
+
+        // Opened again, the directory is other contracts, and invalid ones.
+        assert!(Workspace::open(&root, contracts).is_err());
+        let original = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/v1");
+        fs::copy(
+            original.join("assertions.json"),
+            root.join("contracts/v1/assertions.json"),
+        )
+        .expect("copy");
+        fs::write(
+            root.join("contracts/v1/profiles.json"),
+            fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/v1/profiles.json"),
+            )
+            .expect("profiles"),
+        )
+        .expect("write");
+        let reopened = Workspace::open(&root, contracts).expect("opens");
+        assert_ne!(reopened.contracts_digest(), digest);
+        assert!(!reopened.check_file(registry).is_accepted());
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn the_reference_graph_between_formats_is_acyclic() {

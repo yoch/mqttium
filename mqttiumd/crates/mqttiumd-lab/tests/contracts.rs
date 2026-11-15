@@ -39,22 +39,48 @@ fn the_contract_directory_is_accepted() {
     }
 }
 
+/// A PASS requires a complete registry: every guard point of every cell of
+/// the P1 machines has exactly one rule. That a seed lists its holes
+/// instead of hiding them stays covered by the toy seed of the corpus and
+/// by `review_l0.rs`.
 #[test]
-fn the_seed_registry_lists_its_holes_instead_of_hiding_them() {
-    let report = workspace().check_file(Path::new("contracts/v1/p1.transitions.json"));
+fn the_p1_registry_is_complete_and_has_no_hole() {
+    let path = Path::new("contracts/v1/p1.transitions.json");
+    let bytes = fs::read(root().join(path)).expect("the registry is readable");
+    let registry: Value = serde_json::from_slice(&bytes).expect("the registry is JSON");
+    assert_eq!(registry["status"], "complete");
+    let report = workspace().check_file(path);
     assert!(report.is_accepted(), "{:?}", report.diagnostics);
-    assert!(
-        report
-            .notes
-            .iter()
-            .any(|note| note.contains("registry hole"))
-    );
-    assert!(
-        report
-            .notes
-            .iter()
-            .any(|note| note.contains("cannot support a PASS"))
-    );
+    assert!(report.notes.is_empty(), "{:?}", report.notes);
+}
+
+/// The same registry with one rule removed is refused, whichever rule it
+/// is: completeness is checked, not declared.
+#[test]
+fn the_p1_registry_without_any_one_of_its_rules_has_a_hole() {
+    let path = "contracts/v1/p1.transitions.json";
+    let bytes = fs::read(root().join(path)).expect("the registry is readable");
+    let registry: Value = serde_json::from_slice(&bytes).expect("the registry is JSON");
+    let rules = registry["rules"].as_array().expect("rules");
+    assert!(rules.len() >= 90);
+    let workspace = workspace();
+    for (index, rule) in rules.iter().enumerate() {
+        let mut without = registry.clone();
+        without["rules"]
+            .as_array_mut()
+            .expect("rules")
+            .remove(index);
+        let report = workspace.check_value(&without);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == code::REGISTRY_HOLE),
+            "without {}: {:?}",
+            rule["id"],
+            report.diagnostics
+        );
+    }
 }
 
 #[test]
@@ -103,6 +129,61 @@ fn every_invalid_example_is_refused_for_its_declared_reason() {
             report.diagnostics
         );
     }
+}
+
+/// One misplaced member is one diagnostic: a reader that reports the same
+/// mistake twice, or lets it cascade, spends the bounded report on noise.
+#[test]
+fn a_scenario_with_one_misplaced_step_gets_one_diagnostic() {
+    let workspace = workspace();
+    for name in [
+        "scenario-deliver-while-crashed.json",
+        "scenario-second-wait-on-a-holding-fault.json",
+        "scenario-release-twice.json",
+        "scenario-release-before-hold.json",
+        "scenario-inspect-while-crashed.json",
+    ] {
+        let file = format!("contracts/examples/v1/invalid/{name}");
+        let report = workspace.check_file(Path::new(&file));
+        assert_eq!(
+            report.diagnostics.len(),
+            1,
+            "{file}: {:?}",
+            report.diagnostics
+        );
+    }
+}
+
+/// DEM-018: the three orders of QABS are scenarios of their own, each
+/// with the injections that produce its order.
+#[test]
+fn the_qabs_scenarios_are_accepted_and_differ_by_their_injections() {
+    let workspace = workspace();
+    let mut actions = Vec::new();
+    for letter in ["A", "B", "C"] {
+        let file = format!("tests/scenarios/qabs/QABS-{letter}.json");
+        let report = workspace.check_file(Path::new(&file));
+        assert!(report.is_accepted(), "{file}: {:?}", report.diagnostics);
+        let bytes = fs::read(root().join(&file)).expect("scenario");
+        let scenario: Value = serde_json::from_slice(&bytes).expect("JSON");
+        assert_eq!(scenario["id"], format!("QABS-{letter}"));
+        let fence: Vec<String> = scenario["faults"]
+            .as_array()
+            .expect("faults")
+            .iter()
+            .filter(|fault| fault["point"] == "store.fence.transit")
+            .map(|fault| fault["action"].as_str().expect("action").to_owned())
+            .collect();
+        actions.push(fence);
+    }
+    assert_eq!(
+        actions,
+        [
+            vec!["hold_command"],
+            vec!["hold_command"],
+            vec!["refuse_fence"]
+        ]
+    );
 }
 
 #[test]
@@ -270,4 +351,158 @@ fn the_contract_digest_does_not_depend_on_how_the_directory_is_spelled() {
     assert_eq!(digest("contracts/v1/"), reference);
     assert_eq!(digest("./contracts/v1"), reference);
     assert!(Workspace::open(&root(), Path::new("contracts/../contracts/v1")).is_err());
+}
+
+/// The reason a refusing PUBREC carries, as the transition catalogue
+/// states it for `EmitPubrecRefusal`, is the reason of the contract: the
+/// oracle judges traces against the first, the core answers with the
+/// second.
+#[test]
+fn the_reasons_of_a_refusal_are_those_of_the_contract() {
+    use mqttiumd_contract::capacity::Resource;
+    use mqttiumd_contract::outcome::RejectReason;
+    use mqttiumd_contract::packet::AckReason;
+
+    let bytes = fs::read(root().join("contracts/v1/p1.catalog.json")).expect("catalogue");
+    let catalogue: Value = serde_json::from_slice(&bytes).expect("JSON");
+    let table = catalogue
+        .pointer("/refusal_reasons")
+        .and_then(Value::as_object)
+        .expect("the catalogue states the reasons of EmitPubrecRefusal");
+    let rejections = [
+        (
+            "CapacityExceeded",
+            RejectReason::CapacityExceeded(Resource::PayloadBytes),
+        ),
+        ("Fenced", RejectReason::Fenced),
+        ("PreconditionFailed", RejectReason::PreconditionFailed),
+        ("EpochClosed", RejectReason::EpochClosed),
+    ];
+    assert_eq!(table.len(), rejections.len(), "{table:?}");
+    for (name, rejection) in rejections {
+        let stated = table.get(name).and_then(Value::as_str);
+        let reason = format!("{:?}", AckReason::refusing(rejection));
+        assert_eq!(stated, Some(reason.as_str()), "{name}");
+    }
+}
+
+/// The cases of the order of a recovery inventory hold for the contract's
+/// rule. The oracle runs the same file through its own copy.
+#[test]
+fn the_recovery_order_cases_hold_for_the_contract() {
+    use mqttiumd_contract::effects::{OrderRefused, RecoveryOrder};
+    use mqttiumd_lab::semantic::representative_fact;
+
+    let path = root().join("crates/mqttiumd-lab/tests/support/recovery-order-cases.json");
+    let cases: Value = serde_json::from_slice(&fs::read(path).expect("cases")).expect("JSON");
+    let cases = cases["cases"].as_array().expect("cases");
+    assert!(cases.len() >= 10);
+    for case in cases {
+        let mut order = RecoveryOrder::new();
+        let mut found = Vec::new();
+        for (index, fact) in case["facts"].as_array().expect("facts").iter().enumerate() {
+            let kind = fact[0].as_str().expect("kind");
+            let topic = fact.get(1).and_then(Value::as_str).unwrap_or_default();
+            let fact = representative_fact(kind, topic).expect("a kind of fact");
+            if let Err(refusal) = order.admit(&fact) {
+                let name = match refusal {
+                    OrderRefused::RankDecreased { .. } => "RankDecreased",
+                    OrderRefused::Repeated(_) => "Repeated",
+                    OrderRefused::RoutesUnsorted => "RoutesUnsorted",
+                };
+                found.push(serde_json::json!([index, name]));
+            }
+        }
+        assert_eq!(Value::Array(found), case["refused"], "{}", case["name"]);
+    }
+}
+
+/// A `.json` file of the schema directory that is not a schema is refused
+/// when the contracts are opened, as the oracle refuses it: it would be
+/// hashed into the contract digest and never read as a rule.
+#[test]
+fn a_file_of_the_schema_directory_that_is_not_a_schema_is_refused() {
+    let base = std::env::temp_dir().join(format!("mqttiumd-l3-schema-dir-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    for directory in ["contracts/v1", "contracts/schema/v1"] {
+        fs::create_dir_all(base.join(directory)).expect("directory");
+        for entry in fs::read_dir(root().join(directory)).expect("listing") {
+            let entry = entry.expect("entry");
+            if entry.path().is_file() {
+                fs::copy(entry.path(), base.join(directory).join(entry.file_name())).expect("copy");
+            }
+        }
+    }
+    assert!(Workspace::open(&base, Path::new("contracts/v1")).is_ok());
+    // The foreign file is itself a valid local schema: only its place
+    // refuses it.
+    fs::write(
+        base.join("contracts/schema/v1/notes.json"),
+        b"{\"$schema\": \"https://json-schema.org/draft/2020-12/schema\"}\n",
+    )
+    .expect("write");
+    let refused = Workspace::open(&base, Path::new("contracts/v1"));
+    let _ = fs::remove_dir_all(&base);
+    let diagnostic = refused
+        .err()
+        .expect("a foreign file in the schema directory is refused");
+    assert_eq!(diagnostic.code, code::SCHEMA_NOT_LOCAL, "{diagnostic:?}");
+}
+
+/// A release the store refused for certain is prepared again only when it
+/// was fenced and the bound of preparations is not reached; any other
+/// refusal stops the owner, and nothing is persisted or acknowledged
+/// (record 0013, line 4). Without the reason the registry prepared again
+/// whatever the refusal, which loops for ever on a definitive one.
+#[test]
+fn a_release_refused_for_good_is_never_prepared_again() {
+    let bytes = fs::read(root().join("contracts/v1/p1.transitions.json")).expect("registry");
+    let registry: Value = serde_json::from_slice(&bytes).expect("JSON");
+    let rules = registry["rules"].as_array().expect("rules");
+    let rule = |id: &str| {
+        rules
+            .iter()
+            .find(|rule| rule["id"] == id)
+            .unwrap_or_else(|| panic!("no rule {id}"))
+    };
+    let again = rule("inbound_qos2.release_pending.rejected.prepare_again");
+    assert_eq!(
+        again["guard_partition"]["refusal"],
+        serde_json::json!(["fenced"])
+    );
+    let defer = rule("inbound_qos2.release_pending.rejected.defer");
+    assert_eq!(
+        defer["guard_partition"]["refusal"],
+        serde_json::json!(["fenced"])
+    );
+    for (id, refusal) in [
+        (
+            "inbound_qos2.release_pending.rejected.fenced_at_bound.stop",
+            "fenced_at_bound",
+        ),
+        (
+            "inbound_qos2.release_pending.rejected.definitive.stop",
+            "definitive",
+        ),
+    ] {
+        let stop = rule(id);
+        assert_eq!(stop["disposition"], "FAULT", "{id}");
+        assert_eq!(
+            stop["guard_partition"]["refusal"],
+            serde_json::json!([refusal]),
+            "{id}"
+        );
+        assert_eq!(stop["next_state_class"], "ReleasePending", "{id}");
+        assert_eq!(stop["required_effects"], serde_json::json!([]), "{id}");
+        for effect in ["Persist", "EmitPubcomp", "EmitPubcompNotFound"] {
+            assert!(
+                stop["forbidden_effects"]
+                    .as_array()
+                    .expect("effects")
+                    .iter()
+                    .any(|forbidden| forbidden == effect),
+                "{id} must forbid {effect}"
+            );
+        }
+    }
 }

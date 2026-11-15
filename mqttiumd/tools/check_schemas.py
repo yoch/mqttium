@@ -46,6 +46,7 @@ FORMATS = {
     "mqttiumd.transition-registry": "transition-registry.schema.json",
     "mqttiumd.run-manifest": "run-manifest.schema.json",
     "mqttiumd.run-result": "run-result.schema.json",
+    "mqttiumd.store-snapshot": "store-snapshot.schema.json",
     "mqttiumd.fault-catalog": "catalogs.schema.json",
     "mqttiumd.profile-catalog": "catalogs.schema.json",
     "mqttiumd.assertion-catalog": "catalogs.schema.json",

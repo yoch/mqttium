@@ -62,6 +62,7 @@
               "required": [
                 "point",
                 "meaning",
+                "carries",
                 "actions"
               ],
               "properties": {
@@ -70,6 +71,13 @@
                 },
                 "meaning": {
                   "$ref": "primitives.schema.json#/$defs/text"
+                },
+                "carries": {
+                  "description": "What passes through the point: a command on its way to the writer, or a store result on its way to the core.",
+                  "enum": [
+                    "command",
+                    "result"
+                  ]
                 },
                 "actions": {
                   "type": "array",
@@ -195,6 +203,7 @@
               "required": [
                 "name",
                 "meaning",
+                "every_run",
                 "requirements"
               ],
               "properties": {
@@ -203,6 +212,10 @@
                 },
                 "meaning": {
                   "$ref": "primitives.schema.json#/$defs/text"
+                },
+                "every_run": {
+                  "description": "Whether every run owes the assertion, or only a run of a scenario that lists it. A qualifying result reports the assertions of its scenario and those every run owes.",
+                  "type": "boolean"
                 },
                 "requirements": {
                   "type": "array",
@@ -507,6 +520,43 @@
             },
             "minItems": 1,
             "maxItems": 16
+          },
+          "refusal_reasons": {
+            "description": "The reason the effect EmitPubrecRefusal carries, for each reason of a certain rejection of the admission.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "PreconditionFailed",
+              "CapacityExceeded",
+              "Fenced",
+              "EpochClosed"
+            ],
+            "properties": {
+              "PreconditionFailed": {
+                "enum": [
+                  "QuotaExceeded",
+                  "ImplementationSpecificError"
+                ]
+              },
+              "CapacityExceeded": {
+                "enum": [
+                  "QuotaExceeded",
+                  "ImplementationSpecificError"
+                ]
+              },
+              "Fenced": {
+                "enum": [
+                  "QuotaExceeded",
+                  "ImplementationSpecificError"
+                ]
+              },
+              "EpochClosed": {
+                "enum": [
+                  "QuotaExceeded",
+                  "ImplementationSpecificError"
+                ]
+              }
+            }
           }
         }
       }

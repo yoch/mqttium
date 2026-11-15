@@ -1,0 +1,81 @@
+{
+  "format": "mqttiumd.store-snapshot",
+  "schema_version": 1,
+  "run_id": "certain-rejection-without-a-fence",
+  "checkpoint": "unknown",
+  "backend": "sim-store",
+  "meta": {
+    "incarnation": "1",
+    "last_opened_epoch": "1",
+    "opened_by": {
+      "startup_hex": "01010101010101010101010101010101",
+      "ticket": "1"
+    },
+    "collected_through": "0",
+    "state_revision": "0",
+    "next_session": "4"
+  },
+  "sessions": [
+    {
+      "session": "1",
+      "client_id_hex": "70312d70726f6475636572",
+      "revision": "1",
+      "state": "Active"
+    },
+    {
+      "session": "2",
+      "client_id_hex": "70312d62",
+      "revision": "1",
+      "state": "Active"
+    },
+    {
+      "session": "3",
+      "client_id_hex": "70312d63",
+      "revision": "1",
+      "state": "Active"
+    }
+  ],
+  "route_table": {
+    "revision": "2",
+    "routes": [
+      {
+        "topic_hex": "70312f6578616d706c65",
+        "targets": [
+          {
+            "session": "2",
+            "qos": 1
+          },
+          {
+            "session": "3",
+            "qos": 1
+          }
+        ]
+      }
+    ]
+  },
+  "operations": [],
+  "fences": [],
+  "payloads": [],
+  "publications": [],
+  "obligations": [],
+  "inbound_exchanges": [],
+  "account": {
+    "used": {
+      "payload_bytes": "0",
+      "references": "0",
+      "exchange_slots": "0",
+      "receipt_slots": "0"
+    },
+    "limits": {
+      "payload_bytes": "4096",
+      "references": "16",
+      "exchange_slots": "4",
+      "receipt_slots": "8",
+      "max_targets_per_admission": "4",
+      "max_topic_bytes": "256",
+      "max_payload_bytes": "1024",
+      "max_sessions": "8",
+      "max_route_targets": "8"
+    }
+  }
+}

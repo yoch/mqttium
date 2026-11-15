@@ -1,0 +1,21 @@
+{
+  "format": "mqttiumd.trace-record",
+  "schema_version": 1,
+  "run_id": "p1-02-example",
+  "record_sequence": "13",
+  "origin_component": "broker-core",
+  "origin_incarnation": "1",
+  "origin_sequence": "1",
+  "causal_parents": [],
+  "time_domain": "logical-step",
+  "time_value": "13",
+  "kind": "DurableStateInspected",
+  "payload": {
+    "checkpoint": "after_commit_before_crash",
+    "snapshot": {
+      "path": "runs/p1-02-example/after_commit_before_crash.snapshot.json",
+      "sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "bytes": "2048"
+    }
+  }
+}

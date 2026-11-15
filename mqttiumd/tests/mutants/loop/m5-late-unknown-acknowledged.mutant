@@ -1,0 +1,24 @@
+diff --git a/mqttiumd/crates/mqttiumd-core/src/owner.rs b/mqttiumd/crates/mqttiumd-core/src/owner.rs
+index 2f882bc..26566d1 100644
+--- a/mqttiumd/crates/mqttiumd-core/src/owner.rs
++++ b/mqttiumd/crates/mqttiumd-core/src/owner.rs
+@@ -1394,6 +1394,19 @@ impl Owner {
+                 .is_some_and(|held| held.operation == operation)
+         });
+         let Some(index) = waiting else {
++            // MUTANT M5: a late unknown answer acknowledges the exchange again.
++            if let StoreReply::Outcome(StoreOutcome::PendingOrUnknown) = reply
++                && let Some(slot) = slots
++                    .iter()
++                    .find(|slot| slot.admission.is_some_and(|known| known.operation == operation))
++            {
++                let frame = OutboundFrame::Pubrec {
++                    packet_id: slot.packet_id,
++                    reason: AckReason::Success,
++                };
++                self.plan_answer(slot, frame, draft)?;
++                return Ok(Change::Nothing);
++            }
+             return self.plan_late_result(effect, operation, reply);
+         };
+         let slot = &slots[index];
