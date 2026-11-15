@@ -30,6 +30,7 @@ use std::process::Command;
 
 use serde_json::{Value, json};
 
+use super::backend::{Backend, Memory};
 use super::collector::{Collector, KindTable};
 use super::mqtt::transport::Bounds;
 use super::process::{Settings, Stop, owner_config};
@@ -38,7 +39,7 @@ use super::scenario::Scenario;
 use crate::files;
 use crate::manifest;
 use crate::store::adapter::AdapterLimits;
-use crate::store::durable::{MAX_CLIENT_ID_BYTES, MemoryStore};
+use crate::store::durable::MAX_CLIENT_ID_BYTES;
 use crate::store::fixture;
 use crate::strict;
 use crate::workspace::Workspace;
@@ -59,6 +60,12 @@ pub struct Request {
     /// The slug the run is named by; derived from the scenario and the
     /// seed when absent.
     pub run_id: Option<String>,
+    /// The durable store the campaign runs on: `sim-store`, or `sqlite`
+    /// once lot L7 provides it.
+    pub backend: String,
+    /// The packed source this binary was built from by `run --rebuild`,
+    /// copied into the campaign as `source.tar`.
+    pub built_from: Option<PathBuf>,
 }
 
 /// What a campaign left, for the command line.
@@ -285,22 +292,24 @@ fn narrow<T: TryFrom<u64>>(value: u64, name: &str) -> Result<T, String> {
 
 /// The process under test as a fixture sets it up: its settings, the
 /// data set installed through store commands, and the clients.
-pub struct Setup {
+pub struct Setup<S> {
     pub settings: Settings,
-    pub store: MemoryStore,
+    pub store: S,
     pub population: Population,
 }
 
-impl Setup {
-    /// Reads a fixture document (already validated) and installs it.
-    pub fn from_fixture(
+impl<S: crate::store::durable::DurableStore> Setup<S> {
+    /// Reads a fixture document (already validated) and installs it in a
+    /// new data set of `backend`.
+    pub fn from_fixture<B: Backend<Store = S>>(
+        backend: &mut B,
         fixture_document: &Value,
         run_id: &str,
         seed: u64,
         faults: usize,
     ) -> Result<Self, String> {
         let plan = fixture::plan(fixture_document).map_err(|error| format!("{error:?}"))?;
-        let mut store = MemoryStore::create(plan.incarnation, plan.limits);
+        let mut store = backend.create(plan.incarnation, plan.limits)?;
         let installed =
             fixture::install(&mut store, &plan).map_err(|error| format!("{error:?}"))?;
         let population = Population {
@@ -363,6 +372,15 @@ impl Setup {
 /// Runs one campaign. An error is returned when nothing could be run;
 /// a run that stopped still leaves its directory.
 pub fn execute(request: &Request) -> Result<Report, String> {
+    match request.backend.as_str() {
+        "sim-store" => execute_with(request, Memory),
+        "sqlite" => Err("the sqlite backend is not available yet: lot L7 provides it".to_owned()),
+        other => Err(format!("unknown backend {other}: sim-store or sqlite")),
+    }
+}
+
+/// Runs one campaign on `backend`.
+fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report, String> {
     let out = &request.out;
     if out.exists()
         && fs::read_dir(out)
@@ -378,6 +396,11 @@ pub fn execute(request: &Request) -> Result<Report, String> {
     let contracts = relative(&request.contracts)?;
     let scenario_path = relative(&request.scenario)?;
 
+    // The source the binary was built from, when it was rebuilt.
+    if let Some(tar) = &request.built_from {
+        let bytes = fs::read(tar).map_err(|error| io(tar, error))?;
+        write(out, "source.tar", &bytes)?;
+    }
     // One read of every input, into the campaign; then the campaign is
     // the root the run reads.
     copy_contracts(root, Path::new(&contracts), out)?;
@@ -418,6 +441,7 @@ pub fn execute(request: &Request) -> Result<Report, String> {
         store,
         population,
     } = Setup::from_fixture(
+        &mut backend,
         &fixture_document,
         &run_id,
         request.seed,
@@ -431,8 +455,12 @@ pub fn execute(request: &Request) -> Result<Report, String> {
         .map_err(|error| error.to_string())?;
     let kinds = KindTable::from_schema(&schema)?;
     let collector = Collector::new(&run_id, kinds, scenario.max_trace_bytes);
+    let backend_name = backend.name();
+    let backend_settings = backend.describe();
+    let backend_crash = backend.crash();
     let outcome: Outcome = run(Plan {
         scenario: &scenario,
+        backend,
         settings,
         population,
         store,
@@ -475,7 +503,7 @@ pub fn execute(request: &Request) -> Result<Report, String> {
     run_manifest["generators"] = generators.clone();
     run_manifest["scenario"] = artifact(out, &scenario_path)?;
     run_manifest["fixture"] = artifact(out, &fixture_path)?;
-    run_manifest["backend"] = json!("sim-store");
+    run_manifest["backend"] = json!(backend_name);
     run_manifest["failure_model"] = json!(scenario.failure_model());
     run_manifest["scheduler"] = json!({
         "version": SCHEDULER_VERSION.to_string(),
@@ -520,7 +548,7 @@ pub fn execute(request: &Request) -> Result<Report, String> {
         "run_id": run_id,
         "verdict": "INCONCLUSIVE",
         "exit_code": 2,
-        "scope": format!("{} on the deterministic store, simulated process crash, seed {}", scenario.id, request.seed),
+        "scope": format!("{} on the backend {backend_name}, seed {}", scenario.id, request.seed),
         "reasons": reasons,
         "assertions": assertions,
         "faults": faults,
@@ -557,6 +585,9 @@ pub fn execute(request: &Request) -> Result<Report, String> {
         fixture_path.clone(),
     ];
     paths.extend(outcome.snapshots.iter().map(|(path, _)| path.clone()));
+    if request.built_from.is_some() {
+        paths.push("source.tar".to_owned());
+    }
     paths.extend(modified.iter().cloned());
     let (contract_dir, schema_dir) = files::contract_directories(Path::new(&contracts))?;
     for directory in [&contract_dir, &schema_dir] {
@@ -577,10 +608,18 @@ pub fn execute(request: &Request) -> Result<Report, String> {
         "run_id": run_id,
         "scenario": scenario.id,
         "covers": {
-            "backend": "sim-store: the deterministic store of the bench, in memory",
-            "crash": "simulated: the process under test is dropped and its store reopened from its durable state, in the same operating-system process",
+            "backend": backend_name,
+            "crash": backend_crash,
             "perimeter": "full: client bytes through the transport of the bench, decoded by independent peers",
             "start_up": "the real path: EpochOpening through the store adapter, EpochGrant, OwnerAuthority::from_grant, one box for owner 0, Owner::new",
+        },
+        "backend_settings": backend_settings,
+        "built_from": match request.built_from {
+            Some(_) => json!({
+                "source": artifact(out, "source.tar")?,
+                "build": super::rebuild::build_command(),
+            }),
+            None => Value::Null,
         },
         "lab": run_manifest["artifact"].clone(),
         "contracts_digest": workspace.contracts_digest(),
@@ -599,9 +638,13 @@ pub fn execute(request: &Request) -> Result<Report, String> {
         "modified": modified,
         "commands": {"replay": replay, "judge": judge},
         "limits": [
-            "the binary is identified by its digest; that it was built from the recorded revision and modifications is not established",
+            match request.built_from {
+                Some(_) => "the binary that ran was built by run --rebuild from source.tar of this campaign; that a build elsewhere gives the same digest is not established".to_owned(),
+                None => "the binary is identified by its digest; that it was built from the recorded revision and modifications is not established: run --rebuild establishes it".to_owned(),
+            },
             "a fault at the fence point, or on the result of a resolution, selects every resolution: the store adapter gives a resolution no source",
             "the authority of the runner keeps one owner active: S0 runs owner 0 only",
+            "the run reads only the copy of the contracts, the scenario and the fixture it makes in the campaign; a concurrent write to the checkout during the copy is not excluded",
         ],
         "artifacts": inventory,
     });
