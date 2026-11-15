@@ -503,11 +503,20 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     {
         return Err(format!("{} exists and is not empty", out.display()));
     }
-    fs::create_dir_all(out).map_err(|error| io(out, error))?;
     let root = &request.root;
     let canonical_root = root.canonicalize().map_err(|error| io(root, error))?;
     let contracts = relative(&request.contracts)?;
     let scenario_path = relative(&request.scenario)?;
+    // What the bench does not play is refused before anything is written.
+    {
+        let path = canonical_root.join(&scenario_path);
+        let bytes = fs::read(&path).map_err(|error| io(&path, error))?;
+        let document = strict::parse(&bytes).map_err(|error| error.to_string())?;
+        if let Some(why) = super::scenario::unplayed(&document) {
+            return Err(format!("{scenario_path} is not played: {why}"));
+        }
+    }
+    fs::create_dir_all(out).map_err(|error| io(out, error))?;
 
     // The source the binary was built from, when it was rebuilt.
     if let Some(tar) = &request.built_from {
