@@ -513,6 +513,175 @@ ok(
     scenario(lambda v: (v["steps"][1].pop("packet_id"), v["steps"][1].update(qos=0))),
 )
 
+# The steps of P1-02b (ADR 0001): no crash, a held command, a held result and
+# two deadlines. `tests/scenarios/p1/P1-02b.json` itself comes with lot L4;
+# this document only fixes the shape of the steps.
+MATCH_A = {"command_kind": "AdmitPublication", "publication_binding": "pub_A"}
+
+
+def fault(fid, point, action, **extra):
+    match = {**MATCH_A, **extra.pop("match", {})}
+    return {
+        "id": fid,
+        "point": point,
+        "match": match,
+        "occurrence": "1",
+        "action": action,
+        **extra,
+        "expected_hits": "1",
+    }
+
+
+def drive_fault(binding):
+    return {"kind": "DriveUntil", "event": "FaultHit", "binding": binding, "max_steps": "512"}
+
+
+HELD = scenario(
+    lambda v: v.update(
+        id="P1-02b",
+        faults=[
+            fault(
+                "held_admission",
+                "store.command.transit",
+                "hold_command",
+                bind_operation_as="op_A",
+            ),
+            fault(
+                "held_unknown",
+                "store.result.ready",
+                "delay_result",
+                match={"result_of": "ResolveAndFence"},
+            ),
+            fault(
+                "lost_admission_result",
+                "store.result.ready",
+                "drop_result",
+                match={"result_of": "Persist"},
+            ),
+        ],
+        steps=[
+            BASE["steps"][0],
+            BASE["steps"][1],
+            drive_fault("held_admission"),
+            {"kind": "FireDeadline", "max_steps": "512"},
+            drive_fault("held_unknown"),
+            {"kind": "ReleaseHeldCommand", "fault": "held_admission"},
+            drive_fault("lost_admission_result"),
+            {"kind": "InspectDurableState", "checkpoint": "after_commit"},
+            {"kind": "FireDeadline", "max_steps": "512"},
+            BASE["steps"][8],
+            {"kind": "DeliverHeldResult", "fault": "held_unknown", "max_steps": "512"},
+            BASE["steps"][9],
+            BASE["steps"][10],
+            BASE["steps"][11],
+        ],
+        assertions=[name for name in BASE["assertions"] if name != "no_pubrec_observed_before_crash"],
+    )
+)
+RELEASE, DELIVER = 5, 10
+
+
+def held(edit):
+    value = copy.deepcopy(HELD)
+    edit(value)
+    return value
+
+
+def swap(first, second):
+    def edit(value):
+        steps = value["steps"]
+        steps[first], steps[second] = steps[second], steps[first]
+
+    return edit
+
+
+ok("scenario-held-command-and-result.json", HELD)
+bad(
+    "scenario-release-before-hold.json",
+    "step-order-invalid",
+    "/steps/2",
+    "A command is released only after the step that reached its hold.",
+    held(swap(2, RELEASE)),
+)
+bad(
+    "scenario-release-twice.json",
+    "step-order-invalid",
+    f"/steps/{RELEASE + 1}",
+    "A held command is released once.",
+    held(lambda v: v["steps"].insert(RELEASE + 1, copy.deepcopy(v["steps"][RELEASE]))),
+)
+bad(
+    "scenario-deliver-after-crash.json",
+    "step-order-invalid",
+    f"/steps/{DELIVER + 2}",
+    "A crash destroys what the broker process held; nothing is left to deliver.",
+    held(
+        lambda v: v["steps"].__setitem__(
+            slice(DELIVER, DELIVER), [BASE["steps"][4], BASE["steps"][5]]
+        )
+    ),
+)
+bad(
+    "scenario-release-undeclared-fault.json",
+    "binding-undefined",
+    f"/steps/{RELEASE}/fault",
+    "ReleaseHeldCommand names a fault that is not declared.",
+    held(setter(["steps", RELEASE, "fault"], "held_release")),
+)
+bad(
+    "scenario-release-of-a-held-result.json",
+    "held-item-mismatch",
+    f"/steps/{RELEASE}/fault",
+    "The fault delays a result; it holds no command to release.",
+    held(setter(["steps", RELEASE, "fault"], "held_unknown")),
+)
+bad(
+    "scenario-deliver-of-a-dropped-result.json",
+    "held-item-mismatch",
+    f"/steps/{DELIVER}/fault",
+    "A dropped result is gone; only a delayed result can be delivered.",
+    held(setter(["steps", DELIVER, "fault"], "lost_admission_result")),
+)
+bad(
+    "scenario-result-of-on-a-command-point.json",
+    "fault-match-invalid",
+    "/faults/0/match/result_of",
+    "The point carries a command; `result_of` selects among results.",
+    held(setter(["faults", 0, "match", "result_of"], "Persist")),
+)
+bad(
+    "scenario-result-of-unknown-effect.json",
+    "schema-violation",
+    "/faults/1/match/result_of",
+    "Only Persist and ResolveAndFence are answered by a store result.",
+    held(setter(["faults", 1, "match", "result_of"], "LoadWork")),
+)
+bad(
+    "scenario-fire-deadline-without-budget.json",
+    "schema-violation",
+    "/steps/3",
+    "Firing a deadline is bounded like every step that drives the broker.",
+    held(lambda v: v["steps"][3].pop("max_steps")),
+)
+bad(
+    "scenario-fire-deadline-budget-exceeded.json",
+    "budget-exceeded",
+    "/steps/3/max_steps",
+    "The new steps obey the scenario budget.",
+    held(setter(["steps", 3, "max_steps"], "8192")),
+)
+
+# fault catalogue
+FAULTS = json.loads((V1 / "fault-points.json").read_text())
+ok("fault-catalog.json", FAULTS)
+bad(
+    "fault-catalog-point-without-carries.json",
+    "schema-violation",
+    "/points/0",
+    "Every injection point says whether a command or a result passes through it.",
+    (lambda v: (v["points"][0].pop("carries"), v)[1])(copy.deepcopy(FAULTS)),
+)
+
 # fixture
 fixture = json.loads((ROOT / "tests/fixtures/p1/three-persistent-sessions.json").read_text())
 

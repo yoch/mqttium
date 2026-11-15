@@ -1,0 +1,43 @@
+{
+  "format": "mqttiumd.fault-catalog",
+  "schema_version": 1,
+  "command_kinds": [
+    "AdmitPublication",
+    "ReleaseInbound"
+  ],
+  "points": [
+    {
+      "point": "store.command.transit",
+      "meaning": "The adapter accepted a command that has not entered the writer yet.",
+      "actions": [
+        "hold_command"
+      ]
+    },
+    {
+      "point": "store.commit.applied",
+      "meaning": "The transaction is committed and no result exists yet.",
+      "carries": "command",
+      "actions": [
+        "barrier"
+      ]
+    },
+    {
+      "point": "store.result.ready",
+      "meaning": "The result is ready on the store side and not delivered to the core.",
+      "carries": "result",
+      "actions": [
+        "drop_result",
+        "delay_result",
+        "duplicate_result"
+      ]
+    },
+    {
+      "point": "store.result.consume",
+      "meaning": "The result reached the core, which has not finished consuming it.",
+      "carries": "result",
+      "actions": [
+        "barrier"
+      ]
+    }
+  ]
+}

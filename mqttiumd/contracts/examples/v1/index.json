@@ -6,6 +6,8 @@
     "tests/fixtures/p1/three-persistent-sessions.json",
     "contracts/examples/v1/valid/scenario-u64-max.json",
     "contracts/examples/v1/valid/scenario-qos0-publish.json",
+    "contracts/examples/v1/valid/scenario-held-command-and-result.json",
+    "contracts/examples/v1/valid/fault-catalog.json",
     "contracts/examples/v1/valid/trace-record-header.json",
     "contracts/examples/v1/valid/trace-record-store-commit-stable.json",
     "contracts/examples/v1/valid/trace-record-fault-hit.json",
@@ -352,6 +354,72 @@
       "code": "step-order-invalid",
       "pointer": "/steps/4",
       "why": "RestartBroker needs a crashed broker."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-release-before-hold.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/2",
+      "why": "A command is released only after the step that reached its hold."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-release-twice.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/6",
+      "why": "A held command is released once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-deliver-after-crash.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/12",
+      "why": "A crash destroys what the broker process held; nothing is left to deliver."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-release-undeclared-fault.json",
+      "code": "binding-undefined",
+      "pointer": "/steps/5/fault",
+      "why": "ReleaseHeldCommand names a fault that is not declared."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-release-of-a-held-result.json",
+      "code": "held-item-mismatch",
+      "pointer": "/steps/5/fault",
+      "why": "The fault delays a result; it holds no command to release."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-deliver-of-a-dropped-result.json",
+      "code": "held-item-mismatch",
+      "pointer": "/steps/10/fault",
+      "why": "A dropped result is gone; only a delayed result can be delivered."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-result-of-on-a-command-point.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/0/match/result_of",
+      "why": "The point carries a command; `result_of` selects among results."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-result-of-unknown-effect.json",
+      "code": "schema-violation",
+      "pointer": "/faults/1/match/result_of",
+      "why": "Only Persist and ResolveAndFence are answered by a store result."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-fire-deadline-without-budget.json",
+      "code": "schema-violation",
+      "pointer": "/steps/3",
+      "why": "Firing a deadline is bounded like every step that drives the broker."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-fire-deadline-budget-exceeded.json",
+      "code": "budget-exceeded",
+      "pointer": "/steps/3/max_steps",
+      "why": "The new steps obey the scenario budget."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/fault-catalog-point-without-carries.json",
+      "code": "schema-violation",
+      "pointer": "/points/0",
+      "why": "Every injection point says whether a command or a result passes through it."
     },
     {
       "file": "contracts/examples/v1/invalid/fixture-route-target-unknown.json",

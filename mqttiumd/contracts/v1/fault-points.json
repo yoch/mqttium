@@ -9,6 +9,7 @@
     {
       "point": "store.command.transit",
       "meaning": "The adapter accepted a command that has not entered the writer yet.",
+      "carries": "command",
       "actions": [
         "hold_command"
       ]
@@ -16,6 +17,7 @@
     {
       "point": "store.commit.applied",
       "meaning": "The transaction is committed and no result exists yet.",
+      "carries": "command",
       "actions": [
         "barrier"
       ]
@@ -23,6 +25,7 @@
     {
       "point": "store.result.ready",
       "meaning": "The result is ready on the store side and not delivered to the core.",
+      "carries": "result",
       "actions": [
         "drop_result",
         "delay_result",
@@ -32,6 +35,7 @@
     {
       "point": "store.result.consume",
       "meaning": "The result reached the core, which has not finished consuming it.",
+      "carries": "result",
       "actions": [
         "barrier"
       ]
