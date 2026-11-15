@@ -9,9 +9,10 @@ content, under which assumptions, with which tool, and what is not proved.
 The harnesses, the scripts and their output are the evidence; this file is
 the guide to them.
 
-**State: not received.** The proof runs locally. Two conditions of the
-reception are not met yet: no call site of lot L1 exists, and nothing here
-runs in CI. See "What is not done".
+**State: not received.** The runs recorded here are local. Two conditions
+of the reception are not met yet: the call site of lot L1 is not on the
+integration branch, and the job `pilot proof` of the `mqttiumd` workflow
+has not been read green on an exact revision. See "What is not done".
 
 ## The function
 
@@ -29,7 +30,7 @@ runs in CI. See "What is not done".
 | `proofs/credits/harnesses.txt` | `sha256:54f85cc0270a7956d07fceaa2914f5741982b6567503d3fd380cdeca64c17ca1` |
 | `proofs/credits/tests/no_allocation.rs` | `sha256:f63b2706874092e4de47409d38d0efe883b9ed813d8c4dc7979d935f0d16e558` |
 | Recorded in | `BODY.sha256`; `run.sh` fails with exit 5 when any of them differs |
-| Call site in the product | None yet. Lot L1 calls it and writes no second variant (DEM-024) |
+| Call site in the product | Not on the integration branch yet. On the branch of lot L1 it is `LeaseTable::release` in `crates/mqttiumd-core/src/leases.rs`, the only call outside `credits.rs` (seen at `8106a200` of `claude/mqttiumd-l1-inbound-core`); it is named here for good once merged (DEM-024) |
 
 The text of the function is from its `pub fn` line to the first closing
 brace in column one.
@@ -401,23 +402,12 @@ inconclusive, so a stale mutant cannot count as caught.
 
 ## What is not done
 
-- **No call site.** Lot L1 has not called the function yet. The reception
-  names that call site.
-- **Not in CI.** The workflow is a shared file. Until a job installs the
-  pinned tools and runs `proofs/credits/run.sh`, every result above is a
-  local run.
-- **Record 0010 is proposed, not accepted.** The interface is on the
-  integration branch; the owner of the repository accepts the record.
-- **The precondition is not enforced anywhere.** One record per held
-  lease is owed by the lease table of lot L1, as an open condition; no
-  test of L1 shows it yet.
-- **The record goes stale with the contract.** It did once already:
-  lot L1 added a variant of `WakeCondition` to `capacity.rs` and the
-  identity `OutboxSerial` to `ids.rs`. On the merge `23334904` `run.sh`
-  failed with exit 5, every harness still verified; the two additions
-  were read (neither touches what the body calls), the proof was run on
-  the new content and recorded. The same will happen at the next change
-  of those files, and lot L6 records, not the lot that made the change.
+- **The call site is not merged.** Lot L1 wrote it on its own branch;
+  the reception names it on the integration branch, on an exact revision.
+- **Not read green in CI.** The job `pilot proof` of
+  `.github/workflows/mqttiumd.yml` installs the pinned Kani and runs the
+  commands of this file. Until it is read green on an exact revision,
+  every result above is a local run.
 - **Human time** of the maintenance trial.
 - The open condition "Pilot proof" of
   `docs/reception/open-conditions.md` stays open.
