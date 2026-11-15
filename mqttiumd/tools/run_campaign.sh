@@ -2,7 +2,7 @@
 # Runs one campaign with the runner of the bench, then has the oracle
 # judge the directory it wrote (lot L4). Run from the mqttiumd directory:
 #
-#   tools/run_campaign.sh <scenario> <empty campaign directory> [seed]
+#   tools/run_campaign.sh <scenario> <empty campaign directory> [seed] [sim-store|sqlite]
 #
 # The runner computes no verdict. The exit status is the oracle's:
 # 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 3 OUT_OF_SCOPE; 70 when the oracle
@@ -11,16 +11,18 @@
 # the campaign, which the runner wrote before any judgement.
 set -euo pipefail
 
-if [[ $# -lt 2 || $# -gt 3 ]]; then
-    echo "usage: tools/run_campaign.sh <scenario> <empty campaign directory> [seed]" >&2
+if [[ $# -lt 2 || $# -gt 4 ]]; then
+    echo "usage: tools/run_campaign.sh <scenario> <empty campaign directory> [seed] [sim-store|sqlite]" >&2
     exit 2
 fi
 scenario=$1
 out=$2
 seed=${3:-1}
+backend=${4:-sim-store}
 
 if ! cargo run -q -p mqttiumd-lab --locked -- run \
-    --contracts contracts/v1 --scenario "$scenario" --seed "$seed" --out "$out"; then
+    --contracts contracts/v1 --scenario "$scenario" --seed "$seed" --backend "$backend" \
+    --out "$out"; then
     echo "no campaign was written" >&2
     exit 2
 fi

@@ -38,7 +38,14 @@ directories are generated and never committed.
 ```bash
 tools/run_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02        # seed 1
 tools/run_campaign.sh tests/scenarios/qabs/QABS-B.json /tmp/qabs-b 7  # another seed
+tools/run_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02-sqlite 1 sqlite
 ```
+
+The fourth argument names the store: `sim-store` (the default) or
+`sqlite`, the store of `crates/mqttiumd-store-sqlite` in one file of the
+campaign. On both, a crash of a scenario is simulated inside one
+process: the adapter is dropped and the store recovered or reopened. No
+process is killed and nothing is shown about `fsync` or power loss.
 
 The loop is shown to reject a defect by mutations kept as diffs under
 `tests/mutants/loop/` (`*.mutant`: the root `.gitignore` ignores `*.patch`
@@ -49,6 +56,7 @@ failing assertion and its reason with `expected.json`:
 
 ```bash
 tools/run_loop_mutants.sh
+tools/run_loop_mutants.sh --backend sqlite
 ```
 
 `proofs/` is a workspace of its own, so the four commands above do not see

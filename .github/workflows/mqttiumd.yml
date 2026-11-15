@@ -69,20 +69,30 @@ jobs:
           python -m pip install --disable-pip-version-check -r tests/oracle/requirements.txt
           python tests/oracle/build_traces.py --check
           python -m unittest discover -t tests/oracle -s tests/oracle/tests
-      # A campaign runs a scenario through the real core, the deterministic
-      # store and their adapters, and the oracle judges the directory the
-      # runner wrote. The step fails unless the oracle's verdict is PASS.
+      # A campaign runs a scenario through the real core, a store and their
+      # adapters, and the oracle judges the directory the runner wrote. The
+      # step fails unless the oracle's verdict is PASS. On both stores the
+      # crash of a scenario is simulated inside one process: no process is
+      # killed.
       - name: Campaigns on the deterministic store
         run: |
           for scenario in p1/P1-02 p1/P1-02b qabs/QABS-A qabs/QABS-B qabs/QABS-C audit/F3-steady-lag; do
             tools/run_campaign.sh "tests/scenarios/$scenario.json" \
-              "$RUNNER_TEMP/campaigns/$(basename "$scenario")"
+              "$RUNNER_TEMP/campaigns/sim-store/$(basename "$scenario")"
+          done
+      - name: Campaigns on the SQLite store
+        run: |
+          for scenario in p1/P1-02 p1/P1-02b qabs/QABS-A qabs/QABS-B qabs/QABS-C audit/F3-steady-lag; do
+            tools/run_campaign.sh "tests/scenarios/$scenario.json" \
+              "$RUNNER_TEMP/campaigns/sqlite/$(basename "$scenario")" 1 sqlite
           done
       # The loop must reject a defect: each mutation of tests/mutants/loop
       # is applied in a temporary worktree, played, and judged by the
       # oracle of this tree, and must be refused for its own reason.
-      - name: The loop rejects its mutants
+      - name: The loop rejects its mutants on the deterministic store
         run: tools/run_loop_mutants.sh
+      - name: The loop rejects its mutants on the SQLite store
+        run: tools/run_loop_mutants.sh --backend sqlite
       - name: Keep the campaign directories
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

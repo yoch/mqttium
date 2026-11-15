@@ -8,10 +8,12 @@ result never carries PASS.
 """
 
 import contextlib
+import hashlib
 import io
 import json
 import shutil
 import unittest
+from unittest import mock
 
 from mqttiumd_oracle import __main__ as command
 from mqttiumd_oracle import results
@@ -24,6 +26,24 @@ TRACES = "tests/oracle/traces"
 SCENARIO = f"{TRACES}/scenarios/p1-02.json"
 FULL = "contracts/examples/v1/valid/run-manifest-with-oracle-and-generators.json"
 BARE = "contracts/examples/v1/valid/run-manifest-content-only.json"
+
+
+ORACLE = "tests/oracle/mqttiumd_oracle"
+
+
+def running_oracle():
+    """The files of the oracle as the bench lists them: its modules and its requirements."""
+    paths = sorted(f"{ORACLE}/{path.name}" for path in (ROOT / ORACLE).glob("*.py")) + [
+        "tests/oracle/requirements.txt"
+    ]
+    return [
+        {
+            "path": path,
+            "sha256": hashlib.sha256((ROOT / path).read_bytes()).hexdigest(),
+            "bytes": str(len((ROOT / path).read_bytes())),
+        }
+        for path in paths
+    ]
 
 
 class Produce(unittest.TestCase):
@@ -57,9 +77,7 @@ class Produce(unittest.TestCase):
                 scheduler={"version": "1", "seed": "1"},
                 commands=["mqttiumd-lab run", "mqttiumd_oracle judge"],
             )
-            manifest["oracle"]["files"] = [
-                self.cite(entry["path"]) for entry in manifest["oracle"]["files"]
-            ]
+            manifest["oracle"]["files"] = running_oracle()
         manifest.update(changes)
         return self.store(manifest)
 
@@ -154,6 +172,7 @@ class Produce(unittest.TestCase):
         manifest_value["scenario"]["sha256"] = "1" * 64
         manifest_value["oracle"]["files"][0]["sha256"] = "2" * 64
         manifest_value["checkout"]["tree_state"] = "modified"
+        manifest_value["checkout"]["modified_paths"] = ["tools/probe.txt"]
         self.store(manifest_value)
         code, out = self.run_command("p1-02-good", manifest)
         unmet = self.unmet(self.written(out))
@@ -161,8 +180,8 @@ class Produce(unittest.TestCase):
             "the manifest names other contracts",
             "the manifest names another scenario",
             "the oracle that judged is not the one the manifest identifies: "
-            "tests/oracle/mqttiumd_oracle/judge.py",
-            "the tree was modified and its content is not kept in the run directory",
+            f"{manifest_value['oracle']['files'][0]['path']}",
+            "the modified path tools/probe.txt is not kept in the run directory",
         ):
             self.assertTrue(any(words in reason for reason in unmet), (words, unmet))
 
@@ -172,6 +191,118 @@ class Produce(unittest.TestCase):
         with contextlib.redirect_stderr(errors), self.assertRaises(SystemExit):
             command._main([*arguments, "--out", "o", "--scope", "s", "--qualifying"])
         self.assertIn("unrecognized arguments: --qualifying", errors.getvalue())
+
+
+class Campaign(unittest.TestCase):
+    """``produce`` run as a campaign runs it: ``--root`` is the campaign directory.
+
+    The campaign holds its contracts, scenario, fixture and trace, not the
+    oracle: the oracle that judges is the one that runs, and the manifest
+    names its files by their paths in the checkout.
+    """
+
+    def setUp(self):
+        self.campaign = ROOT / f"target/oracle-tests/{self.id().rsplit('.', 1)[-1]}/campaign"
+        shutil.rmtree(self.campaign.parent, ignore_errors=True)
+        self.campaign.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, self.campaign.parent, ignore_errors=True)
+        shutil.copytree(ROOT / "contracts", self.campaign / "contracts")
+        scenario = json.loads((ROOT / SCENARIO).read_text())
+        for path in (SCENARIO, scenario["initial_fixture"], f"{TRACES}/p1-02-good/trace.jsonl"):
+            (self.campaign / path).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(ROOT / path, self.campaign / path)
+        self.contracts = Contracts.open(self.campaign)
+
+    def cite(self, path):
+        data = (self.campaign / path).read_bytes()
+        return {"path": path, "sha256": hashlib.sha256(data).hexdigest(), "bytes": str(len(data))}
+
+    def keep(self, path, data):
+        (self.campaign / path).parent.mkdir(parents=True, exist_ok=True)
+        (self.campaign / path).write_bytes(data)
+
+    def produce(self, **checkout):
+        manifest = json.loads((ROOT / FULL).read_text())
+        scenario = json.loads((ROOT / SCENARIO).read_text())
+        manifest.update(
+            scenario=self.cite(SCENARIO),
+            fixture=self.cite(scenario["initial_fixture"]),
+            backend="sim-store",
+            failure_model="process",
+            scheduler={"version": "1", "seed": "1"},
+            commands=["mqttiumd-lab run", "mqttiumd_oracle produce"],
+        )
+        manifest["contracts"] = [self.cite(path) for path in sorted(self.contracts.files)]
+        manifest["contracts_digest"] = self.contracts.digest
+        manifest["oracle"]["files"] = running_oracle()
+        for member in ("oracle", "generators"):
+            manifest[member]["sha256"] = contracts_digest(
+                (entry["sha256"], entry["path"]) for entry in manifest[member]["files"]
+            )
+        manifest["checkout"].update(checkout)
+        (self.campaign / "manifest.json").write_text(json.dumps(manifest))
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(io.StringIO()):
+            command.main(
+                [
+                    "--root",
+                    str(self.campaign),
+                    "produce",
+                    "--scenario",
+                    SCENARIO,
+                    "--trace",
+                    f"{TRACES}/p1-02-good/trace.jsonl",
+                    "--manifest",
+                    "manifest.json",
+                    "--out",
+                    "run-result.json",
+                    "--scope",
+                    "P1-02 in a campaign",
+                ]
+            )
+        result = json.loads((self.campaign / "run-result.json").read_text())
+        return [reason for reason in result["reasons"] if reason.startswith("not qualifying: ")]
+
+    def test_the_oracle_that_runs_is_the_one_the_manifest_names(self):
+        self.assertEqual(self.produce(), [f"not qualifying: {results.UNTIED_BINARY}"])
+
+    def test_an_oracle_file_the_manifest_does_not_list_is_named(self):
+        listed = running_oracle()
+        missing = listed.pop(0)["path"]
+        with mock.patch(f"{__name__}.running_oracle", return_value=listed):
+            unmet = self.produce()
+        self.assertIn(
+            f"not qualifying: the manifest does not list the oracle file {missing}", unmet
+        )
+
+    def test_a_modified_tree_whose_content_is_kept_qualifies_on_that_count(self):
+        self.keep("modified/untracked/tools/probe.txt", b"probe\n")
+        # A long binary line before a diff does not hide that diff.
+        self.keep(
+            "modified/tracked.patch",
+            b"diff --git a/assets/blob b/assets/blob\nGIT binary patch\n"
+            + b"z" * (results.MAX_HEADER_BYTES * 3)
+            + b"\ndiff --git a/crates/x.rs b/crates/x.rs\n--- a/crates/x.rs\n+++ b/crates/x.rs\n",
+        )
+        unmet = self.produce(
+            tree_state="modified", modified_paths=["crates/x.rs", "tools/probe.txt"]
+        )
+        self.assertEqual(unmet, [f"not qualifying: {results.UNTIED_BINARY}"])
+
+    def test_a_modified_path_the_campaign_does_not_keep_is_named(self):
+        self.keep(
+            "modified/tracked.patch",
+            b"diff --git a/crates/x.rs b/crates/x.rs\n",
+        )
+        unmet = self.produce(tree_state="modified", modified_paths=["crates/x.rs", "crates/y.rs"])
+        self.assertIn(
+            "not qualifying: the modified path crates/y.rs is not kept in the run directory",
+            unmet,
+        )
+        self.assertNotIn(
+            "not qualifying: the modified path crates/x.rs is not kept in the run directory",
+            unmet,
+        )
 
 
 if __name__ == "__main__":
