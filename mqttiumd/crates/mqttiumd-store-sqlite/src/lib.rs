@@ -120,13 +120,13 @@ impl From<Corrupt> for OpenError {
 /// decode. Nothing it prepared is written.
 #[derive(Debug)]
 enum Fault {
-    Sql,
+    Sql(rusqlite::Error),
     Corrupt,
 }
 
 impl From<rusqlite::Error> for Fault {
-    fn from(_: rusqlite::Error) -> Self {
-        Self::Sql
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sql(error)
     }
 }
 
@@ -1212,7 +1212,10 @@ impl SqliteStore {
     /// The durable state, or why it could not be read: a value that does
     /// not decode is `OpenError::Corrupt`, as for `inspect`.
     pub fn try_snapshot(&self) -> Result<DurableState, OpenError> {
-        Ok(self.snapshot())
+        self.read_snapshot().map_err(|fault| match fault {
+            Fault::Corrupt => OpenError::Corrupt,
+            Fault::Sql(error) => OpenError::Sql(error),
+        })
     }
 
     /// The engine and the settings in force, read back at opening.
@@ -1867,9 +1870,9 @@ impl DurableStore for SqliteStore {
     }
 
     fn snapshot(&self) -> DurableState {
-        // Inspection only: a store whose durable values do not decode
-        // cannot be inspected, and says so.
-        self.read_snapshot()
+        // The interface has no error here. A caller that must not stop on
+        // a value that does not decode calls `try_snapshot` or `inspect`.
+        self.try_snapshot()
             .expect("the durable state of the SQLite store decodes")
     }
 }
