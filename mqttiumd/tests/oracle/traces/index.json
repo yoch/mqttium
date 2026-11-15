@@ -1171,6 +1171,24 @@
       "why": "DEM-MU-05: an unknown answer arriving after the commit makes the core acknowledge again."
     },
     {
+      "name": "p1-02b-good-bench-ordered-after-the-late-unknown",
+      "scenario": "tests/oracle/traces/scenarios/p1-02b.json",
+      "trace": "tests/oracle/traces/p1-02b-good-bench-ordered-after-the-late-unknown/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "terminal_knowledge_never_regresses": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
+      },
+      "why": "The bench acts after it read the late unknown answer: an order, not a regression of the product."
+    },
+    {
       "name": "operation-resolved-again-after-its-commit",
       "scenario": "tests/oracle/traces/scenarios/p1-02b.json",
       "trace": "tests/oracle/traces/operation-resolved-again-after-its-commit/trace.jsonl",
@@ -1529,6 +1547,42 @@
         "scenario_reaches_its_end": "PASS"
       },
       "why": "A declared injection duplicates a result: handed over twice, the copy refused; that is expected."
+    },
+    {
+      "name": "provenance-refusal-excused-only-through-the-bench",
+      "scenario": "tests/oracle/traces/scenarios/p1-02-duplicate.json",
+      "trace": "tests/oracle/traces/provenance-refusal-excused-only-through-the-bench/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
+      },
+      "why": "The refusal follows the injection only through the supervisor's inspection: no cause excuses it."
+    },
+    {
+      "name": "provenance-result-handed-over-only-through-the-bench",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/provenance-result-handed-over-only-through-the-bench/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "FAIL",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS"
+      },
+      "why": "K1: the handover follows the store's result only through a record of a peer: the store did not produce it."
     },
     {
       "name": "provenance-duplicate-reaches-the-core",
