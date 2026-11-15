@@ -451,6 +451,8 @@ pub struct TraceWriter<'a> {
     /// The `StoreResultReady` of each piece of work, the parent of its
     /// handover.
     ready: BTreeMap<WorkId, Origin>,
+    /// The causes the caller gave for the submission being written.
+    causes: Vec<Cause>,
 }
 
 /// What a writer produced from a list of events.
@@ -503,6 +505,7 @@ impl<'a> TraceWriter<'a> {
             submitted: BTreeMap::new(),
             hits: BTreeMap::new(),
             ready: BTreeMap::new(),
+            causes: Vec::new(),
         }
     }
 
@@ -521,15 +524,24 @@ impl<'a> TraceWriter<'a> {
         *sequence = sequence.saturating_add(1);
         let record_sequence = self.next_record;
         self.next_record = record_sequence.saturating_add(1);
-        let parents: Vec<Value> = parents
+        // The causes the caller gave come first, then the writer's own.
+        let given = core::mem::take(&mut self.causes);
+        let parents: Vec<Value> = given
             .iter()
-            .map(|parent| {
+            .map(|cause| {
+                json!({
+                    "origin_component": cause.component,
+                    "origin_incarnation": decimal(cause.incarnation),
+                    "origin_sequence": decimal(cause.sequence),
+                })
+            })
+            .chain(parents.iter().map(|parent| {
                 json!({
                     "origin_component": parent.component,
                     "origin_incarnation": decimal(self.origin_incarnation),
                     "origin_sequence": decimal(parent.sequence),
                 })
-            })
+            }))
             .collect();
         let value = json!({
             "format": "mqttiumd.trace-record",
@@ -564,8 +576,14 @@ impl<'a> TraceWriter<'a> {
         event: &StoreEvent,
         causes: &[Cause],
     ) -> Result<Option<Value>, CauseRefused> {
-        let _ = causes;
-        Ok(self.one(event))
+        let submission = matches!(event, StoreEvent::CommandSubmitted { .. });
+        if !submission && !causes.is_empty() {
+            return Err(CauseRefused::NotASubmission);
+        }
+        self.causes = causes.to_vec();
+        let record = self.one(event);
+        self.causes.clear();
+        Ok(record)
     }
 
     /// Writes `events`, in order.
