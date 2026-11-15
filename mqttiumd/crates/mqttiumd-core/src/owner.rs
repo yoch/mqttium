@@ -15,9 +15,11 @@
 //! for all the slots of the plan. When the box refuses, nothing was taken
 //! and the input goes back as it came.
 //!
-//! The owner holds no effect box. The box of each step is handed to it,
-//! so the holder of the creation authority may replace a box (ADR 0009)
-//! and no counter of the owner starts again.
+//! An owner is built from its effect box, which it takes and keeps: a box
+//! exists once, and the creation authority creates no second box for an
+//! identity that is active (ADR 0009), so no path builds two owners of one
+//! identity. The box is replaced through the owner, [`Owner::renew_box`],
+//! and no counter or state of the owner starts again.
 
 use core::num::{NonZeroU32, NonZeroUsize};
 
@@ -31,8 +33,9 @@ use crate::contract::command::{
     ReleaseInbound, Source, Target,
 };
 use crate::contract::effects::{
-    CloseReason, Effect, EffectReservation, FactRank, FrameProgress, Input, Outbox, OwnedEffect,
-    RecoveredFact, RecoveryOrder,
+    CloseReason, CreateRefused, DispatchReport, Effect, EffectReservation, EffectSink, FactRank,
+    FrameProgress, Input, Outbox, OwnedEffect, OwnerAuthority, RecoveredFact, RecoveryOrder,
+    RetireRefusal,
 };
 use crate::contract::ids::{
     AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, DeliveryId, EffectId, EffectSeq,
@@ -100,17 +103,34 @@ pub struct OwnerConfig {
 
 /// Why an owner was not constructed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum OwnerRefused {
+pub enum OwnerRefusal {
     /// The box cannot hold the largest reservation of a transition.
     BoxTooSmall { capacity: usize, needed: usize },
     /// The tables could not be allocated.
     AllocationFailed,
 }
 
-impl From<AllocationFailed> for OwnerRefused {
-    fn from(_: AllocationFailed) -> Self {
-        Self::AllocationFailed
-    }
+/// An owner that was not constructed, and the box it was given back.
+#[derive(Debug)]
+pub struct OwnerRefused {
+    pub outbox: Outbox,
+    pub reason: OwnerRefusal,
+}
+
+/// Why a box was not renewed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RenewRefused {
+    /// The authority is not the one of the owner's run epoch. Nothing
+    /// changed.
+    ForeignAuthority,
+    /// The new box could not hold the largest reservation of a transition.
+    /// Nothing changed.
+    BoxTooSmall { capacity: usize, needed: usize },
+    /// The box could not be retired; the owner keeps it. Nothing changed.
+    Retire(RetireRefusal),
+    /// The box was retired and the new one was not created: the owner has
+    /// no box until a renewal succeeds. Its counters and state are kept.
+    Create(CreateRefused),
 }
 
 /// The state of an inbound QoS 2 exchange the owner holds. A Packet
@@ -477,6 +497,9 @@ pub struct Owner {
     /// The latest connections that were closed; see `OwnerConfig`.
     closed: BoundedQueue<ConnectionGeneration>,
     resolution_delay: LogicalDuration,
+    /// The one box of this owner; `None` after a renewal whose creation
+    /// failed.
+    outbox: Option<Outbox>,
 }
 
 fn table<T>(bound: NonZeroU32) -> Result<BoundedVec<T>, AllocationFailed> {
@@ -528,21 +551,39 @@ impl Owner {
     /// until the page that closes the inventory.
     ///
     /// The owner, the data set and the run epoch are those of `outbox`,
-    /// which only a creation authority builds (ADR 0009). The box is not
-    /// kept: every step is handed the box to publish into, and it must be
-    /// a box of the same owner under the same authority.
-    pub fn new(config: OwnerConfig, outbox: &Outbox) -> Result<Self, OwnerRefused> {
+    /// which only a creation authority builds (ADR 0009). The owner takes
+    /// the box and keeps it; a refusal gives it back.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a refusal hands the box back by value, as the retirement of a box does"
+    )]
+    pub fn new(config: OwnerConfig, outbox: Outbox) -> Result<Self, OwnerRefused> {
         if outbox.capacity() < MAX_TRANSITION_SLOTS {
-            return Err(OwnerRefused::BoxTooSmall {
+            let reason = OwnerRefusal::BoxTooSmall {
                 capacity: outbox.capacity(),
                 needed: MAX_TRANSITION_SLOTS,
-            });
+            };
+            return Err(OwnerRefused { outbox, reason });
         }
         let id = outbox.id();
         let credit = Credits::new(
             config.payload_bytes,
             ExchangeSlots::new(u64::from(config.max_exchanges.get())),
         );
+        let tables = (|| {
+            Ok::<_, AllocationFailed>((
+                table(config.max_routes)?,
+                table(config.max_sessions)?,
+                table(config.max_exchanges)?,
+                LeaseTable::new(config.account, credit, config.max_exchanges)?,
+                ring(config.retained_operations)?,
+                ring(config.remembered_connections)?,
+            ))
+        })();
+        let Ok((routes, sessions, slots, leases, finished, closed)) = tables else {
+            let reason = OwnerRefusal::AllocationFailed;
+            return Err(OwnerRefused { outbox, reason });
+        };
         Ok(Self {
             id: id.owner(),
             incarnation: id.incarnation(),
@@ -553,14 +594,66 @@ impl Owner {
             epoch_recovered: false,
             limits: None,
             route_revision: None,
-            routes: table(config.max_routes)?,
-            sessions: table(config.max_sessions)?,
-            slots: table(config.max_exchanges)?,
-            leases: LeaseTable::new(config.account, credit, config.max_exchanges)?,
-            finished: ring(config.retained_operations)?,
-            closed: ring(config.remembered_connections)?,
+            routes,
+            sessions,
+            slots,
+            leases,
+            finished,
+            closed,
             resolution_delay: config.resolution_delay,
+            outbox: Some(outbox),
         })
+    }
+
+    /// The box of the owner, if it has one.
+    #[must_use]
+    pub fn outbox(&self) -> Option<&Outbox> {
+        self.outbox.as_ref()
+    }
+
+    /// Hands the effects of the box to `sink`, in order (an owner without
+    /// a box has none).
+    pub fn dispatch(&mut self, sink: &mut dyn EffectSink) -> DispatchReport {
+        match self.outbox.as_mut() {
+            Some(outbox) => outbox.dispatch(sink),
+            None => DispatchReport {
+                accepted: 0,
+                blocked: None,
+            },
+        }
+    }
+
+    /// Replaces the box of the owner: retires it under `authority`, then
+    /// creates one for the same identity (ADR 0009). The counters and the
+    /// state of the owner are kept. The retirement is refused while an
+    /// effect waits or a reservation lives, and the owner keeps its box.
+    pub fn renew_box(
+        &mut self,
+        authority: &mut OwnerAuthority,
+        capacity: NonZeroUsize,
+        max_reservations: NonZeroU32,
+    ) -> Result<(), RenewRefused> {
+        if authority.incarnation() != self.incarnation || authority.epoch() != self.epoch {
+            return Err(RenewRefused::ForeignAuthority);
+        }
+        if capacity.get() < MAX_TRANSITION_SLOTS {
+            return Err(RenewRefused::BoxTooSmall {
+                capacity: capacity.get(),
+                needed: MAX_TRANSITION_SLOTS,
+            });
+        }
+        if let Some(outbox) = self.outbox.take()
+            && let Err(refused) = authority.retire(outbox)
+        {
+            let reason = refused.reason;
+            self.outbox = Some(refused.outbox);
+            return Err(RenewRefused::Retire(reason));
+        }
+        let outbox = authority
+            .create_outbox(self.id, capacity, max_reservations)
+            .map_err(RenewRefused::Create)?;
+        self.outbox = Some(outbox);
+        Ok(())
     }
 
     /// The owner.
@@ -614,16 +707,25 @@ impl Owner {
 
     /// Applies `input` entirely, or hands it back intact (DEM-006).
     ///
-    /// `outbox` is the box of this owner under the authority of its run
-    /// epoch; anything else is a fault. A refusal keeps the input, the
-    /// state, the identity counters, the account, the reservations held
-    /// and the content of the box as they were.
-    pub fn step(&mut self, input: Input, grant: TurnGrant, outbox: &mut Outbox) -> StepOutcome {
-        let id = outbox.id();
-        if id.owner() != self.id || id.incarnation() != self.incarnation || id.epoch() != self.epoch
-        {
-            return StepOutcome::Fatal(CoreFault::ImpossibleInput);
-        }
+    /// A refusal keeps the input, the state, the identity counters, the
+    /// account, the reservations held and the content of the box as they
+    /// were. An owner without a box, after a renewal that could not create
+    /// one, hands every input back as `Exhausted(ReservationTable)` until
+    /// a renewal succeeds.
+    pub fn step(&mut self, input: Input, grant: TurnGrant) -> StepOutcome {
+        let Some(mut outbox) = self.outbox.take() else {
+            return StepOutcome::Exhausted {
+                input,
+                exhaustion: Exhaustion::ReservationTable,
+                work_used: WorkUnits::ZERO,
+            };
+        };
+        let outcome = self.step_into(input, grant, &mut outbox);
+        self.outbox = Some(outbox);
+        outcome
+    }
+
+    fn step_into(&mut self, input: Input, grant: TurnGrant, outbox: &mut Outbox) -> StepOutcome {
         let plan = match self.plan(&input, grant) {
             Ok(plan) => plan,
             Err(Refusal { stop, work_used }) => {
@@ -1779,7 +1881,6 @@ mod tests {
 
     struct World {
         authority: OwnerAuthority,
-        outbox: Outbox,
         owner: Owner,
         /// The commands submitted so far, in order.
         flights: Vec<Flight>,
@@ -1820,6 +1921,25 @@ mod tests {
 
     fn packet_id(raw: u16) -> InboundPacketId {
         InboundPacketId::new(raw).expect("non-zero")
+    }
+
+    /// An authority for `owners` owners, of the same run epoch.
+    fn authority_of_owners(owners: u32) -> OwnerAuthority {
+        let incarnation = StoreIncarnation::new(INCARNATION);
+        let mut opening = EpochOpening::new(incarnation, StartupNonce::new([2; 16]));
+        let command = opening
+            .submit(RunEpoch::new(EPOCH - 1))
+            .expect("nothing in flight");
+        let reply = OpeningReply {
+            command,
+            outcome: OpeningOutcome::Committed(EpochOpened {
+                incarnation,
+                epoch: RunEpoch::new(EPOCH),
+            }),
+        };
+        assert!(opening.observe(reply).is_ok(), "the reply of this attempt");
+        let grant = opening.hand_over().expect("committed");
+        OwnerAuthority::from_grant(grant, bound(owners)).expect("small")
     }
 
     /// An authority obtained the way the product obtains it: the opening
@@ -2024,10 +2144,9 @@ mod tests {
             let outbox = authority
                 .create_outbox(LogicalOwnerId::new(4), nonzero(capacity), bound(ENTRIES))
                 .expect("first box");
-            let owner = Owner::new(config, &outbox).expect("large enough");
+            let owner = Owner::new(config, outbox).expect("large enough");
             Self {
                 authority,
-                outbox,
                 owner,
                 flights: Vec::new(),
             }
@@ -2078,8 +2197,18 @@ mod tests {
             world
         }
 
+        /// The box of the owner.
+        fn held(&self) -> &Outbox {
+            self.owner.outbox().expect("a box")
+        }
+
+        /// The box of the owner, to squeeze it in a test.
+        fn outbox(&mut self) -> &mut Outbox {
+            self.owner.outbox.as_mut().expect("a box")
+        }
+
         fn step(&mut self, input: Input) -> StepOutcome {
-            self.owner.step(input, GRANT, &mut self.outbox)
+            self.owner.step(input, GRANT)
         }
 
         fn applied(&mut self, input: Input) {
@@ -2099,7 +2228,7 @@ mod tests {
         /// Hands every waiting effect to an adapter that takes it.
         fn drain(&mut self) -> Vec<(EffectId, Effect)> {
             let mut sink = Taking(Vec::new());
-            let _ = self.outbox.dispatch(&mut sink);
+            let _ = self.owner.dispatch(&mut sink);
             sink.0.into_iter().map(OwnedEffect::into_parts).collect()
         }
 
@@ -2192,9 +2321,9 @@ mod tests {
                 leases: owner.leases.snapshot(),
                 finished: owner.finished.iter().copied().collect(),
                 closed: owner.closed.iter().copied().collect(),
-                waiting: self.outbox.pending().map(OwnedEffect::id).collect(),
-                free_slots: self.outbox.free_slots(),
-                live_reservations: self.outbox.has_live_reservations(),
+                waiting: self.held().pending().map(OwnedEffect::id).collect(),
+                free_slots: self.held().free_slots(),
+                live_reservations: self.held().has_live_reservations(),
             }
         }
     }
@@ -2212,7 +2341,7 @@ mod tests {
         let short = TurnGrant {
             work_limit: WorkUnits::ZERO,
         };
-        let outcome = world.owner.step(input(&world), short, &mut world.outbox);
+        let outcome = world.owner.step(input(&world), short);
         assert_eq!(
             outcome,
             StepOutcome::NeedCapacity {
@@ -2229,8 +2358,8 @@ mod tests {
         if slots == 0 {
             // Nothing to reserve: a full box does not refuse it.
             let mut world = build();
-            let all = nonzero(world.outbox.free_slots());
-            let _held = world.outbox.reserve(all).expect("free");
+            let all = nonzero(world.outbox().free_slots());
+            let _held = world.outbox().reserve(all).expect("free");
             world.applied(input(&world));
             return;
         }
@@ -2239,9 +2368,9 @@ mod tests {
         // same way and not stepped.
         let mut world = build();
         let mut twin = build();
-        let hold = nonzero(world.outbox.free_slots() - (slots - 1));
-        let held = world.outbox.reserve(hold).expect("free");
-        let twin_held = twin.outbox.reserve(hold).expect("free");
+        let hold = nonzero(world.outbox().free_slots() - (slots - 1));
+        let held = world.outbox().reserve(hold).expect("free");
+        let twin_held = twin.outbox().reserve(hold).expect("free");
         let before = world.snapshot();
         let outcome = world.step(input(&world));
         assert_eq!(
@@ -2259,18 +2388,18 @@ mod tests {
         assert_eq!(world.snapshot(), before);
         // No entry of the reservation table was taken and given back: the
         // next reservation is the one the twin gets.
-        assert_eq!(world.outbox.release(held), Ok(hold.get()));
-        assert_eq!(twin.outbox.release(twin_held), Ok(hold.get()));
-        let next = world.outbox.reserve(nonzero(1)).expect("free");
-        assert_eq!(Ok(next), twin.outbox.reserve(nonzero(1)));
-        assert_eq!(world.outbox.release(next), Ok(1));
+        assert_eq!(world.outbox().release(held), Ok(hold.get()));
+        assert_eq!(twin.outbox().release(twin_held), Ok(hold.get()));
+        let next = world.outbox().reserve(nonzero(1)).expect("free");
+        assert_eq!(Ok(next), twin.outbox().reserve(nonzero(1)));
+        assert_eq!(world.outbox().release(next), Ok(1));
         // With room, the input that came back is applied.
         world.applied(input(&world));
 
         // The reservation table: every entry is held.
         let mut world = build();
         for _ in 0..ENTRIES {
-            let _held = world.outbox.reserve(nonzero(1)).expect("free");
+            let _held = world.outbox().reserve(nonzero(1)).expect("free");
         }
         let before = world.snapshot();
         let outcome = world.step(input(&world));
@@ -2304,6 +2433,21 @@ mod tests {
         assert_eq!(world.snapshot(), before);
     }
 
+    impl Owner {
+        /// Applies a plan with the box the owner holds, as `step` does.
+        fn apply_held(
+            &mut self,
+            plan: Plan,
+            input: Input,
+            reservation: Option<EffectReservation>,
+        ) -> Result<Progress, CoreFault> {
+            let mut outbox = self.outbox.take().expect("a box");
+            let applied = self.apply(plan, input, reservation, &mut outbox);
+            self.outbox = Some(outbox);
+            applied
+        }
+    }
+
     // ----- Construction and the box of a step -----
 
     // ADR 0006, amendment: the constructor refuses a box smaller than the
@@ -2318,22 +2462,27 @@ mod tests {
                 bound(1),
             )
             .expect("first box");
+        let serial = small.id().serial();
+        let refused = Owner::new(config(), small).expect_err("too small");
         assert_eq!(
-            Owner::new(config(), &small).err(),
-            Some(OwnerRefused::BoxTooSmall {
+            refused.reason,
+            OwnerRefusal::BoxTooSmall {
                 capacity: 1,
                 needed: 2,
-            })
+            }
         );
+        // The box comes back, and it can still be retired.
+        assert_eq!(refused.outbox.id().serial(), serial);
+        assert_eq!(authority.retire(refused.outbox).map_err(|_| ()), Ok(()));
         let exact = authority
             .create_outbox(
-                LogicalOwnerId::new(5),
+                LogicalOwnerId::new(4),
                 nonzero(MAX_TRANSITION_SLOTS),
                 bound(1),
             )
-            .expect("second box");
-        let owner = Owner::new(config(), &exact).expect("large enough");
-        assert_eq!(owner.id(), LogicalOwnerId::new(5));
+            .expect("a box for the same owner, once the first is retired");
+        let owner = Owner::new(config(), exact).expect("large enough");
+        assert_eq!(owner.id(), LogicalOwnerId::new(4));
         assert!(owner.is_recovering());
     }
 
@@ -2345,67 +2494,70 @@ mod tests {
         world.applied(page(&fixture(EPOCH), true));
         assert_eq!(world.sent(connect(CONN, b"p1-producer")), ["EmitConnack"]);
         let _ = world.submit(publish(7));
-        assert_eq!(world.outbox.capacity(), MAX_TRANSITION_SLOTS);
+        assert_eq!(world.outbox().capacity(), MAX_TRANSITION_SLOTS);
     }
 
     #[test]
-    fn a_box_of_another_owner_or_another_authority_is_a_fault() {
+    fn a_box_is_renewed_only_under_the_authority_of_its_owner_and_with_room() {
         let mut world = World::connected();
         let before = world.snapshot();
-        let mut other = world
-            .authority
-            .create_outbox(LogicalOwnerId::new(5), nonzero(CAPACITY), bound(ENTRIES))
-            .expect("second box");
-        assert_eq!(
-            world.owner.step(publish(7), GRANT, &mut other),
-            StepOutcome::Fatal(CoreFault::ImpossibleInput)
-        );
         let mut later = authority(INCARNATION, EPOCH + 1);
-        let mut foreign = later
-            .create_outbox(LogicalOwnerId::new(4), nonzero(CAPACITY), bound(ENTRIES))
-            .expect("first box");
         assert_eq!(
-            world.owner.step(publish(7), GRANT, &mut foreign),
-            StepOutcome::Fatal(CoreFault::ImpossibleInput)
+            world
+                .owner
+                .renew_box(&mut later, nonzero(CAPACITY), bound(ENTRIES)),
+            Err(RenewRefused::ForeignAuthority)
         );
-        assert!(other.is_empty() && foreign.is_empty());
+        assert_eq!(
+            world.owner.renew_box(
+                &mut world.authority,
+                nonzero(MAX_TRANSITION_SLOTS - 1),
+                bound(ENTRIES)
+            ),
+            Err(RenewRefused::BoxTooSmall {
+                capacity: 1,
+                needed: 2,
+            })
+        );
         assert_eq!(world.snapshot(), before);
+        // A box that holds a waiting effect or a live reservation is kept.
+        let _ = world.submit(publish(7));
+        let key = world.outbox().reserve(nonzero(1)).expect("free");
+        let serial = world.held().id().serial();
+        assert_eq!(
+            world
+                .owner
+                .renew_box(&mut world.authority, nonzero(CAPACITY), bound(ENTRIES)),
+            Err(RenewRefused::Retire(RetireRefusal::LiveReservations))
+        );
+        assert_eq!(world.held().id().serial(), serial);
+        assert_eq!(world.outbox().release(key), Ok(1));
     }
 
-    // ADR 0009: replacing the box of an owner resets none of its counters.
+    // ADR 0009, audit F4: replacing the box of an owner resets none of its
+    // counters and none of its state.
     #[test]
     fn replacing_the_box_resets_no_counter_of_the_owner() {
         let mut world = World::connected();
         let first = world.submit(publish(7));
-        let counters = world.owner.counters;
-        let serial = world.outbox.id().serial();
-
-        let World {
-            mut authority,
-            outbox,
-            mut owner,
-            ..
-        } = world;
-        assert_eq!(authority.retire(outbox).map_err(|_| ()), Ok(()));
-        let mut outbox = authority
-            .create_outbox(LogicalOwnerId::new(4), nonzero(CAPACITY), bound(ENTRIES))
-            .expect("the box that replaces it");
-        assert_ne!(outbox.id().serial(), serial);
-        assert_eq!(owner.counters, counters);
-
-        let outcome = owner.step(committed(&first), GRANT, &mut outbox);
-        assert!(
-            matches!(outcome, StepOutcome::Applied { .. }),
-            "{outcome:?}"
+        let mut before = world.snapshot();
+        let serial = world.held().id().serial();
+        assert_eq!(
+            world
+                .owner
+                .renew_box(&mut world.authority, nonzero(CAPACITY), bound(ENTRIES)),
+            Ok(())
         );
-        let outcome = owner.step(publish(8), GRANT, &mut outbox);
-        assert!(
-            matches!(outcome, StepOutcome::Applied { .. }),
-            "{outcome:?}"
-        );
-        let mut sink = Taking(Vec::new());
-        let _ = outbox.dispatch(&mut sink);
-        let effects: Vec<_> = sink.0.into_iter().map(OwnedEffect::into_parts).collect();
+        assert_ne!(world.held().id().serial(), serial);
+        assert_eq!(world.held().id().owner(), LogicalOwnerId::new(4));
+        // Nothing but the box changed.
+        let after = world.snapshot();
+        before.free_slots = after.free_slots;
+        assert_eq!(after, before);
+
+        world.applied(committed(&first));
+        world.applied(publish(8));
+        let effects = world.drain();
         assert_eq!(kinds(&effects), ["EmitPubrec", "Persist", "ArmDeadline"]);
         // The sequences of `EffectId` and `OperationId` continue.
         let sequences: Vec<u64> = effects.iter().map(|(id, _)| id.sequence.get()).collect();
@@ -2418,6 +2570,50 @@ mod tests {
             command.recipe.operation().sequence().get(),
             first.operation.sequence().get() + 1
         );
+    }
+
+    // A renewal whose creation fails leaves the owner without a box: every
+    // input is handed back, nothing changes, and a later renewal resumes.
+    #[test]
+    fn an_owner_without_a_box_hands_every_input_back_until_a_renewal() {
+        let mut world = World::connected();
+        // No allocator provides a box this large.
+        let unobtainable = nonzero(isize::MAX as usize / core::mem::size_of::<OwnedEffect>());
+        assert_eq!(
+            world
+                .owner
+                .renew_box(&mut world.authority, unobtainable, bound(1)),
+            Err(RenewRefused::Create(CreateRefused::AllocationFailed))
+        );
+        assert!(world.owner.outbox().is_none());
+        let counters = world.owner.counters;
+        let revision = world.owner.revision();
+        assert_eq!(
+            world.owner.step(publish(7), GRANT),
+            StepOutcome::Exhausted {
+                input: publish(7),
+                exhaustion: Exhaustion::ReservationTable,
+                work_used: WorkUnits::ZERO,
+            }
+        );
+        let mut sink = Taking(Vec::new());
+        assert_eq!(
+            world.owner.dispatch(&mut sink),
+            DispatchReport {
+                accepted: 0,
+                blocked: None,
+            }
+        );
+        assert_eq!(world.owner.counters, counters);
+        assert_eq!(world.owner.revision(), revision);
+        assert_eq!(world.phase(7), None);
+        assert_eq!(
+            world
+                .owner
+                .renew_box(&mut world.authority, nonzero(CAPACITY), bound(ENTRIES)),
+            Ok(())
+        );
+        let _ = world.submit(publish(7));
     }
 
     // ----- The plan of ADR 0006 -----
@@ -2459,30 +2655,24 @@ mod tests {
         let first = world.owner.plan(&publish(7), GRANT).expect("a plan");
         let second = world.owner.plan(&publish(7), GRANT).expect("the same plan");
         let other = world.owner.plan(&pubrel(9), GRANT).expect("another plan");
-        let key = world.outbox.reserve(nonzero(2)).expect("free");
+        let key = world.outbox().reserve(nonzero(2)).expect("free");
         assert_eq!(
-            world
-                .owner
-                .apply(first, publish(7), Some(key), &mut world.outbox),
+            world.owner.apply_held(first, publish(7), Some(key)),
             Ok(Progress::WaitingForEffects)
         );
         let before = world.snapshot();
-        let key = world.outbox.reserve(nonzero(2)).expect("free");
+        let key = world.outbox().reserve(nonzero(2)).expect("free");
         assert_eq!(
-            world
-                .owner
-                .apply(second, publish(7), Some(key), &mut world.outbox),
+            world.owner.apply_held(second, publish(7), Some(key)),
             Err(CoreFault::StalePlan)
         );
-        assert_eq!(world.outbox.release(key), Ok(2));
-        let key = world.outbox.reserve(nonzero(1)).expect("free");
+        assert_eq!(world.outbox().release(key), Ok(2));
+        let key = world.outbox().reserve(nonzero(1)).expect("free");
         assert_eq!(
-            world
-                .owner
-                .apply(other, pubrel(9), Some(key), &mut world.outbox),
+            world.owner.apply_held(other, pubrel(9), Some(key)),
             Err(CoreFault::StalePlan)
         );
-        assert_eq!(world.outbox.release(key), Ok(1));
+        assert_eq!(world.outbox().release(key), Ok(1));
         assert_eq!(world.snapshot(), before);
     }
 
@@ -2492,21 +2682,26 @@ mod tests {
         let plan = world.owner.plan(&publish(7), GRANT).expect("a plan");
         // Another owner at the same revision, with its own box.
         let mut authority = authority(INCARNATION, EPOCH);
-        let mut outbox = authority
+        let outbox = authority
             .create_outbox(LogicalOwnerId::new(5), nonzero(CAPACITY), bound(ENTRIES))
             .expect("first box");
-        let mut owner = Owner::new(config(), &outbox).expect("large enough");
+        let mut owner = Owner::new(config(), outbox).expect("large enough");
         for input in [page(&fixture(EPOCH), true), connect(CONN, b"p1-producer")] {
-            let outcome = owner.step(input, GRANT, &mut outbox);
+            let outcome = owner.step(input, GRANT);
             assert!(
                 matches!(outcome, StepOutcome::Applied { .. }),
                 "{outcome:?}"
             );
         }
         assert_eq!(owner.revision(), world.owner.revision());
-        let key = outbox.reserve(nonzero(2)).expect("free");
+        let key = owner
+            .outbox
+            .as_mut()
+            .expect("a box")
+            .reserve(nonzero(2))
+            .expect("free");
         assert_eq!(
-            owner.apply(plan, publish(7), Some(key), &mut outbox),
+            owner.apply_held(plan, publish(7), Some(key)),
             Err(CoreFault::StalePlan)
         );
         assert_eq!(owner.exchange(SessionId::new(PRODUCER), packet_id(7)), None);
@@ -2519,18 +2714,16 @@ mod tests {
         let before = world.snapshot();
         for wrong in [1, 3] {
             let plan = world.owner.plan(&publish(7), GRANT).expect("a plan");
-            let key = world.outbox.reserve(nonzero(wrong)).expect("free");
+            let key = world.outbox().reserve(nonzero(wrong)).expect("free");
             assert_eq!(
-                world
-                    .owner
-                    .apply(plan, publish(7), Some(key), &mut world.outbox),
+                world.owner.apply_held(plan, publish(7), Some(key)),
                 Err(CoreFault::ReservationOverrun)
             );
-            assert_eq!(world.outbox.release(key), Ok(wrong));
+            assert_eq!(world.outbox().release(key), Ok(wrong));
         }
         let plan = world.owner.plan(&publish(7), GRANT).expect("a plan");
         assert_eq!(
-            world.owner.apply(plan, publish(7), None, &mut world.outbox),
+            world.owner.apply_held(plan, publish(7), None),
             Err(CoreFault::ReservationOverrun)
         );
         assert_eq!(world.snapshot(), before);
@@ -2636,7 +2829,7 @@ mod tests {
             let mut expected = whole.snapshot();
             expected.revision = Revision::new(2);
             assert_eq!(world.snapshot(), expected, "cut at {cut}");
-            assert!(world.outbox.is_empty());
+            assert!(world.outbox().is_empty());
         }
     }
 
@@ -3010,7 +3203,7 @@ mod tests {
         }
         world.applied(frame(PRODUCER, CONN, FrameProgress::Failed));
         assert_eq!(world.owner.connection_of(SessionId::new(PRODUCER)), None);
-        assert!(world.outbox.is_empty());
+        assert!(world.outbox().is_empty());
         // The connection is gone: what it still carries is absorbed.
         absorbed(&mut world, publish(7));
         absorbed(&mut world, connect(CONN, b"p1-producer"));
@@ -3337,7 +3530,7 @@ mod tests {
         let mut world = World::admission_pending();
         let admission = world.flights[0];
         world.applied(unknown(&admission));
-        assert!(world.outbox.is_empty());
+        assert!(world.outbox().is_empty());
         assert_eq!(world.phase(7), PENDING);
         assert_eq!(
             world.in_flight(7),
@@ -3544,7 +3737,7 @@ mod tests {
         let mut world = World::release_pending();
         let release = world.flights[1];
         world.applied(unknown(&release));
-        assert!(world.outbox.is_empty());
+        assert!(world.outbox().is_empty());
         assert_eq!(world.phase(7), RELEASING);
         assert_eq!(
             world.in_flight(7),
@@ -3727,7 +3920,7 @@ mod tests {
         let mut before = World::connected();
         let admission = before.submit(publish(7));
         // No PUBREC before the crash: the commit was never reported.
-        assert!(before.outbox.is_empty());
+        assert!(before.outbox().is_empty());
         assert_eq!(before.phase(7), PENDING);
         let CommitFacts::PublicationAdmitted {
             publication,
@@ -4071,7 +4264,7 @@ mod tests {
         assert_eq!(world.sent(pubrel(7)), ["CloseConnection"]);
         let admission = world.flights[0];
         world.applied(committed(&admission));
-        assert!(world.outbox.is_empty());
+        assert!(world.outbox().is_empty());
         assert_eq!(world.phase(7), AWAIT);
         assert_eq!(world.sent(connect(11, b"p1-producer")), ["EmitConnack"]);
         world.applied(publish_with(11, 7, Qos::ExactlyOnce, b"payload"));
@@ -4080,7 +4273,7 @@ mod tests {
         let mut world = World::release_pending();
         assert_eq!(world.sent(publish(7)), ["CloseConnection"]);
         world.applied(committed(&world.flights[1]));
-        assert!(world.outbox.is_empty());
+        assert!(world.outbox().is_empty());
         assert_eq!(world.phase(7), None);
         assert_eq!(used(&world), (0, 0));
     }
@@ -4109,9 +4302,7 @@ mod tests {
             work_limit: WorkUnits::new(FIXTURE_WORK - 1),
         };
         assert_eq!(
-            world
-                .owner
-                .step(page(&fixture(EPOCH), true), short, &mut world.outbox),
+            world.owner.step(page(&fixture(EPOCH), true), short),
             StepOutcome::NeedCapacity {
                 input: page(&fixture(EPOCH), true),
                 need: CapacityNeed {
@@ -4126,9 +4317,7 @@ mod tests {
         let exact = TurnGrant {
             work_limit: WorkUnits::new(FIXTURE_WORK),
         };
-        let outcome = world
-            .owner
-            .step(page(&fixture(EPOCH), true), exact, &mut world.outbox);
+        let outcome = world.owner.step(page(&fixture(EPOCH), true), exact);
         assert!(
             matches!(outcome, StepOutcome::Applied { .. }),
             "{outcome:?}"
@@ -4450,32 +4639,53 @@ mod tests {
 
     // ----- Audit of the first wave -----
 
-    // F4: no path builds two owners of one identity. Two owners built from
-    // one box would issue the same identities from fresh counters, so two
-    // different publications could receive the same `OperationId`.
+    // F4: no path builds two owners of one identity. Two owners of one
+    // identity would issue the same identities from fresh counters, so two
+    // different publications could receive the same `OperationId`. An
+    // owner takes its box, and the authority creates no second box for an
+    // identity that is active, also once the first box was dropped without
+    // being retired (ADR 0009).
     #[test]
     fn two_owners_of_one_identity_never_issue_one_operation_id() {
         let mut authority = authority(INCARNATION, EPOCH);
-        let mut outbox = authority
-            .create_outbox(LogicalOwnerId::new(4), nonzero(CAPACITY), bound(ENTRIES))
-            .expect("first box");
-        let mut first = Owner::new(config(), &outbox).expect("large enough");
-        let mut second = Owner::new(config(), &outbox).expect("large enough");
+        let create = |authority: &mut OwnerAuthority, owner: u64| {
+            authority.create_outbox(
+                LogicalOwnerId::new(owner),
+                nonzero(CAPACITY),
+                bound(ENTRIES),
+            )
+        };
+        let outbox = create(&mut authority, 4).expect("first box");
+        let first = Owner::new(config(), outbox).expect("large enough");
+        assert_eq!(
+            create(&mut authority, 4).err(),
+            Some(CreateRefused::OwnerAlreadyActive)
+        );
+        drop(first);
+        assert_eq!(
+            create(&mut authority, 4).err(),
+            Some(CreateRefused::OwnerAlreadyActive),
+            "a box dropped without retirement leaves its owner active"
+        );
+        // Owners of two identities issue two identity spaces.
+        let mut authority = authority_of_owners(2);
         let mut operations = Vec::new();
-        for (owner, payload) in [(&mut first, &b"one"[..]), (&mut second, &b"two"[..])] {
+        for (raw, payload) in [(5, &b"one"[..]), (6, &b"two"[..])] {
+            let outbox = create(&mut authority, raw).expect("a box");
+            let mut owner = Owner::new(config(), outbox).expect("large enough");
             for input in [
                 page(&fixture(EPOCH), true),
                 connect(CONN, b"p1-producer"),
                 publish_with(CONN, 7, Qos::ExactlyOnce, payload),
             ] {
-                let outcome = owner.step(input, GRANT, &mut outbox);
+                let outcome = owner.step(input, GRANT);
                 assert!(
                     matches!(outcome, StepOutcome::Applied { .. }),
                     "{outcome:?}"
                 );
             }
             let mut sink = Taking(Vec::new());
-            let _ = outbox.dispatch(&mut sink);
+            let _ = owner.dispatch(&mut sink);
             for effect in sink.0 {
                 if let (_, Effect::Persist { command }) = effect.into_parts() {
                     operations.push(command.recipe.operation());
