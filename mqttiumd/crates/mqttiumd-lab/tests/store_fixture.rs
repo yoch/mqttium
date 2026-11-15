@@ -131,6 +131,12 @@ impl DurableStore for CommandsOnly {
     fn apply(&mut self, _: &mqttiumd_contract::command::Command) -> Applied {
         panic!("a fixture applies no recipe");
     }
+    fn established(
+        &self,
+        _: mqttiumd_contract::ids::OperationId,
+    ) -> Option<mqttiumd_contract::outcome::StoreOutcome> {
+        panic!("a fixture reads no operation");
+    }
     fn resolve_and_fence(&mut self, _: mqttiumd_contract::ids::OperationId) -> Resolved {
         panic!("a fixture resolves nothing");
     }

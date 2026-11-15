@@ -13,7 +13,7 @@ use mqttiumd_contract::ids::{
 use mqttiumd_contract::outcome::{RejectReason, StoreOutcome, StoreReply};
 use mqttiumd_lab::store::adapter::{
     ActionRefused, AdapterLimits, Answer, Delivery, FaultAction, FaultId, FaultPoint, FaultRefused,
-    FaultSpec, Performed, SimStore, StoreAction, StoreEvent, WorkId, WorkKind,
+    FaultSpec, Performed, SimStore, StoreAction, StoreEvent, Uncorrelated, WorkId, WorkKind,
 };
 use mqttiumd_lab::store::conformance::{World, admission_in, open, operation_id, publication_id};
 use mqttiumd_lab::store::durable::{Durability, DurableStore, Limits, MemoryStore};
@@ -127,26 +127,42 @@ fn a_fault_is_armed_only_with_an_action_its_point_allows() {
     });
     let points = [
         FaultPoint::CommandTransit,
+        FaultPoint::FenceTransit,
         FaultPoint::CommitApplied,
         FaultPoint::ResultReady,
         FaultPoint::ResultConsume,
     ];
     let actions = [
         FaultAction::HoldCommand,
+        FaultAction::RefuseFence,
         FaultAction::Barrier,
         FaultAction::DropResult,
         FaultAction::DelayResult,
         FaultAction::DuplicateResult,
     ];
-    // The pairs of `contracts/v1/fault-points.json`, and no other.
-    let catalogue = [
-        ("store.command.transit", "hold_command"),
-        ("store.commit.applied", "barrier"),
-        ("store.result.ready", "drop_result"),
-        ("store.result.ready", "delay_result"),
-        ("store.result.ready", "duplicate_result"),
-        ("store.result.consume", "barrier"),
-    ];
+    // The pairs of `contracts/v1/fault-points.json`, read from the file,
+    // and no other.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../contracts/v1/fault-points.json"
+    );
+    let file: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("the catalogue")).expect("JSON");
+    let mut catalogue = Vec::new();
+    for point in file["points"].as_array().expect("points") {
+        let name = point["point"].as_str().expect("a name").to_owned();
+        for action in point["actions"].as_array().expect("actions") {
+            catalogue.push((name.clone(), action.as_str().expect("a name").to_owned()));
+        }
+    }
+    let named: Vec<_> = points.iter().map(|point| point.name()).collect();
+    for (point, _) in &catalogue {
+        assert!(named.contains(&point.as_str()), "{point} is not realised");
+    }
+    let catalogue: Vec<(&str, &str)> = catalogue
+        .iter()
+        .map(|(point, action)| (point.as_str(), action.as_str()))
+        .collect();
     let mut allowed = Vec::new();
     for point in points {
         for action in actions {
@@ -447,7 +463,11 @@ fn a_duplicated_result_is_handed_over_once() {
     assert!(bench.store.eligible().is_empty());
     assert_eq!(
         bench.store.take_events().last(),
-        Some(&StoreEvent::UncorrelatedResult { id, operation })
+        Some(&StoreEvent::UncorrelatedResult {
+            id,
+            operation,
+            reason: Uncorrelated::NoWorkInFlight
+        })
     );
 }
 
@@ -636,7 +656,8 @@ fn a_result_that_answers_no_effect_in_flight_is_refused_and_recorded() {
         bench.store.take_events(),
         [StoreEvent::UncorrelatedResult {
             id: WorkId::Effect(stray),
-            operation: Some(operation)
+            operation: Some(operation),
+            reason: Uncorrelated::NoWorkInFlight
         }]
     );
 
@@ -694,7 +715,8 @@ fn an_identity_remembered_by_the_bench_is_refused_after_a_restart() {
         restarted.take_events(),
         [StoreEvent::UncorrelatedResult {
             id,
-            operation: Some(remembered)
+            operation: Some(remembered),
+            reason: Uncorrelated::NoWorkInFlight
         }]
     );
     assert_eq!(restarted.store().snapshot(), before);
@@ -771,6 +793,7 @@ fn recovery_pages_read_through_the_adapter_leave_their_evidence() {
         assert_eq!(
             bench.store.take_events(),
             [StoreEvent::RecoveryPageRead {
+                run_epoch: bench.store.store().ledger().last_opened(),
                 page: pages,
                 last,
                 facts: page.facts.as_slice().to_vec(),
@@ -843,7 +866,8 @@ fn a_left_over_copy_does_not_answer_work_submitted_again() {
         [
             StoreEvent::UncorrelatedResult {
                 id,
-                operation: Some(operation)
+                operation: Some(operation),
+                reason: Uncorrelated::NoWorkInFlight
             },
             StoreEvent::ResultDelivered {
                 id,

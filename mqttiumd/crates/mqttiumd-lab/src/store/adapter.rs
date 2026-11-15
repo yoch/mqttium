@@ -32,16 +32,22 @@ use mqttiumd_contract::command::{Command, OpenEpoch, OpeningAttempt, Recipe, Sta
 use mqttiumd_contract::effects::{
     Effect, EffectSink, Input, OwnedEffect, RecoveredFact, SubmitBlock, SubmitResult,
 };
-use mqttiumd_contract::ids::{EffectId, InboundPacketId, OperationId, SessionId};
-use mqttiumd_contract::outcome::{EpochOpening, OpeningOutcome, OpeningReply, StoreReply};
+use mqttiumd_contract::ids::{EffectId, InboundPacketId, OperationId, RunEpoch, SessionId};
+use mqttiumd_contract::outcome::{
+    EpochOpening, OpeningOutcome, OpeningReply, StoreOutcome, StoreReply,
+};
 
-use super::durable::{DurableStore, RecoveryCursor, RecoveryPage, RecoveryRefused};
+use super::durable::{DurableStore, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved};
 
 /// A named injection point of the fault catalogue.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum FaultPoint {
     /// The adapter accepted a command that has not entered the writer.
     CommandTransit,
+    /// A resolution read the absence of its operation in the writer, and
+    /// its fence has not been written. A resolution that finds a receipt,
+    /// a fence or a retired identity does not reach it.
+    FenceTransit,
     /// The transaction is committed and no result exists yet.
     CommitApplied,
     /// The result is ready on the store side and not delivered.
@@ -56,6 +62,7 @@ impl FaultPoint {
     pub const fn name(self) -> &'static str {
         match self {
             Self::CommandTransit => "store.command.transit",
+            Self::FenceTransit => "store.fence.transit",
             Self::CommitApplied => "store.commit.applied",
             Self::ResultReady => "store.result.ready",
             Self::ResultConsume => "store.result.consume",
@@ -67,6 +74,7 @@ impl FaultPoint {
     pub const fn actions(self) -> &'static [FaultAction] {
         match self {
             Self::CommandTransit => &[FaultAction::HoldCommand],
+            Self::FenceTransit => &[FaultAction::HoldCommand, FaultAction::RefuseFence],
             Self::CommitApplied | Self::ResultConsume => &[FaultAction::Barrier],
             Self::ResultReady => &[
                 FaultAction::DropResult,
@@ -80,8 +88,14 @@ impl FaultPoint {
 /// What a fault does when it is reached.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FaultAction {
-    /// The command stays in transit until it is released.
+    /// The command stays in transit until it is released. At the fence
+    /// point it is the fence that is held; once released it reads again
+    /// when it enters the writer, and fences only an operation that is
+    /// still absent.
     HoldCommand,
+    /// The write of this one fence is impossible; the store stays
+    /// available for everything else. The resolution answers unknown.
+    RefuseFence,
     /// The adapter stops at the point until it is resumed or crashed.
     Barrier,
     /// The result is lost on its way to the core.
@@ -98,6 +112,7 @@ impl FaultAction {
     pub const fn name(self) -> &'static str {
         match self {
             Self::HoldCommand => "hold_command",
+            Self::RefuseFence => "refuse_fence",
             Self::Barrier => "barrier",
             Self::DropResult => "drop_result",
             Self::DelayResult => "delay_result",
@@ -209,6 +224,10 @@ pub enum StoreEvent {
     },
     /// The writer made a fence durable for this operation.
     FenceStable { id: WorkId, operation: OperationId },
+    /// The fence of this resolution was refused by an injection. It is
+    /// recorded where `FenceStable` would be, so that a refusal is never
+    /// inferred from a missing record.
+    FenceRefused { id: WorkId, operation: OperationId },
     /// A result exists on the store side.
     ResultReady { id: WorkId, answer: Answer },
     /// The result was handed to the core.
@@ -218,6 +237,8 @@ pub enum StoreEvent {
         fault: FaultId,
         point: FaultPoint,
         action: FaultAction,
+        /// The matching passage it was reached at, counted from one.
+        occurrence: u64,
         id: WorkId,
         operation: Option<OperationId>,
     },
@@ -225,14 +246,29 @@ pub enum StoreEvent {
     UncorrelatedResult {
         id: WorkId,
         operation: Option<OperationId>,
+        reason: Uncorrelated,
     },
-    /// The adapter read one page of the recovery inventory. `page`
-    /// counts from zero within one inventory.
+    /// The adapter read one page of the recovery inventory, in the data
+    /// set whose last opened epoch was `run_epoch`. `page` counts from
+    /// zero within one inventory.
     RecoveryPageRead {
+        run_epoch: RunEpoch,
         page: u64,
         last: bool,
         facts: Vec<RecoveredFact>,
     },
+    /// The command or the result a fault held was released.
+    HeldItemReleased { fault: FaultId },
+}
+
+/// Why a result answered no work in flight.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Uncorrelated {
+    /// No acceptance it answers is in flight: none under its identity,
+    /// or only a later one.
+    NoWorkInFlight,
+    /// Work is in flight under its identity, for another operation.
+    OperationMismatch,
 }
 
 /// One elementary action of the scheduler on the store.
@@ -265,6 +301,9 @@ pub enum Performed {
     Executed,
     /// A barrier was reached: the adapter is stopped at this point.
     Halted(FaultPoint),
+    /// The work reached a point that holds it: it is back in transit,
+    /// held, and has not changed the store.
+    Held(FaultPoint),
     /// A held command or a delayed result was released.
     Released,
     /// The result was handed over. `barrier` tells that the adapter
@@ -306,7 +345,8 @@ struct Transit {
     id: WorkId,
     ticket: u64,
     work: Work,
-    held: bool,
+    /// The fault that holds it, while one does.
+    held: Option<FaultId>,
 }
 
 /// The inbound exchange slot a command comes from.
@@ -318,7 +358,8 @@ struct Ready {
     kind: WorkKind,
     source: Source,
     answer: Answer,
-    delayed: bool,
+    /// The fault that delays it, while one does.
+    delayed: Option<FaultId>,
 }
 
 struct ArmedFault {
@@ -360,6 +401,8 @@ pub struct SimStore<S> {
     evidence_lost: bool,
     /// The number the next page of the current inventory will carry.
     recovery_page: u64,
+    /// The fault reached by the last passage that reached one.
+    last_hit: Option<FaultId>,
 }
 
 /// What a crash leaves: the store and the evidence already recorded.
@@ -411,6 +454,7 @@ impl<S: DurableStore> SimStore<S> {
             events: Vec::new(),
             evidence_lost: false,
             recovery_page: 0,
+            last_hit: None,
         }
     }
 
@@ -521,10 +565,12 @@ impl<S: DurableStore> SimStore<S> {
             if seen == spec.occurrence && reached.is_none() {
                 armed.hits = armed.hits.saturating_add(1);
                 reached = Some(spec.action);
+                self.last_hit = Some(FaultId(index));
                 self.record(StoreEvent::FaultHit {
                     fault: FaultId(index),
                     point,
                     action: spec.action,
+                    occurrence: seen,
                     id,
                     operation,
                 });
@@ -563,8 +609,10 @@ impl<S: DurableStore> SimStore<S> {
             kind,
             operation,
         });
-        let held = self.pass(FaultPoint::CommandTransit, id, kind, operation, source)
-            == Some(FaultAction::HoldCommand);
+        let held = (self.pass(FaultPoint::CommandTransit, id, kind, operation, source)
+            == Some(FaultAction::HoldCommand))
+        .then_some(self.last_hit)
+        .flatten();
         self.transit.push_back(Transit {
             id,
             ticket,
@@ -605,7 +653,7 @@ impl<S: DurableStore> SimStore<S> {
         }
         let mut actions = Vec::new();
         for transit in &self.transit {
-            actions.push(if transit.held {
+            actions.push(if transit.held.is_some() {
                 StoreAction::ReleaseCommand(transit.id)
             } else {
                 StoreAction::EnterWriter(transit.id)
@@ -618,7 +666,7 @@ impl<S: DurableStore> SimStore<S> {
                 continue;
             }
             seen.push(ready.id);
-            actions.push(if ready.delayed {
+            actions.push(if ready.delayed.is_some() {
                 StoreAction::ReleaseResult(ready.id)
             } else {
                 StoreAction::DeliverResult(ready.id)
@@ -637,16 +685,27 @@ impl<S: DurableStore> SimStore<S> {
         }
         match action {
             StoreAction::ReleaseCommand(id) => {
+                let mut released = Vec::new();
                 for transit in &mut self.transit {
-                    if transit.id == id {
-                        transit.held = false;
+                    if transit.id == id
+                        && let Some(fault) = transit.held.take()
+                    {
+                        released.push(fault);
                     }
+                }
+                for fault in released {
+                    self.record(StoreEvent::HeldItemReleased { fault });
                 }
                 Ok(Performed::Released)
             }
             StoreAction::ReleaseResult(id) => {
-                if let Some(ready) = self.ready.iter_mut().find(|ready| ready.id == id) {
-                    ready.delayed = false;
+                let released = self
+                    .ready
+                    .iter_mut()
+                    .find(|ready| ready.id == id)
+                    .and_then(|ready| ready.delayed.take());
+                if let Some(fault) = released {
+                    self.record(StoreEvent::HeldItemReleased { fault });
                 }
                 Ok(Performed::Released)
             }
@@ -681,9 +740,28 @@ impl<S: DurableStore> SimStore<S> {
     }
 
     /// Runs one command in the writer and makes its result ready.
-    fn run(&mut self, transit: Transit) -> Performed {
+    fn run(&mut self, mut transit: Transit) -> Performed {
         let id = transit.id;
         let (kind, operation, source) = describe(&transit.work);
+        // A resolution that reads an absence reaches the fence point
+        // before its fence is written. A held fence that enters the
+        // writer again reads again, and passes the point again if the
+        // operation is still absent: the fault that held it fired once,
+        // and no other fault can select the same passage (see `arm`).
+        let mut refuse_fence = false;
+        if let Work::Resolve(resolved) = &transit.work
+            && self.store.established(*resolved).is_none()
+        {
+            match self.pass(FaultPoint::FenceTransit, id, kind, operation, source) {
+                Some(FaultAction::HoldCommand) => {
+                    transit.held = self.last_hit;
+                    self.transit.push_back(transit);
+                    return Performed::Held(FaultPoint::FenceTransit);
+                }
+                Some(FaultAction::RefuseFence) => refuse_fence = true,
+                _ => {}
+            }
+        }
         let origin = Origin {
             id,
             ticket: transit.ticket,
@@ -707,7 +785,18 @@ impl<S: DurableStore> SimStore<S> {
                 )
             }
             Work::Resolve(operation) => {
-                let resolved = self.store.resolve_and_fence(*operation);
+                let resolved = if refuse_fence {
+                    self.record(StoreEvent::FenceRefused {
+                        id,
+                        operation: *operation,
+                    });
+                    Resolved {
+                        outcome: StoreOutcome::PendingOrUnknown,
+                        fenced_now: false,
+                    }
+                } else {
+                    self.store.resolve_and_fence(*operation)
+                };
                 if resolved.fenced_now {
                     self.record(StoreEvent::FenceStable {
                         id,
@@ -780,13 +869,14 @@ impl<S: DurableStore> SimStore<S> {
                 // The result is gone: nothing will ever answer this work.
                 self.awaited.remove(&id);
             }
-            Some(FaultAction::DelayResult) => self.ready.push_back(ready(true)),
+            Some(FaultAction::DelayResult) => self.ready.push_back(ready(self.last_hit)),
             Some(FaultAction::DuplicateResult) => {
-                self.ready.push_back(ready(false));
-                self.ready.push_back(ready(false));
+                self.ready.push_back(ready(None));
+                self.ready.push_back(ready(None));
             }
-            Some(FaultAction::HoldCommand | FaultAction::Barrier) | None => {
-                self.ready.push_back(ready(false));
+            Some(FaultAction::HoldCommand | FaultAction::Barrier | FaultAction::RefuseFence)
+            | None => {
+                self.ready.push_back(ready(None));
             }
         }
     }
@@ -814,11 +904,17 @@ impl<S: DurableStore> SimStore<S> {
             (WorkId::Effect(_), Answer::Opening { .. })
             | (WorkId::Opening(_), Answer::Operation { .. }) => None,
         };
-        let answers = self.awaited.get(&id).is_some_and(|(awaited, ticket)| {
-            *awaited == operation && origin.is_none_or(|origin| origin.ticket == *ticket)
-        });
-        let (Some(delivery), true) = (delivery, answers) else {
-            self.record(StoreEvent::UncorrelatedResult { id, operation });
+        let reason = match self.awaited.get(&id) {
+            Some((awaited, _)) if *awaited != operation => Some(Uncorrelated::OperationMismatch),
+            Some((_, ticket)) if origin.is_none_or(|origin| origin.ticket == *ticket) => None,
+            _ => Some(Uncorrelated::NoWorkInFlight),
+        };
+        let (Some(delivery), None) = (delivery, reason) else {
+            self.record(StoreEvent::UncorrelatedResult {
+                id,
+                operation,
+                reason: reason.unwrap_or(Uncorrelated::OperationMismatch),
+            });
             return Performed::Uncorrelated;
         };
         self.awaited.remove(&id);
@@ -869,6 +965,7 @@ impl<S: DurableStore> SimStore<S> {
         cursor: Option<RecoveryCursor>,
         limit: usize,
     ) -> Result<RecoveryPage, RecoveryRefused> {
+        let run_epoch = self.store.ledger().last_opened();
         let page = self.store.recover(cursor, limit)?;
         let number = match cursor {
             None => 0,
@@ -876,6 +973,7 @@ impl<S: DurableStore> SimStore<S> {
         };
         self.recovery_page = number.saturating_add(1);
         self.record(StoreEvent::RecoveryPageRead {
+            run_epoch,
             page: number,
             last: page.next.is_none(),
             facts: page.facts.as_slice().to_vec(),
