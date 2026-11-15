@@ -178,6 +178,15 @@ pub enum Report {
     },
     /// The action is over; the last evidence frame it emitted, if any.
     EndOfAction { last_emission: Option<u64> },
+    /// The action is still in flight inside SQLite. Every frame through
+    /// last_emission was accepted by the surviving collector and its ack
+    /// consumed by the child. Only SIGKILL may follow this report.
+    Parked {
+        last_emission: u64,
+        fault: u32,
+        point: String,
+        settings: String,
+    },
     /// The action was refused; nothing of it was done.
     Refused { reason: String },
     /// The run cannot go on in the child.
@@ -516,6 +525,16 @@ impl Report {
                 }
                 writer
             }
+            Self::Parked {
+                last_emission,
+                fault,
+                point,
+                settings,
+            } => Writer::tag(11)
+                .u64(*last_emission)
+                .u32(*fault)
+                .bytes(point.as_bytes())
+                .bytes(settings.as_bytes()),
         }
         .0
     }
@@ -601,6 +620,12 @@ impl Report {
                 }
                 Self::Finished { unwritten }
             }
+            11 => Self::Parked {
+                last_emission: reader.u64()?,
+                fault: reader.u32()?,
+                point: reader.text()?,
+                settings: reader.text()?,
+            },
             other => return Err(Refusal::UnknownTag(other)),
         };
         reader.end(report)
@@ -671,6 +696,8 @@ pub struct Sequencer<O> {
     next: u64,
     batch: BTreeMap<u64, (O, Vec<u8>)>,
     duplicate: Option<u64>,
+    /// Last emission already retained during this action, before ack.
+    retained: Option<u64>,
 }
 
 impl<O: Clone> Sequencer<O> {
@@ -681,6 +708,7 @@ impl<O: Clone> Sequencer<O> {
             next: 0,
             batch: BTreeMap::new(),
             duplicate: None,
+            retained: None,
         }
     }
 
@@ -692,6 +720,26 @@ impl<O: Clone> Sequencer<O> {
         }
         self.batch
             .insert(evidence.emission, (origin, evidence.record));
+    }
+
+    /// Take a contiguous prefix while the action is still in flight.
+    /// The caller must retain it before acknowledging it to the child.
+    pub fn take_contiguous(&mut self) -> Result<Vec<(O, Vec<u8>)>, OrderRefusal> {
+        if let Some(number) = self.duplicate.take() {
+            return Err(OrderRefusal::Duplicate(number));
+        }
+        if let Some((&number, _)) = self.batch.first_key_value()
+            && number < self.next
+        {
+            return Err(OrderRefusal::AlreadySeen(number));
+        }
+        let mut ready = Vec::new();
+        while let Some(value) = self.batch.remove(&self.next) {
+            self.retained = Some(self.next);
+            self.next += 1;
+            ready.push(value);
+        }
+        Ok(ready)
     }
 
     /// The end of the action: the batch in emission order, or why it is
@@ -709,7 +757,10 @@ impl<O: Clone> Sequencer<O> {
         {
             return Err(OrderRefusal::AlreadySeen(first));
         }
-        let found = batch.last_key_value().map(|(&last, _)| last);
+        let found = batch
+            .last_key_value()
+            .map(|(&last, _)| last)
+            .or(self.retained.take());
         if found != last_emission {
             return Err(OrderRefusal::EndMismatch {
                 stated: last_emission,
@@ -871,6 +922,12 @@ mod tests {
             Report::EndOfAction {
                 last_emission: Some(41),
             },
+            Report::Parked {
+                last_emission: 41,
+                fault: 2,
+                point: "store.commit.prepared".to_owned(),
+                settings: "{\"kill_points\":true}".to_owned(),
+            },
             Report::Refused {
                 reason: "no deadline armed".to_owned(),
             },
@@ -912,6 +969,49 @@ mod tests {
                 unwritten: vec![("ResultDelivered".to_owned(), 3)],
             },
         ]
+    }
+
+    #[test]
+    fn an_in_flight_prefix_is_ordered_before_its_ack_and_the_end_still_checks() {
+        let mut sequencer = Sequencer::new();
+        let frame = |emission| Evidence {
+            emission,
+            record: vec![emission as u8],
+        };
+        sequencer.receive("store", frame(1));
+        assert!(sequencer.take_contiguous().unwrap().is_empty());
+        sequencer.receive("core", frame(0));
+        assert_eq!(
+            sequencer.take_contiguous().unwrap(),
+            vec![("core", vec![0]), ("store", vec![1])]
+        );
+        assert_eq!(sequencer.next(), 2);
+        assert!(sequencer.end_action(Some(1)).unwrap().is_empty());
+        sequencer.receive("store", frame(2));
+        assert_eq!(
+            sequencer.take_contiguous().unwrap(),
+            vec![("store", vec![2])]
+        );
+        assert!(matches!(
+            sequencer.end_action(Some(3)),
+            Err(OrderRefusal::EndMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_evidence_is_refused_after_its_prefix_was_retained() {
+        let mut sequencer = Sequencer::new();
+        let frame = || Evidence {
+            emission: 0,
+            record: vec![1],
+        };
+        sequencer.receive("core", frame());
+        assert_eq!(sequencer.take_contiguous().unwrap().len(), 1);
+        sequencer.receive("core", frame());
+        assert!(matches!(
+            sequencer.take_contiguous(),
+            Err(OrderRefusal::AlreadySeen(0))
+        ));
     }
 
     #[test]
@@ -959,7 +1059,7 @@ mod tests {
         }
         assert_eq!(Action::decode(&[0]), Err(Refusal::UnknownTag(0)));
         assert_eq!(Action::decode(&[15]), Err(Refusal::UnknownTag(15)));
-        assert_eq!(Report::decode(&[11]), Err(Refusal::UnknownTag(11)));
+        assert_eq!(Report::decode(&[12]), Err(Refusal::UnknownTag(12)));
         // A flag is 0 or 1.
         assert_eq!(
             Report::decode(&[7, 2, 0, 0, 0, 0, 0, 0]),

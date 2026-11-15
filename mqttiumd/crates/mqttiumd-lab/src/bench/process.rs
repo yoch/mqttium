@@ -57,6 +57,16 @@ use crate::store::evidence::{Cause as EvidenceCause, TraceWriter, outcome_fields
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Stop(pub String);
 
+/// Evidence staged for one concrete command. It is emitted only by the
+/// callback at the selected SQLite point; it is never normal evidence
+/// merely because the supervisor selected an EnterWriter action.
+#[cfg(feature = "kill-points")]
+pub struct TransactionBarrier {
+    pub point: crate::store::adapter::FaultPoint,
+    pub scenario_fault: usize,
+    pub lines: Vec<u8>,
+}
+
 impl Stop {
     pub fn new(reason: impl Into<String>) -> Self {
         Self(reason.into())
@@ -618,6 +628,45 @@ impl Books {
 }
 
 impl<S: DurableStore> Process<S> {
+    #[cfg(feature = "kill-points")]
+    pub fn prepare_transaction_barrier(
+        &mut self,
+        choice: &Choice,
+        books: &Books,
+    ) -> Result<Option<TransactionBarrier>, Stop> {
+        let Choice::Store(action) = choice else {
+            return Ok(None);
+        };
+        let Some(event) = self.store.transaction_barrier(*action) else {
+            return Ok(None);
+        };
+        let StoreEvent::FaultHit { fault, point, .. } = &event else {
+            return Err(Stop::new("transaction selection returned another event"));
+        };
+        let scenario_fault = books
+            .scenario_fault
+            .get(fault.0)
+            .copied()
+            .ok_or_else(|| Stop::new("transaction barrier has no scenario fault"))?;
+        let mut writer = self.writer.clone();
+        let record = writer
+            .write_caused(&event, &[])
+            .map_err(|why| Stop::new(format!("transaction evidence: {why:?}")))?
+            .ok_or_else(|| Stop::new("transaction barrier has no trace record"))?;
+        let mut lines = serde_json::to_vec(&record)
+            .map_err(|why| Stop::new(format!("transaction evidence: {why}")))?;
+        lines.push(b'\n');
+        Ok(Some(TransactionBarrier {
+            point: *point,
+            scenario_fault,
+            lines,
+        }))
+    }
+
+    #[cfg(feature = "kill-points")]
+    pub fn store_mut_for_kill_hook(&mut self) -> &mut S {
+        self.store.store_mut()
+    }
     /// Starts the process on `store` by the real path, arms the faults
     /// `faults` (scenario index and specification), and recovers.
     ///

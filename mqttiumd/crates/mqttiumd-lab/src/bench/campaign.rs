@@ -411,7 +411,7 @@ pub fn execute(request: &Request) -> Result<Report, String> {
 
 /// The failure model of S0 with a child process, as the topology plan
 /// states it: a limit of the bench, not a property of the product.
-pub const FAILURE_MODEL: &str = "Kill of the process at a declared point, after the decisive record is acknowledged. The kernel and its page cache survive; nothing is shown about fsync, power loss or torn writes. Never inside a transaction: a restriction of the bench.";
+pub const FAILURE_MODEL: &str = "Kill of the process at a declared point, after the decisive record is acknowledged; the surviving collector retains that evidence before issuing the acknowledgement. A transaction may still be in flight at the declared prepared/logged points. The kernel and its page cache survive; nothing is shown about fsync, power loss or torn writes.";
 
 /// What `covers.crash` of `campaign.json` says of the crashes of a run.
 fn crash_statement(in_child: bool, kills: &[super::child::Killed], in_process: &str) -> String {
@@ -514,6 +514,24 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         let document = strict::parse(&bytes).map_err(|error| error.to_string())?;
         if let Some(why) = super::scenario::unplayed(&document) {
             return Err(format!("{scenario_path} is not played: {why}"));
+        }
+        let needs_hook = document
+            .get("faults")
+            .and_then(Value::as_array)
+            .is_some_and(|faults| {
+                faults.iter().any(|fault| {
+                    matches!(
+                        fault.get("point").and_then(Value::as_str),
+                        Some("store.commit.prepared" | "store.commit.logged")
+                    )
+                })
+            });
+        if needs_hook
+            && (request.process != "child"
+                || request.backend != "sqlite"
+                || !cfg!(feature = "kill-points"))
+        {
+            return Err("transaction kill points require --backend sqlite --process child and a lab build with --features kill-points".to_owned());
         }
     }
     fs::create_dir_all(out).map_err(|error| io(out, error))?;
@@ -627,7 +645,12 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     // executed as it stands, it plays this campaign and no other.
     let rebuilt = request.built_from.is_some();
     let replay = format!(
-        "cargo run -p mqttiumd-lab --locked -- run --contracts {contracts} --scenario {scenario_path} --seed {} --run-id {run_id} --backend {}{}{} --out <empty directory outside the work tree>",
+        "cargo run -p mqttiumd-lab --locked{} -- run --contracts {contracts} --scenario {scenario_path} --seed {} --run-id {run_id} --backend {}{}{} --out <empty directory outside the work tree>",
+        if cfg!(feature = "kill-points") {
+            " --features kill-points"
+        } else {
+            ""
+        },
         request.seed,
         request.backend,
         // A run in a child process is replayed in a child; the default,
@@ -802,11 +825,13 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
             "start_up": "the real path: EpochOpening through the store adapter, EpochGrant, OwnerAuthority::from_grant, one box for owner 0, Owner::new",
         },
         "backend_settings": backend_settings,
+        "build_features": super::rebuild::BUILD_FEATURES,
         "kills": outcome.kills.iter().map(|killed| json!({
             "pid": killed.pid,
             "rank": killed.rank.to_string(),
             "signal_sent": killed.signal_sent,
             "wait_status": {"signal": killed.wait_signal, "exit_code": null},
+            "transaction": killed.transaction,
         })).collect::<Vec<_>>(),
         "failure_model": if in_child {
             json!({"kind": scenario.failure_model(), "statement": FAILURE_MODEL})

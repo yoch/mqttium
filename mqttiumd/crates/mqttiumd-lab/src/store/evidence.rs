@@ -437,6 +437,7 @@ pub enum CauseRefused {
 /// store adapter, the store evidence, the fault injector and the
 /// dispatcher, numbered from `first_record` and in the order the adapter
 /// recorded them.
+#[derive(Clone)]
 pub struct TraceWriter<'a> {
     run_id: &'a str,
     origin_incarnation: u64,

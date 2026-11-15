@@ -21,11 +21,23 @@ use std::process::{Command, Stdio};
 /// Where the source is mapped in the binary it builds.
 pub const SOURCE_PREFIX: &str = "/mqttiumd-source";
 
+/// Features of this lab build, also used for its isolated reconstruction.
+pub const BUILD_FEATURES: &[&str] = if cfg!(feature = "kill-points") {
+    &["kill-points"]
+} else {
+    &[]
+};
+
 /// The command that builds the binary of a campaign from its `source.tar`.
 #[must_use]
 pub fn build_command() -> String {
     format!(
-        "tar -x -f source.tar -C <dir> && cd <dir> && RUSTFLAGS='--remap-path-prefix=<dir>={SOURCE_PREFIX}' cargo build --locked --offline -p mqttiumd-lab --bin mqttiumd-lab, where <dir> is $TMPDIR/mqttiumd-source-<first 16 hex digits of the SHA-256 of source.tar>"
+        "tar -x -f source.tar -C <dir> && cd <dir> && RUSTFLAGS='--remap-path-prefix=<dir>={SOURCE_PREFIX}' cargo build --locked --offline -p mqttiumd-lab --bin mqttiumd-lab{}, where <dir> is $TMPDIR/mqttiumd-source-<first 16 hex digits of the SHA-256 of source.tar>",
+        if cfg!(feature = "kill-points") {
+            " --features kill-points"
+        } else {
+            ""
+        }
     )
 }
 
@@ -227,18 +239,22 @@ fn build(tar: &Path, work: &Path) -> Result<(PathBuf, String), String> {
     let target = tree.join("target");
     let flags = format!("--remap-path-prefix={}={SOURCE_PREFIX}", tree.display());
     let command = build_command();
+    let mut cargo = Command::new("cargo");
+    cargo.args([
+        "build",
+        "--locked",
+        "--offline",
+        "-q",
+        "-p",
+        "mqttiumd-lab",
+        "--bin",
+        "mqttiumd-lab",
+    ]);
+    if cfg!(feature = "kill-points") {
+        cargo.args(["--features", "kill-points"]);
+    }
     run(
-        Command::new("cargo")
-            .args([
-                "build",
-                "--locked",
-                "--offline",
-                "-q",
-                "-p",
-                "mqttiumd-lab",
-                "--bin",
-                "mqttiumd-lab",
-            ])
+        cargo
             .env("CARGO_TARGET_DIR", &target)
             .env("RUSTFLAGS", &flags)
             .env_remove("CARGO_ENCODED_RUSTFLAGS")

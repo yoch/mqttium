@@ -162,6 +162,8 @@ fn point(name: &str) -> Result<FaultPoint, String> {
     [
         FaultPoint::CommandTransit,
         FaultPoint::FenceTransit,
+        FaultPoint::CommitPrepared,
+        FaultPoint::CommitLogged,
         FaultPoint::CommitApplied,
         FaultPoint::ResultReady,
         FaultPoint::ResultConsume,
