@@ -78,6 +78,20 @@ These steps give the broker nothing it could not know (ADR 0003): a fired
 deadline carries the token the core armed, a released command is the one
 the adapter accepted, a delivered result answers an effect still in flight.
 
+### Perimeter
+
+A trace header declares the `perimeter` of its run: `full`, or
+`core-without-bytes` when the core is driven with validated packets and no
+transport or peer observes anything. A scenario may require a perimeter;
+absent, it requires `full`.
+
+A run is judged only against a scenario of its own perimeter: for any
+other, every assertion is out of scope, and a qualifying result that holds
+an out-of-scope assertion is refused. A run without bytes therefore never
+passes a full scenario. It has its own scenario, which declares
+`core-without-bytes` and lists the assertions that perimeter can decide;
+an assertion that needs what the peers observed stays out of scope there.
+
 ### Trace records and the provenance of broker inputs
 
 Every kind of record is stated by one origin only. The audit of ADR 0003
