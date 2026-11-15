@@ -7,8 +7,8 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 macro_rules! quantity {
-    ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
+    ($(#[doc = $doc:literal])* $name:ident) => {
+        $(#[doc = $doc])*
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
         pub struct $name(u64);
 

@@ -32,8 +32,8 @@ fn read_u64(bytes: &[u8]) -> u64 {
 }
 
 macro_rules! scalar_id {
-    ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
+    ($(#[doc = $doc:literal])* $name:ident) => {
+        $(#[doc = $doc])*
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
         pub struct $name(u64);
 
@@ -164,8 +164,8 @@ scalar_id!(
 );
 
 macro_rules! scoped_id {
-    ($(#[$meta:meta])* $name:ident, $sequence:ident) => {
-        $(#[$meta])*
+    ($(#[doc = $doc:literal])* $name:ident, $sequence:ident) => {
+        $(#[doc = $doc])*
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
         pub struct $name {
             incarnation: StoreIncarnation,
@@ -307,8 +307,8 @@ pub struct LeaseKey {
 }
 
 macro_rules! packet_id {
-    ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
+    ($(#[doc = $doc:literal])* $name:ident) => {
+        $(#[doc = $doc])*
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
         pub struct $name(NonZeroU16);
 

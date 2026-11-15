@@ -12,8 +12,10 @@
 //! 4. Token rules, checked here on the lexed sources. They are closed
 //!    lists rather than lists of forbidden words:
 //!    - a macro invocation must name a listed macro, or one the same file
-//!      defines; an invocation through a macro variable is refused;
+//!      defines;
 //!    - an attribute must have a listed name;
+//!    - a macro definition captures identifiers and literals only, and
+//!      cannot assemble an invocation or an attribute (see below);
 //!    - conditional compilation exists in three exact forms only;
 //!    - a `use` declaration imports no macro that reads a file or the build
 //!      environment, and renames nothing to the name of an allowed macro;
@@ -27,8 +29,25 @@
 //! identifier. An alias cannot hide a macro: `use core::env as e; e!(…)`
 //! is refused at the import and at the call, since `e` is not listed.
 //!
+//! The rules read the sources, not their expansion, so a macro definition
+//! must not be able to build what the rules refuse. Three things are closed
+//! for that purpose:
+//!
+//! - a name never comes from a macro variable where it would be checked:
+//!   `$name!(…)` and `#[$name …]` are refused whatever the variable is
+//!   called, and so is a `$` inside a `use` declaration;
+//! - a variable captures an `ident` or a `literal`, nothing else: a token
+//!   tree could carry the `!` of an invocation or the brackets of an
+//!   attribute;
+//! - inside a definition, a `!` before a group directly follows a name
+//!   written there, and a `#` directly opens an attribute. A repetition can
+//!   match nothing, produce a name, or end one iteration where the next
+//!   begins; it may not stand between those tokens.
+//!
 //! The rules are deliberately coarse: an identifier that merely starts
-//! with `cfg` is refused, and so is a macro nobody listed yet.
+//! with `cfg` is refused, and so is a macro nobody listed yet. They do not
+//! expand macros: they close the forms listed here, each with a compiled
+//! counterexample in the tests.
 //!
 //! Not covered by any layer, and recorded as such in ADR 0007: `--cfg`
 //! flags passed from outside the sources (the run manifest records the
@@ -126,6 +145,10 @@ const ALLOWED_ATTRIBUTES: [&str; 9] = [
     "allow", "cfg", "cfg_attr", "derive", "doc", "expect", "forbid", "must_use", "test",
 ];
 
+/// What a variable of a local macro may capture. A token tree, a path, a
+/// meta item or an item could carry tokens the rules never see in place.
+const ALLOWED_FRAGMENTS: [&str; 2] = ["ident", "literal"];
+
 /// Macros that read a file or the build environment. They are refused as
 /// invocations by the allow-list; they are also refused in a `use`
 /// declaration, so that none can be imported under another name.
@@ -181,6 +204,129 @@ fn allowed_cfg(tokens: &[Token], index: usize) -> bool {
     }
 }
 
+fn is_char(tree: Option<&TokenTree>, character: char) -> bool {
+    matches!(tree, Some(TokenTree::Punct(punct)) if punct.as_char() == character)
+}
+
+/// Checks the fragment specifiers of a macro matcher: `$name:fragment`.
+fn fragments(stream: TokenStream, found: &mut Vec<String>) {
+    let trees: Vec<TokenTree> = stream.into_iter().collect();
+    for (index, tree) in trees.iter().enumerate() {
+        if let TokenTree::Group(group) = tree {
+            fragments(group.stream(), found);
+        }
+        let declares = is_char(Some(tree), ':')
+            && index >= 2
+            && matches!(trees[index - 1], TokenTree::Ident(_))
+            && is_char(trees.get(index - 2), '$');
+        if !declares {
+            continue;
+        }
+        match trees.get(index + 1) {
+            Some(TokenTree::Ident(fragment))
+                if ALLOWED_FRAGMENTS.contains(&fragment.to_string().as_str()) => {}
+            Some(other) => found.push(format!(
+                "captures a `{other}` fragment in a macro, which is not listed"
+            )),
+            None => found.push("declares a macro variable without a fragment".to_owned()),
+        }
+    }
+}
+
+/// Checks one `!` of a macro definition. Before a group it is an
+/// invocation, and the name must be written just before it: not a
+/// variable, not the end of a repetition, not the start of the stream.
+fn bang(trees: &[TokenTree], index: usize, found: &mut Vec<String>) {
+    // `#![…]` is an attribute; the attribute rule reads it.
+    if index >= 1 && is_char(trees.get(index - 1), '#') {
+        return;
+    }
+    match trees.get(index + 1) {
+        Some(TokenTree::Ident(_) | TokenTree::Literal(_)) => {}
+        Some(TokenTree::Punct(punct)) if punct.as_char() == '=' => {}
+        // `!$variable` negates a variable; `!$(…)` puts a repetition
+        // between the `!` and what follows it.
+        Some(TokenTree::Punct(punct)) if punct.as_char() == '$' => {
+            if !matches!(trees.get(index + 2), Some(TokenTree::Ident(_))) {
+                found.push("puts a repetition after `!` in a macro".to_owned());
+            }
+        }
+        Some(TokenTree::Group(_)) => {
+            let named = index >= 1 && matches!(trees[index - 1], TokenTree::Ident(_));
+            let variable = index >= 2 && is_char(trees.get(index - 2), '$');
+            if named && variable {
+                found.push(format!(
+                    "invokes a macro named by the variable `${}`",
+                    trees[index - 1]
+                ));
+            } else if !named {
+                found.push(
+                    "uses `!` before a group without a name written before it, in a macro"
+                        .to_owned(),
+                );
+            }
+        }
+        _ => found.push("uses `!` in a macro in a form that is not listed".to_owned()),
+    }
+}
+
+/// Checks the rules of one `macro_rules!` body: `(matcher) => {transcriber}`
+/// separated by `;`.
+fn macro_rules(body: TokenStream, found: &mut Vec<String>) {
+    let trees: Vec<TokenTree> = body.into_iter().collect();
+    let mut index = 0;
+    while index < trees.len() {
+        let (Some(TokenTree::Group(matcher)), Some(TokenTree::Group(transcriber))) =
+            (trees.get(index), trees.get(index + 3))
+        else {
+            found.push("defines a macro in a form that is not understood".to_owned());
+            return;
+        };
+        if !is_char(trees.get(index + 1), '=') || !is_char(trees.get(index + 2), '>') {
+            found.push("defines a macro in a form that is not understood".to_owned());
+            return;
+        }
+        fragments(matcher.stream(), found);
+        macro_code(matcher.stream(), true, found);
+        macro_code(transcriber.stream(), true, found);
+        index += 4;
+        if is_char(trees.get(index), ';') {
+            index += 1;
+        }
+    }
+}
+
+/// Walks the token trees for what the flat rules cannot see: the structure
+/// of macro definitions. `inside` tells whether `stream` belongs to one.
+fn macro_code(stream: TokenStream, inside: bool, found: &mut Vec<String>) {
+    let trees: Vec<TokenTree> = stream.into_iter().collect();
+    let mut body = None;
+    for (index, tree) in trees.iter().enumerate() {
+        match tree {
+            TokenTree::Ident(ident)
+                if ident == "macro_rules" && is_char(trees.get(index + 1), '!') =>
+            {
+                // `macro_rules! name {…}`; the name may be a variable.
+                body = (index + 2..=index + 4)
+                    .find(|&position| matches!(trees.get(position), Some(TokenTree::Group(_))));
+                if body.is_none() {
+                    found.push("defines a macro in a form that is not understood".to_owned());
+                }
+            }
+            TokenTree::Group(group) if body == Some(index) => macro_rules(group.stream(), found),
+            TokenTree::Group(group) => macro_code(group.stream(), inside, found),
+            TokenTree::Punct(punct) if punct.as_char() == '$' && !inside => {
+                found.push("uses a macro variable outside a macro definition".to_owned());
+            }
+            TokenTree::Punct(punct) if punct.as_char() == '!' && inside => {
+                // The `!` of a nested `macro_rules!` is followed by a name.
+                bang(&trees, index, found);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Names that the file defines with `macro_rules! name`.
 fn local_macros(tokens: &[Token]) -> Vec<&str> {
     let mut defined = Vec::new();
@@ -200,14 +346,16 @@ fn violations(source: &str) -> Vec<String> {
     let Ok(stream) = TokenStream::from_str(source) else {
         return vec!["does not lex as Rust".to_owned()];
     };
+    let mut found = Vec::new();
+    macro_code(stream.clone(), false, &mut found);
     let mut tokens = Vec::new();
     flatten(stream, &mut tokens);
     let local = local_macros(&tokens);
     let allowed_macro = |name: &str| ALLOWED_MACROS.contains(&name) || local.contains(&name);
-    let mut found = Vec::new();
 
     for (index, token) in tokens.iter().enumerate() {
-        // Attributes: `#[name …]` or `#![name …]`, with a listed name.
+        // Attributes: `#[name …]` or `#![name …]`, with a listed name
+        // written in place. Nothing stands between `#` and the bracket.
         if *token == Token::Punct('#') {
             let open = if is_punct(tokens.get(index + 1), '!') {
                 index + 2
@@ -215,12 +363,13 @@ fn violations(source: &str) -> Vec<String> {
                 index + 1
             };
             if tokens.get(open) != Some(&Token::Open('[')) {
+                found.push("uses `#` without opening an attribute".to_owned());
                 continue;
             }
             match tokens.get(open + 1) {
-                // A macro passes an attribute through: `#[$meta]`. The
-                // attribute itself is checked where it is written.
-                Some(Token::Punct('$')) => {}
+                Some(Token::Punct('$')) => {
+                    found.push("takes an attribute from a macro variable".to_owned());
+                }
                 Some(Token::Ident(name)) => {
                     let qualified = is_punct(tokens.get(open + 2), ':');
                     if qualified || !ALLOWED_ATTRIBUTES.contains(&plain(name)) {
@@ -250,6 +399,9 @@ fn violations(source: &str) -> Vec<String> {
                     .position(|token| *token == Token::Punct(';'))
                     .map_or(tokens.len(), |offset| index + offset);
                 for position in index + 1..end {
+                    if tokens[position] == Token::Punct('$') {
+                        found.push("uses a macro variable in a `use` declaration".to_owned());
+                    }
                     let Token::Ident(imported) = &tokens[position] else {
                         continue;
                     };

@@ -39,8 +39,10 @@ python tools/check_schemas.py
    are `no_std + alloc`, forbid `unsafe`, have no unlisted dependency, use
    conditional compilation only as `cfg(test)` or `cfg(kani)` on a module,
    and contain no async. They invoke only the macros and use only the
-   attributes listed in `crates/mqttiumd-lab/tests/boundary.rs`; extending
-   a list is a decision (ADR 0007). The same core code runs in simulation
+   attributes listed in `crates/mqttiumd-lab/tests/boundary.rs`, and a
+   local macro captures only identifiers and literals: a macro or
+   attribute name is always written, never passed in. Extending a list is
+   a decision (ADR 0007). The same core code runs in simulation
    and against SQLite. That test enforces all of this and states what it
    does not cover.
 2. **An input is applied or handed back intact.** A transition computes a

@@ -62,7 +62,7 @@
     {
       "decision": "0007",
       "path": "docs/decisions/0007-pure-crate-boundary.md",
-      "sha256": "519b90b8259f7989cd378c0d1c7cafde1e65957f2c5d16ca160d016585bb31d1"
+      "sha256": "b3fbc138669c73b3c14da9e9d6aa649f7c097dde209eccaf5571dcea117cc3f3"
     },
     {
       "decision": "0008",
