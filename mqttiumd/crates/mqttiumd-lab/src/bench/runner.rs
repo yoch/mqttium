@@ -26,9 +26,11 @@ use serde_json::{Value, json};
 use mqttiumd_contract::ids::{ConnectionGeneration, InboundPacketId, SessionId};
 
 use super::backend::Backend;
+use super::broker::Broker;
+use super::child::{Child, Config as ChildConfig, Killed};
 use super::collector::{Cause, Collector, Origin};
 use super::mqtt::{Kind, peer};
-use super::process::{Books, Choice, Process, Settings, Stop, Written};
+use super::process::{Books, Process, Settings, Stop, Written};
 use super::scenario::{Event, Fault, Scenario, Step};
 use crate::store::adapter::{FaultSpec, WorkKind};
 use crate::store::evidence::{SnapshotContext, snapshot};
@@ -105,6 +107,8 @@ pub struct Outcome {
     pub steps_played: usize,
     /// Elementary choices made.
     pub elementary: u64,
+    /// The kills of child processes, as the supervisor observed them.
+    pub kills: Vec<Killed>,
 }
 
 /// The fixture as the runner needs it: clients and their sessions.
@@ -124,6 +128,9 @@ pub struct Plan<'a, B: Backend> {
     /// The data set, installed from the fixture, no epoch open.
     pub store: B::Store,
     pub collector: Collector,
+    /// When the process under test runs in a child process: what the
+    /// child needs. `None` runs it in the process of the supervisor.
+    pub child: Option<ChildConfig>,
 }
 
 struct Runner<'a, B: Backend> {
@@ -133,7 +140,11 @@ struct Runner<'a, B: Backend> {
     settings: Settings,
     collector: Collector,
     books: Books,
-    process: Option<Process<B::Store>>,
+    process: Option<Broker<B::Store>>,
+    /// The child process mode, when the process under test runs apart.
+    child: Option<ChildConfig>,
+    /// The kills of child processes, in order.
+    kills: Vec<Killed>,
     /// The durable state while no process runs.
     dormant: Option<B::Store>,
     restarts: u64,
@@ -166,7 +177,7 @@ fn hex(bytes: &[u8]) -> String {
 /// carries no source in the adapter: at the fence point, and for the
 /// result of a `ResolveAndFence`, the fault selects by kind only. Each
 /// scenario of S0 has one exchange, so that selection is the same set.
-fn specification(
+pub(crate) fn specification(
     fault: &Fault,
     exchanges: &BTreeMap<String, (SessionId, u16)>,
 ) -> Result<FaultSpec, Stop> {
@@ -203,7 +214,7 @@ fn specification(
 
 /// The exchanges the scenario binds, by the step that binds them: the
 /// session of the client and the Packet Identifier.
-fn bound_exchanges(
+pub(crate) fn bound_exchanges(
     scenario: &Scenario,
     population: &Population,
 ) -> Result<BTreeMap<String, (SessionId, u16)>, Stop> {
@@ -229,7 +240,7 @@ fn bound_exchanges(
 }
 
 impl<B: Backend> Runner<'_, B> {
-    fn process(&mut self) -> Result<&mut Process<B::Store>, Stop> {
+    fn process(&mut self) -> Result<&mut Broker<B::Store>, Stop> {
         self.process
             .as_mut()
             .ok_or_else(|| Stop::new("the broker is not running"))
@@ -269,21 +280,48 @@ impl<B: Backend> Runner<'_, B> {
     }
 
     fn start(&mut self) -> Result<(), Stop> {
-        let store = self
-            .dormant
-            .take()
-            .ok_or_else(|| Stop::new("no data set to start on"))?;
         let faults = self.faults()?;
         let mut startup = Vec::new();
-        let started = Process::start(
-            store,
-            self.restarts,
-            self.settings,
-            &faults,
-            &mut self.collector,
-            &mut self.books,
-            &mut startup,
-        );
+        let started = match &self.child {
+            None => {
+                let store = self
+                    .dormant
+                    .take()
+                    .ok_or_else(|| Stop::new("no data set to start on"))?;
+                Process::start(
+                    store,
+                    self.restarts,
+                    self.settings,
+                    &faults,
+                    &mut self.collector,
+                    &mut self.books,
+                    &mut startup,
+                )
+                .map(|process| Broker::Local {
+                    process: Box::new(process),
+                    offered: Vec::new(),
+                })
+            }
+            Some(config) => {
+                // The supervisor holds no connection to the data set while a
+                // child is its writer.
+                drop(self.dormant.take());
+                let armed: Vec<usize> = faults.iter().map(|(index, _, _)| *index).collect();
+                let config = config.clone();
+                Child::spawn(
+                    &config,
+                    self.restarts,
+                    &armed,
+                    &mut self.collector,
+                    &mut self.books,
+                )
+                .and_then(|(child, lines)| {
+                    startup = lines;
+                    self.same_engine(child.settings())?;
+                    Ok(Broker::Child(Box::new(child)))
+                })
+            }
+        };
         // The choices of a start-up are elementary choices like others.
         for line in startup {
             self.elementary = self.elementary.saturating_add(1);
@@ -294,7 +332,7 @@ impl<B: Backend> Runner<'_, B> {
         }
         let mut process = started?;
         if self.restarts > 0 {
-            let epoch = process.epoch().get();
+            let epoch = process.epoch();
             self.emit(
                 Origin::BenchSupervisor,
                 "BrokerRecovered",
@@ -317,15 +355,11 @@ impl<B: Backend> Runner<'_, B> {
     /// why, and what still waited. Written at the stop, before the footer.
     fn write_blocked(&mut self, cause: &'static str) -> Result<(), Stop> {
         let step = &self.scenario.steps[self.step_index];
-        let armed = self
-            .process
-            .as_ref()
-            .map_or(0, super::process::Process::armed_deadlines);
+        let armed = self.process.as_ref().map_or(0, Broker::armed_deadlines);
         let holding: Vec<&str> = self
-            .books
-            .held
-            .keys()
-            .map(|index| self.scenario.faults[*index].id.as_str())
+            .holding()
+            .into_iter()
+            .map(|index| self.scenario.faults[index].id.as_str())
             .collect();
         let payload = json!({
             "step": self.step_index.to_string(),
@@ -338,10 +372,33 @@ impl<B: Backend> Runner<'_, B> {
         Ok(())
     }
 
+    /// The engine a child opened the data set with is the one the manifest
+    /// records: the settings it read back, compared by the supervisor.
+    fn same_engine(&self, read_back: &Value) -> Result<(), Stop> {
+        let mut recorded = self.backend.describe();
+        if let Some(recorded) = recorded.as_object_mut() {
+            recorded.remove("inspector");
+        }
+        if &recorded != read_back {
+            return Err(Stop::new(format!(
+                "the child opened the data set with other settings: {read_back}, the manifest records {recorded}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The scenario faults that still hold an item.
+    fn holding(&self) -> Vec<usize> {
+        match &self.process {
+            Some(Broker::Child(child)) => child.state().held.iter().copied().collect(),
+            _ => self.books.held.keys().copied().collect(),
+        }
+    }
+
     /// One elementary choice, drawn among the eligible ones. Returns
     /// false when nothing is eligible.
     fn choose(&mut self, budget: &mut u64) -> Result<bool, Stop> {
-        let choices = self.process()?.choices();
+        let choices = self.process()?.choices()?;
         if choices.is_empty() {
             return Ok(false);
         }
@@ -353,24 +410,21 @@ impl<B: Backend> Runner<'_, B> {
         }
         *budget -= 1;
         self.elementary += 1;
-        let choice = choices[self.generator.pick(choices.len())].clone();
+        let index = self.generator.pick(choices.len());
         self.choices.push(format!(
             "{} step:{} {}",
-            self.elementary,
-            self.step_index,
-            choice.describe()
+            self.elementary, self.step_index, choices[index]
         ));
-        self.apply(&choice)?;
+        self.apply(index)?;
         Ok(true)
     }
 
-    fn apply(&mut self, choice: &Choice) -> Result<(), Stop> {
+    fn apply(&mut self, index: usize) -> Result<(), Stop> {
         let process = self
             .process
             .as_mut()
             .ok_or_else(|| Stop::new("the broker is not running"))?;
-        let written = process.perform(choice, &mut self.collector, &mut self.books)?;
-        process.settle(&mut self.collector, &mut self.books)?;
+        let written = process.choose(index, &mut self.collector, &mut self.books)?;
         if let Some(written) = written {
             self.observe(written)?;
         }
@@ -435,7 +489,13 @@ impl<B: Backend> Runner<'_, B> {
             .process
             .as_mut()
             .ok_or_else(|| Stop::new("the broker is not running"))?;
-        process.receive(connection, &bytes, sent, &mut self.collector)
+        process.receive(
+            connection,
+            &bytes,
+            sent,
+            &mut self.collector,
+            &mut self.books,
+        )
     }
 
     /// Drives until `done` holds, within `max_steps` choices.
@@ -499,7 +559,11 @@ impl<B: Backend> Runner<'_, B> {
             &[],
             json!({"client": name}),
         )?;
-        self.process()?.connect(name, generation);
+        let process = self
+            .process
+            .as_mut()
+            .ok_or_else(|| Stop::new("the broker is not running"))?;
+        process.connect(name, generation, &mut self.collector, &mut self.books)?;
         let bytes = peer::connect(&client_id).map_err(Stop::new)?;
         self.send(name, Kind::Connect, None, None, bytes)
     }
@@ -638,31 +702,25 @@ impl<B: Backend> Runner<'_, B> {
             }
             Step::ReleaseHeldCommand { fault } => {
                 let index = self.fault_index(fault)?;
-                let id = self
-                    .books
-                    .held
-                    .get(&index)
-                    .copied()
-                    .ok_or_else(|| Stop::new(format!("{fault} holds no command")))?;
                 let process = self
                     .process
                     .as_mut()
                     .ok_or_else(|| Stop::new("the broker is not running"))?;
-                process.release_command(id, &mut self.collector, &mut self.books)
+                if !process.holds(&self.books, index) {
+                    return Err(Stop::new(format!("{fault} holds no command")));
+                }
+                process.release_command(index, &mut self.collector, &mut self.books)
             }
             Step::DeliverHeldResult { fault, max_steps } => {
                 let index = self.fault_index(fault)?;
-                let id = self
-                    .books
-                    .held
-                    .get(&index)
-                    .copied()
-                    .ok_or_else(|| Stop::new(format!("{fault} holds no result")))?;
                 let process = self
                     .process
                     .as_mut()
                     .ok_or_else(|| Stop::new("the broker is not running"))?;
-                process.deliver_held_result(id, &mut self.collector, &mut self.books)?;
+                if !process.holds(&self.books, index) {
+                    return Err(Stop::new(format!("{fault} holds no result")));
+                }
+                process.deliver_held_result(index, &mut self.collector, &mut self.books)?;
                 let mut budget = *max_steps;
                 while self.process()?.busy() {
                     if !self.choose(&mut budget)? {
@@ -696,8 +754,14 @@ impl<B: Backend> Runner<'_, B> {
             }
             Step::InspectDurableState { checkpoint } => {
                 let durable = match (&self.process, &self.dormant) {
-                    (Some(process), _) => self.backend.inspect(process.store()),
-                    (None, Some(store)) => self.backend.inspect(store),
+                    (Some(Broker::Local { process, .. }), _) => {
+                        self.backend.inspect(Some(process.store()))
+                    }
+                    // The child is the writer: the backend reads the data set
+                    // without it, read-only.
+                    (Some(Broker::Child(_)), _) => self.backend.inspect(None),
+                    (None, Some(store)) => self.backend.inspect(Some(store)),
+                    (None, None) if self.child.is_some() => self.backend.inspect(None),
                     (None, None) => return Err(Stop::new("no data set to inspect")),
                 }
                 .map_err(Stop::new)?;
@@ -735,7 +799,33 @@ impl<B: Backend> Runner<'_, B> {
                     .process
                     .take()
                     .ok_or_else(|| Stop::new("the broker is not running"))?;
-                let (store, open) = process.crash(&mut self.collector, &mut self.books)?;
+                let (store, open) = match process {
+                    Broker::Local { process, .. } => {
+                        let (store, open) = process.crash(&mut self.collector, &mut self.books)?;
+                        (Some(store), open)
+                    }
+                    Broker::Child(child) => {
+                        // The child is drained between two actions: the kill
+                        // happens at the point its last decisive record
+                        // describes, after that record is acknowledged.
+                        // The peers know which connections were open, in the
+                        // order they were opened.
+                        let mut open: Vec<(ConnectionGeneration, String)> = self
+                            .clients
+                            .iter()
+                            .filter_map(|(name, client)| {
+                                client
+                                    .connection
+                                    .map(|generation| (generation, name.clone()))
+                            })
+                            .collect();
+                        open.sort_by_key(|(generation, _)| generation.get());
+                        let open = open.into_iter().map(|(_, name)| name).collect();
+                        let killed = child.kill()?;
+                        self.kills.push(killed);
+                        (None, open)
+                    }
+                };
                 self.books.held.clear();
                 self.emit(
                     Origin::BenchSupervisor,
@@ -754,7 +844,9 @@ impl<B: Backend> Runner<'_, B> {
                         client.connection = None;
                     }
                 }
-                self.dormant = Some(self.backend.reopen_after_crash(store).map_err(Stop::new)?);
+                if let Some(store) = store {
+                    self.dormant = Some(self.backend.reopen_after_crash(store).map_err(Stop::new)?);
+                }
                 Ok(())
             }
             Step::RestartBroker => {
@@ -779,6 +871,7 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         population,
         store,
         mut collector,
+        child,
     } = plan;
     let header = json!({
         "scenario_id": scenario.id,
@@ -809,6 +902,8 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         collector,
         books: Books::new(scenario.faults.len()),
         process: None,
+        child,
+        kills: Vec::new(),
         dormant: Some(store),
         restarts: 0,
         generator: Generator::new(settings.seed),
@@ -868,9 +963,20 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
             }
         }
     }
+    // A child still running is asked to stop, and must exit on its own.
+    if let Some(Broker::Child(child)) = runner.process.take()
+        && let Err(Stop(reason)) = child.stop(&mut runner.collector, &mut runner.books)
+    {
+        complete = false;
+        stopped = Some(match stopped {
+            Some(stopped) => format!("{stopped}; the child: {reason}"),
+            None => format!("the child: {reason}"),
+        });
+    }
     let Runner {
         collector,
         books,
+        kills,
         choices,
         snapshots,
         elementary,
@@ -888,5 +994,6 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         unwritten: books.unwritten,
         steps_played: played,
         elementary,
+        kills,
     }
 }
