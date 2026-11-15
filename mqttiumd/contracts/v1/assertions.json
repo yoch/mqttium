@@ -139,6 +139,16 @@
       "requirements": [
         "FAIL-001"
       ]
+    },
+    {
+      "name": "transactional_kill_matches_recovery",
+      "meaning": "The command named by the acknowledged deterministic crash point has no result before its real signal-9 kill. K1 has no stable commit and is absent from the complete corroborated recovery inventory; K2b has no stable commit but recovers Committed; K3 has a stable commit before its point and recovers Committed. Later commands and epochs are distinct observations. Whole durable-state equality is checked separately against the deterministic store (record 0020).",
+      "every_run": false,
+      "requirements": [
+        "DUR-003",
+        "DEM-017",
+        "DEM-019"
+      ]
     }
   ]
 }
