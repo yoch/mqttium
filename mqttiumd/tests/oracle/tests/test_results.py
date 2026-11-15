@@ -28,6 +28,12 @@ class Results(unittest.TestCase):
         cls.contracts = Contracts.open(ROOT)
 
     def setUp(self):
+        # These tests recompute assertions and faults. The conditions of a
+        # qualifying run, which recompute also checks (R1), need a campaign
+        # with its source and a complete manifest: test_produce tests them.
+        conditions = mock.patch.object(results, "unmet", return_value=[])
+        conditions.start()
+        self.addCleanup(conditions.stop)
         self.relative = f"target/oracle-tests/{self.id().rsplit('.', 1)[-1]}"
         self.directory = ROOT / self.relative
         shutil.rmtree(self.directory, ignore_errors=True)

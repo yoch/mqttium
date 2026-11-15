@@ -797,6 +797,18 @@ pub struct RetireRefused {
     pub reason: RetireRefusal,
 }
 
+/// Why an authority refuses to replace a box. Nothing changed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReplaceRefusal {
+    /// The box cannot be retired: the reason of [`OwnerAuthority::retire`].
+    Retire(RetireRefusal),
+    /// The new box cannot be created: the reason of
+    /// [`OwnerAuthority::create_outbox`]. `OwnerAlreadyActive` and
+    /// `TableFull` never occur, since the new box takes the entry of the
+    /// old one.
+    Create(CreateRefused),
+}
+
 /// An authority that was not issued: the same grant comes back intact, so
 /// that trying again needs neither a second hand-over nor a new epoch.
 /// The one cause is that the table of active owners could not be
@@ -950,6 +962,75 @@ impl OwnerAuthority {
         Ok(outbox)
     }
 
+    /// Replaces the box of an owner by a new one, with a new serial and
+    /// the given dimensions, at once: the owner stays active throughout,
+    /// and no other owner can take its identity in between.
+    ///
+    /// The box is checked as `retire` checks it, the new one as
+    /// `create_outbox` does, and the new one is allocated, before anything
+    /// changes. The box is replaced in place, so that its holder keeps a
+    /// box at every moment: on any refusal, a failed allocation included,
+    /// `outbox` and the authority are unchanged. On success the old box is
+    /// dropped: it held no effect and no live reservation.
+    pub fn replace_outbox(
+        &mut self,
+        outbox: &mut Outbox,
+        capacity: NonZeroUsize,
+        max_reservations: NonZeroU32,
+    ) -> Result<(), ReplaceRefusal> {
+        let id = outbox.id();
+        let index = self.retirable(outbox).map_err(ReplaceRefusal::Retire)?;
+        // Every check and every allocation comes before the entry changes;
+        // nothing below the allocation can fail.
+        let capacity = capacity.get();
+        let refuse = |reason| Err(ReplaceRefusal::Create(reason));
+        let Some(table) = usize::try_from(max_reservations.get())
+            .ok()
+            .filter(|&table| fits_an_allocation::<ReservationRecord>(table))
+        else {
+            return refuse(CreateRefused::TooLarge);
+        };
+        if !fits_an_allocation::<OwnedEffect>(capacity) {
+            return refuse(CreateRefused::TooLarge);
+        }
+        let Some(serial) = self.next_serial else {
+            return refuse(CreateRefused::SerialsExhausted);
+        };
+        let new_id = OutboxId { serial, ..id };
+        let Ok(replacement) = Outbox::with_capacity(new_id, capacity, table) else {
+            return refuse(CreateRefused::AllocationFailed);
+        };
+        let entry = &mut self.active.as_mut_slice()[index];
+        entry.serial = serial;
+        // The serial is spent; the last one leaves `None`.
+        self.next_serial = serial.checked_next().ok();
+        *outbox = replacement;
+        Ok(())
+    }
+
+    /// The entry of the table `outbox` occupies, when the box may be
+    /// retired; otherwise why not. Nothing changes.
+    fn retirable(&self, outbox: &Outbox) -> Result<usize, RetireRefusal> {
+        let id = outbox.id();
+        if id.incarnation != self.incarnation || id.epoch != self.epoch {
+            return Err(RetireRefusal::ForeignAuthority);
+        }
+        let entry = ActiveBox {
+            owner: id.owner,
+            serial: id.serial,
+        };
+        let Some(index) = self.active.as_slice().iter().position(|e| *e == entry) else {
+            return Err(RetireRefusal::NotActiveEntry);
+        };
+        if !outbox.is_empty() {
+            return Err(RetireRefusal::PendingEffects);
+        }
+        if outbox.has_live_reservations() {
+            return Err(RetireRefusal::LiveReservations);
+        }
+        Ok(index)
+    }
+
     /// Retires a box: its owner is no longer active and may be given a new
     /// box, with a new serial. On a refusal the same box comes back and the
     /// authority is unchanged.
@@ -958,24 +1039,15 @@ impl OwnerAuthority {
     /// effects already accepted still belong to the owner, and retiring
     /// the box does not end its life cycle.
     pub fn retire(&mut self, outbox: Outbox) -> Result<(), RetireRefused> {
+        let index = match self.retirable(&outbox) {
+            Ok(index) => index,
+            Err(reason) => return Err(RetireRefused { outbox, reason }),
+        };
         let id = outbox.id();
-        let refuse = |outbox, reason| Err(RetireRefused { outbox, reason });
-        if id.incarnation != self.incarnation || id.epoch != self.epoch {
-            return refuse(outbox, RetireRefusal::ForeignAuthority);
-        }
         let entry = ActiveBox {
             owner: id.owner,
             serial: id.serial,
         };
-        let Some(index) = self.active.as_slice().iter().position(|e| *e == entry) else {
-            return refuse(outbox, RetireRefusal::NotActiveEntry);
-        };
-        if !outbox.is_empty() {
-            return refuse(outbox, RetireRefusal::PendingEffects);
-        }
-        if outbox.has_live_reservations() {
-            return refuse(outbox, RetireRefusal::LiveReservations);
-        }
         // Remove the entry: move the last one into its place, then drop
         // the last. The table keeps no order.
         let last = self.active.len() - 1;
@@ -2381,6 +2453,131 @@ mod authority_tests {
         let _ = outbox.dispatch(&mut taking());
         assert_eq!(outbox.capacity(), 4, "empty again");
         assert_eq!(outbox.free_slots(), 4);
+    }
+
+    // ----- Replacement of a box (review of the second wave, R2) -----
+
+    #[test]
+    fn replacing_a_box_keeps_its_owner_active_under_a_new_serial() {
+        let mut authority = authority(2);
+        let mut replacement = create(&mut authority, 1).expect("first box");
+        let other = create(&mut authority, 2).expect("second box");
+        let old = replacement.id();
+        assert_eq!(
+            authority.replace_outbox(&mut replacement, slots(6), entries(3)),
+            Ok(())
+        );
+        let new = replacement.id();
+        assert_eq!(new.owner(), old.owner());
+        assert_eq!(new.incarnation(), old.incarnation());
+        assert_eq!(new.epoch(), old.epoch());
+        assert_ne!(new.serial(), old.serial());
+        assert_ne!(new.serial(), other.id().serial());
+        assert_eq!(replacement.capacity(), 6);
+        assert_eq!(authority.active_box(owner(1)), Some(new));
+        assert_eq!(authority.active_box(owner(2)), Some(other.id()));
+        assert_eq!(authority.active_owners(), 2);
+        // The identity stays taken throughout.
+        assert_eq!(
+            create(&mut authority, 1).err(),
+            Some(CreateRefused::OwnerAlreadyActive)
+        );
+        // The replacement is the active entry: it retires, the old one
+        // would not.
+        assert_eq!(authority.retire(replacement).map_err(|_| ()), Ok(()));
+        assert_eq!(authority.active_box(owner(1)), None);
+        // The serial of the replacement was spent: the next box has another.
+        let third = create(&mut authority, 3).expect("a free entry");
+        assert_ne!(third.id().serial(), new.serial());
+        assert_ne!(third.id().serial(), old.serial());
+    }
+
+    #[test]
+    fn a_refused_replacement_changes_nothing_and_gives_the_box_back() {
+        // The reasons of a creation, a failed allocation included.
+        for (capacity, reason) in [
+            (slots(usize::MAX), CreateRefused::TooLarge),
+            (unobtainable(), CreateRefused::AllocationFailed),
+        ] {
+            let mut authority = self::authority(1);
+            let mut outbox = create(&mut authority, 1).expect("first box");
+            let before = (authority_state(&authority), box_state(&outbox));
+            assert_eq!(
+                authority.replace_outbox(&mut outbox, capacity, entries(1)),
+                Err(ReplaceRefusal::Create(reason))
+            );
+            assert_eq!(
+                (authority_state(&authority), box_state(&outbox)),
+                before,
+                "{reason:?}"
+            );
+            assert_eq!(
+                create(&mut authority, 1).err(),
+                Some(CreateRefused::OwnerAlreadyActive),
+                "{reason:?}: the identity stays taken"
+            );
+            // The box kept is still the active entry.
+            assert_eq!(
+                authority.replace_outbox(&mut outbox, slots(4), entries(1)),
+                Ok(())
+            );
+            assert_eq!(authority.active_box(owner(1)), Some(outbox.id()));
+        }
+        // No serial left.
+        let mut authority = self::authority(1);
+        let mut outbox = create(&mut authority, 1).expect("first box");
+        authority.next_serial = None;
+        let before = (authority_state(&authority), box_state(&outbox));
+        assert_eq!(
+            authority.replace_outbox(&mut outbox, slots(4), entries(1)),
+            Err(ReplaceRefusal::Create(CreateRefused::SerialsExhausted))
+        );
+        assert_eq!((authority_state(&authority), box_state(&outbox)), before);
+
+        // The reasons of a retirement.
+        let mut authority = self::authority(2);
+        let mut outbox = create(&mut authority, 1).expect("first box");
+        let key = outbox.reserve(slots(1)).expect("room");
+        let before = authority_state(&authority);
+        assert_eq!(
+            authority.replace_outbox(&mut outbox, slots(4), entries(1)),
+            Err(ReplaceRefusal::Retire(RetireRefusal::LiveReservations))
+        );
+        assert_eq!(outbox.publish(key, effect(1)).map_err(|_| ()), Ok(0));
+        assert_eq!(
+            authority.replace_outbox(&mut outbox, slots(4), entries(1)),
+            Err(ReplaceRefusal::Retire(RetireRefusal::PendingEffects))
+        );
+        assert_eq!(authority_state(&authority), before);
+        let _ = outbox.dispatch(&mut taking());
+        assert_eq!(
+            authority.replace_outbox(&mut outbox, slots(4), entries(1)),
+            Ok(())
+        );
+        let replacement = outbox;
+        // The old box is no longer the active entry; a box of another
+        // authority never was.
+        let mut later = authority_of(INCARNATION, EPOCH + 1, 1);
+        let mut foreign = create(&mut later, 1).expect("a box of another epoch");
+        let before = authority_state(&authority);
+        assert_eq!(
+            authority.replace_outbox(&mut foreign, slots(4), entries(1)),
+            Err(ReplaceRefusal::Retire(RetireRefusal::ForeignAuthority))
+        );
+        assert_eq!(authority_state(&authority), before);
+        // A box of the same owner under another serial is not the active
+        // entry. (Two authorities of one epoch exist only in a test.)
+        let mut twin = authority_of(INCARNATION, EPOCH, 3);
+        let _first = create(&mut twin, 2).expect("serial 0");
+        let _second = create(&mut twin, 3).expect("serial 1");
+        let mut stale = create(&mut twin, 1).expect("serial 2");
+        assert_ne!(stale.id().serial(), replacement.id().serial());
+        assert_eq!(
+            authority.replace_outbox(&mut stale, slots(4), entries(1)),
+            Err(ReplaceRefusal::Retire(RetireRefusal::NotActiveEntry))
+        );
+        assert_eq!(authority_state(&authority), before);
+        drop(replacement);
     }
 }
 
