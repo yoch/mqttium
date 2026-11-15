@@ -9,8 +9,8 @@ and this file is rewritten.
 | | |
 | - | - |
 | Models | `M1a.tla` (sidecar `M1a.json`, 19 configurations), `M1b.tla` (sidecar `M1b.json`, 19 configurations) |
-| Base | Integration branch at `807ca26`; runner chains `8978453`..`f84db36` (merged there) and `8d2cc53`, `2ea5418` (follow-up) |
-| Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb` |
+| Base | Integration branch at `0d99de4`, which holds both runner chains (`f84db36`, `965c3f2`) and the models at `f993d7e` |
+| Contract digest | `sha256:29dd01788a05e141d204a826aba8bcbb3db837a4b49e73e43263f7e2a2d4b4d8`, at the integration head `0d99de4` merged into the lot, where the campaign was last run (38 of 38, 6 min 2 s). Earlier runs of this campaign were on `7a869371…` and `4f78464e…`; the modules and configurations did not change between them |
 | TLC | 2.19 of 08 August 2024 (rev 5a47802), `tla2tools.jar` 1.7.4, digest pinned by `tools/formal/run_tlc.py` |
 | Java | OpenJDK 21.0.12, 64-bit server VM |
 | Command | `python tools/formal/run_tlc.py --models-dir mqttiumd/models/m1` |
@@ -21,9 +21,8 @@ and this file is rewritten.
 The models follow the corrected reading of the fence (see `README.md`,
 "Bounds and limits"): a resolution applied to an absent identity always
 fences it; the outcome stays unknown only when the write of the fence is
-refused, a fault counted by `MaxFenceFail`. Record 0001 says otherwise in
-step 3 of P1-02b; the record that corrects it is proposed and has no
-number yet.
+refused, a fault counted by `MaxFenceFail`. That is record 0015
+(proposed), which corrects step 3 of P1-02b in record 0001.
 
 States and depth are those TLC printed; for a violation they are the
 states explored when the counterexample was found. Durations are

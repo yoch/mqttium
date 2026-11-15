@@ -97,6 +97,21 @@ class Trace:
         return None
 
 
+def lines_of(stream, limit=None):
+    """The lines of a binary ``stream``, each read with a bound.
+
+    A line is never read past ``MAX_LINE_BYTES + 1`` bytes: a longer one is
+    yielded cut, and ``read`` refuses it, so no line is allocated whole
+    before its size is known.
+    """
+    bound = (MAX_LINE_BYTES if limit is None else limit) + 1
+    while line := stream.readline(bound):
+        yield line
+        if len(line) == bound and not line.endswith(b"\n"):
+            # A line longer than the bound: nothing after it is read.
+            return
+
+
 def read(contracts, lines, max_bytes=None) -> Trace:
     """The trace held by ``lines``, an iterable of ``bytes`` lines."""
     trace = Trace()

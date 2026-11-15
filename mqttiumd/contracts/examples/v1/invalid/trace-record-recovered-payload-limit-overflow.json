@@ -22,13 +22,13 @@
       },
       {
         "kind": "Limits",
-        "max_targets_per_admission": 4,
-        "max_topic_bytes": 256,
+        "max_targets_per_admission": "4",
+        "max_topic_bytes": "256",
         "max_payload_bytes": "18446744073709551616"
       },
       {
         "kind": "RouteTable",
-        "revision": "1"
+        "revision": "2"
       },
       {
         "kind": "Route",

@@ -109,6 +109,16 @@ an absence. There:
 A held command does not by itself prevent a fence: a store fences whenever
 it can write the fence.
 
+**What selects a resolution.** A store that reads an absence does not
+know the command of the operation: neither its kind nor its publication.
+At `store.fence.transit`, `match.command_kind` and
+`match.publication_binding` name the resolved operation by its command as
+the bench knows it, from the fault that selected that command earlier in
+the scenario (`store.command.transit` in QABS-A, B and C). The runner of
+the bench maps the selection to the operation; the store is handed only
+the identity. No semantic rule yet refuses a scenario whose fence fault
+names a command no earlier fault selected.
+
 **One fault per item.** Two faults of a scenario never select the same
 command or result. Two selections on one point, for one command kind, with
 compatible publication bindings and compatible `result_of`, are refused
@@ -151,8 +161,11 @@ core consumed:
 A recovery page lists its facts. Besides the epoch, the sessions, the
 inbound exchanges and the operations, an inventory holds what the core
 needs to prepare an admission (record 0014): `Limits`, `RouteTable` and
-one `Route` per target of a topic. A 64-bit quantity is a decimal string
-and a 32-bit bound a JSON integer. The facts of a page follow the order
+one `Route` per target of a topic. Every quantity is a decimal string;
+the two 32-bit bounds of an admission (`max_targets_per_admission`,
+`max_topic_bytes`) refer to the `u32` primitive, in a trace, a snapshot
+and a fixture alike, and the semantic pass refuses a value above
+4294967295 (`u32-out-of-range`). The facts of a page follow the order
 of an inventory, which is the rule of `RecoveryOrder::admit`: `Epoch`,
 `Limits`, `RouteTable`, `Route`, `Session`, `InboundExchange`,
 `Operation`, ranks never decreasing; the first three at most once
@@ -210,6 +223,11 @@ Every table is present, even empty: an absent table is not an empty one.
 What is volatile (a command in transit, a transaction in preparation, a
 result not yet delivered, the control state of an opening) is not in a
 snapshot; the trace shows it.
+
+The revision of the route table is what the store writes; the oracle
+never computes it. The store advances it at each `AddRoute`, so the
+fixture of P1, whose one route has two targets, is at revision 2 in the
+examples, the recipes and the traces of the corpus.
 
 Rows are in the order of their key, numbers numerically, identities
 component by component and bytes as bytes, so that two stores in the same

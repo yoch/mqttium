@@ -131,7 +131,8 @@ def admit_recipe(operation, publication, payload, generation, targets=((B, 1), (
             b"MQDR".hex() + be(1, 2) + be(1, 1),
             scoped_hex(operation) + scoped_hex(operation) + scoped_hex(publication),
             be(PRODUCER) + be(1) + be(7, 2) + be(generation),
-            be(1) + be(2, 1) + be(0, 1),
+            # The fixture's table is at revision 2: one per AddRoute.
+            be(2) + be(2, 1) + be(0, 1),
             be(len(TOPIC), 2) + TOPIC.hex(),
             scoped_hex(payload) + be(len(PAYLOAD)),
             be(len(PAYLOAD)) + be(len(targets)) + be(1) + be(1),
@@ -184,7 +185,7 @@ def snapshot(run, checkpoint, admissions, releases=(), open_exchange=True, epoch
             for session, name in CLIENT_IDS.items()
         ],
         "route_table": {
-            "revision": "1",
+            "revision": "2",
             "routes": [
                 {
                     "topic_hex": TOPIC.hex(),
@@ -590,11 +591,11 @@ def route_fact(topic, target, qos=1):
 ROUTE_FACTS = [
     {
         "kind": "Limits",
-        "max_targets_per_admission": 4,
-        "max_topic_bytes": 256,
+        "max_targets_per_admission": "4",
+        "max_topic_bytes": "256",
         "max_payload_bytes": "1024",
     },
-    {"kind": "RouteTable", "revision": "1"},
+    {"kind": "RouteTable", "revision": "2"},
     route_fact(TOPIC, B),
     route_fact(TOPIC, C),
 ]
@@ -1321,6 +1322,35 @@ case(
     snapshots=lambda states: states["final"]["operations"].pop(0),
 )
 
+
+def on_sqlite(edit=None):
+    def apply(states):
+        for state in states.values():
+            state["backend"] = "sqlite"
+        if edit is not None:
+            edit(states)
+
+    return apply
+
+
+def sqlite_header(events):
+    events[0]["payload"] = dict(events[0]["payload"], backend="sqlite")
+
+
+case(
+    "recipe-lost-on-a-store-without-total-order",
+    "On a backend with no total order, the trace does not say whether op_A was committed before the inspection that lost its recipe.",
+    {
+        "same_recipe_for_op_A": "INCONCLUSIVE",
+        # Nor whether the admission falls inside its exchange: an exchange
+        # whose admission cannot be placed does not lack one.
+        "one_admission_per_observed_inbound_exchange": "INCONCLUSIVE",
+        "no_pubrec_observed_before_crash": "INCONCLUSIVE",
+    },
+    events=sqlite_header,
+    snapshots=on_sqlite(lambda states: states["final"]["operations"].pop(0)),
+)
+
 # ------------------------------------------------------- positive acknowledgement
 
 
@@ -1507,6 +1537,115 @@ case(
     {"broker_inputs_have_provenance": "FAIL"},
     events=in_pages(lambda facts: facts.pop(2), []),
 )
+
+
+# Rules the core applies to a whole inventory (lot L1): a route is listed
+# once, and every route targets a session of the inventory.
+case(
+    "recovery-route-listed-twice-across-pages",
+    "The same route, topic and target, is in two pages of one inventory.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=in_pages(lambda facts: facts.insert(4, dict(facts[3])), [4]),
+)
+case(
+    "recovery-route-to-a-session-the-inventory-lacks",
+    "A route targets a session that no fact of the inventory recovers.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=in_pages(lambda facts: facts.insert(5, route_fact(TOPIC, 9)), []),
+)
+
+
+def read_out_of_order(events):
+    # Page 0 holds the sessions and page 1 the epoch and the routes. The
+    # adapter reads page 1 first, which is an inventory in order; the core
+    # is given page 0 first, which is not.
+    deepcopy_payloads(events)
+    first = at(events, "recovery.read")
+    facts = events[first]["payload"]["facts"]
+    head, tail = facts[:5], facts[5:]
+    pages = [
+        {"run_epoch": "2", "page": "0", "last": False, "facts": tail},
+        {"run_epoch": "2", "page": "1", "last": True, "facts": head},
+    ]
+    events[first : first + 2] = [
+        ev("recovery.read.1", "store-adapter", "RecoveryPageRead", pages[1], [], 2),
+        ev("recovery.read.0", "store-adapter", "RecoveryPageRead", pages[0], [], 2),
+        ev(
+            "recovery.in.0",
+            "broker-core",
+            "RecoveryPageDelivered",
+            pages[0],
+            ["recovery.read.0"],
+            2,
+        ),
+        ev(
+            "recovery.in.1",
+            "broker-core",
+            "RecoveryPageDelivered",
+            pages[1],
+            ["recovery.read.1"],
+            2,
+        ),
+    ]
+
+
+case(
+    "recovery-delivered-out-of-inventory-order",
+    "Read in an order that is an inventory, delivered in one that is not: the core got the sessions before the epoch.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=read_out_of_order,
+)
+
+
+def page_read_twice(events):
+    # The adapter reads page 0 again after a transient error; the core is
+    # given each page once, in order.
+    in_pages([5])(events)
+    first = at(events, "recovery.read.0")
+    again = dict(events[first], label="recovery.read.0.again")
+    events.insert(first + 1, again)
+
+
+case(
+    "recovery-page-read-again",
+    "A page read twice by the adapter and delivered once is one inventory, not a second epoch.",
+    events=page_read_twice,
+)
+
+
+def lying_observer(events):
+    # The peer says it decoded a refusing PUBREC; the bytes it observed are
+    # the positive one.
+    deepcopy_payloads(events)
+    for event in events:
+        if event["kind"] == "PeerPacketObserved" and event["payload"]["packet_kind"] == "PUBREC":
+            event["payload"]["reason_code"] = 0x83
+
+
+case(
+    "observed-reason-is-not-the-bytes",
+    "The reason a peer says it decoded is not the reason in the bytes it observed.",
+    {"one_admission_per_observed_inbound_exchange": "INCONCLUSIVE"},
+    events=lying_observer,
+)
+
+
+def trailing_byte(events):
+    # The bytes the peer observed are more than the one PUBREC it states.
+    deepcopy_payloads(events)
+    for event in events:
+        if event["kind"] == "PeerPacketObserved" and event["payload"]["packet_kind"] == "PUBREC":
+            event["payload"]["bytes_hex"] += "00"
+
+
+case(
+    "observed-bytes-are-more-than-the-packet",
+    "The bytes a peer observed hold more than the one packet it says it decoded.",
+    {"one_admission_per_observed_inbound_exchange": "INCONCLUSIVE"},
+    events=trailing_byte,
+)
+
+
 case(
     "provenance-input-refused",
     "The dispatcher refused a result that answered no effect in flight.",
@@ -2261,6 +2400,45 @@ qabs(
     {REASON: "FAIL"},
     letter="B",
     events=answered_by_an_unknown,
+)
+# Review of the stack, findings 1 to 4 and 6.
+
+
+def fence_listed_afterwards(states):
+    # The fence the final snapshot lists was not established when the store
+    # answered: the snapshot is inspected after the refusal.
+    states["unknown"] = empty_snapshot(states["unknown"]["run_id"], "unknown", [OP_ADMIT])
+
+
+qabs(
+    "certain-rejection-closed-only-afterwards",
+    "DEM-MU-01: the store refuses on an absence it read, and the fence a later snapshot lists came after.",
+    {"certain_rejection_has_a_closure": "FAIL"},
+    letter="C",
+    events=invented_rejection,
+    snapshots=fence_listed_afterwards,
+)
+
+
+def fenced_after_its_commit(events):
+    events.insert(
+        at(events, "admit.ready") + 1,
+        ev(
+            "late.fence",
+            "store-evidence",
+            "StoreFenceStable",
+            {"operation_id": OP_ADMIT},
+            ["admit.stable"],
+        ),
+    )
+
+
+qabs(
+    "fence-stable-after-the-commit",
+    "The operation is committed, and the store then writes a fence for the same identity.",
+    {"fenced_operation_never_executed": "FAIL"},
+    letter="A",
+    events=fenced_after_its_commit,
 )
 qabs(
     "certain-rejection-without-a-fence-on-a-cut-trace",

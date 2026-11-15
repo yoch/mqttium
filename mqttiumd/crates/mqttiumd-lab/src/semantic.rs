@@ -6,7 +6,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use mqttiumd_contract::capacity::PayloadBytes;
 use mqttiumd_contract::decimal::{DecimalError, parse_u64};
+use mqttiumd_contract::effects::{InboundPhase, OrderRefused, RecoveredFact, RecoveryOrder};
+use mqttiumd_contract::ids::{
+    ExchangeGeneration, ExchangeId, InboundPacketId, LogicalOwnerId, OperationId, OperationSeq,
+    PublicationId, PublicationSeq, Revision, RunEpoch, SessionId, StoreIncarnation,
+};
+use mqttiumd_contract::outcome::Knowledge;
+use mqttiumd_contract::packet::{Qos, SharedBytes};
 use serde_json::Value;
 
 use crate::diagnostic::{Diagnostic, MAX_DIAGNOSTICS, Report, code};
@@ -536,7 +544,17 @@ fn fixture(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) {
     u64_at(document, "/store/incarnation", out);
     if let Some(capacities) = document.get("capacities").and_then(Value::as_object) {
         for name in capacities.keys() {
-            u64_at(document, &format!("/capacities/{name}"), out);
+            let pointer = format!("/capacities/{name}");
+            let value = u64_at(document, &pointer, out);
+            if U32_COMPONENTS.contains(&name.as_str())
+                && value.is_some_and(|value| value > u64::from(u32::MAX))
+            {
+                out.push(Diagnostic::new(
+                    code::U32_OUT_OF_RANGE,
+                    pointer,
+                    "the value exceeds 4294967295",
+                ));
+            }
         }
     }
     let profile = text(document, "profile");
@@ -1312,73 +1330,111 @@ fn trace_record(document: &Value, out: &mut Vec<Diagnostic>) {
     }
 }
 
-/// The kinds of recovered fact in the order of an inventory, first to
-/// last, and whether an inventory holds at most one of the kind. This is
-/// the order of `mqttiumd_contract::effects::FactRank`; a test holds the
-/// two together.
-const FACT_RANKS: [(&str, bool); 7] = [
-    ("Epoch", true),
-    ("Limits", true),
-    ("RouteTable", true),
-    ("Route", false),
-    ("Session", false),
-    ("InboundExchange", false),
-    ("Operation", false),
-];
+/// A fact of the given kind for `RecoveryOrder::admit`, which reads only
+/// the kind and, for a route, the topic: the other members are neutral.
+/// `topic_hex` is the topic of a route in lower-case hexadecimal. `None`
+/// for a kind the contract does not know, or a topic that is not hex.
+#[must_use]
+pub fn representative_fact(kind: &str, topic_hex: &str) -> Option<RecoveredFact> {
+    let zero = OperationId::new(
+        StoreIncarnation::new(0),
+        RunEpoch::new(0),
+        LogicalOwnerId::new(0),
+        OperationSeq::new(0),
+    );
+    let publication = PublicationId::new(
+        StoreIncarnation::new(0),
+        RunEpoch::new(0),
+        LogicalOwnerId::new(0),
+        PublicationSeq::new(0),
+    );
+    Some(match kind {
+        "Epoch" => RecoveredFact::Epoch {
+            incarnation: StoreIncarnation::new(0),
+            epoch: RunEpoch::new(0),
+        },
+        "Limits" => RecoveredFact::Limits {
+            max_targets_per_admission: 0,
+            max_topic_bytes: 0,
+            max_payload_bytes: PayloadBytes::new(0),
+        },
+        "RouteTable" => RecoveredFact::RouteTable {
+            revision: Revision::new(0),
+        },
+        "Route" => {
+            let mut topic = Vec::with_capacity(topic_hex.len() / 2);
+            for pair in topic_hex.as_bytes().chunks(2) {
+                let text = core::str::from_utf8(pair).ok()?;
+                topic.push(u8::from_str_radix(text, 16).ok()?);
+            }
+            RecoveredFact::Route {
+                topic: SharedBytes::copy_from(&topic, topic.len()).ok()?,
+                target: SessionId::new(0),
+                target_revision: Revision::new(0),
+                max_qos: Qos::AtMostOnce,
+            }
+        }
+        "Session" => RecoveredFact::Session {
+            session: SessionId::new(0),
+            client_id: SharedBytes::copy_from(&[], 0).ok()?,
+            revision: Revision::new(0),
+        },
+        "InboundExchange" => RecoveredFact::InboundExchange {
+            exchange: ExchangeId {
+                session: SessionId::new(0),
+                generation: ExchangeGeneration::new(0),
+            },
+            packet_id: InboundPacketId::new(1)?,
+            publication,
+            phase: InboundPhase::AwaitPubrel,
+        },
+        "Operation" => RecoveredFact::Operation {
+            operation: zero,
+            knowledge: Knowledge::Unknown,
+        },
+        _ => return None,
+    })
+}
 
-/// The facts of one recovery page follow the order of an inventory, as
-/// `RecoveryOrder::admit` states it (record 0014): ranks never decrease,
-/// the epoch, the limits and the route table appear at most once, and
-/// routes are sorted by the bytes of their topic. A fact out of place
-/// changes nothing for those that follow.
+/// The facts of one recovery page follow the order of an inventory. The
+/// rule is `RecoveryOrder::admit` of the contract crate (record 0014),
+/// applied here as it is: ranks never decrease, the epoch, the limits and
+/// the route table appear at most once, and routes are sorted by the bytes
+/// of their topic. A refused fact changes nothing for those that follow.
 fn recovered_facts_order(document: &Value, out: &mut Vec<Diagnostic>) {
-    let mut last: Option<usize> = None;
-    let mut last_topic: Option<&str> = None;
     let facts = document
         .pointer("/payload/facts")
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
+    let mut order = RecoveryOrder::new();
     for (index, fact) in facts.iter().enumerate() {
         let kind = fact.get("kind").and_then(Value::as_str).unwrap_or_default();
-        let Some(rank) = FACT_RANKS.iter().position(|(name, _)| *name == kind) else {
+        let topic = fact
+            .get("topic_hex")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(fact) = representative_fact(kind, topic) else {
             continue;
         };
         let at = format!("/payload/facts/{index}");
-        if let Some(previous) = last {
-            if rank < previous {
-                out.push(Diagnostic::new(
-                    code::ROWS_OUT_OF_ORDER,
-                    format!("{at}/kind"),
-                    format!("a {kind} fact follows a {} fact", FACT_RANKS[previous].0),
-                ));
-                continue;
-            }
-            if rank == previous && FACT_RANKS[rank].1 {
-                out.push(Diagnostic::new(
-                    code::DUPLICATE_NAME,
-                    format!("{at}/kind"),
-                    format!("a second {kind} fact"),
-                ));
-                continue;
-            }
+        match order.admit(&fact) {
+            Ok(()) => {}
+            Err(OrderRefused::RankDecreased { previous, found }) => out.push(Diagnostic::new(
+                code::ROWS_OUT_OF_ORDER,
+                format!("{at}/kind"),
+                format!("a {found:?} fact follows a {previous:?} fact"),
+            )),
+            Err(OrderRefused::Repeated(rank)) => out.push(Diagnostic::new(
+                code::DUPLICATE_NAME,
+                format!("{at}/kind"),
+                format!("a second {rank:?} fact"),
+            )),
+            Err(OrderRefused::RoutesUnsorted) => out.push(Diagnostic::new(
+                code::ROWS_OUT_OF_ORDER,
+                format!("{at}/topic_hex"),
+                "the topic of the route sorts before the topic of the route before it",
+            )),
         }
-        if kind == "Route" {
-            // Lower-case hexadecimal sorts like the bytes it spells.
-            let topic = fact
-                .get("topic_hex")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if last_topic.is_some_and(|previous| topic < previous) {
-                out.push(Diagnostic::new(
-                    code::ROWS_OUT_OF_ORDER,
-                    format!("{at}/topic_hex"),
-                    "the topic of the route sorts before the topic of the route before it",
-                ));
-                continue;
-            }
-            last_topic = Some(topic);
-        }
-        last = Some(rank);
     }
 }
 
@@ -1521,7 +1577,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
 /// Names of the members that hold a 64-bit decimal string, in a trace
 /// payload or a snapshot. A test walks the schemas and fails when one of
 /// their 64-bit members is missing here.
-const COMPONENTS: [&str; 38] = [
+const COMPONENTS: [&str; 36] = [
     "incarnation",
     "epoch",
     "owner",
@@ -1555,12 +1611,15 @@ const COMPONENTS: [&str; 38] = [
     "next_session",
     "source_session",
     "target_revision",
-    "max_targets_per_admission",
-    "max_topic_bytes",
     "max_payload_bytes",
     "max_sessions",
     "max_route_targets",
 ];
+
+/// Names of the members that hold a 32-bit quantity as a decimal string.
+/// The schema-walk test holds this list to the members that refer to the
+/// `u32` primitive.
+const U32_COMPONENTS: [&str; 2] = ["max_targets_per_admission", "max_topic_bytes"];
 
 /// Checks every decimal-looking identity component below `value`. Payload
 /// members that hold 64-bit components are objects of decimal strings.
@@ -1579,6 +1638,21 @@ fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnosti
     for (key, member) in members {
         let child = format!("{pointer}/{key}");
         match member {
+            Value::String(raw) if U32_COMPONENTS.contains(&key.as_str()) => match parse_u64(raw) {
+                Ok(value) if value <= u64::from(u32::MAX) => {}
+                Ok(_) | Err(DecimalError::Overflow | DecimalError::TooLong) => {
+                    out.push(Diagnostic::new(
+                        code::U32_OUT_OF_RANGE,
+                        child,
+                        format!("{raw:?} exceeds 4294967295"),
+                    ));
+                }
+                Err(error) => out.push(Diagnostic::new(
+                    code::U64_NOT_CANONICAL,
+                    child,
+                    format!("{raw:?} is not a canonical decimal string ({error:?})"),
+                )),
+            },
             Value::String(raw) if COMPONENTS.contains(&key.as_str()) => match parse_u64(raw) {
                 Ok(_) => {}
                 Err(DecimalError::Overflow | DecimalError::TooLong) => out.push(Diagnostic::new(
@@ -1644,59 +1718,47 @@ mod tests {
                 .any(|diagnostic| diagnostic.message.contains(cell))
     }
 
-    /// The order of the kinds of fact is the order of the contract, and
-    /// the kinds held at most once are those the contract names.
-    #[test]
-    fn the_order_of_recovered_facts_is_the_order_of_the_contract() {
-        use mqttiumd_contract::effects::FactRank;
-        let ranks = [
-            FactRank::Epoch,
-            FactRank::Limits,
-            FactRank::RouteTable,
-            FactRank::Route,
-            FactRank::Session,
-            FactRank::InboundExchange,
-            FactRank::Operation,
-        ];
-        assert_eq!(ranks.len(), FACT_RANKS.len());
-        for (rank, (name, once)) in ranks.iter().zip(FACT_RANKS) {
-            assert_eq!(format!("{rank:?}"), name);
-            assert_eq!(rank.at_most_once(), once, "{name}");
-        }
-        assert!(ranks.windows(2).all(|pair| pair[0] < pair[1]));
-    }
-
     /// The Rust reader finds 64-bit members by name. Every member that a
     /// trace or snapshot schema declares as a `u64` must be in its list:
     /// one added to a schema and forgotten here would go unchecked.
     #[test]
     fn every_64_bit_member_of_the_schemas_is_range_checked() {
-        fn walk(schema: &Value, found: &mut BTreeSet<String>) {
+        fn walk(schema: &Value, primitive: &str, found: &mut BTreeSet<String>) {
             match schema {
                 Value::Object(members) => {
                     if let Some(Value::Object(properties)) = members.get("properties") {
                         for (name, property) in properties {
                             let reference = property.get("$ref").and_then(Value::as_str);
-                            if reference.is_some_and(|target| target.ends_with("#/$defs/u64")) {
+                            if reference.is_some_and(|target| target.ends_with(primitive)) {
                                 found.insert(name.clone());
                             }
                         }
                     }
-                    members.values().for_each(|value| walk(value, found));
+                    members
+                        .values()
+                        .for_each(|value| walk(value, primitive, found));
                 }
-                Value::Array(items) => items.iter().for_each(|value| walk(value, found)),
+                Value::Array(items) => items.iter().for_each(|value| walk(value, primitive, found)),
                 _ => {}
             }
         }
         let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/schema/v1");
         let mut found = BTreeSet::new();
+        let mut narrow = BTreeSet::new();
         for file in [
             "trace-record.schema.json",
             "store-snapshot.schema.json",
+            "fixture.schema.json",
             "primitives.schema.json",
         ] {
             let bytes = std::fs::read(directory.join(file)).expect("schema");
-            walk(&serde_json::from_slice(&bytes).expect("JSON"), &mut found);
+            let schema: Value = serde_json::from_slice(&bytes).expect("JSON");
+            // The 64-bit capacities of a fixture are checked by pointer,
+            // not by this list.
+            if file != "fixture.schema.json" {
+                walk(&schema, "#/$defs/u64", &mut found);
+            }
+            walk(&schema, "#/$defs/u32", &mut narrow);
         }
         assert!(found.len() >= 30, "{found:?}");
         // Envelope members of a record are checked by pointer.
@@ -1708,6 +1770,17 @@ mod tests {
             .filter(|name| !COMPONENTS.contains(&name.as_str()))
             .collect();
         assert!(missing.is_empty(), "not range-checked: {missing:?}");
+        // A 32-bit member is bounded by its own list, and only it.
+        let listed: BTreeSet<String> = U32_COMPONENTS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        assert_eq!(narrow, listed);
+        assert!(
+            found.is_disjoint(&narrow),
+            "{:?}",
+            found.intersection(&narrow)
+        );
     }
 
     /// The recipe of the snapshot example is what the contract crate
@@ -1992,16 +2065,41 @@ mod tests {
                 required: &["CloseConnection"],
                 forbidden: &["Persist", "EmitPubrec"],
             },
-            // A refused release is prepared again under a new identity
+            // A fenced release is prepared again under a new identity
             // (DEM-009); PUBCOMP still waits for a commit (ACK-001).
             Expected {
                 state: "ReleasePending",
                 event: "ReleaseResult",
-                point: &[CURRENT, REJECTED, SUFFICIENT],
+                point: &[CURRENT, REJECTED, ("refusal", "fenced"), SUFFICIENT],
                 disposition: "TRANSITION",
                 next: "ReleasePending",
                 required: &["Persist"],
                 forbidden: &["EmitPubcomp"],
+            },
+            // Any other refusal, or a fence at the bound, stops the owner
+            // (record 0013, line 4): preparing again could loop for ever.
+            Expected {
+                state: "ReleasePending",
+                event: "ReleaseResult",
+                point: &[
+                    CURRENT,
+                    REJECTED,
+                    ("refusal", "fenced_at_bound"),
+                    SUFFICIENT,
+                ],
+                disposition: "FAULT",
+                next: "ReleasePending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+            Expected {
+                state: "ReleasePending",
+                event: "ReleaseResult",
+                point: &[CURRENT, REJECTED, ("refusal", "definitive"), INSUFFICIENT],
+                disposition: "FAULT",
+                next: "ReleasePending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
             },
             Expected {
                 state: "ReleasePending",

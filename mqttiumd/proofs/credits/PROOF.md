@@ -9,9 +9,11 @@ content, under which assumptions, with which tool, and what is not proved.
 The harnesses, the scripts and their output are the evidence; this file is
 the guide to them.
 
-**State: not received.** The proof runs locally. Two conditions of the
-reception are not met yet: no call site of lot L1 exists, and nothing here
-runs in CI. See "What is not done".
+**State: not received.** The proof runs in CI: the job `pilot proof` of
+the `mqttiumd` workflow was read green on an exact revision (see "The run
+in CI"). The call site of lot L1 is on the integration branch and is
+named below. The open condition stays open until the reception decides
+it; see "What is not done".
 
 ## The function
 
@@ -22,14 +24,14 @@ runs in CI. See "What is not done".
 | | |
 | - | - |
 | Text of the function | `sha256:f1f4d430f508faa837db8c82d3ecb841bfc9c72f4a18c62f2a67969a83bd5cd1` |
-| `crates/mqttiumd-core/src/credits.rs` | `sha256:cd9e17b4a221265bfab203232e57e54521adb40943ad812e586342e852ce7f22` |
+| `crates/mqttiumd-core/src/credits.rs` | `sha256:51d60af62dbb7e9f197008e0f86449a81b78ec204f2e92f7487fddadee5e1c40` |
 | `crates/mqttiumd-contract/src/capacity.rs` | `sha256:7137872566aeb6892d00a8134b1ba1908c16c89dd75cf1c2790fa4ec2f9e235b` |
 | `crates/mqttiumd-contract/src/ids.rs` | `sha256:c7ab95d573bee210f8f2668c4f13770e68ed93a95e9c704b33e63838a317679e` |
 | `proofs/credits/src/lib.rs`, the harnesses | `sha256:cff057a4624567777a460fb728f6283b48272400e5197eb11633013aa859f605` |
 | `proofs/credits/harnesses.txt` | `sha256:54f85cc0270a7956d07fceaa2914f5741982b6567503d3fd380cdeca64c17ca1` |
 | `proofs/credits/tests/no_allocation.rs` | `sha256:f63b2706874092e4de47409d38d0efe883b9ed813d8c4dc7979d935f0d16e558` |
 | Recorded in | `BODY.sha256`; `run.sh` fails with exit 5 when any of them differs |
-| Call site in the product | None yet. Lot L1 calls it and writes no second variant (DEM-024) |
+| Call site in the product | `LeaseTable::release` in `crates/mqttiumd-core/src/leases.rs`, line 245, at `56ae13a` of the integration branch `claude/optimistic-feynman-fqh947`, merged here unchanged. It is the only call outside `credits.rs`: a search of `crates/` for `release_if_current` finds no other, and a unit test of L1 in `leases.rs` counts exactly one call in the product (DEM-024) |
 
 The text of the function is from its `pub fn` line to the first closing
 brace in column one.
@@ -109,8 +111,11 @@ The function has one precondition, and the harnesses cannot establish
 it: **each held lease has one record.** An account counts usage and does
 not know its leases, so the function cannot tell a second record of a
 held lease from the first. `LeaseRecord` is not `Clone`, but `from_parts`
-and the getters can rebuild a record; recovery calls `from_parts` once
-per durable row, and nothing else does outside this proof crate.
+and the getters can rebuild a record. At `56ae13a` the product does not
+call `from_parts`: a held record comes from `Account::reserve`, both in
+`LeaseTable::reserve` and in `LeaseTable::restore`, which recovery uses
+once per durable row (record 0010). Only this proof crate calls
+`from_parts`.
 
 Harness `p12` builds the state the precondition forbids, a second record
 of the same held lease, and shows what follows: each release is exact on
@@ -162,7 +167,8 @@ The states are built with the public `from_parts` constructors, which
 check nothing. Without them the proof crate could not state an incoherent
 account, or a held lease that its account never counted: the
 encapsulation of the types would have excluded those states from the
-proof. The constructors are also what recovery needs.
+proof. The product does not use them; recovery goes through
+`Account::reserve`.
 
 What the result rests on, and is not proved here:
 
@@ -198,8 +204,8 @@ A result belongs to an exact content.
 
 | | |
 | - | - |
-| Revision | The commit that records this run, on branch `claude/mqttiumd-l6-pilot-proof`: its parent `23334904` merges the integration branch at `807ca26` (the contract chains of lots L1 and L2), and it changes only `BODY.sha256`, this file and the CI proposal |
-| Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb`, unchanged by the lot |
+| Revision | The commit that records this run, on branch `claude/mqttiumd-l6-pilot-proof`. It merges `23eb17e`, a documentation chain of this lot on `credits.rs` (the doc comments of the two `from_parts`; the text of the function is unchanged), whose parent is the integration branch at `56ae13a` (the call site of lot L1). It also changes `BODY.sha256` and this file |
+| Contract digest | `sha256:29dd01788a05e141d204a826aba8bcbb3db837a4b49e73e43263f7e2a2d4b4d8`, as `validate` prints it. It changed since the previous run with the contract chains of other lots on the integration branch; this lot changes no contract |
 | Where | A cloud container, local run. Not CI |
 | Tool | `/root/.cargo/bin/cargo-kani`, as `PATH` selects it: Kani Rust Verifier 0.68.0 (cargo plugin), CBMC 6.11.0 |
 | Compiler the tool brings | `rustc 1.100.0-nightly (8925ea358 2026-08-20)`, toolchain `nightly-2026-08-21-x86_64-unknown-linux-gnu` |
@@ -228,15 +234,54 @@ Twelve harnesses run by the tool, twelve listed, all verified; 41 of 41
 witnesses satisfied; 12 of 12 regions of the function covered under `p1`;
 4 source files reached, all recorded; 3 allocation tests passed. The
 whole run, preflight included, takes 44 seconds from an empty build
-directory, and 40 to 50 seconds here on a warm one.
+directory, and 41 seconds here on a warm one. The merge changed only the
+digest of `credits.rs`: before `--record`, `run.sh` exited 5 on that one
+line, with every other check passed.
+
+On the same revision: `python3 proofs/credits/mutants.py`, 12 of 12
+caught, 0 inconclusive, control passed (155 s);
+`python3 proofs/credits/selftest.py`, 16 of 16 cases as expected
+(318 s).
 
 Also run on that revision: `cargo fmt --check`, `cargo clippy --workspace
 --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`
-(234 passed, 18 of them in `credits`), `validate`,
+(414 passed, 18 of them in `credits`), `validate`,
 `python tools/build_corpus.py --check` and `tools/test-install-tools.sh`
 on the product workspace; `cargo fmt --check` and `cargo clippy` on the
 `proofs/` workspace; `proofs/preflight-selftest.sh` (four fake tools
 refused, the real preflight passes).
+
+## The run in CI
+
+Job `pilot proof` of `.github/workflows/mqttiumd.yml`, on revision
+`69e211cba1fd7b7dfcf2fb5bb29dbfc858de8e3e` of pull request 649: success
+(run 43692794802, job 132746762586, runner `ubuntu-24.04`, no cache).
+The code under `crates/` and `proofs/` at that revision is the one of
+the local run above.
+
+| Step | Result | Time on the runner |
+| - | - | - |
+| Install the pinned toolchain | success | 9 s |
+| `tools/install-tools.sh kani` | success | 12 s |
+| `proofs/preflight-selftest.sh` | success | 3 s |
+| `proofs/credits/run.sh` | success | 29 s |
+| `python3 proofs/credits/mutants.py` | 12 of 12 caught, 0 inconclusive | 97 s |
+| `python3 proofs/credits/selftest.py` | 16 of 16 cases as expected | 201 s |
+| `fmt` and `clippy` on `proofs/` | success | under 1 s |
+
+The whole job took six minutes. The runner was faster than the container
+this lot was developed in for every step (there: 40 to 50 s, 148 to
+175 s and 295 to 357 s for the last three long steps); no other
+difference was seen. The mutants' table and the self-test's lines were
+read in the job log; the output of `run.sh` in that log was not read
+line by line, only its exit status.
+
+The job was read green again on `3d40366` (run 43694148218, job
+132750871543, 7 min 53 s). The revision that records the run above is
+later: its `credits.rs` differs in doc comments. A later revision is a
+new content: the job runs again on it, and its result is read there
+before it is claimed. A file cannot name the CI result of the commit
+that holds it, so that reading is reported on pull request 649.
 
 ## What a PASS of the scripts is worth
 
@@ -401,23 +446,6 @@ inconclusive, so a stale mutant cannot count as caught.
 
 ## What is not done
 
-- **No call site.** Lot L1 has not called the function yet. The reception
-  names that call site.
-- **Not in CI.** The workflow is a shared file. Until a job installs the
-  pinned tools and runs `proofs/credits/run.sh`, every result above is a
-  local run.
-- **Record 0010 is proposed, not accepted.** The interface is on the
-  integration branch; the owner of the repository accepts the record.
-- **The precondition is not enforced anywhere.** One record per held
-  lease is owed by the lease table of lot L1, as an open condition; no
-  test of L1 shows it yet.
-- **The record goes stale with the contract.** It did once already:
-  lot L1 added a variant of `WakeCondition` to `capacity.rs` and the
-  identity `OutboxSerial` to `ids.rs`. On the merge `23334904` `run.sh`
-  failed with exit 5, every harness still verified; the two additions
-  were read (neither touches what the body calls), the proof was run on
-  the new content and recorded. The same will happen at the next change
-  of those files, and lot L6 records, not the lot that made the change.
 - **Human time** of the maintenance trial.
 - The open condition "Pilot proof" of
   `docs/reception/open-conditions.md` stays open.

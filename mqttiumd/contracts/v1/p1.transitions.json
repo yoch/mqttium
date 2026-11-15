@@ -1860,6 +1860,9 @@
         "outcome": [
           "rejected_certain"
         ],
+        "refusal": [
+          "fenced"
+        ],
         "effect_capacity": [
           "sufficient"
         ]
@@ -1888,7 +1891,7 @@
         "MU-08",
         "MU-01"
       ],
-      "justification": "DEM-009: after a certain refusal a new preparation gets another OperationId and keeps the logical request. The exchange is still durably open, the client is owed a PUBCOMP only after a commit, and on a live connection it will not send PUBREL again."
+      "justification": "DEM-009: after a certain refusal a new preparation gets another OperationId and keeps the logical request. Only a fence placed by a resolution of the owner before the command arrived can be overcome so, and only a bounded number of times (record 0013, line 4). The exchange is still durably open, the client is owed a PUBCOMP only after a commit, and on a live connection it will not send PUBREL again."
     },
     {
       "id": "inbound_qos2.release_pending.rejected.defer",
@@ -1901,6 +1904,9 @@
         ],
         "outcome": [
           "rejected_certain"
+        ],
+        "refusal": [
+          "fenced"
         ],
         "effect_capacity": [
           "insufficient"
@@ -1924,6 +1930,80 @@
       "mutations": [
         "MU-25"
       ]
+    },
+    {
+      "id": "inbound_qos2.release_pending.rejected.fenced_at_bound.stop",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "rejected_certain"
+        ],
+        "refusal": [
+          "fenced_at_bound"
+        ]
+      },
+      "disposition": "FAULT",
+      "next_state_class": "ReleasePending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-009",
+        "DEM-010"
+      ],
+      "witnesses": [],
+      "mutations": [
+        "MU-08"
+      ],
+      "justification": "Record 0013, line 4: the release was fenced as many times as the bound allows; preparing again could loop for ever. The owner stops with a diagnostic, and nothing is persisted or acknowledged."
+    },
+    {
+      "id": "inbound_qos2.release_pending.rejected.definitive.stop",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "rejected_certain"
+        ],
+        "refusal": [
+          "definitive"
+        ]
+      },
+      "disposition": "FAULT",
+      "next_state_class": "ReleasePending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-009",
+        "DEM-010"
+      ],
+      "witnesses": [],
+      "mutations": [
+        "MU-08"
+      ],
+      "justification": "Record 0013, line 4: a refusal for another reason than a fence cannot be changed by a new preparation. The owner stops with a diagnostic, and nothing is persisted or acknowledged."
     },
     {
       "id": "inbound_qos2.release_pending.unknown.keep",

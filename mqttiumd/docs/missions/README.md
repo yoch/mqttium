@@ -16,7 +16,7 @@ close.
 | Base branch | `main` |
 | Integrated revision | `874f298b4de7c3a13006cb1ff767dfb09e4031ac`, the merge of PR yoch/mqttium#647 (lot L0, with the amended record 0009) |
 | Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb`, as `validate` prints it on that revision |
-| Contract digest on the integration branch | `sha256:29dd01788a05e141d204a826aba8bcbb3db837a4b49e73e43263f7e2a2d4b4d8` since the contract stack of lot L3 was merged (15 November 2026). The digest above is the one every lot started from |
+| Contract digest on the integration branch | `sha256:5fe5d83fa42d59ea5e2dd5b407812fa28d43fba8a6de2af7fc1a1a3082fccca2` since the final head of lot L3 was merged (`d86adb0`, 15 November 2026): the registry has 94 rules, with the dimension `refusal` of a rejected release, and the fault catalogue says what selects a resolution at the fence point. It was `sha256:ceba8635…2e39` after the bounds of an admission got one encoding, and `sha256:29dd0178…b4d8` before. The digest above is the one every lot started from |
 
 Every lot starts from the integrated revision. The commit that records it
 here differs from it by this file only, and changes no contract. Every lot

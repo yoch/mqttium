@@ -385,3 +385,124 @@ fn the_reasons_of_a_refusal_are_those_of_the_contract() {
         assert_eq!(stated, Some(reason.as_str()), "{name}");
     }
 }
+
+/// The cases of the order of a recovery inventory hold for the contract's
+/// rule. The oracle runs the same file through its own copy.
+#[test]
+fn the_recovery_order_cases_hold_for_the_contract() {
+    use mqttiumd_contract::effects::{OrderRefused, RecoveryOrder};
+    use mqttiumd_lab::semantic::representative_fact;
+
+    let path = root().join("crates/mqttiumd-lab/tests/support/recovery-order-cases.json");
+    let cases: Value = serde_json::from_slice(&fs::read(path).expect("cases")).expect("JSON");
+    let cases = cases["cases"].as_array().expect("cases");
+    assert!(cases.len() >= 10);
+    for case in cases {
+        let mut order = RecoveryOrder::new();
+        let mut found = Vec::new();
+        for (index, fact) in case["facts"].as_array().expect("facts").iter().enumerate() {
+            let kind = fact[0].as_str().expect("kind");
+            let topic = fact.get(1).and_then(Value::as_str).unwrap_or_default();
+            let fact = representative_fact(kind, topic).expect("a kind of fact");
+            if let Err(refusal) = order.admit(&fact) {
+                let name = match refusal {
+                    OrderRefused::RankDecreased { .. } => "RankDecreased",
+                    OrderRefused::Repeated(_) => "Repeated",
+                    OrderRefused::RoutesUnsorted => "RoutesUnsorted",
+                };
+                found.push(serde_json::json!([index, name]));
+            }
+        }
+        assert_eq!(Value::Array(found), case["refused"], "{}", case["name"]);
+    }
+}
+
+/// A `.json` file of the schema directory that is not a schema is refused
+/// when the contracts are opened, as the oracle refuses it: it would be
+/// hashed into the contract digest and never read as a rule.
+#[test]
+fn a_file_of_the_schema_directory_that_is_not_a_schema_is_refused() {
+    let base = std::env::temp_dir().join(format!("mqttiumd-l3-schema-dir-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    for directory in ["contracts/v1", "contracts/schema/v1"] {
+        fs::create_dir_all(base.join(directory)).expect("directory");
+        for entry in fs::read_dir(root().join(directory)).expect("listing") {
+            let entry = entry.expect("entry");
+            if entry.path().is_file() {
+                fs::copy(entry.path(), base.join(directory).join(entry.file_name())).expect("copy");
+            }
+        }
+    }
+    assert!(Workspace::open(&base, Path::new("contracts/v1")).is_ok());
+    // The foreign file is itself a valid local schema: only its place
+    // refuses it.
+    fs::write(
+        base.join("contracts/schema/v1/notes.json"),
+        b"{\"$schema\": \"https://json-schema.org/draft/2020-12/schema\"}\n",
+    )
+    .expect("write");
+    let refused = Workspace::open(&base, Path::new("contracts/v1"));
+    let _ = fs::remove_dir_all(&base);
+    let diagnostic = refused
+        .err()
+        .expect("a foreign file in the schema directory is refused");
+    assert_eq!(diagnostic.code, code::SCHEMA_NOT_LOCAL, "{diagnostic:?}");
+}
+
+/// A release the store refused for certain is prepared again only when it
+/// was fenced and the bound of preparations is not reached; any other
+/// refusal stops the owner, and nothing is persisted or acknowledged
+/// (record 0013, line 4). Without the reason the registry prepared again
+/// whatever the refusal, which loops for ever on a definitive one.
+#[test]
+fn a_release_refused_for_good_is_never_prepared_again() {
+    let bytes = fs::read(root().join("contracts/v1/p1.transitions.json")).expect("registry");
+    let registry: Value = serde_json::from_slice(&bytes).expect("JSON");
+    let rules = registry["rules"].as_array().expect("rules");
+    let rule = |id: &str| {
+        rules
+            .iter()
+            .find(|rule| rule["id"] == id)
+            .unwrap_or_else(|| panic!("no rule {id}"))
+    };
+    let again = rule("inbound_qos2.release_pending.rejected.prepare_again");
+    assert_eq!(
+        again["guard_partition"]["refusal"],
+        serde_json::json!(["fenced"])
+    );
+    let defer = rule("inbound_qos2.release_pending.rejected.defer");
+    assert_eq!(
+        defer["guard_partition"]["refusal"],
+        serde_json::json!(["fenced"])
+    );
+    for (id, refusal) in [
+        (
+            "inbound_qos2.release_pending.rejected.fenced_at_bound.stop",
+            "fenced_at_bound",
+        ),
+        (
+            "inbound_qos2.release_pending.rejected.definitive.stop",
+            "definitive",
+        ),
+    ] {
+        let stop = rule(id);
+        assert_eq!(stop["disposition"], "FAULT", "{id}");
+        assert_eq!(
+            stop["guard_partition"]["refusal"],
+            serde_json::json!([refusal]),
+            "{id}"
+        );
+        assert_eq!(stop["next_state_class"], "ReleasePending", "{id}");
+        assert_eq!(stop["required_effects"], serde_json::json!([]), "{id}");
+        for effect in ["Persist", "EmitPubcomp", "EmitPubcompNotFound"] {
+            assert!(
+                stop["forbidden_effects"]
+                    .as_array()
+                    .expect("effects")
+                    .iter()
+                    .any(|forbidden| forbidden == effect),
+                "{id} must forbid {effect}"
+            );
+        }
+    }
+}
