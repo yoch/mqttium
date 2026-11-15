@@ -181,21 +181,19 @@ fn modified_paths(root: &Path) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
-/// Digest of what differs from the revision: one `<content>  <path>` line
-/// per path of [`modified_paths`]. The content is the SHA-256 of a regular
-/// file, `link:<target>` for a symbolic link, `deleted` for a missing path.
-fn modifications_digest(root: &Path) -> Result<String, String> {
+/// What a manifest says of a modified tree: the paths of
+/// [`modified_paths`] and the digest of what differs from the revision,
+/// computed on that same list, so the list, the digest and what a campaign
+/// keeps name the same paths. The digest covers one `<content>  <path>`
+/// line per path. The content is the SHA-256 of a regular file,
+/// `link:<target>` for a symbolic link, `deleted` for a missing path.
+fn modifications(root: &Path) -> Result<(Vec<String>, String), String> {
+    let paths = modified_paths(root)?;
     let mut content = String::new();
-    for path in modified_paths(root)? {
-        content.push_str(&format!("{}  {path}\n", describe(root, &path)?));
+    for path in &paths {
+        content.push_str(&format!("{}  {path}\n", describe(root, path)?));
     }
-    Ok(sha256_hex(content.as_bytes()))
-}
-
-/// The paths a manifest lists as modified.
-fn listed_modifications(root: &Path) -> Result<Vec<String>, String> {
-    let status = run("git", &["status", "--porcelain", "--", "."], root)?;
-    Ok(status.lines().map(str::to_owned).collect())
+    Ok((paths, sha256_hex(content.as_bytes())))
 }
 
 /// Collects the content sections of a manifest for the workspace at `root`
@@ -208,7 +206,7 @@ pub fn collect(root: &Path, contracts: &Path) -> Result<Value, String> {
             .and_then(files::hash_stream)
             .map_err(|error| format!("{}: {error}", executable.display()))?;
     let revision = run("git", &["rev-parse", "HEAD"], root)?;
-    let modified = listed_modifications(root)?;
+    let (modified, modifications_sha256) = modifications(root)?;
     let files = contract_files(root, contracts)?;
     let digest = contracts_digest(
         files
@@ -243,7 +241,7 @@ pub fn collect(root: &Path, contracts: &Path) -> Result<Value, String> {
             "revision": revision,
             "tree_state": if modified.is_empty() { "clean" } else { "modified" },
             "modified_paths": modified,
-            "modifications_sha256": modifications_digest(root)?,
+            "modifications_sha256": modifications_sha256,
             "lockfile_sha256": sha256_hex(&lockfile),
             "workspace_manifest_sha256": sha256_hex(&workspace),
         },
@@ -267,10 +265,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use super::{
-        contracts_digest, describe, listed_modifications, modifications_digest, modified_paths,
-        sha256_hex,
-    };
+    use super::{contracts_digest, describe, modifications, modified_paths, sha256_hex};
 
     fn git(root: &Path, arguments: &[&str]) {
         let status = Command::new("git")
@@ -282,6 +277,10 @@ mod tests {
     }
 
     /// A repository with one commit holding `old.rs`.
+    fn modifications_digest(root: &Path) -> Result<String, String> {
+        Ok(modifications(root)?.1)
+    }
+
     fn repository(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("mqttiumd-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -331,11 +330,13 @@ mod tests {
         git(&repository, &["commit", "-q", "-m", "a workspace"]);
         fs::write(root.join("tracked.rs"), "pub fn two() {}\n").expect("modified");
         fs::write(root.join("untracked.txt"), b"new").expect("untracked");
-        let listed = listed_modifications(&root).expect("listed");
+        let (listed, digest) = modifications(&root).expect("listed");
         let hashed = modified_paths(&root).expect("paths");
+        let alone = modifications_digest(&root).expect("digest");
         fs::remove_dir_all(&repository).expect("cleanup");
         assert_eq!(hashed, vec!["tracked.rs", "untracked.txt"]);
         assert_eq!(listed, hashed, "the list and the digest name other paths");
+        assert_eq!(digest, alone);
     }
 
     #[test]
