@@ -41,14 +41,14 @@ a manifest: the claim has to be in the trace.
     evidence: INCONCLUSIVE, never PASS;
   - a `wait_status.signal` other than 9 is FAIL;
   - no record of an origin of the child (`broker-core`, `transport`,
-    `timer`, `store-adapter`, `dispatcher`, `fault-injector`) of the
-    killed incarnation comes after the `BrokerKilled`: FAIL; the evidence
-    of the store (`store-evidence`) outlives the broker and is not
-    counted;
+    `timer`, `store-adapter`, `store-evidence`, `dispatcher`,
+    `fault-injector`: every origin but the bench's) of the killed
+    incarnation comes after the `BrokerKilled`: FAIL. The evidence of the
+    store is written by the child and changes incarnation with it, as a
+    trace of a real kill on SQLite shows;
   - the child's records after the kill belong to a later incarnation:
     FAIL otherwise.
 
 ## Not decided here
 
-- Which origins run in the child for the SQLite topology, if it differs:
-  the list above is lot L4's to confirm.
+- The exact list of the origins of the child is lot L4's to confirm.

@@ -12,9 +12,11 @@ not a dropped object or a clean stop:
 - `campaign.json` says the process under test ran in a child, and records
   one kill per crash of the scenario: the signal sent is SIGKILL, the wait
   status is signal 9 with no exit code;
-- in the trace, each BrokerCrashed is followed by a BrokerRecovered of a
-  later incarnation of the broker, and no record of the killed incarnation
-  follows its crash;
+- the header of the trace says the broker ran in a child process, and
+  each BrokerCrashed comes right after a BrokerKilled of the supervisor
+  whose wait status is signal 9 (record 0019); it is followed by a
+  BrokerRecovered, and no record of the killed incarnation of the child
+  follows it;
 - the store of the campaign is one SQLite file with its writer's lock
   file, the same before and after the kill.
 
@@ -76,12 +78,22 @@ def check_trace(campaign: pathlib.Path, kills: list[dict]) -> None:
     """Each crash ends an incarnation of the child for good, and is recovered."""
     lines = (campaign / "trace.jsonl").read_text().splitlines()
     records = [json.loads(line) for line in lines]
+    if records[0]["payload"].get("broker") != "child-process":
+        fail("the header of the trace does not say the broker ran in a child process")
     crashes = [index for index, record in enumerate(records) if record["kind"] == "BrokerCrashed"]
     if not crashes:
         fail("the trace holds no crash of the broker")
     if len(kills) != len(crashes):
         fail(f"{len(crashes)} crashes in the trace, {len(kills)} kills recorded")
     for crash in crashes:
+        killed_by = records[crash - 1]
+        expected = {"signal_sent": "SIGKILL", "wait_status": {"signal": 9}}
+        if (
+            killed_by["kind"] != "BrokerKilled"
+            or killed_by["origin_component"] != "bench-supervisor"
+            or killed_by["payload"] != expected
+        ):
+            fail("a crash of the trace does not follow a BrokerKilled of signal 9")
         killed = {
             (record["origin_component"], record["origin_incarnation"])
             for record in records[:crash]

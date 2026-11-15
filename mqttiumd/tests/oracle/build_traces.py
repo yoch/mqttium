@@ -2130,7 +2130,15 @@ case(
 
 # ------------------------------------------------- a real kill (record 0019)
 KILL = "broker_killed_for_real"
-CHILD = ("broker-core", "transport", "timer", "store-adapter", "dispatcher", "fault-injector")
+CHILD = (
+    "broker-core",
+    "transport",
+    "timer",
+    "store-adapter",
+    "store-evidence",
+    "dispatcher",
+    "fault-injector",
+)
 
 
 def killed(signal=9, claim=True, record=True):
@@ -2140,6 +2148,12 @@ def killed(signal=9, claim=True, record=True):
         deepcopy_payloads(events)
         if claim:
             events[at(events, "header")]["payload"]["broker"] = "child-process"
+        if claim:
+            # The evidence of the store runs in the child: after the crash
+            # it is the restarted child's, of the next incarnation.
+            for event in events[at(events, "crash") :]:
+                if event["origin"] == "store-evidence":
+                    event["inc"] = 2
         if record:
             crash = at(events, "crash")
             frontier = [e["label"] for e in events[:crash] if e["origin"] in CHILD][-1]
@@ -2201,6 +2215,31 @@ def child_after_its_kill(events):
     )
 
 
+def store_after_its_kill(events):
+    # The evidence of the store runs in the child too (record 0019, as the
+    # integration read in a real run): it may not write after the kill.
+    killed()(events)
+    insert_after(
+        events,
+        "killed",
+        [
+            ev(
+                "zombie.store",
+                "store-evidence",
+                "StoreFenceRefused",
+                {"effect_id": effect(1, 9), "operation_id": OP_ADMIT},
+                ["killed"],
+            )
+        ],
+    )
+
+
+case(
+    "store-evidence-writes-after-its-kill",
+    "The evidence of the store, which runs in the child, writes for the killed incarnation after the kill.",
+    {KILL: "FAIL"},
+    events=store_after_its_kill,
+)
 case(
     "child-writes-after-its-kill",
     "A record of the killed incarnation of the child comes after the kill.",

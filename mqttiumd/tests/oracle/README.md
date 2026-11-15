@@ -84,8 +84,8 @@ kill it records fails. A run whose broker is a child process shows, for
 each crash, a `BrokerKilled` before it and after the previous crash
 (missing: inconclusive), with the status of signal 9 (another: FAIL), and
 no record of an origin of the child (the core, the transport, the timer,
-the store adapter, the dispatcher, the fault injector; not the evidence
-of the store, which outlives the broker) of the killed incarnation after
+the store adapter, the evidence of the store, the dispatcher, the fault
+injector: every origin but the bench's) of the killed incarnation after
 the kill (FAIL; unordered with it: inconclusive).
 `terminal_knowledge_never_regresses` counts as a reaction to a late
 unknown answer only a record of the product that names it among its
