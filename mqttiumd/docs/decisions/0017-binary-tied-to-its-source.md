@@ -91,3 +91,20 @@ longer holds (`result-not-qualifying`, naming the condition). Until then
 a result whose source was removed or changed after it was produced still
 stood. `mqttiumd-lab validate` checks the result as a document and does
 not check these conditions: it does not say that a result is evidence.
+
+## What the recorded flags leave out (amendment, 15 November 2026)
+
+`artifact.built_with.rustflags` records the flags the binary was built
+with, except one thing: the directory a `--remap-path-prefix` maps from is
+recorded as `<source>`, so the member reads
+`--remap-path-prefix=<source>=/mqttiumd-source`. The build script of the
+lab copies the flags into the binary; with the real directory in them, the
+path of the unpacked source entered the binary in spite of the remapping,
+and two builds of one archive in two directories were two binaries (found
+by lot L4, shown by a failing check). What the prefix is mapped to is
+recorded as it stands, and it is what the condition above reads.
+
+`tools/check_campaign_binary.sh` therefore builds in a directory of its
+own, whose name the run never saw: a check that passes also shows that the
+binary does not depend on where its source was unpacked on that machine.
+It still shows nothing about another machine or another toolchain.

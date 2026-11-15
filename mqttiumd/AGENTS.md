@@ -96,10 +96,10 @@ provisional result; only a rebuilt run can qualify.
 
 Build directories are per agent: run the suites with `env -u
 CARGO_TARGET_DIR -u CARGO_ENCODED_RUSTFLAGS` or an explicit
-`--target-dir`, and campaigns in directories of their own. A rebuild of
-one source archive uses the directory that archive names under `TMPDIR`,
-so two rebuilds of the same archive must not run together (the binary
-check takes a lock; `run --rebuild` does not yet).
+`--target-dir`, and campaigns in directories of their own. The binary
+check unpacks and builds in a directory of its own; `run --rebuild` uses
+the directory its archive names under `TMPDIR` and takes its turn on a
+lock, so two rebuilds of the same source wait for each other.
 
 The loop is shown to reject a defect by mutations kept as diffs under
 `tests/mutants/loop/` (`*.mutant`: the root `.gitignore` ignores `*.patch`
