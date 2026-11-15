@@ -55,6 +55,7 @@ another lot's part.
 | - | - | - |
 | **Creation authority, the type** (ADR 0009). `Outbox` is a primitive with a precondition: one box per owner and run epoch. Two boxes with one identity accept each other's reservation keys. L1 delivers the bounded `OwnerAuthority`, the serial, uniqueness, atomic creation with its four refusals, and retirement with its conditions; the constructor of `Outbox` becomes private. Tests: those named in the record | L1 | Reception of L1 |
 | **Creation authority, its issuance** (ADR 0009). A durable fact is not an authorisation to construct. The contract of opening an epoch and the hand-over give at most one authority per live opening: none for a duplicated reply, a replayed fact or a further recovery page, none usable for an unknown outcome | L2, with L1 | Reception of L2 |
+| **Epoch opening, replies that disagree** (record 0011, proposed; fourth review of the contract of L2 at `251026a1`). (1) A fault after a grant whose epoch was reported closed must not make `check_recovered` confirm that epoch again. (2) A definitive rejection must not be masked by an earlier non-definitive one of the same command, whatever the order of delivery. (3) A reuse of an attempt identity is refused whenever the ledger can see it, not only when the condition equals the last opened epoch. (4) and (5) The contract states what an opening does with a reply that no ledger can produce (a floor beyond the last epoch; `Superseded` against an established result), and the exhaustive test says which replies it generates from a real ledger and which it invents | L2 | Reception of L2 |
 | **Creation authority, the real path** (ADR 0009). The trusted entry point that constructs an authority is stated; start-up is wired through it, and composition tests go through that path, not through a helper that builds an authority directly | L4 | S0 |
 | **Creation authority on SQLite** (ADR 0009). The opening of an epoch and its results realised on the SQLite store, with the same contract tests | L7 | S0 on SQLite |
 | **Exhausted reservation table.** When every entry of the table is spent, `reserve` still answers `CapacityNeed` with `ResourceReleased`, a wake-up that nothing can produce. L1 distinguishes a definitive exhaustion from a temporary lack and chooses explicitly between stopping and renewing; a test covers a table whose entries are all spent | L1 | Reception of L1 |
@@ -66,7 +67,14 @@ another lot's part.
 | - | - | - |
 | The proof that is received is on `release_if_current` as the product really executes it. Tooling may be prepared in parallel; a proof of a separate demonstration function does not receive the lot | L6, with L1 | Reception of L6 |
 | The proof runs in CI, reproducibly, on the production function, after a versioned preflight in which a true property passes and a false one fails on the real production dependency | L6 | Reception of L6 |
-| `tools/install-tools.sh`: `present()` ignores the exit code of the command it runs and accepts the pinned version as a substring of any output; nothing checks that the tool found is the one `PATH` selects | L6, through the integration owner | Start of L6 |
+| The lease table holds each `LeaseRecord` exactly once: one record per held lease. Recovery calls `LeaseRecord::from_parts` once per durable row and nothing else calls it outside the proof crate. A test of the table shows that no path builds a second record of a held lease (record 0010, proposed) | L1 | Reception of L6 |
+
+## Model M1: reception of L5, then L4
+
+| Condition | Closed by | Blocks |
+| - | - | - |
+| The sidecar of a model lists as `tests` only files that exist and replay one of its counterexamples. Until a deterministic test replays a counterexample of M1, the list stays empty and the correspondence table names, row by row, the lot that owes the replay | L5 for the table, L4 for the replays | G1 |
+| The `mqttiumd` workflow runs the models of `mqttiumd/models/` with the client's TLC runner and its `--models-dir` option; a runner change runs them again | L5, through the integration owner | Reception of L5 |
 
 ## Process topology (ADR 0002)
 
