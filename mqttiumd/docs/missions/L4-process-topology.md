@@ -27,8 +27,10 @@ big-endian `u32` length, one action outstanding at a time.
 | - | - |
 | `Start` | The rank of the start-up |
 | `Choose` | An index in the list of eligible choices the child published last, and the digest of that list. No identity goes down |
-| `Connect` | A connection generation, assigned by the supervisor |
-| `Bytes` | A connection generation and the bytes a peer sent |
+| `Connect` | A connection generation, assigned by the supervisor, and the client |
+| `Bytes` | A connection generation, the bytes a peer sent, and the incarnation and sequence of the `PeerPacketSent` record that states them |
+| `Recover` | Nothing: the recovery of the process just started |
+| `Settle` | Nothing: the adapters move what waits in the box |
 | `FireDeadline` | Nothing: the armed deadline due first |
 | `ReleaseHeld`, `DeliverHeld`, `LeaveBarrier` | The index of a fault in the list the child was started with |
 | `Crash` | Nothing: the simulated crash of the store adapter (sim-store only) |
@@ -84,7 +86,13 @@ any child exists; nothing there starts or stops a process.
 - Reports on the control descriptor: `Eligible` (the descriptions of the
   choices and their digest), `EndOfAction` (the last emission number of
   the action, or none), `Refused` (the action did nothing), `Stopped`
-  (the run cannot go on in the child).
+  (the run cannot go on in the child), `Started` (the epoch, the
+  elementary choices of the start-up, the settings the engine read
+  back), `State` (whether an effect waits, whether the adapter stands at
+  a barrier, the deadlines armed, the hits and the items each scenario
+  fault holds), `Written` (the bytes the transport wrote to a client and
+  the record that states it), `Crashed` (the clients whose connection was
+  open) and `Finished` (the events no record carries).
 - The choice digest is the SHA-256 of the number of choices, then of
   each description with its length first, in list order. The child
   refuses a `Choose` whose digest is not that of the list it published
@@ -100,14 +108,48 @@ any child exists; nothing there starts or stops a process.
   emitted, or older than one already received, is refused.
 
 The descriptors of the child: actions on its standard input, reports on
-its standard output, one inherited descriptor per origin of the child
-from descriptor 3 in the order `broker-core`, `dispatcher`,
-`fault-injector`, `store-adapter`, `store-evidence`, `timer`,
-`transport`; standard error is diagnostics, never evidence. The
-supervisor reads each descriptor on its own reader, so that a full
-descriptor never waits for another to be read
-(`tests/bench_protocol.rs` plays 200 records through a window of 64 on
-socket pairs, with no process).
+its standard output, and one Unix socket per origin of the child
+(`broker-core`, `dispatcher`, `fault-injector`, `store-adapter`,
+`store-evidence`, `timer`, `transport`), which the supervisor binds in a
+directory it creates with mode 0700 and accepts one connection on each;
+standard error is diagnostics, never evidence. The lab forbids unsafe
+code, so a descriptor cannot be placed at a number in the child: the
+socket the supervisor accepted is the channel, and the origin of a
+record is the socket it arrived on. The supervisor reads each descriptor
+on its own reader, so that a full descriptor never waits for another to
+be read (`tests/bench_protocol.rs` plays 200 records through a window of
+64 on socket pairs, with no process).
+
+Implemented in `crates/mqttiumd-lab/src/bench/child.rs`
+(`run --backend sqlite --process child`; the default stays in-process).
+The child relays each record its own collector wrote; the collector of
+the supervisor takes it with `accept`, checks the origin against the
+socket and the sequence against the origin, and numbers it in the
+trace. At the end of each action the child waits until every frame is
+acknowledged before it reads the next action, so that between two
+actions it is drained. Every read of the supervisor has a deadline (30
+seconds): a child that writes nothing stops the run. The settings the
+child's engine read back are compared by the supervisor to those the
+manifest records. The child computes its settings and its faults from
+the campaign directory, the sessions and the faults still armed that the
+supervisor passes on its command line.
+
+`CrashBroker` in a child is a real kill. The child is drained between two
+actions, so the kill happens at the point its last decisive record
+describes, after that record is acknowledged. The supervisor sends
+`SIGKILL` to the process identifier `spawn` gave
+(`std::process::Child::kill`), waits for the wait status and accepts only
+the end by signal 9 with no exit code, reads the descriptors of the child
+to their end and stops the run if a record arrives after the kill; it
+then writes `BrokerCrashed` and the closed connections, and starts the
+next child on the same file only once the end of the killed one is
+confirmed. `campaign.json` states it: `covers.crash` ("process killed:
+SIGKILL to pid …, wait status signal 9"), `kills` (process identifier,
+start-up, signal sent, wait status) and `failure_model` with the
+statement above. The process identifier never enters the trace. A
+contract record of the kill (`BrokerKilled`) is asked of lot L3; until it
+exists, the trace carries none. A child that stops without a crash exits
+on its own with a status of success.
 
 ## Causal parents of the supervisor and the peers
 

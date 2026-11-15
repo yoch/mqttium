@@ -18,7 +18,7 @@ const USAGE: &str = "\
 usage:
   mqttiumd-lab validate --contracts <dir> [--scenario <file>]... [--file <file>]... [--root <dir>]
   mqttiumd-lab manifest [--contracts <dir>] [--root <dir>]
-  mqttiumd-lab run --contracts <dir> --scenario <file> --out <dir> [--seed <n>] [--run-id <slug>] [--backend sim-store|sqlite] [--rebuild] [--root <dir>]
+  mqttiumd-lab run --contracts <dir> --scenario <file> --out <dir> [--seed <n>] [--run-id <slug>] [--backend sim-store|sqlite] [--process in-process|child] [--rebuild] [--root <dir>]
 
 Paths are relative to --root, which defaults to the current directory.
 Exit codes: 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 3 OUT_OF_SCOPE (DEM-023).
@@ -26,7 +26,8 @@ validate exits 0 when every document is accepted and 2 otherwise.
 run computes no verdict: it exits 0 when the campaign directory was
 written, whatever the oracle will find in it, and 2 when no campaign
 could be written; it refuses an --out inside the work tree of the
-repository, where a campaign never goes. The oracle judges the directory (--root <out>).";
+repository, where a campaign never goes. --process child runs the
+process under test in a child process of this binary (sqlite only). The oracle judges the directory (--root <out>).";
 
 /// Invalid configuration prevents a conclusion (DEM-023).
 const INCONCLUSIVE: u8 = 2;
@@ -41,6 +42,7 @@ struct Arguments {
     backend: Option<String>,
     rebuild: bool,
     built_from: Option<PathBuf>,
+    process: Option<String>,
 }
 
 fn parse(arguments: &[String]) -> Result<Arguments, String> {
@@ -54,6 +56,7 @@ fn parse(arguments: &[String]) -> Result<Arguments, String> {
         backend: None,
         rebuild: false,
         built_from: None,
+        process: None,
     };
     let mut rest = arguments.iter();
     while let Some(flag) = rest.next() {
@@ -76,6 +79,7 @@ fn parse(arguments: &[String]) -> Result<Arguments, String> {
             "--run-id" => parsed.run_id = Some(value.clone()),
             "--backend" => parsed.backend = Some(value.clone()),
             "--built-from" => parsed.built_from = Some(PathBuf::from(value)),
+            "--process" => parsed.process = Some(value.clone()),
             _ => return Err(format!("unknown option {flag}")),
         }
     }
@@ -147,6 +151,10 @@ fn run(arguments: &Arguments) -> Result<bool, String> {
             .clone()
             .unwrap_or_else(|| "sim-store".to_owned()),
         built_from: arguments.built_from.clone(),
+        process: arguments
+            .process
+            .clone()
+            .unwrap_or_else(|| "in-process".to_owned()),
     };
     if arguments.rebuild {
         // Refused before anything is built.
@@ -201,7 +209,8 @@ fn rebuilt(arguments: &Arguments, request: &campaign::Request) -> Result<bool, S
         pass("--built-from", &built.tar);
         command
             .args(["--seed", &request.seed.to_string()])
-            .args(["--backend", &request.backend]);
+            .args(["--backend", &request.backend])
+            .args(["--process", &request.process]);
         if let Some(run_id) = &request.run_id {
             command.args(["--run-id", run_id]);
         }
@@ -241,6 +250,11 @@ fn main() -> ExitCode {
                 true
             }),
         "run" => parse(rest).and_then(|arguments| run(&arguments)),
+        // The process under test, started by `run --process child`; never
+        // started by hand.
+        "child" => mqttiumd_lab::bench::child::Arguments::parse(rest)
+            .and_then(|arguments| mqttiumd_lab::bench::child::serve(&arguments))
+            .map(|()| true),
         "replay" | "minimize" => Err(format!(
             "{command} is not implemented yet; it reports no verdict"
         )),

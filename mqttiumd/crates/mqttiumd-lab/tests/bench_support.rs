@@ -79,6 +79,7 @@ pub fn run_scenario_on(scenario: &str, seed: u64, name: &str, backend: &str) -> 
         run_id: Some("bench-test".to_owned()),
         backend: backend.to_owned(),
         built_from: None,
+        process: "in-process".to_owned(),
     };
     let report = execute(&request).unwrap_or_else(|error| panic!("{scenario}: {error}"));
     Campaign { out, report }
