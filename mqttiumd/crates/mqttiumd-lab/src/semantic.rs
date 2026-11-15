@@ -2065,16 +2065,41 @@ mod tests {
                 required: &["CloseConnection"],
                 forbidden: &["Persist", "EmitPubrec"],
             },
-            // A refused release is prepared again under a new identity
+            // A fenced release is prepared again under a new identity
             // (DEM-009); PUBCOMP still waits for a commit (ACK-001).
             Expected {
                 state: "ReleasePending",
                 event: "ReleaseResult",
-                point: &[CURRENT, REJECTED, SUFFICIENT],
+                point: &[CURRENT, REJECTED, ("refusal", "fenced"), SUFFICIENT],
                 disposition: "TRANSITION",
                 next: "ReleasePending",
                 required: &["Persist"],
                 forbidden: &["EmitPubcomp"],
+            },
+            // Any other refusal, or a fence at the bound, stops the owner
+            // (record 0013, line 4): preparing again could loop for ever.
+            Expected {
+                state: "ReleasePending",
+                event: "ReleaseResult",
+                point: &[
+                    CURRENT,
+                    REJECTED,
+                    ("refusal", "fenced_at_bound"),
+                    SUFFICIENT,
+                ],
+                disposition: "FAULT",
+                next: "ReleasePending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
+            },
+            Expected {
+                state: "ReleasePending",
+                event: "ReleaseResult",
+                point: &[CURRENT, REJECTED, ("refusal", "definitive"), INSUFFICIENT],
+                disposition: "FAULT",
+                next: "ReleasePending",
+                required: &[],
+                forbidden: &["Persist", "EmitPubcomp"],
             },
             Expected {
                 state: "ReleasePending",
