@@ -79,6 +79,10 @@ In `../reception/open-conditions.md`.
 Alone: in "Before a result may be used as evidence", the conditions whose
 only closer is L3, and the first two of "Scenario P1-02b".
 
+The oracle and its hand-written traces can be received before the
+provenance of the real collector and the wiring of the bench exist. Gate
+G0 is not passed by that reception alone.
+
 Its part only, of conditions shared with L4: the origin of a trace record
 (L3 defines the rule and refuses a record that breaks it in a trace; L4
 makes the collector assign the origin from the channel), and the single

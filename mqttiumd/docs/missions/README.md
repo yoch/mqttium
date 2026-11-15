@@ -13,9 +13,9 @@ close.
 
 | | |
 | - | - |
-| Base branch | `main`, after PR yoch/mqttium#647 (lot L0) is merged |
+| Base branch | `main`, after PR yoch/mqttium#647 (lot L0, with the amended record 0009) is merged |
 | Integrated revision | Not fixed yet. A commit cannot hold its own identifier: once L0 is merged, a change to this table alone records the revision of `main` that holds it |
-| Contract digest | `sha256:eed8c20e1587c2efc13465efc272b80b740a7634255a056ce938f7279046b93e`. It depends on the content of the contract files only, so it is exact before the merge; the record of the revision repeats what `validate` prints on it |
+| Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb`. It depends on the content of the contract files only, so it is exact before the merge; the record of the revision repeats what `validate` prints on it |
 
 The wave starts from the commit of `main` that records the integrated
 revision. It differs from that revision by this table only. Every lot
@@ -35,15 +35,21 @@ One session and one branch per lot, and an integrator. The integrator
 writes no lot: it merges contract changes one at a time, keeps the shared
 files, and receives each lot on the revision actually proposed.
 
-Each session starts with the interface the others wait for:
+Each session starts with the interface the others wait for, then the
+implementations continue in parallel:
 
-| Lot | First deliverable |
-| - | - |
-| L1 | The interface of `OwnerAuthority`, then creation, retirement and their tests |
-| L2 | The contract of opening an epoch: durable states and results |
-| L3 | The store snapshot and trace formats, the steps of P1-02b, the first registry rules L1 needs |
-| L5 | The extension of the TLC runner, then M1a |
-| L6 | The preflight, the credits types and the real `release_if_current` with its tests |
+| Lot | First deliverable | Coordination |
+| - | - | - |
+| L1 | The interface of `OwnerAuthority`, then creation, retirement and their tests | With L2 on the opening and the hand-over; with L6 on credits |
+| L2 | The contract of opening an epoch: durable states and results | With L1 for the authority; with L3 before the snapshots are fixed |
+| L3 | The store snapshot and trace formats, the steps of P1-02b, the first registry rules L1 needs | Gives the formats to L2 and the rules to L1; the oracle stays independent |
+| L5 | The extension of the TLC runner, then M1a and its configurations | Needs no Rust implementation to advance |
+| L6 | The preflight, the credits types and the real `release_if_current` with its tests | Gives the interface to L1 early, then continues the proof |
+
+Small contract changes are merged one at a time. The lots they affect
+then take the new base and run again the checks it touches. The core and
+the store do not wait for the proofs to end; their interfaces must not
+drift apart meanwhile.
 
 ## Tools
 

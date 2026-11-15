@@ -45,8 +45,12 @@ its tests, delivered early to L1, then the proof.
 2. **A Kani harness** that calls the production body with symbolic values,
    integer limits included. Assumptions must not exclude the error paths;
    separate harnesses cover incoherent accounts and check that their branch
-   mutates nothing. Witnesses of non-vacuity show that each branch of the
-   table is reached under the assumptions.
+   mutates nothing. Witnesses of non-vacuity, with the coverage checks of
+   the tool, show that each branch of the table is reached under the
+   assumptions: an assumption that makes an error path unreachable does
+   not verify it. If the encapsulation of the types prevents the harness
+   from building a state the proof needs, the lot says so and treats it
+   explicitly.
 3. **Where the harness lives.** Prefer a separate crate under `proofs/`
    that depends on the core and calls the public function: the pure crates
    then need no proof attribute. If a proof tool needs an attribute, a
@@ -57,7 +61,9 @@ its tests, delivered early to L1, then the proof.
    requirement. The reception of the lot rests on the Kani proof.
 5. **Mutants** of the function, each caught by the proof or by a test for
    its own reason: a guard dropped, one dimension subtracted before the
-   other is checked, the generation ignored, a release repeated.
+   other is checked, the generation ignored, a release repeated. The
+   result shows the violation of the property aimed at; a compilation
+   failure or a timeout is not a detection.
 6. **A maintenance trial**: an ordinary change of cost or of structure,
    with the human time, the tool time and the adaptations it took.
 7. **The file of the proof**, under `proofs/credits/`: properties, the
@@ -76,10 +82,14 @@ one, and a Kani harness in a separate crate verified functions of
 
 Each tool brings its own compiler: Kani a pinned nightly, Verus the
 toolchain 1.99.1. Neither builds the product, which stays on the toolchain
-of `rust-toolchain.toml`. The file of the proof records, for each run, the
-tool and its version, the compiler the tool brings, the target, the
-options and the bounds. A proof that was not run is not reported as run.
-A compilation failure or a timeout is not a detection.
+of `rust-toolchain.toml`: the ordinary build and the analysis under the
+tool's compiler are two checks that complete each other. The file of the
+proof records, for each run, the revision of the code, the tool and its
+version, the compiler the tool brings, the target, the options and the
+bounds covered. A proof that was not run is not reported as run.
+
+The proof may be developed locally. It is received on a reproducible run
+in CI.
 
 Two defects of `tools/install-tools.sh` are corrected when this lot
 starts, through the integration owner: `present()` ignores the exit code

@@ -50,8 +50,9 @@ ACK-001; ID-001 to ID-004; IO-001 to IO-004. Decision records 0001, 0006,
   reservation table, work limit): the same input comes back; state,
   identity counters, accounts, held reservations and the effect box are
   unchanged (P1-19, MU-25). An explanation in a report does not relax
-  this: a transition that cannot meet it needs an explicit amendment of
-  the contract, by a decision record, before it is written.
+  this: if a piece of metadata may change despite the refusal, that needs
+  an explicit amendment of the contract, by a decision record that gives
+  the equivalence relation it retains and its consequences.
 - The tests of the creation authority named in record 0009: the five of
   its context, the refusals of creation at the last serial and after it,
   no change after a refused creation, no serial used again after
@@ -64,9 +65,9 @@ ACK-001; ID-001 to ID-004; IO-001 to IO-004. Decision records 0001, 0006,
   moved.
 - One named test per registry rule of the two machines, by rule identifier.
 - The credit reservations that `release_if_current` of L6 covers are
-  released by that function and by no second variant (DEM-024). Other
-  releases, such as an effect reservation of a box, keep their own
-  primitive.
+  released by that function and by no second variant (DEM-024). The
+  reservation entries of a box and the operations of the store have their
+  own mechanisms.
 - Control mutations seen to fail: acknowledgement before commit (MU-01),
   recipe changed under an operation (MU-03), mutation despite insufficient
   capacity (MU-25), second admission behind a new exchange (DEM-MU-04),
@@ -82,4 +83,6 @@ expiry, Will, retained messages, wildcards, shared subscriptions.
 
 In `../reception/open-conditions.md`: its part of "Creation authority",
 and the two other conditions of "Effect boxes and transitions". The parts
-of the authority that belong to L2, L4 and L7 stay open.
+of the authority that belong to L2, L4 and L7 stay open: this lot is
+received on its invariant, shown under a start-up precondition that it
+states exactly, without waiting for SQLite.

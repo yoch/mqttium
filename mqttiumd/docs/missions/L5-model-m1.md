@@ -35,8 +35,8 @@ DEM-020; V3-018; ARC-027. Decision records 0001, 0005.
    - After a crash and a recovery: no more crashes, the store available,
      a fair scheduler. This one may assume that the client usefully sends
      its PUBLISH again.
-   - On the live path of P1-02b (record 0001): the unknown outcome is
-     resolved and the exchange progresses with no new packet from the
+   - On the live path of P1-02b (record 0001): from the unknown outcome
+     to its resolution, then to PUBREC, with no new packet from the
      client. A client retransmission is not among its assumptions.
 4. **Non-vacuity**: configurations that are expected to reach a commit, a
    lost result, an unknown outcome, a rejection, a crash after commit and a
@@ -59,7 +59,8 @@ DEM-020; V3-018; ARC-027. Decision records 0001, 0005.
 required. The repository already pins and hash-checks TLC in
 `tools/formal/run_tlc.py`, with sidecar files that declare the outcome each
 configuration must give (`pass` or `violation`). Use that runner and that
-sidecar format.
+sidecar format. `tools/install-tools.sh tlc` already calls the runner's
+own download and digest check: that stays the only source of the jar.
 
 The runner reads `formal/models/` only. The first deliverable of this lot
 is an option `--models-dir` that selects another directory and keeps

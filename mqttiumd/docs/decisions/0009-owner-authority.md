@@ -40,7 +40,17 @@ creates owners.
 
 That a run epoch was opened is a durable fact. A fact can be read any
 number of times: in a recovery page, in a reply that is replayed, in a
-reply that is delivered twice. Reading it authorises nothing.
+reply that is delivered twice. Reading it authorises nothing. In the
+contracts of lot L0, `RecoveredFact` is `Clone` and its variant `Epoch`
+holds the incarnation and the epoch: a function that builds an authority
+from those values can be called twice, whatever the authority it returns
+can or cannot do afterwards.
+
+The rule is:
+
+> Start-up hands over at most one authority for one live opening of an
+> epoch. Reading a durable fact again, a duplicated reply or a further
+> recovery page does not allow a second one.
 
 - There is at most one authority per live opening of an epoch. It is
   issued once, to the component that submitted the opening and received
@@ -54,28 +64,37 @@ reply that is delivered twice. Reading it authorises nothing.
   holds the authority is an explicit procedure, with a state that controls
   it: the authority is moved, never lent to two creators.
 - When the volatile start-up state is lost, the authority is lost with it.
-  Recovery opens a new epoch (DEM-012); the older epoch is never entered
-  again, so nothing can ask for its authority a second time.
+  Recovery opens the new epoch that DEM-012 requires before any new
+  admission. It does not build, in the older epoch, an authority whose
+  counter starts again at zero.
 
 A type that is neither `Clone` nor `Copy` cannot be duplicated once it
 exists. That says nothing about how many times it is constructed. An
-affine permit is therefore accepted only where its issuance is controlled:
-the record of a lot states the trusted entry point, the one function that
-may construct an authority, and a test exercises the real path that
-reaches it, not a helper that builds an authority directly.
+affine permit is therefore accepted only where its issuance is itself
+controlled; otherwise the precondition has only moved from one type to
+another.
+
+The entry point between the store adapter and the contract crate may be
+trusted code. It is then named as such: the lot that writes it states the
+one function that may construct an authority, and a test exercises the
+path the product really takes to reach it, not a helper that builds an
+authority directly. The type system is not credited with a guarantee it
+does not give.
 
 ### Creation
 
 `create_outbox(owner, capacity, max_reservations)` is atomic: it returns a
-box and records it, or it changes nothing. Its refusals are explicit and
-distinct:
+box and records it, or it changes nothing. A refused creation leaves
+unchanged the table of active owners, the boxes that exist and the next
+serial. Every check and every allocation comes before the new entry is
+published. Its refusals are explicit and distinct:
 
 | Refusal | Meaning |
 | - | - |
 | Owner already active | The owner holds a live box |
 | Table full | The bounded table of the authority has no free entry |
 | Allocation failed | Memory could not be obtained; recoverable, the caller may try again |
-| Serials exhausted | The serial counter reached its end; definitive, nothing wraps |
+| Serials exhausted | The serial counter reached its end; definitive, nothing wraps, and it is never reported as a wait that something could end |
 
 Tests: the last usable serial creates a box; the next creation is refused
 as exhausted; a refused creation leaves the table, the counter and the
@@ -99,16 +118,31 @@ is retired only when all of these hold:
 On a refusal the same box comes back and the authority is unchanged.
 
 Dropping a box without retiring it does not free the entry of its owner:
-the owner stays active and a later creation for it is refused. An empty
-box does not mean that its owner is at rest; retirement states it.
+the owner stays active and a later creation for it is refused.
+
+An empty box does not mean that its owner is at rest. Adapters may have
+accepted effects whose replies arrive later; correlating those replies
+still belongs to the life cycle of the owner, and retiring the box does
+not end it.
 
 A box created afterwards for the same owner has a new serial, so every key
 of the retired box is foreign to it.
 
 ### What replacing a box does not reset
 
-Replacing the `Outbox` of an owner resets no counter of that owner. The
-sequences behind `OperationId` and `EffectId` continue where they were.
+The triple (incarnation, epoch, serial) protects the reservation keys of a
+box. It renews no other identity of the owner: `OperationId` and
+`EffectId` have their own sequences, which do not contain the serial. A
+box replaced with those sequences started again could collide with an
+older operation or an older reply.
+
+> Replacing an `Outbox` resets no counter of an owner that stays in the
+> same identity space. Recreating a whole owner keeps its counters or
+> establishes a new identity space explicitly.
+
+For S0 it is enough to keep the counters of the owner when its box is
+replaced, and to open a new epoch after a restart. No identifier changes
+its layout for this.
 
 ## Obligations by lot
 
@@ -121,13 +155,18 @@ sequences behind `OperationId` and `EffectId` continue where they were.
 
 Lots L3, L5 and L6 create no owner. No lot constructs a box another way.
 
+Receiving L1 does not wait for SQLite. It requires L1 to show its
+invariant under a start-up precondition that is stated exactly, and the
+condition of composition stays open until L4 verifies it.
+
 ## Alternatives
 
-- **An owner factory in `mqttiumd-core`.** It would give the same
-  guarantee with the constructor and its guard in one crate. It is set
-  aside as a choice of placement: `Outbox` and its keys are contract
-  types, and the authority is kept beside the type whose precondition it
-  establishes.
+- **An owner factory in `mqttiumd-core`.** Possible in principle, and not
+  different in kind: `OwnerAuthority` is itself an owned factory, with a
+  bounded state and an authorisation to create. It is set aside as a
+  choice of placement in this architecture: `Outbox` and its keys are
+  contract types, and the authority is kept beside the type whose
+  precondition it establishes.
 - **An arena.** Owners live in the arena and keys are arena handles. It
   gives the same guarantee and changes how every owner is addressed; it is
   a larger redesign than S0 needs.
