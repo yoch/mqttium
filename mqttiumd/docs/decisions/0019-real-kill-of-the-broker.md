@@ -30,7 +30,8 @@ a manifest: the claim has to be in the trace.
   `in-process` or `child-process`; absent means `in-process`, so every
   existing trace and manifest keeps its meaning and its bytes. The header
   is what the judge reads; the manifest states the same, and `produce`
-  requires the two to agree for a qualifying result.
+  and `recompute` require the two to agree for a qualifying result (the
+  header is read from the first line of the trace, with a bound).
 - **The assertion** `broker_killed_for_real`, owed by every run. On a
   trace whose header does not claim a child process it has nothing to
   check and passes, unless the trace holds a `BrokerKilled`, which a run
