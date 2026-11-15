@@ -577,16 +577,24 @@ impl OpeningAttempt {
     /// opened the last epoch.
     #[must_use]
     pub fn to_be_bytes(self) -> [u8; 24] {
-        // Skeleton: the encoding is not written yet.
-        [0; 24]
+        let mut bytes = [0u8; 24];
+        bytes[..16].copy_from_slice(&self.startup.to_bytes());
+        bytes[16..].copy_from_slice(&self.ticket.get().to_be_bytes());
+        bytes
     }
 
     /// Decodes the durable encoding, checking its exact length.
     pub fn from_be_slice(bytes: &[u8]) -> Result<Self, IdDecodeError> {
-        // Skeleton: the encoding is not written yet.
-        Err(IdDecodeError::WrongLength {
+        let wrong_length = IdDecodeError::WrongLength {
             expected: Self::ENCODED_LEN,
             actual: bytes.len(),
+        };
+        let (nonce, ticket) = bytes.split_at_checked(16).ok_or(wrong_length)?;
+        let nonce: [u8; 16] = nonce.try_into().map_err(|_| wrong_length)?;
+        let ticket: [u8; 8] = ticket.try_into().map_err(|_| wrong_length)?;
+        Ok(Self {
+            startup: StartupNonce::new(nonce),
+            ticket: OpeningTicket::new(u64::from_be_bytes(ticket)),
         })
     }
 }
