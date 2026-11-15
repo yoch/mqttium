@@ -1094,6 +1094,53 @@ ok(
     "trace-record-recovery-page-delivered.json",
     record(15, "broker-core", 3, "RecoveryPageDelivered", PAGE, [("store-adapter", 2)]),
 )
+
+
+# An inventory with the limits, the route table and its routes (record
+# 0014). Routes are in the order of their topic bytes: a prefix first, a
+# byte 0xff after every ASCII byte, and two targets of one topic together.
+def route(topic, target, qos=1):
+    return {
+        "kind": "Route",
+        "topic_hex": topic.hex(),
+        "target": str(target),
+        "target_revision": "1",
+        "max_qos": qos,
+    }
+
+
+PAGE_FULL = {
+    "run_epoch": "2",
+    "page": "0",
+    "last": True,
+    "facts": [
+        {"kind": "Epoch", "incarnation": "1", "epoch": "2"},
+        {
+            "kind": "Limits",
+            "max_targets_per_admission": 4,
+            "max_topic_bytes": 256,
+            "max_payload_bytes": "1024",
+        },
+        {"kind": "RouteTable", "revision": "1"},
+        route(b"p1", 2),
+        route(b"p1/example", 2),
+        route(b"p1/example", 3, qos=2),
+        route(b"\xff", 3, qos=0),
+        *PAGE["facts"][1:],
+    ],
+}
+FULL_READ = record(14, "store-adapter", 2, "RecoveryPageRead", PAGE_FULL)
+ok("trace-record-recovery-page-with-routes-and-limits.json", FULL_READ)
+ok(
+    "trace-record-recovery-page-of-routes-only.json",
+    record(
+        15,
+        "store-adapter",
+        3,
+        "RecoveryPageRead",
+        {"run_epoch": "2", "page": "1", "last": False, "facts": [route(b"p1/z", 2)]},
+    ),
+)
 REFUSED = record(
     16,
     "dispatcher",
@@ -1133,6 +1180,10 @@ ELIGIBLE = record(
     [("broker-core", 3)],
 )
 ok("trace-record-frame-eligible.json", ELIGIBLE)
+ok(
+    "trace-record-frame-eligible-refusal-without-quota.json",
+    {**ELIGIBLE, "payload": {**ELIGIBLE["payload"], "reason": "ImplementationSpecificError"}},
+)
 ok(
     "trace-record-frame-eligible-connack.json",
     record(
@@ -1241,6 +1292,60 @@ trace_case(
     "/payload/facts/1/revision",
     "Identity components inside a recovered fact are 64-bit as well.",
     setter(["payload", "facts", 1, "revision"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "recovered-facts-rank-decreases",
+    FULL_READ,
+    "/payload/facts/8/kind",
+    "The facts of a page are in the order of the inventory: a route never follows a session.",
+    setter(["payload", "facts", 8], route(b"p1/z", 2)),
+    code="rows-out-of-order",
+)
+trace_case(
+    "recovered-limits-twice",
+    FULL_READ,
+    "/payload/facts/2/kind",
+    "An inventory holds its limits once.",
+    setter(["payload", "facts", 2], PAGE_FULL["facts"][1]),
+    code="duplicate-name",
+)
+trace_case(
+    "recovered-routes-unsorted",
+    FULL_READ,
+    "/payload/facts/5/topic_hex",
+    "Routes are sorted by the bytes of their topic: a prefix comes before what it prefixes.",
+    setter(["payload", "facts", 5, "topic_hex"], b"p1".hex()),
+    code="rows-out-of-order",
+)
+trace_case(
+    "recovered-route-qos-3",
+    FULL_READ,
+    "/payload/facts/3/max_qos",
+    "The QoS of a route is 0, 1 or 2.",
+    setter(["payload", "facts", 3, "max_qos"], 3),
+)
+trace_case(
+    "recovered-limit-of-targets-as-text",
+    FULL_READ,
+    "/payload/facts/1/max_targets_per_admission",
+    "A 32-bit bound is a JSON integer; only 64-bit quantities are decimal strings.",
+    setter(["payload", "facts", 1, "max_targets_per_admission"], "4"),
+)
+trace_case(
+    "recovered-payload-limit-overflow",
+    FULL_READ,
+    "/payload/facts/1/max_payload_bytes",
+    "The bound on a payload is 64-bit.",
+    setter(["payload", "facts", 1, "max_payload_bytes"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "recovered-route-target-revision-overflow",
+    FULL_READ,
+    "/payload/facts/4/target_revision",
+    "The revision of a route target is 64-bit.",
+    setter(["payload", "facts", 4, "target_revision"], "18446744073709551616"),
     code="u64-out-of-range",
 )
 OVER = "18446744073709551616"

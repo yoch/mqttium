@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import itertools
 import json
 import pathlib
 import shutil
@@ -566,7 +567,30 @@ def recovery(inc, facts, tag="recovery"):
     ]
 
 
-BOOT_FACTS = [{"kind": "Epoch", "incarnation": "1", "epoch": "1"}, *SESSION_FACTS]
+def route_fact(topic, target, qos=1):
+    return {
+        "kind": "Route",
+        "topic_hex": topic.hex(),
+        "target": str(target),
+        "target_revision": "1",
+        "max_qos": qos,
+    }
+
+
+# What a core needs to prepare an admission (record 0014): the bounds, the
+# revision of the route table, and its routes in the order of their topic.
+ROUTE_FACTS = [
+    {
+        "kind": "Limits",
+        "max_targets_per_admission": 4,
+        "max_topic_bytes": 256,
+        "max_payload_bytes": "1024",
+    },
+    {"kind": "RouteTable", "revision": "1"},
+    route_fact(TOPIC, B),
+    route_fact(TOPIC, C),
+]
+BOOT_FACTS = [{"kind": "Epoch", "incarnation": "1", "epoch": "1"}, *ROUTE_FACTS, *SESSION_FACTS]
 
 
 def fault_hit(fault, point, cause, operation=OP_ADMIT, effect_id=None, occurrence=1):
@@ -604,6 +628,7 @@ def p1_02():
         + recovery(
             2,
             [{"kind": "Epoch", "incarnation": "1", "epoch": "2"}]
+            + ROUTE_FACTS
             + SESSION_FACTS
             + [
                 {
@@ -1400,6 +1425,80 @@ case(
     {"broker_inputs_have_provenance": "FAIL"},
     events=remembered,
 )
+
+
+def in_pages(*edit):
+    """The recovery of the second incarnation, read and delivered as several pages.
+
+    ``edit`` changes the facts before they are cut; the cuts are the indexes
+    where a new page starts. What the core is delivered is what the adapter
+    read: only the inventory is at fault, when it is.
+    """
+    *changes, cuts = edit
+
+    def apply(events):
+        deepcopy_payloads(events)
+        first = at(events, "recovery.read")
+        facts = events[first]["payload"]["facts"]
+        for change in changes:
+            change(facts)
+        bounds = [0, *cuts, len(facts)]
+        pages = []
+        for number, (start, end) in enumerate(itertools.pairwise(bounds)):
+            content = {
+                "run_epoch": "2",
+                "page": str(number),
+                "last": end == len(facts),
+                "facts": facts[start:end],
+            }
+            read = f"recovery.read.{number}"
+            pages += [
+                ev(read, "store-adapter", "RecoveryPageRead", content, [], 2),
+                ev(
+                    f"recovery.in.{number}",
+                    "broker-core",
+                    "RecoveryPageDelivered",
+                    content,
+                    [read],
+                    2,
+                ),
+            ]
+        events[first : first + 2] = pages
+
+    return apply
+
+
+# Facts of the second recovery: 0 Epoch, 1 Limits, 2 RouteTable, 3 and 4
+# Route, 5 to 7 Session, 8 InboundExchange, 9 Operation.
+case(
+    "recovery-inventory-over-three-pages",
+    "The inventory of a recovery is cut inside its routes and inside its sessions: still one ordered inventory.",
+    events=in_pages([4, 6]),
+)
+case(
+    "recovery-routes-unsorted-across-pages",
+    "Each page is in order, and the first route of the second page sorts before the last of the first.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=in_pages(lambda facts: facts.__setitem__(4, route_fact(b"p1/a", C)), [4]),
+)
+case(
+    "recovery-limits-after-the-routes-of-an-earlier-page",
+    "Each page is in order, and the limits come in a page after the routes they bound.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=in_pages(lambda facts: facts.insert(4, facts.pop(1)), [4]),
+)
+case(
+    "recovery-route-table-again-in-a-later-page",
+    "Each page is in order, and the second page states the route table a second time.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=in_pages(lambda facts: facts.insert(3, dict(facts[2])), [3]),
+)
+case(
+    "recovery-route-without-its-table",
+    "Routes belong to the table that precedes them: an inventory with routes and no table is not one.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=in_pages(lambda facts: facts.pop(2), []),
+)
 case(
     "provenance-input-refused",
     "The dispatcher refused a result that answered no effect in flight.",
@@ -1790,9 +1889,11 @@ RESOLVE_1 = 3
 
 def refusal_out(tag, cause):
     """The core makes a refusing PUBREC eligible and the client observes it."""
-    events = ack_out(tag, 1, 1, 6, "PUBREC", "5003000780", cause)
-    events[0]["payload"]["reason"] = "QuotaExceeded"
-    events[2]["payload"]["reason_code"] = 0x80
+    # No quota is the cause of a fenced admission: the reason is 0x83, the
+    # PUBLISH is valid and the receiver does not accept it (record 0013).
+    events = ack_out(tag, 1, 1, 6, "PUBREC", "5003000783", cause)
+    events[0]["payload"]["reason"] = "ImplementationSpecificError"
+    events[2]["payload"]["reason_code"] = 0x83
     return events
 
 

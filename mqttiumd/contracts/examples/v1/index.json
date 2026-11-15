@@ -31,9 +31,12 @@
     "contracts/examples/v1/valid/trace-record-deadline-delivered.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-read.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-delivered.json",
+    "contracts/examples/v1/valid/trace-record-recovery-page-with-routes-and-limits.json",
+    "contracts/examples/v1/valid/trace-record-recovery-page-of-routes-only.json",
     "contracts/examples/v1/valid/trace-record-input-refused.json",
     "contracts/examples/v1/valid/trace-record-held-item-released.json",
     "contracts/examples/v1/valid/trace-record-frame-eligible.json",
+    "contracts/examples/v1/valid/trace-record-frame-eligible-refusal-without-quota.json",
     "contracts/examples/v1/valid/trace-record-frame-eligible-connack.json",
     "contracts/examples/v1/valid/trace-record-store-fence-refused.json",
     "contracts/examples/v1/valid/trace-record-durable-state-inspected.json",
@@ -625,6 +628,48 @@
       "code": "u64-out-of-range",
       "pointer": "/payload/facts/1/revision",
       "why": "Identity components inside a recovered fact are 64-bit as well."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-facts-rank-decreases.json",
+      "code": "rows-out-of-order",
+      "pointer": "/payload/facts/8/kind",
+      "why": "The facts of a page are in the order of the inventory: a route never follows a session."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-limits-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/payload/facts/2/kind",
+      "why": "An inventory holds its limits once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-routes-unsorted.json",
+      "code": "rows-out-of-order",
+      "pointer": "/payload/facts/5/topic_hex",
+      "why": "Routes are sorted by the bytes of their topic: a prefix comes before what it prefixes."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-route-qos-3.json",
+      "code": "schema-violation",
+      "pointer": "/payload/facts/3/max_qos",
+      "why": "The QoS of a route is 0, 1 or 2."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-limit-of-targets-as-text.json",
+      "code": "schema-violation",
+      "pointer": "/payload/facts/1/max_targets_per_admission",
+      "why": "A 32-bit bound is a JSON integer; only 64-bit quantities are decimal strings."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-payload-limit-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/facts/1/max_payload_bytes",
+      "why": "The bound on a payload is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-route-target-revision-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/facts/4/target_revision",
+      "why": "The revision of a route target is 64-bit."
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-deadline-time-overflow.json",
