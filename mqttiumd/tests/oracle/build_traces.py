@@ -1538,6 +1538,22 @@ case(
 )
 
 
+# Rules the core applies to a whole inventory (lot L1): a route is listed
+# once, and every route targets a session of the inventory.
+case(
+    "recovery-route-listed-twice-across-pages",
+    "The same route, topic and target, is in two pages of one inventory.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=in_pages(lambda facts: facts.insert(4, dict(facts[3])), [4]),
+)
+case(
+    "recovery-route-to-a-session-the-inventory-lacks",
+    "A route targets a session that no fact of the inventory recovers.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=in_pages(lambda facts: facts.insert(5, route_fact(TOPIC, 9)), []),
+)
+
+
 def read_out_of_order(events):
     # Page 0 holds the sessions and page 1 the epoch and the routes. The
     # adapter reads page 1 first, which is an inventory in order; the core
