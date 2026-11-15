@@ -1366,6 +1366,12 @@ impl SqliteStore {
             };
             meta.revision = meta.revision.checked_add(1).ok_or(None)?;
             write_meta(&tx, &meta).map_err(|_| None)?;
+            // K1 `store.commit.prepared`: every row written, `COMMIT` not
+            // called; the transaction is open.
+            #[cfg(feature = "kill-points")]
+            if let Some(hook) = self.kill_hook.as_mut() {
+                hook(kill_points::KillPoint::CommitPrepared);
+            }
             if failing {
                 return Err(None);
             }
