@@ -520,6 +520,43 @@
             },
             "minItems": 1,
             "maxItems": 16
+          },
+          "refusal_reasons": {
+            "description": "The reason the effect EmitPubrecRefusal carries, for each reason of a certain rejection of the admission.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "PreconditionFailed",
+              "CapacityExceeded",
+              "Fenced",
+              "EpochClosed"
+            ],
+            "properties": {
+              "PreconditionFailed": {
+                "enum": [
+                  "QuotaExceeded",
+                  "ImplementationSpecificError"
+                ]
+              },
+              "CapacityExceeded": {
+                "enum": [
+                  "QuotaExceeded",
+                  "ImplementationSpecificError"
+                ]
+              },
+              "Fenced": {
+                "enum": [
+                  "QuotaExceeded",
+                  "ImplementationSpecificError"
+                ]
+              },
+              "EpochClosed": {
+                "enum": [
+                  "QuotaExceeded",
+                  "ImplementationSpecificError"
+                ]
+              }
+            }
           }
         }
       }

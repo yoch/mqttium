@@ -2119,7 +2119,10 @@ def executed_after_fence(events):
     )
     events.insert(at(events, "late.ready"), stable)
     late = events[at(events, "late.ready")]
-    late["payload"] = dict(late["payload"], outcome="Committed")
+    late["payload"] = {
+        **{key: value for key, value in late["payload"].items() if key != "reject_reason"},
+        "outcome": "Committed",
+    }
     late["parents"] = ["late.stable"]
 
 
@@ -2160,7 +2163,7 @@ def invented_rejection(events):
     # with no fence to make it one.
     for label in ("unknown.ready", "unknown.delivered"):
         event = events[at(events, label)]
-        event["payload"] = dict(event["payload"], outcome="RejectedCertain")
+        event["payload"] = dict(event["payload"], outcome="RejectedCertain", reject_reason="Fenced")
 
 
 qabs(
@@ -2234,6 +2237,30 @@ qabs(
     {REASON: "FAIL"},
     letter="B",
     events=reason_of("CapacityExceeded"),
+)
+qabs(
+    "refusal-answering-no-rejection",
+    "The PUBREC refuses, and no certain rejection is among its causes.",
+    {REASON: "FAIL"},
+    letter="B",
+    events=lambda events: events[at(events, "refusal")].update(parents=["publish.in"]),
+)
+
+
+def answered_by_an_unknown(events):
+    # The core is told the outcome is unknown, and refuses on that.
+    deepcopy_payloads(events)
+    payload = events[at(events, "fenced.delivered")]["payload"]
+    payload["outcome"] = "PendingOrUnknown"
+    del payload["reject_reason"]
+
+
+qabs(
+    "refusal-answering-an-unknown-outcome",
+    "The PUBREC refuses, and the result among its causes is an unknown outcome, not a rejection.",
+    {REASON: "FAIL"},
+    letter="B",
+    events=answered_by_an_unknown,
 )
 qabs(
     "certain-rejection-without-a-fence-on-a-cut-trace",
