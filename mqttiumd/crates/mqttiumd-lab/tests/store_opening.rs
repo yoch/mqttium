@@ -48,6 +48,7 @@ const SEED: u64 = 7;
 /// The opening of the first start-up of the run on this store.
 fn opening_for(sim: &Sim) -> EpochOpening {
     sim.begin_opening(startup_nonce(SEED, 0))
+        .expect("healthy opening ledger")
 }
 
 fn opening_fault(point: FaultPoint, action: FaultAction) -> FaultSpec {
@@ -501,7 +502,9 @@ fn an_exhausted_epoch_counter_refuses_the_opening_for_good() {
     assert_eq!(grant.epoch(), RunEpoch::new(u64::MAX));
 
     let before = sim.store().snapshot().expect("healthy durable snapshot");
-    let mut opening = sim.begin_opening(startup_nonce(SEED, 1));
+    let mut opening = sim
+        .begin_opening(startup_nonce(SEED, 1))
+        .expect("healthy opening ledger");
     let id = attempt(&mut sim, &mut opening);
     let refused = reply(&mut sim, id);
     let exhausted = OpeningRejection::EpochsExhausted;
@@ -552,7 +555,9 @@ fn after_a_crash_a_new_epoch_is_opened_and_the_older_one_is_not_entered_again() 
         durable
     );
 
-    let mut opening = sim.begin_opening(startup_nonce(SEED, 1));
+    let mut opening = sim
+        .begin_opening(startup_nonce(SEED, 1))
+        .expect("healthy opening ledger");
     let grant = open_and_hand_over(&mut sim, &mut opening);
     assert!(grant.epoch() > first_epoch);
     assert_eq!(ledger(&sim).phase_of(first_epoch), EpochPhase::Closed);
@@ -609,7 +614,9 @@ fn after_a_crash_a_new_epoch_is_opened_and_the_older_one_is_not_entered_again() 
 fn a_restart_is_not_confused_with_the_process_that_died() {
     for dead_command_first in [true, false] {
         let mut first_process = started();
-        let mut dead_opening = first_process.begin_opening(startup_nonce(SEED, 0));
+        let mut dead_opening = first_process
+            .begin_opening(startup_nonce(SEED, 0))
+            .expect("healthy opening ledger");
         let (_, dead_command) = submit(&mut first_process, &mut dead_opening);
         // The process dies; its command is still on its way to the
         // writer, which the bench delivers by hand below.
@@ -619,7 +626,9 @@ fn a_restart_is_not_confused_with_the_process_that_died() {
             MemoryStore::reopen(crashed.store.snapshot().expect("healthy durable snapshot")),
             LIMITS,
         );
-        let mut opening = sim.begin_opening(startup_nonce(SEED, 1));
+        let mut opening = sim
+            .begin_opening(startup_nonce(SEED, 1))
+            .expect("healthy opening ledger");
         let (id, command) = submit(&mut sim, &mut opening);
         assert_eq!(command.attempt.ticket, dead_command.attempt.ticket);
         assert_eq!(command.after, dead_command.after);
@@ -732,7 +741,9 @@ fn an_attempt_held_past_a_later_opening_is_superseded() {
 
     // Two other start-ups open epochs 1 and 2 meanwhile.
     for restart in [1, 2] {
-        let mut other = sim.begin_opening(startup_nonce(SEED, restart));
+        let mut other = sim
+            .begin_opening(startup_nonce(SEED, restart))
+            .expect("healthy opening ledger");
         let grant = open_and_hand_over(&mut sim, &mut other);
         assert_eq!(grant.epoch(), RunEpoch::new(restart));
     }
@@ -785,8 +796,10 @@ fn two_live_processes_never_hold_the_same_epoch() {
     for older_first in [true, false] {
         let mut sim = started();
         let mut openings = [
-            sim.begin_opening(startup_nonce(SEED, 0)),
-            sim.begin_opening(startup_nonce(SEED, 1)),
+            sim.begin_opening(startup_nonce(SEED, 0))
+                .expect("healthy opening ledger"),
+            sim.begin_opening(startup_nonce(SEED, 1))
+                .expect("healthy opening ledger"),
         ];
         let submitted = openings.each_mut().map(|opening| submit(&mut sim, opening));
         assert_eq!(submitted[0].1.attempt.ticket, submitted[1].1.attempt.ticket);
@@ -822,12 +835,12 @@ fn two_live_processes_never_hold_the_same_epoch() {
 fn a_restart_that_reused_the_nonce_of_the_opener_opens_nothing() {
     let mut sim = started();
     let reused = startup_nonce(SEED, 0);
-    let mut predecessor = sim.begin_opening(reused);
+    let mut predecessor = sim.begin_opening(reused).expect("healthy opening ledger");
     let held = open_and_hand_over(&mut sim, &mut predecessor);
     assert_eq!(held.epoch(), RunEpoch::new(1));
     let before = sim.store().snapshot().expect("healthy durable snapshot");
 
-    let mut successor = sim.begin_opening(reused);
+    let mut successor = sim.begin_opening(reused).expect("healthy opening ledger");
     let (id, command) = submit(&mut sim, &mut successor);
     assert_eq!(command.after, held.epoch());
     assert_eq!(Some(command.attempt), ledger(&sim).opened_by());
@@ -861,14 +874,14 @@ fn a_restart_that_reused_the_nonce_of_the_opener_opens_nothing() {
 fn two_start_ups_with_one_nonce_and_one_condition_share_an_epoch() {
     let mut sim = started();
     let reused = startup_nonce(SEED, 0);
-    let mut predecessor = sim.begin_opening(reused);
+    let mut predecessor = sim.begin_opening(reused).expect("healthy opening ledger");
     let (first, command) = submit(&mut sim, &mut predecessor);
     enter(&mut sim, first);
     let answer = reply(&mut sim, first);
     take(&mut predecessor, answer);
     let held = predecessor.hand_over().expect("committed");
 
-    let mut successor = sim.begin_opening(reused);
+    let mut successor = sim.begin_opening(reused).expect("healthy opening ledger");
     let again = successor
         .submit(command.after)
         .expect("an attempt may start");
@@ -906,7 +919,9 @@ fn a_grant_whose_epoch_the_store_reports_closed_is_never_confirmed_again() {
         RecoveredEpochCheck::Confirms
     );
 
-    let mut restart = sim.begin_opening(startup_nonce(SEED, 1));
+    let mut restart = sim
+        .begin_opening(startup_nonce(SEED, 1))
+        .expect("healthy opening ledger");
     let next = open_and_hand_over(&mut sim, &mut restart);
     assert_eq!(next.epoch(), RunEpoch::new(2));
 

@@ -619,7 +619,10 @@ fn an_opening_is_written_as_submitted_then_opened_once() {
     let mut bench = adapter_bench();
     // One more epoch, so that `after` differs from the incarnation.
     mqttiumd_lab::store::conformance::open(bench.store.store_mut());
-    let mut opening = bench.store.begin_opening(startup_nonce(7, 1));
+    let mut opening = bench
+        .store
+        .begin_opening(startup_nonce(7, 1))
+        .expect("healthy opening ledger");
     let command = opening
         .submit(
             bench
@@ -693,7 +696,10 @@ fn a_submission_has_the_causes_the_caller_gives() {
     let admitted = submit(&mut bench, 1, Effect::Persist { command });
     let absent = operation_id(bench.epoch, 9);
     let fenced = resolve(&mut bench, 2, absent);
-    let mut opening = bench.store.begin_opening(startup_nonce(7, 1));
+    let mut opening = bench
+        .store
+        .begin_opening(startup_nonce(7, 1))
+        .expect("healthy opening ledger");
     let open = opening
         .submit(
             bench
