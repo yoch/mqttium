@@ -84,7 +84,11 @@ payload bytes the client sent, decoded by the oracle from its MQTT 5
 PUBLISH. The expectation comes from what the client did and from the
 routes of the fixture, not from what survives in the snapshot. A snapshot
 of a corrupted store stays a valid document: the bench can represent the
-corruption, the judge recognises it.
+corruption, the judge recognises it. Each publication of the first
+checkpoint carries one obligation per target of the route the fixture
+gives its topic. Limit, outside S0: once outbound distribution exists,
+an obligation legitimately settled between two checkpoints must not fail
+this assertion; today an obligation that disappears is a FAIL.
 
 A snapshot the trace cites is evidence only when it is the snapshot of the
 same run and of the backend the trace declares, for the checkpoint that
