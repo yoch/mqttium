@@ -361,3 +361,118 @@ def test_violation_fails_unless_tlc_names_the_declared_invariant(
 
 def test_campaign_that_ran_no_configuration_is_not_a_success() -> None:
     assert run_tlc.run_campaign([], Path("tla2tools.jar"), "java", verbose=False) != 0
+
+
+# --- Sidecars the runner cannot read, and configurations that do not end ----
+
+
+def _refused(
+    argv: list[str], capsys: pytest.CaptureFixture[str], reason: str, *, index: bool = True
+) -> None:
+    """The campaign, and the index, refuse with exit 2, the reason and no index."""
+    for mode in ([], ["--list"]) if index else ([],):
+        with pytest.raises(SystemExit) as refused:
+            run_tlc.main([*argv, *mode])
+        assert refused.value.code == 2, mode
+        captured = capsys.readouterr()
+        assert reason in captured.err, (mode, captured.err)
+        assert captured.out == "", mode
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        ({"status": None}, "Bad: names no 'status'"),
+        ({"summary": None}, "Bad: names no 'summary'"),
+        ({"status": 3}, "Bad: 'status' is not a string"),
+        ({"summary": ["a"]}, "Bad: 'summary' is not a string"),
+        ({"module": 5}, "Bad: 'module' is not a string"),
+        ({"issues": "647"}, "Bad: 'issues' is not a list"),
+        ({"configs": {"config": "Bad.cfg"}}, "Bad: 'configs' is not a list of entries"),
+        ({"configs": ["Bad.cfg"]}, "Bad: 'configs' is not a list of entries"),
+        ({"configs": [{"config": 5, "expect": "pass"}]}, "Bad: 'config' is not a string"),
+        ({"configs": [{"config": "Bad.cfg", "expect": ["pass"]}]}, "'expect' is not a string"),
+        (
+            {"configs": [{"config": "Bad.cfg", "expect": "violation", "invariant": 1}]},
+            "'invariant' is not a string",
+        ),
+        (
+            {"configs": [{"config": "Bad.cfg", "expect": "liveness", "property": ["P"]}]},
+            "'property' is not a string",
+        ),
+    ],
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_sidecar_with_a_wrong_value_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    change: dict[str, object],
+    reason: str,
+) -> None:
+    _no_tlc(monkeypatch)
+    _write_model(tmp_path, "Bad", [{"config": "Bad.cfg", "expect": "pass"}])
+    sidecar = json.loads((tmp_path / "Bad.json").read_text(encoding="utf-8"))
+    for key, value in change.items():
+        if value is None:
+            del sidecar[key]
+        else:
+            sidecar[key] = value
+    (tmp_path / "Bad.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    _refused(["--models-dir", str(tmp_path)], capsys, reason)
+
+
+@pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        ("[]", "Stray.json: a sidecar is an object"),
+        ('"text"', "Stray.json: a sidecar is an object"),
+        ("{not json", "Stray.json: not JSON"),
+    ],
+    ids=["list", "string", "malformed"],
+)
+def test_directory_with_an_unreadable_sidecar_is_refused_as_a_whole(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    text: str,
+    reason: str,
+) -> None:
+    _no_tlc(monkeypatch)
+    _write_model(tmp_path, "Good", [{"config": "Good.cfg", "expect": "pass"}])
+    (tmp_path / "Stray.json").write_text(text, encoding="utf-8")
+    # Also when only the sound model is selected: a directory that holds a
+    # file nobody can read is not a directory whose campaign means something.
+    _refused(["--models-dir", str(tmp_path)], capsys, reason)
+    _refused(["--models-dir", str(tmp_path), "Good"], capsys, reason)
+
+
+def test_configuration_that_does_not_end_is_a_failed_check_and_the_campaign_goes_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    configs = [
+        {"config": "Slow.cfg", "expect": "pass"},
+        {"config": "Quick.cfg", "expect": "pass"},
+    ]
+    _write_model(tmp_path, "Model", configs)
+
+    def run(command: list[str], **_kwargs: object) -> object:
+        if "Slow.cfg" in command[-2]:
+            raise run_tlc.subprocess.TimeoutExpired(command, 900, output="partial", stderr="")
+        passed = "Model checking completed. No error has been found.\n"
+        return run_tlc.subprocess.CompletedProcess(command, 0, stdout=passed, stderr="")
+
+    monkeypatch.setattr(run_tlc.shutil, "which", lambda _name: "java")
+    monkeypatch.setattr(run_tlc, "tla2tools_jar", lambda: Path("tla2tools.jar"))
+    monkeypatch.setattr(run_tlc.subprocess, "run", run)
+    assert run_tlc.main(["--models-dir", str(tmp_path)]) == 1
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == [
+        "FAIL Model/Slow.cfg: expected pass, got timeout",
+        "ok   Model/Quick.cfg: expected pass, got pass",
+    ]
+    # An interrupted exploration never matches, whatever was declared.
+    interrupted = run_tlc.Outcome("timeout", None, None, "")
+    for expect in sorted(run_tlc.EXPECTATIONS):
+        check = run_tlc.Check("M", tmp_path / "M.tla", tmp_path / "M.cfg", expect, "Inv", "P")
+        assert run_tlc.matches(check, interrupted) is False
