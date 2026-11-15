@@ -197,12 +197,7 @@ impl OpenError {
             Self::Read(error) => *error,
             Self::Sql(error) => reader::sql_error(error),
             Self::WriterAlive => ReadError::Unavailable,
-            Self::WriterLock(error) => match error.kind() {
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
-                    ReadError::Unavailable
-                }
-                _ => ReadError::Io,
-            },
+            Self::WriterLock(error) => reader::io_error(error),
             _ => ReadError::InvalidData,
         }
     }
@@ -1314,11 +1309,12 @@ impl SqliteStore {
     /// anything is written, then the settings are set and read back, and
     /// its durable values are decoded.
     pub fn open(path: &Path) -> Result<Self, OpenError> {
-        if !path.exists() {
-            return Err(OpenError::Read(ReadError::Unavailable));
-        }
         let lock = writer_lock(path)?;
-        let conn = connect(path)?;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::ZERO)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version != SCHEMA_VERSION {
             return Err(OpenError::SchemaVersion(version));

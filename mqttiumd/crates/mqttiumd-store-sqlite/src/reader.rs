@@ -18,32 +18,79 @@ impl std::fmt::Display for CopyRefused {
 
 impl std::error::Error for CopyRefused {}
 
-pub(crate) fn sql_error(error: &rusqlite::Error) -> ReadError {
-    use rusqlite::ErrorCode;
-    match error {
-        rusqlite::Error::FromSqlConversionFailure(_, _, cause) => cause
-            .downcast_ref::<CopyRefused>()
-            .map_or(ReadError::InvalidData, |cause| cause.0),
-        rusqlite::Error::SqliteFailure(failure, _) => match failure.code {
-            ErrorCode::OutOfMemory => ReadError::AllocationFailed,
-            ErrorCode::TooBig => ReadError::LimitExceeded,
-            ErrorCode::SystemIoFailure | ErrorCode::DiskFull | ErrorCode::NoLargeFileSupport => {
-                ReadError::Io
+/// A system failure never asserts that the durable contents were invalid.
+pub(crate) fn io_error(error: &std::io::Error) -> ReadError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::PermissionDenied
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::TimedOut
+        | std::io::ErrorKind::Interrupted => ReadError::Unavailable,
+        std::io::ErrorKind::OutOfMemory => ReadError::AllocationFailed,
+        _ => ReadError::Io,
+    }
+}
+
+fn conversion_error(cause: &(dyn std::error::Error + Send + Sync + 'static)) -> ReadError {
+    conversion_cause(cause, 0)
+}
+
+fn conversion_cause(
+    cause: &(dyn std::error::Error + Send + Sync + 'static),
+    depth: usize,
+) -> ReadError {
+    if depth >= 8 {
+        return ReadError::Unavailable;
+    }
+    if let Some(cause) = cause.downcast_ref::<CopyRefused>() {
+        cause.0
+    } else if let Some(cause) = cause.downcast_ref::<std::io::Error>() {
+        io_error(cause)
+    } else if let Some(cause) = cause.downcast_ref::<rusqlite::types::FromSqlError>() {
+        match cause {
+            rusqlite::types::FromSqlError::Other(cause) => {
+                conversion_cause(cause.as_ref(), depth + 1)
             }
-            ErrorCode::PermissionDenied
-            | ErrorCode::DatabaseBusy
-            | ErrorCode::DatabaseLocked
-            | ErrorCode::ReadOnly
-            | ErrorCode::CannotOpen
-            | ErrorCode::FileLockingProtocolFailed
-            | ErrorCode::AuthorizationForStatementDenied
-            | ErrorCode::OperationAborted
-            | ErrorCode::OperationInterrupted => ReadError::Unavailable,
-            // A missing table/column, wrong type or damaged image is data/schema
-            // invalidity. No classification depends on the engine's text.
             _ => ReadError::InvalidData,
-        },
-        _ => ReadError::InvalidData,
+        }
+    } else if cause.is::<std::str::Utf8Error>() || cause.is::<std::num::TryFromIntError>() {
+        ReadError::InvalidData
+    } else {
+        ReadError::Unavailable
+    }
+}
+
+fn sqlite_error(failure: &rusqlite::ffi::Error) -> ReadError {
+    use rusqlite::ErrorCode;
+    match failure.code {
+        ErrorCode::OutOfMemory => ReadError::AllocationFailed,
+        ErrorCode::TooBig => ReadError::LimitExceeded,
+        ErrorCode::SystemIoFailure | ErrorCode::DiskFull | ErrorCode::NoLargeFileSupport => {
+            ReadError::Io
+        }
+        ErrorCode::DatabaseCorrupt
+        | ErrorCode::NotADatabase
+        | ErrorCode::TypeMismatch
+        | ErrorCode::ConstraintViolation => ReadError::InvalidData,
+        // An internal/configuration/query failure, SQLITE_ERROR included,
+        // cannot prove that durable contents were invalid. SQLITE_ERROR alone
+        // cannot distinguish a missing schema object from a broken query.
+        _ => ReadError::Unavailable,
+    }
+}
+
+pub(crate) fn sql_error(error: &rusqlite::Error) -> ReadError {
+    match error {
+        rusqlite::Error::FromSqlConversionFailure(_, _, cause) => conversion_error(cause.as_ref()),
+        rusqlite::Error::SqliteFailure(failure, _)
+        | rusqlite::Error::SqlInputError { error: failure, .. } => sqlite_error(failure),
+        rusqlite::Error::IntegralValueOutOfRange(_, _)
+        | rusqlite::Error::Utf8Error(_, _)
+        | rusqlite::Error::InvalidColumnType(_, _, _)
+        | rusqlite::Error::QueryReturnedNoRows
+        | rusqlite::Error::QueryReturnedMoreThanOneRow => ReadError::InvalidData,
+        rusqlite::Error::ToSqlConversionFailure(cause) => conversion_error(cause.as_ref()),
+        _ => ReadError::Unavailable,
     }
 }
 
@@ -199,4 +246,78 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn driver(code: i32) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some("display text is not evidence of InvalidData".to_owned()),
+        )
+    }
+
+    #[test]
+    fn a_driver_or_query_failure_does_not_invent_invalid_durable_data() {
+        for error in [
+            driver(rusqlite::ffi::SQLITE_INTERNAL),
+            driver(rusqlite::ffi::SQLITE_MISUSE),
+            driver(rusqlite::ffi::SQLITE_ERROR),
+            driver(rusqlite::ffi::SQLITE_SCHEMA),
+            driver(rusqlite::ffi::SQLITE_RANGE),
+            driver(rusqlite::ffi::SQLITE_NOTFOUND),
+            rusqlite::Error::SqliteSingleThreadedMode,
+            rusqlite::Error::InvalidQuery,
+            rusqlite::Error::InvalidParameterCount(2, 1),
+            rusqlite::Error::InvalidColumnIndex(12),
+            rusqlite::Error::InvalidColumnName("missing".to_owned()),
+        ] {
+            assert_eq!(sql_error(&error), ReadError::Unavailable, "{error:?}");
+        }
+    }
+
+    #[test]
+    fn structured_driver_codes_preserve_data_limits_io_and_allocation_causes() {
+        for (code, expected) in [
+            (rusqlite::ffi::SQLITE_CORRUPT, ReadError::InvalidData),
+            (rusqlite::ffi::SQLITE_NOTADB, ReadError::InvalidData),
+            (rusqlite::ffi::SQLITE_MISMATCH, ReadError::InvalidData),
+            (rusqlite::ffi::SQLITE_CONSTRAINT, ReadError::InvalidData),
+            (rusqlite::ffi::SQLITE_TOOBIG, ReadError::LimitExceeded),
+            (rusqlite::ffi::SQLITE_NOMEM, ReadError::AllocationFailed),
+            (rusqlite::ffi::SQLITE_IOERR_READ, ReadError::Io),
+            (rusqlite::ffi::SQLITE_FULL, ReadError::Io),
+            (rusqlite::ffi::SQLITE_CANTOPEN, ReadError::Unavailable),
+            (rusqlite::ffi::SQLITE_BUSY, ReadError::Unavailable),
+            (rusqlite::ffi::SQLITE_AUTH, ReadError::Unavailable),
+        ] {
+            assert_eq!(sql_error(&driver(code)), expected);
+        }
+    }
+
+    #[test]
+    fn a_conversion_failure_retains_a_structured_io_cause() {
+        let error = rusqlite::Error::FromSqlConversionFailure(
+            0,
+            Type::Blob,
+            Box::new(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+        );
+        assert_eq!(sql_error(&error), ReadError::Io);
+        let error = rusqlite::Error::FromSqlConversionFailure(
+            0,
+            Type::Blob,
+            Box::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        );
+        assert_eq!(sql_error(&error), ReadError::Unavailable);
+        let nested = rusqlite::Error::FromSqlConversionFailure(
+            0,
+            Type::Blob,
+            Box::new(rusqlite::types::FromSqlError::Other(Box::new(
+                std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+            ))),
+        );
+        assert_eq!(sql_error(&nested), ReadError::Io);
+    }
 }
