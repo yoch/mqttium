@@ -903,6 +903,12 @@ impl<S: DurableStore> Process<S> {
         }
     }
 
+    /// The deadlines the timer adapter holds armed and not fired.
+    #[must_use]
+    pub fn armed_deadlines(&self) -> usize {
+        self.timer.armed.len()
+    }
+
     /// Whether an effect still waits in the box, or an input for room.
     #[must_use]
     pub fn busy(&self) -> bool {
