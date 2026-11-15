@@ -42,7 +42,7 @@ def partial_first_inventory(records):
 
 
 class FirstRecovery(unittest.TestCase):
-    def judge_case(self, partial=False):
+    def judge_case(self, partial=False, missing_startup=False):
         with tempfile.TemporaryDirectory(prefix="mqttiumd-first-recovery-") as temporary:
             root = Path(temporary)
             shutil.copytree(CASE, root, dirs_exist_ok=True)
@@ -51,10 +51,18 @@ class FirstRecovery(unittest.TestCase):
             fixture = root / "tests/fixtures/p1/three-persistent-sessions.json"
             fixture.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / "tests/fixtures/p1/three-persistent-sessions.json", fixture)
-            if partial:
+            if partial or missing_startup:
                 path = root / "trace.jsonl"
                 records = [json.loads(line) for line in path.read_text().splitlines()]
-                partial_first_inventory(records)
+                if partial:
+                    partial_first_inventory(records)
+                if missing_startup:
+                    records = [record for record in records if not (
+                        record["kind"] == "BrokerRecovered" and record["payload"]["run_epoch"] == "2"
+                    )]
+                    for index, record in enumerate(records):
+                        record.update(record_sequence=str(index), time_value=str(index))
+                    records[-1]["payload"]["record_count"] = str(len(records))
                 path.write_text("".join(json.dumps(record) + "\n" for record in records))
             result = subprocess.run(
                 [sys.executable, "-m", "mqttiumd_oracle", "--root", str(root),
@@ -77,6 +85,11 @@ class FirstRecovery(unittest.TestCase):
 
     def test_later_complete_inventory_cannot_replace_the_first_partial_inventory(self):
         code, report = self.judge_case(partial=True)
+        self.assertEqual(report["assertions"][ASSERTION]["status"], "INCONCLUSIVE")
+        self.assertEqual((code, report["verdict"]), (2, "INCONCLUSIVE"))
+
+    def test_another_kill_cannot_hide_the_missing_first_startup_observation(self):
+        code, report = self.judge_case(missing_startup=True)
         self.assertEqual(report["assertions"][ASSERTION]["status"], "INCONCLUSIVE")
         self.assertEqual((code, report["verdict"]), (2, "INCONCLUSIVE"))
 
