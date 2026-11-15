@@ -2,7 +2,7 @@
 # Runs one campaign whose result can qualify, and checks that it does
 # (record 0017). Run from the mqttiumd directory, on a clean checkout:
 #
-#   tools/run_qualifying_campaign.sh <scenario> <empty campaign directory> [seed] [sim-store|sqlite] [in-process|child]
+#   tools/run_qualifying_campaign.sh <scenario> <empty campaign directory> [seed] [sim-store|sqlite] [in-process|child] [auto|normal|kill-points]
 #
 # 1. `run --rebuild` builds the lab binary from an archive of the recorded
 #    content, kept in the campaign as source.tar, and plays the scenario
@@ -20,8 +20,8 @@
 # campaign was written.
 set -euo pipefail
 
-if [[ $# -lt 2 || $# -gt 5 ]]; then
-    echo "usage: tools/run_qualifying_campaign.sh <scenario> <empty campaign directory> [seed] [sim-store|sqlite] [in-process|child]" >&2
+if [[ $# -lt 2 || $# -gt 6 ]]; then
+    echo "usage: tools/run_qualifying_campaign.sh <scenario> <empty campaign directory> [seed] [sim-store|sqlite] [in-process|child] [auto|normal|kill-points]" >&2
     exit 2
 fi
 scenario=$1
@@ -29,9 +29,24 @@ out=$2
 seed=${3:-1}
 backend=${4:-sim-store}
 process=${5:-in-process}
+build_mode=${6:-auto}
+if [[ $build_mode == auto ]]; then
+    build_mode=$(python3 - "$scenario" <<'PY'
+import json, sys
+points = {fault["point"] for fault in json.load(open(sys.argv[1]))["faults"]}
+print("kill-points" if points & {"store.commit.prepared", "store.commit.logged"} else "normal")
+PY
+)
+fi
+feature_arguments=()
+case $build_mode in
+    normal) ;;
+    kill-points) feature_arguments=(--features kill-points) ;;
+    *) echo "unknown build mode: $build_mode" >&2; exit 2 ;;
+esac
 result=qualifying-run-result.json
 
-if ! cargo run -q -p mqttiumd-lab --locked -- run \
+if ! cargo run -q -p mqttiumd-lab --locked "${feature_arguments[@]}" -- run \
     --contracts contracts/v1 --scenario "$scenario" --seed "$seed" --backend "$backend" \
     --process "$process" --rebuild --out "$out"; then
     echo "no campaign was written" >&2
@@ -51,7 +66,7 @@ for reason in result.get("reasons", []):
     print(f"  {reason}")
 sys.exit(0 if result["qualification"] == "qualifying" else 1)
 PY
-cargo run -q -p mqttiumd-lab --locked -- validate --contracts contracts/v1 --root "$out" \
+cargo run -q -p mqttiumd-lab --locked "${feature_arguments[@]}" -- validate --contracts contracts/v1 --root "$out" \
     --file run-manifest.json --file "$result"
 oracle recompute --result "$result"
 tools/check_campaign_binary.sh "$out"
