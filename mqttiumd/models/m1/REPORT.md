@@ -9,8 +9,8 @@ and this file is rewritten.
 | | |
 | - | - |
 | Models | `M1a.tla` (sidecar `M1a.json`, 19 configurations), `M1b.tla` (sidecar `M1b.json`, 19 configurations) |
-| Base | Integration branch at `807ca26`; runner chains `8978453`..`f84db36` (merged there) and `8d2cc53`, `2ea5418` (follow-up) |
-| Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb` when the campaign was run; `sha256:4f78464e0cf85779ea16565e4c8b5c776ff94c23e16985cb1c32fb163f22b1e2` after the merge of the integration head `88c92a0`, where the campaign was run again (38 of 38) |
+| Base | Integration branch at `0d99de4`, which holds both runner chains (`f84db36`, `965c3f2`) and the models at `f993d7e` |
+| Contract digest | `sha256:29dd01788a05e141d204a826aba8bcbb3db837a4b49e73e43263f7e2a2d4b4d8`, at the integration head `0d99de4` merged into the lot, where the campaign was last run (38 of 38, 6 min 2 s). Earlier runs of this campaign were on `7a869371…` and `4f78464e…`; the modules and configurations did not change between them |
 | TLC | 2.19 of 08 August 2024 (rev 5a47802), `tla2tools.jar` 1.7.4, digest pinned by `tools/formal/run_tlc.py` |
 | Java | OpenJDK 21.0.12, 64-bit server VM |
 | Command | `python tools/formal/run_tlc.py --models-dir mqttiumd/models/m1` |
