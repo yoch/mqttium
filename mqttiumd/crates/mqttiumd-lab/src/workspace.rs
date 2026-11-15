@@ -141,6 +141,12 @@ pub struct Workspace {
     schemas: Schemas,
     catalogs: Catalogs,
     contracts_digest: String,
+    /// The contract and schema files as they were read when the workspace
+    /// was opened, by resolved path. The digest is the digest of these
+    /// bytes, and these bytes are what the workspace interprets.
+    snapshot: BTreeMap<PathBuf, Vec<u8>>,
+    /// Names of the JSON files of the contract directory, in order.
+    contract_names: Vec<String>,
     active: ReferenceStack,
 }
 
@@ -168,14 +174,47 @@ impl Workspace {
             .map_err(|error| unreadable(format!("{}: {error}", root.display())))?;
         let (contract_dir, schema_dir) =
             files::contract_directories(contracts).map_err(unreadable)?;
-        let listed = manifest::contract_files(root, contracts).map_err(unreadable)?;
+        // One read of every contract and schema file: these bytes are
+        // hashed, and these bytes are interpreted.
+        let mut snapshot = BTreeMap::new();
+        let mut listing = Vec::new();
+        let mut schema_files = Vec::new();
+        let mut contract_names = Vec::new();
+        for (directory, is_schema) in [(&contract_dir, false), (&schema_dir, true)] {
+            let entries = fs::read_dir(root.join(directory))
+                .map_err(|error| unreadable(format!("{directory}: {error}")))?;
+            for entry in entries {
+                let entry = entry.map_err(|error| unreadable(format!("{directory}: {error}")))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.ends_with(".json") {
+                    continue;
+                }
+                let loaded = files::read_document(&canonical_root, &entry.path())
+                    .map_err(|(code, message)| Diagnostic::new(code, "", message))?;
+                listing.push((
+                    format!("{directory}/{name}"),
+                    manifest::sha256_hex(&loaded.bytes),
+                ));
+                if is_schema {
+                    if name.ends_with(".schema.json") {
+                        schema_files.push((name, loaded.bytes.clone()));
+                    }
+                } else {
+                    contract_names.push(name);
+                }
+                snapshot.insert(loaded.path, loaded.bytes);
+            }
+        }
+        listing.sort();
+        schema_files.sort();
+        contract_names.sort();
         let contracts_digest = manifest::contracts_digest(
-            listed
+            listing
                 .iter()
-                .map(|file| (file.sha256.as_str(), file.path.as_str())),
+                .map(|(path, sha256)| (sha256.as_str(), path.as_str())),
         );
         let contracts = root.join(contract_dir);
-        let schemas = Schemas::load(&canonical_root, &root.join(schema_dir))?;
+        let schemas = Schemas::from_bytes(&schema_files)?;
         let mut workspace = Self {
             root: root.to_path_buf(),
             canonical_root,
@@ -183,6 +222,8 @@ impl Workspace {
             schemas,
             catalogs: Catalogs::default(),
             contracts_digest,
+            snapshot,
+            contract_names,
             active: ReferenceStack::default(),
         };
 
@@ -259,6 +300,22 @@ impl Workspace {
 
     /// Reads one document through the bounded, confined reader.
     fn read(&self, path: &Path) -> Result<Loaded, Refusal> {
+        // A contract file is the content the digest names, whatever the
+        // file holds now, even if it is gone.
+        let resolved = path
+            .canonicalize()
+            .ok()
+            .or_else(|| {
+                let relative = path.strip_prefix(&self.root).ok()?;
+                Some(self.canonical_root.join(relative))
+            })
+            .unwrap_or_else(|| path.to_path_buf());
+        if let Some(bytes) = self.snapshot.get(&resolved) {
+            return Ok(Loaded {
+                path: resolved,
+                bytes: bytes.clone(),
+            });
+        }
         files::read_document(&self.canonical_root, path)
     }
 
@@ -393,20 +450,10 @@ impl Workspace {
 
     /// Checks every JSON file of the contract directory, in name order.
     pub fn check_contracts(&self) -> Vec<(PathBuf, Report)> {
-        let mut files: Vec<PathBuf> = fs::read_dir(&self.contracts)
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "json")
-            })
-            .collect();
-        files.sort();
-        files
-            .into_iter()
-            .map(|path| {
+        self.contract_names
+            .iter()
+            .map(|name| {
+                let path = self.contracts.join(name);
                 let report = self.check_path(&path);
                 (path, report)
             })
@@ -459,6 +506,7 @@ mod tests {
             .replace("\"inbound_qos2\"", "\"inbound_qos3\"");
         fs::write(&catalog, changed).expect("write");
         fs::write(root.join("contracts/v1/profiles.json"), "{}").expect("write");
+        fs::remove_file(root.join("contracts/v1/assertions.json")).expect("remove");
 
         assert_eq!(workspace.contracts_digest(), digest);
         let report = workspace.check_file(registry);
@@ -475,6 +523,12 @@ mod tests {
 
         // Opened again, the directory is other contracts, and invalid ones.
         assert!(Workspace::open(&root, contracts).is_err());
+        let original = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/v1");
+        fs::copy(
+            original.join("assertions.json"),
+            root.join("contracts/v1/assertions.json"),
+        )
+        .expect("copy");
         fs::write(
             root.join("contracts/v1/profiles.json"),
             fs::read(
