@@ -31,6 +31,10 @@ use mqttiumd_contract::packet::Qos;
 /// fact is built within this budget.
 pub const MAX_CLIENT_ID_BYTES: usize = 65_535;
 
+/// Finite S0 ceiling for a recovery inventory, including its fixed facts.
+/// Positional cursors can scan a prefix; they never enumerate an unbounded one.
+pub const MAX_RECOVERY_INVENTORY_ROWS: usize = 65_536;
+
 /// Stable causes of a failed durable read. A failure establishes neither
 /// absence nor a rejection and never authorises executing an uncertain command.
 /// Driver details and offending durable values are deliberately not carried.
@@ -62,6 +66,7 @@ pub enum ReadPhase {
     Open,
     Ledger,
     Opening,
+    Lookup,
     Snapshot,
     Inspect,
     Recovery,
@@ -74,6 +79,7 @@ impl ReadPhase {
             Self::Open => "Open",
             Self::Ledger => "Ledger",
             Self::Opening => "Opening",
+            Self::Lookup => "Lookup",
             Self::Snapshot => "Snapshot",
             Self::Inspect => "Inspect",
             Self::Recovery => "Recovery",
