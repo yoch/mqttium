@@ -32,8 +32,8 @@ comes before the reason.
 | 8 | A `retired` result for an operation still awaited | Unreachable in S0 | S0 collects nothing (DEM-020 excludes collection from M1a); not settled beyond S0 | — |
 | 9 | An admission the store rejected for certain, on a live process that still holds the recipe and the payload | Refuse to the client. This is the rule of the registry today (`inbound_qos2.admission_pending.rejected.refuse`) and the recommendation of lot L1 for S0 | DEM-009 and chapter 2 provide for the other outcome: "after a certain rejection, a new preparation gets another OperationId" | Prepare the admission again under a new `OperationId` with the same `RequestId`: it needs a bound on the attempts and a registry rule, and refuses to the client only when the bound is reached |
 | 10 | Reason of the PUBREC that refuses an admission | `0x97` Quota exceeded for a rejection for lack of capacity only; `0x83` Implementation specific error for `Fenced`, `PreconditionFailed` and `EpochClosed` | MQTT 5 section 3.5.2.1: `0x83` is "the PUBLISH is valid but the receiver does not accept it". The chapters fix no reason code | `0x97` for every refusal, which states that a quota is the cause when none is; `0x80` Unspecified error, which says less |
-
 | 11 | An admission, or a resolution, when no receipt slot is left | The outcome is unknown and nothing is written. Every receipt, of a commit or of a rejection, and every fence holds a receipt slot, which collection gives back; a certain rejection that could not be recorded would not be certain. The deterministic store of lot L2 does this | DEM-010: an absence is not a rejection. The chapters do not say what bounds rejection receipts and fences | Rejection receipts and fences written without any bound, which grow exactly when capacity is exhausted (the store before its review); or a separate account for them, which can be exhausted the same way |
+| 12 | A PUBLISH replayed after a certain refusal that the client did not observe (the connection was reset before the refusing PUBREC left) | A new admission under a new identity: the refusal took the exchange to `Absent`, so the replay is a first PUBLISH. This is the rule of the registry (`inbound_qos2.admission_pending.rejected.refuse`) and what the core of lot L1 does | Not settled. ARC-011 says that a certain refusal ends the exchange without distribution; neither it nor MQTT 5 section 4.3.3 says what a receiver remembers of a refusal it could not deliver. Either way the message is distributed at most once | Keep a volatile `Refused` slot that answers the replay with the same refusal, as the models M1a and M1b of lot L5 do (`mqttiumd/models/m1/README.md`, "Disagreements with the registry"): the answer to one exchange is then stable, at the price of one more state and of a bound on what is remembered |
 
 Line 10 is in the contract already: `AckReason::ImplementationSpecificError`
 and `AckReason::refusing` (lot L1, on the integration branch). It is needed
@@ -41,9 +41,13 @@ whichever way line 9 is decided.
 
 ## Consequences
 
-- Lines 1 to 8 are rules of `contracts/v1/p1.transitions.json` on the
-  branch of lot L3; they are not on the integration branch yet.
+- Lines 1 to 8 are rules of `contracts/v1/p1.transitions.json`, on the
+  integration branch since the contract stack of lot L3 was merged.
 - If line 9 is decided the other way, the registry gains a rule and a
   bound, and scenario QABS-B changes its expected frames.
+- Line 12 is a disagreement between the registry and the models of lot L5,
+  found by lot L5 by reading the actions; no counterexample was run. Until
+  it is decided, neither side changes (DEM-025), and the correspondence of
+  M1 names the difference.
 - A line that is refused becomes a contract change of lot L3, with the
   counterexample that the alternative closes.
