@@ -375,15 +375,14 @@ def one_admission_per_observed_inbound_exchange(run):
     # admission that is missing, or an exchange that is, may be the very
     # record an incomplete trace lacks.
     stands = False
-    for commit in run.trace.of_kind("StoreCommitStable"):
-        if commit.payload["command_kind"] != "AdmitPublication":
-            continue
-        operation = _key(commit.payload["operation_id"])
+
+    def attribute(operation, commit):
+        """Places the admission of ``operation``, evidenced by ``commit``, in its exchange."""
         kind, session, packet_id = slots.get(operation, (None, None, None))
         if kind != "AdmitPublication" or session not in clients:
             statuses.append(INCONCLUSIVE)
             reasons.append(f"the admission {operation} cannot be attributed: no readable recipe")
-            continue
+            return
         slot = (clients[session], packet_id)
         owner, unknown = None, []
         for exchange in exchanges:
@@ -405,6 +404,40 @@ def one_admission_per_observed_inbound_exchange(run):
         else:
             statuses.append(FAIL)
             reasons.append(f"the admission {operation} belongs to no exchange {slot} had open")
+
+    stable = [
+        commit
+        for commit in run.trace.of_kind("StoreCommitStable")
+        if commit.payload["command_kind"] == "AdmitPublication"
+    ]
+    for commit in stable:
+        attribute(_key(commit.payload["operation_id"]), commit)
+    # A commit can be durable without its StoreCommitStable when the store's
+    # evidence dies with the child: a real kill inside the transaction after
+    # its commit frame (K2b of the plan of lot L7). The recovery that follows
+    # the kill then shows the operation Committed; that is its admission,
+    # once, unless a StoreCommitStable of it came before. In-process the
+    # evidence of the store is never killed: a commit without it did not
+    # happen, whatever a recovery says.
+    kills = run.trace.of_kind("BrokerKilled") if run.trace.broker == "child-process" else []
+    found = set()
+    for page in run.trace.of_kind("RecoveryPageDelivered"):
+        if not any(run.trace.before(kill, page) for kill in kills):
+            continue
+        for fact in page.payload["facts"]:
+            if fact["kind"] != "Operation" or fact["knowledge"] != "Committed":
+                continue
+            operation = _key(fact["operation_id"])
+            if operation in found or slots.get(operation, (None,))[0] != "AdmitPublication":
+                continue
+            found.add(operation)
+            if any(
+                _key(commit.payload["operation_id"]) == operation
+                and run.trace.before(commit, page) is not False
+                for commit in stable
+            ):
+                continue
+            attribute(operation, page)
     for exchange in exchanges:
         admissions = counts[id(exchange)]
         name = f"exchange {exchange.ordinal} of {exchange.client}, Packet Identifier {exchange.packet_id}"

@@ -2247,6 +2247,93 @@ case(
     events=child_after_its_kill,
 )
 
+# --------------------------------- an admission found again at the recovery
+ADMISSION = "one_admission_per_observed_inbound_exchange"
+
+
+def durable_without_its_record(events):
+    # K2b of the kill inside a transaction: the commit of op_A is durable,
+    # the child, the store's evidence with it, is killed before the store
+    # writes StoreCommitStable or a result. After the restart the recovery
+    # shows the operation Committed and the exchange AwaitPubrel; the replay
+    # is answered from it.
+    # The fault that binds op_A is reached by the submission, as the fault
+    # at the commit point of K2b is.
+    for label in ("admit.stable", "admit.ready"):
+        del events[at(events, label)]
+    events[at(events, "hit.lost_admission_result")]["parents"] = ["admit.submitted"]
+    killed()(events)
+
+
+case(
+    "admission-found-again-at-the-recovery",
+    "K2b: the commit is durable and the store wrote no StoreCommitStable before the kill; "
+    "the recovery shows it, and the replay is answered from it: one admission.",
+    events=durable_without_its_record,
+)
+
+
+def applied_then_killed(events):
+    # K3: the commit is stable, the child is killed before the result.
+    del events[at(events, "admit.ready")]
+    events[at(events, "hit.lost_admission_result")]["parents"] = ["admit.stable"]
+    killed()(events)
+
+
+case(
+    "admission-stable-then-killed",
+    "K3: StoreCommitStable is written, the child is killed before the result; one admission.",
+    events=applied_then_killed,
+)
+
+
+def found_again_and_admitted_again(events):
+    # The recovered admission, then a second commit of the same exchange
+    # after the restart: two admissions.
+    durable_without_its_record(events)
+    insert_after(
+        events,
+        "replay.in",
+        [
+            ev(
+                "again.stable",
+                "store-evidence",
+                "StoreCommitStable",
+                {"operation_id": OP_ADMIT, "command_kind": "AdmitPublication"},
+                ["replay.in"],
+                2,
+            )
+        ],
+    )
+
+
+case(
+    "admission-found-again-and-committed-again",
+    "The recovery shows the admission, and the replay is committed a second time: two admissions.",
+    {ADMISSION: "FAIL"},
+    events=found_again_and_admitted_again,
+)
+
+
+def lost_evidence_without_a_kill(events):
+    # The same history in-process: the store's evidence is never killed, so
+    # a commit without its StoreCommitStable did not happen, whatever the
+    # recovery says (acknowledged-without-admission is the same trace).
+    durable_without_its_record(events)
+    events[at(events, "header")]["payload"].pop("broker")
+    del events[at(events, "killed")]
+    for event in events:
+        if event["origin"] == "store-evidence":
+            event["inc"] = 1
+
+
+case(
+    "admission-found-again-without-a-kill",
+    "In-process, no kill: a recovered commit without its StoreCommitStable is no admission.",
+    {ADMISSION: "FAIL", KILL: "PASS"},
+    events=lost_evidence_without_a_kill,
+)
+
 # ---------------------------------------------- a violation of the store (f)
 
 
