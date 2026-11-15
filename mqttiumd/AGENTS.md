@@ -16,6 +16,21 @@ cargo test --workspace --locked
 cargo run -q -p mqttiumd-lab -- validate --contracts contracts/v1 --scenario tests/scenarios/p1/P1-02.json
 ```
 
+`proofs/` is a workspace of its own, so the four commands above do not see
+it. Its scripts are its only verification, and CI runs them in the job
+`pilot proof`; they need Kani (`tools/install-tools.sh kani`):
+
+```bash
+proofs/credits/run.sh                    # preflight, harnesses, witnesses, coverage, digests
+python3 proofs/credits/mutants.py        # each mutant caught as aimed
+python3 proofs/credits/selftest.py       # the scripts refuse what they claim to check
+```
+
+`run.sh` fails when `crates/mqttiumd-core/src/credits.rs`,
+`crates/mqttiumd-contract/src/capacity.rs` or `ids.rs`, or a file of the
+proof, differs from `proofs/credits/BODY.sha256`. After such a change the
+owner of the proof reviews it, runs `run.sh --record` and says so.
+
 The requirement register and the example corpus are derived files. After
 changing a decision record, a chapter digest, scenario P1-02 or the fixture,
 rebuild them; CI fails when they are not up to date:
