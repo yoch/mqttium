@@ -81,6 +81,10 @@ jobs:
           python -m pip install --disable-pip-version-check -r tests/oracle/requirements.txt
           python tests/oracle/build_traces.py --check
           python -m unittest discover -t tests/oracle -s tests/oracle/tests
+      # A successful receipt of a read failure is distinct from a qualifying
+      # business PASS: incomplete durable evidence remains INCONCLUSIVE.
+      - name: Typed durable reads and process-control reception
+        run: tools/run_read_failure_reception.sh "$RUNNER_TEMP/campaigns/read-failures"
       # A campaign runs a scenario through the real core, a store and their
       # adapters, and the oracle judges the directory the runner wrote. The
       # step fails unless the oracle's verdict is PASS. On both stores the
