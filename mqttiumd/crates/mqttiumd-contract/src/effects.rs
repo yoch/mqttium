@@ -417,7 +417,7 @@ impl Outbox {
     /// amendment).
     #[must_use]
     pub fn capacity(&self) -> usize {
-        self.free_slots()
+        self.queue.capacity()
     }
 
     /// Slots neither filled nor reserved.
