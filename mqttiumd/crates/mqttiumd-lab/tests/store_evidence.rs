@@ -688,9 +688,11 @@ fn a_submission_has_the_causes_the_caller_gives() {
         incarnation: 1,
         sequence: 4,
     };
+    // Its own incarnation, which is not the writer's: a cause is
+    // written as it is given.
     let deadline = Cause {
         component: "broker-core",
-        incarnation: 1,
+        incarnation: 2,
         sequence: 9,
     };
     let names: [&str; 0] = [];
