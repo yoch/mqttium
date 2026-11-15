@@ -95,3 +95,90 @@ fn qabs_c_the_fence_is_refused_and_the_command_stays_held() {
         "no acknowledgement while the outcome is unknown"
     );
 }
+
+/// QABS-A with its steps changed: written below the root, in the
+/// ignored build directory, so that the campaign copies it like any
+/// scenario of the checkout.
+fn variant(name: &str, change: impl FnOnce(&mut Vec<serde_json::Value>)) -> String {
+    let root = bench_support::root();
+    let mut scenario: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("tests/scenarios/qabs/QABS-A.json")).unwrap(),
+    )
+    .unwrap();
+    change(scenario["steps"].as_array_mut().unwrap());
+    let relative = format!("target/bench-scenarios/{name}-{}.json", std::process::id());
+    let path = root.join(&relative);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec_pretty(&scenario).unwrap()).unwrap();
+    relative
+}
+
+/// The run is not played to its end: refused before it starts, or
+/// stopped at the step.
+fn not_played(scenario: &str, name: &str) -> String {
+    let out = bench_support::fresh(name);
+    let request = mqttiumd_lab::bench::campaign::Request {
+        root: bench_support::root(),
+        contracts: std::path::PathBuf::from("contracts/v1"),
+        scenario: std::path::PathBuf::from(scenario),
+        out: out.clone(),
+        seed: 1,
+        run_id: Some("bench-test".to_owned()),
+    };
+    let outcome = match mqttiumd_lab::bench::campaign::execute(&request) {
+        Err(refused) => refused,
+        Ok(report) => report
+            .stopped
+            .expect("the run must not be played to its end"),
+    };
+    let _ = std::fs::remove_dir_all(&out);
+    let _ = std::fs::remove_file(bench_support::root().join(scenario));
+    outcome
+}
+
+#[test]
+fn leaving_a_barrier_twice_is_refused() {
+    let scenario = variant("leave-twice", |steps| {
+        let index = steps
+            .iter()
+            .position(|step| step["kind"] == "LeaveBarrier")
+            .unwrap();
+        let again = steps[index].clone();
+        steps.insert(index + 1, again);
+    });
+    let why = not_played(&scenario, "leave-twice");
+    assert!(why.contains("admission_applied"), "{why}");
+}
+
+#[test]
+fn leaving_a_fault_that_is_not_a_barrier_is_refused() {
+    let scenario = variant("leave-hold", |steps| {
+        let index = steps
+            .iter()
+            .position(|step| step["kind"] == "LeaveBarrier")
+            .unwrap();
+        steps[index]["fault"] = serde_json::json!("held_fence");
+    });
+    let why = not_played(&scenario, "leave-hold");
+    assert!(why.contains("held_fence"), "{why}");
+}
+
+#[test]
+fn qabs_a_inspects_at_the_barrier_before_any_result_is_ready() {
+    let campaign =
+        bench_support::run_scenario("tests/scenarios/qabs/QABS-A.json", 1, "qabs-a-barrier");
+    let trace = records(&campaign.trace());
+    let at = |kind: &str| trace.iter().position(|record| record.kind == kind).unwrap();
+    let barrier = trace
+        .iter()
+        .position(|record| {
+            record.kind == "FaultHit" && record.payload["fault_id"] == "admission_applied"
+        })
+        .unwrap();
+    let inspected = at("DurableStateInspected");
+    let ready = at("StoreResultReady");
+    assert!(
+        barrier < inspected && inspected < ready,
+        "{barrier} {inspected} {ready}"
+    );
+}

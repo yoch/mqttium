@@ -1,0 +1,60 @@
+{
+  "format": "mqttiumd-lab.loop-mutants",
+  "version": 1,
+  "description": "Mutations of the real loop of lot L4: each patch, applied to a temporary worktree of the repository, is played by the runner and judged by the oracle of the unmodified tree. A rejected mutation must get the verdict, the assertion with its status (FAIL unless `assertion_status` says otherwise) and a reason holding the fragment below; when `stopped` is given, the campaign must also say that the run stopped, with that fragment. A known survivor is reported and does not fail the run until the finding it names is merged.",
+  "mutants": [
+    {
+      "id": "m1-payload-owed-lost",
+      "patch": "m1-payload-owed-lost.mutant",
+      "mutation": "the store loses the payload its obligations still owe when the exchange is released",
+      "scenario": "tests/scenarios/p1/P1-02.json",
+      "expect": "rejected",
+      "verdict": "FAIL",
+      "assertion": "same_required_obligations_at_both_checkpoints",
+      "reason": "names a payload the store does not hold"
+    },
+    {
+      "id": "m2-result-altered-before-the-core",
+      "patch": "m2-result-altered-before-the-core.mutant",
+      "mutation": "the dispatcher hands the core a certain rejection for lack of capacity where the store rejected for a fence",
+      "scenario": "tests/scenarios/qabs/QABS-B.json",
+      "expect": "rejected",
+      "verdict": "FAIL",
+      "assertion": "broker_inputs_have_provenance",
+      "reason": "the core consumed a result the store adapter did not hand over"
+    },
+    {
+      "id": "m3-positive-ack-too-early",
+      "patch": "m3-positive-ack-too-early.mutant",
+      "mutation": "the core makes PUBREC Success eligible with the submission of the admission, before any commit is known",
+      "scenario": "tests/scenarios/p1/P1-02.json",
+      "expect": "rejected",
+      "verdict": "FAIL",
+      "assertion": "no_positive_ack_before_confirmed_commit",
+      "reason": "eligible before the core knew of a commit"
+    },
+    {
+      "id": "m4-landmarks-ignored",
+      "patch": "m4-landmarks-ignored.mutant",
+      "mutation": "the core no longer matches the answers of its landmark resolutions, so an answer that arrives after more newer resolutions than it keeps recent is absorbed (finding F3)",
+      "scenario": "tests/scenarios/audit/F3-steady-lag.json",
+      "expect": "rejected",
+      "verdict": "INCONCLUSIVE",
+      "assertion": "trace_complete",
+      "assertion_status": "INCONCLUSIVE",
+      "reason": "the footer does not declare the trace complete",
+      "stopped": "step 19 (DriveUntil): nothing is eligible and the awaited event did not happen",
+      "note": "Step 19 waits for the PUBREC that answers the late answer: the run stops there. An interrupted run is never a PASS; whether a wait that can no longer be met is a FAIL is lot L3's to decide."
+    },
+    {
+      "id": "m5-late-unknown-acknowledged",
+      "patch": "m5-late-unknown-acknowledged.mutant",
+      "mutation": "the core answers an unknown result that arrives after the commit of its operation is known with a second PUBREC",
+      "scenario": "tests/scenarios/p1/P1-02b.json",
+      "expect": "rejected",
+      "verdict": "FAIL",
+      "assertion": "terminal_knowledge_never_regresses",
+      "reason": "follows from the unknown answer of record"
+    }
+  ]
+}

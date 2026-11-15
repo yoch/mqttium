@@ -179,3 +179,33 @@ fn f3_answers_with_a_steady_lag_longer_than_the_old_window_make_progress() {
     assert_eq!((pubrec.packet_id, pubrec.reason_code), (Some(7), 0));
     assert!(after <= RESOLUTIONS);
 }
+
+/// The same counterexample as a scenario the oracle judges: the answer
+/// to the first resolution is held while six newer ones run, then
+/// handed over. The bound is the result slots of the fixture: seven
+/// held answers and one command in transit.
+#[test]
+fn f3_as_a_scenario_the_first_answer_after_six_newer_resolutions_commits_the_exchange() {
+    let campaign =
+        bench_support::run_scenario("tests/scenarios/audit/F3-steady-lag.json", 1, "f3-scenario");
+    assert_eq!(campaign.report.stopped, None);
+    assert!(campaign.report.not_reached.is_empty());
+    let trace = bench_support::records(&campaign.trace());
+    let resolutions = trace
+        .iter()
+        .filter(|record| record.kind == "ResolveSubmitted")
+        .count();
+    assert_eq!(resolutions, 7);
+    let late = trace
+        .iter()
+        .position(|record| record.kind == "HeldItemReleased")
+        .expect("the held answer is handed over");
+    let pubrec = trace
+        .iter()
+        .position(|record| {
+            record.kind == "PeerPacketObserved" && record.payload["packet_kind"] == "PUBREC"
+        })
+        .expect("PUBREC");
+    assert!(pubrec > late, "PUBREC answers the late answer");
+    assert_eq!(trace[pubrec].payload["reason_code"], 0);
+}

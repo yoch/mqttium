@@ -72,14 +72,17 @@ jobs:
       # A campaign runs a scenario through the real core, the deterministic
       # store and their adapters, and the oracle judges the directory the
       # runner wrote. The step fails unless the oracle's verdict is PASS.
-      # P1-02b is not listed until its scenario lists only assertions that
-      # apply to it (open conditions): today the oracle answers OUT_OF_SCOPE.
       - name: Campaigns on the deterministic store
         run: |
-          for scenario in p1/P1-02 qabs/QABS-A qabs/QABS-B qabs/QABS-C; do
+          for scenario in p1/P1-02 p1/P1-02b qabs/QABS-A qabs/QABS-B qabs/QABS-C audit/F3-steady-lag; do
             tools/run_campaign.sh "tests/scenarios/$scenario.json" \
               "$RUNNER_TEMP/campaigns/$(basename "$scenario")"
           done
+      # The loop must reject a defect: each mutation of tests/mutants/loop
+      # is applied in a temporary worktree, played, and judged by the
+      # oracle of this tree, and must be refused for its own reason.
+      - name: The loop rejects its mutants
+        run: tools/run_loop_mutants.sh
       - name: Keep the campaign directories
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
