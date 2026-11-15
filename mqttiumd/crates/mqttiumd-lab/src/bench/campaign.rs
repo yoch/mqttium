@@ -36,7 +36,7 @@ use super::process::{Settings, Stop, owner_config};
 use super::runner::{Outcome, Plan, Population, SCHEDULER_VERSION, run};
 use super::scenario::Scenario;
 use crate::files;
-use crate::manifest::{self, sha256_hex};
+use crate::manifest;
 use crate::store::adapter::AdapterLimits;
 use crate::store::durable::{MAX_CLIENT_ID_BYTES, MemoryStore};
 use crate::store::fixture;
@@ -209,20 +209,32 @@ fn keep_modifications(root: &Path, out: &Path) -> Result<Vec<String>, String> {
     Ok(kept)
 }
 
-/// The digest of a set of files of the checkout: one `<sha256>  <path>`
-/// line each, in path order. Missing files are named as missing.
-fn identify(root: &Path, paths: &[String]) -> Value {
+/// The identity of a set of files of the checkout, as the run manifest
+/// states it: each file with its digest and size, in path order, and the
+/// digest of one `<sha256>  <path>` line per file, computed like the
+/// contract digest. A missing file is an error: nothing is identified by
+/// a file that is not there.
+fn identify(root: &Path, paths: &[String]) -> Result<Value, String> {
+    let mut paths = paths.to_vec();
+    paths.sort();
+    paths.dedup();
     let mut listed = Vec::new();
-    let mut lines = String::new();
-    for path in paths {
-        let digest = fs::File::open(root.join(path))
+    let mut digests = Vec::new();
+    for path in &paths {
+        let full = root.join(path);
+        let (digest, bytes) = fs::File::open(&full)
             .and_then(files::hash_stream)
-            .map(|(digest, _)| digest)
-            .unwrap_or_else(|_| "missing".to_owned());
-        lines.push_str(&format!("{digest}  {path}\n"));
-        listed.push(json!({"path": path, "sha256": digest}));
+            .map_err(|error| io(&full, error))?;
+        listed.push(json!({"path": path, "sha256": digest, "bytes": bytes.to_string()}));
+        digests.push(digest);
     }
-    json!({"sha256": sha256_hex(lines.as_bytes()), "files": listed})
+    let digest = manifest::contracts_digest(
+        digests
+            .iter()
+            .zip(&paths)
+            .map(|(digest, path)| (digest.as_str(), path.as_str())),
+    );
+    Ok(json!({"sha256": digest, "files": listed}))
 }
 
 fn python_files(root: &Path, directory: &str) -> Vec<String> {
@@ -446,8 +458,21 @@ pub fn execute(request: &Request) -> Result<Report, String> {
         "PYTHONPATH=tests/oracle python -m mqttiumd_oracle --root {out_text} --contracts {contracts} judge --scenario {scenario_path} --trace trace.jsonl"
     );
 
-    // The manifest: the binary, the checkout, and the parameters.
+    // The manifest: the binary, the oracle and the generators apart, the
+    // checkout, and the parameters.
+    let mut oracle_files = python_files(root, "tests/oracle/mqttiumd_oracle");
+    oracle_files.push("tests/oracle/requirements.txt".to_owned());
+    let oracle = identify(root, &oracle_files)?;
+    let generators = identify(
+        root,
+        &[
+            "tests/oracle/build_traces.py".to_owned(),
+            "tools/build_corpus.py".to_owned(),
+        ],
+    )?;
     let mut run_manifest = manifest::collect(root, Path::new(&contracts))?;
+    run_manifest["oracle"] = oracle.clone();
+    run_manifest["generators"] = generators.clone();
     run_manifest["scenario"] = artifact(out, &scenario_path)?;
     run_manifest["fixture"] = artifact(out, &fixture_path)?;
     run_manifest["backend"] = json!("sim-store");
@@ -546,8 +571,6 @@ pub fn execute(request: &Request) -> Result<Report, String> {
     for path in &paths {
         inventory.push(artifact(out, path)?);
     }
-    let mut oracle_files = python_files(root, "tests/oracle/mqttiumd_oracle");
-    oracle_files.push("tests/oracle/requirements.txt".to_owned());
     let campaign = json!({
         "format": "mqttiumd-lab.campaign",
         "version": 1,
@@ -561,11 +584,8 @@ pub fn execute(request: &Request) -> Result<Report, String> {
         },
         "lab": run_manifest["artifact"].clone(),
         "contracts_digest": workspace.contracts_digest(),
-        "oracle": identify(root, &oracle_files),
-        "generators": identify(root, &[
-            "tests/oracle/build_traces.py".to_owned(),
-            "tools/build_corpus.py".to_owned(),
-        ]),
+        "oracle": oracle,
+        "generators": generators,
         "seed": request.seed.to_string(),
         "scheduler_version": SCHEDULER_VERSION.to_string(),
         "resolution_delay": RESOLUTION_DELAY.to_string(),

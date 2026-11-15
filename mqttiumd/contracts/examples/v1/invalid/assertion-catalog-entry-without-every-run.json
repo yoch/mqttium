@@ -101,7 +101,7 @@
     },
     {
       "name": "refusal_carries_the_reason_of_its_rejection",
-      "meaning": "A PUBREC that refuses an admission carries the reason the transition catalogue gives for the reason of the certain rejection the core received for it, in the same incarnation, before the frame.",
+      "meaning": "A PUBREC that refuses an admission carries the reason the transition catalogue gives for the reason of the certain rejection the core received for it, in the same incarnation, before the frame. It judges the decision of the core on what the core received; that what the core received is what the store produced is the matter of broker_inputs_have_provenance (K1).",
       "every_run": false,
       "requirements": [
         "ARC-011"

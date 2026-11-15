@@ -2385,6 +2385,53 @@ bad(
     man(setter(["contracts_digest"], "6" * 64)),
 )
 
+
+# The oracle and the generators that judged and built a campaign are
+# identified apart from the lab binary (V3-002): each a digest over the
+# files it lists, in path order, as the contract digest is.
+def identified(*files):
+    listed = [{"path": path, "sha256": digest * 64, "bytes": size} for path, digest, size in files]
+    listing = "".join(f"{f['sha256']}  {f['path']}\n" for f in listed)
+    return {"sha256": hashlib.sha256(listing.encode()).hexdigest(), "files": listed}
+
+
+ORACLE = identified(
+    ("tests/oracle/mqttiumd_oracle/judge.py", "7", "52011"),
+    ("tests/oracle/mqttiumd_oracle/trace.py", "8", "9004"),
+)
+GENERATORS = identified(("tools/run_campaign.sh", "9", "1210"))
+ok(
+    "run-manifest-with-oracle-and-generators.json",
+    man(lambda v: v.update(oracle=ORACLE, generators=GENERATORS)),
+)
+bad(
+    "run-manifest-oracle-of-other-files.json",
+    "evidence-mismatch",
+    "/oracle/sha256",
+    "The digest of the oracle is the digest of the files it lists.",
+    man(lambda v: v.update(oracle={**ORACLE, "sha256": "6" * 64})),
+)
+bad(
+    "run-manifest-generators-out-of-order.json",
+    "evidence-mismatch",
+    "/generators/files/1",
+    "The files of a generator are listed once each, in path order.",
+    man(
+        lambda v: v.update(
+            generators=identified(
+                ("tools/run_campaign.sh", "9", "1210"), ("tools/build_corpus.py", "a", "77")
+            )
+        )
+    ),
+)
+bad(
+    "run-manifest-oracle-without-files.json",
+    "schema-violation",
+    "/oracle",
+    "An identity names the files it is the digest of.",
+    man(lambda v: v.update(oracle={"sha256": ORACLE["sha256"]})),
+)
+
 # tiny transition catalogue and registries
 dump(
     EX / "valid/toy.catalog.json",

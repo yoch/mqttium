@@ -201,6 +201,37 @@
         "$ref": "primitives.schema.json#/$defs/text"
       },
       "maxItems": 64
+    },
+    "oracle": {
+      "$ref": "#/$defs/identity",
+      "description": "The oracle that judges the campaign, identified apart from the lab binary: the digest of one `<sha256>  <path>` line per file, in path order."
+    },
+    "generators": {
+      "$ref": "#/$defs/identity",
+      "description": "The generators of the campaign (scripts and tools that wrote its inputs), identified the same way."
+    }
+  },
+  "$defs": {
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sha256",
+        "files"
+      ],
+      "properties": {
+        "sha256": {
+          "$ref": "primitives.schema.json#/$defs/sha256"
+        },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": {
+            "$ref": "primitives.schema.json#/$defs/artifact"
+          }
+        }
+      }
     }
   }
 }

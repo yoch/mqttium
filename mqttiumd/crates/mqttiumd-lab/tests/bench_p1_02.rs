@@ -105,6 +105,27 @@ fn the_manifest_names_the_parameters_and_every_artefact_is_inventoried() {
         let digest = mqttiumd_lab::manifest::sha256_hex(&campaign.file(path));
         assert_eq!(entry["sha256"], digest.as_str(), "{path}");
     }
+    // The oracle and the generators are identified apart from the lab
+    // binary, in the manifest itself, each file by its digest.
+    for part in ["oracle", "generators"] {
+        let files = manifest[part]["files"].as_array().unwrap();
+        assert!(!files.is_empty(), "{part}");
+        let mut lines = String::new();
+        for file in files {
+            let path = file["path"].as_str().unwrap();
+            let bytes = std::fs::read(bench_support::root().join(path)).unwrap();
+            let digest = mqttiumd_lab::manifest::sha256_hex(&bytes);
+            assert_eq!(file["sha256"], digest.as_str(), "{path}");
+            assert_eq!(file["bytes"], bytes.len().to_string().as_str(), "{path}");
+            lines.push_str(&format!("{digest}  {path}\n"));
+        }
+        assert_eq!(
+            manifest[part]["sha256"],
+            mqttiumd_lab::manifest::sha256_hex(lines.as_bytes()).as_str(),
+            "{part}"
+        );
+        assert_eq!(inventory[part], manifest[part], "{part}");
+    }
     assert!(inventory["oracle"]["sha256"].is_string());
     assert!(inventory["generators"]["sha256"].is_string());
     assert!(inventory["lab"]["sha256"].is_string());
