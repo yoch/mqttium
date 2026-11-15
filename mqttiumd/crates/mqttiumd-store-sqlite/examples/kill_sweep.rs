@@ -17,8 +17,11 @@ use std::time::{Duration, Instant};
 
 use mqttiumd_contract::capacity::{PayloadBytes, ReceiptSlots, References};
 use mqttiumd_contract::command::Command as StoreCommand;
+use mqttiumd_contract::packet::SharedBytes;
 use mqttiumd_lab::manifest::sha256_hex;
-use mqttiumd_lab::store::conformance::{World, accounts_match_what_is_held, fixture_limits};
+use mqttiumd_lab::store::conformance::{
+    World, accounts_match_what_is_held, altered, fixture_limits,
+};
 use mqttiumd_lab::store::durable::{DurableState, DurableStore, Limits, MemoryStore};
 use mqttiumd_store_sqlite::SqliteStore;
 use serde_json::{Value, json};
@@ -63,12 +66,21 @@ fn limits() -> Limits {
 }
 
 fn admission<S>(world: &World<S>, n: u64) -> StoreCommand {
-    world.admission(
+    // The conformance fixture's byte builder is capped at 1024. Reuse its
+    // identities and targets, then construct this explorer's larger recipe
+    // and bytes with its own declared bound before anything is submitted.
+    let mut command = world.admission(
         2 * n,
         u16::try_from(n).expect("bounded packet"),
-        &vec![0x5a; PAYLOAD],
+        b"",
         &[world.b, world.c],
-    )
+    );
+    command = altered(&command, |recipe| {
+        recipe.payload.length = PayloadBytes::new(PAYLOAD as u64);
+        recipe.costs.payload_bytes = recipe.payload.length;
+    });
+    command.payload = Some(SharedBytes::copy_from(&vec![0x5a; PAYLOAD], PAYLOAD).expect("bounded"));
+    command
 }
 
 fn prepare<S: DurableStore>(world: &mut World<S>, target: Target) -> StoreCommand {
@@ -354,6 +366,20 @@ fn next(random: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+fn uniform_delay(random: &mut u64, max_us: u64) -> Result<u64, String> {
+    let width = max_us * 1000 + 1;
+    let ceiling = u64::MAX - u64::MAX % width;
+    // Reject the incomplete last bucket, so the requested delay has no
+    // modulo bias. The retry budget is explicit, including generator use.
+    for _ in 0..16 {
+        let value = next(random);
+        if value < ceiling {
+            return Ok(value % width);
+        }
+    }
+    Err("uniform-delay generator exhausted its retry budget".to_owned())
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     if args.len() != 5 {
         return Err(
@@ -428,7 +454,7 @@ fn run(args: &[String]) -> Result<(), String> {
         let delay_ns = if phase == "calibration" {
             CALIBRATION_DELAYS_US[(index / 8) as usize] * 1000
         } else {
-            next(&mut random) % (max_us * 1000 + 1)
+            uniform_delay(&mut random, max_us)?
         };
         let record = match trial(&out, index, delay_ns, seed, target) {
             Ok(record) => {
@@ -498,5 +524,22 @@ fn main() {
     if let Err(error) = result {
         eprintln!("kill sweep: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sweep_command_uses_the_declared_large_payload_and_commits() {
+        let mut world = World::with_limits(&MemoryStore::create, limits());
+        let command = admission(&world, 1);
+        assert_eq!(command.payload.as_ref().unwrap().len(), PAYLOAD);
+        assert!(world.store.apply(&command).committed_now);
+        assert_eq!(
+            world.store.snapshot().accounts.payload_bytes.get(),
+            PAYLOAD as u64
+        );
     }
 }
