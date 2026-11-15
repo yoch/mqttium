@@ -17,6 +17,9 @@ when:
 * a path listed in ``tests`` does not exist. The list holds only files that
   replay a counterexample of the model; a ``refinement`` model has at least
   one, a ``specification`` model may have none yet;
+* a ``refinement`` model does not name, under ``replays``, the test
+  functions that replay it, or one of them is not a function of a file
+  listed in ``tests``;
 * a configuration does not check what its sidecar entry declares. A passing
   entry states its ``invariants`` or its ``property``, and the list is the
   one of the ``.cfg``; a ``violation`` checks its invariant; a temporal
@@ -298,6 +301,34 @@ def check_metadata(name: str, sidecar: dict[str, object]) -> list[str]:
             defects.append(f"{name}: test {test} does not exist")
     if status == "refinement" and not tests:
         defects.append(f"{name}: a refinement model names the tests that replay it")
+    defects.extend(check_replays(name, sidecar, tests))
+    return defects
+
+
+def check_replays(name: str, sidecar: dict[str, object], tests: list[str]) -> list[str]:
+    """Each replay names a test function that exists in a file of 'tests'."""
+    replays = sidecar.get("replays")
+    if replays is None:
+        if sidecar["status"] == "refinement":
+            return [f"{name}: a refinement model names the test functions that replay it"]
+        return []
+    if not isinstance(replays, list) or not all(
+        isinstance(item, dict)
+        and isinstance(item.get("file"), str)
+        and isinstance(item.get("test"), str)
+        for item in replays
+    ):
+        return [f"{name}: 'replays' is a list of {{file, test}}"]
+    defects = []
+    for item in replays:
+        file, test = item["file"], item["test"]
+        if file not in tests:
+            defects.append(f"{name}: replay file {file} is not in 'tests'")
+            continue
+        path = REPOSITORY / file
+        text = path.read_text(encoding="utf-8") if path.is_file() else ""
+        if not re.search(rf"^\s*(?:pub\s+)?fn\s+{re.escape(test)}\s*\(", text, re.MULTILINE):
+            defects.append(f"{name}: replay {test} is not a test of {file}")
     return defects
 
 
