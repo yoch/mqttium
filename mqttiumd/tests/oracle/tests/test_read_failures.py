@@ -109,6 +109,7 @@ class ReadFailures(unittest.TestCase):
 
     def test_a_partial_recovery_does_not_authorize_a_positive_ack(self):
         _, run = self.run_of(partial_recovery=True, incomplete=True)
+        self.assertEqual(judge.no_positive_ack_before_confirmed_commit(run).status, "FAIL")
         self.assertEqual(judge.judge(run)[ACK].status, "FAIL")
 
     def test_produce_preserves_the_typed_failure_context(self):
