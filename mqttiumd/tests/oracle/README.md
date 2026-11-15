@@ -89,6 +89,8 @@ provenance of packets is not asked of a run that has no transport.
 | `same_required_obligations_at_both_checkpoints` | The obligations of the first checkpoint, by DeliveryId, destination, cause, effective QoS and payload reference, against what the fixture's routes require and against every later checkpoint |
 | `same_recipe_for_op_A` | The bytes stored for the operation a `FaultHit` names, in every snapshot taken after its commit |
 | `no_positive_ack_before_confirmed_commit` | For each positive PUBREC or PUBCOMP, an earlier record of the same incarnation of the core: a committed result delivered to it, or a recovered fact that is sufficient. That the store had committed is not one |
+| `fenced_operation_never_executed` | No commit follows the fence of an operation in the trace, and no snapshot holds an operation both fenced and committed |
+| `certain_rejection_has_a_closure` | Each certain refusal the store reports against what closes it: a fence written before it in the trace, or a fence or a receipt of rejection in a snapshot. An absence that was only read closes nothing (DEM-MU-01) |
 | `no_pubrec_observed_before_crash` | What the peer observed before the crash record |
 | `broker_inputs_have_provenance` | Each input the core consumed against its counterpart: a submission in flight, an armed deadline, a page the store adapter read, bytes the transport received |
 
@@ -127,6 +129,7 @@ is refused.
 
 ## What does not exist yet
 
-- Scenario files for QABS-A, B and C.
+- A run of the QABS scenarios: `tests/scenarios/qabs/` and hand-made traces
+  of the three orders exist; no bench plays them yet.
 
 `docs/reception/open-conditions.md` keeps the rows these close.

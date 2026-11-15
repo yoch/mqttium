@@ -80,16 +80,7 @@
       }
     }
   ],
-  "fences": [
-    {
-      "operation_id": {
-        "incarnation": "1",
-        "epoch": "1",
-        "owner": "0",
-        "sequence": "1"
-      }
-    }
-  ],
+  "fences": [],
   "payloads": [
     {
       "payload_id": {

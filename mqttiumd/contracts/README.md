@@ -82,10 +82,32 @@ A scenario does not wait for a fault whose `expected_hits` is 0.
 **What a point carries.** Each injection point `carries` a command or a
 result, and offers only actions that act on it: `hold_command` on a
 command; `drop_result`, `delay_result` and `duplicate_result` on a result;
-`barrier` on either. On a point that carries a result, `match.result_of`
+`refuse_fence` on the fence of a resolution, which is a command of the
+writer; `barrier` on either. On a point that carries a result, `match.result_of`
 selects the result of a `Persist` or of a `ResolveAndFence` about a
 matching operation; without it, every result about a matching operation
 counts, in the order they become ready.
+
+**Where a fence waits.** A resolution enters the writer and reads what is
+established for its operation. A receipt, a fence or a retired identity
+answers it. An absence brings it to the point `store.fence.transit`, the
+`occurrence` being counted over the resolutions of the operation that read
+an absence. There:
+
+- `hold_command` sets the fence aside until `ReleaseHeldCommand`. The
+  read of the absence is not a decision: the fence is written only if the
+  operation is still absent when the held fence enters the writer. If the
+  command committed meanwhile (QABS-A) the resolution answers `Committed`
+  and writes no fence; otherwise it fences (QABS-B), and the command
+  released afterwards is refused without effect;
+- `refuse_fence` makes the write of this one fence impossible: the
+  resolution answers `PendingOrUnknown` (QABS-C), nothing else changes and
+  the store stays available. The trace records it as `StoreFenceRefused`,
+  so that a refused fence is never inferred from a missing
+  `StoreFenceStable`.
+
+A held command does not by itself prevent a fence: a store fences whenever
+it can write the fence.
 
 **One fault per item.** Two faults of a scenario never select the same
 command or result. Two selections on one point, for one command kind, with
@@ -126,8 +148,8 @@ core consumed:
 | Recovery page | `RecoveryPageDelivered` | `RecoveryPageRead` of the store adapter with the same content |
 
 `InputRefused` is what the dispatcher records when it refuses a result
-that answers no effect in flight. `StoreCommitStable`, `StoreFenceStable`
-and `StoreResultReady` are hidden truth of the store: they judge a run and
+that answers no effect in flight. `StoreCommitStable`, `StoreFenceStable`,
+`StoreFenceRefused` and `StoreResultReady` are hidden truth of the store: they judge a run and
 are never an input. `FaultHit` names the operation and effect it stopped,
 when there is one, and `HeldItemReleased` the fault whose command or
 result a step handed over.

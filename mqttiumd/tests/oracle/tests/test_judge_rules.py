@@ -223,5 +223,74 @@ class Rules(unittest.TestCase):
         self.assertEqual(self.statuses(edit)[PROVENANCE], "FAIL")
 
 
+class Closures(unittest.TestCase):
+    """What makes a certain refusal certain, on the history of QABS-B."""
+
+    CLOSURE = "certain_rejection_has_a_closure"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.contracts = Contracts.open(ROOT)
+        cls.fixture = parse(
+            (ROOT / "tests/fixtures/p1/three-persistent-sessions.json").read_bytes()
+        )
+        cls.scenario = parse((ROOT / "tests/scenarios/qabs/QABS-B.json").read_bytes())
+
+    def status(self, edit=lambda events: None, edit_state=lambda state: None):
+        events = corpus.qabs_b()
+        edit(events)
+        states = corpus.qabs_b_snapshots("in-memory")
+        edit_state(states["final"])
+        records = corpus.render("in-memory", events, states)
+        trace = read(self.contracts, [json.dumps(record).encode() + b"\n" for record in records])
+        self.assertEqual((trace.unreadable, trace.incomplete), ([], []))
+        run = judge.Run(self.contracts, self.scenario, self.fixture, trace)
+        for record in trace.of_kind("DurableStateInspected"):
+            run.snapshots[record.payload["checkpoint"]] = (record, states["final"])
+        return judge.judge(run)[self.CLOSURE].status
+
+    @staticmethod
+    def without_fence_record(events):
+        del events[corpus.at(events, "fence.stable")]
+        events[corpus.at(events, "fenced.ready")]["parents"] = ["released.held_fence"]
+
+    def test_a_fence_written_before_the_refusal_closes_it(self):
+        # The snapshot was taken before any fence could show: the trace is enough.
+        self.assertEqual(self.status(edit_state=lambda state: state.update(fences=[])), "PASS")
+
+    def test_a_receipt_of_rejection_closes_it(self):
+        # A refusal by a guard writes no fence; its receipt keeps it refused.
+        def receipt(state):
+            state["fences"] = []
+            state["operations"] = [
+                {
+                    "operation_id": corpus.OP_ADMIT,
+                    "recipe_hex": corpus.admit_recipe(
+                        corpus.OP_ADMIT, corpus.PUB, corpus.PAYLOAD_ID, 1
+                    ),
+                    "decision": {"kind": "RejectedCertain", "reason": "PreconditionFailed"},
+                }
+            ]
+
+        self.assertEqual(self.status(self.without_fence_record, receipt), "PASS")
+
+    def test_a_fence_the_snapshot_holds_closes_it(self):
+        self.assertEqual(self.status(self.without_fence_record), "PASS")
+
+    def test_nothing_written_closes_nothing(self):
+        self.assertEqual(
+            self.status(self.without_fence_record, lambda state: state.update(fences=[])), "FAIL"
+        )
+
+    def test_a_fence_written_after_the_refusal_does_not_close_it(self):
+        def late(events):
+            fence = events.pop(corpus.at(events, "fence.stable"))
+            events[corpus.at(events, "fenced.ready")]["parents"] = ["released.held_fence"]
+            fence["parents"] = ["fenced.delivered"]
+            corpus.insert_after(events, "fenced.delivered", [fence])
+
+        self.assertEqual(self.status(late, lambda state: state.update(fences=[])), "FAIL")
+
+
 if __name__ == "__main__":
     unittest.main()

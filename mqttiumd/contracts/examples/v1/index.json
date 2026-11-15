@@ -445,9 +445,9 @@
       "why": "A refused fence is not written and not kept: nothing is left to release."
     },
     {
-      "file": "contracts/examples/v1/invalid/scenario-refuse-fence-on-a-command-in-transit.json",
+      "file": "contracts/examples/v1/invalid/scenario-refuse-fence-where-no-fence-waits.json",
       "code": "fault-action-unknown",
-      "pointer": "/faults/0/action",
+      "pointer": "/faults/3/action",
       "why": "Only the point where a fence waits offers to refuse it."
     },
     {
@@ -513,7 +513,7 @@
     {
       "file": "contracts/examples/v1/invalid/fault-catalog-refuse-fence-on-a-result-point.json",
       "code": "fault-action-unknown",
-      "pointer": "/points/2/actions/3",
+      "pointer": "/points/3/actions/3",
       "why": "A fence is a command of the writer: a point that carries a result cannot refuse one."
     },
     {

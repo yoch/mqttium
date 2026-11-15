@@ -32,6 +32,7 @@ PASS, FAIL, INCONCLUSIVE, OUT_OF_SCOPE = "PASS", "FAIL", "INCONCLUSIVE", "OUT_OF
 # trace, so it stands even when the trace is incomplete. For the others a
 # missing record could be the very one that justifies what was observed.
 MONOTONE = {
+    "fenced_operation_never_executed",
     "one_admission_per_observed_inbound_exchange",
     "same_required_obligations_at_both_checkpoints",
     "same_recipe_for_op_A",
@@ -630,7 +631,86 @@ def broker_inputs_have_provenance(run):
     return Status(_worst(statuses), reasons)
 
 
+def _closures(run):
+    """OperationId -> the snapshots' word that it is closed: fenced, or refused by receipt."""
+    closed = set()
+    for _, snapshot in run.snapshots.values():
+        closed.update(_key(row["operation_id"]) for row in snapshot["fences"])
+        closed.update(
+            _key(row["operation_id"])
+            for row in snapshot["operations"]
+            if row["decision"]["kind"] == "RejectedCertain"
+        )
+    return closed
+
+
+def fenced_operation_never_executed(run):
+    """A fenced or refused identity is never committed (DEM-010, V3-006)."""
+    statuses, reasons = [], []
+    commits = {}
+    for record in run.trace.of_kind("StoreCommitStable"):
+        commits.setdefault(_key(record.payload["operation_id"]), []).append(record)
+    for fence in run.trace.of_kind("StoreFenceStable"):
+        operation = _key(fence.payload["operation_id"])
+        for commit in commits.get(operation, []):
+            order = run.trace.before(fence, commit)
+            if order is None:
+                statuses.append(INCONCLUSIVE)
+                reasons.append(
+                    f"record {commit.sequence}: not ordered with the fence of {operation}"
+                )
+            elif order:
+                statuses.append(FAIL)
+                reasons.append(
+                    f"record {commit.sequence}: {operation} is committed after its fence"
+                )
+    for name, (_, snapshot) in run.snapshots.items():
+        closed = {_key(row["operation_id"]) for row in snapshot["fences"]}
+        for row in snapshot["operations"]:
+            if row["decision"]["kind"] == "Committed" and _key(row["operation_id"]) in closed:
+                statuses.append(FAIL)
+                reasons.append(f"{name}: {_key(row['operation_id'])} is both fenced and committed")
+    unusable = [name for name in run.checkpoints() if name not in run.snapshots]
+    if unusable and FAIL not in statuses:
+        return Status(
+            INCONCLUSIVE, [f"{name}: {run.missing.get(name, 'no snapshot')}" for name in unusable]
+        )
+    return Status(_worst(statuses), reasons)
+
+
+def certain_rejection_has_a_closure(run):
+    """A certain refusal rests on a fence or a receipt, never on a read absence (DEM-MU-01)."""
+    closed = _closures(run)
+    unusable = [name for name in run.checkpoints() if name not in run.snapshots]
+    statuses, reasons = [], []
+    fences = run.trace.of_kind("StoreFenceStable")
+    for record in run.trace.of_kind("StoreResultReady", "StoreResultDelivered"):
+        if record.payload["outcome"] != "RejectedCertain":
+            continue
+        operation = _key(record.payload["operation_id"])
+        fenced_before = [
+            run.trace.before(fence, record)
+            for fence in fences
+            if _key(fence.payload["operation_id"]) == operation
+        ]
+        if any(fenced_before) or operation in closed:
+            continue
+        if None in fenced_before or unusable:
+            statuses.append(INCONCLUSIVE)
+            reasons.append(
+                f"record {record.sequence}: the closure of {operation} cannot be established"
+            )
+        else:
+            statuses.append(FAIL)
+            reasons.append(
+                f"record {record.sequence}: {operation} is refused with certainty and nothing closes it"
+            )
+    return Status(_worst(statuses), reasons)
+
+
 ASSERTIONS = {
+    "fenced_operation_never_executed": fenced_operation_never_executed,
+    "certain_rejection_has_a_closure": certain_rejection_has_a_closure,
     "one_admission_per_observed_inbound_exchange": one_admission_per_observed_inbound_exchange,
     "same_required_obligations_at_both_checkpoints": same_required_obligations_at_both_checkpoints,
     "same_recipe_for_op_A": same_recipe_for_op_A,

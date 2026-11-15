@@ -17,7 +17,7 @@
         "publication_binding": "pub_A"
       },
       "occurrence": "1",
-      "action": "refuse_fence",
+      "action": "hold_command",
       "bind_operation_as": "op_A",
       "expected_hits": "1"
     },
@@ -47,7 +47,7 @@
     },
     {
       "id": "refused_fence",
-      "point": "store.fence.transit",
+      "point": "store.commit.applied",
       "match": {
         "command_kind": "AdmitPublication",
         "publication_binding": "pub_A"

@@ -86,6 +86,7 @@ def _requirements(contracts, holder, base, keys, out):
 _ACTS_ON = {
     "barrier": None,
     "hold_command": "command",
+    "refuse_fence": "command",
     "drop_result": "result",
     "delay_result": "result",
     "duplicate_result": "result",

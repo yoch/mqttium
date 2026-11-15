@@ -34,7 +34,7 @@
     },
     {
       "id": "late_rejection",
-      "point": "store.result.ready",
+      "point": "store.result.consume",
       "match": {
         "command_kind": "AdmitPublication",
         "publication_binding": "pub_A",

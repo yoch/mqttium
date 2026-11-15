@@ -1722,7 +1722,7 @@ def qabs_b():
             # The old command is put back in circulation: refused, no effect.
             released("held_admission"),
             ready("late.ready", 1, "RejectedCertain", "released.held_admission"),
-            fault_hit("late_rejection", "store.result.ready", "late.ready"),
+            fault_hit("late_rejection", "store.result.consume", "late.ready"),
             inspected("final"),
         ]
     )
@@ -1817,9 +1817,9 @@ def executed_after_fence(events):
 
 def executed_state(states):
     run = states["final"]["run_id"]
-    committed_state = snapshot(run, "final", [FIRST])
-    committed_state["fences"] = [{"operation_id": OP_ADMIT}]
-    states["final"] = committed_state
+    # The fence is known from the trace alone: this snapshot shows only the
+    # commit, so that the admission can be attributed.
+    states["final"] = snapshot(run, "final", [FIRST])
 
 
 qabs(
@@ -1829,6 +1829,21 @@ qabs(
     letter="B",
     events=executed_after_fence,
     snapshots=executed_state,
+)
+
+
+def fenced_and_committed(states):
+    run = states["final"]["run_id"]
+    states["final"] = snapshot(run, "final", [FIRST])
+    states["final"]["fences"] = [{"operation_id": OP_ADMIT}]
+
+
+qabs(
+    "snapshot-holds-a-fenced-commit",
+    "No commit is in the trace, yet the store holds the operation both fenced and committed.",
+    {"fenced_operation_never_executed": "FAIL"},
+    letter="B",
+    snapshots=fenced_and_committed,
 )
 
 

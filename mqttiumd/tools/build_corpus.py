@@ -715,11 +715,11 @@ bad(
     held(setter(["steps", RELEASE, "fault"], "refused_fence")),
 )
 bad(
-    "scenario-refuse-fence-on-a-command-in-transit.json",
+    "scenario-refuse-fence-where-no-fence-waits.json",
     "fault-action-unknown",
-    "/faults/0/action",
+    "/faults/3/action",
     "Only the point where a fence waits offers to refuse it.",
-    held(setter(["faults", 0, "action"], "refuse_fence")),
+    held(setter(["faults", 3, "point"], "store.commit.applied")),
 )
 bad(
     "scenario-deliver-while-crashed.json",
@@ -809,9 +809,9 @@ bad(
 bad(
     "fault-catalog-refuse-fence-on-a-result-point.json",
     "fault-action-unknown",
-    "/points/2/actions/3",
+    "/points/3/actions/3",
     "A fence is a command of the writer: a point that carries a result cannot refuse one.",
-    (lambda v: (v["points"][2]["actions"].append("refuse_fence"), v)[1])(copy.deepcopy(FAULTS)),
+    (lambda v: (v["points"][3]["actions"].append("refuse_fence"), v)[1])(copy.deepcopy(FAULTS)),
 )
 bad(
     "fault-catalog-action-nobody-defines.json",

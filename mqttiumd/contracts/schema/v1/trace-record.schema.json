@@ -121,7 +121,8 @@
         "RecoveryPageDelivered",
         "InputRefused",
         "HeldItemReleased",
-        "DurableStateInspected"
+        "DurableStateInspected",
+        "StoreFenceRefused"
       ]
     },
     "payload": {
@@ -748,6 +749,30 @@
           "origin_component": {
             "enum": [
               "bench-supervisor"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "StoreFenceRefused"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StoreFenceRefused"
+          },
+          "origin_component": {
+            "enum": [
+              "store-evidence"
             ]
           }
         }
@@ -1580,6 +1605,22 @@
         },
         "snapshot": {
           "$ref": "primitives.schema.json#/$defs/artifact"
+        }
+      }
+    },
+    "StoreFenceRefused": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_id",
+        "operation_id"
+      ],
+      "properties": {
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
         }
       }
     }

@@ -182,7 +182,7 @@ fn entry_names<'a>(document: &'a Value, list: &str, key: &str) -> Vec<(String, &
 fn acts_on(action: &str) -> Option<Option<&'static str>> {
     match action {
         "barrier" => Some(None),
-        "hold_command" => Some(Some("command")),
+        "hold_command" | "refuse_fence" => Some(Some("command")),
         "drop_result" | "delay_result" | "duplicate_result" => Some(Some("result")),
         _ => None,
     }
