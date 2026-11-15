@@ -132,10 +132,24 @@ seconds): a child that writes nothing stops the run. The settings the
 child's engine read back are compared by the supervisor to those the
 manifest records. The child computes its settings and its faults from
 the campaign directory, the sessions and the faults still armed that the
-supervisor passes on its command line. A crash is still simulated in this
-step: the child drops the adapter and the connection of the writer,
-reports, and exits on its own; the supervisor waits for its exit with a
-status of success before it starts the next child on the same file.
+supervisor passes on its command line.
+
+`CrashBroker` in a child is a real kill. The child is drained between two
+actions, so the kill happens at the point its last decisive record
+describes, after that record is acknowledged. The supervisor sends
+`SIGKILL` to the process identifier `spawn` gave
+(`std::process::Child::kill`), waits for the wait status and accepts only
+the end by signal 9 with no exit code, reads the descriptors of the child
+to their end and stops the run if a record arrives after the kill; it
+then writes `BrokerCrashed` and the closed connections, and starts the
+next child on the same file only once the end of the killed one is
+confirmed. `campaign.json` states it: `covers.crash` ("process killed:
+SIGKILL to pid …, wait status signal 9"), `kills` (process identifier,
+start-up, signal sent, wait status) and `failure_model` with the
+statement above. The process identifier never enters the trace. A
+contract record of the kill (`BrokerKilled`) is asked of lot L3; until it
+exists, the trace carries none. A child that stops without a crash exits
+on its own with a status of success.
 
 ## Causal parents of the supervisor and the peers
 
