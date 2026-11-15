@@ -18,7 +18,7 @@ Run from the ``mqttiumd`` directory::
     python tools/build_corpus.py --check   # fail if a derived file is not up to date
 
 After editing a chapter digest, a decision record, the base scenario, the fixture or the
-fault catalogue (invalid examples are edits of it), run it without ``--check`` and commit the
+fault or assertion catalogue (invalid examples are edits of them), run it without ``--check`` and commit the
 result. Standard library only.
 """
 
@@ -798,6 +798,16 @@ bad(
     "/points/0",
     "Every injection point says whether a command or a result passes through it.",
     (lambda v: (v["points"][0].pop("carries"), v)[1])(copy.deepcopy(FAULTS)),
+)
+
+# assertion catalogue
+ASSERTION_CATALOG = json.loads((V1 / "assertions.json").read_text())
+bad(
+    "assertion-catalog-entry-without-every-run.json",
+    "schema-violation",
+    "/assertions/0",
+    "Every assertion says whether every run owes it or only the scenarios that list it.",
+    (lambda v: (v["assertions"][0].pop("every_run", None), v)[1])(copy.deepcopy(ASSERTION_CATALOG)),
 )
 
 # fixture

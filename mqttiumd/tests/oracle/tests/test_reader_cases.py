@@ -95,8 +95,18 @@ class QualifyingResult(Scratch):
 
     def test_an_assertion_the_scenario_does_not_list_is_refused(self):
         result = self.passing()
-        result["assertions"].append({"name": "broker_inputs_have_provenance", "status": "PASS"})
+        result["assertions"].append({"name": "same_recipe_for_op_B", "status": "PASS"})
         self.assertEqual(self.check(result), ["result-incomplete"])
+
+    def test_an_assertion_every_run_owes_cannot_be_left_out(self):
+        # P1-02 lists neither; every run owes both (ADR 0003, DEM-MU-03).
+        for name in ("trace_complete", "broker_inputs_have_provenance"):
+            with self.subTest(name):
+                result = self.passing()
+                kept = [entry for entry in result["assertions"] if entry["name"] != name]
+                self.assertEqual(len(kept), len(result["assertions"]) - 1)
+                result["assertions"] = kept
+                self.assertEqual(self.check(result), ["result-incomplete"])
 
     def test_an_assertion_of_the_scenario_cannot_be_out_of_scope(self):
         result = self.passing()

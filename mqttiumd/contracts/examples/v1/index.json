@@ -506,6 +506,12 @@
       "why": "Every injection point says whether a command or a result passes through it."
     },
     {
+      "file": "contracts/examples/v1/invalid/assertion-catalog-entry-without-every-run.json",
+      "code": "schema-violation",
+      "pointer": "/assertions/0",
+      "why": "Every assertion says whether every run owes it or only the scenarios that list it."
+    },
+    {
       "file": "contracts/examples/v1/invalid/fixture-route-target-unknown.json",
       "code": "client-unknown",
       "pointer": "/routes/0/targets/1/client",

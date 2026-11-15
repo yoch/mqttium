@@ -1,0 +1,75 @@
+{
+  "format": "mqttiumd.assertion-catalog",
+  "schema_version": 1,
+  "assertions": [
+    {
+      "name": "one_admission_per_observed_inbound_exchange",
+      "meaning": "Each inbound exchange, identified independently by the client and the oracle, has exactly one internal admission. A fresh ExchangeId does not reset the count.",
+      "requirements": [
+        "ADM-006",
+        "ARC-011",
+        "V3-003",
+        "DEM-017",
+        "DEM-019"
+      ]
+    },
+    {
+      "name": "same_required_obligations_at_both_checkpoints",
+      "meaning": "Both checkpoints hold the same obligations: DeliveryId, target SessionId, cause, effective QoS and payload reference. A count of two is not enough.",
+      "requirements": [
+        "DUR-003",
+        "ROUTE-001",
+        "DEM-017"
+      ]
+    },
+    {
+      "name": "same_recipe_for_op_A",
+      "meaning": "The canonical recipe stored for the operation bound as op_A is byte-identical at every observation.",
+      "requirements": [
+        "DEM-009",
+        "V3-003"
+      ]
+    },
+    {
+      "name": "no_positive_ack_before_confirmed_commit",
+      "meaning": "No positive acknowledgement is eligible before the core received a confirmation or recovered a sufficient durable fact, even if the store had committed.",
+      "requirements": [
+        "ACK-001",
+        "V3-003",
+        "DEM-019"
+      ]
+    },
+    {
+      "name": "no_pubrec_observed_before_crash",
+      "meaning": "The peer decoder observed no PUBREC of the exchange before the crash.",
+      "requirements": [
+        "DEM-012",
+        "DEM-017"
+      ]
+    },
+    {
+      "name": "broker_inputs_have_provenance",
+      "meaning": "Every input the core consumed is a recovery page the store adapter read, a result or a deadline answering an effect still in flight, or a packet from bytes the transport received; and no input was refused for lack of correlation.",
+      "requirements": [
+        "DEM-008",
+        "DEM-012",
+        "V3-004"
+      ]
+    },
+    {
+      "name": "all_required_faults_hit",
+      "meaning": "Every declared injection was reached exactly as many times as expected; otherwise the run is inconclusive.",
+      "requirements": [
+        "V3-001",
+        "DEM-013"
+      ]
+    },
+    {
+      "name": "trace_complete",
+      "meaning": "The trace has its header, a gapless record sequence per origin and a footer declaring completeness.",
+      "requirements": [
+        "DEM-016"
+      ]
+    }
+  ]
+}
