@@ -986,6 +986,1763 @@
         "DEM-MU-05"
       ],
       "justification": "ADR 0001: a deadline for an operation that became terminal is ignored as stale. Its token is never reused."
+    },
+    {
+      "id": "inbound_qos2.absent.pubrel.not_found",
+      "machine": "inbound_qos2",
+      "state_class": "Absent",
+      "event_class": "Pubrel",
+      "guard_partition": {
+        "effect_capacity": [
+          "sufficient"
+        ]
+      },
+      "disposition": "REJECT",
+      "next_state_class": "Absent",
+      "required_effects": [
+        "EmitPubcompNotFound"
+      ],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubcomp"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ARC-011",
+        "ADM-005"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-05"
+      ],
+      "justification": "ARC-011: an unknown PUBREL follows an explicit protocol rule and makes no publication. MQTT 5 answers PUBCOMP with Packet Identifier not found."
+    },
+    {
+      "id": "inbound_qos2.absent.pubrel.defer",
+      "machine": "inbound_qos2",
+      "state_class": "Absent",
+      "event_class": "Pubrel",
+      "guard_partition": {
+        "effect_capacity": [
+          "insufficient"
+        ]
+      },
+      "disposition": "DEFER",
+      "next_state_class": "Absent",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-006"
+      ],
+      "witnesses": [
+        "P1-19"
+      ],
+      "mutations": [
+        "MU-25"
+      ]
+    },
+    {
+      "id": "inbound_qos2.absent.admission_result.stale",
+      "machine": "inbound_qos2",
+      "state_class": "Absent",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "identity": [
+          "stale"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "Absent",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ARC-011",
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-06",
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-04",
+        "MU-17"
+      ],
+      "justification": "ARC-011: a late return of an old operation does not end, start or acknowledge an exchange."
+    },
+    {
+      "id": "inbound_qos2.absent.admission_result.current",
+      "machine": "inbound_qos2",
+      "state_class": "Absent",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ]
+      },
+      "disposition": "UNREACHABLE",
+      "next_state_class": "Absent",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ARC-011",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-06"
+      ],
+      "mutations": [],
+      "justification": "The slot holds no exchange, so no result can belong to it: a result is correlated to an effect the owner emitted for an exchange it holds (ADR 0003)."
+    },
+    {
+      "id": "inbound_qos2.absent.release_result.stale",
+      "machine": "inbound_qos2",
+      "state_class": "Absent",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "stale"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "Absent",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ARC-011",
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-06",
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-04",
+        "MU-17"
+      ],
+      "justification": "ARC-011: a late return of an old operation does not end, start or acknowledge an exchange."
+    },
+    {
+      "id": "inbound_qos2.absent.release_result.current",
+      "machine": "inbound_qos2",
+      "state_class": "Absent",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ]
+      },
+      "disposition": "UNREACHABLE",
+      "next_state_class": "Absent",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ARC-011",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-06"
+      ],
+      "mutations": [],
+      "justification": "The slot holds no exchange, so no result can belong to it: a result is correlated to an effect the owner emitted for an exchange it holds (ADR 0003)."
+    },
+    {
+      "id": "inbound_qos2.admission_pending.pubrel.close",
+      "machine": "inbound_qos2",
+      "state_class": "AdmissionPending",
+      "event_class": "Pubrel",
+      "guard_partition": {
+        "effect_capacity": [
+          "sufficient"
+        ]
+      },
+      "disposition": "CLOSE",
+      "next_state_class": "AdmissionPending",
+      "required_effects": [
+        "CloseConnection"
+      ],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ADM-005",
+        "ARC-011",
+        "ACK-001"
+      ],
+      "witnesses": [],
+      "mutations": [
+        "MU-01"
+      ],
+      "justification": "No PUBREC of this exchange was ever made eligible, so a conforming client cannot send its PUBREL. The connection is closed for the protocol error; the admission keeps its operation and its resolution continues. Answering PUBCOMP would end an exchange whose admission may yet commit."
+    },
+    {
+      "id": "inbound_qos2.admission_pending.pubrel.defer",
+      "machine": "inbound_qos2",
+      "state_class": "AdmissionPending",
+      "event_class": "Pubrel",
+      "guard_partition": {
+        "effect_capacity": [
+          "insufficient"
+        ]
+      },
+      "disposition": "DEFER",
+      "next_state_class": "AdmissionPending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "CloseConnection",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-006"
+      ],
+      "witnesses": [
+        "P1-19"
+      ],
+      "mutations": [
+        "MU-25"
+      ]
+    },
+    {
+      "id": "inbound_qos2.admission_pending.rejected.refuse",
+      "machine": "inbound_qos2",
+      "state_class": "AdmissionPending",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "rejected_certain"
+        ],
+        "effect_capacity": [
+          "sufficient"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "Absent",
+      "required_effects": [
+        "EmitPubrecRefusal"
+      ],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec"
+      ],
+      "resource_delta_class": "release",
+      "requirements": [
+        "ARC-011",
+        "DEM-010",
+        "V3-006"
+      ],
+      "witnesses": [
+        "P1-01",
+        "P1-11"
+      ],
+      "mutations": [
+        "MU-08",
+        "DEM-MU-01"
+      ],
+      "justification": "ARC-011: a certain refusal ends the exchange without distribution and answers as the protocol says, with a PUBREC that carries a failure."
+    },
+    {
+      "id": "inbound_qos2.admission_pending.rejected.defer",
+      "machine": "inbound_qos2",
+      "state_class": "AdmissionPending",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "rejected_certain"
+        ],
+        "effect_capacity": [
+          "insufficient"
+        ]
+      },
+      "disposition": "DEFER",
+      "next_state_class": "AdmissionPending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-006"
+      ],
+      "witnesses": [
+        "P1-19"
+      ],
+      "mutations": [
+        "MU-25"
+      ]
+    },
+    {
+      "id": "inbound_qos2.admission_pending.unknown.keep",
+      "machine": "inbound_qos2",
+      "state_class": "AdmissionPending",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "unknown"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "AdmissionPending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ARC-011",
+        "IO-002",
+        "DEM-010",
+        "ACK-001"
+      ],
+      "witnesses": [
+        "P1-02b",
+        "QABS-C"
+      ],
+      "mutations": [
+        "MU-02",
+        "DEM-MU-01"
+      ],
+      "justification": "ARC-011: an unknown result keeps the operation and reconciles. The answer publishes nothing: the deadline armed with the resolution starts the next one (ADR 0001)."
+    },
+    {
+      "id": "inbound_qos2.admission_pending.retired.unreachable",
+      "machine": "inbound_qos2",
+      "state_class": "AdmissionPending",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "retired"
+        ]
+      },
+      "disposition": "UNREACHABLE",
+      "next_state_class": "AdmissionPending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-02"
+      ],
+      "mutations": [],
+      "justification": "S0 retires no identity space: collection is outside the profile, and the closing of an epoch at restart answers RejectedCertain. RetiredOutcomeUnavailable cannot be reported for an operation the slot still waits for."
+    },
+    {
+      "id": "inbound_qos2.admission_pending.admission_result.stale",
+      "machine": "inbound_qos2",
+      "state_class": "AdmissionPending",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "identity": [
+          "stale"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "AdmissionPending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ARC-011",
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-06"
+      ],
+      "mutations": [
+        "MU-04"
+      ],
+      "justification": "ARC-011: a late return of an old operation must not end the new exchange. The commit it reports is reconciled by the command machine."
+    },
+    {
+      "id": "inbound_qos2.admission_pending.release_result.stale",
+      "machine": "inbound_qos2",
+      "state_class": "AdmissionPending",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "stale"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "AdmissionPending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ARC-011",
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-06",
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-04",
+        "MU-17"
+      ],
+      "justification": "ARC-011: the late result of the release of an earlier exchange does not touch the exchange that reuses its Packet Identifier."
+    },
+    {
+      "id": "inbound_qos2.admission_pending.release_result.current",
+      "machine": "inbound_qos2",
+      "state_class": "AdmissionPending",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ]
+      },
+      "disposition": "UNREACHABLE",
+      "next_state_class": "AdmissionPending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ARC-011",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-03"
+      ],
+      "mutations": [],
+      "justification": "A release is created only from AwaitPubrel, by the PUBREL of the exchange: before that no release of this exchange exists whose result could arrive."
+    },
+    {
+      "id": "inbound_qos2.await_pubrel.release_result.stale",
+      "machine": "inbound_qos2",
+      "state_class": "AwaitPubrel",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "stale"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "AwaitPubrel",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ARC-011",
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-06",
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-04",
+        "MU-17"
+      ],
+      "justification": "ARC-011: the late result of the release of an earlier exchange does not touch the exchange that reuses its Packet Identifier."
+    },
+    {
+      "id": "inbound_qos2.await_pubrel.release_result.current",
+      "machine": "inbound_qos2",
+      "state_class": "AwaitPubrel",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ]
+      },
+      "disposition": "UNREACHABLE",
+      "next_state_class": "AwaitPubrel",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ARC-011",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-03"
+      ],
+      "mutations": [],
+      "justification": "A release is created only from AwaitPubrel, by the PUBREL of the exchange: before that no release of this exchange exists whose result could arrive."
+    },
+    {
+      "id": "inbound_qos2.await_pubrel.admission_result.repeat",
+      "machine": "inbound_qos2",
+      "state_class": "AwaitPubrel",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "outcome": [
+          "committed",
+          "retired"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "AwaitPubrel",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010",
+        "V3-003"
+      ],
+      "witnesses": [
+        "P1-10",
+        "P1-02b"
+      ],
+      "mutations": [
+        "MU-17",
+        "DEM-MU-05"
+      ],
+      "justification": "DEM-010: knowledge is monotonic. The admission of the exchange is known committed; a repeated commit or an answer after collection changes nothing and acknowledges nothing again."
+    },
+    {
+      "id": "inbound_qos2.await_pubrel.admission_result.rejected_stale",
+      "machine": "inbound_qos2",
+      "state_class": "AwaitPubrel",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "identity": [
+          "stale"
+        ],
+        "outcome": [
+          "rejected_certain"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "AwaitPubrel",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ARC-011",
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-06"
+      ],
+      "mutations": [
+        "MU-04"
+      ]
+    },
+    {
+      "id": "inbound_qos2.await_pubrel.admission_result.contradiction",
+      "machine": "inbound_qos2",
+      "state_class": "AwaitPubrel",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "rejected_certain"
+        ]
+      },
+      "disposition": "FAULT",
+      "next_state_class": "AwaitPubrel",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010"
+      ],
+      "witnesses": [],
+      "mutations": [],
+      "justification": "DEM-010: two contradictory terminal results for one recipe are an internal fault, with a stop and a diagnostic."
+    },
+    {
+      "id": "inbound_qos2.release_pending.publish.close",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "PublishQos2",
+      "guard_partition": {
+        "effect_capacity": [
+          "sufficient"
+        ]
+      },
+      "disposition": "CLOSE",
+      "next_state_class": "ReleasePending",
+      "required_effects": [
+        "CloseConnection"
+      ],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ADM-006",
+        "ADM-005",
+        "ARC-011"
+      ],
+      "witnesses": [],
+      "mutations": [
+        "DEM-MU-04"
+      ],
+      "justification": "ADM-006: during the exchange a PUBLISH creates no second publication. After its PUBREL a client may only resend PUBREL, so the connection is closed for the protocol error and the release continues."
+    },
+    {
+      "id": "inbound_qos2.release_pending.publish.defer",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "PublishQos2",
+      "guard_partition": {
+        "effect_capacity": [
+          "insufficient"
+        ]
+      },
+      "disposition": "DEFER",
+      "next_state_class": "ReleasePending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "CloseConnection",
+        "EmitPubrec"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-006"
+      ],
+      "witnesses": [
+        "P1-19"
+      ],
+      "mutations": [
+        "MU-25"
+      ]
+    },
+    {
+      "id": "inbound_qos2.release_pending.pubrel.replay",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "Pubrel",
+      "guard_partition": {},
+      "disposition": "TRANSITION",
+      "next_state_class": "ReleasePending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ADM-005",
+        "ACK-001",
+        "ARC-011"
+      ],
+      "witnesses": [
+        "P1-03",
+        "P1-09"
+      ],
+      "mutations": [
+        "MU-05",
+        "MU-01"
+      ],
+      "justification": "ADM-005 and ACK-001: a replayed PUBREL asks for no second release and gets no PUBCOMP before the release is known committed. PUBCOMP goes to the connection that is current when the release completes."
+    },
+    {
+      "id": "inbound_qos2.release_pending.admission_result.repeat",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "outcome": [
+          "committed",
+          "unknown",
+          "retired"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "ReleasePending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010",
+        "V3-003"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-17",
+        "DEM-MU-05"
+      ],
+      "justification": "DEM-010: the admission of the exchange is known committed; no later answer about an admission changes the release in progress."
+    },
+    {
+      "id": "inbound_qos2.release_pending.admission_result.rejected_stale",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "identity": [
+          "stale"
+        ],
+        "outcome": [
+          "rejected_certain"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "ReleasePending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ARC-011",
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-06"
+      ],
+      "mutations": [
+        "MU-04"
+      ]
+    },
+    {
+      "id": "inbound_qos2.release_pending.admission_result.contradiction",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "AdmissionResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "rejected_certain"
+        ]
+      },
+      "disposition": "FAULT",
+      "next_state_class": "ReleasePending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010"
+      ],
+      "witnesses": [],
+      "mutations": [],
+      "justification": "DEM-010: two contradictory terminal results for one recipe are an internal fault, with a stop and a diagnostic."
+    },
+    {
+      "id": "inbound_qos2.release_pending.rejected.prepare_again",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "rejected_certain"
+        ],
+        "effect_capacity": [
+          "sufficient"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "ReleasePending",
+      "required_effects": [
+        "Persist"
+      ],
+      "forbidden_effects": [
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-009",
+        "V3-006",
+        "ACK-001",
+        "ADM-005"
+      ],
+      "witnesses": [
+        "P1-11",
+        "QABS-B"
+      ],
+      "mutations": [
+        "MU-08",
+        "MU-01"
+      ],
+      "justification": "DEM-009: after a certain refusal a new preparation gets another OperationId and keeps the logical request. The exchange is still durably open, the client is owed a PUBCOMP only after a commit, and on a live connection it will not send PUBREL again."
+    },
+    {
+      "id": "inbound_qos2.release_pending.rejected.defer",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "rejected_certain"
+        ],
+        "effect_capacity": [
+          "insufficient"
+        ]
+      },
+      "disposition": "DEFER",
+      "next_state_class": "ReleasePending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-006"
+      ],
+      "witnesses": [
+        "P1-19"
+      ],
+      "mutations": [
+        "MU-25"
+      ]
+    },
+    {
+      "id": "inbound_qos2.release_pending.unknown.keep",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "unknown"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "ReleasePending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "IO-002",
+        "DEM-010",
+        "ACK-001"
+      ],
+      "witnesses": [
+        "P1-09"
+      ],
+      "mutations": [
+        "MU-02",
+        "DEM-MU-01"
+      ],
+      "justification": "An unknown result keeps the release and reconciles; nothing is published by the answer itself."
+    },
+    {
+      "id": "inbound_qos2.release_pending.retired.unreachable",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "current"
+        ],
+        "outcome": [
+          "retired"
+        ]
+      },
+      "disposition": "UNREACHABLE",
+      "next_state_class": "ReleasePending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010",
+        "DEM-015"
+      ],
+      "witnesses": [
+        "P1-02"
+      ],
+      "mutations": [],
+      "justification": "S0 retires no identity space: collection is outside the profile, and the closing of an epoch at restart answers RejectedCertain. RetiredOutcomeUnavailable cannot be reported for an operation the slot still waits for."
+    },
+    {
+      "id": "inbound_qos2.release_pending.release_result.stale",
+      "machine": "inbound_qos2",
+      "state_class": "ReleasePending",
+      "event_class": "ReleaseResult",
+      "guard_partition": {
+        "identity": [
+          "stale"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "ReleasePending",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "EmitPubrec",
+        "EmitPubrecRefusal",
+        "EmitPubcomp",
+        "EmitPubcompNotFound"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "ARC-011",
+        "DEM-010"
+      ],
+      "witnesses": [
+        "P1-06",
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-04",
+        "MU-17"
+      ],
+      "justification": "ARC-011: the late result of an older release does not end the exchange that waits for its own."
+    },
+    {
+      "id": "command.prepared.result.unreachable",
+      "machine": "command",
+      "state_class": "Prepared",
+      "event_class": "StoreResult",
+      "guard_partition": {},
+      "disposition": "UNREACHABLE",
+      "next_state_class": "Prepared",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "ResolveAndFence",
+        "ArmDeadline"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-015",
+        "V3-006"
+      ],
+      "witnesses": [
+        "P1-01"
+      ],
+      "mutations": [],
+      "justification": "A result, a deadline and a repetition all follow a submission: a result answers an effect in flight (ADR 0003), a deadline is armed after the adapter accepted Persist (ADR 0001), and nothing was presented to the store yet."
+    },
+    {
+      "id": "command.prepared.timeout.unreachable",
+      "machine": "command",
+      "state_class": "Prepared",
+      "event_class": "ResultTimeout",
+      "guard_partition": {},
+      "disposition": "UNREACHABLE",
+      "next_state_class": "Prepared",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "ResolveAndFence",
+        "ArmDeadline"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-015",
+        "V3-006"
+      ],
+      "witnesses": [
+        "P1-02b"
+      ],
+      "mutations": [],
+      "justification": "A result, a deadline and a repetition all follow a submission: a result answers an effect in flight (ADR 0003), a deadline is armed after the adapter accepted Persist (ADR 0001), and nothing was presented to the store yet."
+    },
+    {
+      "id": "command.prepared.replay.unreachable",
+      "machine": "command",
+      "state_class": "Prepared",
+      "event_class": "Replay",
+      "guard_partition": {},
+      "disposition": "UNREACHABLE",
+      "next_state_class": "Prepared",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist",
+        "ResolveAndFence",
+        "ArmDeadline"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-015",
+        "V3-006"
+      ],
+      "witnesses": [
+        "P1-01"
+      ],
+      "mutations": [],
+      "justification": "A result, a deadline and a repetition all follow a submission: a result answers an effect in flight (ADR 0003), a deadline is armed after the adapter accepted Persist (ADR 0001), and nothing was presented to the store yet."
+    },
+    {
+      "id": "command.submitted.submit.refuse",
+      "machine": "command",
+      "state_class": "Submitted",
+      "event_class": "Submit",
+      "guard_partition": {},
+      "disposition": "REJECT",
+      "next_state_class": "Submitted",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "DEM-009"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-03"
+      ],
+      "justification": "V3-006: a submission freezes the recipe and the OperationId, once. A second submission of the same identity is refused; after a certain refusal a new preparation takes another OperationId (DEM-009)."
+    },
+    {
+      "id": "command.indeterminate.submit.refuse",
+      "machine": "command",
+      "state_class": "Indeterminate",
+      "event_class": "Submit",
+      "guard_partition": {},
+      "disposition": "REJECT",
+      "next_state_class": "Indeterminate",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "DEM-009"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-03"
+      ],
+      "justification": "V3-006: a submission freezes the recipe and the OperationId, once. A second submission of the same identity is refused; after a certain refusal a new preparation takes another OperationId (DEM-009)."
+    },
+    {
+      "id": "command.committed.submit.refuse",
+      "machine": "command",
+      "state_class": "Committed",
+      "event_class": "Submit",
+      "guard_partition": {},
+      "disposition": "REJECT",
+      "next_state_class": "Committed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "DEM-009"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-03"
+      ],
+      "justification": "V3-006: a submission freezes the recipe and the OperationId, once. A second submission of the same identity is refused; after a certain refusal a new preparation takes another OperationId (DEM-009)."
+    },
+    {
+      "id": "command.rejected.submit.refuse",
+      "machine": "command",
+      "state_class": "RejectedCertain",
+      "event_class": "Submit",
+      "guard_partition": {},
+      "disposition": "REJECT",
+      "next_state_class": "RejectedCertain",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "DEM-009"
+      ],
+      "witnesses": [
+        "P1-11"
+      ],
+      "mutations": [
+        "MU-08"
+      ],
+      "justification": "V3-006: a submission freezes the recipe and the OperationId, once. A second submission of the same identity is refused; after a certain refusal a new preparation takes another OperationId (DEM-009)."
+    },
+    {
+      "id": "command.consumed.submit.refuse",
+      "machine": "command",
+      "state_class": "Consumed",
+      "event_class": "Submit",
+      "guard_partition": {},
+      "disposition": "REJECT",
+      "next_state_class": "Consumed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "DEM-009"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-03"
+      ],
+      "justification": "V3-006: a submission freezes the recipe and the OperationId, once. A second submission of the same identity is refused; after a certain refusal a new preparation takes another OperationId (DEM-009)."
+    },
+    {
+      "id": "command.receipt_closed.submit.refuse",
+      "machine": "command",
+      "state_class": "ReceiptClosed",
+      "event_class": "Submit",
+      "guard_partition": {},
+      "disposition": "REJECT",
+      "next_state_class": "ReceiptClosed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "DEM-009"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-03"
+      ],
+      "justification": "V3-006: a submission freezes the recipe and the OperationId, once. A second submission of the same identity is refused; after a certain refusal a new preparation takes another OperationId (DEM-009)."
+    },
+    {
+      "id": "command.submitted.result.retired",
+      "machine": "command",
+      "state_class": "Submitted",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "retired"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "ReceiptClosed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "DEM-010"
+      ],
+      "witnesses": [],
+      "mutations": [
+        "MU-02",
+        "MU-09"
+      ],
+      "justification": "V3-006: the identity is definitively not executable and the detail of its result is no longer available. The command is closed without inventing a precise result; responsibilities it may have committed are not released."
+    },
+    {
+      "id": "command.indeterminate.result.retired",
+      "machine": "command",
+      "state_class": "Indeterminate",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "retired"
+        ]
+      },
+      "disposition": "TRANSITION",
+      "next_state_class": "ReceiptClosed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "DEM-010"
+      ],
+      "witnesses": [],
+      "mutations": [
+        "MU-02",
+        "MU-09"
+      ],
+      "justification": "V3-006: the identity is definitively not executable and the detail of its result is no longer available. The command is closed without inventing a precise result; responsibilities it may have committed are not released."
+    },
+    {
+      "id": "command.submitted.replay.same",
+      "machine": "command",
+      "state_class": "Submitted",
+      "event_class": "Replay",
+      "guard_partition": {
+        "recipe": [
+          "same"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "Submitted",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "DEM-009"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-03"
+      ],
+      "justification": "V3-006: a repetition of the same recipe is never a second execution. The store answers from what it holds for the identity."
+    },
+    {
+      "id": "command.submitted.replay.mismatch",
+      "machine": "command",
+      "state_class": "Submitted",
+      "event_class": "Replay",
+      "guard_partition": {
+        "recipe": [
+          "different"
+        ]
+      },
+      "disposition": "FAULT",
+      "next_state_class": "Submitted",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-009",
+        "V3-003"
+      ],
+      "witnesses": [
+        "P1-05"
+      ],
+      "mutations": [
+        "MU-03"
+      ],
+      "justification": "DEM-009: the same OperationId presented with another recipe is an internal violation, without a second effect."
+    },
+    {
+      "id": "command.indeterminate.replay.same",
+      "machine": "command",
+      "state_class": "Indeterminate",
+      "event_class": "Replay",
+      "guard_partition": {
+        "recipe": [
+          "same"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "Indeterminate",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "DEM-009"
+      ],
+      "witnesses": [
+        "QABS-A",
+        "P1-05"
+      ],
+      "mutations": [
+        "MU-02",
+        "MU-03"
+      ],
+      "justification": "V3-006: a repetition of the same recipe is never a second execution. The store answers from what it holds for the identity."
+    },
+    {
+      "id": "command.indeterminate.replay.mismatch",
+      "machine": "command",
+      "state_class": "Indeterminate",
+      "event_class": "Replay",
+      "guard_partition": {
+        "recipe": [
+          "different"
+        ]
+      },
+      "disposition": "FAULT",
+      "next_state_class": "Indeterminate",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-009",
+        "V3-003"
+      ],
+      "witnesses": [
+        "P1-05"
+      ],
+      "mutations": [
+        "MU-03"
+      ],
+      "justification": "DEM-009: the same OperationId presented with another recipe is an internal violation, without a second effect."
+    },
+    {
+      "id": "command.committed.replay.same",
+      "machine": "command",
+      "state_class": "Committed",
+      "event_class": "Replay",
+      "guard_partition": {
+        "recipe": [
+          "same"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "Committed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "DEM-009"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-17"
+      ],
+      "justification": "V3-006: a repetition of the same recipe is never a second execution. The store answers from what it holds for the identity."
+    },
+    {
+      "id": "command.committed.replay.mismatch",
+      "machine": "command",
+      "state_class": "Committed",
+      "event_class": "Replay",
+      "guard_partition": {
+        "recipe": [
+          "different"
+        ]
+      },
+      "disposition": "FAULT",
+      "next_state_class": "Committed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-009",
+        "V3-003"
+      ],
+      "witnesses": [
+        "P1-05"
+      ],
+      "mutations": [
+        "MU-03"
+      ],
+      "justification": "DEM-009: the same OperationId presented with another recipe is an internal violation, without a second effect."
+    },
+    {
+      "id": "command.rejected.replay.same",
+      "machine": "command",
+      "state_class": "RejectedCertain",
+      "event_class": "Replay",
+      "guard_partition": {
+        "recipe": [
+          "same"
+        ]
+      },
+      "disposition": "REJECT",
+      "next_state_class": "RejectedCertain",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "DEM-009"
+      ],
+      "witnesses": [
+        "P1-11",
+        "QABS-B"
+      ],
+      "mutations": [
+        "MU-08",
+        "DEM-MU-01"
+      ],
+      "justification": "V3-006: a refused identity stays refused, also after quota is released; it never becomes an admission."
+    },
+    {
+      "id": "command.rejected.replay.mismatch",
+      "machine": "command",
+      "state_class": "RejectedCertain",
+      "event_class": "Replay",
+      "guard_partition": {
+        "recipe": [
+          "different"
+        ]
+      },
+      "disposition": "FAULT",
+      "next_state_class": "RejectedCertain",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-009",
+        "V3-003"
+      ],
+      "witnesses": [
+        "P1-05"
+      ],
+      "mutations": [
+        "MU-03"
+      ],
+      "justification": "DEM-009: the same OperationId presented with another recipe is an internal violation, without a second effect."
+    },
+    {
+      "id": "command.consumed.replay.same",
+      "machine": "command",
+      "state_class": "Consumed",
+      "event_class": "Replay",
+      "guard_partition": {
+        "recipe": [
+          "same"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "Consumed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "V3-006",
+        "DEM-009"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-17"
+      ],
+      "justification": "V3-006: a repetition of the same recipe is never a second execution. The store answers from what it holds for the identity."
+    },
+    {
+      "id": "command.consumed.replay.mismatch",
+      "machine": "command",
+      "state_class": "Consumed",
+      "event_class": "Replay",
+      "guard_partition": {
+        "recipe": [
+          "different"
+        ]
+      },
+      "disposition": "FAULT",
+      "next_state_class": "Consumed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-009",
+        "V3-003"
+      ],
+      "witnesses": [
+        "P1-05"
+      ],
+      "mutations": [
+        "MU-03"
+      ],
+      "justification": "DEM-009: the same OperationId presented with another recipe is an internal violation, without a second effect."
+    },
+    {
+      "id": "command.committed.result.retired",
+      "machine": "command",
+      "state_class": "Committed",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "retired"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "Committed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010"
+      ],
+      "witnesses": [],
+      "mutations": [
+        "DEM-MU-05"
+      ],
+      "justification": "DEM-010: an answer after collection reopens nothing; the established result stands."
+    },
+    {
+      "id": "command.rejected.result.repeat",
+      "machine": "command",
+      "state_class": "RejectedCertain",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "rejected_certain",
+          "retired"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "RejectedCertain",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010",
+        "V3-006"
+      ],
+      "witnesses": [
+        "P1-11"
+      ],
+      "mutations": [
+        "MU-08"
+      ],
+      "justification": "DEM-010: a refusal stays a refusal; a repeated refusal or an answer after collection changes nothing."
+    },
+    {
+      "id": "command.consumed.result.repeat",
+      "machine": "command",
+      "state_class": "Consumed",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "committed",
+          "unknown",
+          "retired"
+        ]
+      },
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "Consumed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010",
+        "V3-003"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-17",
+        "DEM-MU-05"
+      ],
+      "justification": "Consumed is a committed result whose dependent effects the owner has published. A repeated commit, a late unknown answer or an answer after collection is applied once and changes nothing."
+    },
+    {
+      "id": "command.consumed.result.contradiction",
+      "machine": "command",
+      "state_class": "Consumed",
+      "event_class": "StoreResult",
+      "guard_partition": {
+        "outcome": [
+          "rejected_certain"
+        ]
+      },
+      "disposition": "FAULT",
+      "next_state_class": "Consumed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010"
+      ],
+      "witnesses": [],
+      "mutations": [],
+      "justification": "DEM-010: two contradictory terminal results for one recipe are an internal fault, with a stop and a diagnostic."
+    },
+    {
+      "id": "command.receipt_closed.result.late",
+      "machine": "command",
+      "state_class": "ReceiptClosed",
+      "event_class": "StoreResult",
+      "guard_partition": {},
+      "disposition": "IGNORE_STALE",
+      "next_state_class": "ReceiptClosed",
+      "required_effects": [],
+      "forbidden_effects": [
+        "Persist"
+      ],
+      "resource_delta_class": "none",
+      "requirements": [
+        "DEM-010",
+        "V3-006"
+      ],
+      "witnesses": [
+        "P1-10"
+      ],
+      "mutations": [
+        "MU-09"
+      ],
+      "justification": "DEM-010: an answer after collection reopens nothing. The detail of the collected result is gone, so no later answer can be judged against it."
     }
   ]
 }

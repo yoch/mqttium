@@ -8,11 +8,11 @@
       "values": [
         {
           "value": "current",
-          "meaning": "The event belongs to the operation and exchange generation the state waits for."
+          "meaning": "The event belongs to the exchange generation the slot holds and, where the state waits for an operation, to that operation."
         },
         {
           "value": "stale",
-          "meaning": "The event belongs to an older operation or exchange generation."
+          "meaning": "The event belongs to an older operation or exchange generation, or the slot holds no exchange it could belong to."
         }
       ]
     },
@@ -146,7 +146,9 @@
     "LoadWork",
     "EmitConnack",
     "EmitPubrec",
+    "EmitPubrecRefusal",
     "EmitPubcomp",
+    "EmitPubcompNotFound",
     "CloseConnection",
     "ArmDeadline",
     "Continue"
