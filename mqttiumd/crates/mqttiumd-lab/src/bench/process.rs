@@ -1381,3 +1381,7 @@ impl<S: DurableStore> Process<S> {
         Ok((crashed.store, open))
     }
 }
+
+#[cfg(test)]
+#[path = "process_read_tests.rs"]
+mod process_read_tests;

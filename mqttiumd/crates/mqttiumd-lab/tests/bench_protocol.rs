@@ -43,7 +43,12 @@ fn child(
     let mut control = BufWriter::new(control);
     let frame = read_frame(&mut actions).map_err(|error| error.to_string())?;
     let action = Action::decode(&frame.ok_or("no action")?).map_err(|error| error.to_string())?;
-    if action != (Action::Start { rank: 0 }) {
+    if action
+        != (Action::Start {
+            rank: 0,
+            recovery_page: 64,
+        })
+    {
         return Err(format!("unexpected {action:?}"));
     }
     let mut window = Window::new();
@@ -134,7 +139,15 @@ fn more_records_than_the_window_flow_without_a_deadlock_and_in_order() {
     reader(supervisor_store, Some("store-evidence"), sender.clone());
     reader(supervisor_control, None, sender);
     let mut actions = supervisor_actions;
-    write_frame(&mut actions, &Action::Start { rank: 0 }.encode()).unwrap();
+    write_frame(
+        &mut actions,
+        &Action::Start {
+            rank: 0,
+            recovery_page: 64,
+        }
+        .encode(),
+    )
+    .unwrap();
 
     let mut sequencer = Sequencer::new();
     let mut seen = 0_u64;

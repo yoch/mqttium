@@ -17,7 +17,8 @@
 //! The runner computes no verdict. When a step cannot be played (an
 //! expectation of the scenario that did not hold, a budget exhausted, a
 //! component that stopped), the run stops there and its trace is
-//! declared incomplete; the oracle concludes nothing from it.
+//! declared incomplete; the oracle reports missing proofs as INCONCLUSIVE
+//! while preserving any violation already established as FAIL.
 
 use std::collections::BTreeMap;
 
@@ -287,28 +288,9 @@ impl<B: Backend> Runner<'_, B> {
 
     /// Record the stable type independently of the optional human diagnostic.
     fn retain_failure(&mut self, error: &Stop) {
-        let Some(failure) = error.failure else {
-            return;
-        };
-        let mut payload = failure.payload();
-        if !error.message.is_empty() {
-            payload["message"] = json!(&error.message);
-        }
-        let record_sequence = self.collector.count();
-        if self
-            .collector
-            .emit(
-                Origin::BenchSupervisor,
-                failure.record_kind(),
-                &[],
-                payload.clone(),
-            )
-            .is_ok()
-        {
+        if let Some(payload) = record_failure(&mut self.collector, error) {
             self.failure_count = self.failure_count.saturating_add(1);
             if self.failures.len() < 64 {
-                payload["kind"] = json!(failure.record_kind());
-                payload["record_sequence"] = json!(record_sequence.to_string());
                 self.failures.push(payload);
             }
         }
@@ -917,6 +899,63 @@ impl<B: Backend> Runner<'_, B> {
                 self.start()
             }
         }
+    }
+}
+
+fn record_failure(collector: &mut Collector, error: &Stop) -> Option<Value> {
+    let failure = error.failure?;
+    let mut payload = failure.payload();
+    if !error.message.is_empty() {
+        payload["message"] = json!(&error.message);
+    }
+    let sequence = collector.count();
+    collector
+        .emit(
+            Origin::BenchSupervisor,
+            failure.record_kind(),
+            &[],
+            payload.clone(),
+        )
+        .ok()?;
+    payload["kind"] = json!(failure.record_kind());
+    payload["record_sequence"] = json!(sequence.to_string());
+    Some(payload)
+}
+
+/// A typed fixture/create failure is still a run observation, before any
+/// process can be started. The ordinary campaign writer retains these facts.
+pub(crate) fn failed_before_start(
+    scenario: &Scenario,
+    backend: &str,
+    in_child: bool,
+    mut collector: Collector,
+    error: Stop,
+) -> Outcome {
+    let mut header = json!({"scenario_id": scenario.id, "backend": backend, "perimeter":"full"});
+    if in_child {
+        header["broker"] = json!("child-process");
+    }
+    let _ = collector.emit(Origin::BenchSupervisor, "TraceHeader", &[], header);
+    let failures: Vec<Value> = record_failure(&mut collector, &error).into_iter().collect();
+    let (trace, refused) = collector.finish(false);
+    Outcome {
+        trace,
+        snapshots: Vec::new(),
+        choices: Vec::new(),
+        stopped: Some(format!("setup: {error}")),
+        failure_count: failures.len() as u64,
+        failures,
+        hits: vec![0; scenario.faults.len()],
+        not_reached: scenario
+            .faults
+            .iter()
+            .map(|fault| format!("{}: 0 hits, {} expected", fault.id, fault.expected_hits))
+            .collect(),
+        refused: refused.iter().map(ToString::to_string).collect(),
+        unwritten: BTreeMap::new(),
+        steps_played: 0,
+        elementary: 0,
+        kills: Vec::new(),
     }
 }
 

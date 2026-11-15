@@ -156,14 +156,19 @@ impl KindTable {
             else {
                 continue;
             };
-            let Some(origins) = rule
-                .pointer("/then/properties/origin_component/enum")
-                .and_then(Value::as_array)
-            else {
+            let Some(origin_rule) = rule.pointer("/then/properties/origin_component") else {
                 continue;
             };
+            let origins: Vec<&Value> =
+                if let Some(names) = origin_rule.get("enum").and_then(Value::as_array) {
+                    names.iter().collect()
+                } else if let Some(name) = origin_rule.get("const") {
+                    vec![name]
+                } else {
+                    continue;
+                };
             let origins = origins
-                .iter()
+                .into_iter()
                 .map(|name| {
                     name.as_str()
                         .and_then(Origin::from_name)
@@ -600,11 +605,20 @@ mod tests {
 
     #[test]
     fn the_failure_kinds_accept_the_schemas_constant_origin() {
-        let schema = crate::strict::parse(include_bytes!("../../../../contracts/schema/v1/trace-record.schema.json")).unwrap();
+        let schema = crate::strict::parse(include_bytes!(
+            "../../../../contracts/schema/v1/trace-record.schema.json"
+        ))
+        .unwrap();
         let kinds = KindTable::from_schema(&schema).unwrap();
         for kind in ["DurableReadFailed", "ProcessControlFailed"] {
-            assert!(kinds.allows(kind, Origin::BenchSupervisor), "{kind} must reach the surviving collector");
-            assert!(!kinds.allows(kind, Origin::BrokerCore), "the child may not forge supervisor failures");
+            assert!(
+                kinds.allows(kind, Origin::BenchSupervisor),
+                "{kind} must reach the surviving collector"
+            );
+            assert!(
+                !kinds.allows(kind, Origin::BrokerCore),
+                "the child may not forge supervisor failures"
+            );
         }
     }
 

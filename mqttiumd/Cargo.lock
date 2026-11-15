@@ -391,6 +391,7 @@ dependencies = [
  "mqttiumd-store-api",
  "mqttiumd-store-sqlite",
  "proc-macro2",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

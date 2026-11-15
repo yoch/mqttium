@@ -5,6 +5,19 @@ use serde_json::{Value, json};
 
 pub const MAX_FAILURE_MESSAGE: usize = 1024;
 
+/// Effective reader budgets, copied into each campaign instead of inferred.
+pub fn read_budgets() -> Value {
+    let describe = |budget: mqttiumd_store_api::ReadBudget| {
+        json!({
+            "max_rows": budget.max_rows.to_string(), "max_bytes": budget.max_bytes.to_string(),
+            "max_field_bytes": budget.max_field_bytes.to_string(),
+        })
+    };
+    json!({"snapshot":describe(mqttiumd_store_api::ReadBudget::SNAPSHOT),
+        "page":describe(mqttiumd_store_api::ReadBudget::PAGE),
+        "max_recovery_inventory_rows":mqttiumd_store_api::MAX_RECOVERY_INVENTORY_ROWS.to_string()})
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReadCause {
     Error(ReadError),
@@ -158,7 +171,9 @@ impl Failure {
         }) {
             return None;
         }
-        let incarnation = object.get("process_incarnation")?.as_str()?.parse().ok()?;
+        let incarnation =
+            mqttiumd_contract::decimal::parse_u64(object.get("process_incarnation")?.as_str()?)
+                .ok()?;
         let code = object.get("code")?.as_str()?;
         let phase = object.get("phase")?.as_str()?;
         match object.get("kind")?.as_str()? {
@@ -184,7 +199,7 @@ impl Failure {
                     _ => return None,
                 };
                 let page = match object.get("page") {
-                    Some(page) => Some(page.as_str()?.parse().ok()?),
+                    Some(page) => Some(mqttiumd_contract::decimal::parse_u64(page.as_str()?).ok()?),
                     None => None,
                 };
                 Some(Self::Read {
@@ -311,3 +326,54 @@ impl std::fmt::Display for Stop {
 }
 
 impl std::error::Error for Stop {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_causes_round_trip_without_interpreting_the_diagnostic() {
+        for code in [
+            ReadError::InvalidData,
+            ReadError::LimitExceeded,
+            ReadError::Unavailable,
+            ReadError::Io,
+            ReadError::AllocationFailed,
+        ] {
+            let cause = Failure::Read {
+                cause: code.into(),
+                phase: ReadPhase::Recovery,
+                process_incarnation: 3,
+                page: Some(1),
+            };
+            assert_eq!(Failure::from_wire(&cause.to_wire()), Some(cause));
+            let diagnostic =
+                Stop::read(code, ReadPhase::Recovery, 3, Some(1)).context("unrelated text");
+            assert_eq!(diagnostic.failure, Some(cause));
+        }
+        let cause = Failure::Control {
+            code: ControlCode::TruncatedFrame,
+            phase: ControlPhase::KillDrain,
+            process_incarnation: 2,
+        };
+        assert_eq!(Failure::from_wire(&cause.to_wire()), Some(cause));
+        let mut unknown = cause.to_wire();
+        unknown["code"] = json!("some text mentioning InvalidData");
+        assert_eq!(Failure::from_wire(&unknown), None);
+        let mut invalid_phase = cause.to_wire();
+        invalid_phase["phase"] = json!("Recovery");
+        assert_eq!(Failure::from_wire(&invalid_phase), None);
+    }
+
+    #[test]
+    fn failure_context_is_bounded_on_utf8_boundaries() {
+        let failure = Stop::read(ReadError::InvalidData, ReadPhase::Open, 1, None);
+        let contextual = failure.clone().context("é".repeat(MAX_FAILURE_MESSAGE));
+        assert_eq!(contextual.failure, failure.failure);
+        assert!(contextual.message.len() <= MAX_FAILURE_MESSAGE);
+        assert_eq!(
+            Stop::new("a".repeat(2048)).message.len(),
+            MAX_FAILURE_MESSAGE
+        );
+    }
+}
