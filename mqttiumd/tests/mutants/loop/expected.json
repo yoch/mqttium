@@ -1,7 +1,7 @@
 {
   "format": "mqttiumd-lab.loop-mutants",
   "version": 1,
-  "description": "Mutations of the real loop of lot L4: each patch, applied to a temporary worktree of the repository, is played by the runner and judged by the oracle of the unmodified tree. A rejected mutation must get the verdict, the assertion with its status (FAIL unless `assertion_status` says otherwise) and a reason holding the fragment below; when `stopped` is given, the campaign must also say that the run stopped, with that fragment. An entry that names `backends` is played only on those (`tools/run_loop_mutants.sh --backend <name>`); one that names none, on every backend. A known survivor is reported and does not fail the run until the finding it names is merged.",
+  "description": "Mutations of the real loop of lot L4: each patch, applied to a temporary worktree of the repository, is played by the runner and judged by the oracle of the unmodified tree. A rejected mutation must get the verdict, the assertion with its status (FAIL unless `assertion_status` says otherwise) and a reason holding the fragment below; when `stopped` is given, the campaign must also say that the run stopped, with that fragment. An entry that names `backends` is played only on those (`tools/run_loop_mutants.sh --backend <name>`); one that names none, on every backend. An entry that names `process` is played with `--process` of that value (the process under test in a child process). A known survivor is reported and does not fail the run until the finding it names is merged.",
   "mutants": [
     {
       "id": "m1-payload-owed-lost",
@@ -72,6 +72,39 @@
       "verdict": "FAIL",
       "assertion": "terminal_knowledge_never_regresses",
       "reason": "follows from the unknown answer of record"
+    },
+    {
+      "id": "n1-decisive-record-withheld-by-the-child",
+      "patch": "n1-decisive-record-withheld-by-the-child.mutant",
+      "mutation": "the child process never relays its StoreCommitStable record: the decisive record of the commit is missing when the supervisor kills it",
+      "scenario": "tests/scenarios/p1/P1-02.json",
+      "backends": [
+        "sqlite"
+      ],
+      "process": "child",
+      "not_on": "the mutation is in the child process, which runs on sqlite only",
+      "expect": "rejected",
+      "verdict": "INCONCLUSIVE",
+      "assertion": "trace_complete",
+      "assertion_status": "INCONCLUSIVE",
+      "reason": "the footer does not declare the trace complete",
+      "stopped": "on the channel store-evidence is out of its sequence",
+      "note": "The collector of the supervisor checks the local order of each origin: the next record of store-evidence arrives out of its sequence and is refused, the trace is cut, and nothing concluded from it is a PASS."
+    },
+    {
+      "id": "n2-restart-on-another-file",
+      "patch": "n2-restart-on-another-file.mutant",
+      "mutation": "the child restarted after the kill opens another file, a copy of the data set taken before anything was committed",
+      "scenario": "tests/scenarios/p1/P1-02.json",
+      "backends": [
+        "sqlite"
+      ],
+      "process": "child",
+      "not_on": "the mutation is in the child process, which runs on sqlite only",
+      "expect": "rejected",
+      "verdict": "FAIL",
+      "assertion": "one_admission_per_observed_inbound_exchange",
+      "reason": "has 2 admissions"
     }
   ]
 }

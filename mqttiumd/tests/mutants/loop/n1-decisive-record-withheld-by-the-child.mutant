@@ -1,0 +1,16 @@
+diff --git a/mqttiumd/crates/mqttiumd-lab/src/bench/child.rs b/mqttiumd/crates/mqttiumd-lab/src/bench/child.rs
+index 1ffc13cf..d7bdb698 100644
+--- a/mqttiumd/crates/mqttiumd-lab/src/bench/child.rs
++++ b/mqttiumd/crates/mqttiumd-lab/src/bench/child.rs
+@@ -793,6 +793,11 @@ impl Relay {
+                 .and_then(Value::as_str)
+                 .and_then(Origin::from_name)
+                 .ok_or("a record without its origin")?;
++            // MUTANT N1: the decisive record of the commit never leaves the
++            // child: the supervisor acknowledges and kills without it.
++            if record.get("kind").and_then(Value::as_str) == Some("StoreCommitStable") {
++                continue;
++            }
+             while !self.window.open() {
+                 self.read_acknowledgement(actions)?;
+             }
