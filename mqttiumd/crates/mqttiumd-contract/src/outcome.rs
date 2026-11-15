@@ -223,9 +223,9 @@ impl OpeningRejection {
     /// property of the reason, not of having been rejected.
     #[must_use]
     pub const fn is_definitive(self) -> bool {
-        // Not written yet: every rejection ends the attempts.
         match self {
-            Self::EpochsExhausted | Self::ForeignIncarnation | Self::PredecessorMoved => true,
+            Self::EpochsExhausted | Self::ForeignIncarnation => true,
+            Self::PredecessorMoved => false,
         }
     }
 }
@@ -446,6 +446,9 @@ impl EpochOpening {
             }
             OpeningStage::Faulted { .. } => return Err(SubmitRefused::Faulted),
         }
+        if last_opened < self.after {
+            return Err(SubmitRefused::LedgerRegressed);
+        }
         let ticket = self
             .ticket
             .checked_next()
@@ -466,14 +469,16 @@ impl EpochOpening {
     /// is the same. The reply of that attempt is still honoured if it
     /// arrives before a new attempt is submitted.
     pub fn abandon(&mut self) -> Result<(), NotAwaiting> {
-        // Not written yet: an attempt in flight cannot be given up.
-        Err(NotAwaiting(self.stage))
+        if self.stage != OpeningStage::Submitted {
+            return Err(NotAwaiting(self.stage));
+        }
+        self.stage = OpeningStage::Unknown;
+        Ok(())
     }
 
     /// Whether a committed opening can be the answer to the attempt in
     /// flight: this data set, and the epoch right after its condition.
     /// Epoch 0 never is, and no epoch below or beyond the next one.
-    #[expect(dead_code, reason = "used once the rules are written")]
     fn answers_the_attempt(&self, opened: EpochOpened) -> bool {
         opened.incarnation == self.incarnation && Ok(opened.epoch) == self.after.checked_next()
     }
@@ -496,6 +501,11 @@ impl EpochOpening {
                 ticket: reply.ticket,
             });
         }
+        if let OpeningOutcome::Committed(opened) = reply.outcome
+            && !self.answers_the_attempt(opened)
+        {
+            return Err(ReplyRefused::Mismatched { opened });
+        }
         let handed_over = match (self.stage, reply.outcome) {
             (OpeningStage::Submitted, OpeningOutcome::Unknown) => {
                 return Ok(self.advance(OpeningStage::Unknown));
@@ -513,9 +523,8 @@ impl EpochOpening {
                 OpeningStage::Committed(known) | OpeningStage::HandedOver(known),
                 OpeningOutcome::Committed(opened),
             ) if known == opened => return Ok(Observed::Unchanged),
-            (OpeningStage::Rejected(known), OpeningOutcome::RejectedCertain(reason))
-                if known == reason =>
-            {
+            // Both say that nothing was opened; the first reason stays.
+            (OpeningStage::Rejected(_), OpeningOutcome::RejectedCertain(_)) => {
                 return Ok(Observed::Unchanged);
             }
             (OpeningStage::HandedOver(known), _) => Some(known),
@@ -531,8 +540,7 @@ impl EpochOpening {
             established: self.stage,
             reported: reply.outcome,
         };
-        // Not written yet: the contradiction is reported and not kept.
-        let _ = handed_over;
+        self.stage = OpeningStage::Faulted { handed_over };
         Err(contradiction)
     }
 

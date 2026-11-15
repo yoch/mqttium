@@ -630,12 +630,10 @@ impl EpochLedger {
     /// The durable phase of `epoch`.
     #[must_use]
     pub fn phase_of(&self, epoch: RunEpoch) -> EpochPhase {
-        if epoch > self.last_opened {
+        if epoch.get() == 0 || epoch > self.last_opened {
             EpochPhase::Unopened
-        } else if epoch == self.last_opened && epoch.get() != 0 {
+        } else if epoch == self.last_opened {
             EpochPhase::Open
-        } else if self.last_opened.get() == 0 {
-            EpochPhase::Unopened
         } else {
             EpochPhase::Closed
         }
@@ -649,8 +647,12 @@ impl EpochLedger {
     /// epoch is no longer the one it expected, or the counter reached
     /// its end. Nothing wraps.
     pub fn open(&self, command: &OpenEpoch) -> Result<Self, OpeningRejection> {
-        // Not written yet: the command is applied whatever it expected.
-        let _ = command;
+        if command.incarnation != self.incarnation {
+            return Err(OpeningRejection::ForeignIncarnation);
+        }
+        if command.after != self.last_opened {
+            return Err(OpeningRejection::PredecessorMoved);
+        }
         let next = self
             .last_opened
             .checked_next()
