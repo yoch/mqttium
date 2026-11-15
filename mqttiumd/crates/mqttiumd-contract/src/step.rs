@@ -14,7 +14,7 @@
 //! application.
 
 use crate::capacity::{CapacityNeed, WorkUnits};
-use crate::effects::Input;
+use crate::effects::{Input, ReserveRefused};
 use crate::ids::{LogicalOwnerId, OperationId, Revision};
 
 /// An input owned by the caller of a step.
@@ -73,6 +73,28 @@ pub enum CoreFault {
     StalePlan,
     /// An input that the adapters can never produce in this state.
     ImpossibleInput,
+    /// A transition asked, in its one reservation, for more effect slots
+    /// than its whole box has. The constructor of an owner refuses such a
+    /// box, so this is a fault of the core and never a wait (ADR 0006,
+    /// amendment).
+    BoxTooSmall { requested: usize, capacity: usize },
+}
+
+/// What is exhausted when a step answers `Exhausted`. No wake-up ends it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Exhaustion {
+    /// The reservation table of the owner's effect box. The holder of the
+    /// creation authority may renew the box: publish or release every
+    /// reservation the box still holds, dispatch it until it is empty,
+    /// retire it, create a box for the same owner and present the input
+    /// again. The retirement is refused while a reservation lives or an
+    /// effect waits. No counter of the owner is reset. Otherwise the
+    /// owner stops.
+    ReservationTable,
+    /// An identity counter of the owner reached its end. It is not
+    /// renewable within a run epoch: the owner stops, and the next epoch
+    /// is a new identity space.
+    IdentityCounter,
 }
 
 /// The structured result of one step.
@@ -90,8 +112,53 @@ pub enum StepOutcome {
         need: CapacityNeed,
         work_used: WorkUnits,
     },
+    /// Nothing was applied; the same input comes back. It keeps everything
+    /// `NeedCapacity` keeps, and unlike it no wake-up ends the refusal: the
+    /// owner is renewed as its `Exhaustion` states, or it stops. It is
+    /// never turned into a `CapacityNeed`.
+    Exhausted {
+        input: OwnedInput,
+        exhaustion: Exhaustion,
+        work_used: WorkUnits,
+    },
     /// The owner cannot continue.
     Fatal(CoreFault),
+}
+
+impl StepOutcome {
+    /// The outcome of a step whose reservation of effect slots was
+    /// refused. This is the one place where a refusal of the box crosses
+    /// the boundary of a step. A transition makes one reservation, for all
+    /// the slots its plan needs, so one refusal decides the step.
+    ///
+    /// A request larger than the box is `Fatal`: like every fault it
+    /// hands back neither the input nor `work_used`, since the owner
+    /// stops; the fault keeps the two sizes for the diagnostic.
+    pub fn reservation_refused(
+        input: OwnedInput,
+        refusal: ReserveRefused,
+        work_used: WorkUnits,
+    ) -> Self {
+        match refusal {
+            ReserveRefused::Need(need) => Self::NeedCapacity {
+                input,
+                need,
+                work_used,
+            },
+            ReserveRefused::TableExhausted => Self::Exhausted {
+                input,
+                exhaustion: Exhaustion::ReservationTable,
+                work_used,
+            },
+            ReserveRefused::LargerThanBox {
+                requested,
+                capacity,
+            } => Self::Fatal(CoreFault::BoxTooSmall {
+                requested,
+                capacity,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -99,6 +166,81 @@ mod tests {
     use super::*;
     use crate::capacity::{Resource, WakeCondition};
     use crate::ids::SessionId;
+
+    fn input() -> Input {
+        Input::WorkAvailable {
+            session: SessionId::new(7),
+        }
+    }
+
+    // ADR 0006, amendment: a definitive refusal of the box is never turned
+    // into a wait at the boundary of a step.
+    #[test]
+    fn an_exhausted_reservation_table_hands_the_input_back_without_a_wake_up() {
+        let outcome = StepOutcome::reservation_refused(
+            input(),
+            ReserveRefused::TableExhausted,
+            WorkUnits::new(2),
+        );
+        assert_eq!(
+            outcome,
+            StepOutcome::Exhausted {
+                input: input(),
+                exhaustion: Exhaustion::ReservationTable,
+                work_used: WorkUnits::new(2),
+            }
+        );
+    }
+
+    #[test]
+    fn a_request_larger_than_the_box_is_a_core_fault() {
+        let outcome = StepOutcome::reservation_refused(
+            input(),
+            ReserveRefused::LargerThanBox {
+                requested: 4,
+                capacity: 3,
+            },
+            WorkUnits::new(1),
+        );
+        assert_eq!(
+            outcome,
+            StepOutcome::Fatal(CoreFault::BoxTooSmall {
+                requested: 4,
+                capacity: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn a_temporary_lack_keeps_its_need_and_its_wake_up() {
+        let wakes = [
+            (Resource::EffectSlots, WakeCondition::EffectAccepted),
+            (
+                Resource::EffectSlots,
+                WakeCondition::EffectAcceptedOrResourceReleased,
+            ),
+            (Resource::Reservations, WakeCondition::ResourceReleased),
+        ];
+        for (resource, wake) in wakes {
+            let need = CapacityNeed {
+                resource,
+                amount: 2,
+                wake,
+            };
+            assert_eq!(
+                StepOutcome::reservation_refused(
+                    input(),
+                    ReserveRefused::Need(need),
+                    WorkUnits::new(5)
+                ),
+                StepOutcome::NeedCapacity {
+                    input: input(),
+                    need,
+                    work_used: WorkUnits::new(5),
+                }
+            );
+        }
+    }
 
     #[test]
     fn a_plan_applies_only_to_the_state_it_was_computed_against() {
