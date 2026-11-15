@@ -65,7 +65,8 @@ another lot's part.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| The sidecar of a model lists as `tests` only files that exist and replay one of its counterexamples. Until a deterministic test replays a counterexample of M1, the list stays empty and the correspondence table names, row by row, the lot that owes the replay | L5 for the table, L4 for the replays | G1 |
+| The sidecar of a model lists as `tests` only files that exist and replay one of its counterexamples. Until a deterministic test replays a counterexample of M1, the list stays empty and the correspondence table names, row by row, the lot that owes the replay | L4 for the replays; the table is written (lot L5, final head `3d6f562`) | G1 |
+| **M1, what its campaign does not establish** (closing report of lot L5). Liveness is claimed on one publication only: on two publications no run of the present module completed. M1b is checked by groups of fault kinds: the run with every kind at once was interrupted at 14.1 million distinct states. M1b has no liveness property. The atomicity of `ApplyCommit` is an assumption the SQLite tests discharge. The fence of both models follows record 0015, and their `Refuse` differs from the registry (record 0013, line 12): both records are proposed | Owner of the repository for the two records; L7 for the atomicity; the bounds stay stated limits | G1 |
 
 ## Process topology (ADR 0002)
 
