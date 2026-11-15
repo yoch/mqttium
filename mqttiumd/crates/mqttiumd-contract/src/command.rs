@@ -513,13 +513,25 @@ pub struct Command {
 /// that it is not reused is a precondition of that trusted code: this
 /// crate draws nothing.
 ///
-/// What the ledger can see of a broken precondition, it refuses: the
-/// opener of the last epoch asking for the next one under the same
-/// identity is `OpeningRejection::AttemptReused`. What it cannot see is
-/// the limit: two start-ups with one nonce that read the same value form
-/// the very same command, and a command presented again is answered as
-/// the one that opened the epoch; and once a later epoch was opened the
-/// ledger no longer holds the identity to compare with.
+/// What the ledger can see of a broken precondition and assert of the
+/// command in front of it, it refuses: the opener of the last epoch
+/// asking for the next one under the same identity is
+/// `OpeningRejection::AttemptReused`, because that command opened
+/// nothing and never will. The limits, named:
+///
+/// - two start-ups with one nonce that read the same value form the
+///   very same command, and a command presented again is answered as
+///   the one that opened the epoch;
+/// - once a later epoch was opened the ledger no longer holds the
+///   identity to compare with;
+/// - a command under the identity of the opener whose condition is
+///   older than the one that opened shows that one identity designates
+///   two commands, but not which of the two it is: the command may be
+///   the one that opened an epoch since closed. It is `Superseded`, not
+///   rejected;
+/// - the same with a condition ahead of the ledger is `Undecided`: once
+///   another start-up opens an epoch, that command would open the next
+///   one, so no ledger can say that it never will.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct StartupNonce([u8; 16]);
 
@@ -1429,6 +1441,34 @@ mod tests {
             opened_by(&committed, &next).open_epoch(),
             Some(RunEpoch::new(5))
         );
+    }
+
+    /// Where the ledger sees one identity under two commands and cannot
+    /// reject. A command under the identity of the opener, with a
+    /// condition ahead of the ledger, would open an epoch once another
+    /// start-up opened the one before: a rejection now would be followed
+    /// by its commit. With a condition older than the one that opened,
+    /// it may be the command that opened an epoch since closed: a
+    /// rejection would deny what it did.
+    #[test]
+    fn a_reused_identity_is_rejected_only_where_the_command_can_never_have_opened() {
+        let read = at(4);
+        let opener = opening(&read, 1);
+        let at_five = opened_by(&read, &opener);
+        let ahead = OpenEpoch {
+            after: RunEpoch::new(6),
+            ..opener
+        };
+        assert_eq!(at_five.open(&ahead), LedgerOpening::Undecided);
+        // Another start-up opens epoch 6: the same command opens 7.
+        let at_six = opened(&at_five);
+        let at_seven = opened_by(&at_six, &ahead);
+        assert_eq!(at_seven.open_epoch(), Some(RunEpoch::new(7)));
+
+        // `opener` did open epoch 5. Now the ledger holds its identity
+        // as the opener of epoch 7, with another command.
+        assert_eq!(at_seven.opened_by(), Some(opener.attempt));
+        assert_eq!(at_seven.open(&opener), LedgerOpening::Superseded);
     }
 
     /// Once a later opening was committed the ledger no longer knows
