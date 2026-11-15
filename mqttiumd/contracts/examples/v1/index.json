@@ -26,7 +26,16 @@
     "contracts/examples/v1/valid/trace-record-packet-delivered.json",
     "contracts/examples/v1/valid/trace-record-resolve-submitted.json",
     "contracts/examples/v1/valid/trace-record-store-result-ready.json",
+    "contracts/examples/v1/valid/trace-record-store-result-handed-over.json",
+    "contracts/examples/v1/valid/trace-record-opening-submitted.json",
+    "contracts/examples/v1/valid/trace-record-store-epoch-opened.json",
+    "contracts/examples/v1/valid/trace-record-opening-reply-delivered.json",
+    "contracts/examples/v1/valid/trace-record-opening-reply-rejected.json",
+    "contracts/examples/v1/valid/trace-record-opening-abandoned.json",
+    "contracts/examples/v1/valid/trace-record-epoch-grant-handed-over.json",
+    "contracts/examples/v1/valid/trace-record-step-blocked.json",
     "contracts/examples/v1/valid/trace-record-store-result-rejected.json",
+    "contracts/examples/v1/valid/trace-record-store-result-violation.json",
     "contracts/examples/v1/valid/trace-record-store-result-delivered-rejected.json",
     "contracts/examples/v1/valid/trace-record-store-fence-stable.json",
     "contracts/examples/v1/valid/trace-record-deadline-armed.json",
@@ -55,6 +64,8 @@
     "contracts/examples/v1/valid/run-result-provisional-out-of-scope.json",
     "contracts/examples/v1/valid/run-result-provisional-nothing-evaluated.json",
     "contracts/examples/v1/valid/run-manifest-content-only.json",
+    "contracts/examples/v1/valid/run-manifest-with-oracle-and-generators.json",
+    "contracts/examples/v1/valid/run-manifest-built-from-its-source.json",
     "contracts/examples/v1/valid/toy.catalog.json",
     "contracts/examples/v1/valid/toy.transitions.complete.json",
     "contracts/examples/v1/valid/toy.transitions.seed-with-hole.json",
@@ -404,6 +415,36 @@
       "why": "A scenario requires a known perimeter."
     },
     {
+      "file": "contracts/examples/v1/invalid/scenario-fence-fault-of-a-command-nobody-selected.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/1/match",
+      "why": "A fence fault names the resolved operation by its command, which an earlier fault must select."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-leave-of-a-held-command.json",
+      "code": "held-item-mismatch",
+      "pointer": "/steps/8/fault",
+      "why": "LeaveBarrier names a fault that holds a command, not the adapter at a barrier."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-leave-before-the-barrier.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/6",
+      "why": "LeaveBarrier comes before any step drove the broker to the barrier."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-leave-twice.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/9",
+      "why": "The adapter leaves a barrier once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-leave-of-an-undeclared-fault.json",
+      "code": "binding-undefined",
+      "pointer": "/steps/8/fault",
+      "why": "LeaveBarrier names a fault that is not declared."
+    },
+    {
       "file": "contracts/examples/v1/invalid/scenario-release-before-hold.json",
       "code": "step-order-invalid",
       "pointer": "/steps/2",
@@ -636,6 +677,78 @@
       "code": "u64-out-of-range",
       "pointer": "/payload/facts/1/revision",
       "why": "Identity components inside a recovered fact are 64-bit as well."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-opening-committed-without-its-epoch.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A committed opening names the epoch it opened."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-opening-rejected-with-an-epoch.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A rejected opening opened nothing: it names a reason, not an epoch."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-opening-rejected-for-an-unknown-reason.json",
+      "code": "schema-violation",
+      "pointer": "/payload/reject_reason",
+      "why": "The reasons of a rejected opening are those of OpeningRejection."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-handed-over-rejection-without-its-reason.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "What the adapter hands over is the result the store produced, reason included."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-for-an-unknown-cause.json",
+      "code": "schema-violation",
+      "pointer": "/payload/cause",
+      "why": "A run stops because nothing was eligible or because its budget ran out."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/step",
+      "why": "The index of a step is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-deadlines-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/armed_deadlines",
+      "why": "The count of armed deadlines is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-without-what-waits.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A stopped run says what still waits: the deadlines armed and not fired."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-without-what-is-held.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A stopped run says which faults still hold an item."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-naming-a-fault-twice.json",
+      "code": "schema-violation",
+      "pointer": "/payload/holding_faults",
+      "why": "Each fault that holds an item is named once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-violation-without-its-kind.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A violation says which one: the store reports no outcome, a violation of the contract."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-commit-with-a-violation.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "Only a violation names a violation."
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-rejection-without-its-reason.json",
@@ -1154,6 +1267,48 @@
       "why": "The contract digest is the digest of the files the manifest lists."
     },
     {
+      "file": "contracts/examples/v1/invalid/run-manifest-oracle-of-other-files.json",
+      "code": "evidence-mismatch",
+      "pointer": "/oracle/sha256",
+      "why": "The digest of the oracle is the digest of the files it lists."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-generators-out-of-order.json",
+      "code": "evidence-mismatch",
+      "pointer": "/generators/files/1",
+      "why": "The files of a generator are listed once each, in path order."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-oracle-without-files.json",
+      "code": "schema-violation",
+      "pointer": "/oracle",
+      "why": "An identity names the files it is the digest of."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-built-from-nothing.json",
+      "code": "schema-violation",
+      "pointer": "/artifact/built_from",
+      "why": "A binary built from a source names that source."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-built-from-without-its-command.json",
+      "code": "schema-violation",
+      "pointer": "/artifact/built_from",
+      "why": "A binary built from a source says how it was built."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-built-from-a-source-too-large.json",
+      "code": "u64-out-of-range",
+      "pointer": "/artifact/built_from/source/bytes",
+      "why": "The size of the source is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-built-from-a-source-outside.json",
+      "code": "schema-violation",
+      "pointer": "/artifact/built_from/source/path",
+      "why": "The source is a file of the campaign, named by a relative path."
+    },
+    {
       "file": "contracts/examples/v1/invalid/toy.transitions.hole.json",
       "code": "registry-hole",
       "pointer": "/rules",
@@ -1263,6 +1418,48 @@
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-peer-packet-observed-stated-by-transport.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-store-result-handed-over-stated-by-broker-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-opening-submitted-stated-by-broker-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-store-epoch-opened-stated-by-store-adapter.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-opening-reply-delivered-stated-by-store-adapter.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-opening-abandoned-stated-by-bench-supervisor.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-epoch-grant-handed-over-stated-by-store-evidence.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-step-blocked-stated-by-broker-core.json",
       "code": "schema-violation",
       "pointer": "/origin_component",
       "why": "A kind of record is stated by its one origin; another may not state it."

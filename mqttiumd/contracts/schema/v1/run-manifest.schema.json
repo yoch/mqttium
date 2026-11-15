@@ -68,9 +68,26 @@
               "maxLength": 4096
             }
           }
+        },
+        "built_from": {
+          "description": "Present only when the binary was rebuilt by the bench from a source the campaign keeps (run --rebuild): `source`, the archive of that source, named by a path relative to the campaign directory (`source.tar`), whose members are the files of the checkout as `./<path>`; and `build`, the text of the build command, which names placeholders (`<dir>`) and describes the build rather than being run as it stands. Such a binary is built with `--remap-path-prefix=<dir>=/mqttiumd-source` in its rustflags. The bench declares the link; tools/check_campaign_binary.sh rebuilds the source and compares digests. That a build elsewhere gives the same binary is not established.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "build"
+          ],
+          "properties": {
+            "source": {
+              "$ref": "primitives.schema.json#/$defs/artifact"
+            },
+            "build": {
+              "$ref": "primitives.schema.json#/$defs/text"
+            }
+          }
         }
       },
-      "description": "The binary that produced this manifest: its digest, and the build parameters captured when it was compiled."
+      "description": "The binary that produced this manifest: its digest, the build parameters captured when it was compiled, and, when the bench rebuilt it, the source it was built from."
     },
     "checkout": {
       "type": "object",
@@ -201,6 +218,37 @@
         "$ref": "primitives.schema.json#/$defs/text"
       },
       "maxItems": 64
+    },
+    "oracle": {
+      "$ref": "#/$defs/identity",
+      "description": "The oracle that judges the campaign, identified apart from the lab binary: the digest of one `<sha256>  <path>` line per file, in path order."
+    },
+    "generators": {
+      "$ref": "#/$defs/identity",
+      "description": "The generators of the campaign (scripts and tools that wrote its inputs), identified the same way."
+    }
+  },
+  "$defs": {
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sha256",
+        "files"
+      ],
+      "properties": {
+        "sha256": {
+          "$ref": "primitives.schema.json#/$defs/sha256"
+        },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": {
+            "$ref": "primitives.schema.json#/$defs/artifact"
+          }
+        }
+      }
     }
   }
 }

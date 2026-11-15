@@ -97,7 +97,8 @@ _ACTS_ON = {
     "duplicate_result": "result",
 }
 # What a fault keeps until a step hands it over.
-_HOLDS = {"hold_command": "command", "delay_result": "result"}
+# A barrier keeps the adapter where it stopped until LeaveBarrier.
+_HOLDS = {"hold_command": "command", "delay_result": "result", "barrier": "barrier"}
 
 _NOT_YET, _HELD, _HANDED, _DESTROYED = range(4)
 _WHY_NOT = {
@@ -216,6 +217,27 @@ def _scenario(contracts, document, out):
                     )
                 )
 
+    # A fence fault names the resolved operation by its command as the
+    # bench knows it: some fault at the command point selects that command
+    # kind and that publication (record 0015, the fault catalogue).
+    for index, fault in enumerate(document["faults"]):
+        if fault["point"] != "store.fence.transit":
+            continue
+        if not any(
+            other["point"] == "store.command.transit"
+            and other["match"]["command_kind"] == fault["match"]["command_kind"]
+            and other["match"].get("publication_binding")
+            == fault["match"].get("publication_binding")
+            for other in document["faults"]
+        ):
+            out.append(
+                Diagnostic(
+                    "fault-match-invalid",
+                    f"/faults/{index}/match",
+                    f"{fault['id']!r} names a command no fault at store.command.transit selects",
+                )
+            )
+
     exchanges = {
         step["bind_exchange_as"] for step in document["steps"] if "bind_exchange_as" in step
     }
@@ -275,8 +297,12 @@ def _scenario(contracts, document, out):
                 )
             elif hold[0] is not None:
                 hold[1] = _HELD
-        elif kind in ("ReleaseHeldCommand", "DeliverHeldResult"):
-            wanted = "command" if kind == "ReleaseHeldCommand" else "result"
+        elif kind in ("ReleaseHeldCommand", "DeliverHeldResult", "LeaveBarrier"):
+            wanted = {
+                "ReleaseHeldCommand": "command",
+                "DeliverHeldResult": "result",
+                "LeaveBarrier": "barrier",
+            }[kind]
             hold = holds.get(step["fault"])
             if hold is None:
                 out.append(
@@ -710,6 +736,8 @@ def _run_manifest(contracts, document, out):
     _u64(document, "/artifact/bytes", out)
     for index in range(len(document["contracts"])):
         _u64(document, f"/contracts/{index}/bytes", out)
+    if "built_from" in document["artifact"]:
+        _u64(document, "/artifact/built_from/source/bytes", out)
     for pointer in ("/scenario/bytes", "/fixture/bytes", "/scheduler/version", "/scheduler/seed"):
         _u64(document, pointer, out)
     paths = [entry["path"] for entry in document["contracts"]]
@@ -723,6 +751,33 @@ def _run_manifest(contracts, document, out):
                 )
             )
             break
+    # The oracle and the generators are identified the same way.
+    for member in ("oracle", "generators"):
+        identity = document.get(member)
+        if identity is None:
+            continue
+        for index in range(len(identity["files"])):
+            _u64(document, f"/{member}/files/{index}/bytes", out)
+        files = [entry["path"] for entry in identity["files"]]
+        for index in range(1, len(files)):
+            if files[index - 1] >= files[index]:
+                out.append(
+                    Diagnostic(
+                        "evidence-mismatch",
+                        f"/{member}/files/{index}",
+                        "the files of an identity are listed once each, in path order",
+                    )
+                )
+                break
+        digest = contracts_digest((entry["sha256"], entry["path"]) for entry in identity["files"])
+        if digest != identity["sha256"]:
+            out.append(
+                Diagnostic(
+                    "evidence-mismatch",
+                    f"/{member}/sha256",
+                    f"the listed files have the digest {digest}",
+                )
+            )
     listed = contracts_digest((entry["sha256"], entry["path"]) for entry in document["contracts"])
     if listed != document["contracts_digest"]:
         out.append(

@@ -37,6 +37,11 @@ class Record:
         return (*self.origin, self.origin_sequence)
 
 
+# The origins of the bench: they drive the product and observe it. The
+# parents of their records order them; they cause nothing in the product.
+BENCH = frozenset({"bench-supervisor", "peer"})
+
+
 @dataclass
 class Trace:
     records: list = field(default_factory=list)
@@ -49,7 +54,10 @@ class Trace:
     # Why the trace is not complete.
     incomplete: list = field(default_factory=list)
     _ancestors: dict = field(default_factory=dict)
+    _causes: dict = field(default_factory=dict)
     _by_key: dict = field(default_factory=dict)
+    # Key of a record -> key of the record its origin stated just before.
+    _previous: dict = field(default_factory=dict)
 
     @property
     def complete(self) -> bool:
@@ -58,21 +66,54 @@ class Trace:
     def of_kind(self, *kinds):
         return [record for record in self.records if record.kind in kinds]
 
+    def _predecessors(self, key):
+        """What precedes a record directly: its explicit causes and its origin's previous record."""
+        record = self._by_key.get(key)
+        found = list(record.parents) if record is not None else []
+        previous = self._previous.get(key)
+        if previous is not None:
+            found.append(previous)
+        return found
+
     def ancestors(self, record):
-        """Keys of every record ``record`` causally depends on."""
+        """Keys of every record that happened before ``record``.
+
+        One relation (finding F5): the local order of each origin and the
+        explicit causes together, closed transitively.
+        """
         found = self._ancestors.get(record.key)
         if found is None:
             found = set()
-            pending = list(record.parents)
+            pending = self._predecessors(record.key)
             while pending:
                 key = pending.pop()
                 if key in found:
                     continue
                 found.add(key)
-                parent = self._by_key.get(key)
-                if parent is not None:
-                    pending.extend(parent.parents)
+                pending.extend(self._predecessors(key))
             self._ancestors[record.key] = found
+        return found
+
+    def causes(self, record):
+        """Keys of the records of the product that ``record`` follows from.
+
+        The relation of ``ancestors`` restricted to the product: a record
+        of the bench (``BENCH``) is never a cause and is never crossed. Its
+        parents say what the supervisor had read when it acted, or what a
+        peer observed: an order (``before``), never a cause of the product.
+        """
+        found = self._causes.get(record.key)
+        if found is None:
+            found = set()
+            pending = self._predecessors(record.key)
+            while pending:
+                key = pending.pop()
+                cause = self._by_key.get(key)
+                if key in found or (cause is not None and cause.origin[0] in BENCH):
+                    continue
+                found.add(key)
+                pending.extend(self._predecessors(key))
+            self._causes[record.key] = found
         return found
 
     def before(self, first, second):
@@ -86,8 +127,6 @@ class Trace:
         """
         if first.key == second.key:
             return False
-        if first.origin == second.origin:
-            return first.origin_sequence < second.origin_sequence
         if first.key in self.ancestors(second):
             return True
         if second.key in self.ancestors(first):
@@ -164,6 +203,30 @@ def read(contracts, lines, max_bytes=None) -> Trace:
     return trace
 
 
+def _cycle(trace: Trace):
+    """The collector sequence of a record on a cycle of the order, or ``None``.
+
+    Kahn's algorithm over the explicit causes and the local order of each
+    origin, in time and memory linear in the records and their causes.
+    """
+    waiting = {key: 0 for key in trace._by_key}
+    followers = {key: [] for key in trace._by_key}
+    for key in trace._by_key:
+        for before in trace._predecessors(key):
+            if before in waiting:
+                waiting[key] += 1
+                followers[before].append(key)
+    ready = [key for key, count in waiting.items() if count == 0]
+    while ready:
+        key = ready.pop()
+        for follower in followers[key]:
+            waiting[follower] -= 1
+            if waiting[follower] == 0:
+                ready.append(follower)
+    left = [trace._by_key[key].sequence for key, count in waiting.items() if count]
+    return min(left) if left else None
+
+
 def _check_whole(trace: Trace) -> None:
     records = trace.records
     problems = trace.incomplete
@@ -195,6 +258,19 @@ def _check_whole(trace: Trace) -> None:
         expected[record.origin] = wanted + 1
 
     trace._by_key = {record.key: record for record in records}
+    last = {}
+    for record in records:
+        if record.origin in last:
+            trace._previous[record.key] = last[record.origin]
+        last[record.origin] = record.key
+    cycle = _cycle(trace)
+    if cycle is not None:
+        problems.append(
+            f"the local orders and the causes form a cycle through record {cycle}: "
+            "no order of the records is consistent with both"
+        )
+        # Every relation computed over a cycle would be false.
+        trace._previous.clear()
     for record in records:
         for parent in record.parents:
             cause = trace._by_key.get(parent)
@@ -202,7 +278,7 @@ def _check_whole(trace: Trace) -> None:
                 problems.append(
                     f"record {record.sequence} names the cause {parent}, which is not in the trace"
                 )
-            elif cause.key == record.key or record.key in trace.ancestors(cause):
+            elif cause.key == record.key:
                 problems.append(f"record {record.sequence} is among its own causes")
             elif trace.backend == "sim-store" and cause.sequence > record.sequence:
                 # A simulated run has a total order: a cause recorded after

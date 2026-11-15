@@ -34,7 +34,7 @@ use mqttiumd_contract::effects::{
 };
 use mqttiumd_contract::ids::{EffectId, InboundPacketId, OperationId, RunEpoch, SessionId};
 use mqttiumd_contract::outcome::{
-    EpochOpening, OpeningOutcome, OpeningReply, StoreOutcome, StoreReply,
+    EpochOpened, EpochOpening, OpeningOutcome, OpeningReply, StoreOutcome, StoreReply,
 };
 
 use super::durable::{DurableStore, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved};
@@ -202,8 +202,9 @@ pub enum FaultRefused {
     ZeroOccurrence,
     TableFull,
     /// An armed fault watches the same point and may select the same
-    /// passage. Only one fault fires at a passage, and the other would
-    /// count it without firing: two faults never select one element.
+    /// passage: it names the same occurrence, or it counts over another
+    /// set (one of the two leaves the kind or the source open). Only one
+    /// fault fires at a passage: two faults never select one element.
     Overlaps(FaultId),
     /// A duplicated result takes one more result slot than its command
     /// did. The slot is reserved when the fault is armed; this one would
@@ -215,16 +216,22 @@ pub enum FaultRefused {
 /// records these are written as.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum StoreEvent {
-    /// The adapter took the work; it is in transit.
+    /// The adapter took the work; it is in transit. An opening carries
+    /// the whole command it submits.
     CommandSubmitted {
         id: WorkId,
         kind: WorkKind,
         operation: Option<OperationId>,
+        opening: Option<OpenEpoch>,
     },
-    /// The writer committed the effect of this work, durably.
+    /// The writer committed the effect of this work, durably. An opening
+    /// that wrote the ledger carries the epoch it opened, read from the
+    /// ledger after the write: once per epoch, however often the command
+    /// is answered `Committed` again.
     CommitStable {
         id: WorkId,
         operation: Option<OperationId>,
+        opened: Option<EpochOpened>,
     },
     /// The writer made a fence durable for this operation.
     FenceStable { id: WorkId, operation: OperationId },
@@ -234,8 +241,14 @@ pub enum StoreEvent {
     FenceRefused { id: WorkId, operation: OperationId },
     /// A result exists on the store side.
     ResultReady { id: WorkId, answer: Answer },
-    /// The result was handed to the core.
-    ResultDelivered { id: WorkId, answer: Answer },
+    /// The result was handed to the core. `produced` when it came out of
+    /// this adapter's own pipeline, after its `ResultReady`; a result
+    /// presented from outside (`present_result`) was produced by no store.
+    ResultDelivered {
+        id: WorkId,
+        answer: Answer,
+        produced: bool,
+    },
     /// An armed fault was reached and its action applied.
     FaultHit {
         fault: FaultId,
@@ -353,6 +366,9 @@ struct Transit {
     work: Work,
     /// The fault that holds it, while one does.
     held: Option<FaultId>,
+    /// It passed the fence point once. Entering the writer again, it is
+    /// the same item: that passage is not counted again.
+    fence_passed: bool,
 }
 
 /// The inbound exchange slot a command comes from.
@@ -492,14 +508,21 @@ impl<S: DurableStore> SimStore<S> {
         let either = |left: Option<WorkKind>, right: Option<WorkKind>| {
             left.zip(right).is_none_or(|(left, right)| left == right)
         };
+        // Two selections overlap when some passage satisfies both, and
+        // they either name the same occurrence or count over different
+        // sets: one names a kind or a source the other leaves open
+        // (`contracts/README.md`, "One fault per item").
         let overlap = self.faults.iter().position(|armed| {
             let other = armed.spec;
-            other.point == spec.point
+            let compatible = other.point == spec.point
                 && either(other.kind, spec.kind)
                 && other
                     .source
                     .zip(spec.source)
-                    .is_none_or(|(left, right)| left == right)
+                    .is_none_or(|(left, right)| left == right);
+            let other_sets = other.kind.is_some() != spec.kind.is_some()
+                || other.source.is_some() != spec.source.is_some();
+            compatible && (other.occurrence == spec.occurrence || other_sets)
         });
         if let Some(index) = overlap {
             return Err(FaultRefused::Overlaps(FaultId(index)));
@@ -635,10 +658,15 @@ impl<S: DurableStore> SimStore<S> {
     fn accept(&mut self, id: WorkId, ticket: u64, work: Work) {
         let (kind, operation, source) = describe(&work);
         self.awaited.insert(id, (operation, ticket));
+        let opening = match &work {
+            Work::Open(command) => Some(*command),
+            Work::Persist(_) | Work::Resolve(_) => None,
+        };
         self.record(StoreEvent::CommandSubmitted {
             id,
             kind,
             operation,
+            opening,
         });
         let held = (self.pass(FaultPoint::CommandTransit, id, kind, operation, source)
             == Some(FaultAction::HoldCommand))
@@ -649,6 +677,7 @@ impl<S: DurableStore> SimStore<S> {
             ticket,
             work,
             held,
+            fence_passed: false,
         });
     }
 
@@ -775,14 +804,16 @@ impl<S: DurableStore> SimStore<S> {
         let id = transit.id;
         let (kind, operation, source) = describe(&transit.work);
         // A resolution that reads an absence reaches the fence point
-        // before its fence is written. A held fence that enters the
-        // writer again reads again, and passes the point again if the
-        // operation is still absent: the fault that held it fired once,
-        // and no other fault can select the same passage (see `arm`).
+        // before its fence is written, once. A held fence that enters
+        // the writer again reads again and fences only an operation
+        // still absent; it is the same item, so that passage is not
+        // counted again and takes no occurrence of another fault.
         let mut refuse_fence = false;
         if let Work::Resolve(resolved) = &transit.work
+            && !transit.fence_passed
             && self.store.established(*resolved).is_none()
         {
+            transit.fence_passed = true;
             match self.pass(FaultPoint::FenceTransit, id, kind, operation, source) {
                 Some(FaultAction::HoldCommand) => {
                     transit.held = self.last_hit;
@@ -802,6 +833,7 @@ impl<S: DurableStore> SimStore<S> {
         // What this run made durable: the effect of the work (recorded
         // as `CommitStable`), or a rejection receipt or a fence. Each is
         // a committed transaction with no result yet.
+        let mut opened = None;
         let (answer, committed_now, wrote) = match &transit.work {
             Work::Persist(command) => {
                 let applied = self.store.apply(command);
@@ -850,7 +882,14 @@ impl<S: DurableStore> SimStore<S> {
                 // writes nothing.
                 let before = self.store.ledger();
                 let outcome = self.store.open_epoch(command);
-                let wrote = self.store.ledger() != before;
+                let after = self.store.ledger();
+                let wrote = after != before;
+                if wrote {
+                    opened = Some(EpochOpened {
+                        incarnation: after.incarnation(),
+                        epoch: after.last_opened(),
+                    });
+                }
                 (
                     Answer::Opening {
                         command: *command,
@@ -862,7 +901,11 @@ impl<S: DurableStore> SimStore<S> {
             }
         };
         if committed_now {
-            self.record(StoreEvent::CommitStable { id, operation });
+            self.record(StoreEvent::CommitStable {
+                id,
+                operation,
+                opened,
+            });
         }
         if wrote
             && self.pass(FaultPoint::CommitApplied, id, kind, operation, source)
@@ -949,7 +992,11 @@ impl<S: DurableStore> SimStore<S> {
             return Performed::Uncorrelated;
         };
         self.awaited.remove(&id);
-        self.record(StoreEvent::ResultDelivered { id, answer });
+        self.record(StoreEvent::ResultDelivered {
+            id,
+            answer,
+            produced: origin.is_some(),
+        });
         let barrier = origin.is_some_and(|origin| {
             self.pass(
                 FaultPoint::ResultConsume,

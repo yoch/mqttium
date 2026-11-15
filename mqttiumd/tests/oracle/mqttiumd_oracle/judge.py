@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from . import recipe as recipes
 from .semantic import InventoryOrder
 from .strict import Refused, parse
-from .trace import Trace
+from .trace import BENCH, Trace
 from .trace import lines_of
 from .trace import read as read_trace
 
@@ -36,6 +36,7 @@ PASS, FAIL, INCONCLUSIVE, OUT_OF_SCOPE = "PASS", "FAIL", "INCONCLUSIVE", "OUT_OF
 # observed. Within these, a status says itself whether its reason is of
 # that kind (``Status.stands``).
 MONOTONE = {
+    "scenario_reaches_its_end",
     "fenced_operation_never_executed",
     "one_admission_per_observed_inbound_exchange",
     "same_required_obligations_at_both_checkpoints",
@@ -445,6 +446,103 @@ def _obligations(snapshot):
     }
 
 
+def _published(data: bytes):
+    """``(topic, payload)`` of the bytes of one MQTT 5 PUBLISH, or ``None``."""
+    try:
+        length, shift, at = 0, 0, 1
+        while True:
+            byte = data[at]
+            length |= (byte & 0x7F) << shift
+            shift, at = shift + 7, at + 1
+            if not byte & 0x80:
+                break
+        end = at + length
+        if data[0] >> 4 != 3 or end != len(data):
+            return None
+        topic_length = int.from_bytes(data[at : at + 2], "big")
+        topic = data[at + 2 : at + 2 + topic_length]
+        at += 2 + topic_length
+        if (data[0] >> 1) & 3:
+            at += 2
+        properties, shift = 0, 0
+        while True:
+            byte = data[at]
+            properties |= (byte & 0x7F) << shift
+            shift, at = shift + 7, at + 1
+            if not byte & 0x80:
+                break
+        at += properties
+        return (topic, data[at:end]) if at <= end else None
+    except IndexError:
+        return None
+
+
+def _broken_references(name, snapshot):
+    """What a snapshot names and does not hold: the store lost it, or never had it."""
+    publications = {_key(row["publication_id"]): row for row in snapshot["publications"]}
+    payloads = {_key(row["payload_id"]) for row in snapshot["payloads"]}
+    reasons = []
+    for row in snapshot["obligations"]:
+        if _key(row["publication_id"]) not in publications:
+            reasons.append(
+                f"{name}: the obligation {_key(row['publication_id'])}/{row['index']} "
+                "names a publication the store does not hold"
+            )
+    for publication, row in publications.items():
+        if _key(row["payload_id"]) not in payloads:
+            reasons.append(
+                f"{name}: the publication {publication} names a payload the store does not hold"
+            )
+    return reasons
+
+
+def _acknowledged_publications(run, names):
+    """Reasons a checkpoint lacks what a client was acknowledged for, and where order is unknown.
+
+    An exchange whose positive PUBREC a peer observed before an inspection
+    was committed: the snapshot of that inspection holds a publication of
+    the topic the client sent, whose payload has the length and digest of
+    the bytes the client sent. The expectation comes from what the client
+    did, not from what survives in the snapshot.
+    """
+    exchanges, _ = run.exchanges()
+    missing, unknown = [], []
+    for exchange in exchanges:
+        if exchange.positive_pubrec is None:
+            continue
+        sent = _published(bytes.fromhex(exchange.opened.payload["bytes_hex"]))
+        if sent is None:
+            unknown.append(f"record {exchange.opened.sequence}: the PUBLISH cannot be read")
+            continue
+        topic, payload = sent
+        digest = hashlib.sha256(payload).hexdigest()
+        for name in names:
+            inspection, snapshot = run.snapshots[name]
+            order = run.trace.before(exchange.positive_pubrec, inspection)
+            if order is None:
+                unknown.append(
+                    f"{name}: not ordered with the PUBREC of record {exchange.positive_pubrec.sequence}"
+                )
+                continue
+            if not order:
+                continue
+            payloads = {
+                _key(row["payload_id"]): (row["length"], row["sha256"])
+                for row in snapshot["payloads"]
+            }
+            held = [
+                payloads.get(_key(row["payload_id"]))
+                for row in snapshot["publications"]
+                if row["topic_hex"] == topic.hex()
+            ]
+            if (str(len(payload)), digest) not in held:
+                missing.append(
+                    f"{name}: no publication holds the payload the client published on "
+                    f"{topic!r} and was acknowledged for (record {exchange.positive_pubrec.sequence})"
+                )
+    return missing, unknown
+
+
 def same_required_obligations_at_both_checkpoints(run):
     names = run.checkpoints()
     if len(names) < 2:
@@ -461,6 +559,14 @@ def same_required_obligations_at_both_checkpoints(run):
     if not lot:
         return Status(FAIL, [f"{names[0]} holds no obligation"])
     reasons = []
+    # Every checkpoint hangs together: an obligation names a publication the
+    # store holds, a publication a payload it holds. A missing reference is
+    # never a value that compares equal to another missing one.
+    for name in names:
+        reasons += _broken_references(name, run.snapshots[name][1])
+    # What a client was acknowledged for is held, whatever else survives.
+    acknowledged, unordered = _acknowledged_publications(run, names)
+    reasons += acknowledged
     # What the fixture requires of each publication, computed here: the
     # exact-topic route and the lower of the two QoS.
     sessions = {client: session for session, client in run.client_of_session().items()}
@@ -504,7 +610,11 @@ def same_required_obligations_at_both_checkpoints(run):
         for delivery in sorted(later.keys() - lot.keys()):
             if delivery[0] in known:
                 reasons.append(f"{name}: the obligation {delivery} appeared")
-    return Status(FAIL if reasons else PASS, reasons)
+    if reasons:
+        return Status(FAIL, reasons)
+    if unordered:
+        return Status(INCONCLUSIVE, unordered)
+    return Status(PASS)
 
 
 def same_recipe_for_op_A(run):
@@ -669,6 +779,9 @@ def broker_inputs_have_provenance(run):
         ]
 
     by_key = {record.key: record for record in trace.records}
+    duplicating = {
+        fault["id"] for fault in run.scenario["faults"] if fault["action"] == "duplicate_result"
+    }
     cores = sorted(
         {record.origin[1] for record in trace.records if record.origin[0] == "broker-core"}
     )
@@ -677,6 +790,15 @@ def broker_inputs_have_provenance(run):
             _key(record.payload["effect_id"]): record
             for record in side("store-adapter", incarnation, "CommandSubmitted", "ResolveSubmitted")
         }
+        # Each submission comes from an effect the core emitted: its parent
+        # is the record of the core, same incarnation, that consumed the
+        # input the effect answers.
+        for record in submitted.values():
+            if not any(
+                parent in by_key and by_key[parent].origin == ("broker-core", incarnation)
+                for parent in record.parents
+            ):
+                blame(record, "the adapter submitted what no record of the core caused")
         answered = set()
         for record in side("broker-core", incarnation, "StoreResultDelivered"):
             effect = _key(record.payload["effect_id"])
@@ -690,6 +812,71 @@ def broker_inputs_have_provenance(run):
             else:
                 ordered(submission, record, "its submission")
             answered.add(effect)
+
+        # K1: what the core consumed is what the adapter handed over, and
+        # that is what the store produced, on content and identities. A
+        # delay or a hold changes nothing of it; only a declared
+        # duplicating injection hands one result over twice.
+        produced = trace.of_kind("StoreResultReady")
+        for record in side("broker-core", incarnation, "StoreResultDelivered"):
+            if not any(
+                by_key[parent].kind == "StoreResultHandedOver"
+                and by_key[parent].payload == record.payload
+                for parent in record.parents
+                if parent in by_key
+            ):
+                blame(record, "the core consumed a result the store adapter did not hand over")
+        handed_from = {}
+        for record in side("store-adapter", incarnation, "StoreResultHandedOver"):
+            causes = trace.causes(record)
+            sources = [
+                ready
+                for ready in produced
+                if ready.key in causes
+                and ready.payload["effect_id"] == record.payload["effect_id"]
+                and ready.payload["operation_id"] == record.payload["operation_id"]
+            ]
+            if not sources:
+                blame(record, "the adapter handed over a result the store did not produce")
+                continue
+            source = max(sources, key=lambda ready: ready.sequence)
+            if source.payload != record.payload:
+                blame(
+                    record,
+                    f"the adapter handed over {record.payload['outcome']}; the store produced "
+                    f"{source.payload['outcome']} (record {source.sequence})",
+                )
+            handed_from.setdefault(source.key, []).append(record)
+        for source, handovers in handed_from.items():
+            duplicated = any(
+                hit.payload["fault_id"] in duplicating and source in trace.causes(hit) | {hit.key}
+                for hit in trace.of_kind("FaultHit")
+            ) or any(
+                hit.payload["fault_id"] in duplicating and hit.key in trace.causes(handover)
+                for hit in trace.of_kind("FaultHit")
+                for handover in handovers
+            )
+            if len(handovers) > 1 and not duplicated:
+                blame(handovers[1], "one result of the store is handed over twice")
+
+        # The reply to an opening answers the command the adapter submitted,
+        # and a committed one names an epoch the store opened for it.
+        opened = {
+            (record.payload["incarnation"], record.payload["epoch"]): record.payload["attempt"]
+            for record in trace.of_kind("StoreEpochOpened")
+        }
+        for record in side("broker-core", incarnation, "OpeningReplyDelivered"):
+            command = {key: record.payload[key] for key in ("attempt", "incarnation", "after")}
+            if not any(
+                by_key[parent].kind == "OpeningSubmitted" and by_key[parent].payload == command
+                for parent in record.parents
+                if parent in by_key
+            ):
+                blame(record, "the opening reply answers no command the adapter submitted")
+            if record.payload["outcome"] == "Committed":
+                where = (record.payload["incarnation"], record.payload["epoch"])
+                if opened.get(where) != record.payload["attempt"]:
+                    blame(record, f"the store opened no epoch {where[1]} for this attempt")
 
         armed = {
             record.payload["token"]: record
@@ -796,11 +983,8 @@ def broker_inputs_have_provenance(run):
             else:
                 ordered(frame, record, "the frame it writes")
 
-    duplicating = {
-        fault["id"] for fault in run.scenario["faults"] if fault["action"] == "duplicate_result"
-    }
     for record in trace.of_kind("InputRefused"):
-        causes = [by_key[key] for key in trace.ancestors(record) if key in by_key]
+        causes = [by_key[key] for key in trace.causes(record) if key in by_key]
         if not any(
             cause.kind == "FaultHit" and cause.payload["fault_id"] in duplicating
             for cause in causes
@@ -910,7 +1094,7 @@ def refusal_carries_the_reason_of_its_rejection(run):
             continue
         causes = [
             by_key[key]
-            for key in run.trace.ancestors(frame)
+            for key in run.trace.causes(frame)
             if key in by_key
             and by_key[key].kind == "StoreResultDelivered"
             and by_key[key].origin == frame.origin
@@ -931,6 +1115,142 @@ def refusal_carries_the_reason_of_its_rejection(run):
     return Status(_worst(statuses), reasons)
 
 
+def scenario_reaches_its_end(run):
+    """The run reached the last step of its scenario (point d of the second wave).
+
+    A DriveUntil step asserts that the awaited event comes with no
+    stimulus beyond what the scenario has already injected. The bench
+    says why it stopped earlier. Nothing eligible while the wait is unmet
+    refutes that assertion for this run: a FAIL, which no missing record
+    undoes, and which does not say the product is stuck for ever. A
+    budget of steps that ran out establishes nothing. What still waited
+    at the stop is reported for diagnosis; the status depends on the
+    cause alone.
+    """
+
+    def waiting(payload):
+        held = payload["holding_faults"]
+        faults = f"faults holding an item: {', '.join(held)}" if held else "no fault holds an item"
+        return f"{payload['armed_deadlines']} deadlines armed and not fired, {faults}"
+
+    blocks = run.trace.of_kind("StepBlocked")
+    stuck = [record for record in blocks if record.payload["cause"] == "quiescent"]
+    if stuck:
+        return Status(
+            FAIL,
+            [
+                f"record {record.sequence}: nothing was eligible and the wait of step "
+                f"{record.payload['step']} ({record.payload['step_kind']}) was unmet, which "
+                "refutes for this run that the awaited event comes with no further stimulus; "
+                f"{waiting(record.payload)}"
+                for record in stuck
+            ],
+        )
+    if blocks:
+        return Status(
+            INCONCLUSIVE,
+            [
+                f"record {record.sequence}: the budget of steps ran out; {waiting(record.payload)}"
+                for record in blocks
+            ],
+        )
+    return Status(PASS)
+
+
+def terminal_knowledge_never_regresses(run):
+    """Knowledge of an operation never goes back (record 0001, step 6; DEM-MU-05).
+
+    Once the core consumed a terminal result of an operation, a later
+    unknown result of it changes nothing: no record of the product names
+    it as its cause, and the operation is never resolved again. A record
+    of the bench that names it says the bench had read it: an order, no
+    reaction.
+    """
+    trace = run.trace
+    # A reaction is a record of the product that names the answer among its
+    # parents; the bench orders its records after what it read, and that
+    # is no reaction.
+    followers = {}
+    for record in trace.records:
+        if record.origin[0] in BENCH:
+            continue
+        for parent in record.parents:
+            followers.setdefault(parent, []).append(record)
+    reasons = []
+    for origin in sorted(
+        {record.origin for record in trace.records if record.origin[0] == "broker-core"}
+    ):
+        terminal = {}
+        for record in trace.records:
+            if record.origin != origin or record.kind != "StoreResultDelivered":
+                continue
+            operation = _key(record.payload["operation_id"])
+            if record.payload["outcome"] in ("Committed", "RejectedCertain"):
+                terminal.setdefault(operation, record)
+            elif record.payload["outcome"] == "PendingOrUnknown" and operation in terminal:
+                for follower in followers.get(record.key, []):
+                    reasons.append(
+                        f"record {follower.sequence} ({follower.kind}) follows from the unknown "
+                        f"answer of record {record.sequence}, after the terminal one of record "
+                        f"{terminal[operation].sequence}"
+                    )
+        for record in trace.of_kind("ResolveSubmitted"):
+            operation = _key(record.payload["operation_id"])
+            known = terminal.get(operation)
+            if known is not None and record.origin[1] == origin[1] and trace.before(known, record):
+                reasons.append(
+                    f"record {record.sequence}: {operation} is resolved again after the "
+                    f"terminal result of record {known.sequence}"
+                )
+    return Status(FAIL if reasons else PASS, reasons)
+
+
+def one_grant_per_opened_epoch(run):
+    """At most one creation authority per opened epoch (DEM-012, record 0011).
+
+    A grant follows, among its causes in the same incarnation of the core,
+    a committed reply for its epoch, and the store opened that epoch for
+    the attempt the reply answers. An abandoned or unknown opening alone
+    never justifies one: only a committed reply taken before or after it.
+    """
+    trace = run.trace
+    grants = trace.of_kind("EpochGrantHandedOver")
+    if not grants:
+        return Status(INCONCLUSIVE, ["the trace records no grant of an epoch"])
+    by_key = {record.key: record for record in trace.records}
+    opened = {
+        (record.payload["incarnation"], record.payload["epoch"]): record.payload["attempt"]
+        for record in trace.of_kind("StoreEpochOpened")
+    }
+    reasons, seen = [], {}
+    for grant in grants:
+        epoch = (grant.payload["incarnation"], grant.payload["epoch"])
+        if epoch in seen:
+            reasons.append(
+                f"record {grant.sequence}: epoch {epoch[1]} was already granted by record {seen[epoch]}"
+            )
+        seen.setdefault(epoch, grant.sequence)
+        replies = [
+            by_key[key]
+            for key in trace.causes(grant)
+            if key in by_key
+            and by_key[key].kind == "OpeningReplyDelivered"
+            and by_key[key].origin == grant.origin
+            and by_key[key].payload["outcome"] == "Committed"
+            and (by_key[key].payload["incarnation"], by_key[key].payload["epoch"]) == epoch
+        ]
+        # Justified only by a committed reply the store's ledger confirms:
+        # without any committed reply there is nothing to confirm.
+        if not any(opened.get(epoch) == reply.payload["attempt"] for reply in replies):
+            why = (
+                "the store opened it for no attempt whose committed reply the core took"
+                if replies
+                else "no committed reply for it precedes the grant"
+            )
+            reasons.append(f"record {grant.sequence}: epoch {epoch[1]}: {why}")
+    return Status(FAIL if reasons else PASS, reasons)
+
+
 ASSERTIONS = {
     "fenced_operation_never_executed": fenced_operation_never_executed,
     "certain_rejection_has_a_closure": certain_rejection_has_a_closure,
@@ -941,6 +1261,9 @@ ASSERTIONS = {
     "no_positive_ack_before_confirmed_commit": no_positive_ack_before_confirmed_commit,
     "no_pubrec_observed_before_crash": no_pubrec_observed_before_crash,
     "broker_inputs_have_provenance": broker_inputs_have_provenance,
+    "one_grant_per_opened_epoch": one_grant_per_opened_epoch,
+    "terminal_knowledge_never_regresses": terminal_knowledge_never_regresses,
+    "scenario_reaches_its_end": scenario_reaches_its_end,
     "all_required_faults_hit": all_required_faults_hit,
     "trace_complete": trace_complete,
 }

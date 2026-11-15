@@ -63,9 +63,11 @@ Three steps let a scenario order a race without a crash (ADR 0001):
 | `FireDeadline` | Drives the broker, within `max_steps`, until no effect waits in an effect box; then lets the timer adapter deliver the armed deadline that is due first, and drives until the core has consumed it. Two deadlines due at the same logical time fire in the order they were armed. If no deadline is armed the step fails and the run is inconclusive: it is never a no-op. Logical time advances in no other way: a deadline never fires by itself between two steps |
 | `ReleaseHeldCommand` | Lets the command that the named fault holds enter the writer |
 | `DeliverHeldResult` | Hands the result that the named fault delays to the core, and drives, within `max_steps`, until the core has consumed it |
+| `LeaveBarrier` | Lets the adapter that the named `barrier` fault stopped leave its point. Until then it stays there, whatever the following steps are: an inspection taken before `LeaveBarrier` sees the state at the barrier |
 
-**What a fault holds.** The action `hold_command` holds a command and
-`delay_result` holds a result. Such a fault holds one item in the life of a
+**What a fault holds.** The action `hold_command` holds a command,
+`delay_result` holds a result, and `barrier` holds the adapter at its
+point. Such a fault holds one item in the life of a
 scenario:
 
 - it holds it once a `DriveUntil` step has waited for its hit, and a
@@ -78,6 +80,11 @@ scenario:
   of the run (QABS-C keeps its command held).
 
 A scenario does not wait for a fault whose `expected_hits` is 0.
+
+QABS-A inspects at the barrier of the applied commit and then leaves
+it: `after_commit` sees the commit and no result, and the result becomes
+ready only after `LeaveBarrier`. A barrier no step leaves holds the
+adapter to the end of the run (QABS-B and QABS-C end at theirs).
 
 **What a point carries.** Each injection point `carries` a command or a
 result, and offers only actions that act on it: `hold_command` on a
@@ -116,8 +123,9 @@ At `store.fence.transit`, `match.command_kind` and
 the bench knows it, from the fault that selected that command earlier in
 the scenario (`store.command.transit` in QABS-A, B and C). The runner of
 the bench maps the selection to the operation; the store is handed only
-the identity. No semantic rule yet refuses a scenario whose fence fault
-names a command no earlier fault selected.
+the identity. Both readers refuse a fence fault whose command kind and
+publication no fault at `store.command.transit` selects
+(`fault-match-invalid`).
 
 **One fault per item.** Two faults of a scenario never select the same
 command or result. Two selections on one point, for one command kind, with
@@ -154,7 +162,8 @@ core consumed:
 | Input of the core | Record of the core | What must precede it |
 | - | - | - |
 | Packet | `PacketDelivered` | `ClientBytesReceived` of the transport whose bytes are exactly that packet, itself caused by the `PeerPacketSent` of the peer with the same bytes |
-| Store result | `StoreResultDelivered` | `CommandSubmitted` or `ResolveSubmitted` of the store adapter with the same effect and operation, not answered before |
+| Store result | `StoreResultDelivered` | `StoreResultHandedOver` of the store adapter with the same content, itself after the `StoreResultReady` the store produced with the same content; and `CommandSubmitted` or `ResolveSubmitted` with the same effect and operation, not answered before |
+| Opening reply | `OpeningReplyDelivered` | `OpeningSubmitted` of the store adapter with the same command; a committed reply names an epoch `StoreEpochOpened` records for that attempt |
 | Deadline | `DeadlineDelivered` | `DeadlineArmed` of the timer with the same token, not delivered before |
 | Recovery page | `RecoveryPageDelivered` | `RecoveryPageRead` of the store adapter with the same content |
 
@@ -188,6 +197,54 @@ contract crate, and the assertion
 rejection a refusing frame answers is the latest certain rejection among
 its causes, delivered to the same incarnation of the core.
 
+A store may answer with no outcome at all: a contract violation
+(`StoreReply::Violation`), today only `RecipeMismatch`, for an
+`OperationId` presented again with a different recipe. The three result
+records then carry the outcome `Violation` and name it in `violation`,
+which no other outcome has. A violation is not a commit: an
+acknowledgement that follows from it fails
+`no_positive_ack_before_confirmed_commit`, and it is no terminal
+knowledge. The store adapter hands it over unchanged, as any result.
+
+A `CommandSubmitted` or `ResolveSubmitted` has as a parent the record of
+the core, in the same incarnation, that consumed the input the effect
+comes from (`PacketDelivered` for an admission or a release,
+`DeadlineDelivered` for a resolution). The other links have their
+parents already: commit, fence and ready result their cause in the
+store, the handover its ready result, the consumed result its handover.
+
+The result chain is closed on content (finding K1 of the audit): what the
+core consumed is what the adapter handed over, and that is what the store
+produced, effect, operation, outcome and reason of a rejection alike. A
+hold or a delay changes nothing of it; a result is handed over twice only
+under a declared `duplicate_result`; a dropped result is produced and
+never handed over.
+
+Start-up opens an epoch (records 0009 and 0011): `OpeningSubmitted` is
+the whole `OpenEpoch` the adapter submits; `StoreEpochOpened` the hidden
+truth of the ledger, at most once per epoch; `OpeningReplyDelivered` the
+reply the core takes, which names the command it answers, the epoch when
+committed and the reason when rejected; `OpeningAbandoned` that start-up
+stopped waiting, which is not terminal; `EpochGrantHandedOver` the one
+creation authority. `one_grant_per_opened_epoch`, owed by every run,
+holds when each epoch is granted at most once, after a committed reply
+the ledger confirms.
+
+A run the bench stops before the last step of its scenario ends with
+`StepBlocked {step, step_kind, cause, armed_deadlines, holding_faults}`
+of the bench supervisor, before the footer: `quiescent` when no action
+was eligible and the awaited event had not happened, `budget` when the
+steps ran out. The assertion `scenario_reaches_its_end`, owed by every
+run, fails on `quiescent` and is inconclusive on `budget`. The FAIL says
+what one finished run establishes: a `DriveUntil` step asserts that the
+awaited event comes with no stimulus beyond what the scenario has already
+injected, and nothing eligible with the wait unmet refutes that for this
+run (no missing record undoes it). It does not say the product is stuck
+for ever. For diagnosis only, the record counts the deadlines armed and
+not fired and names the faults that still hold an item, so that a reader
+can tell a stopped product from a scenario that did not fire a deadline
+it armed or release what it holds; the verdict depends on `cause` alone.
+
 `InputRefused` is what the dispatcher records when it refuses a result
 that answers no effect in flight. `StoreCommitStable`, `StoreFenceStable`,
 `StoreFenceRefused` and `StoreResultReady` are hidden truth of the store: they judge a run and
@@ -197,6 +254,15 @@ result a step handed over.
 
 A record says what its emitter claims. Checking a trace as a whole, and
 the assertion `broker_inputs_have_provenance`, is the oracle's work.
+
+### The oracle and the generators of a campaign
+
+A run manifest may name, apart from the lab binary, the `oracle` that
+judges the campaign and the `generators` that wrote its inputs (V3-002).
+Each is `{sha256, files}`: the files with their digest and size, in path
+order and once each, and the digest of one `<sha256>  <path>` line per
+file, as the contract digest is. Both readers refuse a digest that is
+not that of the files listed, and files out of order (`evidence-mismatch`).
 
 ### Store snapshots
 
@@ -301,6 +367,15 @@ still applies: the `.gitignore` files of the tree, the exclude file of the
 clone, and the file-mode and line-ending settings of the repository. The
 contract files are listed once each, in path order, which is the order
 their digest is defined by.
+
+`artifact.built_from` is present only when the bench rebuilt the binary
+from a source it keeps in the campaign (`run --rebuild`, record 0017):
+`source` names that archive as a file of the campaign, by relative path,
+digest and size, and `build` is the command that built it. It is the
+bench's declaration that the binary which ran is the one this source
+builds; `tools/check_campaign_binary.sh` checks it by building the source
+again and comparing digests, outside the oracle. That a build on another
+machine gives the same binary is not established.
 
 ## Example corpus
 

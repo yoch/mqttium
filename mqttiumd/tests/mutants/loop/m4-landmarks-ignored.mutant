@@ -1,0 +1,14 @@
+diff --git a/mqttiumd/crates/mqttiumd-core/src/owner.rs b/mqttiumd/crates/mqttiumd-core/src/owner.rs
+index 2f882bc..b464056 100644
+--- a/mqttiumd/crates/mqttiumd-core/src/owner.rs
++++ b/mqttiumd/crates/mqttiumd-core/src/owner.rs
+@@ -284,7 +284,8 @@ impl Answers {
+     fn names(&self, effect: EffectId) -> bool {
+         self.persist == effect
+             || self.recent.contains(&Some(effect))
+-            || self.landmarks.contains(&Some(effect))
++            // MUTANT M4: the landmark resolutions answer nothing.
++            || (false && self.landmarks.contains(&Some(effect)))
+     }
+ 
+     /// Retains the next resolution of the operation.

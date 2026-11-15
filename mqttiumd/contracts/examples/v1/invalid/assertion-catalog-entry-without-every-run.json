@@ -101,10 +101,34 @@
     },
     {
       "name": "refusal_carries_the_reason_of_its_rejection",
-      "meaning": "A PUBREC that refuses an admission carries the reason the transition catalogue gives for the reason of the certain rejection the core received for it, in the same incarnation, before the frame.",
+      "meaning": "A PUBREC that refuses an admission carries the reason the transition catalogue gives for the reason of the certain rejection the core received for it, in the same incarnation, before the frame. It judges the decision of the core on what the core received; that what the core received is what the store produced is the matter of broker_inputs_have_provenance (K1).",
       "every_run": false,
       "requirements": [
         "ARC-011"
+      ]
+    },
+    {
+      "name": "one_grant_per_opened_epoch",
+      "meaning": "At most one grant is handed over per opened epoch, and each follows, among its causes in the same incarnation of the core, a committed reply for that epoch to an attempt whose epoch the store opened.",
+      "every_run": true,
+      "requirements": [
+        "DEM-012"
+      ]
+    },
+    {
+      "name": "terminal_knowledge_never_regresses",
+      "meaning": "An unknown result consumed after a terminal result of the same operation changes nothing: no record of the product names it as its cause, no second acknowledgement, no new resolution of the operation. A record of the bench ordered after it (an inspection, a crash, a packet of a peer) is no reaction of the product.",
+      "every_run": false,
+      "requirements": [
+        "DEM-010"
+      ]
+    },
+    {
+      "name": "scenario_reaches_its_end",
+      "meaning": "The run reached the last step of its scenario. A DriveUntil step asserts that the awaited event comes with no stimulus beyond what the scenario has already injected; a run the bench stopped because no action was eligible and the wait was unmet refutes that assertion for this run, and fails. It does not establish that the product is stuck for ever. A run stopped by its budget of steps concludes nothing.",
+      "every_run": true,
+      "requirements": [
+        "DEM-017"
       ]
     }
   ]

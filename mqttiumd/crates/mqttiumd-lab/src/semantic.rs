@@ -197,11 +197,13 @@ fn acts_on(action: &str) -> Option<Option<&'static str>> {
 }
 
 /// What a fault keeps until a step hands it over, if its action holds
-/// anything.
+/// anything. A barrier keeps the adapter where it stopped until
+/// `LeaveBarrier`.
 fn held_item(action: &str) -> Option<&'static str> {
     match action {
         "hold_command" => Some("command"),
         "delay_result" => Some("result"),
+        "barrier" => Some("barrier"),
         _ => None,
     }
 }
@@ -366,6 +368,30 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
             }
         }
     }
+    // A fence fault names the resolved operation by its command as the
+    // bench knows it: some fault at the command point selects that command
+    // kind and that publication (record 0015, the fault catalogue).
+    for (index, fault) in faults.iter().enumerate() {
+        if text(fault, "point") != "store.fence.transit" {
+            continue;
+        }
+        let selected = faults.iter().any(|other| {
+            text(other, "point") == "store.command.transit"
+                && member(other, "/match/command_kind") == member(fault, "/match/command_kind")
+                && member(other, "/match/publication_binding")
+                    == member(fault, "/match/publication_binding")
+        });
+        if !selected {
+            out.push(Diagnostic::new(
+                code::FAULT_MATCH_INVALID,
+                format!("/faults/{index}/match"),
+                format!(
+                    "{:?} names a command no fault at store.command.transit selects",
+                    text(fault, "id")
+                ),
+            ));
+        }
+    }
     let exchanges: BTreeSet<&str> = steps
         .iter()
         .filter_map(|step| step.get("bind_exchange_as").and_then(Value::as_str))
@@ -439,9 +465,10 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
                     }
                 }
             }
-            "ReleaseHeldCommand" | "DeliverHeldResult" => {
+            "ReleaseHeldCommand" | "DeliverHeldResult" | "LeaveBarrier" => {
                 let wanted = match kind {
                     "ReleaseHeldCommand" => "command",
+                    "LeaveBarrier" => "barrier",
                     _ => "result",
                 };
                 let name = text(step, "fault");
@@ -1262,6 +1289,9 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
 
 fn run_manifest(document: &Value, out: &mut Vec<Diagnostic>) {
     u64_at(document, "/artifact/bytes", out);
+    if document.pointer("/artifact/built_from").is_some() {
+        u64_at(document, "/artifact/built_from/source/bytes", out);
+    }
     for index in 0..items(document, "contracts").len() {
         u64_at(document, &format!("/contracts/{index}/bytes"), out);
     }
@@ -1284,6 +1314,36 @@ fn run_manifest(document: &Value, out: &mut Vec<Diagnostic>) {
             format!("/contracts/{}", index + 1),
             "contract files are listed once each, in path order",
         ));
+    }
+    // The oracle and the generators are identified the same way.
+    for member in ["oracle", "generators"] {
+        let Some(identity) = document.get(member) else {
+            continue;
+        };
+        let files = items(identity, "files");
+        for index in 0..files.len() {
+            u64_at(document, &format!("/{member}/files/{index}/bytes"), out);
+        }
+        let paths: Vec<&str> = files.iter().map(|file| text(file, "path")).collect();
+        if let Some(index) = paths.windows(2).position(|pair| pair[0] >= pair[1]) {
+            out.push(Diagnostic::new(
+                code::EVIDENCE_MISMATCH,
+                format!("/{member}/files/{}", index + 1),
+                "the files of an identity are listed once each, in path order",
+            ));
+        }
+        let listed = contracts_digest(
+            files
+                .iter()
+                .map(|file| (text(file, "sha256"), text(file, "path"))),
+        );
+        if listed != text(identity, "sha256") {
+            out.push(Diagnostic::new(
+                code::EVIDENCE_MISMATCH,
+                format!("/{member}/sha256"),
+                format!("the listed files have the digest {listed}"),
+            ));
+        }
     }
     // The digest must be the digest of the files the manifest lists.
     let listed = contracts_digest(
@@ -1577,7 +1637,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
 /// Names of the members that hold a 64-bit decimal string, in a trace
 /// payload or a snapshot. A test walks the schemas and fails when one of
 /// their 64-bit members is missing here.
-const COMPONENTS: [&str; 36] = [
+const COMPONENTS: [&str; 38] = [
     "incarnation",
     "epoch",
     "owner",
@@ -1608,6 +1668,8 @@ const COMPONENTS: [&str; 36] = [
     "collected_through",
     "state_revision",
     "target",
+    "step",
+    "armed_deadlines",
     "next_session",
     "source_session",
     "target_revision",

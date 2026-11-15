@@ -28,6 +28,50 @@ python tests/oracle/build_traces.py --check
 python -m unittest discover -t tests/oracle -s tests/oracle/tests
 ```
 
+A campaign runs one scenario through the real core, the deterministic
+store and their adapters (`crates/mqttiumd-lab/src/bench/`), then has the
+oracle judge the directory the runner wrote. The runner computes no
+verdict, and its `run-result` is provisional. The exit status is the
+oracle's: 0 PASS, 1 FAIL, 2 INCONCLUSIVE, 3 OUT_OF_SCOPE. Campaign
+directories are generated and never committed.
+
+```bash
+tools/run_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02        # seed 1
+tools/run_campaign.sh tests/scenarios/qabs/QABS-B.json /tmp/qabs-b 7  # another seed
+tools/run_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02-sqlite 1 sqlite
+```
+
+The fourth argument names the store: `sim-store` (the default) or
+`sqlite`, the store of `crates/mqttiumd-store-sqlite` in one file of the
+campaign. On both, a crash of a scenario is simulated inside one
+process: the adapter is dropped and the store recovered or reopened. No
+process is killed and nothing is shown about `fsync` or power loss.
+
+A result of the oracle is qualifying only for a run whose binary the
+runner rebuilt from an archive of the recorded content, kept in the
+campaign (`run --rebuild`, record 0017); any other result is provisional
+and never PASS. The script below plays such a run on a clean checkout,
+has the oracle produce the result, requires it to be qualifying, accepted
+by `validate` and standing at `recompute`, and rebuilds the binary a
+second time from the archive to compare it with the one the manifest
+names. The campaign directory must be outside the work tree:
+
+```bash
+tools/run_qualifying_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02-q 1 sqlite
+```
+
+The loop is shown to reject a defect by mutations kept as diffs under
+`tests/mutants/loop/` (`*.mutant`: the root `.gitignore` ignores `*.patch`
+and `*.diff`). The script applies each one in a temporary worktree, never
+in the current tree, plays the campaign with the mutated binary, has the
+oracle of the unmodified tree judge it, and compares the verdict, the
+failing assertion and its reason with `expected.json`:
+
+```bash
+tools/run_loop_mutants.sh
+tools/run_loop_mutants.sh --backend sqlite
+```
+
 `proofs/` is a workspace of its own, so the four commands above do not see
 it. Its scripts are its only verification, and CI runs them in the job
 `pilot proof`; they need Kani (`tools/install-tools.sh kani`):
@@ -108,7 +152,7 @@ before you start.
 | - | - | - |
 | Contracts and oracle | `contracts/`, `tests/oracle/`, `tests/scenarios/` | Core behaviour to match an expectation |
 | Core | `crates/mqttiumd-core/` | `contracts/`, `tests/oracle/`, assertions |
-| Store | `crates/mqttiumd-store-sqlite/`, the deterministic store in `crates/mqttiumd-lab/` | Admission guarantees |
+| Store | `crates/mqttiumd-store-api/` (the interface every store realises), `crates/mqttiumd-store-sqlite/`, the deterministic store in `crates/mqttiumd-lab/` | Admission guarantees |
 | Bench and adversarial | `crates/mqttiumd-lab/`, mutations, injectors | An assertion, to turn a run green |
 
 A change of public type, durable encoding, injection point or schema is a

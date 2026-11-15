@@ -33,14 +33,19 @@ fn passing(name: &str) -> (std::path::PathBuf, String, Value) {
     fs::write(directory.join("trace.jsonl"), b"{}\n").expect("trace");
     let scenario: Value =
         serde_json::from_slice(&fs::read(root().join(SCENARIO)).expect("P1-02")).expect("JSON");
-    // The assertions of the scenario, and the one every run owes that
-    // P1-02 does not list.
-    let assertions: Vec<Value> = scenario["assertions"]
+    // The assertions of the scenario, and those every run owes that P1-02
+    // does not list.
+    let mut names: Vec<Value> = scenario["assertions"]
         .as_array()
         .expect("assertions")
-        .iter()
-        .cloned()
-        .chain([json!("broker_inputs_have_provenance")])
+        .clone();
+    for name in EVERY_RUN {
+        if !names.iter().any(|listed| listed == name) {
+            names.push(json!(name));
+        }
+    }
+    let assertions: Vec<Value> = names
+        .into_iter()
         .map(|name| json!({"name": name, "status": "PASS"}))
         .collect();
     let result = json!({
@@ -104,9 +109,14 @@ fn a_pass_with_only_out_of_scope_assertions_is_refused() {
     assert!(codes.contains(&"result-incomplete"), "{codes:?}");
 }
 
-/// P1-02 is the text of the specification and lists neither assertion
-/// below; every run owes them all the same (ADR 0003, DEM-MU-03).
-const EVERY_RUN: [&str; 2] = ["trace_complete", "broker_inputs_have_provenance"];
+/// What every run owes, which P1-02, the text of the specification, does
+/// not all list (ADR 0003, DEM-MU-03, DEM-012).
+const EVERY_RUN: [&str; 4] = [
+    "trace_complete",
+    "broker_inputs_have_provenance",
+    "one_grant_per_opened_epoch",
+    "scenario_reaches_its_end",
+];
 
 #[test]
 fn an_assertion_every_run_owes_cannot_be_left_out() {

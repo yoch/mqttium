@@ -122,7 +122,14 @@
         "InputRefused",
         "HeldItemReleased",
         "DurableStateInspected",
-        "StoreFenceRefused"
+        "StoreFenceRefused",
+        "StoreResultHandedOver",
+        "OpeningSubmitted",
+        "StoreEpochOpened",
+        "OpeningReplyDelivered",
+        "OpeningAbandoned",
+        "EpochGrantHandedOver",
+        "StepBlocked"
       ]
     },
     "payload": {
@@ -777,6 +784,174 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "StoreResultHandedOver"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StoreResultHandedOver"
+          },
+          "origin_component": {
+            "enum": [
+              "store-adapter"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "OpeningSubmitted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/OpeningSubmitted"
+          },
+          "origin_component": {
+            "enum": [
+              "store-adapter"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "StoreEpochOpened"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StoreEpochOpened"
+          },
+          "origin_component": {
+            "enum": [
+              "store-evidence"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "OpeningReplyDelivered"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/OpeningReplyDelivered"
+          },
+          "origin_component": {
+            "enum": [
+              "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "OpeningAbandoned"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/OpeningAbandoned"
+          },
+          "origin_component": {
+            "enum": [
+              "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "EpochGrantHandedOver"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/EpochGrantHandedOver"
+          },
+          "origin_component": {
+            "enum": [
+              "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "StepBlocked"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StepBlocked"
+          },
+          "origin_component": {
+            "enum": [
+              "bench-supervisor"
+            ]
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -879,6 +1054,9 @@
         },
         "reject_reason": {
           "$ref": "primitives.schema.json#/$defs/reject_reason"
+        },
+        "violation": {
+          "$ref": "primitives.schema.json#/$defs/store_violation"
         }
       },
       "allOf": [
@@ -905,6 +1083,30 @@
               ]
             }
           }
+        },
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "Violation"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "violation"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "violation"
+              ]
+            }
+          }
         }
       ]
     },
@@ -928,6 +1130,9 @@
         },
         "reject_reason": {
           "$ref": "primitives.schema.json#/$defs/reject_reason"
+        },
+        "violation": {
+          "$ref": "primitives.schema.json#/$defs/store_violation"
         }
       },
       "allOf": [
@@ -951,6 +1156,30 @@
             "not": {
               "required": [
                 "reject_reason"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "Violation"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "violation"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "violation"
               ]
             }
           }
@@ -1790,6 +2019,300 @@
         },
         "operation_id": {
           "$ref": "primitives.schema.json#/$defs/operation_id"
+        }
+      }
+    },
+    "opening_attempt": {
+      "description": "The identity of an opening attempt: the nonce its start-up drew and its number there.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "startup_hex",
+        "ticket"
+      ],
+      "properties": {
+        "startup_hex": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "ticket": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "StoreResultHandedOver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_id",
+        "operation_id",
+        "outcome"
+      ],
+      "properties": {
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "outcome": {
+          "$ref": "primitives.schema.json#/$defs/store_outcome"
+        },
+        "reject_reason": {
+          "$ref": "primitives.schema.json#/$defs/reject_reason"
+        },
+        "violation": {
+          "$ref": "primitives.schema.json#/$defs/store_violation"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "RejectedCertain"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reject_reason"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "reject_reason"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "Violation"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "violation"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "violation"
+              ]
+            }
+          }
+        }
+      ],
+      "description": "The result the store adapter hands over towards the core: the content of the result the store produced."
+    },
+    "OpeningSubmitted": {
+      "description": "The command OpenEpoch, whole, as the store adapter hands it to the writer.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempt",
+        "incarnation",
+        "after"
+      ],
+      "properties": {
+        "attempt": {
+          "$ref": "#/$defs/opening_attempt"
+        },
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "after": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "StoreEpochOpened": {
+      "description": "Hidden truth: the epoch the ledger holds as opened, and the attempt that opened it, once durable.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch",
+        "attempt"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "attempt": {
+          "$ref": "#/$defs/opening_attempt"
+        }
+      }
+    },
+    "OpeningReplyDelivered": {
+      "description": "The reply to an OpenEpoch the core consumed: the whole command it answers and its outcome. A committed reply names the epoch, a rejected one its reason.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempt",
+        "incarnation",
+        "after",
+        "outcome"
+      ],
+      "properties": {
+        "attempt": {
+          "$ref": "#/$defs/opening_attempt"
+        },
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "after": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "outcome": {
+          "enum": [
+            "Committed",
+            "RejectedCertain",
+            "Superseded",
+            "Unknown"
+          ]
+        },
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "reject_reason": {
+          "enum": [
+            "EpochsExhausted",
+            "ForeignIncarnation",
+            "PredecessorMoved",
+            "AttemptReused"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "Committed"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "epoch"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "epoch"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "const": "RejectedCertain"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "reject_reason"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "reject_reason"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "OpeningAbandoned": {
+      "description": "Start-up stopped waiting for the reply of this attempt. Not terminal: the reply is still honoured if it arrives before a new submission.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempt"
+      ],
+      "properties": {
+        "attempt": {
+          "$ref": "#/$defs/opening_attempt"
+        }
+      }
+    },
+    "EpochGrantHandedOver": {
+      "description": "The grant of an opened epoch moved to the creator of owners.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "StepBlocked": {
+      "description": "The bench stopped the run before its last step: at `step`, of kind `step_kind`, because no action was eligible and the awaited event had not happened (`quiescent`), or because the budget of steps ran out (`budget`). For diagnosis only, what still waited at the stop: `armed_deadlines`, the deadlines armed and not fired, and `holding_faults`, the faults that still hold an item. The verdict depends on `cause` alone.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step",
+        "step_kind",
+        "cause",
+        "armed_deadlines",
+        "holding_faults"
+      ],
+      "properties": {
+        "step": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "step_kind": {
+          "$ref": "primitives.schema.json#/$defs/type_name"
+        },
+        "cause": {
+          "enum": [
+            "quiescent",
+            "budget"
+          ]
+        },
+        "armed_deadlines": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "holding_faults": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "primitives.schema.json#/$defs/name"
+          }
         }
       }
     }

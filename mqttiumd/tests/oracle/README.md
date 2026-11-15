@@ -56,6 +56,33 @@ unreadable; so does a record stated by another origin than the one its kind
 belongs to, which is how a trace that breaks the origin rule of ADR 0003 is
 refused.
 
+The order is one relation (finding F5 of the audit): the local order of
+each origin and the explicit causes together, closed transitively. A
+trace in which the two form a cycle is incomplete, found in time linear in
+its records and causes; `before` is computed from that same relation, and
+two records it does not order stay unordered unless the run has a total
+order (the simulated store).
+
+A parent does not mean the same thing for every origin. For a record of
+the product (the core, the transport, the timer, the store adapter, the
+store's evidence, the dispatcher, the fault injector) it is a cause. For a
+record of the bench supervisor it is what the supervisor had read when it
+acted; for a record of a peer, what the peer observed and the supervisor
+record it acted on. The parents of a record of the bench order it
+(`before`); they never make it a cause of the product. `causes` is the
+order relation restricted to the product: it never includes nor crosses a
+record of the bench. The assertions that ask why a record of the product
+exists read `causes`: the source of a result the adapter hands over and
+the injection that duplicates it (K1), the injection that excuses a
+refused input, the rejection a refusing PUBREC answers, the committed
+reply a grant follows. Those that ask only what came first read `before`:
+the closure before a refusal, the commit before an inspection, the crash
+before an observed PUBREC, a resolution after a terminal result.
+`terminal_knowledge_never_regresses` counts as a reaction to a late
+unknown answer only a record of the product that names it among its
+parents: an inspection, a crash or a packet the bench orders after it is
+no regression of the product.
+
 Nothing concluded from an incomplete trace is a PASS. A FAIL stands on an
 incomplete trace only where no missing record could undo it (two admissions
 for one exchange, obligations or a recipe that changed between two
@@ -65,6 +92,23 @@ distinction is made per reason, not per assertion: an acknowledged exchange
 without admission, or an admission outside any exchange, may only lack the
 record that was lost, and is inconclusive on an incomplete trace. A trace
 of another scenario concludes nothing.
+
+What a store holds must hang together and must hold what a client was
+acknowledged for (finding F2 of the audit). At every checkpoint an
+obligation names a publication the snapshot holds and a publication a
+payload it holds; a missing reference is a FAIL, never a value equal to
+another missing one. An exchange whose positive PUBREC a peer observed
+before an inspection was committed: that snapshot holds a publication of
+the topic the client sent, whose payload has the length and digest of the
+payload bytes the client sent, decoded by the oracle from its MQTT 5
+PUBLISH. The expectation comes from what the client did and from the
+routes of the fixture, not from what survives in the snapshot. A snapshot
+of a corrupted store stays a valid document: the bench can represent the
+corruption, the judge recognises it. Each publication of the first
+checkpoint carries one obligation per target of the route the fixture
+gives its topic. Limit, outside S0: once outbound distribution exists,
+an obligation legitimately settled between two checkpoints must not fail
+this assertion; today an obligation that disappears is a FAIL.
 
 A snapshot the trace cites is evidence only when it is the snapshot of the
 same run and of the backend the trace declares, for the checkpoint that
@@ -154,13 +198,55 @@ where a status or an injection count differs (`result-not-recomputed`). A
 provisional result names no evidence and is refused as such. The verdict of
 a result is never taken from the result.
 
+The command `produce` writes the run-result of a run, for a campaign to
+recompute and validate. It writes a qualifying result only when every
+condition of a qualifying run holds as far as the files it is given
+establish it (`results.unmet`): the manifest is valid and names the
+contracts in use; it names the scenario and its fixture with the digests
+of the files given; it records the backend, the failure model, the
+scheduler and the commands; it identifies the oracle and the generators,
+and the oracle files it lists are the ones that judged: every module of
+the oracle that runs, read from where it runs and not from the campaign,
+is listed with its digest; every modified path the manifest records is
+kept in the campaign as the bench keeps it, a tracked one by its diff in
+`modified/tracked.patch` and an untracked one as
+`modified/untracked/<path>`; and the manifest ties the binary to its
+source (`artifact.built_from`, record 0017): the campaign holds it with
+the digest and size the member names, the binary was built with its
+paths remapped (`--remap-path-prefix=<dir>=/mqttiumd-source`), and the
+archive, read member by member as a stream with a bound on their number,
+holds each contract and oracle file the manifest lists with the same
+digest, and each untracked file the campaign keeps with the same
+content. Without that member the result is provisional.
+
+What a qualifying result establishes, from the campaign alone: the
+verdict is the one the observations determine, the cited files are the
+ones the run read, the oracle that judged is the one the manifest
+identifies, the modified content is kept, and the campaign holds the
+source the bench declares its binary built from, holding the contracts
+and the oracle of the run. It does not establish that this source is the
+recorded revision: that needs git, and a modified tracked file is kept as
+a patch the oracle does not apply. The oracle builds nothing: that the binary which ran is the one that source builds is the
+bench's declaration, which `tools/check_campaign_binary.sh` checks
+outside the oracle by building it again. That a build on another machine
+gives the same binary is not established.
+
+A provisional result never carries PASS: a run whose checks all
+pass is written INCONCLUSIVE, with one reason `not qualifying: …` per
+unmet condition before the reasons of the assertions. No option makes the
+command claim qualifying, and a qualifying result it writes must stand
+when recomputed, or the oracle exits as defective.
+
 ```bash
 PYTHONPATH=tests/oracle python -m mqttiumd_oracle judge --scenario <file> --trace <file>
 PYTHONPATH=tests/oracle python -m mqttiumd_oracle recompute --result <file>
+PYTHONPATH=tests/oracle python -m mqttiumd_oracle produce --scenario <file> --trace <file> \
+    --manifest <file> --out <file> --scope <text>
 ```
 
-`judge` exits with the code of the verdict (0 PASS, 1 FAIL, 2 INCONCLUSIVE,
-3 OUT_OF_SCOPE); `recompute` exits 0 when the result stands and 2 when it
+`judge` and `produce` exit with the code of the verdict (0 PASS, 1 FAIL,
+2 INCONCLUSIVE, 3 OUT_OF_SCOPE), `produce` with that of the verdict it
+writes; `recompute` exits 0 when the result stands and 2 when it
 is refused. A defect of the oracle, or contracts it cannot read, exits 70:
 the run was not judged, and a caller must never record that as a verdict.
 

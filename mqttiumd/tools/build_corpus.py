@@ -619,6 +619,54 @@ HELD = scenario(
         ],
     )
 )
+# LeaveBarrier: QABS-A holds the adapter at the barrier of the applied
+# commit, inspects there, then leaves the barrier.
+QABS_A = json.loads((ROOT / "tests/scenarios/qabs/QABS-A.json").read_text())
+LEAVE = next(i for i, step in enumerate(QABS_A["steps"]) if step["kind"] == "LeaveBarrier")
+
+
+def qabs_a(edit):
+    value = copy.deepcopy(QABS_A)
+    edit(value)
+    return value
+
+
+bad(
+    "scenario-fence-fault-of-a-command-nobody-selected.json",
+    "fault-match-invalid",
+    "/faults/1/match",
+    "A fence fault names the resolved operation by its command, which an earlier fault must select.",
+    qabs_a(setter(["faults", 1, "match", "command_kind"], "ReleaseInbound")),
+)
+bad(
+    "scenario-leave-of-a-held-command.json",
+    "held-item-mismatch",
+    f"/steps/{LEAVE}/fault",
+    "LeaveBarrier names a fault that holds a command, not the adapter at a barrier.",
+    qabs_a(setter(["steps", LEAVE, "fault"], "held_fence")),
+)
+bad(
+    "scenario-leave-before-the-barrier.json",
+    "step-order-invalid",
+    f"/steps/{LEAVE - 2}",
+    "LeaveBarrier comes before any step drove the broker to the barrier.",
+    qabs_a(lambda v: v["steps"].insert(LEAVE - 2, v["steps"].pop(LEAVE))),
+)
+bad(
+    "scenario-leave-twice.json",
+    "step-order-invalid",
+    f"/steps/{LEAVE + 1}",
+    "The adapter leaves a barrier once.",
+    qabs_a(lambda v: v["steps"].insert(LEAVE + 1, copy.deepcopy(v["steps"][LEAVE]))),
+)
+bad(
+    "scenario-leave-of-an-undeclared-fault.json",
+    "binding-undefined",
+    f"/steps/{LEAVE}/fault",
+    "LeaveBarrier names a fault that is not declared.",
+    qabs_a(setter(["steps", LEAVE, "fault"], "applied")),
+)
+
 RELEASE, DELIVER = 6, 11
 
 
@@ -1059,6 +1107,97 @@ ok(
         [("store-evidence", 0)],
     ),
 )
+# K1: the result the store produced, handed over by the adapter, consumed
+# by the core. And the opening of an epoch (records agreed with lot L2).
+HANDED = record(
+    8,
+    "store-adapter",
+    3,
+    "StoreResultHandedOver",
+    {"effect_id": EFFECT, "operation_id": OP, "outcome": "Committed"},
+    [("store-evidence", 1)],
+)
+ok("trace-record-store-result-handed-over.json", HANDED)
+ATTEMPT = {"startup_hex": "02" * 16, "ticket": "1"}
+ok(
+    "trace-record-opening-submitted.json",
+    record(
+        1,
+        "store-adapter",
+        0,
+        "OpeningSubmitted",
+        {"attempt": ATTEMPT, "incarnation": "1", "after": "1"},
+    ),
+)
+ok(
+    "trace-record-store-epoch-opened.json",
+    record(
+        2,
+        "store-evidence",
+        0,
+        "StoreEpochOpened",
+        {"incarnation": "1", "epoch": "2", "attempt": ATTEMPT},
+        [("store-adapter", 0)],
+    ),
+)
+REPLY = record(
+    3,
+    "broker-core",
+    0,
+    "OpeningReplyDelivered",
+    {"attempt": ATTEMPT, "incarnation": "1", "after": "1", "outcome": "Committed", "epoch": "2"},
+    [("store-adapter", 0)],
+)
+ok("trace-record-opening-reply-delivered.json", REPLY)
+ok(
+    "trace-record-opening-reply-rejected.json",
+    record(
+        3,
+        "broker-core",
+        0,
+        "OpeningReplyDelivered",
+        {
+            "attempt": ATTEMPT,
+            "incarnation": "1",
+            "after": "1",
+            "outcome": "RejectedCertain",
+            "reject_reason": "PredecessorMoved",
+        },
+        [("store-adapter", 0)],
+    ),
+)
+ok(
+    "trace-record-opening-abandoned.json",
+    record(4, "broker-core", 1, "OpeningAbandoned", {"attempt": ATTEMPT}, [("broker-core", 0)]),
+)
+ok(
+    "trace-record-epoch-grant-handed-over.json",
+    record(
+        5,
+        "broker-core",
+        2,
+        "EpochGrantHandedOver",
+        {"incarnation": "1", "epoch": "2"},
+        [("broker-core", 0)],
+    ),
+)
+# A run that stopped before its last step says why (the bench): no action
+# was eligible and the awaited event had not happened, or the budget of
+# steps ran out.
+BLOCKED = record(
+    9,
+    "bench-supervisor",
+    3,
+    "StepBlocked",
+    {
+        "step": "19",
+        "step_kind": "DriveUntil",
+        "cause": "quiescent",
+        "armed_deadlines": "1",
+        "holding_faults": ["hold_result"],
+    },
+)
+ok("trace-record-step-blocked.json", BLOCKED)
 REJECTED = record(
     7,
     "store-evidence",
@@ -1073,6 +1212,23 @@ REJECTED = record(
     [("store-evidence", 0)],
 )
 ok("trace-record-store-result-rejected.json", REJECTED)
+# The store refuses a recipe that differs from the one an OperationId
+# already designates: no outcome, a violation (StoreViolation).
+VIOLATION = record(
+    7,
+    "store-evidence",
+    1,
+    "StoreResultReady",
+    {
+        "effect_id": EFFECT,
+        "operation_id": OP,
+        "outcome": "Violation",
+        "violation": "RecipeMismatch",
+    },
+    [("store-evidence", 0)],
+)
+ok("trace-record-store-result-violation.json", VIOLATION)
+
 ok(
     "trace-record-store-result-delivered-rejected.json",
     record(
@@ -1334,6 +1490,97 @@ trace_case(
     "Identity components inside a recovered fact are 64-bit as well.",
     setter(["payload", "facts", 1, "revision"], "18446744073709551616"),
     code="u64-out-of-range",
+)
+trace_case(
+    "opening-committed-without-its-epoch",
+    REPLY,
+    "/payload",
+    "A committed opening names the epoch it opened.",
+    dropped("payload", "epoch"),
+)
+trace_case(
+    "opening-rejected-with-an-epoch",
+    REPLY,
+    "/payload",
+    "A rejected opening opened nothing: it names a reason, not an epoch.",
+    lambda value: value["payload"].update(
+        outcome="RejectedCertain", reject_reason="PredecessorMoved"
+    ),
+)
+trace_case(
+    "opening-rejected-for-an-unknown-reason",
+    REPLY,
+    "/payload/reject_reason",
+    "The reasons of a rejected opening are those of OpeningRejection.",
+    lambda value: (
+        value["payload"].pop("epoch"),
+        value["payload"].update(outcome="RejectedCertain", reject_reason="Busy"),
+    ),
+)
+trace_case(
+    "handed-over-rejection-without-its-reason",
+    HANDED,
+    "/payload",
+    "What the adapter hands over is the result the store produced, reason included.",
+    setter(["payload", "outcome"], "RejectedCertain"),
+)
+trace_case(
+    "step-blocked-for-an-unknown-cause",
+    BLOCKED,
+    "/payload/cause",
+    "A run stops because nothing was eligible or because its budget ran out.",
+    setter(["payload", "cause"], "timeout"),
+)
+trace_case(
+    "step-blocked-overflow",
+    BLOCKED,
+    "/payload/step",
+    "The index of a step is 64-bit.",
+    setter(["payload", "step"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "step-blocked-deadlines-overflow",
+    BLOCKED,
+    "/payload/armed_deadlines",
+    "The count of armed deadlines is 64-bit.",
+    setter(["payload", "armed_deadlines"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "step-blocked-without-what-waits",
+    BLOCKED,
+    "/payload",
+    "A stopped run says what still waits: the deadlines armed and not fired.",
+    dropped("payload", "armed_deadlines"),
+)
+trace_case(
+    "step-blocked-without-what-is-held",
+    BLOCKED,
+    "/payload",
+    "A stopped run says which faults still hold an item.",
+    dropped("payload", "holding_faults"),
+)
+trace_case(
+    "step-blocked-naming-a-fault-twice",
+    BLOCKED,
+    "/payload/holding_faults",
+    "Each fault that holds an item is named once.",
+    setter(["payload", "holding_faults"], ["hold_result", "hold_result"]),
+)
+trace_case(
+    "violation-without-its-kind",
+    VIOLATION,
+    "/payload",
+    "A violation says which one: the store reports no outcome, a violation of the contract.",
+    dropped("payload", "violation"),
+)
+trace_case(
+    "commit-with-a-violation",
+    VIOLATION,
+    "/payload",
+    "Only a violation names a violation.",
+    setter(["payload", "outcome"], "Committed"),
 )
 trace_case(
     "rejection-without-its-reason",
@@ -2237,6 +2484,103 @@ bad(
     man(setter(["contracts_digest"], "6" * 64)),
 )
 
+
+# The oracle and the generators that judged and built a campaign are
+# identified apart from the lab binary (V3-002): each a digest over the
+# files it lists, in path order, as the contract digest is.
+def identified(*files):
+    listed = [{"path": path, "sha256": digest * 64, "bytes": size} for path, digest, size in files]
+    listing = "".join(f"{f['sha256']}  {f['path']}\n" for f in listed)
+    return {"sha256": hashlib.sha256(listing.encode()).hexdigest(), "files": listed}
+
+
+ORACLE = identified(
+    ("tests/oracle/mqttiumd_oracle/judge.py", "7", "52011"),
+    ("tests/oracle/mqttiumd_oracle/trace.py", "8", "9004"),
+)
+GENERATORS = identified(("tools/run_campaign.sh", "9", "1210"))
+ok(
+    "run-manifest-with-oracle-and-generators.json",
+    man(lambda v: v.update(oracle=ORACLE, generators=GENERATORS)),
+)
+bad(
+    "run-manifest-oracle-of-other-files.json",
+    "evidence-mismatch",
+    "/oracle/sha256",
+    "The digest of the oracle is the digest of the files it lists.",
+    man(lambda v: v.update(oracle={**ORACLE, "sha256": "6" * 64})),
+)
+bad(
+    "run-manifest-generators-out-of-order.json",
+    "evidence-mismatch",
+    "/generators/files/1",
+    "The files of a generator are listed once each, in path order.",
+    man(
+        lambda v: v.update(
+            generators=identified(
+                ("tools/run_campaign.sh", "9", "1210"), ("tools/build_corpus.py", "a", "77")
+            )
+        )
+    ),
+)
+bad(
+    "run-manifest-oracle-without-files.json",
+    "schema-violation",
+    "/oracle",
+    "An identity names the files it is the digest of.",
+    man(lambda v: v.update(oracle={"sha256": ORACLE["sha256"]})),
+)
+
+
+# The binary tied to the source it was rebuilt from (run --rebuild).
+BUILT_FROM = {
+    "source": {"path": "source.tar", "sha256": "5" * 64, "bytes": "20480"},
+    "build": "cargo build --locked --offline -p mqttiumd-lab --bin mqttiumd-lab",
+}
+ok(
+    "run-manifest-built-from-its-source.json",
+    man(lambda v: v["artifact"].update(built_from=copy.deepcopy(BUILT_FROM))),
+)
+bad(
+    "run-manifest-built-from-nothing.json",
+    "schema-violation",
+    "/artifact/built_from",
+    "A binary built from a source names that source.",
+    man(lambda v: v["artifact"].update(built_from={"build": BUILT_FROM["build"]})),
+)
+bad(
+    "run-manifest-built-from-without-its-command.json",
+    "schema-violation",
+    "/artifact/built_from",
+    "A binary built from a source says how it was built.",
+    man(lambda v: v["artifact"].update(built_from={"source": BUILT_FROM["source"]})),
+)
+bad(
+    "run-manifest-built-from-a-source-too-large.json",
+    "u64-out-of-range",
+    "/artifact/built_from/source/bytes",
+    "The size of the source is 64-bit.",
+    man(
+        lambda v: v["artifact"].update(
+            built_from={
+                **BUILT_FROM,
+                "source": {**BUILT_FROM["source"], "bytes": "18446744073709551616"},
+            }
+        )
+    ),
+)
+bad(
+    "run-manifest-built-from-a-source-outside.json",
+    "schema-violation",
+    "/artifact/built_from/source/path",
+    "The source is a file of the campaign, named by a relative path.",
+    man(
+        lambda v: v["artifact"].update(
+            built_from={**BUILT_FROM, "source": {**BUILT_FROM["source"], "path": "/tmp/source.tar"}}
+        )
+    ),
+)
+
 # tiny transition catalogue and registries
 dump(
     EX / "valid/toy.catalog.json",
@@ -2432,6 +2776,13 @@ for kind_name, origin in [
     ("held-item-released", "bench-supervisor"),
     ("fault-hit", "broker-core"),
     ("peer-packet-observed", "transport"),
+    ("store-result-handed-over", "broker-core"),
+    ("opening-submitted", "broker-core"),
+    ("store-epoch-opened", "store-adapter"),
+    ("opening-reply-delivered", "store-adapter"),
+    ("opening-abandoned", "bench-supervisor"),
+    ("epoch-grant-handed-over", "store-evidence"),
+    ("step-blocked", "broker-core"),
 ]:
     trace_case(
         f"{kind_name}-stated-by-{origin}",
