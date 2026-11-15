@@ -526,6 +526,22 @@ fn a_use_declaration_holds_no_macro_variable() {
 }
 
 #[test]
+fn a_repetition_does_not_assemble_a_call_or_an_attribute() {
+    // A repetition can vanish, produce a name, or put the end of one
+    // iteration before the start of the next. Every source but the last
+    // was compiled; the compiler honours the attribute of the fifth.
+    let sources = [
+        "macro_rules! gap {\n    ($($x:ident)*) => {\n        env $($x)* !(\"CARGO_MANIFEST_DIR\")\n    };\n}\npub const BUILD_DIRECTORY: &str = gap!();",
+        "macro_rules! gap {\n    ($($x:ident)*) => {\n        env ! $($x)* (\"CARGO_MANIFEST_DIR\")\n    };\n}\npub const BUILD_DIRECTORY: &str = gap!();",
+        "macro_rules! each {\n    ($($x:ident)*) => {\n        $($x)* !(\"CARGO_MANIFEST_DIR\")\n    };\n}\npub const BUILD_DIRECTORY: &str = each!(env);",
+        "macro_rules! across {\n    ($($x:ident)*) => {\n        const _: () = { $( (\"CARGO_MANIFEST_DIR\"); const $x: &str = env ! )* (\"CARGO_MANIFEST_DIR\"); };\n    };\n}\nacross!(A B);",
+        "macro_rules! attr {\n    ($($x:ident)*) => {\n        # $($x)* [path = \"../outside.rs\"] mod outside;\n    };\n}\nattr!();",
+        "macro_rules! sep { ($($x:ident)*) => { $( (\"X\"); const $x: &str = env )!* (\"X\"); }; }",
+    ];
+    assert_eq!(accepted(&sources), Vec::<&str>::new());
+}
+
+#[test]
 fn ordinary_macros_are_still_accepted() {
     for source in [
         // An ordinary invocation of a listed macro.
@@ -538,6 +554,9 @@ fn ordinary_macros_are_still_accepted() {
         // A variable beside a type annotation in a body is not a fragment.
         "macro_rules! field { ($name:ident) => { pub struct S { pub $name: u64 } }; }\nfield!(value);",
         "macro_rules! twice { ($x:literal) => { $x + $x }; }\nfn f() -> u8 { twice!(1) }",
+        // Negation and comparison in a body are not invocations.
+        "macro_rules! differs { ($a:ident, $b:ident) => { $a != $b && !$a.is_empty() && !false }; }",
+        "macro_rules! checked { ($a:ident) => { if !($a > 0) { panic!(\"zero\") } }; }",
     ] {
         assert_eq!(
             violations(source),
