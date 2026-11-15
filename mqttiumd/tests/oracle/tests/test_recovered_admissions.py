@@ -50,9 +50,15 @@ class RecoveredAdmissions(unittest.TestCase):
             snapshots["final"]["operations"].append(
                 {
                     "operation_id": other,
-                    "command_kind": "AdmitPublication",
                     "recipe_hex": corpus.admit_recipe(other, other, other, 1),
-                    "decision": "Committed",
+                    "decision": {
+                        "kind": "Committed",
+                        "facts": {
+                            "kind": "PublicationAdmitted",
+                            "publication_id": other,
+                            "exchange": corpus.exchange(1),
+                        },
+                    },
                 }
             )
 
@@ -90,8 +96,7 @@ class RecoveredAdmissions(unittest.TestCase):
             for snapshot in snapshots.values():
                 for operation in snapshot["operations"]:
                     if operation["operation_id"] == corpus.OP_ADMIT:
-                        operation["decision"] = "RejectedCertain"
-                        operation["rejection"] = "QuotaExceeded"
+                        operation["decision"] = {"kind": "RejectedCertain", "reason": "QuotaExceeded"}
 
         result = self.recovered(edit_states=states)
         self.assertEqual(result.status, "FAIL")
