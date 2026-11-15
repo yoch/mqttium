@@ -183,3 +183,56 @@ fn an_actual_unix_reader_preserves_a_truncated_frame_after_real_kill() {
         "the real Unix frame reader's truncation was dropped: {result:?}"
     );
 }
+
+#[test]
+fn a_drain_failure_keeps_the_confirmed_signal_nine_receipt() {
+    let (child, sender, _, _) = fixture();
+    let pid = child.pid();
+    let producer = std::thread::spawn(move || {
+        let start = Instant::now();
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(start.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut bytes = 64_u32.to_be_bytes().to_vec();
+        bytes.push(1);
+        let refusal = read_frame(&mut bytes.as_slice()).unwrap_err();
+        sender
+            .send(Arrival::Broken(format!("broker-core: {refusal}")))
+            .unwrap();
+    });
+    let attempt = child.kill_observed();
+    producer.join().unwrap();
+    assert!(attempt.result.is_err());
+    let observed = attempt
+        .observed
+        .expect("the real SIGKILL is not erased by collection failure");
+    assert_eq!(observed.pid, pid);
+    assert_eq!(observed.wait_signal, 9);
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+}
+
+#[test]
+fn the_actual_unix_reader_accepts_a_clean_eof_after_real_kill() {
+    let (child, sender, _, _) = fixture();
+    let pid = child.pid();
+    let (input, output) = UnixStream::pair().expect("Unix socket pair");
+    reader(input, Some(Origin::BrokerCore), sender.clone());
+    drop(sender);
+    let producer = std::thread::spawn(move || {
+        let start = Instant::now();
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(start.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(output);
+    });
+    let result = child.kill();
+    producer.join().unwrap();
+    assert_eq!(
+        result
+            .expect("clean EOF does not invent protocol damage")
+            .wait_signal,
+        9
+    );
+}

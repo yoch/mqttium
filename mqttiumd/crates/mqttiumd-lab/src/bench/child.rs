@@ -123,6 +123,12 @@ pub struct Killed {
     pub transaction: Option<Value>,
 }
 
+/// A confirmed termination remains observable even when its evidence drain fails.
+pub(crate) struct KillAttempt {
+    pub observed: Option<Killed>,
+    pub result: Result<(), Stop>,
+}
+
 /// The private directory of the sockets of one child, removed when it is
 /// dropped, whether the child started or not.
 struct SocketDirectory(PathBuf);
@@ -381,6 +387,10 @@ impl Child {
         let mut end: Option<Option<u64>> = None;
         let mut acknowledged = self.sequencer.next().checked_sub(1);
         let mut last_fault = None;
+        let mut control_reports = 0_usize;
+        // The deadline belongs to this action, not to the last byte of activity.
+        // Repeated control reports cannot keep missing evidence alive forever.
+        let deadline = Instant::now() + self.silence;
         loop {
             // Retain the ordered prefix outside the child BEFORE its ack.
             // In particular FaultHit is durable to the surviving process
@@ -416,7 +426,10 @@ impl Child {
             {
                 break;
             }
-            match self.received.recv_timeout(self.silence) {
+            match self
+                .received
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
                 Ok(Arrival::Evidence(origin, evidence)) => {
                     if evidence.emission.saturating_sub(self.sequencer.next())
                         >= super::protocol::WINDOW
@@ -425,47 +438,66 @@ impl Child {
                     }
                     self.sequencer.receive(origin, evidence);
                 }
-                Ok(Arrival::Report(Report::EndOfAction { last_emission })) => {
-                    end = Some(last_emission);
-                }
-                Ok(Arrival::Report(Report::Parked {
-                    last_emission,
-                    fault,
-                    point,
-                    settings,
-                })) => {
-                    if Some(last_emission) != acknowledged || !self.sequencer.is_empty() {
-                        return Err(stop(
-                            "transaction parked before its evidence was retained and acknowledged",
-                        ));
-                    }
-                    let hit = last_fault
-                        .as_ref()
-                        .ok_or_else(|| stop("transaction parked without a FaultHit"))?;
-                    if hit["point"] != point || hit.get("operation_id").is_none() {
-                        return Err(stop("transaction park contradicts the retained FaultHit"));
-                    }
-                    let settings: Value = serde_json::from_str(&settings)
-                        .map_err(|why| stop(format!("transaction settings: {why}")))?;
-                    if settings["kill_points"] != true || settings["wal_autocheckpoint"] != 0 {
-                        return Err(stop("transaction park has incompatible effective settings"));
-                    }
-                    self.parked = Some(serde_json::json!({
-                        "fault": fault, "point": point, "hit": hit, "backend_settings": settings,
-                        "evidence_retained_before_ack": true,
-                    }));
-                    end = Some(Some(last_emission));
-                }
                 Ok(Arrival::Report(report)) => {
-                    if reports.len() >= REPORTS_PER_ACTION {
+                    if control_reports >= REPORTS_PER_ACTION {
                         return Err(stop("the child exceeded the bounded action report list"));
                     }
-                    reports.push(report);
+                    control_reports += 1;
+                    match report {
+                        Report::EndOfAction { last_emission } => {
+                            if end.is_some() {
+                                return Err(stop(
+                                    "the child sent more than one action termination",
+                                ));
+                            }
+                            end = Some(last_emission);
+                        }
+                        Report::Parked {
+                            last_emission,
+                            fault,
+                            point,
+                            settings,
+                        } => {
+                            if end.is_some() {
+                                return Err(stop(
+                                    "the child sent more than one action termination",
+                                ));
+                            }
+                            if Some(last_emission) != acknowledged || !self.sequencer.is_empty() {
+                                return Err(stop(
+                                    "transaction parked before its evidence was retained and acknowledged",
+                                ));
+                            }
+                            let hit = last_fault
+                                .as_ref()
+                                .ok_or_else(|| stop("transaction parked without a FaultHit"))?;
+                            if hit["point"] != point || hit.get("operation_id").is_none() {
+                                return Err(stop(
+                                    "transaction park contradicts the retained FaultHit",
+                                ));
+                            }
+                            let settings: Value = serde_json::from_str(&settings)
+                                .map_err(|why| stop(format!("transaction settings: {why}")))?;
+                            if settings["kill_points"] != true
+                                || settings["wal_autocheckpoint"] != 0
+                            {
+                                return Err(stop(
+                                    "transaction park has incompatible effective settings",
+                                ));
+                            }
+                            self.parked = Some(serde_json::json!({
+                                "fault": fault, "point": point, "hit": hit, "backend_settings": settings,
+                                "evidence_retained_before_ack": true,
+                            }));
+                            end = Some(Some(last_emission));
+                        }
+                        other => reports.push(other),
+                    }
                 }
                 Ok(Arrival::Broken(why)) => return Err(stop(format!("the child broke: {why}"))),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     return Err(stop(format!(
-                        "the child {} wrote nothing for {} ms",
+                        "the child {} did not finish its action within {} ms",
                         self.pid,
                         self.silence.as_millis()
                     )));
@@ -716,7 +748,23 @@ impl Child {
     /// the wait status (signal 9, no exit code) before this returns; a
     /// frame that arrives after the kill can only describe what was not
     /// allowed, and stops the run.
-    pub fn kill(mut self) -> Result<Killed, Stop> {
+    pub fn kill(self) -> Result<Killed, Stop> {
+        let attempt = self.kill_observed();
+        attempt.result?;
+        attempt
+            .observed
+            .ok_or_else(|| stop("the kill has no confirmed wait observation"))
+    }
+
+    /// The runner keeps the confirmed wait observation before interpreting
+    /// any failure of the evidence drain. Such a failure cannot erase SIGKILL.
+    pub(crate) fn kill_observed(mut self) -> KillAttempt {
+        let mut observed = None;
+        let result = self.kill_into(&mut observed);
+        KillAttempt { observed, result }
+    }
+
+    fn kill_into(&mut self, observed: &mut Option<Killed>) -> Result<(), Stop> {
         if self.actions.is_none() {
             return Err(stop("the child is not driven any more"));
         }
@@ -756,12 +804,33 @@ impl Child {
                 self.pid
             )));
         }
-        // Its descriptors close with it: what is left is read to the end.
-        let mut late = Vec::new();
+        *observed = Some(killed);
+        // Its descriptors close with it. A clean EOF is represented by the
+        // reader dropping its sender; a started/truncated frame is Broken.
+        let deadline = Instant::now() + self.silence;
+        let mut failure = None;
+        let mut count = 0_usize;
         loop {
-            match self.received.recv_timeout(self.silence) {
-                Ok(Arrival::Evidence(origin, _)) => late.push(origin.name()),
-                Ok(Arrival::Report(_) | Arrival::Broken(_)) => {}
+            match self
+                .received
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(arrival) => {
+                    count += 1;
+                    if count > ARRIVAL_CAPACITY {
+                        return Err(stop(
+                            "the killed child's evidence drain exceeded its frame budget",
+                        ));
+                    }
+                    let why = match arrival {
+                        Arrival::Evidence(origin, _) => {
+                            format!("a record of {} arrived after the kill", origin.name())
+                        }
+                        Arrival::Report(_) => "a control report arrived after the kill".to_owned(),
+                        Arrival::Broken(why) => format!("the killed child's evidence broke: {why}"),
+                    };
+                    failure.get_or_insert_with(|| stop(why));
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     return Err(stop(format!(
@@ -771,15 +840,10 @@ impl Child {
                 }
             }
         }
-        if !late.is_empty() {
-            return Err(stop(format!(
-                "{} records arrived after the kill of the child {}: {}",
-                late.len(),
-                self.pid,
-                late.join(", ")
-            )));
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-        Ok(killed)
     }
 
     /// Waits for the exit of the child before `limit`.

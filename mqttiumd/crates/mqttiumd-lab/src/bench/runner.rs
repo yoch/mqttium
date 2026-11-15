@@ -827,20 +827,23 @@ impl<B: Backend> Runner<'_, B> {
                             .collect();
                         open.sort_by_key(|(generation, _)| generation.get());
                         let open = open.into_iter().map(|(_, name)| name).collect();
-                        let killed = child.kill()?;
+                        let attempt = child.kill_observed();
                         // The kill as the wait status showed it, before the
                         // crash (decision 0019); its process identifier goes
                         // to campaign.json only.
-                        self.emit(
-                            Origin::BenchSupervisor,
-                            "BrokerKilled",
-                            &[],
-                            json!({
-                                "signal_sent": killed.signal_sent,
-                                "wait_status": {"signal": killed.wait_signal},
-                            }),
-                        )?;
-                        self.kills.push(killed);
+                        if let Some(killed) = attempt.observed {
+                            self.emit(
+                                Origin::BenchSupervisor,
+                                "BrokerKilled",
+                                &[],
+                                json!({
+                                    "signal_sent": killed.signal_sent,
+                                    "wait_status": {"signal": killed.wait_signal},
+                                }),
+                            )?;
+                            self.kills.push(killed);
+                        }
+                        attempt.result?;
                         (None, open)
                     }
                 };
