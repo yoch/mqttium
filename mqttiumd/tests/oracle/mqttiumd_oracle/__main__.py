@@ -1,0 +1,68 @@
+"""Command line of the oracle.
+
+Run from the ``mqttiumd`` directory::
+
+    python -m mqttiumd_oracle judge --scenario <file> --trace <file>
+    python -m mqttiumd_oracle recompute --result <file>
+
+Paths are relative to ``--root``, which defaults to the current directory.
+``judge`` prints the status of every assertion with its reasons and exits
+with the code of the verdict they determine: 0 PASS, 1 FAIL, 2 INCONCLUSIVE,
+3 OUT_OF_SCOPE (DEM-023). ``recompute`` exits 0 when the result stands and 2
+when it is refused: a refused result concludes nothing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+from . import judge, results
+from .documents import Contracts
+from .semantic import verdict_of
+from .strict import Refused
+
+
+def main(arguments=None) -> int:
+    parser = argparse.ArgumentParser(prog="mqttiumd_oracle", description=__doc__.splitlines()[0])
+    parser.add_argument("--root", default=".")
+    parser.add_argument("--contracts", default="contracts/v1")
+    commands = parser.add_subparsers(dest="command", required=True)
+    judging = commands.add_parser("judge")
+    judging.add_argument("--scenario", required=True)
+    judging.add_argument("--trace", required=True)
+    recomputing = commands.add_parser("recompute")
+    recomputing.add_argument("--result", required=True)
+    options = parser.parse_args(arguments)
+
+    contracts = Contracts.open(options.root, options.contracts)
+    if options.command == "recompute":
+        refusals = results.recompute(contracts, options.result)
+        for refusal in refusals:
+            print(f"refused {refusal}", file=sys.stderr)
+        print("stands" if not refusals else f"refused: {len(refusals)} reasons")
+        return 0 if not refusals else results.EXIT_CODES["INCONCLUSIVE"]
+    try:
+        run = judge.Run.load(contracts, options.scenario, options.trace)
+    except (Refused, OSError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return results.EXIT_CODES["INCONCLUSIVE"]
+    statuses, faults = results._observed(run)
+    reached = all(fault["hits"] == fault["expected_hits"] for fault in faults)
+    verdict = verdict_of([status.status for status in statuses.values()], reached)
+    report = {
+        "contracts": f"sha256:{contracts.digest}",
+        "verdict": verdict,
+        "assertions": {
+            name: {"status": status.status, "reasons": status.reasons}
+            for name, status in statuses.items()
+        },
+        "faults": faults,
+    }
+    print(json.dumps(report, indent=2))
+    return results.EXIT_CODES[verdict]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

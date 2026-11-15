@@ -42,6 +42,7 @@ The two readers reach that agreement by different means where it matters:
 | `mqttiumd_oracle/recipe.py` | The canonical bytes of a recipe, decoded independently |
 | `mqttiumd_oracle/trace.py` | A trace read as a whole, and the order it establishes between two records |
 | `mqttiumd_oracle/judge.py` | The observations of a run and the assertions of the catalogue |
+| `mqttiumd_oracle/results.py` | A qualifying result produced from the observations; a result that is offered, recomputed |
 
 ## Reading a trace
 
@@ -92,12 +93,31 @@ python tests/oracle/build_traces.py           # rewrite the corpus
 python tests/oracle/build_traces.py --check   # what the tests run
 ```
 
+## Results
+
+`results.produce` writes a qualifying result from the observations of a
+run: the statuses the judge found, the injection counts of the trace, the
+verdict they determine and the reasons of whatever is not a PASS.
+`results.recompute` takes a result that is offered, checks it as a
+document, judges the scenario and trace it cites again, and refuses it
+where a status or an injection count differs (`result-not-recomputed`). A
+provisional result names no evidence and is refused as such. The verdict of
+a result is never taken from the result.
+
+```bash
+PYTHONPATH=tests/oracle python -m mqttiumd_oracle judge --scenario <file> --trace <file>
+PYTHONPATH=tests/oracle python -m mqttiumd_oracle recompute --result <file>
+```
+
+`judge` exits with the code of the verdict (0 PASS, 1 FAIL, 2 INCONCLUSIVE,
+3 OUT_OF_SCOPE); `recompute` exits 0 when the result stands and 2 when it
+is refused.
+
 ## What does not exist yet
 
-- The recomputation of a qualifying result from the files it cites, and the
-  refusal of a result whose statuses differ.
 - Obligations of a run on a sub-perimeter (core without bytes): a trace
-  does not declare its perimeter yet.
+  does not declare its perimeter yet, so every run is judged as a full one
+  and a run without peer records is inconclusive.
 - Scenario files for QABS-A, B and C.
 
 `docs/reception/open-conditions.md` keeps the rows these close.

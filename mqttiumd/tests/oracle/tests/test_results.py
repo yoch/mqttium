@@ -91,6 +91,19 @@ class Results(unittest.TestCase):
         self.assertEqual(result["verdict"], "INCONCLUSIVE")
         self.assertEqual(result["faults"][0]["hits"], "2")
 
+    def test_a_missed_injection_blocks_the_pass_even_if_no_assertion_watches_it(self):
+        scenario = json.loads((ROOT / SCENARIO).read_text())
+        scenario["assertions"].remove("all_required_faults_hit")
+        result = self.produced("fault-hit-twice", self.write("scenario.json", scenario))
+        self.assertEqual(set(self.statuses(result).values()), {"PASS"})
+        self.assertEqual((result["verdict"], result["exit_code"]), ("INCONCLUSIVE", 2))
+        self.assertEqual(self.contracts.check_file(self.write("result.json", result)), [])
+
+    def test_a_result_whose_verdict_contradicts_its_statuses_is_refused_as_a_document(self):
+        result = self.produced("p1-02-good")
+        result["verdict"], result["exit_code"] = "FAIL", 1
+        self.assertEqual(self.refusals(result), [("verdict-inconsistent", "/verdict")])
+
     def passing_claim(self, trace):
         """A result that cites ``trace`` and claims what a good run would."""
         result = self.produced(trace)
