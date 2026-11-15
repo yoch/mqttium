@@ -36,8 +36,8 @@ It becomes a requirement only when the owner of the repository accepts it.
   without `StoreCommitStable`; K3's is Committed and its stable record
   precedes its point. Missing inventory is inconclusive, a contradicted
   expectation fails. Commits of a new epoch or retransmission are separate
-  operations and are not forbidden by the interrupted command's absence. The sentence of the bench's
-  failure model (`campaign.json`, `covers.crash`) loses "never inside a
+  operations and are not forbidden by the interrupted command's absence.
+  The sentence of the bench's failure model (`campaign.json`, `covers.crash`) loses "never inside a
   transaction" for such a run: that sentence is lot L4's.
 - **What the oracle concludes.** At K2b a commit is durable without its
   `StoreCommitStable`: on a run whose broker is a child process,
@@ -51,8 +51,9 @@ It becomes a requirement only when the owner of the repository accepts it.
 ## Test instrumentation and checkpoint policy
 
 The lab's `kill-points` feature forwards to the store feature and is off
-by default. A feature-enabled run records `effective.build_features` and
-the store's `kill_points`; the source reconstruction command includes the
+by default. A feature-enabled run records `build_features` in
+`campaign.json` and the store's `kill_points` in `backend_settings`; the
+source reconstruction command includes the
 same feature in `artifact.built_from.build`, and the second build follows
 that command. Cargo feature unification can instrument a dependency of
 another workspace member; `tools/check_kill_points.sh` checks a separate
