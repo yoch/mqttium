@@ -1331,63 +1331,6 @@
       "why": "K1: the adapter submits a resolution caused by the bench, not by the core."
     },
     {
-      "name": "admission-found-again-at-the-recovery",
-      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
-      "trace": "tests/oracle/traces/admission-found-again-at-the-recovery/trace.jsonl",
-      "expected": {
-        "one_admission_per_observed_inbound_exchange": "PASS",
-        "same_required_obligations_at_both_checkpoints": "PASS",
-        "same_recipe_for_op_A": "PASS",
-        "no_positive_ack_before_confirmed_commit": "PASS",
-        "no_pubrec_observed_before_crash": "PASS",
-        "broker_inputs_have_provenance": "PASS",
-        "all_required_faults_hit": "PASS",
-        "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS",
-        "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
-      },
-      "why": "K2b: the commit is durable and the store wrote no StoreCommitStable before the kill; the recovery shows it, and the replay is answered from it: one admission."
-    },
-    {
-      "name": "admission-stable-then-killed",
-      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
-      "trace": "tests/oracle/traces/admission-stable-then-killed/trace.jsonl",
-      "expected": {
-        "one_admission_per_observed_inbound_exchange": "PASS",
-        "same_required_obligations_at_both_checkpoints": "PASS",
-        "same_recipe_for_op_A": "PASS",
-        "no_positive_ack_before_confirmed_commit": "PASS",
-        "no_pubrec_observed_before_crash": "PASS",
-        "broker_inputs_have_provenance": "PASS",
-        "all_required_faults_hit": "PASS",
-        "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS",
-        "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
-      },
-      "why": "K3: StoreCommitStable is written, the child is killed before the result; one admission."
-    },
-    {
-      "name": "admission-found-again-and-committed-again",
-      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
-      "trace": "tests/oracle/traces/admission-found-again-and-committed-again/trace.jsonl",
-      "expected": {
-        "one_admission_per_observed_inbound_exchange": "FAIL",
-        "same_required_obligations_at_both_checkpoints": "PASS",
-        "same_recipe_for_op_A": "PASS",
-        "no_positive_ack_before_confirmed_commit": "PASS",
-        "no_pubrec_observed_before_crash": "PASS",
-        "broker_inputs_have_provenance": "PASS",
-        "all_required_faults_hit": "PASS",
-        "trace_complete": "PASS",
-        "one_grant_per_opened_epoch": "PASS",
-        "scenario_reaches_its_end": "PASS",
-        "broker_killed_for_real": "PASS"
-      },
-      "why": "The recovery shows the admission, and the replay is committed a second time: two admissions."
-    },
-    {
       "name": "p1-02-good-killed-for-real",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/p1-02-good-killed-for-real/trace.jsonl",
@@ -1500,6 +1443,82 @@
         "broker_killed_for_real": "FAIL"
       },
       "why": "A record of the killed incarnation of the child comes after the kill."
+    },
+    {
+      "name": "admission-found-again-at-the-recovery",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/admission-found-again-at-the-recovery/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS",
+        "broker_killed_for_real": "PASS"
+      },
+      "why": "K2b: the commit is durable and the store wrote no StoreCommitStable before the kill; the recovery shows it, and the replay is answered from it: one admission."
+    },
+    {
+      "name": "admission-stable-then-killed",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/admission-stable-then-killed/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS",
+        "broker_killed_for_real": "PASS"
+      },
+      "why": "K3: StoreCommitStable is written, the child is killed before the result; one admission."
+    },
+    {
+      "name": "admission-found-again-and-committed-again",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/admission-found-again-and-committed-again/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "FAIL",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS",
+        "broker_killed_for_real": "PASS"
+      },
+      "why": "The recovery shows the admission, and the replay is committed a second time: two admissions."
+    },
+    {
+      "name": "admission-found-again-without-a-kill",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/admission-found-again-without-a-kill/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "FAIL",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS",
+        "broker_killed_for_real": "PASS"
+      },
+      "why": "In-process, no kill: a recovered commit without its StoreCommitStable is no admission."
     },
     {
       "name": "pubcomp-after-a-recipe-mismatch",

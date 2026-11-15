@@ -78,6 +78,16 @@ refused input, the rejection a refusing PUBREC answers, the committed
 reply a grant follows. Those that ask only what came first read `before`:
 the closure before a refusal, the commit before an inspection, the crash
 before an observed PUBREC, a resolution after a terminal result.
+`one_admission_per_observed_inbound_exchange` counts the admissions of
+an exchange by their `StoreCommitStable`, and by one more evidence: a
+commit can be durable without that record when the store's evidence dies
+with the child, killed inside the transaction after its commit frame (K2b
+of the plan of lot L7). On a run whose broker is a child process, an
+`Operation` fact `Committed` of a recovery that follows a `BrokerKilled`
+is then the admission of that operation, once, unless a
+`StoreCommitStable` of it came before. In-process the evidence of the
+store is never killed, and a commit without it is no admission.
+
 `broker_killed_for_real` (record 0019), owed by every run, reads the
 claim of the trace header. A run in-process has nothing to show, and a
 kill it records fails. A run whose broker is a child process shows, for
