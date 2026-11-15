@@ -1209,6 +1209,12 @@ impl SqliteStore {
         })
     }
 
+    /// The durable state, or why it could not be read: a value that does
+    /// not decode is `OpenError::Corrupt`, as for `inspect`.
+    pub fn try_snapshot(&self) -> Result<DurableState, OpenError> {
+        Ok(self.snapshot())
+    }
+
     /// The engine and the settings in force, read back at opening.
     #[must_use]
     pub fn effective_settings(&self) -> &Settings {
