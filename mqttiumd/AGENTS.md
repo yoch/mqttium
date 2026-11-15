@@ -60,6 +60,47 @@ names. The campaign directory must be outside the work tree:
 tools/run_qualifying_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02-q 1 sqlite
 ```
 
+By default the process under test runs inside the runner and a crash is
+simulated. On the SQLite store it can run in a child process
+(`--process child`, the fifth argument of the two scripts above): the
+supervisor then kills that child with SIGKILL where the scenario crashes
+the broker, waits for its end by that signal, and starts another child on
+the same database file. The script below plays such a run rebuilt from
+its source, which must qualify, and plays it again under `strace` to keep
+the kernel's account of the kill; `tools/check_campaign_kill.py` checks
+both. It shows the loss of the process after a commit, outside any
+transaction, and the recovery; nothing about a transaction cut by a kill,
+`fsync` or a power loss:
+
+```bash
+tools/run_killed_campaign.sh tests/scenarios/p1/P1-02.json /tmp/p1-02-killed
+```
+
+Only `recompute` says that a result is evidence: it recomputes the
+assertions and the faults from the trace and checks again every condition
+of a qualifying run, so a qualifying result whose source archive, oracle
+or kept modification no longer matches is refused. `validate` checks the
+document only. The reception below produces a qualifying campaign from
+the clean tree and one from a modified worktree, degrades independent
+copies, and requires each refusal for its own reason:
+
+```bash
+tools/run_recompute_reception.sh /tmp/recompute-reception sqlite
+```
+
+The command a campaign records in `campaign.json` (`commands.replay`)
+names every parameter of the run, its store included, and
+`commands.replay_scope` says what that replay is: an ordinary replay
+plays with the lab binary of the checkout it is run in and gives a
+provisional result; only a rebuilt run can qualify.
+
+Build directories are per agent: run the suites with `env -u
+CARGO_TARGET_DIR -u CARGO_ENCODED_RUSTFLAGS` or an explicit
+`--target-dir`, and campaigns in directories of their own. A rebuild of
+one source archive uses the directory that archive names under `TMPDIR`,
+so two rebuilds of the same archive must not run together (the binary
+check takes a lock; `run --rebuild` does not yet).
+
 The loop is shown to reject a defect by mutations kept as diffs under
 `tests/mutants/loop/` (`*.mutant`: the root `.gitignore` ignores `*.patch`
 and `*.diff`). The script applies each one in a temporary worktree, never

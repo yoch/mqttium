@@ -194,9 +194,31 @@ run: the statuses the judge found, the injection counts of the trace, the
 verdict they determine and the reasons of whatever is not a PASS.
 `results.recompute` takes a result that is offered, checks it as a
 document, judges the scenario and trace it cites again, and refuses it
-where a status or an injection count differs (`result-not-recomputed`). A
-provisional result names no evidence and is refused as such. The verdict of
-a result is never taken from the result.
+where a status or an injection count differs (`result-not-recomputed`). It
+also checks again every condition of a qualifying run (`results.unmet`)
+from the scenario and the manifest the result cites, as `produce` checks
+them: a qualifying result whose source has gone or changed, whose oracle
+is not the one that runs, or whose kept modifications are missing is
+refused (`result-not-qualifying` at `/manifest`, naming the condition;
+R1 of the audit of `a4aea95f`). A provisional result names no evidence
+and is refused as such. The verdict of a result is never taken from the
+result.
+
+`mqttiumd-lab validate` checks a result as a document: its schema, the
+digests and sizes of the files it cites (scenario, manifest, trace), the
+contracts it names, its assertions and faults against its scenario, and
+that its verdict is the one they determine. It does not judge the trace
+and does not check the conditions of a qualifying run: a qualifying
+result whose `source.tar` is missing is still accepted by `validate`.
+Acceptance by `validate` says the document is consistent; that it is
+evidence is said only by `recompute`.
+
+`python3 tools/reproduce_recompute.py <campaign> <new directory>
+[--modified <campaign of a modified tree>] [--oracle <checkout>]` replays
+the reception of R1 on a real campaign: independent copies, each with one
+defect (none, source removed, source changed by one byte, another oracle,
+a kept file removed), `recompute` then `produce` on each, one JSON line
+per case, exit 0 when each case is refused for its defect alone.
 
 The command `produce` writes the run-result of a run, for a campaign to
 recompute and validate. It writes a qualifying result only when every

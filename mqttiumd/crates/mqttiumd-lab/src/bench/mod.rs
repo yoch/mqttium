@@ -9,6 +9,9 @@
 //! - `collector`: the one writer of the trace, origin by channel;
 //! - `process`: the process under test, the real core and the
 //!   deterministic store, started by the real path;
+//! - `broker`: what the runner asks of that process, in the supervisor or
+//!   in a child process;
+//! - `child`: the child process and the supervisor's side of it;
 //! - `runner`: the supervisor, the peers and the scheduler of choices;
 //! - `protocol`: the frames, messages, order and flow between the
 //!   supervisor and the child process, tested before any process exists;
@@ -19,7 +22,9 @@
 //! Nothing here computes a verdict.
 
 pub mod backend;
+pub mod broker;
 pub mod campaign;
+pub mod child;
 pub mod collector;
 pub mod mqtt;
 pub mod process;

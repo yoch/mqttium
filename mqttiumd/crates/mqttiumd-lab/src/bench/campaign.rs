@@ -31,6 +31,7 @@ use std::process::Command;
 use serde_json::{Value, json};
 
 use super::backend::{Backend, Memory};
+use super::child::Config as ChildConfig;
 use super::collector::{Collector, KindTable};
 use super::mqtt::transport::Bounds;
 use super::process::{Settings, Stop, owner_config};
@@ -66,6 +67,10 @@ pub struct Request {
     /// The packed source this binary was built from by `run --rebuild`,
     /// copied into the campaign as `source.tar`.
     pub built_from: Option<PathBuf>,
+    /// Where the process under test runs: `in-process`, in the process of
+    /// the supervisor (the default), or `child`, in a child process driven
+    /// by the control protocol (SQLite only).
+    pub process: String,
 }
 
 /// What a campaign left, for the command line.
@@ -290,6 +295,53 @@ fn narrow<T: TryFrom<u64>>(value: u64, name: &str) -> Result<T, String> {
     T::try_from(value).map_err(|_| format!("{name} does not fit"))
 }
 
+/// The settings of the process a fixture fixes, the same at every
+/// start-up, in the supervisor and in a child process alike.
+pub fn settings_of(
+    fixture_document: &Value,
+    run_id: &str,
+    seed: u64,
+    faults: usize,
+) -> Result<Settings, String> {
+    let plan = fixture::plan(fixture_document).map_err(|error| format!("{error:?}"))?;
+    let limits = plan.limits;
+    let owner = owner_config(
+        narrow(limits.max_sessions as u64, "max_sessions")?,
+        narrow(limits.max_route_targets as u64, "max_route_targets")?,
+        narrow(limits.exchange_slots.get(), "exchange_slots")?,
+        limits.payload_bytes.get(),
+        RESOLUTION_DELAY,
+    )
+    .map_err(|Stop(reason)| reason)?;
+    let effect_slots: usize = narrow(capacity(fixture_document, "effect_slots")?, "effect_slots")?;
+    let effect_slots = NonZeroUsize::new(effect_slots).ok_or("no effect slot")?;
+    let reservations = NonZeroU32::new(narrow(effect_slots.get() as u64, "reservations")?)
+        .ok_or("no reservation")?;
+    let leaked: &'static str = Box::leak(run_id.to_owned().into_boxed_str());
+    let settings = Settings {
+        run_id: leaked,
+        seed,
+        resolution_delay: RESOLUTION_DELAY,
+        work_limit: 4096,
+        recovery_page: 64,
+        effect_slots,
+        reservations,
+        adapter: AdapterLimits {
+            operations_in_flight: plan.operations_in_flight,
+            result_slots: plan.result_slots,
+            faults: faults.max(1),
+            events: 4096,
+        },
+        owner,
+        bounds: Bounds {
+            max_client_id: MAX_CLIENT_ID_BYTES,
+            max_topic: limits.max_topic_bytes,
+            max_payload: limits.max_payload_bytes,
+        },
+    };
+    Ok(settings)
+}
+
 /// The process under test as a fixture sets it up: its settings, the
 /// data set installed through store commands, and the clients.
 pub struct Setup<S> {
@@ -312,6 +364,7 @@ impl<S: crate::store::durable::DurableStore> Setup<S> {
         let mut store = backend.create(plan.incarnation, plan.limits)?;
         let installed =
             fixture::install(&mut store, &plan).map_err(|error| format!("{error:?}"))?;
+        let settings = settings_of(fixture_document, run_id, seed, faults)?;
         let population = Population {
             clients: plan
                 .sessions
@@ -325,42 +378,6 @@ impl<S: crate::store::durable::DurableStore> Setup<S> {
                 })
                 .collect::<Result<_, _>>()?,
         };
-        let limits = plan.limits;
-        let owner = owner_config(
-            narrow(limits.max_sessions as u64, "max_sessions")?,
-            narrow(limits.max_route_targets as u64, "max_route_targets")?,
-            narrow(limits.exchange_slots.get(), "exchange_slots")?,
-            limits.payload_bytes.get(),
-            RESOLUTION_DELAY,
-        )
-        .map_err(|Stop(reason)| reason)?;
-        let effect_slots: usize =
-            narrow(capacity(fixture_document, "effect_slots")?, "effect_slots")?;
-        let effect_slots = NonZeroUsize::new(effect_slots).ok_or("no effect slot")?;
-        let reservations = NonZeroU32::new(narrow(effect_slots.get() as u64, "reservations")?)
-            .ok_or("no reservation")?;
-        let leaked: &'static str = Box::leak(run_id.to_owned().into_boxed_str());
-        let settings = Settings {
-            run_id: leaked,
-            seed,
-            resolution_delay: RESOLUTION_DELAY,
-            work_limit: 4096,
-            recovery_page: 64,
-            effect_slots,
-            reservations,
-            adapter: AdapterLimits {
-                operations_in_flight: plan.operations_in_flight,
-                result_slots: plan.result_slots,
-                faults: faults.max(1),
-                events: 4096,
-            },
-            owner,
-            bounds: Bounds {
-                max_client_id: MAX_CLIENT_ID_BYTES,
-                max_topic: limits.max_topic_bytes,
-                max_payload: limits.max_payload_bytes,
-            },
-        };
         Ok(Self {
             settings,
             store,
@@ -373,6 +390,15 @@ impl<S: crate::store::durable::DurableStore> Setup<S> {
 /// a run that stopped still leaves its directory.
 pub fn execute(request: &Request) -> Result<Report, String> {
     refuse_inside_work_tree(&request.root, &request.out)?;
+    match (request.process.as_str(), request.backend.as_str()) {
+        ("in-process", _) | ("child", "sqlite") => {}
+        ("child", other) => {
+            return Err(format!(
+                "--process child runs on sqlite only; {other} lives in the process that runs it"
+            ));
+        }
+        (other, _) => return Err(format!("unknown process {other}: in-process or child")),
+    }
     match request.backend.as_str() {
         "sim-store" => execute_with(request, Memory),
         "sqlite" => execute_with(
@@ -381,6 +407,33 @@ pub fn execute(request: &Request) -> Result<Report, String> {
         ),
         other => Err(format!("unknown backend {other}: sim-store or sqlite")),
     }
+}
+
+/// The failure model of S0 with a child process, as the topology plan
+/// states it: a limit of the bench, not a property of the product.
+pub const FAILURE_MODEL: &str = "Kill of the process at a declared point, after the decisive record is acknowledged. The kernel and its page cache survive; nothing is shown about fsync, power loss or torn writes. Never inside a transaction: a restriction of the bench.";
+
+/// What `covers.crash` of `campaign.json` says of the crashes of a run.
+fn crash_statement(in_child: bool, kills: &[super::child::Killed], in_process: &str) -> String {
+    if !in_child {
+        return in_process.to_owned();
+    }
+    if kills.is_empty() {
+        return "no crash: the child process stopped cleanly at the end of the run".to_owned();
+    }
+    let each: Vec<String> = kills
+        .iter()
+        .map(|killed| {
+            format!(
+                "{} to pid {} (start-up {}), wait status signal {}",
+                killed.signal_sent, killed.pid, killed.rank, killed.wait_signal
+            )
+        })
+        .collect();
+    format!(
+        "process killed: {}; the supervisor and its collector stayed alive, waited for the end of the child before starting the next one on the same file, and nothing opened, copied or moved the database or its -wal and -shm files in between",
+        each.join("; ")
+    )
 }
 
 /// A campaign is generated: it is never written inside the work tree of
@@ -450,11 +503,20 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     {
         return Err(format!("{} exists and is not empty", out.display()));
     }
-    fs::create_dir_all(out).map_err(|error| io(out, error))?;
     let root = &request.root;
     let canonical_root = root.canonicalize().map_err(|error| io(root, error))?;
     let contracts = relative(&request.contracts)?;
     let scenario_path = relative(&request.scenario)?;
+    // What the bench does not play is refused before anything is written.
+    {
+        let path = canonical_root.join(&scenario_path);
+        let bytes = fs::read(&path).map_err(|error| io(&path, error))?;
+        let document = strict::parse(&bytes).map_err(|error| error.to_string())?;
+        if let Some(why) = super::scenario::unplayed(&document) {
+            return Err(format!("{scenario_path} is not played: {why}"));
+        }
+    }
+    fs::create_dir_all(out).map_err(|error| io(out, error))?;
 
     // The source the binary was built from, when it was rebuilt.
     if let Some(tar) = &request.built_from {
@@ -517,6 +579,28 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     let collector = Collector::new(&run_id, kinds, scenario.max_trace_bytes);
     let backend_name = backend.name();
     let backend_settings = backend.describe();
+    let child = (request.process == "child")
+        .then(|| -> Result<ChildConfig, String> {
+            let campaign = out.canonicalize().map_err(|error| io(out, error))?;
+            Ok(ChildConfig {
+                executable: std::env::current_exe()
+                    .map_err(|error| format!("the binary of the run: {error}"))?,
+                store: campaign.join("store").join("mqttiumd.sqlite"),
+                campaign,
+                contracts: contracts.clone(),
+                scenario: scenario_path.clone(),
+                seed: request.seed,
+                run_id: run_id.clone(),
+                sessions: population
+                    .clients
+                    .iter()
+                    .map(|(name, _, session)| (name.clone(), *session))
+                    .collect(),
+                silence: super::child::SILENCE,
+            })
+        })
+        .transpose()?;
+    let in_child = child.is_some();
     let backend_crash = backend.crash();
     let outcome: Outcome = run(Plan {
         scenario: &scenario,
@@ -525,6 +609,7 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         population,
         store,
         collector,
+        child,
     });
 
     // The evidence, as it was collected.
@@ -542,9 +627,16 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     // executed as it stands, it plays this campaign and no other.
     let rebuilt = request.built_from.is_some();
     let replay = format!(
-        "cargo run -p mqttiumd-lab --locked -- run --contracts {contracts} --scenario {scenario_path} --seed {} --run-id {run_id} --backend {}{} --out <empty directory outside the work tree>",
+        "cargo run -p mqttiumd-lab --locked -- run --contracts {contracts} --scenario {scenario_path} --seed {} --run-id {run_id} --backend {}{}{} --out <empty directory outside the work tree>",
         request.seed,
         request.backend,
+        // A run in a child process is replayed in a child; the default,
+        // in-process, is not named.
+        if request.process == "child" {
+            " --process child"
+        } else {
+            ""
+        },
         if rebuilt { " --rebuild" } else { "" }
     );
     let replay_scope = if rebuilt {
@@ -701,11 +793,23 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         "scenario": scenario.id,
         "covers": {
             "backend": backend_name,
-            "crash": backend_crash,
+            "process": request.process,
+            "crash": crash_statement(in_child, &outcome.kills, backend_crash),
             "perimeter": "full: client bytes through the transport of the bench, decoded by independent peers",
             "start_up": "the real path: EpochOpening through the store adapter, EpochGrant, OwnerAuthority::from_grant, one box for owner 0, Owner::new",
         },
         "backend_settings": backend_settings,
+        "kills": outcome.kills.iter().map(|killed| json!({
+            "pid": killed.pid,
+            "rank": killed.rank.to_string(),
+            "signal_sent": killed.signal_sent,
+            "wait_status": {"signal": killed.wait_signal, "exit_code": null},
+        })).collect::<Vec<_>>(),
+        "failure_model": if in_child {
+            json!({"kind": scenario.failure_model(), "statement": FAILURE_MODEL})
+        } else {
+            json!({"kind": scenario.failure_model()})
+        },
         "built_from": built_from.unwrap_or(Value::Null),
         "lab": run_manifest["artifact"].clone(),
         "contracts_digest": workspace.contracts_digest(),
