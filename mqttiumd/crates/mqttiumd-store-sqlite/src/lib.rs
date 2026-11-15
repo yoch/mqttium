@@ -314,6 +314,10 @@ fn blob(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Vec<u8>> {
 }
 
 fn read_meta(conn: &Connection) -> Result<Meta, Fault> {
+    #[cfg(test)]
+    if let Some(error) = transaction_read_tests::take_if_transaction(conn) {
+        return Err(Fault::Read(error));
+    }
     let mut statement = conn.prepare_cached(
         "SELECT format, incarnation, last_opened, opened_by, collected_through, revision,
                 next_session, route_revision,
@@ -2185,5 +2189,76 @@ impl DurableStore for SqliteStore {
     fn snapshot_with_budget(&self, budget: ReadBudget) -> Result<DurableState, ReadError> {
         self.read_snapshot(budget)
             .map_err(|fault| fault.read_error())
+    }
+}
+
+#[cfg(test)]
+mod transaction_read_tests {
+    use super::*;
+    use mqttiumd_contract::command::{OpeningAttempt, OpeningTicket, StartupNonce};
+    use std::cell::Cell;
+
+    std::thread_local! {
+        // One-shot fault at the first metadata read *inside* a transaction.
+        // Initial and final ledger reads are deliberately healthy.
+        static FAILURE: Cell<Option<ReadError>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn take_if_transaction(conn: &Connection) -> Option<ReadError> {
+        if conn.is_autocommit() {
+            None
+        } else {
+            FAILURE.with(|failure| failure.take())
+        }
+    }
+
+    #[test]
+    fn an_opening_keeps_the_read_cause_when_only_its_transactional_read_fails() {
+        let directory =
+            std::env::temp_dir().join(format!("mqttiumd-opening-read-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("test directory");
+        let path = directory.join("store.sqlite");
+        let mut store = SqliteStore::create(
+            &path,
+            StoreIncarnation::new(1),
+            Limits {
+                payload_bytes: PayloadBytes::new(4096),
+                references: References::new(16),
+                exchange_slots: ExchangeSlots::new(4),
+                receipt_slots: ReceiptSlots::new(8),
+                max_targets_per_admission: 4,
+                max_topic_bytes: 256,
+                max_payload_bytes: 1024,
+                max_sessions: 8,
+                max_route_targets: 4,
+            },
+        )
+        .expect("healthy store");
+        let before = store.snapshot().expect("healthy initial snapshot");
+        let command = OpenEpoch {
+            attempt: OpeningAttempt {
+                startup: StartupNonce::new([3; 16]),
+                ticket: OpeningTicket::new(1),
+            },
+            incarnation: before.ledger.incarnation(),
+            after: before.ledger.last_opened(),
+        };
+        for cause in [
+            ReadError::InvalidData,
+            ReadError::LimitExceeded,
+            ReadError::Unavailable,
+            ReadError::Io,
+            ReadError::AllocationFailed,
+        ] {
+            FAILURE.with(|failure| failure.set(Some(cause)));
+            assert_eq!(store.open_epoch(&command), Err(cause));
+            assert_eq!(store.snapshot().expect("fault is one-shot"), before);
+        }
+        assert!(matches!(
+            store.open_epoch(&command),
+            Ok(OpeningOutcome::Committed(_))
+        ));
+        drop(store);
+        std::fs::remove_dir_all(directory).expect("cleanup");
     }
 }
