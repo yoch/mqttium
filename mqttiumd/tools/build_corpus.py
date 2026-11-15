@@ -2054,6 +2054,33 @@ INSPECTED = record(
     },
 )
 ok("trace-record-durable-state-inspected.json", INSPECTED)
+
+# Typed failures are supervisor observations, even when startup has not
+# reached Started. The process incarnation is distinct from the observer's.
+READ_FAILED = record(
+    14, "bench-supervisor", 2, "DurableReadFailed",
+    {"code": "InvalidData", "phase": "Recovery", "process_incarnation": "2", "page": "1"},
+)
+CONTROL_FAILED = record(
+    15, "bench-supervisor", 3, "ProcessControlFailed",
+    {"code": "TruncatedFrame", "phase": "KillDrain", "process_incarnation": "2"},
+)
+ok("trace-record-durable-read-failed.json", READ_FAILED)
+ok("trace-record-process-control-failed.json", CONTROL_FAILED)
+ok("trace-record-durable-lookup-failed.json", edited(
+    READ_FAILED, lambda v: v["payload"].update(code="Io", phase="Lookup")
+))
+for case, base, pointer, edit in [
+    ("read-failure-unknown-code", READ_FAILED, "/payload/code", setter(["payload", "code"], "rusqlite error text")),
+    ("read-failure-wrong-phase", READ_FAILED, "/payload/phase", setter(["payload", "phase"], "KillDrain")),
+    ("read-failure-numeric-incarnation", READ_FAILED, "/payload/process_incarnation", setter(["payload", "process_incarnation"], 2)),
+    ("read-failure-numeric-page", READ_FAILED, "/payload/page", setter(["payload", "page"], 1)),
+    ("read-failure-unbounded-message", READ_FAILED, "/payload/message", setter(["payload", "message"], "x" * 1025)),
+    ("read-failure-by-the-core", READ_FAILED, "/origin_component", setter(["origin_component"], "broker-core")),
+    ("control-failure-read-code", CONTROL_FAILED, "/payload/code", setter(["payload", "code"], "InvalidData")),
+    ("control-failure-with-page", CONTROL_FAILED, "/payload", setter(["payload", "page"], "1")),
+]:
+    trace_case(case, base, pointer, "Failures have bounded, stable codes and phase-specific typed context (record 0021).", edit)
 trace_case(
     "durable-state-inspected-by-the-core",
     INSPECTED,
@@ -2617,6 +2644,23 @@ def result(verdict, exit_code, statuses, hits="1", qualification="provisional", 
 
 
 PASSING = [("trace_complete", "PASS"), ("all_required_faults_hit", "PASS")]
+
+FAILED_READ_RESULT = result("INCONCLUSIVE", 2, [("durable_reads_complete", "INCONCLUSIVE")])
+FAILED_READ_RESULT.update(failure_count="1", failures=[{
+    "kind": READ_FAILED["kind"], "record_sequence": READ_FAILED["record_sequence"],
+    **READ_FAILED["payload"],
+}])
+ok("run-result-provisional-typed-read-failure.json", FAILED_READ_RESULT)
+bad(
+    "run-result-failure-without-count.json", "schema-violation", "",
+    "A bounded typed failure list declares its untruncated total (record 0021).",
+    edited(FAILED_READ_RESULT, lambda v: v.pop("failure_count")),
+)
+bad(
+    "run-result-unbounded-failure-list.json", "schema-violation", "/failures",
+    "At most the first 64 failure contexts are kept in a result (record 0021).",
+    edited(FAILED_READ_RESULT, lambda v: v.update(failure_count="65", failures=v["failures"] * 65)),
+)
 
 
 def at_least(minimum, hits):

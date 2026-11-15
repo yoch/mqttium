@@ -292,6 +292,53 @@
         "Fenced",
         "EpochClosed"
       ]
+    },
+    "durableReadCode": {
+      "enum": [
+        "InvalidData",
+        "LimitExceeded",
+        "Unavailable",
+        "Io",
+        "AllocationFailed",
+        "FrontierMoved",
+        "EmptyPage"
+      ]
+    },
+    "durableReadPhase": {
+      "enum": [
+        "Open",
+        "Ledger",
+        "Opening",
+        "Lookup",
+        "Snapshot",
+        "Inspect",
+        "Recovery"
+      ]
+    },
+    "processControlCode": {
+      "enum": [
+        "TruncatedFrame",
+        "FrameTooLarge",
+        "InvalidFrame",
+        "Io",
+        "ClosedChannel",
+        "DuplicateTermination",
+        "ReportBudgetExceeded",
+        "ActionDeadlineExceeded",
+        "DrainDeadlineExceeded",
+        "LateEvidence",
+        "LateReport",
+        "InvalidOrdering",
+        "InvalidParked"
+      ]
+    },
+    "processControlPhase": {
+      "enum": [
+        "Start",
+        "Action",
+        "KillDrain",
+        "Stop"
+      ]
     }
   }
 }
