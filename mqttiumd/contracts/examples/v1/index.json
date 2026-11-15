@@ -10,6 +10,8 @@
     "contracts/examples/v1/valid/scenario-u64-max.json",
     "contracts/examples/v1/valid/scenario-core-without-bytes.json",
     "contracts/examples/v1/valid/scenario-qos0-publish.json",
+    "contracts/examples/v1/valid/scenario-barrier-at-commit-prepared.json",
+    "contracts/examples/v1/valid/scenario-barrier-at-commit-logged.json",
     "contracts/examples/v1/valid/scenario-permanent-delay.json",
     "contracts/examples/v1/valid/scenario-repeated-fault-after-the-occurrence-of-another.json",
     "contracts/examples/v1/valid/scenario-held-command-and-result.json",
@@ -425,6 +427,30 @@
       "code": "fault-match-invalid",
       "pointer": "/faults/1/match",
       "why": "A fence fault names the resolved operation by its command, which an earlier fault must select."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-hold-at-commit-prepared.json",
+      "code": "fault-action-unknown",
+      "pointer": "/faults/2/action",
+      "why": "store.commit.prepared only stops the writer at a barrier: no command is held there."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-result-at-commit-prepared.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/2/match/result_of",
+      "why": "store.commit.prepared carries a command; no result exists there yet."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-hold-at-commit-logged.json",
+      "code": "fault-action-unknown",
+      "pointer": "/faults/2/action",
+      "why": "store.commit.logged only stops the writer at a barrier: no command is held there."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-result-at-commit-logged.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/2/match/result_of",
+      "why": "store.commit.logged carries a command; no result exists there yet."
     },
     {
       "file": "contracts/examples/v1/invalid/scenario-leave-of-a-held-command.json",
