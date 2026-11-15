@@ -95,6 +95,14 @@ class TransactionalKills(unittest.TestCase):
         self.assertEqual(result.status, "FAIL")
         self.assertTrue(any("no StoreCommitStable" in reason for reason in result.reasons))
 
+    def test_the_hit_identifies_a_submitted_command_of_that_incarnation(self):
+        def edit(events):
+            events[corpus.at(events, "admit.submitted")]["payload"]["operation_id"] = corpus.OP_SECOND
+
+        result = self.decide(self.run_at("store.commit.prepared", edit))
+        self.assertEqual(result.status, "INCONCLUSIVE")
+        self.assertTrue(any("submitted command" in reason for reason in result.reasons))
+
     def test_missing_completed_recovery_is_inconclusive(self):
         def edit(events):
             for label in ("recovery.read", "recovery.in"):
