@@ -56,6 +56,11 @@ pub struct LeaseRecord {
 impl LeaseRecord {
     /// Rebuilds a record from its parts, as recovery reads them.
     ///
+    /// Two callers have a reason to use it: recovery, which rebuilds the
+    /// records it read, and the proof crate, which must state every record,
+    /// the incoherent ones included. A transition never calls it: it gets a
+    /// held lease from [`Account::reserve`], which charges the account.
+    ///
     /// Nothing is checked against any account: [`release_if_current`] does
     /// not rely on the record and the account agreeing, and refuses without
     /// mutation when they do not.
@@ -116,7 +121,15 @@ impl Account {
 
     /// Rebuilds an account from its parts, as recovery reads them.
     ///
-    /// Coherence is not checked: see [`Account::is_coherent`].
+    /// Two callers have a reason to use it: recovery, and the proof crate,
+    /// which must state the accounts whose usage exceeds a limit. A
+    /// transition never calls it: an account starts with [`Account::new`]
+    /// and changes through [`Account::reserve`] and [`release_if_current`].
+    ///
+    /// Coherence is not checked: see [`Account::is_coherent`]. An
+    /// incoherent account is not refused by [`release_if_current`]: a
+    /// release from it is exact or refused whole, and the proof covers
+    /// both.
     #[must_use]
     pub const fn from_parts(id: AccountId, used: Credits, limit: Credits) -> Self {
         Self { id, used, limit }
