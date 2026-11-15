@@ -16,6 +16,7 @@ import unittest
 from mqttiumd_oracle import __main__ as command
 from mqttiumd_oracle import results
 from mqttiumd_oracle.documents import Contracts
+from mqttiumd_oracle.semantic import contracts_digest
 
 from .support import ROOT
 
@@ -42,19 +43,33 @@ class Produce(unittest.TestCase):
         return {"path": path, "sha256": sha256, "bytes": str(size)}
 
     def manifest(self, base=FULL, **changes):
-        """A manifest of this tree: its contracts, scenario, fixture and oracle files."""
+        """A manifest of this tree: its contracts, scenario, fixture, parameters and oracle."""
         manifest = json.loads((ROOT / base).read_text())
         manifest["contracts"] = [self.cite(path) for path in sorted(self.contracts.files)]
         manifest["contracts_digest"] = self.contracts.digest
-        if "scenario" in manifest:
-            manifest["scenario"] = self.cite(SCENARIO)
+        if base == FULL:
             scenario = json.loads((ROOT / SCENARIO).read_text())
-            manifest["fixture"] = self.cite(scenario["initial_fixture"])
-        if "oracle" in manifest:
+            manifest.update(
+                scenario=self.cite(SCENARIO),
+                fixture=self.cite(scenario["initial_fixture"]),
+                backend="sim-store",
+                failure_model="process",
+                scheduler={"version": "1", "seed": "1"},
+                commands=["mqttiumd-lab run", "mqttiumd_oracle judge"],
+            )
             manifest["oracle"]["files"] = [
                 self.cite(entry["path"]) for entry in manifest["oracle"]["files"]
             ]
         manifest.update(changes)
+        return self.store(manifest)
+
+    def store(self, manifest):
+        for member in ("oracle", "generators"):
+            if member in manifest:
+                files = manifest[member]["files"]
+                manifest[member]["sha256"] = contracts_digest(
+                    (entry["sha256"], entry["path"]) for entry in files
+                )
         path = f"{self.relative}/manifest.json"
         (ROOT / path).write_text(json.dumps(manifest))
         return path
@@ -129,12 +144,17 @@ class Produce(unittest.TestCase):
             self.assertTrue(any(words in reason for reason in unmet), (words, unmet))
 
     def test_a_manifest_of_other_files_is_named(self):
-        manifest = self.manifest(contracts_digest="0" * 64)
+        manifest = self.manifest()
         manifest_value = json.loads((ROOT / manifest).read_text())
+        listed = manifest_value["contracts"]
+        listed[0]["sha256"] = "0" * 64
+        manifest_value["contracts_digest"] = contracts_digest(
+            (entry["sha256"], entry["path"]) for entry in listed
+        )
         manifest_value["scenario"]["sha256"] = "1" * 64
         manifest_value["oracle"]["files"][0]["sha256"] = "2" * 64
         manifest_value["checkout"]["tree_state"] = "modified"
-        (ROOT / manifest).write_text(json.dumps(manifest_value))
+        self.store(manifest_value)
         code, out = self.run_command("p1-02-good", manifest)
         unmet = self.unmet(self.written(out))
         for words in (
@@ -150,7 +170,7 @@ class Produce(unittest.TestCase):
         errors = io.StringIO()
         arguments = ["produce", "--scenario", SCENARIO, "--trace", "t", "--manifest", "m"]
         with contextlib.redirect_stderr(errors), self.assertRaises(SystemExit):
-            command._main([*arguments, "--out", "o", "--qualifying"])
+            command._main([*arguments, "--out", "o", "--scope", "s", "--qualifying"])
         self.assertIn("unrecognized arguments: --qualifying", errors.getvalue())
 
 

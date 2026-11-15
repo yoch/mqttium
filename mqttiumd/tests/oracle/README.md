@@ -178,13 +178,33 @@ where a status or an injection count differs (`result-not-recomputed`). A
 provisional result names no evidence and is refused as such. The verdict of
 a result is never taken from the result.
 
+The command `produce` writes the run-result of a run, for a campaign to
+recompute and validate. It writes a qualifying result only when every
+condition of a qualifying run holds as far as the files it is given
+establish it (`results.unmet`): the manifest is valid and names the
+contracts in use; it names the scenario and its fixture with the digests
+of the files given; it records the backend, the failure model, the
+scheduler and the commands; it identifies the oracle and the generators,
+and the oracle files it lists are the ones that judged; the tree was
+clean; and something establishes that the binary was built from the
+recorded content. No member of `run-manifest` v1 says the last (an open
+condition of lot L4), so today the command always writes a provisional
+result. A provisional result never carries PASS: a run whose checks all
+pass is written INCONCLUSIVE, with one reason `not qualifying: …` per
+unmet condition before the reasons of the assertions. No option makes the
+command claim qualifying, and a qualifying result it writes must stand
+when recomputed, or the oracle exits as defective.
+
 ```bash
 PYTHONPATH=tests/oracle python -m mqttiumd_oracle judge --scenario <file> --trace <file>
 PYTHONPATH=tests/oracle python -m mqttiumd_oracle recompute --result <file>
+PYTHONPATH=tests/oracle python -m mqttiumd_oracle produce --scenario <file> --trace <file> \
+    --manifest <file> --out <file> --scope <text>
 ```
 
-`judge` exits with the code of the verdict (0 PASS, 1 FAIL, 2 INCONCLUSIVE,
-3 OUT_OF_SCOPE); `recompute` exits 0 when the result stands and 2 when it
+`judge` and `produce` exit with the code of the verdict (0 PASS, 1 FAIL,
+2 INCONCLUSIVE, 3 OUT_OF_SCOPE), `produce` with that of the verdict it
+writes; `recompute` exits 0 when the result stands and 2 when it
 is refused. A defect of the oracle, or contracts it cannot read, exits 70:
 the run was not judged, and a caller must never record that as a verdict.
 
