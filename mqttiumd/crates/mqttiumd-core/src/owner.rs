@@ -5126,4 +5126,51 @@ mod tests {
             first.operation.sequence().get() + 1
         );
     }
+
+    // A demonstration of the SCOPE of invariant I3 of `Answers`, written by
+    // the auditor of the second wave; not a defect. I3 holds when the
+    // answers are late by at most k newer resolutions, k finite and the
+    // same for every resolution. Here every delay is finite, but the
+    // answers of the landmarks (ranks 1, 2, 4, 8 ...) arrive 16 times
+    // their rank later, so the delays have no common bound: each landmark
+    // is evicted before its answer arrives, the answers of the other
+    // resolutions arrive after these are evicted too, and the exchange
+    // stays AdmissionPending while 507 Committed answers are delivered.
+    // This is outside I3, and the test passes as long as the correlation
+    // is the one documented there.
+    #[test]
+    fn review_individually_finite_delays_do_not_imply_a_uniform_lag_bound() {
+        let mut world = World::admission_pending();
+        let admission = world.flights[0];
+        let mut pending = Vec::<(usize, EffectId)>::new();
+        let mut delivered = 0;
+        let mut max_pending = 0;
+        for rank in 1..=512usize {
+            let token = world.in_flight(7).deadline;
+            world.applied(deadline(token));
+            let effects = world.drain();
+            assert_eq!(kinds(&effects), ["ResolveAndFence", "ArmDeadline"]);
+            let due = if rank.is_power_of_two() {
+                16 * rank
+            } else {
+                rank + 2
+            };
+            pending.push((due, effects[0].0));
+            max_pending = max_pending.max(pending.len());
+            while let Some(index) = pending.iter().position(|(due, _)| *due <= rank) {
+                let (_, effect) = pending.remove(index);
+                world.applied(Input::StoreResult {
+                    effect,
+                    operation: admission.operation,
+                    reply: StoreReply::Outcome(StoreOutcome::Committed(admission.facts)),
+                });
+                delivered += 1;
+                assert!(world.drain().is_empty());
+            }
+            assert_eq!(world.phase(7), PENDING);
+            assert!(pending.len() <= 6);
+        }
+        assert_eq!(delivered, 507);
+        let _ = max_pending;
+    }
 }
