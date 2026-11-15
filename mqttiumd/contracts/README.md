@@ -224,6 +224,11 @@ What is volatile (a command in transit, a transaction in preparation, a
 result not yet delivered, the control state of an opening) is not in a
 snapshot; the trace shows it.
 
+The revision of the route table is what the store writes; the oracle
+never computes it. The store advances it at each `AddRoute`, so the
+fixture of P1, whose one route has two targets, is at revision 2 in the
+examples, the recipes and the traces of the corpus.
+
 Rows are in the order of their key, numbers numerically, identities
 component by component and bytes as bytes, so that two stores in the same
 state write the same bytes. What a key member is comes from the schema,

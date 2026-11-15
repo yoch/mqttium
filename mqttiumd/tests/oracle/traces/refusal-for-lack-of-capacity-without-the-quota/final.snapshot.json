@@ -36,7 +36,7 @@
     }
   ],
   "route_table": {
-    "revision": "1",
+    "revision": "2",
     "routes": [
       {
         "topic_hex": "70312f6578616d706c65",
