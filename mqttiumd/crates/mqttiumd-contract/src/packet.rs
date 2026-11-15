@@ -7,6 +7,7 @@
 use alloc::sync::Arc;
 
 use crate::ids::InboundPacketId;
+use crate::outcome::RejectReason;
 
 /// MQTT quality of service.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -112,8 +113,31 @@ pub enum AckReason {
     Success,
     /// PUBCOMP for a PUBREL whose identifier is not in use.
     PacketIdentifierNotFound,
-    /// PUBREC refusing the admission for lack of capacity.
+    /// PUBREC refusing the admission for lack of capacity (MQTT 5
+    /// section 3.5.2.1, reason code 0x97). It answers a certain rejection
+    /// for `CapacityExceeded` and no other: it tells the client that a
+    /// quota is the cause.
     QuotaExceeded,
+    /// PUBREC refusing an admission that is valid and that the broker
+    /// does not accept (MQTT 5 section 3.5.2.1, reason code 0x83,
+    /// "Implementation specific error: the PUBLISH is valid but the
+    /// receiver does not accept it"). It answers the certain rejections
+    /// in which no quota is involved: `Fenced`, `PreconditionFailed` and
+    /// `EpochClosed`.
+    ImplementationSpecificError,
+}
+
+impl AckReason {
+    /// The reason of the PUBREC that refuses an admission the store
+    /// certainly rejected. Nothing was admitted, the exchange ends and the
+    /// Packet Identifier is free again (MQTT 5 section 4.3.3).
+    #[must_use]
+    pub const fn refusing(rejection: RejectReason) -> Self {
+        // Interface only: every refusal still claims a quota, as the
+        // traces did before this reason existed.
+        let _ = rejection;
+        Self::QuotaExceeded
+    }
 }
 
 /// A frame the core may make eligible on a connection.
@@ -138,6 +162,36 @@ pub enum OutboundFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capacity::Resource;
+
+    // MQTT 5 section 3.5.2.1: a refusal says that a quota is exceeded only
+    // when one is.
+    #[test]
+    fn a_refusal_names_a_quota_only_for_a_lack_of_capacity() {
+        for resource in [
+            Resource::PayloadBytes,
+            Resource::References,
+            Resource::ExchangeSlots,
+            Resource::ReceiptSlots,
+        ] {
+            assert_eq!(
+                AckReason::refusing(RejectReason::CapacityExceeded(resource)),
+                AckReason::QuotaExceeded,
+                "{resource:?}"
+            );
+        }
+        for rejection in [
+            RejectReason::Fenced,
+            RejectReason::PreconditionFailed,
+            RejectReason::EpochClosed,
+        ] {
+            assert_eq!(
+                AckReason::refusing(rejection),
+                AckReason::ImplementationSpecificError,
+                "{rejection:?}: no quota is involved"
+            );
+        }
+    }
 
     #[test]
     fn qos_wire_values_are_closed() {
