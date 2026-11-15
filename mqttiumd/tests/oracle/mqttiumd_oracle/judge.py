@@ -38,6 +38,14 @@ MONOTONE = {
 }
 
 
+# What only independent peers can decide: without bytes nobody observed
+# what a client sent or received.
+NEEDS_PEERS = {
+    "one_admission_per_observed_inbound_exchange",
+    "no_pubrec_observed_before_crash",
+}
+
+
 @dataclass
 class Status:
     status: str
@@ -576,6 +584,10 @@ def broker_inputs_have_provenance(run):
                 blame(record, f"page {record.payload['page']} delivered, page {expected} expected")
             expected += 1
 
+        if trace.perimeter != "full":
+            # Without bytes there is no transport: the packets the core
+            # consumed are the validated packets of the scenario.
+            continue
         received = {
             record.key: record for record in side("transport", incarnation, "ClientBytesReceived")
         }
@@ -626,24 +638,36 @@ ASSERTIONS = {
 
 def judge(run: Run) -> dict:
     """The status of every assertion of the scenario, by name."""
+    trace = run.trace
+    required = run.scenario.get("perimeter", "full")
     statuses = {}
     for name in run.scenario["assertions"]:
         decide = ASSERTIONS.get(name)
         if decide is None:
             statuses[name] = Status(INCONCLUSIVE, ["the oracle does not decide this assertion"])
-        elif run.trace.unreadable:
-            statuses[name] = Status(INCONCLUSIVE, list(run.trace.unreadable))
-        elif run.trace.scenario_id not in (None, run.scenario["id"]):
+        elif trace.unreadable:
+            statuses[name] = Status(INCONCLUSIVE, list(trace.unreadable))
+        elif trace.scenario_id not in (None, run.scenario["id"]):
             # A run is judged only against its own scenario.
+            statuses[name] = Status(INCONCLUSIVE, [f"the trace is a run of {trace.scenario_id}"])
+        elif trace.perimeter not in (None, required):
+            # Nor against a scenario of another perimeter: a run without
+            # bytes never passes a full scenario.
             statuses[name] = Status(
-                INCONCLUSIVE, [f"the trace is a run of {run.trace.scenario_id}"]
+                OUT_OF_SCOPE,
+                [f"the run is {trace.perimeter}; the scenario requires {required}"],
             )
+        elif trace.perimeter != "full" and name in NEEDS_PEERS:
+            statuses[name] = Status(OUT_OF_SCOPE, [f"no peer observes a {trace.perimeter} run"])
         else:
             statuses[name] = decide(run)
-    if run.trace.incomplete:
-        # Nothing concluded from an incomplete trace is a PASS, and a FAIL
-        # stands only where no missing record could undo it.
+    if trace.incomplete:
+        # Nothing concluded from an incomplete trace is a PASS or a scope
+        # decision, and a FAIL stands only where no missing record could
+        # undo it.
         for name, status in statuses.items():
-            if status.status == PASS or (status.status == FAIL and name not in MONOTONE):
+            if status.status in (PASS, OUT_OF_SCOPE) or (
+                status.status == FAIL and name not in MONOTONE
+            ):
                 statuses[name] = Status(INCONCLUSIVE, status.reasons + ["the trace is incomplete"])
     return statuses

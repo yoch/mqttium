@@ -67,6 +67,18 @@ known total order. Where the trace does not say, the oracle does not
 choose: several interleavings of independent records are accepted, and an
 event is never moved before its prerequisite.
 
+## Perimeter
+
+A run is judged only against a scenario of its own perimeter. A trace
+whose header declares another perimeter than the scenario requires puts
+every assertion out of scope, and a qualifying result that holds an
+out-of-scope assertion is refused: a run without bytes never passes a full
+scenario. Against its own scenario such a run is judged on what it can
+show; the two assertions that need what peers observed
+(`one_admission_per_observed_inbound_exchange`,
+`no_pubrec_observed_before_crash`) stay out of scope there, and the
+provenance of packets is not asked of a run that has no transport.
+
 ## The assertions
 
 | Assertion | Decided from |
@@ -115,9 +127,6 @@ is refused.
 
 ## What does not exist yet
 
-- Obligations of a run on a sub-perimeter (core without bytes): a trace
-  does not declare its perimeter yet, so every run is judged as a full one
-  and a run without peer records is inconclusive.
 - Scenario files for QABS-A, B and C.
 
 `docs/reception/open-conditions.md` keeps the rows these close.
