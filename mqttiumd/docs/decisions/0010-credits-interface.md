@@ -42,9 +42,11 @@ before any mutation.
 `LeaseRecord::from_parts` and `Account::from_parts` rebuild a state from
 its parts. Recovery rebuilds what it read, and the proof crate must state
 incoherent states: a checked constructor would exclude from the proof the
-states whose branches DEM-021 asks to verify. Two callers have a reason to
-use them: recovery, once per durable row, and the proof crate. A transition
-never calls them.
+states whose branches DEM-021 asks to verify. One caller has a reason to
+use them: the proof crate. Recovery in the core of lot L1 does not: it
+charges a recovered lease through `Account::reserve`, once per durable
+row, so that the core has one charging path. A transition never calls
+them.
 
 ### An account over its limit is not refused by a release
 

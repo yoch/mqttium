@@ -352,3 +352,36 @@ fn the_contract_digest_does_not_depend_on_how_the_directory_is_spelled() {
     assert_eq!(digest("./contracts/v1"), reference);
     assert!(Workspace::open(&root(), Path::new("contracts/../contracts/v1")).is_err());
 }
+
+/// The reason a refusing PUBREC carries, as the transition catalogue
+/// states it for `EmitPubrecRefusal`, is the reason of the contract: the
+/// oracle judges traces against the first, the core answers with the
+/// second.
+#[test]
+fn the_reasons_of_a_refusal_are_those_of_the_contract() {
+    use mqttiumd_contract::capacity::Resource;
+    use mqttiumd_contract::outcome::RejectReason;
+    use mqttiumd_contract::packet::AckReason;
+
+    let bytes = fs::read(root().join("contracts/v1/p1.catalog.json")).expect("catalogue");
+    let catalogue: Value = serde_json::from_slice(&bytes).expect("JSON");
+    let table = catalogue
+        .pointer("/refusal_reasons")
+        .and_then(Value::as_object)
+        .expect("the catalogue states the reasons of EmitPubrecRefusal");
+    let rejections = [
+        (
+            "CapacityExceeded",
+            RejectReason::CapacityExceeded(Resource::PayloadBytes),
+        ),
+        ("Fenced", RejectReason::Fenced),
+        ("PreconditionFailed", RejectReason::PreconditionFailed),
+        ("EpochClosed", RejectReason::EpochClosed),
+    ];
+    assert_eq!(table.len(), rejections.len(), "{table:?}");
+    for (name, rejection) in rejections {
+        let stated = table.get(name).and_then(Value::as_str);
+        let reason = format!("{:?}", AckReason::refusing(rejection));
+        assert_eq!(stated, Some(reason.as_str()), "{name}");
+    }
+}
