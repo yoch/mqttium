@@ -64,7 +64,7 @@ fn the_p1_registry_without_any_one_of_its_rules_has_a_hole() {
     let rules = registry["rules"].as_array().expect("rules");
     assert!(rules.len() >= 90);
     let workspace = workspace();
-    for index in 0..rules.len() {
+    for (index, rule) in rules.iter().enumerate() {
         let mut without = registry.clone();
         without["rules"]
             .as_array_mut()
@@ -77,7 +77,7 @@ fn the_p1_registry_without_any_one_of_its_rules_has_a_hole() {
                 .iter()
                 .any(|diagnostic| diagnostic.code == code::REGISTRY_HOLE),
             "without {}: {:?}",
-            rules[index]["id"],
+            rule["id"],
             report.diagnostics
         );
     }
