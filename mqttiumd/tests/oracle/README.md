@@ -210,10 +210,22 @@ the oracle that runs, read from where it runs and not from the campaign,
 is listed with its digest; every modified path the manifest records is
 kept in the campaign as the bench keeps it, a tracked one by its diff in
 `modified/tracked.patch` and an untracked one as
-`modified/untracked/<path>`; and something establishes that the binary
-was built from the recorded content. No member of `run-manifest` v1 says the last (an open
-condition of lot L4), so today the command always writes a provisional
-result. A provisional result never carries PASS: a run whose checks all
+`modified/untracked/<path>`; and the manifest ties the binary to its
+source (`artifact.built_from`, record 0017), which the campaign holds with
+the digest and size the member names. Without that member the result is
+provisional.
+
+What a qualifying result establishes, from the campaign alone: the
+verdict is the one the observations determine, the cited files are the
+ones the run read, the oracle that judged is the one the manifest
+identifies, the modified content is kept, and the campaign holds the
+source the bench declares its binary built from. The oracle builds
+nothing: that the binary which ran is the one that source builds is the
+bench's declaration, which `tools/check_campaign_binary.sh` checks
+outside the oracle by building it again. That a build on another machine
+gives the same binary is not established.
+
+A provisional result never carries PASS: a run whose checks all
 pass is written INCONCLUSIVE, with one reason `not qualifying: …` per
 unmet condition before the reasons of the assertions. No option makes the
 command claim qualifying, and a qualifying result it writes must stand

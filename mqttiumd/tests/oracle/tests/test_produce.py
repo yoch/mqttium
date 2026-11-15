@@ -131,7 +131,7 @@ class Produce(unittest.TestCase):
             self.unmet(result),
             [
                 "not qualifying: nothing establishes that the binary was built from the "
-                "recorded content (no member of run-manifest v1 says so)"
+                "recorded content (the manifest has no artifact.built_from)"
             ],
         )
         self.assertEqual({entry["status"] for entry in result["assertions"]}, {"PASS"})
@@ -208,9 +208,11 @@ class Campaign(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.campaign.parent, ignore_errors=True)
         shutil.copytree(ROOT / "contracts", self.campaign / "contracts")
         scenario = json.loads((ROOT / SCENARIO).read_text())
-        for path in (SCENARIO, scenario["initial_fixture"], f"{TRACES}/p1-02-good/trace.jsonl"):
+        for path in (SCENARIO, scenario["initial_fixture"]):
             (self.campaign / path).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ROOT / path, self.campaign / path)
+        # The trace with the snapshots it names.
+        shutil.copytree(ROOT / TRACES / "p1-02-good", self.campaign / TRACES / "p1-02-good")
         self.contracts = Contracts.open(self.campaign)
 
     def cite(self, path):
@@ -221,7 +223,7 @@ class Campaign(unittest.TestCase):
         (self.campaign / path).parent.mkdir(parents=True, exist_ok=True)
         (self.campaign / path).write_bytes(data)
 
-    def produce(self, **checkout):
+    def produce(self, built_from=None, **checkout):
         manifest = json.loads((ROOT / FULL).read_text())
         scenario = json.loads((ROOT / SCENARIO).read_text())
         manifest.update(
@@ -240,6 +242,8 @@ class Campaign(unittest.TestCase):
                 (entry["sha256"], entry["path"]) for entry in manifest[member]["files"]
             )
         manifest["checkout"].update(checkout)
+        if built_from is not None:
+            manifest["artifact"]["built_from"] = built_from
         (self.campaign / "manifest.json").write_text(json.dumps(manifest))
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(io.StringIO()):
@@ -260,8 +264,45 @@ class Campaign(unittest.TestCase):
                     "P1-02 in a campaign",
                 ]
             )
-        result = json.loads((self.campaign / "run-result.json").read_text())
-        return [reason for reason in result["reasons"] if reason.startswith("not qualifying: ")]
+        self.result = json.loads((self.campaign / "run-result.json").read_text())
+        return [
+            reason for reason in self.result["reasons"] if reason.startswith("not qualifying: ")
+        ]
+
+    def rebuilt(self, data=b"the source of the binary\n"):
+        """A built_from member naming ``source.tar`` as the campaign keeps it."""
+        self.keep("source.tar", data)
+        return {
+            "source": self.cite("source.tar"),
+            "build": "cargo build --locked --offline -p mqttiumd-lab --bin mqttiumd-lab",
+        }
+
+    def test_a_complete_run_qualifies_and_stands(self):
+        self.assertEqual(self.produce(self.rebuilt()), [])
+        self.assertEqual(self.result["qualification"], "qualifying")
+        self.assertEqual((self.result["verdict"], self.result["exit_code"]), ("PASS", 0))
+        self.assertEqual(self.contracts.check_file("run-result.json"), [])
+        self.assertEqual(results.recompute(self.contracts, "run-result.json"), [])
+
+    def test_a_source_the_campaign_does_not_hold_is_named(self):
+        member = self.rebuilt()
+        (self.campaign / "source.tar").unlink()
+        self.assertEqual(
+            self.produce(member),
+            ["not qualifying: the source the manifest names, source.tar, is not in the campaign"],
+        )
+
+    def test_a_source_that_differs_is_named(self):
+        member = self.rebuilt()
+        # The same size, other bytes: only the digest tells them apart.
+        self.keep("source.tar", b"the source of the binarY\n")
+        self.assertEqual(
+            self.produce(member),
+            [
+                "not qualifying: source.tar of the campaign is not the source the manifest "
+                "names: its digest or its size differs"
+            ],
+        )
 
     def test_the_oracle_that_runs_is_the_one_the_manifest_names(self):
         self.assertEqual(self.produce(), [f"not qualifying: {results.UNTIED_BINARY}"])
