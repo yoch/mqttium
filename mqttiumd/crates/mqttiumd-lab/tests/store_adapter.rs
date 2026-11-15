@@ -1191,3 +1191,23 @@ fn a_crash_gives_back_the_slot_a_duplicate_reserved() {
     let last = bench.admission(3, 9, b"p", &[bench.b]);
     persist(&mut bench, 3, &last);
 }
+
+/// Only a duplicate makes a result more than its command did: any other
+/// armed fault reserves nothing, and a command takes the single slot.
+#[test]
+fn only_a_duplicate_reserves_a_result_slot() {
+    let mut bench = bench_with_results(1);
+    arm(
+        &mut bench,
+        FaultPoint::CommandTransit,
+        FaultAction::HoldCommand,
+    );
+    arm(
+        &mut bench,
+        FaultPoint::ResultReady,
+        FaultAction::DelayResult,
+    );
+    let command = bench.admission(1, 7, b"p", &[bench.b]);
+    persist(&mut bench, 1, &command);
+    assert_eq!(bench.store.results_owed(), 1);
+}
