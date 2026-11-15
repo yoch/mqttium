@@ -1131,6 +1131,30 @@ impl Process {
         self.input(input, pending, collector, books)
     }
 
+    /// Whether the store adapter is stopped at a barrier.
+    #[must_use]
+    pub fn halted(&self) -> bool {
+        self.store.halted_at().is_some()
+    }
+
+    /// Leaves the barrier the store adapter is stopped at, if any: the
+    /// adapter goes on from that point, and a result handed over at the
+    /// barrier is consumed by the core.
+    pub fn leave_barrier(
+        &mut self,
+        collector: &mut Collector,
+        books: &mut Books,
+    ) -> Result<(), Stop> {
+        if self.store.resume().is_none() {
+            return Ok(());
+        }
+        flush(&mut self.store, &mut self.writer, collector, books)?;
+        if let Some((input, pending)) = self.consuming.take() {
+            self.input(input, pending, collector, books)?;
+        }
+        self.settle(collector, books)
+    }
+
     /// `ReleaseHeldCommand`: the command the fault holds may enter the
     /// writer.
     pub fn release_command(

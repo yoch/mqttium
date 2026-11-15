@@ -464,6 +464,17 @@ impl Runner<'_> {
     }
 
     fn play(&mut self, step: &Step) -> Result<(), Stop> {
+        // A barrier holds the adapter at its point while the steps after
+        // the one that waited for it only look (an inspection) or crash
+        // the broker. Any other step acts on the broker, and the adapter
+        // first goes on from the point. The scenario vocabulary has no
+        // step that leaves a barrier: this is the rule of the runner.
+        if !matches!(step, Step::InspectDurableState { .. } | Step::CrashBroker)
+            && let Some(process) = self.process.as_mut()
+            && process.halted()
+        {
+            process.leave_barrier(&mut self.collector, &mut self.books)?;
+        }
         match step {
             Step::ClientResumeSession {
                 client,
