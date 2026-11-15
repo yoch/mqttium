@@ -80,6 +80,10 @@ class Contracts:
         directory = root / contracts
         schema_directory = directory.parent / "schema" / directory.name
         paths = sorted(directory.glob("*.json")) + sorted(schema_directory.glob("*.json"))
+        # A contract file is bounded like any document, before it is read.
+        for path in paths:
+            if path.stat().st_size > MAX_DOCUMENT_BYTES:
+                raise ContractsUnreadable(f"{path.name} exceeds {MAX_DOCUMENT_BYTES} bytes")
         # One read: these bytes are hashed, and these bytes are parsed.
         content = {path: path.read_bytes() for path in paths}
         files = {

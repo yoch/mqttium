@@ -25,6 +25,7 @@ from . import recipe as recipes
 from .semantic import InventoryOrder
 from .strict import Refused, parse
 from .trace import Trace
+from .trace import lines_of
 from .trace import read as read_trace
 
 PASS, FAIL, INCONCLUSIVE, OUT_OF_SCOPE = "PASS", "FAIL", "INCONCLUSIVE", "OUT_OF_SCOPE"
@@ -166,7 +167,7 @@ class Run:
         fixture = parse(contracts.read(scenario["initial_fixture"]))
         budget = int(scenario["budgets"]["max_trace_bytes"])
         with (contracts.root / trace_path).open("rb") as stream:
-            trace = read_trace(contracts, stream, max_bytes=budget)
+            trace = read_trace(contracts, lines_of(stream), max_bytes=budget)
         run = cls(contracts, scenario, fixture, trace)
         run._load_snapshots()
         return run
