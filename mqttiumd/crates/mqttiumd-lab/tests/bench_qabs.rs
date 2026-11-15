@@ -184,3 +184,89 @@ fn qabs_a_inspects_at_the_barrier_before_any_result_is_ready() {
         "{barrier} {inspected} {ready}"
     );
 }
+
+/// The trace of a variant of QABS-A that stops before its end.
+fn stopped_trace(scenario: &str, name: &str) -> (String, Vec<serde_json::Value>) {
+    let campaign = bench_support::run_scenario(scenario, 1, name);
+    let _ = std::fs::remove_file(bench_support::root().join(scenario));
+    let stopped = campaign
+        .report
+        .stopped
+        .clone()
+        .expect("the run must stop before its end");
+    let lines = campaign
+        .trace()
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    (stopped, lines)
+}
+
+#[test]
+fn a_wait_that_nothing_eligible_can_meet_is_a_step_blocked_and_the_trace_stays_complete() {
+    // Without the release of the held admission, nothing reaches the
+    // barrier: the wait of step 5 cannot be met.
+    let scenario = variant("blocked-quiescent", |steps| {
+        let index = steps
+            .iter()
+            .position(|step| step["kind"] == "ReleaseHeldCommand")
+            .unwrap();
+        steps.remove(index);
+    });
+    let (stopped, trace) = stopped_trace(&scenario, "blocked-quiescent");
+    assert!(stopped.starts_with("step 5 (DriveUntil)"), "{stopped}");
+    let [.., blocked, footer] = trace.as_slice() else {
+        panic!("a short trace");
+    };
+    assert_eq!(blocked["kind"], "StepBlocked");
+    assert_eq!(blocked["origin_component"], "bench-supervisor");
+    assert_eq!(
+        blocked["payload"],
+        serde_json::json!({
+            "step": "5",
+            "step_kind": "DriveUntil",
+            "cause": "quiescent",
+            // The deadline the resolution armed again, not fired.
+            "armed_deadlines": "1",
+            "holding_faults": ["held_admission", "held_fence"],
+        })
+    );
+    assert_eq!(footer["kind"], "TraceFooter");
+    assert_eq!(footer["payload"]["complete"], true);
+}
+
+#[test]
+fn a_wait_that_runs_out_of_steps_is_a_step_blocked_by_its_budget() {
+    let scenario = variant("blocked-budget", |steps| {
+        let last = steps
+            .iter()
+            .rposition(|step| step["kind"] == "DriveUntil")
+            .unwrap();
+        steps[last]["max_steps"] = serde_json::json!("1");
+    });
+    let (stopped, trace) = stopped_trace(&scenario, "blocked-budget");
+    assert!(stopped.contains("max_steps"), "{stopped}");
+    let [.., blocked, footer] = trace.as_slice() else {
+        panic!("a short trace");
+    };
+    assert_eq!(blocked["kind"], "StepBlocked");
+    assert_eq!(blocked["payload"]["cause"], "budget");
+    assert_eq!(blocked["payload"]["step_kind"], "DriveUntil");
+    assert_eq!(footer["payload"]["complete"], true);
+}
+
+#[test]
+fn a_stop_that_is_no_wait_writes_no_step_blocked_and_cuts_the_trace() {
+    // A deadline fired before anything armed one.
+    let scenario = variant("stop-no-wait", |steps| {
+        steps.insert(
+            1,
+            serde_json::json!({"kind": "FireDeadline", "max_steps": "512"}),
+        );
+    });
+    let (stopped, trace) = stopped_trace(&scenario, "stop-no-wait");
+    assert!(stopped.contains("no deadline armed"), "{stopped}");
+    assert!(trace.iter().all(|record| record["kind"] != "StepBlocked"));
+    assert_eq!(trace.last().unwrap()["payload"]["complete"], false);
+}

@@ -84,3 +84,80 @@ fn p1_02b_gives_the_same_trace_for_the_same_seed() {
     let second = run_scenario(SCENARIO, 5, "p102b-same");
     assert_eq!(first.trace(), second.trace());
 }
+
+/// P1-02b with an inspection of the supervisor between the delivery of the
+/// late unknown answer and the PUBREL of the peer: written below the root,
+/// in the ignored build directory, so that the campaign copies it like any
+/// scenario of the checkout. The case the oracle must judge PASS once
+/// `terminal_knowledge_never_regresses` follows only the causes of the
+/// product (lot L3): an inspection decided by the scenario is no reaction
+/// of the product to the unknown answer.
+#[test]
+fn an_inspection_after_the_late_unknown_answer_is_named_and_names_it() {
+    let root = bench_support::root();
+    let mut scenario: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(SCENARIO)).unwrap()).unwrap();
+    let steps = scenario["steps"].as_array_mut().unwrap();
+    let pubrel = steps
+        .iter()
+        .position(|step| step["kind"] == "ClientSendPubrel")
+        .unwrap();
+    assert_eq!(steps[pubrel - 1]["kind"], "DeliverHeldResult");
+    steps.insert(
+        pubrel,
+        serde_json::json!({"kind": "InspectDurableState", "checkpoint": "after_late_unknown"}),
+    );
+    scenario["id"] = serde_json::json!("P1-02B-INTERPOSED");
+    let relative = format!(
+        "target/bench-scenarios/P1-02b-interposed-{}.json",
+        std::process::id()
+    );
+    std::fs::create_dir_all(root.join("target/bench-scenarios")).unwrap();
+    std::fs::write(
+        root.join(&relative),
+        serde_json::to_vec_pretty(&scenario).unwrap(),
+    )
+    .unwrap();
+    let campaign = run_scenario(&relative, 1, "p102b-interposed");
+    let _ = std::fs::remove_file(root.join(&relative));
+    assert_eq!(campaign.report.stopped, None);
+    let lines: Vec<serde_json::Value> = campaign
+        .trace()
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    let key = |record: &serde_json::Value| {
+        serde_json::json!({
+            "origin_component": record["origin_component"],
+            "origin_incarnation": record["origin_incarnation"],
+            "origin_sequence": record["origin_sequence"],
+        })
+    };
+    let late = lines
+        .iter()
+        .rfind(|record| {
+            record["kind"] == "StoreResultDelivered"
+                && record["payload"]["outcome"] == "PendingOrUnknown"
+        })
+        .expect("the late unknown answer reaches the core");
+    let inspected = lines
+        .iter()
+        .find(|record| {
+            record["kind"] == "DurableStateInspected"
+                && record["payload"]["checkpoint"] == "after_late_unknown"
+        })
+        .expect("the inspection after the late answer");
+    let sent = lines
+        .iter()
+        .find(|record| {
+            record["kind"] == "PeerPacketSent" && record["payload"]["packet_kind"] == "PUBREL"
+        })
+        .expect("the PUBREL");
+    // The supervisor had read the late answer when it inspected; the peer
+    // acted on the supervisor. So the PUBREL descends from the unknown
+    // answer through records of the bench only.
+    let parents = |record: &serde_json::Value| record["causal_parents"].as_array().unwrap().clone();
+    assert!(parents(inspected).contains(&key(late)), "{inspected}");
+    assert_eq!(parents(sent), [key(inspected)], "{sent}");
+}

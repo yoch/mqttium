@@ -374,7 +374,10 @@ impl<S: crate::store::durable::DurableStore> Setup<S> {
 pub fn execute(request: &Request) -> Result<Report, String> {
     match request.backend.as_str() {
         "sim-store" => execute_with(request, Memory),
-        "sqlite" => Err("the sqlite backend is not available yet: lot L7 provides it".to_owned()),
+        "sqlite" => execute_with(
+            request,
+            super::backend::Sqlite::new(request.out.join("store").join("mqttiumd.sqlite")),
+        ),
         other => Err(format!("unknown backend {other}: sim-store or sqlite")),
     }
 }
@@ -587,6 +590,15 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     paths.extend(outcome.snapshots.iter().map(|(path, _)| path.clone()));
     if request.built_from.is_some() {
         paths.push("source.tar".to_owned());
+    }
+    // The data set of a backend that keeps one in the campaign.
+    if let Ok(entries) = fs::read_dir(out.join("store")) {
+        let mut stored: Vec<String> = entries
+            .filter_map(Result::ok)
+            .map(|entry| format!("store/{}", entry.file_name().to_string_lossy()))
+            .collect();
+        stored.sort();
+        paths.extend(stored);
     }
     paths.extend(modified.iter().cloned());
     let (contract_dir, schema_dir) = files::contract_directories(Path::new(&contracts))?;

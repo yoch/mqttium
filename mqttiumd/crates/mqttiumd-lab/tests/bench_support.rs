@@ -64,6 +64,11 @@ pub fn fresh(name: &str) -> PathBuf {
 
 /// Runs a scenario of the checkout with `seed`.
 pub fn run_scenario(scenario: &str, seed: u64, name: &str) -> Campaign {
+    run_scenario_on(scenario, seed, name, "sim-store")
+}
+
+/// Runs a scenario of the checkout with `seed` on `backend`.
+pub fn run_scenario_on(scenario: &str, seed: u64, name: &str, backend: &str) -> Campaign {
     let out = fresh(name);
     let request = Request {
         root: root(),
@@ -72,7 +77,7 @@ pub fn run_scenario(scenario: &str, seed: u64, name: &str) -> Campaign {
         out: out.clone(),
         seed,
         run_id: Some("bench-test".to_owned()),
-        backend: "sim-store".to_owned(),
+        backend: backend.to_owned(),
         built_from: None,
     };
     let report = execute(&request).unwrap_or_else(|error| panic!("{scenario}: {error}"));
