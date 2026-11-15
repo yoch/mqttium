@@ -1258,6 +1258,68 @@ mod tests {
         );
     }
 
+    // Review of 437edc2, finding 5: slots held by live reservations are
+    // not freed by the acceptance of an effect. A lack that the queued
+    // effects alone cannot cover must not name `EffectAccepted` alone.
+    #[test]
+    fn a_lack_of_slots_held_by_reservations_does_not_wait_for_an_acceptance_alone() {
+        // Capacity 4: one effect queued, three slots reserved.
+        let mut outbox = filled(4, 1);
+        let held = outbox.reserve(slots(3)).expect("room");
+        let before = snapshot(&outbox);
+        let refusal = outbox.reserve(slots(2)).expect_err("no slot is free");
+        assert!(
+            !matches!(
+                refusal,
+                ReserveRefused::Need(CapacityNeed {
+                    wake: WakeCondition::EffectAccepted,
+                    ..
+                })
+            ),
+            "one acceptance cannot free two slots: {refusal:?}"
+        );
+        assert_eq!(snapshot(&outbox), before);
+        assert_eq!(outbox.release(held), Ok(3));
+
+        // An empty queue, every slot reserved: no acceptance can happen.
+        let mut outbox = outbox_of(0, 2);
+        let _held = outbox.reserve(slots(2)).expect("room");
+        let refusal = outbox.reserve(slots(1)).expect_err("no slot is free");
+        assert!(
+            !matches!(
+                refusal,
+                ReserveRefused::Need(CapacityNeed {
+                    wake: WakeCondition::EffectAccepted,
+                    ..
+                })
+            ),
+            "no effect waits for an adapter: {refusal:?}"
+        );
+    }
+
+    // Review of 437edc2, finding 6: an entry held at its last generation
+    // is spent when its reservation ends, however it ends. A table that
+    // has nothing else is exhausted already.
+    #[test]
+    fn a_table_whose_only_entries_left_are_held_at_their_last_generation_is_exhausted() {
+        let mut outbox = Outbox::with_capacity(box_id(0), EffectSlots::new(4), 2).expect("small");
+        for record in outbox.records.as_mut_slice() {
+            record.generation = u64::MAX;
+        }
+        let first = outbox.reserve(slots(1)).expect("an entry is left");
+        let second = outbox.reserve(slots(1)).expect("an entry is left");
+        let before = snapshot(&outbox);
+        assert_eq!(
+            outbox.reserve(slots(1)),
+            Err(ReserveRefused::TableExhausted),
+            "no end of these reservations frees an entry"
+        );
+        assert_eq!(snapshot(&outbox), before);
+        // The live reservations are untouched.
+        assert_eq!(outbox.remaining(first), Ok(1));
+        assert_eq!(outbox.remaining(second), Ok(1));
+    }
+
     #[test]
     fn a_deadline_is_dispatched_only_after_the_persist_it_watches() {
         use crate::ids::{DeadlineToken, OperationId, OperationSeq};
@@ -1658,6 +1720,55 @@ mod authority_tests {
 
         let outbox = create(&mut authority, 1).expect("the caller may try again");
         assert_eq!(Some(outbox.id().serial()), before.1, "a serial was skipped");
+    }
+
+    // Review of 437edc2, finding 1: a size that no allocation can ever
+    // satisfy is not a recoverable failure the caller may retry.
+    #[test]
+    fn a_size_that_can_never_be_allocated_is_not_reported_as_recoverable() {
+        let mut authority = authority(2);
+        let before = authority_state(&authority);
+        let refusal = authority
+            .create_outbox(owner(1), EffectSlots::new(u64::MAX), 2)
+            .map(|outbox| outbox.id())
+            .expect_err("no such box");
+        assert_ne!(
+            refusal,
+            CreateRefused::AllocationFailed,
+            "trying again cannot succeed"
+        );
+        assert_eq!(authority_state(&authority), before);
+    }
+
+    // Review of 437edc2, finding 2: with no entry at all there is no box
+    // whose retirement could lift `TableFull`.
+    #[test]
+    fn an_authority_without_any_entry_is_not_reported_as_a_full_table() {
+        let mut authority = authority(0);
+        let refusal = create(&mut authority, 1)
+            .map(|outbox| outbox.id())
+            .expect_err("no entry");
+        assert_ne!(refusal, CreateRefused::TableFull, "nothing can be retired");
+    }
+
+    // Review of 437edc2, finding 3: a box that can hold no effect, or no
+    // reservation, is dead. Creating it would spend a serial and keep its
+    // owner active for nothing.
+    #[test]
+    fn a_box_that_could_never_take_an_effect_is_not_created() {
+        let mut authority = authority(2);
+        let before = authority_state(&authority);
+        for (capacity, max_reservations) in [(0, 2), (4, 0), (0, 0)] {
+            let created = authority
+                .create_outbox(owner(1), EffectSlots::new(capacity), max_reservations)
+                .map(|outbox| outbox.id());
+            assert!(
+                created.is_err(),
+                "a dead box was created: capacity {capacity}, {max_reservations} reservations"
+            );
+            assert_eq!(authority_state(&authority), before);
+            assert_eq!(authority.active_box(owner(1)), None);
+        }
     }
 
     // ADR 0009: a refused creation leaves unchanged the table of active
