@@ -106,3 +106,51 @@ fn an_unreasonable_page_request_is_a_limit_not_an_allocation_failure() {
         "an invalid requested bound must be refused before any reservation"
     );
 }
+
+#[test]
+fn a_missing_file_is_unavailable_and_is_not_created_by_inspection() {
+    let path = fixture("missing-access");
+    let missing = path.with_file_name("missing.sqlite");
+    assert_eq!(SqliteStore::inspect(&missing), Err(ReadError::Unavailable));
+    let error = SqliteStore::open(&missing).expect_err("an existing store is required");
+    assert_eq!(error.read_error(), ReadError::Unavailable);
+    assert!(!missing.exists());
+}
+
+#[test]
+fn an_invalid_ledger_cannot_fall_back_to_an_earlier_cached_read() {
+    let path = fixture("no-cache");
+    let mut store = SqliteStore::open(&path).expect("healthy store opens");
+    let command = mqttiumd_lab::store::conformance::opening_command(&store);
+    let operation = mqttiumd_lab::store::conformance::operation_id(command.after, 1);
+    let revision: Vec<u8> = rusqlite::Connection::open(&path)
+        .expect("raw reader")
+        .query_row("SELECT revision FROM meta", [], |row| row.get(0))
+        .expect("original revision");
+    // NULL fits the SQL schema, but an opened epoch must retain its opener.
+    change(&path, "UPDATE meta SET opened_by = NULL");
+    assert_eq!(store.ledger(), Err(ReadError::InvalidData));
+    assert_eq!(store.open_epoch(&command), Err(ReadError::InvalidData));
+    assert_eq!(store.established(operation), Err(ReadError::InvalidData));
+    let after: Vec<u8> = rusqlite::Connection::open(&path)
+        .expect("raw reader")
+        .query_row("SELECT revision FROM meta", [], |row| row.get(0))
+        .expect("same revision");
+    assert_eq!(after, revision, "a failed read did not open another epoch");
+}
+
+#[test]
+fn invalid_session_state_is_not_silently_filtered_out_of_recovery() {
+    let path = fixture("invalid-session-state");
+    change(&path, "DELETE FROM routes; UPDATE sessions SET state = 99");
+    let store = SqliteStore::open(&path).expect("physical opening succeeds");
+    let first = store.recover(None, 3).expect("valid metadata page");
+    assert!(
+        first.next.is_some(),
+        "invalid sessions are still pending facts"
+    );
+    assert_eq!(
+        store.recover(first.next, 64),
+        Err(RecoveryRefused::Read(ReadError::InvalidData))
+    );
+}
