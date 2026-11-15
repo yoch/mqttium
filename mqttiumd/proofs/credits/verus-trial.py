@@ -36,6 +36,9 @@ import tempfile
 import time
 from pathlib import Path
 
+import prooflib
+from prooflib import function_text
+
 HERE = Path(__file__).resolve().parent
 PRODUCT = HERE.parent.parent
 PRELUDE = "use vstd::prelude::*;"
@@ -91,23 +94,14 @@ ANNOTATIONS = [
      f"{VERIFY}\n{SPEC}pub fn release_if_current(\n"),
 ]
 
+# The same mutants as the proof's, by name, from the one place that
+# defines them.
 MUTANTS = {
-    "state-written-before-checks": (
-        "    let Some(bytes) = account.used.bytes.checked_sub(lease.cost.bytes) else {\n",
-        "    lease.state = LeaseState::Released;\n"
-        "    let Some(bytes) = account.used.bytes.checked_sub(lease.cost.bytes) else {\n",
-    ),
-    "bytes-subtracted-before-slots-checked": (
-        "    let Some(slots) = account.used.slots.checked_sub(lease.cost.slots) else {\n",
-        "    account.used.bytes = bytes;\n"
-        "    let Some(slots) = account.used.slots.checked_sub(lease.cost.slots) else {\n",
-    ),
+    mutant.name: (mutant.find, mutant.replace)
+    for mutant in prooflib.MUTANTS
+    if mutant.name in ("state-written-before-checks", "bytes-subtracted-before-slots-checked")
 }
-
-
-def body(text: str) -> str:
-    start = text.index("pub fn release_if_current(")
-    return text[start : text.index("\n}\n", start) + 3]
+assert len(MUTANTS) == 2, "a mutant of the Verus trial is no longer defined"
 
 
 def once(text: str, find: str, replace: str, where: str) -> str:
@@ -183,7 +177,7 @@ def main() -> int:
             path.write_text(once(path.read_text(), find, replace, file))
             added += replace.count("\n") - find.count("\n")
         annotated = (work / "crates/mqttiumd-core/src/credits.rs").read_text()
-        expect("  same body", body(annotated) == body(production),
+        expect("  same body", function_text(annotated) == function_text(production),
                f"the text of the function is the production one; {added} lines added around it "
                f"in {len({a[0] for a in ANNOTATIONS})} files")
 

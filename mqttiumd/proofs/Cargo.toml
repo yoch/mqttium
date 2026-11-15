@@ -20,6 +20,9 @@ publish = false
 mqttiumd-core = { path = "../crates/mqttiumd-core" }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `deny`, not `forbid`: one test, credits/tests/no_allocation.rs, installs
+# a counting global allocator and allows `unsafe` for it alone. The
+# product crates keep `forbid`.
+unsafe_code = "deny"
 unused_must_use = "deny"
 unexpected_cfgs = { level = "deny", check-cfg = ["cfg(kani)"] }

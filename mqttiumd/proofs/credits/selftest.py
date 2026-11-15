@@ -28,7 +28,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -168,25 +167,45 @@ def case_mutant_not_found_is_reported(copy: Path) -> list[str]:
     return problems + ([output[-1500:]] if problems else [])
 
 
-def case_timeout_leaves_no_process(copy: Path) -> list[str]:
-    """A run that exceeds its time limit leaves no tool running behind it."""
+def case_timeout_is_reported(copy: Path) -> list[str]:
+    """A run that exceeds its time limit is inconclusive, and reported."""
     report = copy / "report.md"
     code, output = run(copy, "python3", "proofs/credits/mutants.py", "--report", str(report),
-                       env={"MUTANTS_TIME_LIMIT_SECONDS": "3"})
+                       env={"MUTANTS_TIME_LIMIT_SECONDS": "5"})
     problems = []
     if code != 1 or "timed out" not in output:
         problems.append(f"expected exit 1 and a timeout, got exit {code}")
-    time.sleep(1)
-    listing = subprocess.run(["ps", "-eo", "pid,args"], stdout=subprocess.PIPE, text=True,
-                             check=False).stdout
-    left = [line for line in listing.splitlines()
-            if "mqttiumd-mutants-" in line and "selftest" not in line]
-    if left:
-        problems.append("processes still run in the mutants' directory: " + "; ".join(left)[:400])
     text = report.read_text() if report.exists() else ""
-    if "mutants: FAIL" not in text:
-        problems.append("the report does not carry the verdict")
+    if "inconclusive" not in text or "mutants: FAIL" not in text:
+        problems.append("the report does not carry the inconclusive rows and the verdict")
     return problems + ([output[-1500:]] if problems else [])
+
+
+def case_timeout_kills_the_whole_group(copy: Path) -> list[str]:
+    """A command that exceeds its limit is killed with the children it started."""
+    # The copy's own library, so that the case tests the code of the copy.
+    marker = f"selftest-orphan-{os.getpid()}"
+    script = (
+        "import sys, time; sys.path.insert(0, 'proofs/credits'); import prooflib\n"
+        f"command = ['sh', '-c', '(exec -a {marker} sleep 60) & sleep 60']\n"
+        "code, _, _ = prooflib.run_bounded(command, prooflib.Path('.'), 1)\n"
+        "print(code)\n"
+    )
+    problems = []
+    try:
+        done = subprocess.run(["python3", "-c", script], cwd=copy, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, check=False, timeout=20)
+        if done.stdout.strip() != "None":
+            problems.append(f"the timeout was not reported: {done.stdout.strip()}")
+    except subprocess.TimeoutExpired:
+        problems.append("the call had not returned 20 s after a limit of 1 s: "
+                        "it waits for a child it did not kill")
+    left = subprocess.run(["pgrep", "-f", marker], stdout=subprocess.PIPE, text=True, check=False)
+    orphans = [pid for pid in left.stdout.split() if pid != str(os.getpid())]
+    if orphans:
+        problems.append(f"a child of the command still runs: pid {', '.join(orphans)}")
+        subprocess.run(["pkill", "-f", marker], check=False)
+    return problems
 
 
 def case_unmodified_copy_passes(copy: Path) -> list[str]:
@@ -212,7 +231,8 @@ CASES = [
     case_unknown_argument,
     case_record_after_a_failed_harness,
     case_mutant_not_found_is_reported,
-    case_timeout_leaves_no_process,
+    case_timeout_is_reported,
+    case_timeout_kills_the_whole_group,
     case_unmodified_copy_passes,
 ]
 
