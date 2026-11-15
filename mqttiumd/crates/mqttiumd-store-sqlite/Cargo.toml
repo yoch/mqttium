@@ -23,3 +23,5 @@ workspace = true
 [dev-dependencies]
 # Writes a foreign schema version into a file, for the refusal test.
 rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled", "cache"] }
+# The measurement example writes its report as JSON.
+serde_json = "1"
