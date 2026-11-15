@@ -151,8 +151,11 @@ core consumed:
 A recovery page lists its facts. Besides the epoch, the sessions, the
 inbound exchanges and the operations, an inventory holds what the core
 needs to prepare an admission (record 0014): `Limits`, `RouteTable` and
-one `Route` per target of a topic. A 64-bit quantity is a decimal string
-and a 32-bit bound a JSON integer. The facts of a page follow the order
+one `Route` per target of a topic. Every quantity is a decimal string;
+the two 32-bit bounds of an admission (`max_targets_per_admission`,
+`max_topic_bytes`) refer to the `u32` primitive, in a trace, a snapshot
+and a fixture alike, and the semantic pass refuses a value above
+4294967295 (`u32-out-of-range`). The facts of a page follow the order
 of an inventory, which is the rule of `RecoveryOrder::admit`: `Epoch`,
 `Limits`, `RouteTable`, `Route`, `Session`, `InboundExchange`,
 `Operation`, ranks never decreasing; the first three at most once

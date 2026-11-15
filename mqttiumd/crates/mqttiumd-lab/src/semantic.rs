@@ -536,7 +536,17 @@ fn fixture(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) {
     u64_at(document, "/store/incarnation", out);
     if let Some(capacities) = document.get("capacities").and_then(Value::as_object) {
         for name in capacities.keys() {
-            u64_at(document, &format!("/capacities/{name}"), out);
+            let pointer = format!("/capacities/{name}");
+            let value = u64_at(document, &pointer, out);
+            if U32_COMPONENTS.contains(&name.as_str())
+                && value.is_some_and(|value| value > u64::from(u32::MAX))
+            {
+                out.push(Diagnostic::new(
+                    code::U32_OUT_OF_RANGE,
+                    pointer,
+                    "the value exceeds 4294967295",
+                ));
+            }
         }
     }
     let profile = text(document, "profile");
@@ -1521,7 +1531,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
 /// Names of the members that hold a 64-bit decimal string, in a trace
 /// payload or a snapshot. A test walks the schemas and fails when one of
 /// their 64-bit members is missing here.
-const COMPONENTS: [&str; 38] = [
+const COMPONENTS: [&str; 36] = [
     "incarnation",
     "epoch",
     "owner",
@@ -1555,12 +1565,15 @@ const COMPONENTS: [&str; 38] = [
     "next_session",
     "source_session",
     "target_revision",
-    "max_targets_per_admission",
-    "max_topic_bytes",
     "max_payload_bytes",
     "max_sessions",
     "max_route_targets",
 ];
+
+/// Names of the members that hold a 32-bit quantity as a decimal string.
+/// The schema-walk test holds this list to the members that refer to the
+/// `u32` primitive.
+const U32_COMPONENTS: [&str; 2] = ["max_targets_per_admission", "max_topic_bytes"];
 
 /// Checks every decimal-looking identity component below `value`. Payload
 /// members that hold 64-bit components are objects of decimal strings.
@@ -1579,6 +1592,21 @@ fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnosti
     for (key, member) in members {
         let child = format!("{pointer}/{key}");
         match member {
+            Value::String(raw) if U32_COMPONENTS.contains(&key.as_str()) => match parse_u64(raw) {
+                Ok(value) if value <= u64::from(u32::MAX) => {}
+                Ok(_) | Err(DecimalError::Overflow | DecimalError::TooLong) => {
+                    out.push(Diagnostic::new(
+                        code::U32_OUT_OF_RANGE,
+                        child,
+                        format!("{raw:?} exceeds 4294967295"),
+                    ));
+                }
+                Err(error) => out.push(Diagnostic::new(
+                    code::U64_NOT_CANONICAL,
+                    child,
+                    format!("{raw:?} is not a canonical decimal string ({error:?})"),
+                )),
+            },
             Value::String(raw) if COMPONENTS.contains(&key.as_str()) => match parse_u64(raw) {
                 Ok(_) => {}
                 Err(DecimalError::Overflow | DecimalError::TooLong) => out.push(Diagnostic::new(
@@ -1671,32 +1699,42 @@ mod tests {
     /// one added to a schema and forgotten here would go unchecked.
     #[test]
     fn every_64_bit_member_of_the_schemas_is_range_checked() {
-        fn walk(schema: &Value, found: &mut BTreeSet<String>) {
+        fn walk(schema: &Value, primitive: &str, found: &mut BTreeSet<String>) {
             match schema {
                 Value::Object(members) => {
                     if let Some(Value::Object(properties)) = members.get("properties") {
                         for (name, property) in properties {
                             let reference = property.get("$ref").and_then(Value::as_str);
-                            if reference.is_some_and(|target| target.ends_with("#/$defs/u64")) {
+                            if reference.is_some_and(|target| target.ends_with(primitive)) {
                                 found.insert(name.clone());
                             }
                         }
                     }
-                    members.values().for_each(|value| walk(value, found));
+                    members
+                        .values()
+                        .for_each(|value| walk(value, primitive, found));
                 }
-                Value::Array(items) => items.iter().for_each(|value| walk(value, found)),
+                Value::Array(items) => items.iter().for_each(|value| walk(value, primitive, found)),
                 _ => {}
             }
         }
         let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/schema/v1");
         let mut found = BTreeSet::new();
+        let mut narrow = BTreeSet::new();
         for file in [
             "trace-record.schema.json",
             "store-snapshot.schema.json",
+            "fixture.schema.json",
             "primitives.schema.json",
         ] {
             let bytes = std::fs::read(directory.join(file)).expect("schema");
-            walk(&serde_json::from_slice(&bytes).expect("JSON"), &mut found);
+            let schema: Value = serde_json::from_slice(&bytes).expect("JSON");
+            // The 64-bit capacities of a fixture are checked by pointer,
+            // not by this list.
+            if file != "fixture.schema.json" {
+                walk(&schema, "#/$defs/u64", &mut found);
+            }
+            walk(&schema, "#/$defs/u32", &mut narrow);
         }
         assert!(found.len() >= 30, "{found:?}");
         // Envelope members of a record are checked by pointer.
@@ -1708,6 +1746,17 @@ mod tests {
             .filter(|name| !COMPONENTS.contains(&name.as_str()))
             .collect();
         assert!(missing.is_empty(), "not range-checked: {missing:?}");
+        // A 32-bit member is bounded by its own list, and only it.
+        let listed: BTreeSet<String> = U32_COMPONENTS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        assert_eq!(narrow, listed);
+        assert!(
+            found.is_disjoint(&narrow),
+            "{:?}",
+            found.intersection(&narrow)
+        );
     }
 
     /// The recipe of the snapshot example is what the contract crate

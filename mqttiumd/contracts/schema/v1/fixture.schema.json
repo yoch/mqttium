@@ -148,10 +148,10 @@
           "$ref": "primitives.schema.json#/$defs/u64"
         },
         "max_targets_per_admission": {
-          "$ref": "primitives.schema.json#/$defs/u64"
+          "$ref": "primitives.schema.json#/$defs/u32"
         },
         "max_topic_bytes": {
-          "$ref": "primitives.schema.json#/$defs/u64"
+          "$ref": "primitives.schema.json#/$defs/u32"
         },
         "max_payload_bytes": {
           "$ref": "primitives.schema.json#/$defs/u64"

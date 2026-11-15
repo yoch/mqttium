@@ -893,6 +893,13 @@ bad(
     fix(setter(["capacities", "payload_bytes"], "99999999999999999999")),
 )
 bad(
+    "fixture-topic-limit-over-32-bits.json",
+    "u32-out-of-range",
+    "/capacities/max_topic_bytes",
+    "The bound on a topic is a 32-bit quantity, in a fixture as in a snapshot or a trace.",
+    fix(setter(["capacities", "max_topic_bytes"], "4294967296")),
+)
+bad(
     "fixture-session-not-persistent.json",
     "schema-violation",
     "/sessions/0/persistent",
@@ -2003,8 +2010,6 @@ for path in (
     ["account", "limits", "payload_bytes"],
     ["account", "limits", "exchange_slots"],
     ["account", "limits", "receipt_slots"],
-    ["account", "limits", "max_targets_per_admission"],
-    ["account", "limits", "max_topic_bytes"],
     ["account", "limits", "max_payload_bytes"],
     ["account", "limits", "max_sessions"],
     ["account", "limits", "max_route_targets"],

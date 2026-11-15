@@ -566,6 +566,12 @@
       "why": "Capacities are 64-bit."
     },
     {
+      "file": "contracts/examples/v1/invalid/fixture-topic-limit-over-32-bits.json",
+      "code": "u32-out-of-range",
+      "pointer": "/capacities/max_topic_bytes",
+      "why": "The bound on a topic is a 32-bit quantity, in a fixture as in a snapshot or a trace."
+    },
+    {
       "file": "contracts/examples/v1/invalid/fixture-session-not-persistent.json",
       "code": "schema-violation",
       "pointer": "/sessions/0/persistent",
@@ -1037,18 +1043,6 @@
       "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-receipt-slots.json",
       "code": "u64-out-of-range",
       "pointer": "/account/limits/receipt_slots",
-      "why": "Every 64-bit member of a snapshot is range-checked."
-    },
-    {
-      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-max-targets-per-admission.json",
-      "code": "u64-out-of-range",
-      "pointer": "/account/limits/max_targets_per_admission",
-      "why": "Every 64-bit member of a snapshot is range-checked."
-    },
-    {
-      "file": "contracts/examples/v1/invalid/store-snapshot-overflow-account-limits-max-topic-bytes.json",
-      "code": "u64-out-of-range",
-      "pointer": "/account/limits/max_topic_bytes",
       "why": "Every 64-bit member of a snapshot is range-checked."
     },
     {

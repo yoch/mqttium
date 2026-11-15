@@ -42,6 +42,11 @@ def _get(document, pointer):
     return value
 
 
+# The capacities of a fixture that are 32-bit quantities, as the fixture
+# schema declares them through the ``u32`` primitive.
+U32_CAPACITIES = ("max_targets_per_admission", "max_topic_bytes")
+
+
 def _u64(document, pointer, out):
     """The value of the decimal string at ``pointer``; ``None`` if absent or bad."""
     raw = _get(document, pointer)
@@ -350,7 +355,11 @@ def _scenario(contracts, document, out):
 def _fixture(contracts, document, out):
     _u64(document, "/store/incarnation", out)
     for name in document["capacities"]:
-        _u64(document, f"/capacities/{name}", out)
+        value = _u64(document, f"/capacities/{name}", out)
+        if name in U32_CAPACITIES and value is not None and value > 0xFFFF_FFFF:
+            out.append(
+                Diagnostic("u32-out-of-range", f"/capacities/{name}", f"{value} exceeds 4294967295")
+            )
     if document["profile"] not in contracts.catalogs["profiles"]:
         out.append(Diagnostic("profile-unknown", "/profile", "the profile is not catalogued"))
     _unique(_named(document, "sessions", "client"), "client", "duplicate-name", out)
@@ -737,6 +746,18 @@ def _decimal_members(schemas, file, schema, value, pointer, out, depth=0):
         return
     reference = schema.get("$ref")
     if reference is not None:
+        if reference.endswith("#/$defs/u32"):
+            if isinstance(value, str):
+                try:
+                    if u64(value) > 0xFFFF_FFFF:
+                        out.append(
+                            Diagnostic("u32-out-of-range", pointer, f"{value!r} exceeds 4294967295")
+                        )
+                except ValueError as error:
+                    out.append(
+                        Diagnostic(str(error), pointer, f"{value!r} is not a decimal string")
+                    )
+            return
         if reference.endswith("#/$defs/u64"):
             if isinstance(value, str):
                 try:
