@@ -1921,21 +1921,24 @@ mod tests {
         }
     }
 
-    /// The registry leaves one cell for the change that declares it
-    /// complete.
+    /// V3-006: an old command presented again after its receipt was
+    /// closed is refused, whatever recipe it carries: the stored result is
+    /// gone, and none is invented.
     #[test]
-    fn one_cell_is_left_for_the_change_that_declares_the_registry_complete() {
-        let (_, report) = p1_registry();
-        let holes: Vec<&String> = report
-            .notes
-            .iter()
-            .filter(|note| note.starts_with("registry hole"))
+    fn a_command_replayed_after_its_receipt_was_closed_is_refused() {
+        let expectations: Vec<Expected> = ["same", "different"]
+            .into_iter()
+            .map(|recipe| Expected {
+                state: "ReceiptClosed",
+                event: "Replay",
+                point: Box::leak(Box::new([("recipe", recipe)])),
+                disposition: "REJECT",
+                next: "ReceiptClosed",
+                required: &[],
+                forbidden: &["Persist"],
+            })
             .collect();
-        assert_eq!(holes.len(), 1, "{holes:?}");
-        assert!(
-            holes[0].contains("command ReceiptClosed x Replay"),
-            "{holes:?}"
-        );
+        check_expectations(&expectations);
     }
 
     /// ADR 0001, "Guards": a deadline for an operation that became terminal
