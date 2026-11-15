@@ -388,10 +388,19 @@ dependencies = [
  "jsonschema",
  "mqttiumd-contract",
  "mqttiumd-core",
+ "mqttiumd-store-api",
+ "mqttiumd-store-sqlite",
  "proc-macro2",
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "mqttiumd-store-api"
+version = "0.0.0"
+dependencies = [
+ "mqttiumd-contract",
 ]
 
 [[package]]
@@ -400,6 +409,7 @@ version = "0.0.0"
 dependencies = [
  "mqttiumd-contract",
  "mqttiumd-lab",
+ "mqttiumd-store-api",
  "rusqlite",
  "serde_json",
 ]

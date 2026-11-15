@@ -10,7 +10,7 @@ use mqttiumd_contract::effects::InboundPhase;
 use mqttiumd_contract::ids::{ExchangeGeneration, ExchangeId, SessionId};
 use mqttiumd_contract::outcome::RejectReason;
 use mqttiumd_contract::packet::Qos;
-use mqttiumd_lab::store::durable::{ObligationPhase, SessionState};
+use mqttiumd_store_api::{ObligationPhase, SessionState};
 
 /// A durable value that does not decode: the file is not one this store
 /// wrote, or it was damaged. Nothing is inferred from it.

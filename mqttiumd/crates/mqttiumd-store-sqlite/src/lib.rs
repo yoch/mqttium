@@ -45,7 +45,7 @@ use mqttiumd_contract::outcome::{
     CommitFacts, Knowledge, OpeningOutcome, RejectReason, StoreOutcome, StoreReply, StoreViolation,
 };
 use mqttiumd_contract::packet::{Qos, SharedBytes};
-use mqttiumd_lab::store::durable::{
+use mqttiumd_store_api::{
     Accounts, AdminCommand, AdminDone, AdminRefused, Applied, Decision, Durability, DurableState,
     DurableStore, InboundRecord, Limits, MAX_CLIENT_ID_BYTES, ObligationRecord, OperationRecord,
     PayloadRecord, PublicationRecord, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved,
@@ -653,7 +653,7 @@ fn stage_admission(
             target.session_revision.to_be_bytes().as_slice(),
             qos_code(target.effective_qos),
             cause_code(target.cause),
-            obligation_phase_code(mqttiumd_lab::store::durable::ObligationPhase::Pending),
+            obligation_phase_code(mqttiumd_store_api::ObligationPhase::Pending),
         ])?;
     }
     if exactly_once {
