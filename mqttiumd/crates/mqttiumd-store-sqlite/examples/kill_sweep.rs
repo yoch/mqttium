@@ -16,7 +16,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use mqttiumd_contract::capacity::{PayloadBytes, ReceiptSlots, References};
-use mqttiumd_contract::command::Command as StoreCommand;
+use mqttiumd_contract::command::{Command as StoreCommand, FrozenRecipe, Recipe};
+use mqttiumd_contract::packet::SharedBytes;
 use mqttiumd_lab::manifest::sha256_hex;
 use mqttiumd_lab::store::conformance::{World, accounts_match_what_is_held, fixture_limits};
 use mqttiumd_lab::store::durable::{DurableState, DurableStore, Limits, MemoryStore};
@@ -63,12 +64,23 @@ fn limits() -> Limits {
 }
 
 fn admission<S>(world: &World<S>, n: u64) -> StoreCommand {
-    world.admission(
+    // The conformance fixture's byte builder is capped at 1024. Reuse its
+    // identities and targets, then construct this explorer's larger recipe
+    // and bytes with its own declared bound before anything is submitted.
+    let mut command = world.admission(
         2 * n,
         u16::try_from(n).expect("bounded packet"),
-        &vec![0x5a; PAYLOAD],
+        b"",
         &[world.b, world.c],
-    )
+    );
+    let Recipe::AdmitPublication(mut recipe) = command.recipe.get().clone() else {
+        unreachable!("the fixture constructed an admission")
+    };
+    recipe.payload.length = PayloadBytes::new(PAYLOAD as u64);
+    recipe.costs.payload_bytes = recipe.payload.length;
+    command.recipe = FrozenRecipe::freeze(Recipe::AdmitPublication(recipe)).expect("well formed");
+    command.payload = Some(SharedBytes::copy_from(&vec![0x5a; PAYLOAD], PAYLOAD).expect("bounded"));
+    command
 }
 
 fn prepare<S: DurableStore>(world: &mut World<S>, target: Target) -> StoreCommand {
