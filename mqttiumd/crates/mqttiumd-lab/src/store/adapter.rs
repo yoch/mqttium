@@ -37,6 +37,8 @@ use mqttiumd_contract::outcome::{
     EpochOpened, EpochOpening, OpeningOutcome, OpeningReply, StoreOutcome, StoreReply,
 };
 
+use mqttiumd_store_api::ReadError;
+
 use super::durable::{DurableStore, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved};
 
 /// A named injection point of the fault catalogue.
@@ -346,6 +348,8 @@ pub enum ActionRefused {
     Halted,
     /// The action is not among the eligible ones.
     NotEligible,
+    /// A durable read failed; it establishes no absence or result.
+    Read(ReadError),
 }
 
 /// The bounds of the adapter.
@@ -714,9 +718,11 @@ impl<S: DurableStore> SimStore<S> {
     /// The opening of this start-up: for the data set behind the
     /// adapter, which start-up verified by reading its ledger, and with
     /// the nonce this start-up drew.
-    #[must_use]
-    pub fn begin_opening(&self, startup: StartupNonce) -> EpochOpening {
-        EpochOpening::new(self.store.ledger().incarnation(), startup)
+    pub fn begin_opening(&self, startup: StartupNonce) -> Result<EpochOpening, ReadError> {
+        Ok(EpochOpening::new(
+            self.store.ledger()?.incarnation(),
+            startup,
+        ))
     }
 
     /// Submits the opening of an epoch. It travels like a command: in
@@ -809,7 +815,7 @@ impl<S: DurableStore> SimStore<S> {
                     .transit
                     .remove(index)
                     .ok_or(ActionRefused::NotEligible)?;
-                Ok(self.run(transit))
+                self.run(transit)
             }
             StoreAction::DeliverResult(id) => {
                 let index = self
@@ -830,7 +836,7 @@ impl<S: DurableStore> SimStore<S> {
     }
 
     /// Runs one command in the writer and makes its result ready.
-    fn run(&mut self, mut transit: Transit) -> Performed {
+    fn run(&mut self, mut transit: Transit) -> Result<Performed, ActionRefused> {
         let id = transit.id;
         let (kind, operation, source) = describe(&transit.work);
         // A resolution that reads an absence reaches the fence point
@@ -841,14 +847,18 @@ impl<S: DurableStore> SimStore<S> {
         let mut refuse_fence = false;
         if let Work::Resolve(resolved) = &transit.work
             && !transit.fence_passed
-            && self.store.established(*resolved).is_none()
+            && self
+                .store
+                .established(*resolved)
+                .map_err(ActionRefused::Read)?
+                .is_none()
         {
             transit.fence_passed = true;
             match self.pass(FaultPoint::FenceTransit, id, kind, operation, source) {
                 Some(FaultAction::HoldCommand) => {
                     transit.held = self.last_hit;
                     self.transit.push_back(transit);
-                    return Performed::Held(FaultPoint::FenceTransit);
+                    return Ok(Performed::Held(FaultPoint::FenceTransit));
                 }
                 Some(FaultAction::RefuseFence) => refuse_fence = true,
                 _ => {}
@@ -910,9 +920,12 @@ impl<S: DurableStore> SimStore<S> {
                 // The outcome does not say so: the command that opened
                 // the last epoch is answered `Committed` again and
                 // writes nothing.
-                let before = self.store.ledger();
-                let outcome = self.store.open_epoch(command);
-                let after = self.store.ledger();
+                let before = self.store.ledger().map_err(ActionRefused::Read)?;
+                let outcome = self
+                    .store
+                    .open_epoch(command)
+                    .map_err(ActionRefused::Read)?;
+                let after = self.store.ledger().map_err(ActionRefused::Read)?;
                 let wrote = after != before;
                 if wrote {
                     opened = Some(EpochOpened {
@@ -945,10 +958,10 @@ impl<S: DurableStore> SimStore<S> {
                 point: FaultPoint::CommitApplied,
                 pending: Some((origin, answer)),
             });
-            return Performed::Halted(FaultPoint::CommitApplied);
+            return Ok(Performed::Halted(FaultPoint::CommitApplied));
         }
         self.make_ready(origin, answer);
-        Performed::Executed
+        Ok(Performed::Executed)
     }
 
     fn make_ready(&mut self, origin: Origin, answer: Answer) {
@@ -1073,7 +1086,11 @@ impl<S: DurableStore> SimStore<S> {
         cursor: Option<RecoveryCursor>,
         limit: usize,
     ) -> Result<RecoveryPage, RecoveryRefused> {
-        let run_epoch = self.store.ledger().last_opened();
+        let run_epoch = self
+            .store
+            .ledger()
+            .map_err(RecoveryRefused::Read)?
+            .last_opened();
         let page = self.store.recover(cursor, limit)?;
         let number = match cursor {
             None => 0,

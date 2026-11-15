@@ -26,6 +26,7 @@ pub mod broker;
 pub mod campaign;
 pub mod child;
 pub mod collector;
+pub mod failure;
 pub mod mqtt;
 pub mod process;
 pub mod protocol;

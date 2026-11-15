@@ -177,11 +177,15 @@ pub enum Report {
         digest: [u8; 32],
     },
     /// The action is over; the last evidence frame it emitted, if any.
-    EndOfAction { last_emission: Option<u64> },
+    EndOfAction {
+        action_sequence: u64,
+        last_emission: Option<u64>,
+    },
     /// The action is still in flight inside SQLite. Every frame through
     /// last_emission was accepted by the surviving collector and its ack
     /// consumed by the child. Only SIGKILL may follow this report.
     Parked {
+        action_sequence: u64,
         last_emission: u64,
         fault: u32,
         point: String,
@@ -191,6 +195,11 @@ pub enum Report {
     Refused { reason: String },
     /// The run cannot go on in the child.
     Stopped { reason: String },
+    /// A stable typed cause, including failures before Started.
+    Failed {
+        failure: super::failure::Failure,
+        message: String,
+    },
     /// The process started: its epoch, the elementary choices of its
     /// start-up for the choice log, and the settings the store engine read
     /// back, as JSON, for the supervisor to compare to the manifest.
@@ -468,12 +477,18 @@ impl Report {
                 }
                 writer
             }
-            Self::EndOfAction { last_emission } => match last_emission {
-                None => Writer::tag(2),
-                Some(emission) => Writer::tag(3).u64(*emission),
+            Self::EndOfAction {
+                action_sequence,
+                last_emission,
+            } => match last_emission {
+                None => Writer::tag(2).u64(*action_sequence),
+                Some(emission) => Writer::tag(3).u64(*action_sequence).u64(*emission),
             },
             Self::Refused { reason } => Writer::tag(4).bytes(reason.as_bytes()),
             Self::Stopped { reason } => Writer::tag(5).bytes(reason.as_bytes()),
+            Self::Failed { failure, message } => Writer::tag(12)
+                .bytes(failure.to_wire().to_string().as_bytes())
+                .bytes(message.as_bytes()),
             Self::Started {
                 epoch,
                 startup,
@@ -526,11 +541,13 @@ impl Report {
                 writer
             }
             Self::Parked {
+                action_sequence,
                 last_emission,
                 fault,
                 point,
                 settings,
             } => Writer::tag(11)
+                .u64(*action_sequence)
                 .u64(*last_emission)
                 .u32(*fault)
                 .bytes(point.as_bytes())
@@ -558,9 +575,11 @@ impl Report {
                 Self::Eligible { choices, digest }
             }
             2 => Self::EndOfAction {
+                action_sequence: reader.u64()?,
                 last_emission: None,
             },
             3 => Self::EndOfAction {
+                action_sequence: reader.u64()?,
                 last_emission: Some(reader.u64()?),
             },
             4 => Self::Refused {
@@ -621,11 +640,22 @@ impl Report {
                 Self::Finished { unwritten }
             }
             11 => Self::Parked {
+                action_sequence: reader.u64()?,
                 last_emission: reader.u64()?,
                 fault: reader.u32()?,
                 point: reader.text()?,
                 settings: reader.text()?,
             },
+            12 => {
+                let raw = reader.bytes()?;
+                let value = crate::strict::parse(&raw).map_err(|_| Refusal::Short)?;
+                let failure = super::failure::Failure::from_wire(&value).ok_or(Refusal::Short)?;
+                let message = reader.text()?;
+                if message.len() > super::failure::MAX_FAILURE_MESSAGE {
+                    return Err(Refusal::TooLarge(message.len()));
+                }
+                Self::Failed { failure, message }
+            }
             other => return Err(Refusal::UnknownTag(other)),
         };
         reader.end(report)
@@ -917,12 +947,15 @@ mod tests {
                 digest: choices_digest(&[]),
             },
             Report::EndOfAction {
+                action_sequence: 9,
                 last_emission: None,
             },
             Report::EndOfAction {
+                action_sequence: 9,
                 last_emission: Some(41),
             },
             Report::Parked {
+                action_sequence: 9,
                 last_emission: 41,
                 fault: 2,
                 point: "store.commit.prepared".to_owned(),
@@ -933,6 +966,15 @@ mod tests {
             },
             Report::Stopped {
                 reason: "core fault".to_owned(),
+            },
+            Report::Failed {
+                failure: super::super::failure::Failure::Read {
+                    cause: mqttiumd_store_api::ReadError::InvalidData.into(),
+                    phase: mqttiumd_store_api::ReadPhase::Recovery,
+                    process_incarnation: 2,
+                    page: Some(1),
+                },
+                message: "durable recovery refused".to_owned(),
             },
             Report::Started {
                 epoch: 2,
@@ -1059,7 +1101,7 @@ mod tests {
         }
         assert_eq!(Action::decode(&[0]), Err(Refusal::UnknownTag(0)));
         assert_eq!(Action::decode(&[15]), Err(Refusal::UnknownTag(15)));
-        assert_eq!(Report::decode(&[12]), Err(Refusal::UnknownTag(12)));
+        assert_eq!(Report::decode(&[13]), Err(Refusal::UnknownTag(13)));
         // A flag is 0 or 1.
         assert_eq!(
             Report::decode(&[7, 2, 0, 0, 0, 0, 0, 0]),

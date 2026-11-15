@@ -82,6 +82,7 @@ fn child(
     write_frame(
         &mut control,
         &Report::EndOfAction {
+            action_sequence: 0,
             last_emission: Some(RECORDS - 1),
         }
         .encode(),
@@ -160,7 +161,7 @@ fn more_records_than_the_window_flow_without_a_deadlock_and_in_order() {
                     write_frame(&mut actions, &Action::Acknowledge { through }.encode()).unwrap();
                 }
             }
-            Read::Report(Report::EndOfAction { last_emission }) => end = Some(last_emission),
+            Read::Report(Report::EndOfAction { last_emission, .. }) => end = Some(last_emission),
             Read::Report(other) => panic!("unexpected {other:?}"),
         }
     }

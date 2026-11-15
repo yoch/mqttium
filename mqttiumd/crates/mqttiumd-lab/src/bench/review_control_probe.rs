@@ -29,6 +29,7 @@ fn fixture() -> (Child, mpsc::SyncSender<Arrival>, Collector, Books) {
         silence: Duration::from_secs(2),
         ended: true,
         parked: None,
+        next_action: 0,
     };
     (child, sender, collector, Books::new(0))
 }
@@ -38,12 +39,14 @@ fn repeated_contradictory_ends_exceeding_report_budget_are_refused() {
     for _ in 0..=REPORTS_PER_ACTION {
         sender
             .send(Arrival::Report(Report::EndOfAction {
+                action_sequence: 0,
                 last_emission: Some(0),
             }))
             .unwrap();
     }
     sender
         .send(Arrival::Report(Report::EndOfAction {
+            action_sequence: 0,
             last_emission: None,
         }))
         .unwrap();
@@ -67,9 +70,7 @@ fn broken_evidence_after_signal_is_not_silently_discarded() {
         let mut bytes = 64u32.to_be_bytes().to_vec();
         bytes.push(1);
         let refusal = read_frame(&mut bytes.as_slice()).unwrap_err();
-        sender
-            .send(Arrival::Broken(format!("broker-core: {refusal}")))
-            .unwrap();
+        sender.send(Arrival::Broken(refusal)).unwrap();
     });
     let result = child.kill();
     assert!(
@@ -83,11 +84,13 @@ fn one_end_cannot_erase_the_evidence_promised_by_an_earlier_end() {
     let (mut child, sender, mut collector, mut books) = fixture();
     sender
         .send(Arrival::Report(Report::EndOfAction {
+            action_sequence: 0,
             last_emission: Some(0),
         }))
         .unwrap();
     sender
         .send(Arrival::Report(Report::EndOfAction {
+            action_sequence: 0,
             last_emission: None,
         }))
         .unwrap();
@@ -104,6 +107,7 @@ fn termination_reports_are_in_the_same_bounded_control_budget() {
     let (mut child, sender, mut collector, mut books) = fixture();
     sender
         .send(Arrival::Report(Report::EndOfAction {
+            action_sequence: 0,
             last_emission: Some(0),
         }))
         .unwrap();
@@ -117,6 +121,7 @@ fn termination_reports_are_in_the_same_bounded_control_budget() {
     }
     sender
         .send(Arrival::Report(Report::EndOfAction {
+            action_sequence: 0,
             last_emission: None,
         }))
         .unwrap();
@@ -146,6 +151,7 @@ fn reports_without_evidence_progress_do_not_reset_the_action_deadline() {
             std::thread::sleep(Duration::from_millis(50));
         }
         let _ = sender.send(Arrival::Report(Report::EndOfAction {
+            action_sequence: 0,
             last_emission: None,
         }));
     });
@@ -197,9 +203,7 @@ fn a_drain_failure_keeps_the_confirmed_signal_nine_receipt() {
         let mut bytes = 64_u32.to_be_bytes().to_vec();
         bytes.push(1);
         let refusal = read_frame(&mut bytes.as_slice()).unwrap_err();
-        sender
-            .send(Arrival::Broken(format!("broker-core: {refusal}")))
-            .unwrap();
+        sender.send(Arrival::Broken(refusal)).unwrap();
     });
     let attempt = child.kill_observed();
     producer.join().unwrap();
@@ -234,5 +238,29 @@ fn the_actual_unix_reader_accepts_a_clean_eof_after_real_kill() {
             .expect("clean EOF does not invent protocol damage")
             .wait_signal,
         9
+    );
+}
+
+#[test]
+fn a_duplicate_empty_end_cannot_complete_a_second_action() {
+    let (mut child, sender, mut collector, mut books) = fixture();
+    sender
+        .send(Arrival::Report(Report::EndOfAction {
+            action_sequence: 0,
+            last_emission: None,
+        }))
+        .unwrap();
+    sender
+        .send(Arrival::Report(Report::EndOfAction {
+            action_sequence: 0,
+            last_emission: None,
+        }))
+        .unwrap();
+    drop(sender);
+    let first = child.act(&Action::Settle, &mut collector, &mut books);
+    let second = child.act(&Action::Settle, &mut collector, &mut books);
+    assert!(
+        first.is_err() || second.is_err(),
+        "two actions were accepted from one repeated empty terminator"
     );
 }
