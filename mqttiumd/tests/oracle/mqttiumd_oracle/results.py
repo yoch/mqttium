@@ -1,4 +1,4 @@
-"""Producing a qualifying result, and recomputing one that is offered.
+"""Producing a result, qualifying only with its evidence, and recomputing one that is offered.
 
 A qualifying result is evidence. It is produced here, from the observations
 of a run, and one that is offered is found again from the files it cites: a
@@ -73,6 +73,85 @@ def produce(contracts, scenario_path, trace_path, manifest_path, scope):
         "contracts_digest": contracts.digest,
         "artifacts": [],
     }
+
+
+# The condition of a qualifying run that no file given to the command can
+# establish yet (docs/reception/open-conditions.md, lot L4).
+UNTIED_BINARY = (
+    "nothing establishes that the binary was built from the recorded content "
+    "(no member of run-manifest v1 says so)"
+)
+
+
+def unmet(contracts, scenario_path, manifest_path):
+    """The conditions of a qualifying run that the given files do not establish."""
+    try:
+        data = contracts.read(manifest_path)
+    except Refused as refusal:
+        return [f"the manifest cannot be read: {refusal.diagnostic}"]
+    problems = contracts.check_bytes(data)
+    if problems:
+        return [f"the manifest is not a valid document: {problem}" for problem in problems]
+    manifest = parse(data)
+    if manifest["format"] != "mqttiumd.run-manifest":
+        return ["the manifest is not a run manifest"]
+    out = []
+    if manifest["contracts_digest"] != contracts.digest:
+        out.append("the manifest names other contracts than the ones in use")
+    out += _cited(contracts, manifest.get("scenario"), scenario_path, "scenario")
+    try:
+        fixture = parse(contracts.read(scenario_path)).get("initial_fixture")
+    except Refused as refusal:
+        return [*out, f"the scenario cannot be read: {refusal.diagnostic}"]
+    if fixture is not None:
+        out += _cited(contracts, manifest.get("fixture"), fixture, "fixture")
+    for member, words in (
+        ("backend", "backend"),
+        ("failure_model", "failure model"),
+        ("scheduler", "scheduler"),
+    ):
+        if member not in manifest:
+            out.append(f"the manifest records no {words}")
+    if not manifest.get("commands"):
+        out.append("the manifest records no command")
+    for member in ("oracle", "generators"):
+        if member not in manifest:
+            out.append(f"the manifest does not identify the {member}")
+    for entry in manifest.get("oracle", {}).get("files", []):
+        try:
+            sha256, _ = contracts.hash_evidence(entry["path"])
+        except Refused:
+            sha256 = None
+        if sha256 != entry["sha256"]:
+            out.append(
+                f"the oracle that judged is not the one the manifest identifies: {entry['path']}"
+            )
+    if manifest["checkout"]["tree_state"] != "clean":
+        out.append("the tree was modified and its content is not kept in the run directory")
+    out.append(UNTIED_BINARY)
+    return out
+
+
+def _cited(contracts, cited, path, words):
+    if cited is None:
+        return [f"the manifest names no {words}"]
+    try:
+        sha256, _ = contracts.hash_evidence(path)
+    except Refused as refusal:
+        return [f"the {words} cannot be read: {refusal.diagnostic}"]
+    if cited["sha256"] != sha256:
+        return [f"the manifest names another {words} than {path}"]
+    return []
+
+
+def provisional(result, conditions):
+    """``result`` as a development document: no evidence, so never a PASS."""
+    out = dict(result, qualification="provisional")
+    verdict = "INCONCLUSIVE" if result["verdict"] == "PASS" else result["verdict"]
+    out.update(verdict=verdict, exit_code=EXIT_CODES[verdict])
+    reasons = [_text(f"not qualifying: {condition}") for condition in conditions]
+    out["reasons"] = (reasons + result["reasons"])[:MAX_REASONS]
+    return out
 
 
 def recompute(contracts, result_path):

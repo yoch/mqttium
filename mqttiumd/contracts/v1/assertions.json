@@ -118,7 +118,7 @@
     },
     {
       "name": "terminal_knowledge_never_regresses",
-      "meaning": "An unknown result consumed after a terminal result of the same operation changes nothing: nothing the core does follows from it, no second acknowledgement, no new resolution of the operation.",
+      "meaning": "An unknown result consumed after a terminal result of the same operation changes nothing: no record of the product names it as its cause, no second acknowledgement, no new resolution of the operation. A record of the bench ordered after it (an inspection, a crash, a packet of a peer) is no reaction of the product.",
       "every_run": false,
       "requirements": [
         "DEM-010"
