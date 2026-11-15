@@ -8,7 +8,7 @@
 # product.
 [workspace]
 resolver = "3"
-members = ["preflight"]
+members = ["credits", "preflight"]
 
 [workspace.package]
 version = "0.0.0"
