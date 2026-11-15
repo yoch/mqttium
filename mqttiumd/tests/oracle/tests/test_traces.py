@@ -50,7 +50,10 @@ class Traces(unittest.TestCase):
                 run = Run.load(self.contracts, scenario, f"tests/oracle/traces/{trace}/trace.jsonl")
                 found = {name: status.status for name, status in judge(run).items()}
                 self.assertEqual(found["broker_inputs_have_provenance"], expected)
-                self.assertEqual(set(found), {*listed, "broker_inputs_have_provenance"})
+                self.assertEqual(
+                    set(found),
+                    {*listed, "broker_inputs_have_provenance", "one_grant_per_opened_epoch"},
+                )
 
     def test_every_refusal_states_its_reason(self):
         for case in INDEX:

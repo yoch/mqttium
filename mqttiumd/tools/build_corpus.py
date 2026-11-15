@@ -1059,6 +1059,80 @@ ok(
         [("store-evidence", 0)],
     ),
 )
+# K1: the result the store produced, handed over by the adapter, consumed
+# by the core. And the opening of an epoch (records agreed with lot L2).
+HANDED = record(
+    8,
+    "store-adapter",
+    3,
+    "StoreResultHandedOver",
+    {"effect_id": EFFECT, "operation_id": OP, "outcome": "Committed"},
+    [("store-evidence", 1)],
+)
+ok("trace-record-store-result-handed-over.json", HANDED)
+ATTEMPT = {"startup_hex": "02" * 16, "ticket": "1"}
+ok(
+    "trace-record-opening-submitted.json",
+    record(
+        1,
+        "store-adapter",
+        0,
+        "OpeningSubmitted",
+        {"attempt": ATTEMPT, "incarnation": "1", "after": "1"},
+    ),
+)
+ok(
+    "trace-record-store-epoch-opened.json",
+    record(
+        2,
+        "store-evidence",
+        0,
+        "StoreEpochOpened",
+        {"incarnation": "1", "epoch": "2", "attempt": ATTEMPT},
+        [("store-adapter", 0)],
+    ),
+)
+REPLY = record(
+    3,
+    "broker-core",
+    0,
+    "OpeningReplyDelivered",
+    {"attempt": ATTEMPT, "incarnation": "1", "after": "1", "outcome": "Committed", "epoch": "2"},
+    [("store-adapter", 0)],
+)
+ok("trace-record-opening-reply-delivered.json", REPLY)
+ok(
+    "trace-record-opening-reply-rejected.json",
+    record(
+        3,
+        "broker-core",
+        0,
+        "OpeningReplyDelivered",
+        {
+            "attempt": ATTEMPT,
+            "incarnation": "1",
+            "after": "1",
+            "outcome": "RejectedCertain",
+            "reject_reason": "PredecessorMoved",
+        },
+        [("store-adapter", 0)],
+    ),
+)
+ok(
+    "trace-record-opening-abandoned.json",
+    record(4, "broker-core", 1, "OpeningAbandoned", {"attempt": ATTEMPT}, [("broker-core", 0)]),
+)
+ok(
+    "trace-record-epoch-grant-handed-over.json",
+    record(
+        5,
+        "broker-core",
+        2,
+        "EpochGrantHandedOver",
+        {"incarnation": "1", "epoch": "2"},
+        [("broker-core", 0)],
+    ),
+)
 REJECTED = record(
     7,
     "store-evidence",
@@ -1334,6 +1408,39 @@ trace_case(
     "Identity components inside a recovered fact are 64-bit as well.",
     setter(["payload", "facts", 1, "revision"], "18446744073709551616"),
     code="u64-out-of-range",
+)
+trace_case(
+    "opening-committed-without-its-epoch",
+    REPLY,
+    "/payload",
+    "A committed opening names the epoch it opened.",
+    dropped("payload", "epoch"),
+)
+trace_case(
+    "opening-rejected-with-an-epoch",
+    REPLY,
+    "/payload",
+    "A rejected opening opened nothing: it names a reason, not an epoch.",
+    lambda value: value["payload"].update(
+        outcome="RejectedCertain", reject_reason="PredecessorMoved"
+    ),
+)
+trace_case(
+    "opening-rejected-for-an-unknown-reason",
+    REPLY,
+    "/payload/reject_reason",
+    "The reasons of a rejected opening are those of OpeningRejection.",
+    lambda value: (
+        value["payload"].pop("epoch"),
+        value["payload"].update(outcome="RejectedCertain", reject_reason="Busy"),
+    ),
+)
+trace_case(
+    "handed-over-rejection-without-its-reason",
+    HANDED,
+    "/payload",
+    "What the adapter hands over is the result the store produced, reason included.",
+    setter(["payload", "outcome"], "RejectedCertain"),
 )
 trace_case(
     "rejection-without-its-reason",
@@ -2432,6 +2539,12 @@ for kind_name, origin in [
     ("held-item-released", "bench-supervisor"),
     ("fault-hit", "broker-core"),
     ("peer-packet-observed", "transport"),
+    ("store-result-handed-over", "broker-core"),
+    ("opening-submitted", "broker-core"),
+    ("store-epoch-opened", "store-adapter"),
+    ("opening-reply-delivered", "store-adapter"),
+    ("opening-abandoned", "bench-supervisor"),
+    ("epoch-grant-handed-over", "store-evidence"),
 ]:
     trace_case(
         f"{kind_name}-stated-by-{origin}",

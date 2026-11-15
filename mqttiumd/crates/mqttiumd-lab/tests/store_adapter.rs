@@ -225,11 +225,20 @@ fn a_plain_admission_leaves_its_evidence_in_order() {
             StoreEvent::CommandSubmitted {
                 id,
                 kind: WorkKind::AdmitPublication,
-                operation
+                operation,
+                opening: None
             },
-            StoreEvent::CommitStable { id, operation },
+            StoreEvent::CommitStable {
+                id,
+                operation,
+                opened: None
+            },
             StoreEvent::ResultReady { id, answer },
-            StoreEvent::ResultDelivered { id, answer },
+            StoreEvent::ResultDelivered {
+                id,
+                answer,
+                produced: true
+            },
         ]
     );
     assert!(!bench.store.evidence_lost());
@@ -874,7 +883,8 @@ fn a_left_over_copy_does_not_answer_work_submitted_again() {
                 answer: Answer::Operation {
                     operation,
                     reply: fenced
-                }
+                },
+                produced: true
             },
         ]
     );

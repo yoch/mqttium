@@ -412,6 +412,24 @@ struct Origin {
     sequence: u64,
 }
 
+/// A record of another component that caused a submission: the record
+/// of the core that consumed the input the effect comes from. The bench
+/// knows it; the adapter does not, and the writer never guesses it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Cause {
+    pub component: &'static str,
+    pub incarnation: u64,
+    pub sequence: u64,
+}
+
+/// Why `TraceWriter::write_caused` wrote nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CauseRefused {
+    /// Causes are given only for a submission: `CommandSubmitted`,
+    /// `ResolveSubmitted` or `OpeningSubmitted`.
+    NotASubmission,
+}
+
 /// Writes the evidence of one adapter as trace records. The collector
 /// of lot L4 owns the trace; this writer gives it the records of the
 /// store adapter, the store evidence, the fault injector and the
@@ -430,6 +448,11 @@ pub struct TraceWriter<'a> {
     submitted: BTreeMap<WorkId, (Origin, &'static str)>,
     /// The record of each fault that was reached.
     hits: BTreeMap<FaultId, Origin>,
+    /// The `StoreResultReady` of each piece of work, the parent of its
+    /// handover.
+    ready: BTreeMap<WorkId, Origin>,
+    /// The causes the caller gave for the submission being written.
+    causes: Vec<Cause>,
 }
 
 /// What a writer produced from a list of events.
@@ -481,6 +504,8 @@ impl<'a> TraceWriter<'a> {
             sequences: BTreeMap::new(),
             submitted: BTreeMap::new(),
             hits: BTreeMap::new(),
+            ready: BTreeMap::new(),
+            causes: Vec::new(),
         }
     }
 
@@ -499,15 +524,24 @@ impl<'a> TraceWriter<'a> {
         *sequence = sequence.saturating_add(1);
         let record_sequence = self.next_record;
         self.next_record = record_sequence.saturating_add(1);
-        let parents: Vec<Value> = parents
+        // The causes the caller gave come first, then the writer's own.
+        let given = core::mem::take(&mut self.causes);
+        let parents: Vec<Value> = given
             .iter()
-            .map(|parent| {
+            .map(|cause| {
+                json!({
+                    "origin_component": cause.component,
+                    "origin_incarnation": decimal(cause.incarnation),
+                    "origin_sequence": decimal(cause.sequence),
+                })
+            })
+            .chain(parents.iter().map(|parent| {
                 json!({
                     "origin_component": parent.component,
                     "origin_incarnation": decimal(self.origin_incarnation),
                     "origin_sequence": decimal(parent.sequence),
                 })
-            })
+            }))
             .collect();
         let value = json!({
             "format": "mqttiumd.trace-record",
@@ -534,6 +568,24 @@ impl<'a> TraceWriter<'a> {
             .collect()
     }
 
+    /// Writes one submission with the causes the caller gives, in their
+    /// order, as its causal parents. The event is written as `write`
+    /// writes it; `None` when no record of the formats carries it.
+    pub fn write_caused(
+        &mut self,
+        event: &StoreEvent,
+        causes: &[Cause],
+    ) -> Result<Option<Value>, CauseRefused> {
+        let submission = matches!(event, StoreEvent::CommandSubmitted { .. });
+        if !submission && !causes.is_empty() {
+            return Err(CauseRefused::NotASubmission);
+        }
+        self.causes = causes.to_vec();
+        let record = self.one(event);
+        self.causes.clear();
+        Ok(record)
+    }
+
     /// Writes `events`, in order.
     pub fn write(&mut self, events: &[StoreEvent]) -> Written {
         let mut written = Written::default();
@@ -549,9 +601,50 @@ impl<'a> TraceWriter<'a> {
     fn one(&mut self, event: &StoreEvent) -> Option<Value> {
         match event {
             StoreEvent::CommandSubmitted {
+                id: id @ WorkId::Opening(_),
+                kind: WorkKind::OpenEpoch,
+                opening: Some(command),
+                ..
+            } => {
+                let (record, origin) = self.record(
+                    "store-adapter",
+                    "OpeningSubmitted",
+                    &[],
+                    json!({
+                        "attempt": opened_by(Some(command.attempt)),
+                        "incarnation": decimal(command.incarnation.get()),
+                        "after": decimal(command.after.get()),
+                    }),
+                );
+                self.submitted
+                    .insert(*id, (origin, kind_name(WorkKind::OpenEpoch)));
+                Some(record)
+            }
+            StoreEvent::CommitStable {
+                id: id @ WorkId::Opening(attempt),
+                opened: Some(opened),
+                ..
+            } => {
+                let parents = self.parent_of(*id);
+                Some(
+                    self.record(
+                        "store-evidence",
+                        "StoreEpochOpened",
+                        &parents,
+                        json!({
+                            "incarnation": decimal(opened.incarnation.get()),
+                            "epoch": decimal(opened.epoch.get()),
+                            "attempt": opened_by(Some(*attempt)),
+                        }),
+                    )
+                    .0,
+                )
+            }
+            StoreEvent::CommandSubmitted {
                 id: id @ WorkId::Effect(effect),
                 kind,
                 operation: Some(operation),
+                ..
             } => {
                 let (record, origin) = match kind {
                     WorkKind::ResolveAndFence => self.record(
@@ -581,6 +674,7 @@ impl<'a> TraceWriter<'a> {
             StoreEvent::CommitStable {
                 id,
                 operation: Some(operation),
+                ..
             } => {
                 // The kind is the one the work was submitted with; only
                 // effects carry an operation.
@@ -643,8 +737,35 @@ impl<'a> TraceWriter<'a> {
                     payload["reject_reason"] = json!(rejected);
                 }
                 let parents = self.parent_of(*id);
+                let (record, origin) =
+                    self.record("store-evidence", "StoreResultReady", &parents, payload);
+                self.ready.insert(*id, origin);
+                Some(record)
+            }
+            StoreEvent::ResultDelivered {
+                id: id @ WorkId::Effect(effect),
+                answer: Answer::Operation { operation, reply },
+                produced,
+            } => {
+                // What the adapter hands over has the content of what the
+                // store produced; a result presented from outside follows
+                // no `StoreResultReady`.
+                let (outcome, rejected) = store_outcome(*reply)?;
+                let mut payload = json!({
+                    "effect_id": effect_id(*effect),
+                    "operation_id": operation_id(*operation),
+                    "outcome": outcome,
+                });
+                if let Some(rejected) = rejected {
+                    payload["reject_reason"] = json!(rejected);
+                }
+                let parents: Vec<Origin> = if *produced {
+                    self.ready.get(id).copied().into_iter().collect()
+                } else {
+                    Vec::new()
+                };
                 Some(
-                    self.record("store-evidence", "StoreResultReady", &parents, payload)
+                    self.record("store-adapter", "StoreResultHandedOver", &parents, payload)
                         .0,
                 )
             }
