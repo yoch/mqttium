@@ -59,6 +59,14 @@ measurement of its writer.
 5. With lot L4, through the integrator: one scenario played by the bench
    on this store and judged by the oracle.
 
+## Later
+
+- A kill in the middle of a transaction. SQLite in WAL is atomic against
+  a process killed at any instant; S0 kills only at declared points, a
+  restriction of the bench for deterministic runs. That test is what
+  discharges the assumption of model M1 that `ApplyCommit` is atomic
+  (open condition, lot L7). Not before the bench's real kill exists.
+
 ## Paths
 
 Owned by this lot: `crates/mqttiumd-store-sqlite/`, and
