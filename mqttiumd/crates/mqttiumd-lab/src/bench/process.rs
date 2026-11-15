@@ -28,16 +28,15 @@ use serde_json::{Value, json};
 
 use mqttiumd_contract::capacity::{PayloadBytes, WorkUnits};
 use mqttiumd_contract::effects::{
-    Effect, EffectSink, InboundPhase, Input, Outbox, OwnedEffect, OwnerAuthority, RecoveredFact,
-    SubmitBlock, SubmitResult,
+    Effect, EffectSink, Input, Outbox, OwnedEffect, OwnerAuthority, RecoveredFact, SubmitBlock,
+    SubmitResult,
 };
 use mqttiumd_contract::ids::{
-    AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, EffectId, ExchangeId,
-    LogicalDuration, LogicalOwnerId, LogicalTime, OperationId, PublicationId, RunEpoch,
+    AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, EffectId, LogicalDuration,
+    LogicalOwnerId, LogicalTime, OperationId, RunEpoch,
 };
 use mqttiumd_contract::outcome::{
-    EpochOpening, Knowledge, Observed as OpeningObserved, OpeningStage, RecoveredEpochCheck,
-    RejectReason, StoreOutcome, StoreReply,
+    EpochOpening, Observed as OpeningObserved, OpeningStage, RecoveredEpochCheck, StoreReply,
 };
 use mqttiumd_contract::packet::OutboundFrame;
 use mqttiumd_contract::step::{StepOutcome, TurnGrant};
@@ -50,7 +49,7 @@ use crate::store::adapter::{
     StoreEvent, WorkId, startup_nonce,
 };
 use crate::store::durable::{DurableStore, MemoryStore};
-use crate::store::evidence::TraceWriter;
+use crate::store::evidence::{TraceWriter, recovered_fact, store_outcome};
 
 /// Why the run cannot go on. The trace is then declared incomplete.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -129,22 +128,6 @@ fn operation_json(operation: OperationId) -> Value {
     })
 }
 
-fn publication_json(publication: PublicationId) -> Value {
-    json!({
-        "incarnation": decimal(publication.incarnation().get()),
-        "epoch": decimal(publication.epoch().get()),
-        "owner": decimal(publication.owner().get()),
-        "sequence": decimal(publication.sequence().get()),
-    })
-}
-
-fn exchange_json(exchange: ExchangeId) -> Value {
-    json!({
-        "session": decimal(exchange.session.get()),
-        "generation": decimal(exchange.generation.get()),
-    })
-}
-
 fn connection_json(connection: ConnectionKey) -> Value {
     json!({
         "session": decimal(connection.session.get()),
@@ -152,102 +135,10 @@ fn connection_json(connection: ConnectionKey) -> Value {
     })
 }
 
-/// A recovered fact as the core received it, in the trace format.
-#[must_use]
-pub fn fact_json(fact: &RecoveredFact) -> Value {
-    match fact {
-        RecoveredFact::Epoch { incarnation, epoch } => json!({
-            "kind": "Epoch",
-            "incarnation": decimal(incarnation.get()),
-            "epoch": decimal(epoch.get()),
-        }),
-        RecoveredFact::Limits {
-            max_targets_per_admission,
-            max_topic_bytes,
-            max_payload_bytes,
-        } => json!({
-            "kind": "Limits",
-            "max_targets_per_admission": decimal(u64::from(*max_targets_per_admission)),
-            "max_topic_bytes": decimal(u64::from(*max_topic_bytes)),
-            "max_payload_bytes": decimal(max_payload_bytes.get()),
-        }),
-        RecoveredFact::RouteTable { revision } => json!({
-            "kind": "RouteTable",
-            "revision": decimal(revision.get()),
-        }),
-        RecoveredFact::Route {
-            topic,
-            target,
-            target_revision,
-            max_qos,
-        } => json!({
-            "kind": "Route",
-            "topic_hex": hex(topic.as_slice()),
-            "target": decimal(target.get()),
-            "target_revision": decimal(target_revision.get()),
-            "max_qos": *max_qos as u8,
-        }),
-        RecoveredFact::Session {
-            session,
-            client_id,
-            revision,
-        } => json!({
-            "kind": "Session",
-            "session": decimal(session.get()),
-            "client_id_hex": hex(client_id.as_slice()),
-            "revision": decimal(revision.get()),
-        }),
-        RecoveredFact::InboundExchange {
-            exchange,
-            packet_id,
-            publication,
-            phase,
-        } => json!({
-            "kind": "InboundExchange",
-            "exchange": exchange_json(*exchange),
-            "packet_id": packet_id.get(),
-            "publication": publication_json(*publication),
-            "phase": match phase {
-                InboundPhase::AwaitPubrel => "AwaitPubrel",
-            },
-        }),
-        RecoveredFact::Operation {
-            operation,
-            knowledge,
-        } => json!({
-            "kind": "Operation",
-            "operation_id": operation_json(*operation),
-            "knowledge": match knowledge {
-                Knowledge::Unknown => "Unknown",
-                Knowledge::Retired => "Retired",
-                Knowledge::Committed(_) => "Committed",
-                Knowledge::RejectedCertain(_) => "RejectedCertain",
-            },
-        }),
-    }
-}
-
-fn reject_reason(reason: RejectReason) -> &'static str {
-    match reason {
-        RejectReason::PreconditionFailed => "PreconditionFailed",
-        RejectReason::CapacityExceeded(_) => "CapacityExceeded",
-        RejectReason::Fenced => "Fenced",
-        RejectReason::EpochClosed => "EpochClosed",
-    }
-}
-
 /// The payload of `StoreResultDelivered` for the result the core took,
 /// or `None` for a violation, which the format has no outcome for.
 fn delivered_json(effect: EffectId, operation: OperationId, reply: &StoreReply) -> Option<Value> {
-    let StoreReply::Outcome(outcome) = reply else {
-        return None;
-    };
-    let (name, rejected) = match outcome {
-        StoreOutcome::Committed(_) => ("Committed", None),
-        StoreOutcome::RejectedCertain(reason) => ("RejectedCertain", Some(reject_reason(*reason))),
-        StoreOutcome::PendingOrUnknown => ("PendingOrUnknown", None),
-        StoreOutcome::RetiredOutcomeUnavailable => ("RetiredOutcomeUnavailable", None),
-    };
+    let (name, rejected) = store_outcome(*reply)?;
     let mut payload = json!({
         "effect_id": effect_json(effect),
         "operation_id": operation_json(operation),
@@ -814,7 +705,7 @@ impl Process {
                 }
             }
             let last = page.next.is_none();
-            let facts: Vec<Value> = page.facts.as_slice().iter().map(fact_json).collect();
+            let facts: Vec<Value> = page.facts.as_slice().iter().map(recovered_fact).collect();
             let pending = Pending {
                 kind: "RecoveryPageDelivered",
                 payload: json!({

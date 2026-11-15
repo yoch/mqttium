@@ -1,0 +1,22 @@
+diff --git a/mqttiumd/crates/mqttiumd-lab/src/store/adapter.rs b/mqttiumd/crates/mqttiumd-lab/src/store/adapter.rs
+index f7521dd..0a90b05 100644
+--- a/mqttiumd/crates/mqttiumd-lab/src/store/adapter.rs
++++ b/mqttiumd/crates/mqttiumd-lab/src/store/adapter.rs
+@@ -921,6 +921,17 @@ impl<S: DurableStore> SimStore<S> {
+         let operation = operation_of(answer);
+         let delivery = match (id, answer) {
+             (WorkId::Effect(effect), Answer::Operation { operation, reply }) => {
++                // MUTANT M2: a fence rejection reaches the core as a lack of capacity.
++                let reply = match reply {
++                    StoreReply::Outcome(StoreOutcome::RejectedCertain(
++                        mqttiumd_contract::outcome::RejectReason::Fenced,
++                    )) => StoreReply::Outcome(StoreOutcome::RejectedCertain(
++                        mqttiumd_contract::outcome::RejectReason::CapacityExceeded(
++                            mqttiumd_contract::capacity::Resource::ReceiptSlots,
++                        ),
++                    )),
++                    other => other,
++                };
+                 Some(Delivery::Store(Input::StoreResult {
+                     effect,
+                     operation,
