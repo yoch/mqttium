@@ -1060,6 +1060,36 @@
         "broker_inputs_have_provenance": "PASS"
       },
       "why": "DEM-MU-01: the store answers a certain refusal though its fence was refused."
+    },
+    {
+      "name": "certain-rejection-without-a-fence-on-a-cut-trace",
+      "scenario": "tests/scenarios/qabs/QABS-C.json",
+      "trace": "tests/oracle/traces/certain-rejection-without-a-fence-on-a-cut-trace/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "INCONCLUSIVE",
+        "no_positive_ack_before_confirmed_commit": "INCONCLUSIVE",
+        "fenced_operation_never_executed": "INCONCLUSIVE",
+        "certain_rejection_has_a_closure": "INCONCLUSIVE",
+        "all_required_faults_hit": "INCONCLUSIVE",
+        "trace_complete": "INCONCLUSIVE",
+        "broker_inputs_have_provenance": "INCONCLUSIVE"
+      },
+      "why": "The trace is cut: the fence that closes the refusal may be the record that is missing."
+    },
+    {
+      "name": "fenced-command-executed-on-a-cut-trace",
+      "scenario": "tests/scenarios/qabs/QABS-B.json",
+      "trace": "tests/oracle/traces/fenced-command-executed-on-a-cut-trace/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "INCONCLUSIVE",
+        "no_positive_ack_before_confirmed_commit": "INCONCLUSIVE",
+        "fenced_operation_never_executed": "FAIL",
+        "certain_rejection_has_a_closure": "INCONCLUSIVE",
+        "all_required_faults_hit": "INCONCLUSIVE",
+        "trace_complete": "INCONCLUSIVE",
+        "broker_inputs_have_provenance": "INCONCLUSIVE"
+      },
+      "why": "The trace is cut, and it already holds a commit after its fence: no missing record undoes that."
     }
   ]
 }

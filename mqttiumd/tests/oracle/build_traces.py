@@ -1977,6 +1977,8 @@ def qabs(name, why, expected=None, *, letter, **options):
         "C": (qabs_c, qabs_c_snapshots),
     }[letter]
     listed = json.loads((ROOT / f"tests/scenarios/qabs/QABS-{letter}.json").read_text())
+    if callable(expected):
+        expected = expected(listed["assertions"])
     case(
         name,
         why,
@@ -2058,6 +2060,35 @@ qabs(
     {"certain_rejection_has_a_closure": "FAIL"},
     letter="C",
     events=invented_rejection,
+)
+
+
+def cut(**standing):
+    """What a cut trace concludes: nothing, but the failures that stand."""
+
+    def expected(assertions):
+        owed = [*assertions, "trace_complete", "broker_inputs_have_provenance"]
+        return {**dict.fromkeys(owed, "INCONCLUSIVE"), **standing}
+
+    return expected
+
+
+qabs(
+    "certain-rejection-without-a-fence-on-a-cut-trace",
+    "The trace is cut: the fence that closes the refusal may be the record that is missing.",
+    cut(),
+    letter="C",
+    events=invented_rejection,
+    raw=lambda records: records.pop(),
+)
+qabs(
+    "fenced-command-executed-on-a-cut-trace",
+    "The trace is cut, and it already holds a commit after its fence: no missing record undoes that.",
+    cut(fenced_operation_never_executed="FAIL"),
+    letter="B",
+    events=executed_after_fence,
+    snapshots=executed_state,
+    raw=lambda records: records.pop(),
 )
 
 OUTPUTS["index.json"] = dump({"traces": INDEX})
