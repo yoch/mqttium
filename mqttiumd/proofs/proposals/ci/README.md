@@ -40,12 +40,26 @@ merged. It has not been run in CI: only its commands were run, locally.
 Notes for the owner of the workflow:
 
 - The job inherits `defaults.run.working-directory: mqttiumd`.
-- Measured locally: the proof about twenty seconds, the mutants about two
-  minutes, both after the tools are installed. Installing Kani compiles
-  `kani-verifier` and downloads its bundle; that time was not measured in
-  CI. A cache of `~/.cargo/bin/kani`, `~/.cargo/bin/cargo-kani` and
-  `~/.kani`, keyed on `KANI_VERSION`, would avoid it.
-- With the current installer the step "Install the pinned Kani" accepts a
-  tool it should refuse (see `../install-tools/`). The preflight does not
-  rely on it: it checks the tool `PATH` selects itself.
+- Measured locally on `b0d6b940`, tools already installed:
+
+  | Step | Time |
+  | - | - |
+  | `proofs/preflight-selftest.sh` | 1 s |
+  | `proofs/credits/run.sh`, from an empty `proofs/target` | 20 s |
+  | `python3 proofs/credits/mutants.py` | 135 s |
+  | `fmt` and `clippy` on `proofs/` | a few seconds |
+
+- What `tools/install-tools.sh kani` leaves on disk: `~/.kani`, 485 MB
+  (the Kani bundle with CBMC); the nightly toolchain it installs under
+  `~/.rustup/toolchains`, 594 MB, which `~/.kani` links to; and
+  `~/.cargo/bin/kani` and `~/.cargo/bin/cargo-kani`, under 1 MB each.
+  The time of a cold installation and the size of the download itself
+  were not measured: here the tools were installed once, before any
+  timing.
+- What can be cached, keyed on `KANI_VERSION` of the installer:
+  `~/.kani`, the two binaries, and the toolchain
+  `nightly-2026-08-21-x86_64-unknown-linux-gnu` of `~/.rustup`. The
+  preflight fails when the cache holds another version or another
+  toolchain than `proofs/TOOLCHAIN` pins, so a stale cache cannot pass.
+  `proofs/target` (31 MB) is not worth caching.
 - Verus is not needed: the trial is not part of the reception.

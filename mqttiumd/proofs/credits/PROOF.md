@@ -20,7 +20,7 @@ runs in CI. See "What is not done".
 
 | | |
 | - | - |
-| Digest of `credits.rs` | `sha256:0ec077a7916f5a004700059bbf08fdb700ab9791d735e97823939c2cbaef4bab` |
+| Digest of `credits.rs` | `sha256:49669d713e09854672a29a7e180dd4ccfbc8caaa6cf1cce228cccd16fc9082f1` |
 | Digest of the text of the function | `sha256:f1f4d430f508faa837db8c82d3ecb841bfc9c72f4a18c62f2a67969a83bd5cd1` |
 | Recorded in | `BODY.sha256`; `run.sh` fails when the source differs |
 | Call site in the product | None yet. Lot L1 calls it and writes no second variant (DEM-024) |
@@ -136,7 +136,7 @@ A result belongs to an exact content.
 
 | | |
 | - | - |
-| Revision | `2607c073` on branch `claude/mqttiumd-l6-pilot-proof` (base `874f298b` of `main`); this file was added after it and changes no code |
+| Revision | `b0d6b940` on branch `claude/mqttiumd-l6-pilot-proof`: the lot merged with the contract chain `74ea7f4..9465451`, which sits on `642b376` of the integration branch. Later commits change this file and `proofs/proposals/` only |
 | Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb`, unchanged by the lot |
 | Where | A cloud container, local run. Not CI |
 | Tool | `/root/.cargo/bin/cargo-kani`, as `PATH` selects it: Kani Rust Verifier 0.68.0 (cargo plugin), CBMC 6.11.0 |
@@ -163,14 +163,24 @@ A result belongs to an exact content.
 
 Eleven harnesses verified, none failed; 39 of 39 witnesses satisfied; 12
 of 12 regions of the function covered under `p1`. The whole run, preflight
-included, takes about twenty seconds.
+included, takes about twenty seconds, from an empty build directory as
+well.
 
 Also run on that revision: `cargo fmt --check`, `cargo clippy --workspace
 --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`
 (151 passed, 17 of them in `credits`), `validate`, each on the product
 workspace; `cargo fmt --check` and `cargo clippy` on the `proofs/`
 workspace; `proofs/preflight-selftest.sh` (four fake tools refused, the
-real preflight passes).
+real preflight passes); `tools/test-install-tools.sh` and
+`tools/install-tools.sh kani verus` with the corrected installer of the
+integration branch (both tools present).
+
+The proof crates are a workspace of their own, so that the product
+workspace and its lock file carry nothing of the proof. The price:
+`cargo test --workspace` and `cargo clippy --workspace` at the root of
+`mqttiumd/` do not see `proofs/`. The scripts of the table of commands
+are the only verification of this directory; they count only where they
+run.
 
 ## Mutants
 
@@ -208,6 +218,27 @@ The last mutant protects a decision of the function: a stale key is
 examined before the account. After a slot is reused, the old key may name
 another account than the new reservation; that is a late release, not a
 fault.
+
+## The order of the guards
+
+The function examines four conditions in a fixed order. The order is a
+decision; each rank has a case that another order would break.
+
+| Rank | Guard | Why here | What another order breaks |
+| - | - | - | - |
+| 1 | The key is not the key of the record: `Stale` | A key says which reservation the caller means. Until it matches, nothing the record or the account holds concerns the caller | After a slot is reused, an old key may name another account than the new reservation. With the account examined first, that late release would be `WrongAccount`, a fault, where it is a release that came late. Mutant `account-checked-before-the-key`, check P2a, witness W2c |
+| 2 | The account is not the lease's: `WrongAccount` | The key is current, so the caller means this lease, and presented an account it is not charged to. That is a fault of the caller whatever the state of the lease | With the state examined first, a released lease presented with a wrong account would answer `AlreadyReleased`, and the fault would go unseen. Unit test `a_wrong_account_is_reported_for_a_released_lease_too`, check P4a with witness W4b |
+| 3 | The lease is released: `AlreadyReleased` | Before any arithmetic: a released lease owes nothing, so its cost is never compared with a usage | With the subtractions examined first, a repeated release from an account that no longer holds the cost would answer `CostExceedsUsage`, a fault, for a harmless repetition; with the guard dropped, the cost is subtracted twice. Mutant `release-repeated`, checks P3a and P3b |
+| 4 | Both subtractions, then the writes | Both differences are computed and checked before either usage or the state is written | Any write placed before the last check is a partial mutation on a refusal. Mutants `bytes-subtracted-before-slots-checked` and `state-written-before-checks`, checks P5b and P5d |
+
+Bytes are examined before slots. When both exceed their usage the error
+names the bytes; nothing depends on which is named, and nothing is
+written in either case.
+
+An account whose usage exceeds a limit is not refused. A release only
+lowers a usage, so refusing it would keep an incoherent account
+incoherent for longer; the release is exact or refused whole (`p8`,
+`p9`).
 
 ## The Verus trial
 
@@ -281,10 +312,8 @@ inconclusive, so a stale mutant cannot count as caught.
 - **Not in CI.** The workflow is a shared file. Until a job installs the
   pinned tools and runs `proofs/credits/run.sh`, every result above is a
   local run.
-- **The installer.** `tools/install-tools.sh` still has the two defects
-  of the open conditions. The correction and its test are proposed in
-  `proofs/proposals/install-tools/`. The preflight does not rely on the
-  installer's check: it checks the tool `PATH` selects itself.
+- **The contract change is not reviewed yet.** The chain
+  `74ea7f4..9465451` waits for the integration owner.
 - **Human time** of the maintenance trial.
 - The open condition "Pilot proof" of
   `docs/reception/open-conditions.md` stays open.
