@@ -605,13 +605,16 @@ impl OpeningAttempt {
 
     /// Decodes the durable encoding, checking its exact length.
     pub fn from_be_slice(bytes: &[u8]) -> Result<Self, IdDecodeError> {
-        let wrong_length = IdDecodeError::WrongLength {
-            expected: Self::ENCODED_LEN,
-            actual: bytes.len(),
-        };
-        let (nonce, ticket) = bytes.split_at_checked(16).ok_or(wrong_length)?;
-        let nonce: [u8; 16] = nonce.try_into().map_err(|_| wrong_length)?;
-        let ticket: [u8; 8] = ticket.try_into().map_err(|_| wrong_length)?;
+        if bytes.len() != Self::ENCODED_LEN {
+            return Err(IdDecodeError::WrongLength {
+                expected: Self::ENCODED_LEN,
+                actual: bytes.len(),
+            });
+        }
+        let mut nonce = [0u8; 16];
+        nonce.copy_from_slice(&bytes[..16]);
+        let mut ticket = [0u8; 8];
+        ticket.copy_from_slice(&bytes[16..]);
         Ok(Self {
             startup: StartupNonce::new(nonce),
             ticket: OpeningTicket::new(u64::from_be_bytes(ticket)),
