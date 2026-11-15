@@ -24,6 +24,7 @@ its source; a test fails when the register and the records drift apart.
 | [0007](0007-pure-crate-boundary.md) | Accepted with amendments | How the purity of the core is enforced | L0 |
 | [0008](0008-early-writer-measurement.md) | Accepted with amendments | An early, non-qualifying measurement of the single writer | L7 |
 | [0009](0009-owner-authority.md) | Accepted with amendments | Creation authority for owners and effect boxes; a durable fact is not an authorisation to construct | L1, L2, L4, L7 |
+| [0010](0010-credits-interface.md) | Proposed | Credits: the order of the guards of `release_if_current`, `Account::reserve`, unchecked constructors, one record per held lease | L1, L6 |
 
 What each record leaves open is tracked in
 [`../reception/open-conditions.md`](../reception/open-conditions.md).
