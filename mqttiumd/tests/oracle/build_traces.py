@@ -1552,6 +1552,27 @@ case(
 )
 
 
+case(
+    "obligations-gone-at-both-checkpoints",
+    "F2: publications and payloads are held and equal at both checkpoints, and no obligation is.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=without("obligations"),
+)
+
+
+def one_obligation_gone(states):
+    for state in states.values():
+        state["obligations"].pop()
+
+
+case(
+    "one-obligation-gone-at-both-checkpoints",
+    "F2: the acknowledged publication carries one obligation of the two its routes require, at both checkpoints.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=one_obligation_gone,
+)
+
+
 def everything_gone(states):
     for state in states.values():
         for table in ("publications", "payloads", "obligations"):
@@ -2050,6 +2071,34 @@ case(
     base=p1_02b,
     scenario="p1-02b",
     events=unknown_before_the_commit,
+)
+
+
+def submitted_from_nothing(events):
+    # The adapter submits the release with no record of the core as its
+    # cause: nothing shows the core emitted that effect.
+    events[at(events, "release.submitted")]["parents"] = []
+
+
+case(
+    "command-submitted-that-the-core-did-not-emit",
+    "K1: the adapter submits a command that no record of the core causes.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=submitted_from_nothing,
+)
+
+
+def resolved_from_the_bench(events):
+    events[at(events, "resolve.2")]["parents"] = ["header"]
+
+
+case(
+    "resolution-submitted-that-the-core-did-not-emit",
+    "K1: the adapter submits a resolution caused by the bench, not by the core.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    base=p1_02b,
+    scenario="p1-02b",
+    events=resolved_from_the_bench,
 )
 
 # ------------------------------------------ the opening of an epoch

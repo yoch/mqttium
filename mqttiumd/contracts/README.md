@@ -196,6 +196,13 @@ contract crate, and the assertion
 rejection a refusing frame answers is the latest certain rejection among
 its causes, delivered to the same incarnation of the core.
 
+A `CommandSubmitted` or `ResolveSubmitted` has as a parent the record of
+the core, in the same incarnation, that consumed the input the effect
+comes from (`PacketDelivered` for an admission or a release,
+`DeadlineDelivered` for a resolution). The other links have their
+parents already: commit, fence and ready result their cause in the
+store, the handover its ready result, the consumed result its handover.
+
 The result chain is closed on content (finding K1 of the audit): what the
 core consumed is what the adapter handed over, and that is what the store
 produced, effect, operation, outcome and reason of a rejection alike. A
@@ -222,6 +229,15 @@ result a step handed over.
 
 A record says what its emitter claims. Checking a trace as a whole, and
 the assertion `broker_inputs_have_provenance`, is the oracle's work.
+
+### The oracle and the generators of a campaign
+
+A run manifest may name, apart from the lab binary, the `oracle` that
+judges the campaign and the `generators` that wrote its inputs (V3-002).
+Each is `{sha256, files}`: the files with their digest and size, in path
+order and once each, and the digest of one `<sha256>  <path>` line per
+file, as the contract digest is. Both readers refuse a digest that is
+not that of the files listed, and files out of order (`evidence-mismatch`).
 
 ### Store snapshots
 

@@ -789,6 +789,15 @@ def broker_inputs_have_provenance(run):
             _key(record.payload["effect_id"]): record
             for record in side("store-adapter", incarnation, "CommandSubmitted", "ResolveSubmitted")
         }
+        # Each submission comes from an effect the core emitted: its parent
+        # is the record of the core, same incarnation, that consumed the
+        # input the effect answers.
+        for record in submitted.values():
+            if not any(
+                parent in by_key and by_key[parent].origin == ("broker-core", incarnation)
+                for parent in record.parents
+            ):
+                blame(record, "the adapter submitted what no record of the core caused")
         answered = set()
         for record in side("broker-core", incarnation, "StoreResultDelivered"):
             effect = _key(record.payload["effect_id"])

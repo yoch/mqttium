@@ -16,7 +16,7 @@ close.
 | Base branch | `main` |
 | Integrated revision | `874f298b4de7c3a13006cb1ff767dfb09e4031ac`, the merge of PR yoch/mqttium#647 (lot L0, with the amended record 0009) |
 | Contract digest | `sha256:7a869371e38d0bd344e49bf8928905ef0d59cebe932f7df3ce0cb2530bfb47cb`, as `validate` prints it on that revision |
-| Contract digest on the integration branch | `sha256:54975bb0aae9c455cb9d24465307f4636d1d641cb810f352f4d24ae578ace652` since the corrections of findings K1 and F5 and the scenario P1-02b were merged (second wave, 15 November 2026): records of the hand-over of a result and of the opening of an epoch, the assertions `one_grant_per_opened_epoch` and `terminal_knowledge_never_regresses`, the step `LeaveBarrier`. It was `sha256:836e6817…97e2` after K1 alone on the branch of lot L3, and `sha256:5fe5d83f…cca2` at the end of the first wave. The digest above is the one every lot started from |
+| Contract digest on the integration branch | `sha256:4b216f228eb2cbe8130d44856dd3875d45ce0f4c1b9a49a481853d5691246e08` since the manifest gained the optional identities of the oracle and of the generators (second wave, 15 November 2026). Before it in the second wave: `sha256:54975bb0…e652` with the corrections of findings K1 and F5 and the scenario P1-02b (records of the hand-over of a result and of the opening of an epoch, the assertions `one_grant_per_opened_epoch` and `terminal_knowledge_never_regresses`, the step `LeaveBarrier`). It was `sha256:5fe5d83f…cca2` at the end of the first wave. The digest above is the one every lot started from |
 
 Every lot starts from the integrated revision. The commit that records it
 here differs from it by this file only, and changes no contract. Every lot
