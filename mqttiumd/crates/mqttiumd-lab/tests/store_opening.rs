@@ -148,12 +148,13 @@ fn a_committed_opening_hands_over_one_grant_for_the_epoch_the_store_opened() {
         ticket: OpeningTicket::new(1),
     };
     let id = WorkId::Opening(attempt);
+    let command = OpenEpoch {
+        attempt,
+        incarnation: INCARNATION,
+        after: RunEpoch::new(0),
+    };
     let answer = Answer::Opening {
-        command: OpenEpoch {
-            attempt,
-            incarnation: INCARNATION,
-            after: RunEpoch::new(0),
-        },
+        command,
         outcome: OpeningOutcome::Committed(grant.opened()),
     };
     assert_eq!(
@@ -162,14 +163,20 @@ fn a_committed_opening_hands_over_one_grant_for_the_epoch_the_store_opened() {
             StoreEvent::CommandSubmitted {
                 id,
                 kind: WorkKind::OpenEpoch,
-                operation: None
+                operation: None,
+                opening: Some(command)
             },
             StoreEvent::CommitStable {
                 id,
-                operation: None
+                operation: None,
+                opened: Some(grant.opened())
             },
             StoreEvent::ResultReady { id, answer },
-            StoreEvent::ResultDelivered { id, answer },
+            StoreEvent::ResultDelivered {
+                id,
+                answer,
+                produced: true
+            },
         ]
     );
 }

@@ -26,6 +26,13 @@
     "contracts/examples/v1/valid/trace-record-packet-delivered.json",
     "contracts/examples/v1/valid/trace-record-resolve-submitted.json",
     "contracts/examples/v1/valid/trace-record-store-result-ready.json",
+    "contracts/examples/v1/valid/trace-record-store-result-handed-over.json",
+    "contracts/examples/v1/valid/trace-record-opening-submitted.json",
+    "contracts/examples/v1/valid/trace-record-store-epoch-opened.json",
+    "contracts/examples/v1/valid/trace-record-opening-reply-delivered.json",
+    "contracts/examples/v1/valid/trace-record-opening-reply-rejected.json",
+    "contracts/examples/v1/valid/trace-record-opening-abandoned.json",
+    "contracts/examples/v1/valid/trace-record-epoch-grant-handed-over.json",
     "contracts/examples/v1/valid/trace-record-store-result-rejected.json",
     "contracts/examples/v1/valid/trace-record-store-result-delivered-rejected.json",
     "contracts/examples/v1/valid/trace-record-store-fence-stable.json",
@@ -404,6 +411,30 @@
       "why": "A scenario requires a known perimeter."
     },
     {
+      "file": "contracts/examples/v1/invalid/scenario-leave-of-a-held-command.json",
+      "code": "held-item-mismatch",
+      "pointer": "/steps/8/fault",
+      "why": "LeaveBarrier names a fault that holds a command, not the adapter at a barrier."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-leave-before-the-barrier.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/6",
+      "why": "LeaveBarrier comes before any step drove the broker to the barrier."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-leave-twice.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/9",
+      "why": "The adapter leaves a barrier once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-leave-of-an-undeclared-fault.json",
+      "code": "binding-undefined",
+      "pointer": "/steps/8/fault",
+      "why": "LeaveBarrier names a fault that is not declared."
+    },
+    {
       "file": "contracts/examples/v1/invalid/scenario-release-before-hold.json",
       "code": "step-order-invalid",
       "pointer": "/steps/2",
@@ -636,6 +667,30 @@
       "code": "u64-out-of-range",
       "pointer": "/payload/facts/1/revision",
       "why": "Identity components inside a recovered fact are 64-bit as well."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-opening-committed-without-its-epoch.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A committed opening names the epoch it opened."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-opening-rejected-with-an-epoch.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "A rejected opening opened nothing: it names a reason, not an epoch."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-opening-rejected-for-an-unknown-reason.json",
+      "code": "schema-violation",
+      "pointer": "/payload/reject_reason",
+      "why": "The reasons of a rejected opening are those of OpeningRejection."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-handed-over-rejection-without-its-reason.json",
+      "code": "schema-violation",
+      "pointer": "/payload",
+      "why": "What the adapter hands over is the result the store produced, reason included."
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-rejection-without-its-reason.json",
@@ -1263,6 +1318,42 @@
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-peer-packet-observed-stated-by-transport.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-store-result-handed-over-stated-by-broker-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-opening-submitted-stated-by-broker-core.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-store-epoch-opened-stated-by-store-adapter.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-opening-reply-delivered-stated-by-store-adapter.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-opening-abandoned-stated-by-bench-supervisor.json",
+      "code": "schema-violation",
+      "pointer": "/origin_component",
+      "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-epoch-grant-handed-over-stated-by-store-evidence.json",
       "code": "schema-violation",
       "pointer": "/origin_component",
       "why": "A kind of record is stated by its one origin; another may not state it."

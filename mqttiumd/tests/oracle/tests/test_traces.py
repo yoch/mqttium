@@ -50,7 +50,10 @@ class Traces(unittest.TestCase):
                 run = Run.load(self.contracts, scenario, f"tests/oracle/traces/{trace}/trace.jsonl")
                 found = {name: status.status for name, status in judge(run).items()}
                 self.assertEqual(found["broker_inputs_have_provenance"], expected)
-                self.assertEqual(set(found), {*listed, "broker_inputs_have_provenance"})
+                self.assertEqual(
+                    set(found),
+                    {*listed, "broker_inputs_have_provenance", "one_grant_per_opened_epoch"},
+                )
 
     def test_every_refusal_states_its_reason(self):
         for case in INDEX:
@@ -104,3 +107,12 @@ class Traces(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Scenarios(unittest.TestCase):
+    def test_the_p1_02b_of_the_corpus_is_the_scenario_the_bench_plays(self):
+        # Lot L4 plays tests/scenarios/p1/P1-02b.json; the corpus judges its
+        # hand-made traces against the same scenario.
+        played = json.loads((ROOT / "tests/scenarios/p1/P1-02b.json").read_text())
+        judged = json.loads((ORACLE / "traces/scenarios/p1-02b.json").read_text())
+        self.assertEqual(played, judged)

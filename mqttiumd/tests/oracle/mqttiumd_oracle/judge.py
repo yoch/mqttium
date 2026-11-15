@@ -778,6 +778,9 @@ def broker_inputs_have_provenance(run):
         ]
 
     by_key = {record.key: record for record in trace.records}
+    duplicating = {
+        fault["id"] for fault in run.scenario["faults"] if fault["action"] == "duplicate_result"
+    }
     cores = sorted(
         {record.origin[1] for record in trace.records if record.origin[0] == "broker-core"}
     )
@@ -799,6 +802,72 @@ def broker_inputs_have_provenance(run):
             else:
                 ordered(submission, record, "its submission")
             answered.add(effect)
+
+        # K1: what the core consumed is what the adapter handed over, and
+        # that is what the store produced, on content and identities. A
+        # delay or a hold changes nothing of it; only a declared
+        # duplicating injection hands one result over twice.
+        produced = trace.of_kind("StoreResultReady")
+        for record in side("broker-core", incarnation, "StoreResultDelivered"):
+            if not any(
+                by_key[parent].kind == "StoreResultHandedOver"
+                and by_key[parent].payload == record.payload
+                for parent in record.parents
+                if parent in by_key
+            ):
+                blame(record, "the core consumed a result the store adapter did not hand over")
+        handed_from = {}
+        for record in side("store-adapter", incarnation, "StoreResultHandedOver"):
+            causes = trace.ancestors(record)
+            sources = [
+                ready
+                for ready in produced
+                if ready.key in causes
+                and ready.payload["effect_id"] == record.payload["effect_id"]
+                and ready.payload["operation_id"] == record.payload["operation_id"]
+            ]
+            if not sources:
+                blame(record, "the adapter handed over a result the store did not produce")
+                continue
+            source = max(sources, key=lambda ready: ready.sequence)
+            if source.payload != record.payload:
+                blame(
+                    record,
+                    f"the adapter handed over {record.payload['outcome']}; the store produced "
+                    f"{source.payload['outcome']} (record {source.sequence})",
+                )
+            handed_from.setdefault(source.key, []).append(record)
+        for source, handovers in handed_from.items():
+            duplicated = any(
+                hit.payload["fault_id"] in duplicating
+                and source in trace.ancestors(hit) | {hit.key}
+                for hit in trace.of_kind("FaultHit")
+            ) or any(
+                hit.payload["fault_id"] in duplicating and hit.key in trace.ancestors(handover)
+                for hit in trace.of_kind("FaultHit")
+                for handover in handovers
+            )
+            if len(handovers) > 1 and not duplicated:
+                blame(handovers[1], "one result of the store is handed over twice")
+
+        # The reply to an opening answers the command the adapter submitted,
+        # and a committed one names an epoch the store opened for it.
+        opened = {
+            (record.payload["incarnation"], record.payload["epoch"]): record.payload["attempt"]
+            for record in trace.of_kind("StoreEpochOpened")
+        }
+        for record in side("broker-core", incarnation, "OpeningReplyDelivered"):
+            command = {key: record.payload[key] for key in ("attempt", "incarnation", "after")}
+            if not any(
+                by_key[parent].kind == "OpeningSubmitted" and by_key[parent].payload == command
+                for parent in record.parents
+                if parent in by_key
+            ):
+                blame(record, "the opening reply answers no command the adapter submitted")
+            if record.payload["outcome"] == "Committed":
+                where = (record.payload["incarnation"], record.payload["epoch"])
+                if opened.get(where) != record.payload["attempt"]:
+                    blame(record, f"the store opened no epoch {where[1]} for this attempt")
 
         armed = {
             record.payload["token"]: record
@@ -905,9 +974,6 @@ def broker_inputs_have_provenance(run):
             else:
                 ordered(frame, record, "the frame it writes")
 
-    duplicating = {
-        fault["id"] for fault in run.scenario["faults"] if fault["action"] == "duplicate_result"
-    }
     for record in trace.of_kind("InputRefused"):
         causes = [by_key[key] for key in trace.ancestors(record) if key in by_key]
         if not any(
@@ -1040,6 +1106,93 @@ def refusal_carries_the_reason_of_its_rejection(run):
     return Status(_worst(statuses), reasons)
 
 
+def terminal_knowledge_never_regresses(run):
+    """Knowledge of an operation never goes back (record 0001, step 6; DEM-MU-05).
+
+    Once the core consumed a terminal result of an operation, a later
+    unknown result of it changes nothing: no record follows from it as
+    its cause, and the operation is never resolved again.
+    """
+    trace = run.trace
+    followers = {}
+    for record in trace.records:
+        for parent in record.parents:
+            followers.setdefault(parent, []).append(record)
+    reasons = []
+    for origin in sorted(
+        {record.origin for record in trace.records if record.origin[0] == "broker-core"}
+    ):
+        terminal = {}
+        for record in trace.records:
+            if record.origin != origin or record.kind != "StoreResultDelivered":
+                continue
+            operation = _key(record.payload["operation_id"])
+            if record.payload["outcome"] in ("Committed", "RejectedCertain"):
+                terminal.setdefault(operation, record)
+            elif record.payload["outcome"] == "PendingOrUnknown" and operation in terminal:
+                for follower in followers.get(record.key, []):
+                    reasons.append(
+                        f"record {follower.sequence} ({follower.kind}) follows from the unknown "
+                        f"answer of record {record.sequence}, after the terminal one of record "
+                        f"{terminal[operation].sequence}"
+                    )
+        for record in trace.of_kind("ResolveSubmitted"):
+            operation = _key(record.payload["operation_id"])
+            known = terminal.get(operation)
+            if known is not None and record.origin[1] == origin[1] and trace.before(known, record):
+                reasons.append(
+                    f"record {record.sequence}: {operation} is resolved again after the "
+                    f"terminal result of record {known.sequence}"
+                )
+    return Status(FAIL if reasons else PASS, reasons)
+
+
+def one_grant_per_opened_epoch(run):
+    """At most one creation authority per opened epoch (DEM-012, record 0011).
+
+    A grant follows, among its causes in the same incarnation of the core,
+    a committed reply for its epoch, and the store opened that epoch for
+    the attempt the reply answers. An abandoned or unknown opening alone
+    never justifies one: only a committed reply taken before or after it.
+    """
+    trace = run.trace
+    grants = trace.of_kind("EpochGrantHandedOver")
+    if not grants:
+        return Status(INCONCLUSIVE, ["the trace records no grant of an epoch"])
+    by_key = {record.key: record for record in trace.records}
+    opened = {
+        (record.payload["incarnation"], record.payload["epoch"]): record.payload["attempt"]
+        for record in trace.of_kind("StoreEpochOpened")
+    }
+    reasons, seen = [], {}
+    for grant in grants:
+        epoch = (grant.payload["incarnation"], grant.payload["epoch"])
+        if epoch in seen:
+            reasons.append(
+                f"record {grant.sequence}: epoch {epoch[1]} was already granted by record {seen[epoch]}"
+            )
+        seen.setdefault(epoch, grant.sequence)
+        replies = [
+            by_key[key]
+            for key in trace.ancestors(grant)
+            if key in by_key
+            and by_key[key].kind == "OpeningReplyDelivered"
+            and by_key[key].origin == grant.origin
+            and by_key[key].payload["outcome"] == "Committed"
+            and (by_key[key].payload["incarnation"], by_key[key].payload["epoch"]) == epoch
+        ]
+        # Justified only by a committed reply the store's ledger confirms:
+        # without any committed reply there is nothing to confirm.
+        if not any(opened.get(epoch) == reply.payload["attempt"] for reply in replies):
+            why = (
+                "the store opened it for no attempt whose committed reply the core took"
+                if replies
+                else "no committed reply for it precedes the grant"
+            )
+            reasons.append(f"record {grant.sequence}: epoch {epoch[1]}: {why}")
+    return Status(FAIL if reasons else PASS, reasons)
+
+
 ASSERTIONS = {
     "fenced_operation_never_executed": fenced_operation_never_executed,
     "certain_rejection_has_a_closure": certain_rejection_has_a_closure,
@@ -1050,6 +1203,8 @@ ASSERTIONS = {
     "no_positive_ack_before_confirmed_commit": no_positive_ack_before_confirmed_commit,
     "no_pubrec_observed_before_crash": no_pubrec_observed_before_crash,
     "broker_inputs_have_provenance": broker_inputs_have_provenance,
+    "one_grant_per_opened_epoch": one_grant_per_opened_epoch,
+    "terminal_knowledge_never_regresses": terminal_knowledge_never_regresses,
     "all_required_faults_hit": all_required_faults_hit,
     "trace_complete": trace_complete,
 }

@@ -63,9 +63,11 @@ Three steps let a scenario order a race without a crash (ADR 0001):
 | `FireDeadline` | Drives the broker, within `max_steps`, until no effect waits in an effect box; then lets the timer adapter deliver the armed deadline that is due first, and drives until the core has consumed it. Two deadlines due at the same logical time fire in the order they were armed. If no deadline is armed the step fails and the run is inconclusive: it is never a no-op. Logical time advances in no other way: a deadline never fires by itself between two steps |
 | `ReleaseHeldCommand` | Lets the command that the named fault holds enter the writer |
 | `DeliverHeldResult` | Hands the result that the named fault delays to the core, and drives, within `max_steps`, until the core has consumed it |
+| `LeaveBarrier` | Lets the adapter that the named `barrier` fault stopped leave its point. Until then it stays there, whatever the following steps are: an inspection taken before `LeaveBarrier` sees the state at the barrier |
 
-**What a fault holds.** The action `hold_command` holds a command and
-`delay_result` holds a result. Such a fault holds one item in the life of a
+**What a fault holds.** The action `hold_command` holds a command,
+`delay_result` holds a result, and `barrier` holds the adapter at its
+point. Such a fault holds one item in the life of a
 scenario:
 
 - it holds it once a `DriveUntil` step has waited for its hit, and a
@@ -78,6 +80,11 @@ scenario:
   of the run (QABS-C keeps its command held).
 
 A scenario does not wait for a fault whose `expected_hits` is 0.
+
+QABS-A inspects at the barrier of the applied commit and then leaves
+it: `after_commit` sees the commit and no result, and the result becomes
+ready only after `LeaveBarrier`. A barrier no step leaves holds the
+adapter to the end of the run (QABS-B and QABS-C end at theirs).
 
 **What a point carries.** Each injection point `carries` a command or a
 result, and offers only actions that act on it: `hold_command` on a
@@ -154,7 +161,8 @@ core consumed:
 | Input of the core | Record of the core | What must precede it |
 | - | - | - |
 | Packet | `PacketDelivered` | `ClientBytesReceived` of the transport whose bytes are exactly that packet, itself caused by the `PeerPacketSent` of the peer with the same bytes |
-| Store result | `StoreResultDelivered` | `CommandSubmitted` or `ResolveSubmitted` of the store adapter with the same effect and operation, not answered before |
+| Store result | `StoreResultDelivered` | `StoreResultHandedOver` of the store adapter with the same content, itself after the `StoreResultReady` the store produced with the same content; and `CommandSubmitted` or `ResolveSubmitted` with the same effect and operation, not answered before |
+| Opening reply | `OpeningReplyDelivered` | `OpeningSubmitted` of the store adapter with the same command; a committed reply names an epoch `StoreEpochOpened` records for that attempt |
 | Deadline | `DeadlineDelivered` | `DeadlineArmed` of the timer with the same token, not delivered before |
 | Recovery page | `RecoveryPageDelivered` | `RecoveryPageRead` of the store adapter with the same content |
 
@@ -187,6 +195,23 @@ contract crate, and the assertion
 `refusal_carries_the_reason_of_its_rejection` holds a run to it: the
 rejection a refusing frame answers is the latest certain rejection among
 its causes, delivered to the same incarnation of the core.
+
+The result chain is closed on content (finding K1 of the audit): what the
+core consumed is what the adapter handed over, and that is what the store
+produced, effect, operation, outcome and reason of a rejection alike. A
+hold or a delay changes nothing of it; a result is handed over twice only
+under a declared `duplicate_result`; a dropped result is produced and
+never handed over.
+
+Start-up opens an epoch (records 0009 and 0011): `OpeningSubmitted` is
+the whole `OpenEpoch` the adapter submits; `StoreEpochOpened` the hidden
+truth of the ledger, at most once per epoch; `OpeningReplyDelivered` the
+reply the core takes, which names the command it answers, the epoch when
+committed and the reason when rejected; `OpeningAbandoned` that start-up
+stopped waiting, which is not terminal; `EpochGrantHandedOver` the one
+creation authority. `one_grant_per_opened_epoch`, owed by every run,
+holds when each epoch is granted at most once, after a committed reply
+the ledger confirms.
 
 `InputRefused` is what the dispatcher records when it refuses a result
 that answers no effect in flight. `StoreCommitStable`, `StoreFenceStable`,

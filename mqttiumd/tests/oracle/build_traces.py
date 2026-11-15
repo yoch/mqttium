@@ -30,6 +30,14 @@ BASE = "tests/oracle/traces"
 OUTPUTS: dict[str, bytes] = {}
 INDEX: list[dict] = []
 
+# What every run owes, as the catalogue says: a trace is judged on these
+# whatever its scenario lists.
+EVERY_RUN = [
+    entry["name"]
+    for entry in json.loads((ROOT / "contracts/v1/assertions.json").read_text())["assertions"]
+    if entry["every_run"]
+]
+
 ASSERTIONS = [
     "one_admission_per_observed_inbound_exchange",
     "same_required_obligations_at_both_checkpoints",
@@ -63,7 +71,14 @@ P1_02["assertions"] = ASSERTIONS
 P1_02B = json.loads(
     (ROOT / "contracts/examples/v1/valid/scenario-held-command-and-result.json").read_text()
 )
-P1_02B["assertions"] = ASSERTIONS
+# P1-02b runs on a live process: no crash, so the assertion about a PUBREC
+# before the crash does not apply; that knowledge never regresses does.
+P1_02B_ASSERTIONS = [
+    *ASSERTIONS[: ASSERTIONS.index("no_pubrec_observed_before_crash")],
+    "terminal_knowledge_never_regresses",
+    *ASSERTIONS[ASSERTIONS.index("no_pubrec_observed_before_crash") + 1 :],
+]
+P1_02B["assertions"] = P1_02B_ASSERTIONS
 # The same scenario with a second injection: the result of the release is
 # duplicated, and the dispatcher refuses the copy.
 P1_02_DUPLICATE = copy.deepcopy(P1_02)
@@ -562,8 +577,83 @@ def header(scenario):
     )
 
 
-def recovery(inc, facts, tag="recovery"):
+def attempt(epoch):
+    """The attempt that opens ``epoch``, as the snapshot names it in ``opened_by``."""
+    return {"startup_hex": f"{epoch:02x}" * 16, "ticket": "1"}
+
+
+def opening(inc, tag):
+    """Start-up opens epoch ``inc`` after ``inc - 1`` and hands over its grant."""
+    command = {"attempt": attempt(inc), "incarnation": "1", "after": str(inc - 1)}
     return [
+        ev(f"{tag}.opening", "store-adapter", "OpeningSubmitted", command, [], inc),
+        ev(
+            f"{tag}.opened",
+            "store-evidence",
+            "StoreEpochOpened",
+            {"incarnation": "1", "epoch": str(inc), "attempt": attempt(inc)},
+            [f"{tag}.opening"],
+        ),
+        ev(
+            f"{tag}.opening.reply",
+            "broker-core",
+            "OpeningReplyDelivered",
+            {**command, "outcome": "Committed", "epoch": str(inc)},
+            [f"{tag}.opening", f"{tag}.opened"],
+            inc,
+        ),
+        ev(
+            f"{tag}.grant",
+            "broker-core",
+            "EpochGrantHandedOver",
+            {"incarnation": "1", "epoch": str(inc)},
+            [f"{tag}.opening.reply"],
+            inc,
+        ),
+    ]
+
+
+def add_handovers(events):
+    """Every result the core consumes is handed over by the store adapter first (K1).
+
+    A result already handed over is left as it is, so that an edit may add
+    a result to a history and have it handed over too.
+    """
+    labels = {event["label"]: event for event in events}
+    for index in range(len(events) - 1, -1, -1):
+        event = events[index]
+        if event["kind"] != "StoreResultDelivered":
+            continue
+        if any(
+            labels.get(parent, {}).get("kind") == "StoreResultHandedOver"
+            for parent in event["parents"]
+        ):
+            continue
+        label = f"{event['label']}.handed"
+        handover = ev(
+            label,
+            "store-adapter",
+            "StoreResultHandedOver",
+            copy.deepcopy(event["payload"]),
+            list(event["parents"]),
+            event["inc"],
+        )
+        event["parents"] = [label]
+        events.insert(index, handover)
+    return events
+
+
+def handed(history):
+    """A history whose results are all handed over by the store adapter."""
+
+    def with_handovers():
+        return add_handovers(history())
+
+    return with_handovers
+
+
+def recovery(inc, facts, tag="recovery"):
+    return opening(inc, tag) + [
         ev(f"{tag}.read", "store-adapter", "RecoveryPageRead", page(inc, facts), [], inc),
         ev(
             f"{tag}.in",
@@ -660,6 +750,9 @@ def p1_02():
         + ack_out("pubcomp", 2, 2, 4, "PUBCOMP", PUBCOMP_HEX, "release.delivered")
         + [inspected("final")]
     )
+
+
+p1_02 = handed(p1_02)
 
 
 FIRST = (OP_ADMIT, PUB, PAYLOAD_ID, 1)
@@ -810,6 +903,9 @@ def p1_02b():
     )
 
 
+p1_02b = handed(p1_02b)
+
+
 def p1_02b_snapshots(run):
     return {
         "after_commit": snapshot(run, "after_commit", [FIRST]),
@@ -884,6 +980,7 @@ def case(
     assertions=ASSERTIONS,
     states_of=None,
     scenario_path=None,
+    handovers=True,
 ):
     """One trace of the corpus.
 
@@ -894,6 +991,9 @@ def case(
     run = name
     history = base()
     events(history)
+    if handovers:
+        # A result an edit added is handed over like the others.
+        add_handovers(history)
     states = (states_of or (p1_02_snapshots if base is p1_02 else p1_02b_snapshots))(run)
     snapshots(states)
     records = render(run, history, states)
@@ -905,9 +1005,10 @@ def case(
     }
     files(written)
     OUTPUTS.update(written)
+    if scenario == "p1-02b" and assertions is ASSERTIONS:
+        assertions = P1_02B_ASSERTIONS
+    assertions = [*assertions, *(name for name in EVERY_RUN if name not in assertions)]
     statuses = dict.fromkeys(assertions, "PASS")
-    if base is p1_02b:
-        statuses["no_pubrec_observed_before_crash"] = "OUT_OF_SCOPE"
     statuses.update(expected or {})
     INDEX.append(
         {
@@ -935,7 +1036,7 @@ def insert_after(events, label, new):
     events[index:index] = new
 
 
-ALL_INCONCLUSIVE = dict.fromkeys(ASSERTIONS, "INCONCLUSIVE")
+ALL_INCONCLUSIVE = dict.fromkeys([*ASSERTIONS, *EVERY_RUN], "INCONCLUSIVE")
 
 # ----------------------------------------------------------------- good traces
 case("p1-02-good", "The history of P1-02 the specification describes.")
@@ -1342,9 +1443,6 @@ case(
     "On a backend with no total order, the trace does not say whether op_A was committed before the inspection that lost its recipe.",
     {
         "same_recipe_for_op_A": "INCONCLUSIVE",
-        # Nor whether the admission falls inside its exchange: an exchange
-        # whose admission cannot be placed does not lack one.
-        "one_admission_per_observed_inbound_exchange": "INCONCLUSIVE",
         "no_pubrec_observed_before_crash": "INCONCLUSIVE",
         # Nor whether the acknowledgement precedes an inspection, so
         # whether that snapshot must hold the publication.
@@ -1762,6 +1860,278 @@ case(
 )
 
 
+# ---------------------------------------------- second wave, finding K1
+
+
+def result_changed_in_the_store(events):
+    # The store produced an unknown outcome; the core consumed a commit.
+    deepcopy_payloads(events)
+    events[at(events, "release.ready")]["payload"]["outcome"] = "PendingOrUnknown"
+
+
+case(
+    "result-altered-between-the-store-and-the-core",
+    "K1: the store produced an unknown outcome, and the core consumed a commit for it.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=result_changed_in_the_store,
+)
+
+
+def handover_altered(events):
+    deepcopy_payloads(events)
+    payload = events[at(events, "release.delivered.handed")]["payload"]
+    payload.update(outcome="RejectedCertain", reject_reason="Fenced")
+
+
+case(
+    "result-altered-between-the-adapter-and-the-core",
+    "K1: the adapter handed over a refusal, and the core consumed a commit.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=handover_altered,
+)
+
+
+def no_handover(events):
+    handover = events.pop(at(events, "release.delivered.handed"))
+    events[at(events, "release.delivered")]["parents"] = handover["parents"]
+
+
+case(
+    "result-consumed-without-a-handover",
+    "K1: the core consumed a result the store adapter never handed over.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=no_handover,
+    handovers=False,
+)
+
+
+def handed_twice(events):
+    first = at(events, "release.delivered.handed")
+    events.insert(first + 1, dict(events[first], label="release.handed.again"))
+
+
+case(
+    "result-handed-over-twice",
+    "K1: one result the store produced is handed over twice, and no injection duplicates it.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=handed_twice,
+)
+
+
+def consumed_otherwise(events):
+    # Store and adapter agree on a commit; the core consumed an unknown.
+    deepcopy_payloads(events)
+    events[at(events, "release.delivered")]["payload"]["outcome"] = "PendingOrUnknown"
+
+
+case(
+    "result-consumed-otherwise-than-handed-over",
+    "K1: the adapter handed over the commit the store produced, and the core consumed an unknown.",
+    {"broker_inputs_have_provenance": "FAIL", "no_positive_ack_before_confirmed_commit": "FAIL"},
+    events=consumed_otherwise,
+)
+
+
+def handed_from_nothing(events):
+    events[at(events, "release.delivered.handed")]["parents"] = ["release.submitted"]
+
+
+case(
+    "result-handed-over-that-the-store-did-not-produce",
+    "K1: the adapter hands over a result that no result of the store precedes.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=handed_from_nothing,
+)
+
+
+# ---------------------------------- P1-02b: terminal knowledge never regresses
+TERMINAL = "terminal_knowledge_never_regresses"
+
+
+def resolves_again(events):
+    # The late unknown answer after the commit makes the core resolve
+    # again: it went back to waiting.
+    insert_after(
+        events,
+        "unknown.delivered",
+        [
+            ev(
+                "resolve.again",
+                "store-adapter",
+                "ResolveSubmitted",
+                {"effect_id": effect(1, 12), "operation_id": OP_ADMIT},
+                ["unknown.delivered"],
+            )
+        ],
+    )
+
+
+case(
+    "late-unknown-resolved-again",
+    "DEM-MU-05: an unknown answer arriving after the commit makes the core resolve again.",
+    {TERMINAL: "FAIL"},
+    base=p1_02b,
+    scenario="p1-02b",
+    events=resolves_again,
+)
+
+
+def acknowledges_again(events):
+    insert_after(
+        events,
+        "unknown.delivered",
+        ack_out("pubrec.again", 1, 1, 12, "PUBREC", PUBREC_HEX, "unknown.delivered"),
+    )
+
+
+case(
+    "late-unknown-acknowledged-again",
+    "DEM-MU-05: an unknown answer arriving after the commit makes the core acknowledge again.",
+    {TERMINAL: "FAIL"},
+    base=p1_02b,
+    scenario="p1-02b",
+    events=acknowledges_again,
+)
+
+
+def resolves_again_later(events):
+    # Long after the commit is known, the core resolves the operation once
+    # more, from no answer in particular.
+    insert_after(
+        events,
+        "release.delivered",
+        [
+            ev(
+                "resolve.again",
+                "store-adapter",
+                "ResolveSubmitted",
+                {"effect_id": effect(1, 12), "operation_id": OP_ADMIT},
+                ["release.delivered"],
+            )
+        ],
+    )
+
+
+case(
+    "operation-resolved-again-after-its-commit",
+    "DEM-MU-05: after the commit is known, the operation is resolved again.",
+    {TERMINAL: "FAIL"},
+    base=p1_02b,
+    scenario="p1-02b",
+    events=resolves_again_later,
+)
+
+
+def unknown_before_the_commit(events):
+    # The unknown answer reaches the core while the outcome is still
+    # unknown, and the core arms a deadline on it: knowledge has not
+    # regressed, it has not yet progressed.
+    for label in ("unknown.released", "unknown.delivered.handed", "unknown.delivered"):
+        event = events.pop(at(events, label))
+        events.insert(at(events, "deadline.2"), event)
+    insert_after(
+        events,
+        "unknown.delivered",
+        [
+            ev(
+                "armed.on.unknown",
+                "timer",
+                "DeadlineArmed",
+                {"effect_id": effect(1, 13), "token": "9", "after": "30"},
+                ["unknown.delivered"],
+            )
+        ],
+    )
+
+
+case(
+    "p1-02b-good-unknown-before-the-commit",
+    "An unknown answer consumed before any terminal one may be followed: nothing regressed.",
+    base=p1_02b,
+    scenario="p1-02b",
+    events=unknown_before_the_commit,
+)
+
+# ------------------------------------------ the opening of an epoch
+GRANT = "one_grant_per_opened_epoch"
+
+
+def grant_twice(events):
+    first = at(events, "boot.grant")
+    events.insert(first + 1, dict(events[first], label="boot.grant.again"))
+
+
+case(
+    "epoch-granted-twice",
+    "One opened epoch, two grants handed over.",
+    {GRANT: "FAIL"},
+    events=grant_twice,
+)
+
+
+def grant_on_an_unknown(events):
+    deepcopy_payloads(events)
+    reply = events[at(events, "boot.opening.reply")]["payload"]
+    reply["outcome"] = "Unknown"
+    del reply["epoch"]
+
+
+case(
+    "epoch-granted-on-an-unknown-outcome",
+    "The opening's outcome is unknown, and a grant is handed over all the same.",
+    {GRANT: "FAIL"},
+    events=grant_on_an_unknown,
+)
+
+
+def reply_to_nothing(events):
+    events[at(events, "boot.opening.reply")]["parents"] = ["boot.opened"]
+
+
+case(
+    "opening-reply-to-no-submission",
+    "The core consumes an opening reply that answers no command the adapter submitted.",
+    {"broker_inputs_have_provenance": "FAIL"},
+    events=reply_to_nothing,
+)
+
+
+def committed_another_epoch(events):
+    deepcopy_payloads(events)
+    events[at(events, "boot.opening.reply")]["payload"]["epoch"] = "5"
+    events[at(events, "boot.grant")]["payload"]["epoch"] = "5"
+
+
+case(
+    "opening-committed-for-an-epoch-the-store-did-not-open",
+    "The core is told its command opened epoch 5; the store opened epoch 1 for that attempt.",
+    {"broker_inputs_have_provenance": "FAIL", GRANT: "FAIL"},
+    events=committed_another_epoch,
+)
+
+
+def abandoned_then_committed(events):
+    # Start-up stops waiting, then the reply of the same attempt arrives
+    # before any new submission: it is honoured, and the grant is right.
+    reply = at(events, "boot.opening.reply")
+    events.insert(
+        reply,
+        ev(
+            "boot.abandoned",
+            "broker-core",
+            "OpeningAbandoned",
+            {"attempt": attempt(1)},
+            ["boot.opening"],
+        ),
+    )
+
+
+case(
+    "p1-02-good-opening-abandoned-then-committed",
+    "The start-up abandons its opening, then receives its committed reply; the grant follows it.",
+    events=abandoned_then_committed,
+)
+
 case(
     "provenance-input-refused",
     "The dispatcher refused a result that answered no effect in flight.",
@@ -1872,6 +2242,32 @@ case(
     "A declared injection duplicates a result; the dispatcher refuses the copy, and that is the expected outcome.",
     scenario="p1-02-duplicate",
     events=duplicate_refused,
+)
+
+
+def duplicate_handed_over(events):
+    # The injection duplicates the result: the adapter hands it over twice,
+    # and the dispatcher refuses the copy.
+    duplicate_refused(events)
+    events.insert(
+        at(events, "copy.refused"),
+        ev(
+            "copy.handed",
+            "store-adapter",
+            "StoreResultHandedOver",
+            copy.deepcopy(events[at(events, "release.delivered.handed")]["payload"]),
+            ["hit.duplicated_release_result"],
+            2,
+        ),
+    )
+    events[at(events, "copy.refused")]["parents"] = ["copy.handed"]
+
+
+case(
+    "p1-02-good-duplicate-handed-over-and-refused",
+    "A declared injection duplicates a result: handed over twice, the copy refused; that is expected.",
+    scenario="p1-02-duplicate",
+    events=duplicate_handed_over,
 )
 
 
@@ -2109,13 +2505,13 @@ case(
 case(
     "core-without-bytes-against-the-full-scenario",
     "A run without bytes is offered for the full scenario: it never passes it.",
-    dict.fromkeys(ASSERTIONS, "OUT_OF_SCOPE"),
+    dict.fromkeys([*ASSERTIONS, *EVERY_RUN], "OUT_OF_SCOPE"),
     events=without_bytes,
 )
 case(
     "full-run-against-a-scenario-without-bytes",
     "A full run is offered for the scenario of another perimeter.",
-    dict.fromkeys(CORE_ASSERTIONS, "OUT_OF_SCOPE"),
+    dict.fromkeys([*CORE_ASSERTIONS, *EVERY_RUN], "OUT_OF_SCOPE"),
     scenario="p1-02-core",
     assertions=CORE_ASSERTIONS,
 )
@@ -2236,8 +2632,12 @@ def qabs_a():
                 ["released.held_admission"],
             ),
             fault_hit("admission_applied", "store.commit.applied", "admit.stable"),
-            ready("admit.ready", 1, "Committed", "admit.stable"),
+            # At the barrier the commit is applied and no result exists:
+            # the inspection sees the commit, then the adapter leaves the
+            # barrier and the result becomes ready (LeaveBarrier).
             inspected("after_commit"),
+            released("admission_applied"),
+            ready("admit.ready", 1, "Committed", "released.admission_applied"),
             delivered("admit", 1, 1, OP_ADMIT),
             # The held fence enters the writer, reads again and writes nothing.
             released("held_fence"),
@@ -2252,6 +2652,9 @@ def qabs_a():
         + ack_out("pubcomp", 1, 1, 10, "PUBCOMP", PUBCOMP_HEX, "release.delivered")
         + [inspected("final")]
     )
+
+
+qabs_a = handed(qabs_a)
 
 
 def qabs_a_snapshots(run):
@@ -2287,6 +2690,9 @@ def qabs_b():
             inspected("final"),
         ]
     )
+
+
+qabs_b = handed(qabs_b)
 
 
 def empty_snapshot(run, checkpoint, fences=()):
@@ -2328,6 +2734,9 @@ def qabs_c():
         ),
         inspected("unknown"),
     ]
+
+
+qabs_c = handed(qabs_c)
 
 
 def qabs_c_snapshots(run):
@@ -2416,7 +2825,7 @@ qabs(
 def invented_rejection(events):
     # DEM-MU-01: an absence that was read is reported as a certain refusal,
     # with no fence to make it one.
-    for label in ("unknown.ready", "unknown.delivered"):
+    for label in ("unknown.ready", "unknown.delivered.handed", "unknown.delivered"):
         event = events[at(events, label)]
         event["payload"] = dict(event["payload"], outcome="RejectedCertain", reject_reason="Fenced")
 
@@ -2434,7 +2843,7 @@ def cut(**standing):
     """What a cut trace concludes: nothing, but the failures that stand."""
 
     def expected(assertions):
-        owed = [*assertions, "trace_complete", "broker_inputs_have_provenance"]
+        owed = [*assertions, *EVERY_RUN]
         return {**dict.fromkeys(owed, "INCONCLUSIVE"), **standing}
 
     return expected
@@ -2493,21 +2902,32 @@ qabs(
     letter="B",
     events=reason_of("CapacityExceeded"),
 )
+
+
+def refusal_before_its_rejection(events):
+    # The refusing frame is made eligible before the rejection reaches the
+    # core: nothing it could answer happened before it.
+    frame = events.pop(at(events, "refusal"))
+    frame["parents"] = ["publish.in"]
+    events.insert(at(events, "fenced.delivered.handed"), frame)
+
+
 qabs(
     "refusal-answering-no-rejection",
-    "The PUBREC refuses, and no certain rejection is among its causes.",
+    "The PUBREC refuses before the core received any certain rejection.",
     {REASON: "FAIL"},
     letter="B",
-    events=lambda events: events[at(events, "refusal")].update(parents=["publish.in"]),
+    events=refusal_before_its_rejection,
 )
 
 
 def answered_by_an_unknown(events):
     # The core is told the outcome is unknown, and refuses on that.
     deepcopy_payloads(events)
-    payload = events[at(events, "fenced.delivered")]["payload"]
-    payload["outcome"] = "PendingOrUnknown"
-    del payload["reject_reason"]
+    for label in ("fenced.ready", "fenced.delivered.handed", "fenced.delivered"):
+        payload = events[at(events, label)]["payload"]
+        payload["outcome"] = "PendingOrUnknown"
+        del payload["reject_reason"]
 
 
 qabs(

@@ -77,6 +77,9 @@ pub enum Step {
         fault: String,
         max_steps: u64,
     },
+    LeaveBarrier {
+        fault: String,
+    },
     InspectDurableState {
         checkpoint: String,
     },
@@ -97,6 +100,7 @@ impl Step {
             Self::FireDeadline { .. } => "FireDeadline",
             Self::ReleaseHeldCommand { .. } => "ReleaseHeldCommand",
             Self::DeliverHeldResult { .. } => "DeliverHeldResult",
+            Self::LeaveBarrier { .. } => "LeaveBarrier",
             Self::InspectDurableState { .. } => "InspectDurableState",
             Self::CrashBroker => "CrashBroker",
             Self::RestartBroker => "RestartBroker",
@@ -275,6 +279,9 @@ fn step(value: &Value) -> Result<Step, String> {
         "DeliverHeldResult" => Step::DeliverHeldResult {
             fault: text(value, "fault")?.to_owned(),
             max_steps: decimal(value, "max_steps")?,
+        },
+        "LeaveBarrier" => Step::LeaveBarrier {
+            fault: text(value, "fault")?.to_owned(),
         },
         "InspectDurableState" => Step::InspectDurableState {
             checkpoint: text(value, "checkpoint")?.to_owned(),
