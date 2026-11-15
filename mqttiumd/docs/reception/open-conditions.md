@@ -15,13 +15,9 @@ the assertions are true.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| The oracle recomputes every assertion from the trace, the snapshots and the decoded packets, and a result whose statuses differ is refused | L3 | G0 |
-| The obligations of a run are derived from its exact scenario and perimeter; a run on a sub-perimeter (core without bytes) has its own declared obligations and never passes the full scenario | L3 | G0 |
-| A trace is checked as a whole: header first, gapless sequence per origin, causal parents present, footer count and completeness | L3 | G0 |
-| The collector assigns the origin of a record from its channel and refuses a record that claims another (ADR 0003). L3: the rule, and the refusal of a trace that breaks it. L4: the collector that assigns the origin. The row stays until both parts are done | L3, L4 | G0 |
-| A PASS requires a registry whose status is `complete`; the 39 uncovered cells of `p1.transitions.json` are written by the oracle role | L3 | G0 |
-| The assertion `broker_inputs_have_provenance` and the trace records it needs join the contracts (ADR 0003) | L3 | S0, DEM-MU-03 |
-| A permanent second reader of the semantic rules exists; today only the schema level has one (`tools/check_schemas.py`) | L3 | G0 |
+| The collector assigns the origin of a record from its channel and refuses a record that claims another (ADR 0003). The rule and the refusal of a trace that breaks it are done by lot L3; the collector that assigns the origin is owed | L4 | G0 |
+| **Oracle, review of lot L3** (head `3c023bf`). (1) `certain_rejection_has_a_closure` accepts a certain rejection when any snapshot, even a later one, holds its closure. (2) The order of a recovery inventory is judged on the pages read, not on the pages delivered to the core. (3) `same_recipe_for_op_A` and (4) `fenced_operation_never_executed` pass where the trace does not establish the order, or the order is the reverse. (5) The trace reader and the contract reader of the oracle allocate before they check a size. (6) A packet observed by a peer is trusted on its declared reason and identifier, and nothing checks the reason of a refusing PUBREC. (7) The order of recovered facts is written three times instead of calling `RecoveryOrder::admit`. (8) The limits of an admission have two encodings, in a trace and in a snapshot. (9) The list of contract files is computed twice, and the two readers disagree on a stray file in the schema directory | L3 | G0 |
+| The registry rules that decide a behaviour of the broker which the chapters leave open (record 0013, proposed) are accepted or replaced | Owner of the repository | G0 |
 
 ## Before a campaign is run (L4, L7)
 
@@ -41,8 +37,6 @@ observed in the checkout. It does not connect the two.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| The scenario format gains the steps P1-02b needs: firing a deadline, releasing a held command, delivering a held result; as a contract change with examples | L3 | P1-02b |
-| The registry rows for a replayed PUBLISH while the outcome is unknown, after a reconnect and on a live connection | L3 | P1-02b, G0 |
 | `tests/scenarios/p1/P1-02b.json` and its run on the deterministic store | L4 | S0 |
 
 ## Effect boxes and transitions (ADR 0006): reception of L1
