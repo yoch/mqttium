@@ -110,8 +110,8 @@ VARIABLES
     hObl,       \* every obligation committed and not settled
     hRefused,   \* identities the core treated as certainly rejected
     hKnown,     \* identities the core learnt as committed
-    hRaces      \* how a fence and an application were ordered, and why
-                \* the store refused a command
+    hRaces      \* per identity: how its fence and its application were
+                \* ordered, and why the store refused its command
 
 durable  == <<dEpoch, dCommitted, dFenced, dPub, dSlot, dObl, dUsed, dSrcGen,
               dDestGen, dNextOp>>
@@ -125,6 +125,9 @@ history  == <<hAdmit, hObl, hRefused, hKnown, hRaces>>
 vars     == <<durable, volatile, internal, conn, external, client, env, history>>
 
 RecipeOf(o) == (CHOOSE x \in vPrep : x.op = o).recipe
+
+\* What the verifier recorded about one identity.
+RacesOf(o) == {e[1] : e \in {x \in hRaces : x[2] = o}}
 
 TypeOK ==
     /\ dEpoch \in Epochs
@@ -163,7 +166,7 @@ TypeOK ==
     /\ hRefused \subseteq Ops /\ hKnown \subseteq Ops
     /\ hRaces \subseteq {"CommitBeforeFence", "FenceBeforeCommand",
                          "EpochClosed", "StaleSource", "StaleTarget",
-                         "NoCapacity"}
+                         "NoCapacity"} \X Ops
 
 Init ==
     /\ dEpoch = 1 /\ dCommitted = {} /\ dFenced = {} /\ dPub = {} /\ dSlot = {}
@@ -372,7 +375,7 @@ ApplyCommand(c) ==
           /\ UNCHANGED <<durable, hAdmit, hObl, hRaces>>
        \/ /\ o \notin dCommitted /\ o \in dFenced
           /\ Report(o, "RejectedCertain")
-          /\ hRaces' = hRaces \cup {"FenceBeforeCommand"}
+          /\ hRaces' = hRaces \cup {<<"FenceBeforeCommand", o>>}
           /\ UNCHANGED <<durable, hAdmit, hObl>>
        \/ /\ o \notin dCommitted /\ o \notin dFenced
           /\ EpochOpen(r) /\ SourceCurrent(r) /\ TargetsCurrent(r)
@@ -388,7 +391,7 @@ ApplyCommand(c) ==
           /\ dFenced' = IF Mutation = "RefusalNotDurable" THEN dFenced
                         ELSE dFenced \cup {o}
           /\ Report(o, "RejectedCertain")
-          /\ hRaces' = hRaces \cup {RefusalCause(r)}
+          /\ hRaces' = hRaces \cup {<<RefusalCause(r), o>>}
           /\ UNCHANGED <<dEpoch, dCommitted, dPub, dSlot, dObl, dUsed,
                          dSrcGen, dDestGen, dNextOp, hAdmit, hObl>>
     /\ UNCHANGED <<volatile, tResolve, tFencing, conn, external, client,
@@ -421,7 +424,7 @@ FenceEstablish(o) ==
     /\ tFencing' = tFencing \ {o}
     /\ IF o \in dCommitted /\ Mutation # "FenceOnStaleRead"
        THEN /\ Ready(o, "Committed")
-            /\ hRaces' = hRaces \cup {"CommitBeforeFence"}
+            /\ hRaces' = hRaces \cup {<<"CommitBeforeFence", o>>}
             /\ UNCHANGED dFenced
        ELSE /\ dFenced' = dFenced \cup {o}
             /\ Ready(o, "RejectedCertain")
@@ -663,33 +666,35 @@ ReachReplayWhileUnknown ==
 \* QABS-A: the resolver observed an absence, the command committed, the
 \* fence step returned the commit and PUBREC was observed.
 ReachCommitBeforeFence ==
-    /\ hRaces = {"CommitBeforeFence"} /\ dFenced = {} /\ kPhase = "acked"
+    /\ kPhase = "acked" /\ vOp # NoOp /\ vOp \in dCommitted
+    /\ RacesOf(vOp) = {"CommitBeforeFence"}
 
 \* QABS-B: the fence won, the delayed command was then refused without
 \* effect, and the refusal was observed.
 ReachFenceBeforeCommand ==
-    /\ hRaces = {"FenceBeforeCommand"} /\ dCommitted = {} /\ kPhase = "refused"
+    /\ kPhase = "refused" /\ vOp # NoOp /\ vOp \in dFenced
+    /\ RacesOf(vOp) = {"FenceBeforeCommand"} /\ dCommitted = {}
 
 \* The second exchange finds the capacity used by the first and is refused
 \* without any resolution being involved.
 ReachCapacityRefusal ==
     /\ kPhase = "refused" /\ kExch = 2
     /\ \A d \in Dests : dUsed[d] = Capacity
-    /\ 1 \in dCommitted /\ 2 \in dFenced
-    /\ hRaces = {"NoCapacity"}
+    /\ 1 \in dCommitted /\ 2 \in dFenced /\ vOp = 2
+    /\ RacesOf(2) = {"NoCapacity"}
 
 \* A command prepared for a destination session that was then reset is
 \* refused.
 ReachStaleTargetRefusal ==
     /\ eDestReset > 0 /\ kPhase = "refused" /\ dNextOp = 2 /\ 1 \in dFenced
-    /\ hRaces = {"StaleTarget"}
+    /\ vOp = 1 /\ RacesOf(1) = {"StaleTarget"}
 
 \* A command of the first epoch refused in the second, while a new
 \* admission of the same exchange commits.
 ReachEpochClosedRefusal ==
     /\ dEpoch = 2 /\ 1 \in dFenced /\ 2 \in dCommitted
     /\ kPhase = "acked" /\ kExch = 1
-    /\ hRaces = {"EpochClosed"}
+    /\ vOp = 2 /\ RacesOf(1) = {"EpochClosed"} /\ RacesOf(2) = {}
 
 \* The source session was reset after a commit: the obligations stay and
 \* a new exchange is admitted on the same Packet Identifier.

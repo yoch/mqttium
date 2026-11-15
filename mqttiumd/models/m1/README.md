@@ -27,7 +27,14 @@ declared is a failure of the campaign, not a detection. Their status is
 and of the decision records, and no implementation exists yet to refine.
 
 `python models/check_models.py`, from `mqttiumd/`, checks without Java
-that the files, the sidecars and the correspondence table below agree.
+that the files, the sidecars and the correspondence table below agree. A
+passing entry of a sidecar lists the `invariants` its configuration
+checks, and the script compares the two; the runner ignores that member.
+`python -m unittest discover -s models -p "test_*.py"` runs the tests of
+the script.
+
+A witness whose predicate reads recorded events reads those of the
+identity it is about, so that another publication cannot supply them.
 
 ## M1a
 

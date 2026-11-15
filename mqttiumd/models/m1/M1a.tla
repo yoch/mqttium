@@ -108,8 +108,11 @@ client   == <<kPhase, kSentGen, kGen>>
 env      == <<proc, eCrash, eLoss, eFence>>
 history  == <<hAdmit, hPresented, hKnown, hRefused, hFenced, hAuth, hEvents>>
 
-Events == {"CommitResultLost", "ResolvedCommitted", "FencedWhileHeld",
-           "Represented"}
+\* Each event is recorded with the identity it happened to: a witness
+\* reads the events of the identity it is about, not those of another.
+Events == {"CommitResultLost", "ResolvedCommitted", "FenceRefused",
+           "FencedWhileHeld", "Represented"} \X Ops
+EventsOf(o) == {e[1] : e \in {x \in hEvents : x[2] = o}}
 Note(events) == hEvents' = IF Trace THEN hEvents \cup events ELSE hEvents
 vars     == <<durable, volatile, internal, conn, external, client, env, history>>
 
@@ -288,7 +291,7 @@ Represent(o) ==
                 ELSE RecipeOf(o)
        IN /\ tCmd' = tCmd \cup {[op |-> o, recipe |-> r, hold |-> "fresh"]}
           /\ hPresented' = hPresented \cup {<<o, r>>}
-    /\ Note({"Represented"})
+    /\ Note({<<"Represented", o>>})
     /\ UNCHANGED <<durable, volatile, tResolve, tResult, conn, external,
                    client, env, hAdmit, hKnown, hRefused, hFenced, hAuth>>
 
@@ -376,8 +379,8 @@ Resolve(o) ==
     /\ tResolve' = tResolve \ {o}
     /\ \/ /\ dDecision[o] = "committed"
           /\ Ready(o, "Committed")
-          /\ Note(IF "CommitResultLost" \in hEvents
-                  THEN {"ResolvedCommitted"} ELSE {})
+          /\ Note(IF <<"CommitResultLost", o>> \in hEvents
+                  THEN {<<"ResolvedCommitted", o>>} ELSE {})
           /\ UNCHANGED <<dDecision, hFenced, eFence>>
        \/ /\ dDecision[o] = "fenced"
           /\ Ready(o, "RejectedCertain")
@@ -386,12 +389,13 @@ Resolve(o) ==
           /\ Fence(o)
           /\ Ready(o, "RejectedCertain")
           /\ Note(IF \E c \in tCmd : c.op = o /\ c.hold = "held"
-                  THEN {"FencedWhileHeld"} ELSE {})
+                  THEN {<<"FencedWhileHeld", o>>} ELSE {})
           /\ UNCHANGED eFence
        \/ /\ dDecision[o] = "none" /\ eFence < MaxFenceFail
           /\ eFence' = eFence + 1
           /\ Ready(o, "PendingOrUnknown")
-          /\ UNCHANGED <<dDecision, hFenced, hEvents>>
+          /\ Note({<<"FenceRefused", o>>})
+          /\ UNCHANGED <<dDecision, hFenced>>
     /\ UNCHANGED <<dPub, dSlot, dObl, dAcct, dEpoch, dNextOp, volatile, tCmd,
                    conn, external, client, proc, eCrash, eLoss, hAdmit,
                    hPresented, hKnown, hRefused, hAuth>>
@@ -400,7 +404,7 @@ LoseResult(r) ==
     /\ r \in tResult /\ eLoss < MaxLoss
     /\ tResult' = tResult \ {r}
     /\ eLoss' = eLoss + 1
-    /\ Note(IF r.out = "Committed" THEN {"CommitResultLost"} ELSE {})
+    /\ Note(IF r.out = "Committed" THEN {<<"CommitResultLost", r.op>>} ELSE {})
     /\ UNCHANGED <<durable, volatile, tCmd, tResolve, conn, external, client,
                    proc, eCrash, eFence, hAdmit, hPresented, hKnown, hRefused,
                    hFenced, hAuth>>
@@ -648,7 +652,7 @@ ReachCrashAfterCommit ==
 \* the crash, recovered and acknowledged on the new connection without a
 \* second identity.
 ReachRecovery ==
-    /\ eCrash > 0 /\ hEvents = {"CommitResultLost"} /\ proc = "up"
+    /\ eCrash > 0 /\ EventsOf(1) = {"CommitResultLost"} /\ proc = "up"
     /\ dNextOp = 2
     /\ \E p \in Pubs : /\ kPhase[p] = "acked" /\ kSentGen[p] = 2
                        /\ \E s \in dSlot : s.pub = p /\ s.op = 1
@@ -660,11 +664,14 @@ ReachRecovery ==
 \* resolution that returns the commit; PUBREC observed on the first
 \* connection while the old unknown answer is still held.
 ReachLivePath ==
-    /\ eCrash = 0 /\ eFence > 0
-    /\ hEvents = {"CommitResultLost", "ResolvedCommitted"}
-    /\ \E p \in Pubs : /\ kPhase[p] = "acked" /\ kSentGen[p] = 1
-                       /\ vOp[p] # NoOp /\ vKnow[vOp[p]] = "Committed"
-                       /\ [op |-> vOp[p], out |-> "PendingOrUnknown"] \in tResult
+    /\ eCrash = 0
+    /\ \E p \in Pubs :
+        /\ kPhase[p] = "acked" /\ kSentGen[p] = 1
+        /\ vOp[p] # NoOp /\ vKnow[vOp[p]] = "Committed"
+        \* The events of the identity of this very publication.
+        /\ EventsOf(vOp[p]) = {"FenceRefused", "CommitResultLost",
+                               "ResolvedCommitted"}
+        /\ [op |-> vOp[p], out |-> "PendingOrUnknown"] \in tResult
 
 \* Both identities are used up, a creation is suspended and a delayed
 \* command is still there.
@@ -675,9 +682,9 @@ ReachExhaustion ==
 \* QABS-B: the fence is established while the command is held; the core
 \* learns the rejection, and the held command can only be refused.
 ReachFenceWhileHeld ==
-    /\ "FencedWhileHeld" \in hEvents
-    /\ \E o \in Ops : /\ o \in hFenced /\ vKnow[o] = "Rejected"
-                      /\ \E c \in tCmd : c.op = o /\ c.hold = "held"
+    \E o \in Ops : /\ "FencedWhileHeld" \in EventsOf(o)
+                   /\ o \in hFenced /\ vKnow[o] = "Rejected"
+                   /\ \E c \in tCmd : c.op = o /\ c.hold = "held"
 
 NoCommit           == ~ReachCommit
 NoLostResult       == ~ReachLostResult
