@@ -147,9 +147,15 @@ class Rules(unittest.TestCase):
                 state["operations"].append(
                     {
                         "operation_id": other,
-                        "command_kind": "AdmitPublication",
                         "recipe_hex": recipe,
-                        "decision": "Committed",
+                        "decision": {
+                            "kind": "Committed",
+                            "facts": {
+                                "kind": "PublicationAdmitted",
+                                "publication_id": other,
+                                "exchange": {"session": "1", "generation": "1"},
+                            },
+                        },
                     }
                 )
 

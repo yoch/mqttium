@@ -85,7 +85,11 @@ with the child, killed inside the transaction after its commit frame (K2b
 of the plan of lot L7). On a run whose broker is a child process, an
 `Operation` fact `Committed` of a recovery that follows a `BrokerKilled`
 is then the admission of that operation, once, unless a
-`StoreCommitStable` of it came before. In-process the evidence of the
+`StoreCommitStable` of it came before. The recovery page must match a
+preceding `RecoveryPageRead` in that incarnation, and its Committed
+knowledge must not contradict an observed durable decision of that
+operation. A missing read leaves the admission unplaced and inconclusive;
+a contradiction fails. In-process the evidence of the
 store is never killed, and a commit without it is no admission.
 
 `broker_killed_for_real` (record 0019), owed by every run, reads the
@@ -299,3 +303,13 @@ the run was not judged, and a caller must never record that as a verdict.
   of the three orders exist; no bench plays them yet.
 
 `docs/reception/open-conditions.md` keeps the rows these close.
+
+The deterministic crash scenarios `tests/scenarios/crash/{K1,K2b,K3}.json`
+require `transactional_kill_matches_recovery`: the declared point and
+durable operation identity match the hit, the hit precedes a real signal-9
+kill, no result was ready before it, and the first complete corroborated
+recovery inventory shows K1 absent or K2b/K3 Committed. Only K3 has a stable
+record before the point. K1 compares obligations after retransmission and
+at the end; K2b/K3 compare them immediately after recovery and at the end.
+Full durable-state equality against the deterministic store belongs to
+the separate store tests; this assertion does not claim to calculate it.

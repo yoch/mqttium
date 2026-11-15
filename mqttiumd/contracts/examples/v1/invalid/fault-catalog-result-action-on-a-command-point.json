@@ -34,7 +34,7 @@
     },
     {
       "point": "store.commit.logged",
-      "meaning": "Inside the transaction of the store: the commit frame is written and synced, COMMIT has not returned and no StoreCommitStable is written. A kill here leaves the state after the command, which only the recovery shows (record 0020).",
+      "meaning": "SQLite WAL hook after commit and release of the SQLite write lock, before the outcome is available to the adapter and before StoreCommitStable. A kill here leaves the state after the command (record 0020).",
       "carries": "command",
       "actions": [
         "barrier"
