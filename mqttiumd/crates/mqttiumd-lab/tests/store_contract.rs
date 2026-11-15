@@ -170,3 +170,8 @@ fn a_fact_that_cannot_be_built_is_not_the_end_of_the_inventory() {
         Err(RecoveryRefused::AllocationFailed)
     );
 }
+
+#[test]
+fn recovered_facts_follow_the_order_of_an_inventory() {
+    conformance::recovered_facts_follow_the_order_of_an_inventory(&memory);
+}

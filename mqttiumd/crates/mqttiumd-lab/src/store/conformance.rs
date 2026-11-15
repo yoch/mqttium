@@ -17,7 +17,7 @@ use mqttiumd_contract::command::{
     OpeningAttempt, OpeningRejection, OpeningTicket, PayloadRef, Recipe, ReleaseInbound, Source,
     StartupNonce, Target,
 };
-use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
+use mqttiumd_contract::effects::{InboundPhase, RecoveredFact, RecoveryOrder};
 use mqttiumd_contract::ids::{
     DeliveryId, ExchangeGeneration, ExchangeId, InboundPacketId, LogicalOwnerId, OperationId,
     OperationSeq, PayloadId, PayloadSeq, PublicationId, PublicationSeq, RequestId, RequestSeq,
@@ -1168,7 +1168,9 @@ pub fn recovery_reads_bounded_pages_of_durable_facts<S: DurableStore>(
             (fenced, Knowledge::RejectedCertain(RejectReason::Fenced)),
         ]
     );
-    assert_eq!(facts.len(), 1 + 3 + 1 + 3);
+    // The epoch, the limits, the route table and its two targets, three
+    // sessions, one inbound exchange, three operations.
+    assert_eq!(facts.len(), 1 + 1 + 1 + 2 + 3 + 1 + 3);
 
     // The same inventory in pages of every size, never above the limit.
     for limit in 1..=facts.len() + 1 {
@@ -1479,6 +1481,78 @@ pub fn every_receipt_and_fence_holds_a_receipt_slot<S: DurableStore>(
     assert_eq!(outcome(world.store.apply(&early).reply), precondition);
 }
 
+/// The inventory is in the order of record 0014: the epoch, the limits,
+/// the route table, the routes sorted by the bytes of their topic with
+/// the targets of one topic in the order they were added, the sessions,
+/// the inbound exchanges, the operations. `RecoveryOrder::admit` takes
+/// every fact, page by page from a fresh rule, and over the whole
+/// inventory with the rule carried from page to page.
+pub fn recovered_facts_follow_the_order_of_an_inventory<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut world = World::new(make);
+    // A topic that sorts before the fixture's, whose targets are added
+    // in the order `c`, then `producer`.
+    for session in [world.c, world.producer] {
+        let added = world.store.admin(AdminCommand::AddRoute {
+            topic: b"a/first".to_vec(),
+            session,
+            qos: Qos::ExactlyOnce,
+        });
+        let Ok(AdminDone::RouteAdded { route_revision }) = added else {
+            panic!("the route was not added: {added:?}");
+        };
+        world.route_revision = route_revision;
+    }
+    let committed = world.admission(1, 7, b"payload", &[world.b]);
+    assert!(world.store.apply(&committed).committed_now);
+    open(&mut world.store);
+
+    let whole = world.store.recover(None, 64).expect("one page");
+    assert_eq!(whole.next, None);
+    let facts = whole.facts.as_slice();
+    let limits = fixture_limits();
+    let route = |topic: &[u8], target, max_qos| RecoveredFact::Route {
+        topic: SharedBytes::copy_from(topic, 256).expect("fits"),
+        target,
+        target_revision: Revision::new(1),
+        max_qos,
+    };
+    assert_eq!(
+        &facts[1..7],
+        [
+            RecoveredFact::Limits {
+                max_targets_per_admission: limits.max_targets_per_admission as u32,
+                max_topic_bytes: limits.max_topic_bytes as u32,
+                max_payload_bytes: PayloadBytes::new(limits.max_payload_bytes as u64),
+            },
+            RecoveredFact::RouteTable {
+                revision: world.route_revision
+            },
+            route(b"a/first", world.c, Qos::ExactlyOnce),
+            route(b"a/first", world.producer, Qos::ExactlyOnce),
+            route(TOPIC, world.b, Qos::AtLeastOnce),
+            route(TOPIC, world.c, Qos::AtLeastOnce),
+        ]
+    );
+    for limit in 1..=facts.len() {
+        let mut carried = RecoveryOrder::new();
+        let mut cursor = None;
+        loop {
+            let page = world.store.recover(cursor, limit).expect("a page");
+            let mut fresh = RecoveryOrder::new();
+            for fact in page.facts.as_slice() {
+                assert_eq!(fresh.admit(fact), Ok(()), "pages of {limit}: {fact:?}");
+                assert_eq!(carried.admit(fact), Ok(()), "pages of {limit}: {fact:?}");
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+    }
+}
+
 /// Every check of this module, in order.
 pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     opening_opens_the_next_epoch_and_closes_the_older_ones(make);
@@ -1506,4 +1580,5 @@ pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     a_client_id_longer_than_mqtt_allows_is_refused(make);
     what_is_established_in_epoch_zero_is_never_collected(make);
     every_receipt_and_fence_holds_a_receipt_slot(make);
+    recovered_facts_follow_the_order_of_an_inventory(make);
 }

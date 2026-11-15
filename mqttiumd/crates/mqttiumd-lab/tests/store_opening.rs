@@ -236,11 +236,11 @@ fn an_opening_whose_reply_is_lost_gives_no_authority_and_is_opened_again() {
     // be read, and it authorises nothing.
     let page = sim.recover(None, 8).expect("a page");
     assert_eq!(
-        page.facts.as_slice(),
-        [RecoveredFact::Epoch {
+        page.facts.as_slice()[0],
+        RecoveredFact::Epoch {
             incarnation: INCARNATION,
             epoch: RunEpoch::new(1)
-        }]
+        }
     );
     assert_eq!(
         opening.check_recovered(INCARNATION, RunEpoch::new(1)),
