@@ -66,6 +66,19 @@ without admission, or an admission outside any exchange, may only lack the
 record that was lost, and is inconclusive on an incomplete trace. A trace
 of another scenario concludes nothing.
 
+What a store holds must hang together and must hold what a client was
+acknowledged for (finding F2 of the audit). At every checkpoint an
+obligation names a publication the snapshot holds and a publication a
+payload it holds; a missing reference is a FAIL, never a value equal to
+another missing one. An exchange whose positive PUBREC a peer observed
+before an inspection was committed: that snapshot holds a publication of
+the topic the client sent, whose payload has the length and digest of the
+payload bytes the client sent, decoded by the oracle from its MQTT 5
+PUBLISH. The expectation comes from what the client did and from the
+routes of the fixture, not from what survives in the snapshot. A snapshot
+of a corrupted store stays a valid document: the bench can represent the
+corruption, the judge recognises it.
+
 A snapshot the trace cites is evidence only when it is the snapshot of the
 same run and of the backend the trace declares, for the checkpoint that
 cites it. Otherwise the checkpoint has no usable snapshot.
