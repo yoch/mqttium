@@ -47,8 +47,36 @@ tools/run_read_failure_reception.sh /tmp/new-read-failures
 tools/run_transactional_reception.sh /tmp/new-transactions 1
 ```
 
-Next integration action: receive the real child failure artefacts, run the
-four workspace checks and both feature modes, then publish the coherent
-chain and requalify K1/K2b/K3 on its exact source. Keep K2a/WAL CI gates;
-their complementary finite scope is unchanged. No main merge or global
-acceptance of proposed ADRs is authorised.
+Published/tested implementation: `d1848e3c099db61d9e0d86c5922ce41fe479feed`.
+Connector read-back confirms that head and the store-interface/supervisor blobs.
+Final local suites: 683 normal Rust tests, 691 instrumented tests, 142 oracle
+tests; all pass without ignored tests. Both clippy modes and formatting pass.
+The instrumented suite was run separately after a collision of a legacy
+source-relative fixture during a parallel attempt; that failure is not a
+semantic detection. Fourteen control probes include the final Stop/EOF case
+(red af6a81b5, fix c1e871f1) and a retained kill despite collector refusal
+(red 6a21eaae, fix e29e1742). Eight real child/inspector cases and ten setup
+cause/phase combinations are received; failed business exchanges stay INC.
+
+Fresh K1/K2b/K3 on this exact clean implementation all qualify PASS, validate
+accepts, recompute stands, second binaries match, and each expected negative
+is detected. Each separately traced run owns its own strace witness. Common
+source archive SHA-256: `1033e98fa30925bb53633cf8cdaa677ba57882f00a3ed6d1725079a8e9df6cf7`.
+
+The initial CI failed before oracle dependencies were installed, not on a
+semantic assertion. CI setup-order fix 3a35ca6d installs the pinned interpreter
+and oracle before Rust tests. Both actual vertical tests pass in a newly
+isolated Python environment with those dependencies. The final publication
+adds that workflow fix and this report/journal; application code is unchanged.
+Read its exact final HEAD/checks and its own new campaign artifact from the PR.
+
+Local evidence: `/workspace/mqttium-read-evidence/`. Archives and SHA-256:
+`../reports/0006-typed-durable-read-reception.md`. Historical transaction report
+0004 and K2a/WAL scopes remain unchanged. Existing K2a/WAL final CI gates stay
+required; final CI evidence belongs to its own published SHA.
+
+Next integration action: read final published HEAD and checks; investigate
+any actionable failure and receive that SHA's fresh CI artifacts. Next product
+increment: a minimal TCP CONNECT + durable QoS 1 exchange, PUBACK after commit,
+invalid-copy startup refused before readiness, reconnect without readmission.
+No main merge or global acceptance of proposed ADRs is authorised.

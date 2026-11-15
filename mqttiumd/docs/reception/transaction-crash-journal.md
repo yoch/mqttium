@@ -47,8 +47,7 @@ Full commands, scopes, findings and archive SHA-256 values:
 `/workspace/mqttium-evidence/`, with `SHA256SUMS`; final deterministic runs
 remain at `/tmp/mqttium-transactional-reception-final/`.
 
-Immediate continuation: read final PR head/checks; fix any actionable CI
-failure before changing evidence claims. Next useful code increment: a typed,
-bounded durable-reader failure through the store trait and supervisor, first
-shown on an isolated malformed durable value that still passes quick_check.
-No main merge or global ADR acceptance is authorised.
+Continuation: the typed bounded durable-reader chain and its control fixes
+are received in `durable-read-journal.md` and report 0006. This journal retains
+the prior transaction dataset and its exact scope. Read the PR for the current
+published HEAD and checks. No main merge or global ADR acceptance is authorised.

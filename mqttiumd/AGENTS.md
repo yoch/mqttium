@@ -101,6 +101,10 @@ check unpacks and builds in a directory of its own; `run --rebuild` uses
 the directory its archive names under `TMPDIR` and takes its turn on a
 lock, so two rebuilds of the same source wait for each other.
 
+Run normal and instrumented full suites sequentially in one checkout, or use
+separate worktrees. Separate Cargo targets alone do not isolate the legacy
+source-relative `target/workspace-tests/one-snapshot` fixture.
+
 The loop is shown to reject a defect by mutations kept as diffs under
 `tests/mutants/loop/` (`*.mutant`: the root `.gitignore` ignores `*.patch`
 and `*.diff`). The script applies each one in a temporary worktree, never
