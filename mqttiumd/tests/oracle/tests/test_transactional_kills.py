@@ -6,6 +6,7 @@ import unittest
 from mqttiumd_oracle import judge
 
 from . import test_judge_rules as rules
+from .test_recovered_admissions import sqlite_lifecycle
 
 corpus = rules.corpus
 ASSERTION = "transactional_kill_matches_recovery"
@@ -44,6 +45,34 @@ class TransactionalKills(unittest.TestCase):
         decide = judge.ASSERTIONS.get(ASSERTION)
         self.assertIsNotNone(decide, "the transaction crash assertion must be implemented")
         return decide(run)
+
+    def test_sqlite_recovery_is_identified_without_an_invented_causal_edge(self):
+        for point in ("store.commit.prepared", "store.commit.logged", "store.commit.applied"):
+            with self.subTest(point=point):
+                run = self.run_at(point, sqlite_lifecycle)
+                kill = run.trace.of_kind("BrokerKilled")[0]
+                page = run.trace.of_kind("RecoveryPageDelivered")[-1]
+                self.assertIsNone(run.trace.before(kill, page))
+                self.assertEqual(self.decide(run).status, "PASS")
+
+    def test_sqlite_kill_requires_an_unambiguous_matching_startup(self):
+        for problem in ("wrong-epoch", "wrong-incarnation", "absent", "reused-epoch"):
+            with self.subTest(problem=problem):
+                def edit(events):
+                    sqlite_lifecycle(events)
+                    if problem == "wrong-epoch":
+                        events[corpus.at(events, "restart")]["payload"]["run_epoch"] = "3"
+                    elif problem == "wrong-incarnation":
+                        for label in ("recovery.read", "recovery.in"):
+                            events[corpus.at(events, label)]["inc"] = 3
+                    elif problem == "absent":
+                        del events[corpus.at(events, "restart")]
+                    else:
+                        duplicate = copy.deepcopy(events[corpus.at(events, "restart")])
+                        duplicate["label"] = "restart.reused"
+                        corpus.insert_after(events, "restart", [duplicate])
+
+                self.assertEqual(self.decide(self.run_at("store.commit.logged", edit)).status, "INCONCLUSIVE")
 
     def test_k1_has_no_commit_of_the_interrupted_command(self):
         self.assertEqual(self.decide(self.run_at("store.commit.prepared")).status, "PASS")
