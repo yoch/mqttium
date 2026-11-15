@@ -29,10 +29,12 @@ big-endian `u32` length, one action outstanding at a time.
 | `Choose` | An index in the list of eligible choices the child published last, and the digest of that list. No identity goes down |
 | `Connect` | A connection generation, assigned by the supervisor |
 | `Bytes` | A connection generation and the bytes a peer sent |
-| `FireDeadline`, `ReleaseHeld`, `DeliverHeld`, `LeaveBarrier` | The index of a fault in the list the child was started with |
+| `FireDeadline` | Nothing: the armed deadline due first |
+| `ReleaseHeld`, `DeliverHeld`, `LeaveBarrier` | The index of a fault in the list the child was started with |
 | `Crash` | Nothing: the simulated crash of the store adapter (sim-store only) |
 | `Inspect` | Nothing: the durable state of the store, read without the writer (sim-store only) |
 | `Stop` | Nothing |
+| `Acknowledge` | The emission number up to which, included, the supervisor read every evidence frame |
 
 Evidence, child to supervisor: one file descriptor per origin of the
 child, and one control descriptor (eligible choices, end of action,
@@ -61,6 +63,51 @@ acknowledged.
 
 The frame size and the window are working values; the run manifest
 records them as effective parameters.
+
+## Wire format
+
+Written and tested in `crates/mqttiumd-lab/src/bench/protocol.rs` before
+any child exists; nothing there starts or stops a process.
+
+- A frame is a big-endian `u32` length and its body, of 1 to 65 536
+  bytes. A length is checked from the header alone, before anything is
+  allocated; an empty frame, a longer one or a stream that ends inside a
+  frame is refused.
+- An action or a report is a tag byte and its fields, integers
+  big-endian, byte strings and texts with a `u32` length first, the
+  choice digest as 32 bytes. One encoding, no optional field: an unknown
+  tag, a field cut short, a text that is not UTF-8 or a byte left over is
+  refused. A list of choices whose count the frame cannot hold is refused
+  before it is allocated.
+- An evidence frame is the emission number (`u64`) and the record as
+  the child wrote it, never empty. Its origin is the descriptor.
+- Reports on the control descriptor: `Eligible` (the descriptions of the
+  choices and their digest), `EndOfAction` (the last emission number of
+  the action, or none), `Refused` (the action did nothing), `Stopped`
+  (the run cannot go on in the child).
+- The choice digest is the SHA-256 of the number of choices, then of
+  each description with its length first, in list order. The child
+  refuses a `Choose` whose digest is not that of the list it published
+  last, or whose index is outside it.
+- At the end of an action the supervisor orders the frames of every
+  descriptor by emission number and refuses the batch on a duplicate, a
+  number of an earlier action of the incarnation, a missing number, or a
+  last number other than the one `EndOfAction` states. A new incarnation
+  numbers from 0.
+- The child emits at most 64 frames not acknowledged, goes past a
+  decisive record only once it is acknowledged, and is killable only
+  when every frame is acknowledged. An acknowledgement of a frame not
+  emitted, or older than one already received, is refused.
+
+The descriptors of the child: actions on its standard input, reports on
+its standard output, one inherited descriptor per origin of the child
+from descriptor 3 in the order `broker-core`, `dispatcher`,
+`fault-injector`, `store-adapter`, `store-evidence`, `timer`,
+`transport`; standard error is diagnostics, never evidence. The
+supervisor reads each descriptor on its own reader, so that a full
+descriptor never waits for another to be read
+(`tests/bench_protocol.rs` plays 200 records through a window of 64 on
+socket pairs, with no process).
 
 ## Causal parents of the supervisor and the peers
 
