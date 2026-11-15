@@ -799,7 +799,7 @@ impl Child {
                 self.pid
             )));
         }
-        Ok(())
+        self.drain_after_exit(ControlPhase::Stop)
     }
 
     /// Kills the child with `SIGKILL` and waits until the operating system
@@ -868,6 +868,13 @@ impl Child {
             )));
         }
         *observed = Some(killed);
+        self.drain_after_exit(ControlPhase::KillDrain)
+    }
+
+    /// Once the process is reaped, every reader must reach a clean EOF.
+    /// A second final terminator is still a protocol failure, even when
+    /// no later action exists to reject its reused serial.
+    fn drain_after_exit(&mut self, phase: ControlPhase) -> Result<(), Stop> {
         // Its descriptors close with it. A clean EOF is represented by the
         // reader dropping its sender; a started/truncated frame is Broken.
         let deadline = Instant::now() + self.silence;
@@ -881,37 +888,52 @@ impl Child {
                 Ok(arrival) => {
                     count += 1;
                     if count > ARRIVAL_CAPACITY {
-                        return Err(self.control(
-                            ControlCode::ReportBudgetExceeded,
-                            ControlPhase::KillDrain,
-                            "the killed child's evidence drain exceeded its frame budget",
-                        ));
+                        failure.get_or_insert_with(|| {
+                            self.control(
+                                ControlCode::ReportBudgetExceeded,
+                                phase,
+                                "the exited child's evidence drain exceeded its frame budget",
+                            )
+                        });
+                        break;
                     }
                     let error = match arrival {
                         Arrival::Evidence(origin, _) => self.control(
                             ControlCode::LateEvidence,
-                            ControlPhase::KillDrain,
-                            format!("a record of {} arrived after the kill", origin.name()),
+                            phase,
+                            format!("a record of {} arrived after process exit", origin.name()),
                         ),
+                        Arrival::Report(Report::EndOfAction { .. } | Report::Parked { .. })
+                            if phase == ControlPhase::Stop =>
+                        {
+                            self.control(
+                                ControlCode::DuplicateTermination,
+                                phase,
+                                "a final action termination was repeated after process exit",
+                            )
+                        }
                         Arrival::Report(_) => self.control(
                             ControlCode::LateReport,
-                            ControlPhase::KillDrain,
-                            "a control report arrived after the kill",
+                            phase,
+                            "a control report arrived after process exit",
                         ),
-                        Arrival::Broken(why) => self.broken(why, ControlPhase::KillDrain),
+                        Arrival::Broken(why) => self.broken(why, phase),
                     };
                     failure.get_or_insert(error);
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    return Err(self.control(
-                        ControlCode::DrainDeadlineExceeded,
-                        ControlPhase::KillDrain,
-                        format!(
-                            "the descriptors of the killed child {} did not close",
-                            self.pid
-                        ),
-                    ));
+                    failure.get_or_insert_with(|| {
+                        self.control(
+                            ControlCode::DrainDeadlineExceeded,
+                            phase,
+                            format!(
+                                "the descriptors of the exited child {} did not close",
+                                self.pid
+                            ),
+                        )
+                    });
+                    break;
                 }
             }
         }

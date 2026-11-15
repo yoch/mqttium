@@ -17,14 +17,23 @@ fn assert_control<T: std::fmt::Debug>(
     );
 }
 fn fixture() -> (Child, mpsc::SyncSender<Arrival>, Collector, Books) {
-    let mut process = Command::new("cat")
+    let process = Command::new("cat")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
+    fixture_from_process(process)
+}
+
+fn fixture_from_process(
+    mut process: std::process::Child,
+) -> (Child, mpsc::SyncSender<Arrival>, Collector, Books) {
     let actions = process.stdin.take().unwrap();
     let pid = process.id();
     let (sender, received) = mpsc::sync_channel(ARRIVAL_CAPACITY);
+    if let Some(output) = process.stdout.take() {
+        reader(output, None, sender.clone());
+    }
     let schema = crate::strict::parse(include_bytes!(
         "../../../../contracts/schema/v1/trace-record.schema.json"
     ))
@@ -356,5 +365,70 @@ fn duplicate_terminations_cross_the_actual_unix_control_reader() {
         &child.act(&Action::Settle, &mut collector, &mut books),
         ControlCode::DuplicateTermination,
         ControlPhase::Action,
+    );
+}
+
+/// Reads a complete Stop frame, emits the specified terminations through the
+/// real control descriptor, then exits 0. No timeout or broken write is needed.
+fn stopping_fixture(terminations: u8) -> (Child, mpsc::SyncSender<Arrival>, Collector, Books) {
+    let process = Command::new("python3")
+        .arg("-c")
+        .arg(
+            r#"
+import sys
+length = int.from_bytes(sys.stdin.buffer.read(4), "big")
+assert sys.stdin.buffer.read(length) == bytes([11]), "expected the Stop action"
+body = bytes.fromhex(sys.argv[2])
+sys.stdout.buffer.write((len(body).to_bytes(4, "big") + body) * int(sys.argv[1]))
+sys.stdout.buffer.flush()
+sys.exit(0)
+"#,
+        )
+        .arg(terminations.to_string())
+        .arg(
+            Report::EndOfAction {
+                action_sequence: 0,
+                last_emission: None,
+            }
+            .encode()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fixture_from_process(process)
+}
+
+#[test]
+fn a_successful_final_stop_refuses_a_duplicate_termination_before_eof() {
+    let (child, sender, mut collector, mut books) = stopping_fixture(2);
+    let pid = child.pid();
+    drop(sender);
+    let result = child.stop(&mut collector, &mut books);
+    assert_control(
+        &result,
+        ControlCode::DuplicateTermination,
+        ControlPhase::Stop,
+    );
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the normal exit was reaped"
+    );
+}
+
+#[test]
+fn a_successful_final_stop_accepts_a_clean_control_eof() {
+    let (child, sender, mut collector, mut books) = stopping_fixture(1);
+    let pid = child.pid();
+    drop(sender);
+    child
+        .stop(&mut collector, &mut books)
+        .expect("one complete termination and a normal exit is healthy");
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the normal exit was reaped"
     );
 }
