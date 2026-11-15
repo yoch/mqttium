@@ -202,8 +202,9 @@ pub enum FaultRefused {
     ZeroOccurrence,
     TableFull,
     /// An armed fault watches the same point and may select the same
-    /// passage. Only one fault fires at a passage, and the other would
-    /// count it without firing: two faults never select one element.
+    /// passage: it names the same occurrence, or it counts over another
+    /// set (one of the two leaves the kind or the source open). Only one
+    /// fault fires at a passage: two faults never select one element.
     Overlaps(FaultId),
     /// A duplicated result takes one more result slot than its command
     /// did. The slot is reserved when the fault is armed; this one would
@@ -353,6 +354,9 @@ struct Transit {
     work: Work,
     /// The fault that holds it, while one does.
     held: Option<FaultId>,
+    /// It passed the fence point once. Entering the writer again, it is
+    /// the same item: that passage is not counted again.
+    fence_passed: bool,
 }
 
 /// The inbound exchange slot a command comes from.
@@ -492,14 +496,21 @@ impl<S: DurableStore> SimStore<S> {
         let either = |left: Option<WorkKind>, right: Option<WorkKind>| {
             left.zip(right).is_none_or(|(left, right)| left == right)
         };
+        // Two selections overlap when some passage satisfies both, and
+        // they either name the same occurrence or count over different
+        // sets: one names a kind or a source the other leaves open
+        // (`contracts/README.md`, "One fault per item").
         let overlap = self.faults.iter().position(|armed| {
             let other = armed.spec;
-            other.point == spec.point
+            let compatible = other.point == spec.point
                 && either(other.kind, spec.kind)
                 && other
                     .source
                     .zip(spec.source)
-                    .is_none_or(|(left, right)| left == right)
+                    .is_none_or(|(left, right)| left == right);
+            let other_sets = other.kind.is_some() != spec.kind.is_some()
+                || other.source.is_some() != spec.source.is_some();
+            compatible && (other.occurrence == spec.occurrence || other_sets)
         });
         if let Some(index) = overlap {
             return Err(FaultRefused::Overlaps(FaultId(index)));
@@ -649,6 +660,7 @@ impl<S: DurableStore> SimStore<S> {
             ticket,
             work,
             held,
+            fence_passed: false,
         });
     }
 
@@ -775,14 +787,16 @@ impl<S: DurableStore> SimStore<S> {
         let id = transit.id;
         let (kind, operation, source) = describe(&transit.work);
         // A resolution that reads an absence reaches the fence point
-        // before its fence is written. A held fence that enters the
-        // writer again reads again, and passes the point again if the
-        // operation is still absent: the fault that held it fired once,
-        // and no other fault can select the same passage (see `arm`).
+        // before its fence is written, once. A held fence that enters
+        // the writer again reads again and fences only an operation
+        // still absent; it is the same item, so that passage is not
+        // counted again and takes no occurrence of another fault.
         let mut refuse_fence = false;
         if let Work::Resolve(resolved) = &transit.work
+            && !transit.fence_passed
             && self.store.established(*resolved).is_none()
         {
+            transit.fence_passed = true;
             match self.pass(FaultPoint::FenceTransit, id, kind, operation, source) {
                 Some(FaultAction::HoldCommand) => {
                     transit.held = self.last_hit;
