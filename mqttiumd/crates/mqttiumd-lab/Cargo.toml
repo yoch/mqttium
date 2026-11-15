@@ -11,6 +11,9 @@ publish.workspace = true
 mqttiumd-contract.workspace = true
 # The runner of lot L4 drives the real core (DEM-024).
 mqttiumd-core = { path = "../mqttiumd-core" }
+# The interface of the store, and the SQLite store the bench runs on.
+mqttiumd-store-api = { path = "../mqttiumd-store-api" }
+mqttiumd-store-sqlite = { path = "../mqttiumd-store-sqlite" }
 # Offline only: no HTTP or file retriever is compiled in, so a schema can
 # never be downloaded during a run (DEM-014).
 jsonschema = { version = "0.61.2", default-features = false }
