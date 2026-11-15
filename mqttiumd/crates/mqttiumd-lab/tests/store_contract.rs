@@ -201,3 +201,18 @@ fn snapshot_limits_refuse_without_changing_the_store() {
 fn recovery_limits_refuse_without_claiming_the_inventory_ends() {
     conformance::recovery_limits_refuse_without_claiming_the_inventory_ends(&memory);
 }
+
+#[test]
+fn snapshot_fields_include_the_opening_identity() {
+    conformance::snapshot_fields_include_the_opening_identity(&memory);
+}
+
+#[test]
+fn recovery_field_limits_apply_to_the_selected_page() {
+    conformance::recovery_field_limits_apply_to_the_selected_page(&memory);
+}
+
+#[test]
+fn recovery_field_limits_include_fixed_identities() {
+    conformance::recovery_field_limits_include_fixed_identities(&memory);
+}

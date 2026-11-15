@@ -1845,6 +1845,12 @@ pub fn snapshot_limits_refuse_without_changing_the_store<S: DurableStore>(
             max_bytes: 0,
             ..ReadBudget::SNAPSHOT
         },
+        // Every fixture field and row fits individually. Their combined
+        // logical size still exceeds this snapshot budget.
+        ReadBudget {
+            max_bytes: 512,
+            ..ReadBudget::SNAPSHOT
+        },
         ReadBudget {
             max_field_bytes: 1,
             ..ReadBudget::SNAPSHOT
@@ -1919,6 +1925,172 @@ pub fn recovery_limits_refuse_without_claiming_the_inventory_ends<S: DurableStor
     );
 }
 
+/// A snapshot includes the 24-byte opening attempt even when it has no
+/// publication or operation identity. Its field budget covers that metadata.
+pub fn snapshot_fields_include_the_opening_identity<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let world = World::new(make);
+    let before = world.store.snapshot().expect("healthy durable snapshot");
+    assert!(before.ledger.opened_by().is_some());
+    assert!(before.operations.is_empty());
+    assert!(before.publications.is_empty());
+    for max_field_bytes in [8, 16, 23] {
+        assert_eq!(
+            world.store.snapshot_with_budget(ReadBudget {
+                max_field_bytes,
+                ..ReadBudget::SNAPSHOT
+            }),
+            Err(ReadError::LimitExceeded),
+            "snapshot field budget {max_field_bytes}"
+        );
+    }
+    assert_eq!(
+        world.store.snapshot_with_budget(ReadBudget {
+            max_field_bytes: 24,
+            ..ReadBudget::SNAPSHOT
+        }),
+        Ok(before)
+    );
+}
+
+/// A page charges only the fields it delivers. The opening attempt belongs
+/// to the snapshot; it does not prevent a metadata page of eight-byte fields.
+pub fn recovery_field_limits_apply_to_the_selected_page<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let world = World::new(make);
+    let metadata = world
+        .store
+        .recover_with_budget(
+            None,
+            3,
+            ReadBudget {
+                max_field_bytes: 8,
+                ..ReadBudget::PAGE
+            },
+        )
+        .expect("the metadata facts contain only fields of at most eight bytes");
+    assert!(matches!(
+        metadata.facts.as_slice(),
+        [
+            RecoveredFact::Epoch { .. },
+            RecoveredFact::Limits { .. },
+            RecoveredFact::RouteTable { .. }
+        ]
+    ));
+    let cursor = metadata.next.expect("the fixture has routes");
+    assert!(TOPIC.len() > 8 && TOPIC.len() <= 16);
+    assert_eq!(
+        world.store.recover_with_budget(
+            Some(cursor),
+            1,
+            ReadBudget {
+                max_field_bytes: 8,
+                ..ReadBudget::PAGE
+            },
+        ),
+        Err(RecoveryRefused::Read(ReadError::LimitExceeded))
+    );
+    let route = world
+        .store
+        .recover_with_budget(
+            Some(cursor),
+            1,
+            ReadBudget {
+                max_field_bytes: 16,
+                ..ReadBudget::PAGE
+            },
+        )
+        .expect("the route topic fits within sixteen bytes");
+    assert!(matches!(
+        route.facts.as_slice(),
+        [RecoveredFact::Route { topic, .. }] if topic.as_slice() == TOPIC
+    ));
+}
+
+/// Fixed durable identities count as fields too. A refused identity fact is
+/// still read at the same cursor when its complete 32-byte field fits.
+pub fn recovery_field_limits_include_fixed_identities<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut world = World::new(make);
+    let command = world.admission(1, 7, b"payload", &[world.b]);
+    assert!(world.store.apply(&command).committed_now);
+    assert!(
+        world
+            .store
+            .resolve_and_fence(operation_id(world.epoch, 2))
+            .fenced_now
+    );
+    open(&mut world.store);
+    let before = world.store.snapshot().expect("healthy durable snapshot");
+    let inventory = world.store.recover(None, 64).expect("one complete page");
+    assert!(inventory.next.is_none());
+    let mut cursor = None;
+    let mut inbound = 0;
+    let mut committed = 0;
+    let mut fenced = 0;
+    for expected in inventory.facts.as_slice() {
+        let is_identity = match expected {
+            RecoveredFact::InboundExchange { .. } => {
+                inbound += 1;
+                true
+            }
+            RecoveredFact::Operation {
+                knowledge: Knowledge::Committed(_),
+                ..
+            } => {
+                committed += 1;
+                true
+            }
+            RecoveredFact::Operation {
+                knowledge: Knowledge::RejectedCertain(RejectReason::Fenced),
+                ..
+            } => {
+                fenced += 1;
+                true
+            }
+            _ => false,
+        };
+        if is_identity {
+            for max_field_bytes in [16, 31] {
+                assert_eq!(
+                    world.store.recover_with_budget(
+                        cursor,
+                        1,
+                        ReadBudget {
+                            max_field_bytes,
+                            ..ReadBudget::PAGE
+                        },
+                    ),
+                    Err(RecoveryRefused::Read(ReadError::LimitExceeded)),
+                    "field budget {max_field_bytes} before {expected:?}"
+                );
+            }
+        }
+        let page = world
+            .store
+            .recover_with_budget(
+                cursor,
+                1,
+                ReadBudget {
+                    max_field_bytes: 32,
+                    ..ReadBudget::PAGE
+                },
+            )
+            .expect("every selected field fits within thirty-two bytes");
+        assert_eq!(page.facts.as_slice(), std::slice::from_ref(expected));
+        cursor = page.next;
+    }
+    assert_eq!((inbound, committed, fenced), (1, 1, 1));
+    assert!(cursor.is_none());
+    assert_eq!(
+        world.store.snapshot().expect("healthy durable snapshot"),
+        before
+    );
+}
+
 /// Every check of this module, in order.
 pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     opening_opens_the_next_epoch_and_closes_the_older_ones(make);
@@ -1952,4 +2124,7 @@ pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     recovered_facts_follow_the_order_of_an_inventory(make);
     snapshot_limits_refuse_without_changing_the_store(make);
     recovery_limits_refuse_without_claiming_the_inventory_ends(make);
+    snapshot_fields_include_the_opening_identity(make);
+    recovery_field_limits_apply_to_the_selected_page(make);
+    recovery_field_limits_include_fixed_identities(make);
 }
