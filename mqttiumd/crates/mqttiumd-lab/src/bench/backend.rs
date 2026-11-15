@@ -103,6 +103,8 @@ pub fn sqlite_settings(store: &mqttiumd_store_sqlite::SqliteStore) -> Value {
         "user_version": settings.user_version,
         "page_size": settings.page_size,
         "wal_autocheckpoint": settings.wal_autocheckpoint,
+        "kill_points": settings.kill_points,
+        "checkpoint_policy": settings.checkpoint_policy,
         "read_back": "after they were set, at each opening",
     })
 }

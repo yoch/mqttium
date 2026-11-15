@@ -48,6 +48,10 @@ pub enum FaultPoint {
     /// its fence has not been written. A resolution that finds a receipt,
     /// a fence or a retired identity does not reach it.
     FenceTransit,
+    /// SQLite has written every row, but has not called COMMIT.
+    CommitPrepared,
+    /// SQLite's WAL hook after commit, before the application has its result.
+    CommitLogged,
     /// The transaction is committed and no result exists yet.
     CommitApplied,
     /// The result is ready on the store side and not delivered.
@@ -63,6 +67,8 @@ impl FaultPoint {
         match self {
             Self::CommandTransit => "store.command.transit",
             Self::FenceTransit => "store.fence.transit",
+            Self::CommitPrepared => "store.commit.prepared",
+            Self::CommitLogged => "store.commit.logged",
             Self::CommitApplied => "store.commit.applied",
             Self::ResultReady => "store.result.ready",
             Self::ResultConsume => "store.result.consume",
@@ -75,7 +81,10 @@ impl FaultPoint {
         match self {
             Self::CommandTransit => &[FaultAction::HoldCommand],
             Self::FenceTransit => &[FaultAction::HoldCommand, FaultAction::RefuseFence],
-            Self::CommitApplied | Self::ResultConsume => &[FaultAction::Barrier],
+            Self::CommitPrepared
+            | Self::CommitLogged
+            | Self::CommitApplied
+            | Self::ResultConsume => &[FaultAction::Barrier],
             Self::ResultReady => &[
                 FaultAction::DropResult,
                 FaultAction::DelayResult,
@@ -492,6 +501,27 @@ impl<S: DurableStore> SimStore<S> {
     /// order like any other step.
     pub fn store_mut(&mut self) -> &mut S {
         &mut self.store
+    }
+
+    /// Selects the transaction barrier for an about-to-enter command.
+    /// The returned event is staged: only the SQLite callback may emit
+    /// it, and the child must stop if that callback is never reached.
+    #[cfg(feature = "kill-points")]
+    pub fn transaction_barrier(&mut self, action: StoreAction) -> Option<StoreEvent> {
+        let StoreAction::EnterWriter(id) = action else {
+            return None;
+        };
+        let transit = self.transit.iter().find(|transit| transit.id == id)?;
+        if !matches!(transit.work, Work::Persist(_)) {
+            return None;
+        }
+        let (kind, operation, source) = describe(&transit.work);
+        for point in [FaultPoint::CommitPrepared, FaultPoint::CommitLogged] {
+            if self.pass(point, id, kind, operation, source).is_some() {
+                return self.events.pop();
+            }
+        }
+        None
     }
 
     /// Arms a fault. Faults are tried in arming order.

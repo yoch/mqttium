@@ -28,3 +28,7 @@ proc-macro2 = "1"
 
 [lints]
 workspace = true
+
+[features]
+# Test instrumentation is explicit and is reproduced by run --rebuild.
+kill-points = ["mqttiumd-store-sqlite/kill-points"]

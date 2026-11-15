@@ -26,7 +26,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -110,6 +110,8 @@ pub struct Killed {
     pub signal_sent: &'static str,
     /// The signal the wait status reports: 9.
     pub wait_signal: i32,
+    /// The in-flight point and settings actually reported there, if any.
+    pub transaction: Option<Value>,
 }
 
 /// The private directory of the sockets of one child, removed when it is
@@ -143,6 +145,8 @@ pub struct Child {
     /// Whether the last action ended: every frame read, acknowledged,
     /// ordered and kept in the trace.
     ended: bool,
+    /// A command still owns its SQLite stack, after the retained hit's ack.
+    parked: Option<Value>,
 }
 
 fn stop(reason: impl Into<String>) -> Stop {
@@ -171,7 +175,11 @@ fn accept(listener: &UnixListener, deadline: Instant) -> Result<UnixStream, Stop
 }
 
 /// One reader per descriptor: a full descriptor never waits for another.
-fn reader(stream: impl Read + Send + 'static, origin: Option<Origin>, to: mpsc::Sender<Arrival>) {
+fn reader(
+    stream: impl Read + Send + 'static,
+    origin: Option<Origin>,
+    to: mpsc::SyncSender<Arrival>,
+) {
     thread::spawn(move || {
         let mut stream = BufReader::new(stream);
         loop {
@@ -261,7 +269,7 @@ impl Child {
         let pid = process.id();
         let actions = process.stdin.take().ok_or_else(|| stop("no stdin"))?;
         let reports = process.stdout.take().ok_or_else(|| stop("no stdout"))?;
-        let (sender, received) = mpsc::channel();
+        let (sender, received) = mpsc::sync_channel(8 * super::protocol::WINDOW as usize);
         reader(reports, None, sender.clone());
         // From here every way out goes through `Drop for Child`, which makes
         // sure the process does not outlive the run.
@@ -280,6 +288,7 @@ impl Child {
             _sockets: sockets,
             silence: config.silence,
             ended: true,
+            parked: None,
         };
         let deadline = Instant::now() + config.silence;
         for (origin, listener) in &listeners {
@@ -347,6 +356,11 @@ impl Child {
         collector: &mut Collector,
         books: &mut Books,
     ) -> Result<Vec<Report>, Stop> {
+        if self.parked.is_some() {
+            return Err(stop(
+                "a transaction is parked in flight: only SIGKILL may follow",
+            ));
+        }
         let actions = self
             .actions
             .as_mut()
@@ -356,13 +370,27 @@ impl Child {
             .map_err(|refusal| stop(format!("the child does not read: {refusal}")))?;
         let mut reports = Vec::new();
         let mut end: Option<Option<u64>> = None;
-        let mut read = BTreeSet::new();
         let mut acknowledged = self.sequencer.next().checked_sub(1);
+        let mut last_fault = None;
         loop {
-            let contiguous = (self.sequencer.next()..)
-                .take_while(|number| read.contains(number))
-                .last()
-                .or(acknowledged);
+            // Retain the ordered prefix outside the child BEFORE its ack.
+            // In particular FaultHit is durable to the surviving process
+            // while the child is still executing the SQLite callback.
+            for (origin, line) in self
+                .sequencer
+                .take_contiguous()
+                .map_err(|why| stop(format!("the evidence of the child: {why}")))?
+            {
+                let record: Value = serde_json::from_slice(&line)
+                    .map_err(|why| stop(format!("a record of {}: {why}", origin.name())))?;
+                collector
+                    .accept(origin, &record)
+                    .map_err(|why| stop(format!("the collector refused a record: {why}")))?;
+                if record["kind"] == "FaultHit" {
+                    last_fault = Some(record["payload"].clone());
+                }
+            }
+            let contiguous = self.sequencer.next().checked_sub(1);
             if contiguous != acknowledged
                 && let Some(through) = contiguous
             {
@@ -381,13 +409,50 @@ impl Child {
             }
             match self.received.recv_timeout(self.silence) {
                 Ok(Arrival::Evidence(origin, evidence)) => {
-                    read.insert(evidence.emission);
+                    if evidence.emission.saturating_sub(self.sequencer.next())
+                        >= super::protocol::WINDOW
+                    {
+                        return Err(stop("the child emitted beyond the bounded evidence window"));
+                    }
                     self.sequencer.receive(origin, evidence);
                 }
                 Ok(Arrival::Report(Report::EndOfAction { last_emission })) => {
                     end = Some(last_emission);
                 }
-                Ok(Arrival::Report(report)) => reports.push(report),
+                Ok(Arrival::Report(Report::Parked {
+                    last_emission,
+                    fault,
+                    point,
+                    settings,
+                })) => {
+                    if Some(last_emission) != acknowledged || !self.sequencer.is_empty() {
+                        return Err(stop(
+                            "transaction parked before its evidence was retained and acknowledged",
+                        ));
+                    }
+                    let hit = last_fault
+                        .as_ref()
+                        .ok_or_else(|| stop("transaction parked without a FaultHit"))?;
+                    if hit["point"] != point || hit.get("operation_id").is_none() {
+                        return Err(stop("transaction park contradicts the retained FaultHit"));
+                    }
+                    let settings: Value = serde_json::from_str(&settings)
+                        .map_err(|why| stop(format!("transaction settings: {why}")))?;
+                    if settings["kill_points"] != true || settings["wal_autocheckpoint"] != 0 {
+                        return Err(stop("transaction park has incompatible effective settings"));
+                    }
+                    self.parked = Some(serde_json::json!({
+                        "fault": fault, "point": point, "hit": hit, "backend_settings": settings,
+                        "evidence_retained_before_ack": true,
+                    }));
+                    end = Some(Some(last_emission));
+                }
+                Ok(Arrival::Report(report)) => {
+                    if reports.len() >= super::protocol::WINDOW as usize {
+                        return Err(stop("the child exceeded the bounded action report list"));
+                    }
+                    reports.push(report);
+                }
                 Ok(Arrival::Broken(why)) => return Err(stop(format!("the child broke: {why}"))),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     return Err(stop(format!(
@@ -416,7 +481,7 @@ impl Child {
                 .map_err(|refusal| stop(format!("the collector refused a record: {refusal}")))?;
         }
         // Every frame of the action is now in the trace.
-        self.ended = true;
+        self.ended = self.parked.is_none();
         let mut others = Vec::new();
         let mut failure = None;
         for report in reports {
@@ -457,7 +522,12 @@ impl Child {
         }
         match failure {
             Some(reason) => Err(stop(reason)),
-            None => Ok(others),
+            None => {
+                if self.parked.is_some() {
+                    self.eligible.clear();
+                }
+                Ok(others)
+            }
         }
     }
 
@@ -643,7 +713,7 @@ impl Child {
         }
         // Drained, checked: the last action ended, nothing waits in the
         // sequencer, and nothing waits unread on a descriptor.
-        if !self.ended || !self.sequencer.is_empty() {
+        if (!self.ended && self.parked.is_none()) || !self.sequencer.is_empty() {
             return Err(stop(format!(
                 "the child {} is not drained: an action has not ended",
                 self.pid
@@ -669,6 +739,7 @@ impl Child {
             rank: self.rank,
             signal_sent: "SIGKILL",
             wait_signal: status.signal().unwrap_or(0),
+            transaction: self.parked.clone(),
         };
         if status.signal() != Some(9) || status.code().is_some() {
             return Err(stop(format!(
@@ -820,6 +891,10 @@ struct Relay {
 impl Relay {
     fn send(&mut self, collector: &mut Collector, actions: &mut impl Read) -> Result<(), String> {
         let lines = collector.take_lines();
+        self.send_lines(&lines, actions)
+    }
+
+    fn send_lines(&mut self, lines: &[u8], actions: &mut impl Read) -> Result<(), String> {
         for line in lines
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
@@ -846,6 +921,13 @@ impl Relay {
             };
             write_frame(socket, &evidence.encode()).map_err(|refusal| refusal.to_string())?;
             self.last = Some(emission);
+            let kind = record.get("kind").and_then(Value::as_str).unwrap_or("");
+            while !self
+                .window
+                .past(emission, super::protocol::decisive(origin.name(), kind))
+            {
+                self.read_acknowledgement(actions)?;
+            }
         }
         Ok(())
     }
@@ -868,6 +950,115 @@ impl Relay {
         }
         Ok(())
     }
+}
+
+/// Owned IO can be reached from rusqlite's Send callback without unsafe,
+/// a second reader, or a lock held by the action that entered SQLite.
+struct ChildIo {
+    relay: Relay,
+    actions: BufReader<std::io::Stdin>,
+    reports: BufWriter<std::io::Stdout>,
+}
+
+#[cfg(feature = "kill-points")]
+fn arm_transaction_barrier(
+    current: &mut Process<mqttiumd_store_sqlite::SqliteStore>,
+    choice: &Choice,
+    books: &Books,
+    io: &Arc<Mutex<ChildIo>>,
+) -> Result<bool, Stop> {
+    use crate::store::adapter::FaultPoint;
+    use mqttiumd_store_sqlite::kill_points::KillPoint;
+
+    let Some(prepared) = current.prepare_transaction_barrier(choice, books)? else {
+        return Ok(false);
+    };
+    let wanted = match prepared.point {
+        FaultPoint::CommitPrepared => KillPoint::CommitPrepared,
+        FaultPoint::CommitLogged => KillPoint::CommitLogged,
+        _ => return Err(stop("an unexpected transaction point")),
+    };
+    let io = Arc::clone(io);
+    let effective = Arc::new(Mutex::new(Value::Null));
+    let for_hook = Arc::clone(&effective);
+    let mut hits = books.hits.clone();
+    let hit = hits
+        .get_mut(prepared.scenario_fault)
+        .ok_or_else(|| stop("transaction fault has no counter"))?;
+    *hit = hit
+        .checked_add(1)
+        .ok_or_else(|| stop("transaction fault counter exhausted"))?;
+    let armed = u32::try_from(current.armed_deadlines()).unwrap_or(u32::MAX);
+    let held: Vec<u32> = books
+        .held
+        .keys()
+        .filter_map(|id| u32::try_from(*id).ok())
+        .collect();
+    current
+        .store_mut_for_kill_hook()
+        .set_kill_hook(Some(Box::new(move |point| {
+            if point != wanted {
+                return;
+            }
+            let outcome = (|| -> Result<(), String> {
+                let mut io = io.lock().map_err(|_| "the child IO lock is poisoned")?;
+                let ChildIo {
+                    relay,
+                    actions,
+                    reports,
+                } = &mut *io;
+                // The record was prepared earlier, but its bytes leave the
+                // process only NOW, from the actual SQLite callback.
+                relay.send_lines(&prepared.lines, actions)?;
+                relay.drain(actions)?;
+                let fault = u32::try_from(prepared.scenario_fault)
+                    .map_err(|_| "transaction fault index does not fit")?;
+                write_frame(
+                    reports,
+                    &Report::State {
+                        busy: true,
+                        halted: true,
+                        armed,
+                        barrier: Some(fault),
+                        hits: hits.clone(),
+                        held: held.clone(),
+                    }
+                    .encode(),
+                )
+                .map_err(|why| why.to_string())?;
+                write_frame(
+                    reports,
+                    &Report::Parked {
+                        last_emission: relay.last.ok_or("transaction hit was not emitted")?,
+                        fault,
+                        point: prepared.point.name().to_owned(),
+                        settings: for_hook
+                            .lock()
+                            .map_err(|_| "settings lock poisoned")?
+                            .to_string(),
+                    }
+                    .encode(),
+                )
+                .map_err(|why| why.to_string())?;
+                // An outstanding SQLite call has no action reply. This read
+                // parks its stack until SIGKILL; EOF or any extra action is
+                // an explicit protocol failure, never a completed command.
+                match read_frame(actions).map_err(|why| why.to_string())? {
+                    None => Err("the supervisor closed a parked transaction".to_owned()),
+                    Some(_) => Err("an action followed a parked transaction".to_owned()),
+                }
+            })();
+            eprintln!(
+                "mqttiumd-lab child: {}",
+                outcome.expect_err("a parked callback cannot finish")
+            );
+            std::process::exit(70);
+        })))
+        .map_err(|why| stop(format!("arming the SQLite point: {why:?}")))?;
+    *effective
+        .lock()
+        .map_err(|_| stop("settings lock poisoned"))? = sqlite_settings(current.store());
+    Ok(true)
 }
 
 /// `mqttiumd-lab child`: runs the process under test until `Stop` or the
@@ -920,13 +1111,16 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
             UnixStream::connect(&path).map_err(|error| format!("{}: {error}", path.display()))?;
         sockets.push((origin, BufWriter::new(socket)));
     }
-    let mut relay = Relay {
+    let relay = Relay {
         sockets,
         window: Window::new(),
         last: None,
     };
-    let mut actions = BufReader::new(std::io::stdin().lock());
-    let mut reports = BufWriter::new(std::io::stdout().lock());
+    let io = Arc::new(Mutex::new(ChildIo {
+        relay,
+        actions: BufReader::new(std::io::stdin()),
+        reports: BufWriter::new(std::io::stdout()),
+    }));
     let report = |reports: &mut BufWriter<_>, report: &Report| {
         write_frame(reports, &report.encode()).map_err(|refusal| refusal.to_string())
     };
@@ -939,11 +1133,15 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
     let mut offered: Vec<Choice> = Vec::new();
     let mut published: Vec<String> = Vec::new();
     loop {
-        let Some(body) = read_frame(&mut actions).map_err(|refusal| refusal.to_string())? else {
+        let body = {
+            let mut io = io.lock().map_err(|_| "the child IO lock is poisoned")?;
+            io.relay.last = None;
+            read_frame(&mut io.actions).map_err(|refusal| refusal.to_string())?
+        };
+        let Some(body) = body else {
             return Ok(());
         };
         let action = Action::decode(&body).map_err(|refusal| refusal.to_string())?;
-        relay.last = None;
         let mut others: Vec<Report> = Vec::new();
         let mut stopping = false;
         let outcome: Result<(), Stop> = (|| {
@@ -996,7 +1194,30 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
                                 .get(index as usize)
                                 .cloned()
                                 .ok_or_else(|| stop("no such choice"))?;
+                            #[cfg(feature = "kill-points")]
+                            let armed = {
+                                {
+                                    let mut guard =
+                                        io.lock().map_err(|_| stop("child IO lock poisoned"))?;
+                                    let ChildIo { relay, actions, .. } = &mut *guard;
+                                    relay.send(&mut collector, actions).map_err(stop)?;
+                                    relay.drain(actions).map_err(stop)?;
+                                }
+                                arm_transaction_barrier(current, &choice, &books, &io)?
+                            };
                             let written = current.perform(&choice, &mut collector, &mut books)?;
+                            #[cfg(feature = "kill-points")]
+                            if armed {
+                                current
+                                    .store_mut_for_kill_hook()
+                                    .set_kill_hook(None)
+                                    .map_err(|why| {
+                                        stop(format!("disarming a missed point: {why:?}"))
+                                    })?;
+                                return Err(stop(
+                                    "the armed transaction kill point was not reached",
+                                ));
+                            }
                             current.settle(&mut collector, &mut books)?;
                             if let Some(written) = written {
                                 others.push(Report::Written {
@@ -1073,25 +1294,31 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
             }
             Ok(())
         })();
-        relay.send(&mut collector, &mut actions)?;
+        let mut guard = io.lock().map_err(|_| "the child IO lock is poisoned")?;
+        let ChildIo {
+            relay,
+            actions,
+            reports,
+        } = &mut *guard;
+        relay.send(&mut collector, actions)?;
         for other in &others {
-            report(&mut reports, other)?;
+            report(reports, other)?;
         }
         if let Err(Stop(reason)) = outcome {
-            report(&mut reports, &Report::Stopped { reason })?;
+            report(reports, &Report::Stopped { reason })?;
         }
         if let Some(current) = &process {
             offered = current.choices();
             published = offered.iter().map(Choice::describe).collect();
             report(
-                &mut reports,
+                reports,
                 &Report::Eligible {
                     digest: choices_digest(&published),
                     choices: published.clone(),
                 },
             )?;
             report(
-                &mut reports,
+                reports,
                 &Report::State {
                     busy: current.busy(),
                     halted: current.halted(),
@@ -1108,7 +1335,7 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
         }
         if stopping {
             report(
-                &mut reports,
+                reports,
                 &Report::Finished {
                     unwritten: books
                         .unwritten
@@ -1119,12 +1346,12 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
             )?;
         }
         report(
-            &mut reports,
+            reports,
             &Report::EndOfAction {
                 last_emission: relay.last,
             },
         )?;
-        relay.drain(&mut actions)?;
+        relay.drain(actions)?;
         if stopping {
             return Ok(());
         }

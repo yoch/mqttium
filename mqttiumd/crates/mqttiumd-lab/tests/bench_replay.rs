@@ -32,7 +32,14 @@ fn the_recorded_command_replays_the_campaign_on(backend: &str) {
     // Nothing but the directory is changed.
     let out = fresh(&format!("replay-of-{backend}"));
     let (program, arguments) = command.split_once(" -- ").expect("cargo run … -- …");
-    assert_eq!(program, "cargo run -p mqttiumd-lab --locked");
+    assert_eq!(
+        program,
+        if cfg!(feature = "kill-points") {
+            "cargo run -p mqttiumd-lab --locked --features kill-points"
+        } else {
+            "cargo run -p mqttiumd-lab --locked"
+        }
+    );
     let arguments: Vec<String> = arguments
         .replace(PLACEHOLDER, "\u{1}")
         .split(' ')
