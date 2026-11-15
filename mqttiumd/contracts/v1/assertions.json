@@ -115,6 +115,14 @@
       "requirements": [
         "DEM-012"
       ]
+    },
+    {
+      "name": "terminal_knowledge_never_regresses",
+      "meaning": "An unknown result consumed after a terminal result of the same operation changes nothing: nothing the core does follows from it, no second acknowledgement, no new resolution of the operation.",
+      "every_run": false,
+      "requirements": [
+        "DEM-010"
+      ]
     }
   ]
 }

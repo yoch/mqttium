@@ -1005,7 +1005,7 @@ def case(
     }
     files(written)
     OUTPUTS.update(written)
-    if base is p1_02b and assertions is ASSERTIONS:
+    if scenario == "p1-02b" and assertions is ASSERTIONS:
         assertions = P1_02B_ASSERTIONS
     assertions = [*assertions, *(name for name in EVERY_RUN if name not in assertions)]
     statuses = dict.fromkeys(assertions, "PASS")
@@ -1991,6 +1991,65 @@ case(
     base=p1_02b,
     scenario="p1-02b",
     events=acknowledges_again,
+)
+
+
+def resolves_again_later(events):
+    # Long after the commit is known, the core resolves the operation once
+    # more, from no answer in particular.
+    insert_after(
+        events,
+        "release.delivered",
+        [
+            ev(
+                "resolve.again",
+                "store-adapter",
+                "ResolveSubmitted",
+                {"effect_id": effect(1, 12), "operation_id": OP_ADMIT},
+                ["release.delivered"],
+            )
+        ],
+    )
+
+
+case(
+    "operation-resolved-again-after-its-commit",
+    "DEM-MU-05: after the commit is known, the operation is resolved again.",
+    {TERMINAL: "FAIL"},
+    base=p1_02b,
+    scenario="p1-02b",
+    events=resolves_again_later,
+)
+
+
+def unknown_before_the_commit(events):
+    # The unknown answer reaches the core while the outcome is still
+    # unknown, and the core arms a deadline on it: knowledge has not
+    # regressed, it has not yet progressed.
+    for label in ("unknown.released", "unknown.delivered.handed", "unknown.delivered"):
+        event = events.pop(at(events, label))
+        events.insert(at(events, "deadline.2"), event)
+    insert_after(
+        events,
+        "unknown.delivered",
+        [
+            ev(
+                "armed.on.unknown",
+                "timer",
+                "DeadlineArmed",
+                {"effect_id": effect(1, 13), "token": "9", "after": "30"},
+                ["unknown.delivered"],
+            )
+        ],
+    )
+
+
+case(
+    "p1-02b-good-unknown-before-the-commit",
+    "An unknown answer consumed before any terminal one may be followed: nothing regressed.",
+    base=p1_02b,
+    scenario="p1-02b",
+    events=unknown_before_the_commit,
 )
 
 # ------------------------------------------ the opening of an epoch
