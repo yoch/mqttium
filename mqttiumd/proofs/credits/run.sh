@@ -8,7 +8,8 @@
 #    verified and a false one refuted (proofs/preflight.sh).
 # 2. The body: the digest of crates/mqttiumd-core/src/credits.rs and of the
 #    text of release_if_current must be the ones recorded in BODY.sha256.
-#    A result belongs to an exact content.
+#    A result belongs to an exact content. The module names nothing that
+#    allocates or does IO.
 # 3. Every harness listed in harnesses.txt, one run each: verified, no
 #    failed check, and exactly the listed number of cover properties, all
 #    satisfied. The list and the source must name the same harnesses.
@@ -51,6 +52,17 @@ $current
 BODY.sha256 records:
 $(cat "$HERE/BODY.sha256" 2>/dev/null)
 Review the change, then run with --record and update PROOF.md."
+
+# The module names nothing that allocates or does IO: no path into `alloc`
+# or `std`, no collection, no formatting macro. The crate is `no_std`, so
+# this is what "does not allocate" can mean in the source; the tests are
+# excluded, they run under `std`.
+production="$(sed '/^#\[cfg(test)\]$/,$d' "$SOURCE")"
+if printf '%s\n' "$production" \
+    | grep -nE '(^|[^a-z_])(alloc|std)::|[^a-z_](Vec|Box|String|Rc|Arc)[^a-z_]|(vec|format|write|print|println)!' \
+    | grep -vE '^[0-9]+:\s*//'; then
+    fail 5 "credits.rs names something that allocates or does IO (lines above)"
+fi
 
 # --- 3. the harnesses ----------------------------------------------------
 listed="$(grep -v '^#' "$HERE/harnesses.txt" | cut -d' ' -f1 | sort)"
@@ -102,6 +114,7 @@ proof: PASS
   function        mqttiumd_core::credits::release_if_current
   source digest   sha256:$file_digest (crates/mqttiumd-core/src/credits.rs)
   body digest     sha256:$body_digest (text of the function)
+  no allocation   the module names no allocating or IO item (source check)
   harnesses       $total verified, 0 failed
   witnesses       $witnesses of $witnesses cover properties satisfied
   coverage        $covered of $all regions of the function covered (p1, no assumption)
