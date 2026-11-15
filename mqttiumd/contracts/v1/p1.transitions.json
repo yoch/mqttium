@@ -1281,7 +1281,7 @@
         "MU-08",
         "DEM-MU-01"
       ],
-      "justification": "ARC-011: a certain refusal ends the exchange without distribution and answers as the protocol says, with a PUBREC that carries a failure."
+      "justification": "ARC-011: a certain refusal ends the exchange without distribution and answers as the protocol says, with a PUBREC that carries a failure. The reason is the one the rejection gives: QuotaExceeded when a capacity is the cause, ImplementationSpecificError otherwise (record 0013, line 10)."
     },
     {
       "id": "inbound_qos2.admission_pending.rejected.defer",

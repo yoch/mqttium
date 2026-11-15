@@ -798,6 +798,61 @@ def _by_schema(contracts, document, out):
     _decimal_members(contracts.schemas, file, contracts.schemas[file], document, "", out)
 
 
+# The place of a kind of fact in the inventory of a recovery, first to last
+# (record 0014), and the kinds an inventory holds at most once.
+FACT_RANKS = ("Epoch", "Limits", "RouteTable", "Route", "Session", "InboundExchange", "Operation")
+FACTS_ONCE = ("Epoch", "Limits", "RouteTable")
+
+
+class InventoryOrder:
+    """The order of the facts of a recovery, as ``RecoveryOrder`` states it.
+
+    Ranks never decrease; the epoch, the limits and the route table appear
+    at most once; routes are sorted by the bytes of their topic, equal
+    topics accepted. A fresh value checks one page; a value carried from
+    page to page checks a whole inventory. A refusal changes nothing.
+    """
+
+    def __init__(self):
+        self.last = None
+        self.last_topic = None
+
+    def admit(self, fact):
+        """``None`` when ``fact`` may come next, else ``(code, member, why)``."""
+        rank = FACT_RANKS.index(fact["kind"])
+        if self.last is not None:
+            if rank < self.last:
+                return (
+                    "rows-out-of-order",
+                    "kind",
+                    f"a {fact['kind']} fact follows a {FACT_RANKS[self.last]} fact",
+                )
+            if rank == self.last and fact["kind"] in FACTS_ONCE:
+                return ("duplicate-name", "kind", f"a second {fact['kind']} fact")
+        if fact["kind"] == "Route":
+            # Lower-case hexadecimal sorts like the bytes it spells.
+            if self.last_topic is not None and fact["topic_hex"] < self.last_topic:
+                return (
+                    "rows-out-of-order",
+                    "topic_hex",
+                    "the topic of the route sorts before the topic of the route before it",
+                )
+            self.last_topic = fact["topic_hex"]
+        self.last = rank
+        return None
+
+
+def _trace_record(contracts, document, out):
+    _by_schema(contracts, document, out)
+    if document["kind"] in ("RecoveryPageRead", "RecoveryPageDelivered"):
+        order = InventoryOrder()
+        for index, fact in enumerate(document["payload"]["facts"]):
+            refusal = order.admit(fact)
+            if refusal is not None:
+                code, member, why = refusal
+                out.append(Diagnostic(code, f"/payload/facts/{index}/{member}", why))
+
+
 def _key(value):
     """A hashable form of a JSON value."""
     if isinstance(value, dict):
@@ -881,7 +936,7 @@ _RULES = {
     "mqttiumd.transition-catalog": _transition_catalog,
     "mqttiumd.run-result": _run_result,
     "mqttiumd.run-manifest": _run_manifest,
-    "mqttiumd.trace-record": _by_schema,
+    "mqttiumd.trace-record": _trace_record,
     "mqttiumd.store-snapshot": _store_snapshot,
     "mqttiumd.requirement-register": _names_once("entries", "id"),
     "mqttiumd.assertion-catalog": _assertion_catalog,

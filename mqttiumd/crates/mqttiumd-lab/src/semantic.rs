@@ -1304,6 +1304,82 @@ fn trace_record(document: &Value, out: &mut Vec<Diagnostic>) {
         );
     }
     decimal_strings(document.get("payload"), "/payload", out);
+    if matches!(
+        document.get("kind").and_then(Value::as_str),
+        Some("RecoveryPageRead" | "RecoveryPageDelivered")
+    ) {
+        recovered_facts_order(document, out);
+    }
+}
+
+/// The kinds of recovered fact in the order of an inventory, first to
+/// last, and whether an inventory holds at most one of the kind. This is
+/// the order of `mqttiumd_contract::effects::FactRank`; a test holds the
+/// two together.
+const FACT_RANKS: [(&str, bool); 7] = [
+    ("Epoch", true),
+    ("Limits", true),
+    ("RouteTable", true),
+    ("Route", false),
+    ("Session", false),
+    ("InboundExchange", false),
+    ("Operation", false),
+];
+
+/// The facts of one recovery page follow the order of an inventory, as
+/// `RecoveryOrder::admit` states it (record 0014): ranks never decrease,
+/// the epoch, the limits and the route table appear at most once, and
+/// routes are sorted by the bytes of their topic. A fact out of place
+/// changes nothing for those that follow.
+fn recovered_facts_order(document: &Value, out: &mut Vec<Diagnostic>) {
+    let mut last: Option<usize> = None;
+    let mut last_topic: Option<&str> = None;
+    let facts = document
+        .pointer("/payload/facts")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    for (index, fact) in facts.iter().enumerate() {
+        let kind = fact.get("kind").and_then(Value::as_str).unwrap_or_default();
+        let Some(rank) = FACT_RANKS.iter().position(|(name, _)| *name == kind) else {
+            continue;
+        };
+        let at = format!("/payload/facts/{index}");
+        if let Some(previous) = last {
+            if rank < previous {
+                out.push(Diagnostic::new(
+                    code::ROWS_OUT_OF_ORDER,
+                    format!("{at}/kind"),
+                    format!("a {kind} fact follows a {} fact", FACT_RANKS[previous].0),
+                ));
+                continue;
+            }
+            if rank == previous && FACT_RANKS[rank].1 {
+                out.push(Diagnostic::new(
+                    code::DUPLICATE_NAME,
+                    format!("{at}/kind"),
+                    format!("a second {kind} fact"),
+                ));
+                continue;
+            }
+        }
+        if kind == "Route" {
+            // Lower-case hexadecimal sorts like the bytes it spells.
+            let topic = fact
+                .get("topic_hex")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if last_topic.is_some_and(|previous| topic < previous) {
+                out.push(Diagnostic::new(
+                    code::ROWS_OUT_OF_ORDER,
+                    format!("{at}/topic_hex"),
+                    "the topic of the route sorts before the topic of the route before it",
+                ));
+                continue;
+            }
+            last_topic = Some(topic);
+        }
+        last = Some(rank);
+    }
 }
 
 /// One component of the key of a snapshot row: a number, or bytes in
@@ -1445,7 +1521,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
 /// Names of the members that hold a 64-bit decimal string, in a trace
 /// payload or a snapshot. A test walks the schemas and fails when one of
 /// their 64-bit members is missing here.
-const COMPONENTS: [&str; 37] = [
+const COMPONENTS: [&str; 38] = [
     "incarnation",
     "epoch",
     "owner",
@@ -1475,6 +1551,7 @@ const COMPONENTS: [&str; 37] = [
     "ticket",
     "collected_through",
     "state_revision",
+    "target",
     "next_session",
     "source_session",
     "target_revision",
@@ -1565,6 +1642,28 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains(cell))
+    }
+
+    /// The order of the kinds of fact is the order of the contract, and
+    /// the kinds held at most once are those the contract names.
+    #[test]
+    fn the_order_of_recovered_facts_is_the_order_of_the_contract() {
+        use mqttiumd_contract::effects::FactRank;
+        let ranks = [
+            FactRank::Epoch,
+            FactRank::Limits,
+            FactRank::RouteTable,
+            FactRank::Route,
+            FactRank::Session,
+            FactRank::InboundExchange,
+            FactRank::Operation,
+        ];
+        assert_eq!(ranks.len(), FACT_RANKS.len());
+        for (rank, (name, once)) in ranks.iter().zip(FACT_RANKS) {
+            assert_eq!(format!("{rank:?}"), name);
+            assert_eq!(rank.at_most_once(), once, "{name}");
+        }
+        assert!(ranks.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     /// The Rust reader finds 64-bit members by name. Every member that a

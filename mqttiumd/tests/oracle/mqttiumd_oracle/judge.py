@@ -22,6 +22,7 @@ import hashlib
 from dataclasses import dataclass, field
 
 from . import recipe as recipes
+from .semantic import InventoryOrder
 from .strict import Refused, parse
 from .trace import Trace
 from .trace import read as read_trace
@@ -658,6 +659,20 @@ def broker_inputs_have_provenance(run):
             fired.add(token)
 
         pages = side("store-adapter", incarnation, "RecoveryPageRead")
+        # The pages the adapter read are one inventory (record 0014): the
+        # order holds from page to page, and a route belongs to the table
+        # that precedes it. A page of another kind of store is not an input
+        # a core may be given.
+        inventory, table = InventoryOrder(), False
+        for page in pages:
+            for index, fact in enumerate(page.payload["facts"]):
+                refusal = inventory.admit(fact)
+                if refusal is not None:
+                    blame(page, f"fact {index} is out of place in the inventory: {refusal[2]}")
+                elif fact["kind"] == "RouteTable":
+                    table = True
+                elif fact["kind"] == "Route" and not table:
+                    blame(page, f"fact {index} is a route and no route table precedes it")
         used = set()
         expected = 0
         for record in side("broker-core", incarnation, "RecoveryPageDelivered"):

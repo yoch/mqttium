@@ -70,6 +70,14 @@ A snapshot the trace cites is evidence only when it is the snapshot of the
 same run and of the backend the trace declares, for the checkpoint that
 cites it. Otherwise the checkpoint has no usable snapshot.
 
+The pages the store adapter read during one recovery are one inventory
+(record 0014). The oracle carries the order of the facts from page to
+page, and requires a route table before the first route; a page out of
+place fails `broker_inputs_have_provenance`, since no store of the
+contract hands such an inventory to a core. It does not require that an
+inventory holds an epoch, limits or a table when it has no route: record
+0014 leaves that open.
+
 The packets the core consumed are audited down to the bytes: the bytes the
 transport received name the packet of a peer that carries the same bytes,
 and those bytes are exactly the one packet delivered, by its type and its

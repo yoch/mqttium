@@ -925,11 +925,12 @@
           "$ref": "primitives.schema.json#/$defs/packet_id"
         },
         "reason": {
-          "description": "The outcome the frame carries, in the vocabulary of the subset.",
+          "description": "The outcome the frame carries, in the vocabulary of the subset. A PUBREC that refuses an admission carries QuotaExceeded when a capacity is the cause and ImplementationSpecificError otherwise.",
           "enum": [
             "Success",
             "PacketIdentifierNotFound",
-            "QuotaExceeded"
+            "QuotaExceeded",
+            "ImplementationSpecificError"
           ]
         },
         "session_present": {
@@ -1352,7 +1353,7 @@
       }
     },
     "recovered_fact": {
-      "description": "One fact of a recovery page, as the store adapter reads it from the store the broker opened.",
+      "description": "One fact of a recovery page, as the store adapter reads it from the store the broker opened. The semantic pass enforces the order of the facts of a page: Epoch, Limits, RouteTable, Route, Session, InboundExchange, Operation.",
       "type": "object",
       "required": [
         "kind"
@@ -1361,6 +1362,9 @@
         "kind": {
           "enum": [
             "Epoch",
+            "Limits",
+            "RouteTable",
+            "Route",
             "Session",
             "InboundExchange",
             "Operation"
@@ -1396,6 +1400,117 @@
               },
               "epoch": {
                 "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Limits"
+              }
+            }
+          },
+          "then": {
+            "description": "The bounds the core needs to refuse before any mutation. The two 32-bit bounds are JSON integers.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "max_targets_per_admission",
+              "max_topic_bytes",
+              "max_payload_bytes"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Limits"
+              },
+              "max_targets_per_admission": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4294967295
+              },
+              "max_topic_bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4294967295
+              },
+              "max_payload_bytes": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "RouteTable"
+              }
+            }
+          },
+          "then": {
+            "description": "The durable revision of the route table. The routes that follow belong to it.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "revision"
+            ],
+            "properties": {
+              "kind": {
+                "const": "RouteTable"
+              },
+              "revision": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Route"
+              }
+            }
+          },
+          "then": {
+            "description": "One target of one exact topic. Routes are sorted by the bytes of their topic.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "topic_hex",
+              "target",
+              "target_revision",
+              "max_qos"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Route"
+              },
+              "topic_hex": {
+                "$ref": "primitives.schema.json#/$defs/hex_bytes"
+              },
+              "target": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "target_revision": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "max_qos": {
+                "$ref": "primitives.schema.json#/$defs/qos"
               }
             }
           }

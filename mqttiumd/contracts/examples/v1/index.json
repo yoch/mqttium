@@ -636,6 +636,12 @@
       "why": "The facts of a page are in the order of the inventory: a route never follows a session."
     },
     {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-epoch-twice.json",
+      "code": "duplicate-name",
+      "pointer": "/payload/facts/1/kind",
+      "why": "An inventory holds its epoch once."
+    },
+    {
       "file": "contracts/examples/v1/invalid/trace-record-recovered-limits-twice.json",
       "code": "duplicate-name",
       "pointer": "/payload/facts/2/kind",
@@ -664,6 +670,12 @@
       "code": "u64-out-of-range",
       "pointer": "/payload/facts/1/max_payload_bytes",
       "why": "The bound on a payload is 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovered-route-target-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/facts/4/target",
+      "why": "The session a route targets is a 64-bit identity."
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-recovered-route-target-revision-overflow.json",

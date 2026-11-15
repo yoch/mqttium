@@ -1303,6 +1303,14 @@ trace_case(
     code="rows-out-of-order",
 )
 trace_case(
+    "recovered-epoch-twice",
+    FULL_READ,
+    "/payload/facts/1/kind",
+    "An inventory holds its epoch once.",
+    setter(["payload", "facts", 1], PAGE_FULL["facts"][0]),
+    code="duplicate-name",
+)
+trace_case(
     "recovered-limits-twice",
     FULL_READ,
     "/payload/facts/2/kind",
@@ -1338,6 +1346,14 @@ trace_case(
     "/payload/facts/1/max_payload_bytes",
     "The bound on a payload is 64-bit.",
     setter(["payload", "facts", 1, "max_payload_bytes"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "recovered-route-target-overflow",
+    FULL_READ,
+    "/payload/facts/4/target",
+    "The session a route targets is a 64-bit identity.",
+    setter(["payload", "facts", 4, "target"], "18446744073709551616"),
     code="u64-out-of-range",
 )
 trace_case(

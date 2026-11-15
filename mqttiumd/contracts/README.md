@@ -148,6 +148,24 @@ core consumed:
 | Deadline | `DeadlineDelivered` | `DeadlineArmed` of the timer with the same token, not delivered before |
 | Recovery page | `RecoveryPageDelivered` | `RecoveryPageRead` of the store adapter with the same content |
 
+A recovery page lists its facts. Besides the epoch, the sessions, the
+inbound exchanges and the operations, an inventory holds what the core
+needs to prepare an admission (record 0014): `Limits`, `RouteTable` and
+one `Route` per target of a topic. A 64-bit quantity is a decimal string
+and a 32-bit bound a JSON integer. The facts of a page follow the order
+of an inventory, which is the rule of `RecoveryOrder::admit`: `Epoch`,
+`Limits`, `RouteTable`, `Route`, `Session`, `InboundExchange`,
+`Operation`, ranks never decreasing; the first three at most once
+(`duplicate-name`); routes sorted by the bytes of their topic, equal
+topics accepted (`rows-out-of-order` for a rank or a topic out of place).
+A reader of documents sees one page. That the pages of one recovery form
+one inventory, and that a route has its table before it, is checked by
+the oracle on the whole trace.
+
+`FrameEligible` carries the reason of an acknowledgement. A PUBREC that
+refuses an admission carries `QuotaExceeded` when a capacity is the cause
+and `ImplementationSpecificError` (0x83) otherwise.
+
 `InputRefused` is what the dispatcher records when it refuses a result
 that answers no effect in flight. `StoreCommitStable`, `StoreFenceStable`,
 `StoreFenceRefused` and `StoreResultReady` are hidden truth of the store: they judge a run and
