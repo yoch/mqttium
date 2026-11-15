@@ -638,6 +638,34 @@ bad(
     "A fence fault names the resolved operation by its command, which an earlier fault must select.",
     qabs_a(setter(["faults", 1, "match", "command_kind"], "ReleaseInbound")),
 )
+# A kill inside a transaction (record 0020): the barrier of QABS-A moved to
+# the two points of the SQLite store's transaction.
+for point, name in (("store.commit.prepared", "prepared"), ("store.commit.logged", "logged")):
+    ok(f"scenario-barrier-at-commit-{name}.json", qabs_a(setter(["faults", 2, "point"], point)))
+    bad(
+        f"scenario-hold-at-commit-{name}.json",
+        "fault-action-unknown",
+        "/faults/2/action",
+        f"{point} only stops the writer at a barrier: no command is held there.",
+        qabs_a(
+            lambda v, point=point: (
+                v["faults"][2].update(point=point, action="hold_command"),
+                v["steps"].pop(LEAVE),
+            )
+        ),
+    )
+    bad(
+        f"scenario-result-at-commit-{name}.json",
+        "fault-match-invalid",
+        "/faults/2/match/result_of",
+        f"{point} carries a command; no result exists there yet.",
+        qabs_a(
+            lambda v, point=point: (
+                v["faults"][2].update(point=point),
+                v["faults"][2]["match"].update(result_of="Persist"),
+            )
+        ),
+    )
 bad(
     "scenario-leave-of-a-held-command.json",
     "held-item-mismatch",
@@ -1098,12 +1126,15 @@ bad(
     "A point that carries a command cannot delay a result.",
     (lambda v: (v["points"][0]["actions"].append("delay_result"), v)[1])(copy.deepcopy(FAULTS)),
 )
+READY_AT = next(i for i, p in enumerate(FAULTS["points"]) if p["point"] == "store.result.ready")
 bad(
     "fault-catalog-refuse-fence-on-a-result-point.json",
     "fault-action-unknown",
-    "/points/3/actions/3",
+    f"/points/{READY_AT}/actions/{len(FAULTS['points'][READY_AT]['actions'])}",
     "A fence is a command of the writer: a point that carries a result cannot refuse one.",
-    (lambda v: (v["points"][3]["actions"].append("refuse_fence"), v)[1])(copy.deepcopy(FAULTS)),
+    (lambda v: (v["points"][READY_AT]["actions"].append("refuse_fence"), v)[1])(
+        copy.deepcopy(FAULTS)
+    ),
 )
 bad(
     "fault-catalog-action-nobody-defines.json",

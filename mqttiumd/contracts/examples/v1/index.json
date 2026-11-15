@@ -10,6 +10,8 @@
     "contracts/examples/v1/valid/scenario-u64-max.json",
     "contracts/examples/v1/valid/scenario-core-without-bytes.json",
     "contracts/examples/v1/valid/scenario-qos0-publish.json",
+    "contracts/examples/v1/valid/scenario-barrier-at-commit-prepared.json",
+    "contracts/examples/v1/valid/scenario-barrier-at-commit-logged.json",
     "contracts/examples/v1/valid/scenario-permanent-delay.json",
     "contracts/examples/v1/valid/scenario-repeated-fault-after-the-occurrence-of-another.json",
     "contracts/examples/v1/valid/scenario-held-command-and-result.json",
@@ -427,6 +429,30 @@
       "why": "A fence fault names the resolved operation by its command, which an earlier fault must select."
     },
     {
+      "file": "contracts/examples/v1/invalid/scenario-hold-at-commit-prepared.json",
+      "code": "fault-action-unknown",
+      "pointer": "/faults/2/action",
+      "why": "store.commit.prepared only stops the writer at a barrier: no command is held there."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-result-at-commit-prepared.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/2/match/result_of",
+      "why": "store.commit.prepared carries a command; no result exists there yet."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-hold-at-commit-logged.json",
+      "code": "fault-action-unknown",
+      "pointer": "/faults/2/action",
+      "why": "store.commit.logged only stops the writer at a barrier: no command is held there."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-result-at-commit-logged.json",
+      "code": "fault-match-invalid",
+      "pointer": "/faults/2/match/result_of",
+      "why": "store.commit.logged carries a command; no result exists there yet."
+    },
+    {
       "file": "contracts/examples/v1/invalid/scenario-leave-of-a-held-command.json",
       "code": "held-item-mismatch",
       "pointer": "/steps/8/fault",
@@ -681,7 +707,7 @@
     {
       "file": "contracts/examples/v1/invalid/fault-catalog-refuse-fence-on-a-result-point.json",
       "code": "fault-action-unknown",
-      "pointer": "/points/3/actions/3",
+      "pointer": "/points/5/actions/3",
       "why": "A fence is a command of the writer: a point that carries a result cannot refuse one."
     },
     {

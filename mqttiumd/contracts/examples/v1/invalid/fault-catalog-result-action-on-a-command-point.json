@@ -25,6 +25,22 @@
       ]
     },
     {
+      "point": "store.commit.prepared",
+      "meaning": "Inside the transaction of the store: the guards and writes of the command and the meta row are written, the commit is not. A kill here leaves the state before the command (record 0020).",
+      "carries": "command",
+      "actions": [
+        "barrier"
+      ]
+    },
+    {
+      "point": "store.commit.logged",
+      "meaning": "Inside the transaction of the store: the commit frame is written and synced, COMMIT has not returned and no StoreCommitStable is written. A kill here leaves the state after the command, which only the recovery shows (record 0020).",
+      "carries": "command",
+      "actions": [
+        "barrier"
+      ]
+    },
+    {
       "point": "store.commit.applied",
       "meaning": "The transaction is committed and no result exists yet.",
       "carries": "command",
