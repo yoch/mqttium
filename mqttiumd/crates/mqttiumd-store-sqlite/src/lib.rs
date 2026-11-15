@@ -88,6 +88,28 @@ use codec::{
 
 pub use schema::{FORMAT, SCHEMA_VERSION};
 
+/// The points of the store at which the bench may kill its process, in
+/// a build with the feature `kill-points` only (record 0002, plan
+/// `docs/missions/L7-kill-inside-a-transaction.md`). The product is never
+/// built with it: `effective_settings().kill_points` says which build
+/// runs, and `tools/check_kill_points.sh` refuses a product build that
+/// carries it.
+#[cfg(feature = "kill-points")]
+pub mod kill_points {
+    /// A point inside the write path of a command.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum KillPoint {
+        /// `store.commit.prepared`: every guard read and every row written,
+        /// the meta row one revision later, `COMMIT` not called yet. The
+        /// transaction is open and holds the engine's write lock.
+        CommitPrepared,
+    }
+
+    /// Called at each point the store passes. It may block, for the bench
+    /// to kill the process there; it must not call the store.
+    pub type Hook = Box<dyn FnMut(KillPoint) + Send>;
+}
+
 /// What the engine says about itself and about the settings in force,
 /// read back after they were set (DEM-011).
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -107,6 +129,9 @@ pub struct Settings {
     /// `PRAGMA wal_autocheckpoint`, in pages: the engine's checkpoint of
     /// the WAL into the database. Commits are not grouped otherwise.
     pub wal_autocheckpoint: i64,
+    /// Whether this build carries the kill points of the bench (feature
+    /// `kill-points`). A build of the product must say false.
+    pub kill_points: bool,
 }
 
 /// Why a file was not opened as a store.
@@ -1109,6 +1134,7 @@ fn settle(conn: &Connection) -> Result<Settings, OpenError> {
         user_version,
         page_size,
         wal_autocheckpoint,
+        kill_points: cfg!(feature = "kill-points"),
     })
 }
 
@@ -1150,6 +1176,8 @@ pub struct SqliteStore {
     /// The writer's lock, held while the store lives. Declared last: the
     /// fields drop in order, so the connection is closed, and its last
     /// checkpoint done, before another writer can take the lock.
+    #[cfg(feature = "kill-points")]
+    kill_hook: Option<kill_points::Hook>,
     _writer_lock: File,
 }
 
@@ -1270,6 +1298,8 @@ impl SqliteStore {
             settings,
             durability: Durability::Available,
             ledger: meta.ledger,
+            #[cfg(feature = "kill-points")]
+            kill_hook: None,
             _writer_lock: lock,
         })
     }
@@ -1281,6 +1311,12 @@ impl SqliteStore {
             Fault::Corrupt => OpenError::Corrupt,
             Fault::Sql(error) => OpenError::Sql(error),
         })
+    }
+
+    /// Sets the function the store calls at each kill point, or removes it.
+    #[cfg(feature = "kill-points")]
+    pub fn set_kill_hook(&mut self, hook: Option<kill_points::Hook>) {
+        self.kill_hook = hook;
     }
 
     /// The engine and the settings in force, read back at opening.

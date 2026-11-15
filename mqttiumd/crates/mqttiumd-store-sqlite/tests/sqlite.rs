@@ -47,6 +47,9 @@ fn the_settings_in_force_are_read_back() {
     assert!(!settings.compile_options.is_empty());
     assert!(settings.page_size > 0);
     assert!(settings.wal_autocheckpoint > 0);
+    // The settings say which build runs: the workspace tests, without the
+    // feature, run a store that carries no kill point.
+    assert_eq!(settings.kill_points, cfg!(feature = "kill-points"));
 }
 
 #[test]
