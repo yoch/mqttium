@@ -903,6 +903,13 @@ fn two_faults_that_may_select_one_passage_are_refused() {
             source: Some((bench.producer, packet(7))),
             ..fault(FaultPoint::ResultReady, FaultAction::DropResult)
         },
+        // Another occurrence, but counted over the passages of one
+        // source only: which fault acts would depend on the store.
+        FaultSpec {
+            source: Some((bench.producer, packet(7))),
+            occurrence: 2,
+            ..fault(FaultPoint::ResultReady, FaultAction::DropResult)
+        },
     ];
     for spec in overlapping {
         assert_eq!(
@@ -1210,4 +1217,124 @@ fn only_a_duplicate_reserves_a_result_slot() {
     let command = bench.admission(1, 7, b"p", &[bench.b]);
     persist(&mut bench, 1, &command);
     assert_eq!(bench.store.results_owed(), 1);
+}
+
+fn on_resolutions(point: FaultPoint, action: FaultAction, occurrence: u64) -> FaultSpec {
+    FaultSpec {
+        kind: Some(WorkKind::ResolveAndFence),
+        occurrence,
+        ..fault(point, action)
+    }
+}
+
+fn hits_of(events: &[StoreEvent], fault: FaultId) -> Vec<(u64, WorkId)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            StoreEvent::FaultHit {
+                fault: reached,
+                occurrence,
+                id,
+                ..
+            } if *reached == fault => Some((*occurrence, *id)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Faults on one point, for one kind, at different occurrences select
+/// different passages (`contracts/README.md`, "One fault per item"):
+/// they are armed, and each fires at its own passage.
+#[test]
+fn faults_of_different_occurrences_each_fire_at_their_passage() {
+    let mut bench = bench_with(AdapterLimits {
+        operations_in_flight: 4,
+        result_slots: 8,
+        ..LIMITS
+    });
+    let faults: Vec<FaultId> = (1..=3)
+        .map(|occurrence| {
+            bench
+                .store
+                .arm(on_resolutions(
+                    FaultPoint::ResultReady,
+                    FaultAction::DelayResult,
+                    occurrence,
+                ))
+                .expect("another occurrence")
+        })
+        .collect();
+    let mut ids = Vec::new();
+    for sequence in 1..=3 {
+        let operation = operation_id(bench.epoch, 10 + sequence);
+        let id = resolve(&mut bench, sequence, operation);
+        assert_eq!(enter(&mut bench, id), Performed::Executed);
+        ids.push(id);
+    }
+    let events = bench.store.take_events();
+    for (index, fault) in faults.iter().enumerate() {
+        let occurrence = index as u64 + 1;
+        assert_eq!(hits_of(&events, *fault), [(occurrence, ids[index])]);
+    }
+    // Each result is delayed: none is handed over before it is released.
+    for id in ids {
+        assert!(
+            bench
+                .store
+                .eligible()
+                .contains(&StoreAction::ReleaseResult(id))
+        );
+    }
+}
+
+/// A fence held at its point passes it again when it enters the writer
+/// again. That second passage is the same item: it is not counted, and
+/// it takes no occurrence of another fault. The next resolution is the
+/// second passage, and the fault of occurrence 2 fires there.
+#[test]
+fn a_held_fence_passing_again_takes_no_occurrence_of_another_fault() {
+    let mut bench = fresh_bench();
+    let hold = bench
+        .store
+        .arm(on_resolutions(
+            FaultPoint::FenceTransit,
+            FaultAction::HoldCommand,
+            1,
+        ))
+        .expect("allowed");
+    let refuse = bench
+        .store
+        .arm(on_resolutions(
+            FaultPoint::FenceTransit,
+            FaultAction::RefuseFence,
+            2,
+        ))
+        .expect("another occurrence");
+    let absent = operation_id(bench.epoch, 21);
+    let first = resolve(&mut bench, 1, absent);
+    assert_eq!(
+        enter(&mut bench, first),
+        Performed::Held(FaultPoint::FenceTransit)
+    );
+    assert_eq!(
+        bench.store.perform(StoreAction::ReleaseCommand(first)),
+        Ok(Performed::Released)
+    );
+    assert_eq!(enter(&mut bench, first), Performed::Executed);
+    assert_eq!(
+        delivered_reply(deliver(&mut bench, first)),
+        StoreReply::Outcome(StoreOutcome::RejectedCertain(RejectReason::Fenced))
+    );
+    assert_eq!(bench.store.hits(refuse), 0);
+
+    let absent = operation_id(bench.epoch, 22);
+    let second = resolve(&mut bench, 2, absent);
+    assert_eq!(enter(&mut bench, second), Performed::Executed);
+    assert_eq!(
+        delivered_reply(deliver(&mut bench, second)),
+        StoreReply::Outcome(StoreOutcome::PendingOrUnknown)
+    );
+    let events = bench.store.take_events();
+    assert_eq!(hits_of(&events, hold), [(1, first)]);
+    assert_eq!(hits_of(&events, refuse), [(2, second)]);
 }
