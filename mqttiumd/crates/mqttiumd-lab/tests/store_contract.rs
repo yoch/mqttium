@@ -4,8 +4,10 @@
 //! store of lot L7 runs the same ones with its own factory.
 
 use mqttiumd_contract::ids::StoreIncarnation;
-use mqttiumd_lab::store::conformance;
-use mqttiumd_lab::store::durable::{Limits, MemoryStore};
+use mqttiumd_lab::store::conformance::{self, World};
+use mqttiumd_lab::store::durable::{
+    DurableStore, Limits, MAX_CLIENT_ID_BYTES, MemoryStore, RecoveryRefused,
+};
 
 fn memory(incarnation: StoreIncarnation, limits: Limits) -> MemoryStore {
     MemoryStore::create(incarnation, limits)
@@ -114,4 +116,57 @@ fn administration_refusals_change_nothing() {
 #[test]
 fn the_suite_runs_every_check() {
     conformance::all(&memory);
+}
+
+#[test]
+fn an_admission_without_targets_holds_no_payload_bytes() {
+    conformance::an_admission_without_targets_holds_no_payload_bytes(&memory);
+}
+
+#[test]
+fn a_deleted_session_frees_its_place() {
+    conformance::a_deleted_session_frees_its_place(&memory);
+}
+
+#[test]
+fn a_client_id_longer_than_mqtt_allows_is_refused() {
+    conformance::a_client_id_longer_than_mqtt_allows_is_refused(&memory);
+}
+
+#[test]
+fn what_is_established_in_epoch_zero_is_never_collected() {
+    conformance::what_is_established_in_epoch_zero_is_never_collected(&memory);
+}
+
+#[test]
+fn every_receipt_and_fence_holds_a_receipt_slot() {
+    conformance::every_receipt_and_fence_holds_a_receipt_slot(&memory);
+}
+
+/// A fact that cannot be built within its budget is an error where it
+/// stands, never the end of the inventory: the page before it is
+/// complete and says that more follows, and the page that reaches it is
+/// refused. Durable state that holds a ClientID longer than MQTT allows
+/// can only come from outside the store (a corrupt or foreign file);
+/// it is read back here as such.
+#[test]
+fn a_fact_that_cannot_be_built_is_not_the_end_of_the_inventory() {
+    let world = World::new(&memory);
+    let mut durable = world.store.snapshot();
+    let record = durable.sessions.get_mut(&world.b).expect("b exists");
+    record.client_id = vec![b'x'; MAX_CLIENT_ID_BYTES + 1];
+    let reopened = MemoryStore::reopen(durable);
+
+    // The epoch and `producer` come before `b`.
+    let first = reopened.recover(None, 2).expect("two facts that fit");
+    assert_eq!(first.facts.as_slice().len(), 2);
+    let next = first.next.expect("the inventory goes on");
+    assert_eq!(
+        reopened.recover(Some(next), 4),
+        Err(RecoveryRefused::AllocationFailed)
+    );
+    assert_eq!(
+        reopened.recover(None, 64),
+        Err(RecoveryRefused::AllocationFailed)
+    );
 }

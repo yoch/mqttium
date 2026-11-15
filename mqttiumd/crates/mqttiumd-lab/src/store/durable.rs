@@ -29,6 +29,11 @@ use mqttiumd_contract::outcome::{
 };
 use mqttiumd_contract::packet::{Qos, SharedBytes};
 
+/// The longest ClientID MQTT can carry: a UTF-8 string with a two-byte
+/// length. A session never holds a longer one, and a recovered session
+/// fact is built within this budget.
+pub const MAX_CLIENT_ID_BYTES: usize = 65_535;
+
 /// The durable limits of a data set, fixed when it is created.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Limits {
@@ -39,6 +44,8 @@ pub struct Limits {
     pub max_targets_per_admission: usize,
     pub max_topic_bytes: usize,
     pub max_payload_bytes: usize,
+    /// Active sessions at a time. Terminal ones are not counted: their
+    /// identity is never used again, and they hold nothing.
     pub max_sessions: usize,
     pub max_route_targets: usize,
 }
@@ -50,6 +57,20 @@ pub struct Accounts {
     pub references: References,
     pub exchange_slots: ExchangeSlots,
     pub receipt_slots: ReceiptSlots,
+}
+
+impl Accounts {
+    /// What one receipt or one fence holds.
+    pub const RECEIPT: Self = Self::receipt();
+
+    const fn receipt() -> Self {
+        Self {
+            payload_bytes: PayloadBytes::ZERO,
+            references: References::ZERO,
+            exchange_slots: ExchangeSlots::ZERO,
+            receipt_slots: ReceiptSlots::new(1),
+        }
+    }
 }
 
 /// Life cycle of a session incarnation.
@@ -102,7 +123,9 @@ pub struct PublicationRecord {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PayloadRecord {
     pub bytes: Vec<u8>,
-    /// Live obligations that still refer to the payload.
+    /// Live obligations that still refer to the payload. Never zero: a
+    /// payload no obligation refers to is not kept, and its bytes are
+    /// not charged.
     pub references: u64,
 }
 
@@ -147,8 +170,10 @@ pub struct DurableState {
     pub route_revision: Revision,
     pub sessions: BTreeMap<SessionId, SessionRecord>,
     pub routes: BTreeMap<Vec<u8>, Vec<RouteTarget>>,
+    /// Every receipt, admitted or rejected, holds one receipt slot.
     pub operations: BTreeMap<OperationId, OperationRecord>,
     /// Identities closed by `ResolveAndFence` before any command arrived.
+    /// Each holds one receipt slot, like a receipt.
     pub fences: BTreeSet<OperationId>,
     pub publications: BTreeMap<PublicationId, PublicationRecord>,
     pub payloads: BTreeMap<PayloadId, PayloadRecord>,
@@ -198,6 +223,8 @@ pub enum AdminRefused {
     DuplicateTarget,
     TableFull,
     TopicTooLong,
+    /// Longer than `MAX_CLIENT_ID_BYTES`.
+    ClientIdTooLong,
     /// A counter reached its end; nothing wraps.
     Exhausted,
     /// The epoch is open or was never opened: nothing to collect.
@@ -215,6 +242,10 @@ pub struct Applied {
     /// Whether this application is the one that committed the effect of
     /// the operation. False for a repetition, a rejection or a violation.
     pub committed_now: bool,
+    /// Whether this application made anything durable: the effect, or
+    /// the receipt of a rejection. The point after a commit is passed
+    /// exactly when this is true.
+    pub wrote: bool,
 }
 
 /// What `ResolveAndFence` established.
@@ -248,6 +279,9 @@ pub enum RecoveryRefused {
     FrontierMoved,
     /// A page of zero facts makes no progress.
     EmptyPage,
+    /// A page, or a fact on it, could not be built within its budget.
+    /// Nothing is said about the facts after it: the inventory is not
+    /// complete, and it is not presented as complete.
     AllocationFailed,
 }
 
@@ -364,14 +398,19 @@ impl MemoryStore {
     }
 
     /// Commits a receipt that records a certain rejection, so that the
-    /// operation stays rejected whatever changes later.
+    /// operation stays rejected whatever changes later. The receipt holds
+    /// one receipt slot. Returns the outcome and whether it was written.
     fn commit_rejection(
         &mut self,
         operation: OperationId,
         recipe: Vec<u8>,
         reason: RejectReason,
-    ) -> StoreOutcome {
+    ) -> (StoreOutcome, bool) {
         let mut staged = self.committed.clone();
+        // No slot, no receipt: the rejection could not be recorded, and
+        // a later presentation could still execute, so nothing certain
+        // is announced. Durable state never grows past its accounts.
+
         staged.operations.insert(
             operation,
             OperationRecord {
@@ -380,11 +419,9 @@ impl MemoryStore {
             },
         );
         if self.commit(staged) {
-            StoreOutcome::RejectedCertain(reason)
+            (StoreOutcome::RejectedCertain(reason), false)
         } else {
-            // The rejection could not be recorded: a later presentation
-            // could still execute, so nothing certain is announced.
-            StoreOutcome::PendingOrUnknown
+            (StoreOutcome::PendingOrUnknown, false)
         }
     }
 }
@@ -526,8 +563,13 @@ impl DurableState {
         }
         self.active_session(admit.source.session, admit.source.session_revision)?;
 
+        // A payload identity names one payload, kept or not.
         if self.publications.contains_key(&admit.publication)
             || self.payloads.contains_key(&admit.payload.id)
+            || self
+                .publications
+                .values()
+                .any(|publication| publication.payload == admit.payload.id)
         {
             return Err(failed);
         }
@@ -542,13 +584,19 @@ impl DurableState {
                 payload: admit.payload.id,
             },
         );
-        self.payloads.insert(
-            admit.payload.id,
-            PayloadRecord {
-                bytes: bytes.as_slice().to_vec(),
-                references: reference_count,
-            },
-        );
+        // Its bytes are kept while an obligation refers to them, and only
+        // then charged. Without a target nothing refers to them: they are
+        // charged and released in this same transaction, so nothing is
+        // left that no obligation would ever release.
+        {
+            self.payloads.insert(
+                admit.payload.id,
+                PayloadRecord {
+                    bytes: bytes.as_slice().to_vec(),
+                    references: reference_count,
+                },
+            );
+        }
         for target in targets {
             self.active_session(target.session, target.session_revision)?;
             let obligation = ObligationRecord {
@@ -585,6 +633,7 @@ impl DurableState {
             exchange_slots: admit.costs.exchange_slots,
             receipt_slots: admit.costs.receipt_slots,
         })?;
+
         Ok(CommitFacts::PublicationAdmitted {
             publication: admit.publication,
             exchange: admit.source.exchange,
@@ -642,9 +691,12 @@ impl DurableState {
     fn stage_admin(&mut self, command: AdminCommand) -> Result<AdminDone, AdminRefused> {
         match command {
             AdminCommand::CreateSession { client_id } => {
-                if self.sessions.values().any(|record| {
-                    record.state == SessionState::Active && record.client_id == client_id
-                }) {
+                let active = || {
+                    self.sessions
+                        .values()
+                        .filter(|record| record.state == SessionState::Active)
+                };
+                if active().any(|record| record.client_id == client_id) {
                     return Err(AdminRefused::DuplicateClientId);
                 }
                 if self.sessions.len() >= self.limits.max_sessions {
@@ -752,15 +804,19 @@ impl DurableState {
                     self.collected_through = through;
                 }
                 let collected = self.collected_through;
-                // The receipt of an admission holds the receipt slot its
-                // recipe was charged; rejections and fences hold none.
+                // Epoch 0 is never opened, so never closed: its receipts
+                // and fences are never retired, and they stay.
+                let retired = |operation: &OperationId| operation.epoch() <= collected;
+                // Every receipt and every fence holds one receipt slot.
                 let mut freed = 0u64;
-                for (operation, record) in &self.operations {
-                    let admitted = matches!(
+                let held = self.operations.iter().filter(|(_, record)| {
+                    matches!(
                         record.decision,
                         Decision::Committed(CommitFacts::PublicationAdmitted { .. })
-                    );
-                    if operation.epoch() <= collected && admitted {
+                    )
+                });
+                for (operation, _) in held {
+                    if retired(operation) {
                         freed = freed.checked_add(1).ok_or(AdminRefused::Exhausted)?;
                     }
                 }
@@ -769,10 +825,8 @@ impl DurableState {
                     .receipt_slots
                     .checked_sub(ReceiptSlots::new(freed))
                     .ok_or(AdminRefused::Inconsistent)?;
-                self.operations
-                    .retain(|operation, _| operation.epoch() > collected);
-                self.fences
-                    .retain(|operation| operation.epoch() > collected);
+                self.operations.retain(|operation, _| !retired(operation));
+                self.fences.retain(|operation| !retired(operation));
                 Ok(AdminDone::Collected)
             }
         }
@@ -780,69 +834,63 @@ impl DurableState {
 
     /// The recovery inventory, in a fixed order: the epoch, the active
     /// sessions, the inbound markers, then what is established about the
-    /// operations of older epochs.
-    fn fact_at(&self, position: usize) -> Option<RecoveredFact> {
-        let mut index = position;
-        if let Some(epoch) = self.ledger.open_epoch() {
-            if index == 0 {
-                return Some(RecoveredFact::Epoch {
-                    incarnation: self.ledger.incarnation(),
-                    epoch,
-                });
-            }
-            index -= 1;
-        }
-        let mut sessions = self
+    /// operations of older epochs. A fact that cannot be built within its
+    /// budget is an error in its place, never the end of the inventory.
+    fn inventory(&self) -> impl Iterator<Item = Result<RecoveredFact, RecoveryRefused>> + '_ {
+        let incarnation = self.ledger.incarnation();
+        let open = self.ledger.open_epoch();
+        let older = move |operation: &OperationId| Some(operation.epoch()) != open;
+        let epoch = open.map(|epoch| Ok(RecoveredFact::Epoch { incarnation, epoch }));
+        let sessions = self
             .sessions
             .iter()
-            .filter(|(_, record)| record.state == SessionState::Active);
-        let active = sessions.clone().count();
-        if index < active {
-            let (session, record) = sessions.nth(index)?;
-            return Some(RecoveredFact::Session {
-                session: *session,
-                client_id: SharedBytes::copy_from(&record.client_id, usize::MAX).ok()?,
-                revision: record.revision,
+            .filter(|(_, record)| record.state == SessionState::Active)
+            .map(|(session, record)| {
+                let client_id = SharedBytes::copy_from(&record.client_id, usize::MAX)
+                    .map_err(|_| RecoveryRefused::AllocationFailed)?;
+                Ok(RecoveredFact::Session {
+                    session: *session,
+                    client_id,
+                    revision: record.revision,
+                })
             });
-        }
-        index -= active;
-        if index < self.inbound.len() {
-            let ((_, packet_id), marker) = self.inbound.iter().nth(index)?;
-            return Some(RecoveredFact::InboundExchange {
+        let inbound = self.inbound.iter().map(|((_, packet_id), marker)| {
+            Ok(RecoveredFact::InboundExchange {
                 exchange: marker.exchange,
                 packet_id: *packet_id,
                 publication: marker.publication,
                 phase: marker.phase,
-            });
-        }
-        index -= self.inbound.len();
-        let open = self.ledger.open_epoch();
-        let older = |operation: &OperationId| Some(operation.epoch()) != open;
-        let mut receipts = self
+            })
+        });
+        let receipts = self
             .operations
             .iter()
-            .filter(|(operation, _)| older(operation));
-        let receipt_count = receipts.clone().count();
-        if index < receipt_count {
-            let (operation, record) = receipts.nth(index)?;
-            return Some(RecoveredFact::Operation {
-                operation: *operation,
-                knowledge: match record.decision {
-                    Decision::Committed(facts) => Knowledge::Committed(facts),
-                    Decision::Rejected(reason) => Knowledge::RejectedCertain(reason),
-                },
+            .filter(move |(operation, _)| older(operation))
+            .map(|(operation, record)| {
+                Ok(RecoveredFact::Operation {
+                    operation: *operation,
+                    knowledge: match record.decision {
+                        Decision::Committed(facts) => Knowledge::Committed(facts),
+                        Decision::Rejected(reason) => Knowledge::RejectedCertain(reason),
+                    },
+                })
             });
-        }
-        index -= receipt_count;
-        let operation = self
+        let fences = self
             .fences
             .iter()
-            .filter(|operation| older(operation))
-            .nth(index)?;
-        Some(RecoveredFact::Operation {
-            operation: *operation,
-            knowledge: Knowledge::RejectedCertain(RejectReason::Fenced),
-        })
+            .filter(move |operation| older(operation))
+            .map(|operation| {
+                Ok(RecoveredFact::Operation {
+                    operation: *operation,
+                    knowledge: Knowledge::RejectedCertain(RejectReason::Fenced),
+                })
+            });
+        epoch
+            .into_iter()
+            .chain(sessions)
+            .chain(inbound)
+            .chain(receipts)
+            .chain(fences)
     }
 }
 
@@ -871,6 +919,12 @@ impl DurableStore for MemoryStore {
         let settled = |outcome| Applied {
             reply: StoreReply::Outcome(outcome),
             committed_now: false,
+            wrote: false,
+        };
+        let rejected = |(outcome, wrote)| Applied {
+            reply: StoreReply::Outcome(outcome),
+            committed_now: false,
+            wrote,
         };
         let recipe = command.recipe.get();
         let operation = recipe.operation();
@@ -896,6 +950,7 @@ impl DurableStore for MemoryStore {
                 return Applied {
                     reply: StoreReply::Violation(StoreViolation::RecipeMismatch),
                     committed_now: false,
+                    wrote: false,
                 };
             }
         }
@@ -906,7 +961,7 @@ impl DurableStore for MemoryStore {
         if phase != EpochPhase::Open {
             // Its epoch is not open yet. It must not become executable
             // when that epoch opens: the rejection is recorded.
-            return settled(self.commit_rejection(
+            return rejected(self.commit_rejection(
                 operation,
                 canonical,
                 RejectReason::PreconditionFailed,
@@ -934,6 +989,7 @@ impl DurableStore for MemoryStore {
                     Applied {
                         reply: StoreReply::Outcome(StoreOutcome::Committed(facts)),
                         committed_now: true,
+                        wrote: true,
                     }
                 } else {
                     settled(StoreOutcome::PendingOrUnknown)
@@ -941,7 +997,7 @@ impl DurableStore for MemoryStore {
             }
             // The staged copy, with whatever rows it already held, is
             // dropped here.
-            Err(reason) => settled(self.commit_rejection(operation, canonical, reason)),
+            Err(reason) => rejected(self.commit_rejection(operation, canonical, reason)),
         }
     }
 
@@ -954,6 +1010,9 @@ impl DurableStore for MemoryStore {
             Established::Outcome(outcome) => settled(outcome),
             Established::Absent(_) => {
                 let mut staged = self.committed.clone();
+                // A fence holds a receipt slot. Without one no fence is
+                // written, and absence proves nothing: unknown.
+
                 staged.fences.insert(operation);
                 if self.commit(staged) {
                     Resolved {
@@ -995,21 +1054,25 @@ impl DurableStore for MemoryStore {
         };
         let mut facts =
             BoundedVec::with_capacity(limit).map_err(|_| RecoveryRefused::AllocationFailed)?;
+        // One pass over the inventory per page, from where the cursor
+        // stands; the fact after the page tells whether there is a next.
+        let mut inventory = self.committed.inventory().skip(start);
         let mut position = start;
         while !facts.is_full() {
-            let Some(fact) = self.committed.fact_at(position) else {
+            let Some(fact) = inventory.next() else {
                 return Ok(RecoveryPage { facts, next: None });
             };
-            if facts.try_push(fact).is_err() {
-                break;
+            if facts.try_push(fact?).is_err() {
+                return Err(RecoveryRefused::AllocationFailed);
             }
-            // Bounded by the number of facts held in memory.
-            position += 1;
+            position = position
+                .checked_add(1)
+                .ok_or(RecoveryRefused::AllocationFailed)?;
         }
-        let next = self
-            .committed
-            .fact_at(position)
-            .map(|_| RecoveryCursor { revision, position });
+        let next = inventory
+            .next()
+            .is_some()
+            .then_some(RecoveryCursor { revision, position });
         Ok(RecoveryPage { facts, next })
     }
 

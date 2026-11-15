@@ -929,3 +929,39 @@ fn an_opening_run_again_by_the_writer_leaves_no_second_commit_in_the_evidence() 
     );
     assert_eq!(opening.observe(again), Ok(Observed::Unchanged));
 }
+
+/// A duplication leaves a second copy of an opening's reply. When the
+/// same command is submitted again, that copy does not answer it: the
+/// reply of the new acceptance is the one handed over.
+#[test]
+fn a_left_over_copy_of_a_reply_does_not_answer_an_opening_submitted_again() {
+    let mut sim = started();
+    sim.arm(opening_fault(
+        FaultPoint::ResultReady,
+        FaultAction::DuplicateResult,
+    ))
+    .expect("allowed");
+    let mut opening = opening_for(&sim);
+    let (id, command) = submit(&mut sim, &mut opening);
+    enter(&mut sim, id);
+    let first = reply(&mut sim, id);
+    assert_eq!(first.outcome, committed(1));
+
+    sim.submit_opening(command).expect("room");
+    enter(&mut sim, id);
+    let _ = sim.take_events();
+    assert_eq!(
+        sim.perform(StoreAction::DeliverResult(id)),
+        Ok(Performed::Uncorrelated)
+    );
+    let again = reply(&mut sim, id);
+    assert_eq!(again.outcome, committed(1));
+    let events = sim.take_events();
+    assert!(matches!(
+        events.as_slice(),
+        [
+            StoreEvent::UncorrelatedResult { .. },
+            StoreEvent::ResultDelivered { .. }
+        ]
+    ));
+}

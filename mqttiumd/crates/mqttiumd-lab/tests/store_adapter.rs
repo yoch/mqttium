@@ -6,6 +6,7 @@ use mqttiumd_contract::command::Command;
 use mqttiumd_contract::effects::{
     Effect, EffectSink, Input, OwnedEffect, SubmitBlock, SubmitResult,
 };
+use mqttiumd_contract::ids::OperationId;
 use mqttiumd_contract::ids::{
     EffectId, EffectSeq, InboundPacketId, LogicalOwnerId, SessionId, StoreIncarnation,
 };
@@ -14,8 +15,8 @@ use mqttiumd_lab::store::adapter::{
     ActionRefused, AdapterLimits, Answer, Delivery, FaultAction, FaultId, FaultPoint, FaultRefused,
     FaultSpec, Performed, SimStore, StoreAction, StoreEvent, WorkId, WorkKind,
 };
-use mqttiumd_lab::store::conformance::{World, open, operation_id};
-use mqttiumd_lab::store::durable::{DurableStore, Limits, MemoryStore};
+use mqttiumd_lab::store::conformance::{World, admission_in, open, operation_id, publication_id};
+use mqttiumd_lab::store::durable::{Durability, DurableStore, Limits, MemoryStore};
 
 type Bench = World<SimStore<MemoryStore>>;
 
@@ -169,8 +170,19 @@ fn a_fault_is_armed_only_with_an_action_its_point_allows() {
         }),
         Err(FaultRefused::ZeroOccurrence)
     );
+    // Each on a kind of its own, so that no two select one passage.
+    let kinds = [
+        WorkKind::AdmitPublication,
+        WorkKind::ReleaseInbound,
+        WorkKind::ResolveAndFence,
+        WorkKind::OpenEpoch,
+    ];
     for (index, spec) in allowed.iter().take(5).enumerate() {
-        assert_eq!(bench.store.arm(*spec), Ok(FaultId(index)));
+        let spec = FaultSpec {
+            kind: Some(kinds[index % kinds.len()]),
+            ..*spec
+        };
+        assert_eq!(bench.store.arm(spec), Ok(FaultId(index)));
     }
     assert_eq!(bench.store.arm(allowed[5]), Err(FaultRefused::TableFull));
 }
@@ -352,7 +364,7 @@ fn a_dropped_result_never_reaches_the_core_and_the_commit_is_reconciled() {
             operation,
             StoreReply::Outcome(StoreOutcome::PendingOrUnknown)
         ),
-        Performed::Uncorrelated
+        Ok(Performed::Uncorrelated)
     );
 
     // The owner reconciles by `ResolveAndFence`, under a new effect.
@@ -480,13 +492,13 @@ fn a_fault_counts_only_the_passages_it_matches() {
             occurrence: 2,
         })
         .expect("allowed");
-    let on_packet_9 = bench
+    let release_of_7 = bench
         .store
         .arm(FaultSpec {
             point: FaultPoint::CommandTransit,
             action: FaultAction::HoldCommand,
-            kind: None,
-            source: Some((bench.producer, packet(9))),
+            kind: Some(WorkKind::ReleaseInbound),
+            source: Some((bench.producer, packet(7))),
             occurrence: 1,
         })
         .expect("allowed");
@@ -515,13 +527,13 @@ fn a_fault_counts_only_the_passages_it_matches() {
         bench.store.eligible(),
         [
             StoreAction::EnterWriter(ids[0]),
-            StoreAction::EnterWriter(ids[1]),
+            StoreAction::ReleaseCommand(ids[1]),
             StoreAction::ReleaseCommand(ids[2]),
-            StoreAction::ReleaseCommand(ids[3]),
+            StoreAction::EnterWriter(ids[3]),
         ]
     );
     assert_eq!(bench.store.hits(second_admission), 1);
-    assert_eq!(bench.store.hits(on_packet_9), 1);
+    assert_eq!(bench.store.hits(release_of_7), 1);
     // A fault that was not reached says so: the run is inconclusive
     // for whoever required it.
     assert_eq!(bench.store.hits(never), 0);
@@ -618,7 +630,7 @@ fn a_result_that_answers_no_effect_in_flight_is_refused_and_recorded() {
     let stray = effect_id(&bench, 5);
     assert_eq!(
         bench.store.present_result(stray, operation, committed),
-        Performed::Uncorrelated
+        Ok(Performed::Uncorrelated)
     );
     assert_eq!(
         bench.store.take_events(),
@@ -637,7 +649,7 @@ fn a_result_that_answers_no_effect_in_flight_is_refused_and_recorded() {
     let other = operation_id(bench.epoch, 2);
     assert_eq!(
         bench.store.present_result(in_flight, other, committed),
-        Performed::Uncorrelated
+        Ok(Performed::Uncorrelated)
     );
     // The real result is still expected and still delivered.
     assert_eq!(enter(&mut bench, id), Performed::Executed);
@@ -648,7 +660,7 @@ fn a_result_that_answers_no_effect_in_flight_is_refused_and_recorded() {
     // Once delivered, the same result presented again answers nothing.
     assert_eq!(
         bench.store.present_result(in_flight, operation, committed),
-        Performed::Uncorrelated
+        Ok(Performed::Uncorrelated)
     );
 }
 
@@ -676,7 +688,7 @@ fn an_identity_remembered_by_the_bench_is_refused_after_a_restart() {
             remembered,
             StoreReply::Outcome(StoreOutcome::RejectedCertain(RejectReason::Fenced)),
         ),
-        Performed::Uncorrelated
+        Ok(Performed::Uncorrelated)
     );
     assert_eq!(
         restarted.take_events(),
@@ -783,4 +795,259 @@ fn recovery_pages_read_through_the_adapter_leave_their_evidence() {
     ));
     assert!(bench.store.recover(first.next, 0).is_err());
     assert!(bench.store.take_events().is_empty());
+}
+
+fn resolve(bench: &mut Bench, sequence: u64, operation: OperationId) -> WorkId {
+    let effect = OwnedEffect::new(
+        effect_id(bench, sequence),
+        Effect::ResolveAndFence { operation },
+    );
+    let id = WorkId::Effect(effect.id());
+    assert_eq!(bench.store.try_submit(effect), SubmitResult::Accepted);
+    id
+}
+
+/// A duplication leaves a second copy of a result. The work it answered
+/// is done; when the owner submits again under the same identity, the
+/// copy answers nothing: the dispatcher hands over the result of the
+/// new acceptance and refuses the old one.
+#[test]
+fn a_left_over_copy_does_not_answer_work_submitted_again() {
+    let mut bench = bench();
+    arm(
+        &mut bench,
+        FaultPoint::ResultReady,
+        FaultAction::DuplicateResult,
+    );
+    let operation = operation_id(bench.epoch, 1);
+    bench.store.store_mut().set_durability(Durability::Failing);
+    let id = resolve(&mut bench, 1, operation);
+    assert_eq!(enter(&mut bench, id), Performed::Executed);
+    let unknown = StoreReply::Outcome(StoreOutcome::PendingOrUnknown);
+    assert_eq!(delivered_reply(deliver(&mut bench, id)), unknown);
+
+    // The owner submits again under the same effect, and the medium
+    // writes now. The copy of the first result is still ready.
+    bench
+        .store
+        .store_mut()
+        .set_durability(Durability::Available);
+    assert_eq!(resolve(&mut bench, 1, operation), id);
+    assert_eq!(enter(&mut bench, id), Performed::Executed);
+    let _ = bench.store.take_events();
+    assert_eq!(deliver(&mut bench, id), Performed::Uncorrelated);
+    let fenced = StoreReply::Outcome(StoreOutcome::RejectedCertain(RejectReason::Fenced));
+    assert_eq!(delivered_reply(deliver(&mut bench, id)), fenced);
+    assert_eq!(
+        bench.store.take_events(),
+        [
+            StoreEvent::UncorrelatedResult {
+                id,
+                operation: Some(operation)
+            },
+            StoreEvent::ResultDelivered {
+                id,
+                answer: Answer::Operation {
+                    operation,
+                    reply: fenced
+                }
+            },
+        ]
+    );
+}
+
+/// Only one fault fires at a passage. Two faults that may select the
+/// same passage at one point are refused when the second is armed:
+/// otherwise it would count that passage without firing, and never be
+/// reached.
+#[test]
+fn two_faults_that_may_select_one_passage_are_refused() {
+    let mut bench = fresh_bench();
+    let packet = |raw| InboundPacketId::new(raw).expect("non-zero");
+    let first = bench
+        .store
+        .arm(fault(FaultPoint::ResultReady, FaultAction::DelayResult))
+        .expect("allowed");
+    let overlapping = [
+        fault(FaultPoint::ResultReady, FaultAction::DropResult),
+        FaultSpec {
+            kind: Some(WorkKind::AdmitPublication),
+            occurrence: 2,
+            ..fault(FaultPoint::ResultReady, FaultAction::DuplicateResult)
+        },
+        FaultSpec {
+            source: Some((bench.producer, packet(7))),
+            ..fault(FaultPoint::ResultReady, FaultAction::DropResult)
+        },
+    ];
+    for spec in overlapping {
+        assert_eq!(
+            bench.store.arm(spec),
+            Err(FaultRefused::Overlaps(first)),
+            "{spec:?}"
+        );
+    }
+    // Another point, or filters that no passage satisfies together, are
+    // armed.
+    let mut bench = fresh_bench();
+    let admissions = bench
+        .store
+        .arm(FaultSpec {
+            kind: Some(WorkKind::AdmitPublication),
+            ..fault(FaultPoint::ResultReady, FaultAction::DelayResult)
+        })
+        .expect("allowed");
+    let releases = FaultSpec {
+        kind: Some(WorkKind::ReleaseInbound),
+        ..fault(FaultPoint::ResultReady, FaultAction::DropResult)
+    };
+    assert_eq!(bench.store.arm(releases), Ok(FaultId(1)));
+    let on_7 = FaultSpec {
+        source: Some((bench.producer, packet(7))),
+        kind: Some(WorkKind::AdmitPublication),
+        ..fault(FaultPoint::CommandTransit, FaultAction::HoldCommand)
+    };
+    let on_8 = FaultSpec {
+        source: Some((bench.producer, packet(8))),
+        ..on_7
+    };
+    assert_eq!(bench.store.arm(on_7), Ok(FaultId(2)));
+    assert_eq!(bench.store.arm(on_8), Ok(FaultId(3)));
+    assert_eq!(admissions, FaultId(0));
+}
+
+/// A fence made durable, and the receipt of a rejection, are committed
+/// transactions with no result yet: the point after the commit is
+/// passed, and a crash there keeps them and loses the result.
+#[test]
+fn a_fence_and_a_rejection_receipt_pass_the_point_after_their_commit() {
+    // The fence.
+    let mut bench = fresh_bench();
+    let barrier = bench
+        .store
+        .arm(FaultSpec {
+            kind: Some(WorkKind::ResolveAndFence),
+            ..fault(FaultPoint::CommitApplied, FaultAction::Barrier)
+        })
+        .expect("allowed");
+    let operation = operation_id(bench.epoch, 1);
+    let id = resolve(&mut bench, 1, operation);
+    assert_eq!(
+        enter(&mut bench, id),
+        Performed::Halted(FaultPoint::CommitApplied)
+    );
+    assert_eq!(bench.store.hits(barrier), 1);
+    hit(
+        &bench.store.take_events(),
+        barrier,
+        "store.commit.applied",
+        "barrier",
+        id,
+    );
+    let crashed = bench.store.crash();
+    assert!(crashed.store.snapshot().fences.contains(&operation));
+    assert!(
+        !crashed
+            .events
+            .iter()
+            .any(|event| matches!(event, StoreEvent::ResultReady { .. }))
+    );
+
+    // The receipt of a rejection: a command for an epoch not open yet.
+    let mut bench = fresh_bench();
+    let barrier = bench
+        .store
+        .arm(FaultSpec {
+            kind: Some(WorkKind::AdmitPublication),
+            ..fault(FaultPoint::CommitApplied, FaultAction::Barrier)
+        })
+        .expect("allowed");
+    let ahead = bench.epoch.checked_next().expect("not the last epoch");
+    let command = admission_in(
+        ahead,
+        bench.route_revision,
+        bench.producer,
+        1,
+        7,
+        b"payload",
+        &[bench.b],
+    );
+    let id = persist(&mut bench, 1, &command);
+    assert_eq!(
+        enter(&mut bench, id),
+        Performed::Halted(FaultPoint::CommitApplied)
+    );
+    assert_eq!(bench.store.hits(barrier), 1);
+    // Nothing was committed as an effect: no commit is recorded.
+    assert!(
+        !bench
+            .store
+            .take_events()
+            .iter()
+            .any(|event| matches!(event, StoreEvent::CommitStable { .. }))
+    );
+    assert!(
+        bench
+            .store
+            .store()
+            .snapshot()
+            .operations
+            .contains_key(&command.recipe.operation())
+    );
+
+    // A repetition writes nothing and does not pass the point.
+    let mut bench = fresh_bench();
+    let committed = bench.admission(1, 7, b"payload", &[bench.b]);
+    let first = persist(&mut bench, 1, &committed);
+    assert_eq!(enter(&mut bench, first), Performed::Executed);
+    let _ = deliver(&mut bench, first);
+    let barrier = arm(&mut bench, FaultPoint::CommitApplied, FaultAction::Barrier);
+    let again = persist(&mut bench, 2, &committed);
+    assert_eq!(enter(&mut bench, again), Performed::Executed);
+    assert_eq!(bench.store.hits(barrier), 0);
+}
+
+/// While a barrier holds, nothing reaches the core: not a result of the
+/// pipeline, and not a result presented from outside it.
+#[test]
+fn nothing_is_handed_over_while_a_barrier_holds() {
+    let mut bench = bench();
+    arm(&mut bench, FaultPoint::ResultConsume, FaultAction::Barrier);
+    let first = bench.admission(1, 7, b"payload", &[bench.b]);
+    let second = bench.admission(2, 8, b"payload", &[bench.b]);
+    let first_id = persist(&mut bench, 1, &first);
+    let second_id = persist(&mut bench, 2, &second);
+    assert_eq!(enter(&mut bench, first_id), Performed::Executed);
+    assert_eq!(enter(&mut bench, second_id), Performed::Executed);
+    assert!(matches!(
+        deliver(&mut bench, first_id),
+        Performed::Delivered { barrier: true, .. }
+    ));
+    let WorkId::Effect(effect) = second_id else {
+        panic!("an effect");
+    };
+    let committed = StoreReply::Outcome(StoreOutcome::Committed(
+        mqttiumd_contract::outcome::CommitFacts::PublicationAdmitted {
+            publication: publication_id(bench.epoch, 2),
+            exchange: mqttiumd_contract::ids::ExchangeId {
+                session: bench.producer,
+                generation: mqttiumd_contract::ids::ExchangeGeneration::new(2),
+            },
+        },
+    ));
+    let _ = bench.store.take_events();
+    assert_eq!(
+        bench
+            .store
+            .present_result(effect, second.recipe.operation(), committed),
+        Err(ActionRefused::Halted)
+    );
+    assert!(bench.store.take_events().is_empty());
+    // After the barrier the real result is still expected and delivered.
+    assert_eq!(bench.store.resume(), Some(FaultPoint::ResultConsume));
+    assert_eq!(delivered_reply(deliver(&mut bench, second_id)), committed);
+}
+
+fn fresh_bench() -> Bench {
+    bench_with(LIMITS)
 }

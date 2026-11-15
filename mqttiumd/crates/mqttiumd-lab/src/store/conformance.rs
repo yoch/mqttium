@@ -31,7 +31,7 @@ use mqttiumd_contract::packet::{Qos, SharedBytes};
 
 use super::durable::{
     Accounts, AdminCommand, AdminDone, AdminRefused, Decision, DurableState, DurableStore, Limits,
-    ObligationPhase, RecoveryRefused, Resolved, SessionState,
+    MAX_CLIENT_ID_BYTES, ObligationPhase, RecoveryRefused, Resolved, SessionState,
 };
 
 /// The incarnation every check creates its data set with.
@@ -345,9 +345,19 @@ fn admitted(command: &Command) -> CommitFacts {
     }
 }
 
-/// The state without what a rejection is allowed to add: its receipt
-/// and the revision of the commit that recorded it.
+/// The state without what a rejection is allowed to add: its receipt,
+/// the receipt slot it holds and the revision of the commit that
+/// recorded it.
 fn without_receipts(mut state: DurableState) -> DurableState {
+    let receipts = state.operations.len() as u64;
+    state.accounts.receipt_slots = ReceiptSlots::new(
+        state
+            .accounts
+            .receipt_slots
+            .get()
+            .checked_sub(receipts)
+            .expect("each receipt holds a slot"),
+    );
     state.operations.clear();
     state.revision = 0;
     state
@@ -627,7 +637,9 @@ pub fn a_failed_guard_leaves_no_admitted_subset<S: DurableStore>(
         without_receipts(before)
     );
 
-    // The last account checked is short.
+    // The last account checked is short. It is the receipt account, so
+    // the rejection itself cannot be recorded: nothing certain is said,
+    // and nothing at all is written.
     let mut tight = fixture_limits();
     tight.receipt_slots = ReceiptSlots::new(0);
     let mut world = World::with_limits(make, tight);
@@ -635,12 +647,9 @@ pub fn a_failed_guard_leaves_no_admitted_subset<S: DurableStore>(
     let command = world.admission(1, 7, b"payload", &[world.b, world.c]);
     assert_eq!(
         outcome(world.store.apply(&command).reply),
-        StoreOutcome::RejectedCertain(RejectReason::CapacityExceeded(Resource::ReceiptSlots))
+        StoreOutcome::PendingOrUnknown
     );
-    assert_eq!(
-        without_receipts(world.store.snapshot()),
-        without_receipts(before)
-    );
+    assert_eq!(world.store.snapshot(), before);
 
     // The inbound slot is taken by an earlier admission: a newcomer on
     // the same packet, under a fresh exchange, admits nothing.
@@ -655,13 +664,23 @@ pub fn a_failed_guard_leaves_no_admitted_subset<S: DurableStore>(
     assert_eq!(after.obligations, before.obligations);
     assert_eq!(after.payloads, before.payloads);
     assert_eq!(after.inbound, before.inbound);
-    assert_eq!(after.accounts, before.accounts);
+    // The only account that moved is the slot of the rejection receipt.
+    assert_eq!(
+        after.accounts,
+        Accounts {
+            receipt_slots: ReceiptSlots::new(before.accounts.receipt_slots.get() + 1),
+            ..before.accounts
+        }
+    );
 }
 
-/// Each account refuses an admission it cannot hold, naming itself.
+/// Each account refuses an admission it cannot hold, naming itself. The
+/// rejection is recorded and holds its receipt slot, except when the
+/// receipt account is the one that is short: then nothing can be
+/// recorded, and nothing certain is said.
 pub fn each_account_is_checked<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     type Tighten = fn(&mut Limits);
-    let cases: [(Tighten, Resource); 4] = [
+    let cases: [(Tighten, Resource); 3] = [
         (
             |limits| limits.payload_bytes = PayloadBytes::new(6),
             Resource::PayloadBytes,
@@ -674,10 +693,6 @@ pub fn each_account_is_checked<S: DurableStore>(make: &dyn Fn(StoreIncarnation, 
             |limits| limits.exchange_slots = ExchangeSlots::new(0),
             Resource::ExchangeSlots,
         ),
-        (
-            |limits| limits.receipt_slots = ReceiptSlots::new(0),
-            Resource::ReceiptSlots,
-        ),
     ];
     for (tighten, resource) in cases {
         let mut limits = fixture_limits();
@@ -688,8 +703,18 @@ pub fn each_account_is_checked<S: DurableStore>(make: &dyn Fn(StoreIncarnation, 
             outcome(world.store.apply(&command).reply),
             StoreOutcome::RejectedCertain(RejectReason::CapacityExceeded(resource))
         );
-        assert_eq!(world.store.snapshot().accounts, Accounts::default());
+        assert_eq!(world.store.snapshot().accounts, Accounts::RECEIPT);
     }
+    let mut limits = fixture_limits();
+    limits.receipt_slots = ReceiptSlots::new(0);
+    let mut world = World::with_limits(make, limits);
+    let before = world.store.snapshot();
+    let command = world.admission(1, 7, b"payload", &[world.b, world.c]);
+    assert_eq!(
+        outcome(world.store.apply(&command).reply),
+        StoreOutcome::PendingOrUnknown
+    );
+    assert_eq!(world.store.snapshot(), before);
     // An account at its limit exactly is not exceeded.
     let mut limits = fixture_limits();
     limits.payload_bytes = PayloadBytes::new(7);
@@ -1249,6 +1274,211 @@ pub fn administration_refusals_change_nothing<S: DurableStore>(
     }
 }
 
+/// An admission towards no target, a topic without a route, keeps no
+/// payload: nothing would ever release its bytes. It is charged and
+/// released in the same transaction, so such admissions never exhaust
+/// the payload account.
+pub fn an_admission_without_targets_holds_no_payload_bytes<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut limits = fixture_limits();
+    limits.payload_bytes = PayloadBytes::new(1500);
+    limits.receipt_slots = ReceiptSlots::new(16);
+    let mut world = World::with_limits(make, limits);
+    let payload = [7u8; 1000];
+    for round in 1..=4u64 {
+        let admit = 2 * round - 1;
+        let packet = u16::try_from(round).expect("small");
+        let command = world.admission(admit, packet, &payload, &[]);
+        let applied = world.store.apply(&command);
+        assert_eq!(
+            outcome(applied.reply),
+            StoreOutcome::Committed(admitted(&command)),
+            "round {round}"
+        );
+        let state = world.store.snapshot();
+        assert_eq!(state.accounts.payload_bytes, PayloadBytes::ZERO);
+        assert!(state.payloads.is_empty());
+        let release = world.release(admit + 1, packet, admit);
+        assert!(world.store.apply(&release).committed_now, "round {round}");
+    }
+    // A payload identity still names one payload: another admission
+    // under the identity of a payload that was not kept is refused.
+    let reused = altered(&world.admission(9, 9, &payload, &[]), |admit| {
+        admit.payload.id = PayloadId::new(INCARNATION, world.epoch, OWNER, PayloadSeq::new(1));
+    });
+    assert_eq!(
+        outcome(world.store.apply(&reused).reply),
+        StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed)
+    );
+    // With a target the bytes are kept and charged as before.
+    let kept = world.admission(10, 10, &payload, &[world.b]);
+    assert!(world.store.apply(&kept).committed_now);
+    assert_eq!(
+        world.store.snapshot().accounts.payload_bytes,
+        PayloadBytes::new(1000)
+    );
+}
+
+/// `max_sessions` bounds the sessions that are active. A deleted session
+/// is terminal and frees its place; its identity is never used again.
+pub fn a_deleted_session_frees_its_place<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut limits = fixture_limits();
+    limits.max_sessions = 3;
+    let mut world = World::with_limits(make, limits);
+    assert_eq!(
+        world
+            .store
+            .admin(AdminCommand::DeleteSession { session: world.c }),
+        Ok(AdminDone::SessionDeleted)
+    );
+    let again = world.store.admin(AdminCommand::CreateSession {
+        client_id: b"p1-c".to_vec(),
+    });
+    let Ok(AdminDone::SessionCreated { session, .. }) = again else {
+        panic!("the place of a deleted session was not freed: {again:?}");
+    };
+    assert_ne!(session, world.c);
+    assert_eq!(
+        world.store.admin(AdminCommand::CreateSession {
+            client_id: b"p1-d".to_vec(),
+        }),
+        Err(AdminRefused::TableFull)
+    );
+}
+
+/// A ClientID is at most what MQTT can carry. A longer one makes no
+/// session, so no recovered fact has to carry it.
+pub fn a_client_id_longer_than_mqtt_allows_is_refused<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut world = World::new(make);
+    let before = world.store.snapshot();
+    assert_eq!(
+        world.store.admin(AdminCommand::CreateSession {
+            client_id: vec![b'x'; MAX_CLIENT_ID_BYTES + 1],
+        }),
+        Err(AdminRefused::ClientIdTooLong)
+    );
+    assert_eq!(world.store.snapshot(), before);
+    assert!(matches!(
+        world.store.admin(AdminCommand::CreateSession {
+            client_id: vec![b'x'; MAX_CLIENT_ID_BYTES],
+        }),
+        Ok(AdminDone::SessionCreated { .. })
+    ));
+}
+
+/// Epoch 0 is never opened, so never closed and never collected: what is
+/// established about its identities stays, whatever is collected.
+pub fn what_is_established_in_epoch_zero_is_never_collected<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut world = World::new(make);
+    let zero = RunEpoch::new(0);
+    let fenced = operation_id(zero, 1);
+    let fence = world.store.resolve_and_fence(fenced);
+    let rejected_fence = StoreOutcome::RejectedCertain(RejectReason::Fenced);
+    assert_eq!(fence.outcome, rejected_fence);
+    assert!(fence.fenced_now);
+    let early = admission_in(zero, world.route_revision, world.producer, 2, 7, b"p", &[]);
+    let precondition = StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed);
+    assert_eq!(outcome(world.store.apply(&early).reply), precondition);
+
+    let closed = world.epoch;
+    open(&mut world.store);
+    assert_eq!(
+        world
+            .store
+            .admin(AdminCommand::CollectClosedEpochs { through: closed }),
+        Ok(AdminDone::Collected)
+    );
+    let state = world.store.snapshot();
+    assert!(state.fences.contains(&fenced));
+    assert!(state.operations.contains_key(&early.recipe.operation()));
+    // The same answers, and no second fence.
+    assert_eq!(
+        world.store.resolve_and_fence(fenced),
+        settled(rejected_fence)
+    );
+    let fenced_command = admission_in(zero, world.route_revision, world.producer, 1, 8, b"p", &[]);
+    assert_eq!(
+        outcome(world.store.apply(&fenced_command).reply),
+        rejected_fence
+    );
+    assert_eq!(outcome(world.store.apply(&early).reply), precondition);
+    assert_eq!(world.store.snapshot(), state);
+}
+
+/// Every receipt and every fence holds one receipt slot, whatever it
+/// says and whatever epoch it belongs to. When none is left, nothing is
+/// written and nothing certain is said: durable state never grows past
+/// its accounts. Collection gives the slots back.
+pub fn every_receipt_and_fence_holds_a_receipt_slot<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut limits = fixture_limits();
+    limits.receipt_slots = ReceiptSlots::new(3);
+    let mut world = World::with_limits(make, limits);
+    let slots = |world: &World<S>| world.store.snapshot().accounts.receipt_slots;
+    let ahead = world.epoch.checked_next().expect("not the last epoch");
+    let fenced = StoreOutcome::RejectedCertain(RejectReason::Fenced);
+    let precondition = StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed);
+
+    assert_eq!(
+        world
+            .store
+            .resolve_and_fence(operation_id(world.epoch, 1))
+            .outcome,
+        fenced
+    );
+    assert_eq!(slots(&world), ReceiptSlots::new(1));
+    let future = |sequence, packet| {
+        admission_in(
+            ahead,
+            world.route_revision,
+            world.producer,
+            sequence,
+            packet,
+            b"p",
+            &[],
+        )
+    };
+    let early = future(2, 7);
+    assert_eq!(outcome(world.store.apply(&early).reply), precondition);
+    assert_eq!(slots(&world), ReceiptSlots::new(2));
+    let refused = altered(&world.admission(3, 8, b"payload", &[world.b]), |admit| {
+        admit.costs.receipt_slots = ReceiptSlots::new(2);
+    });
+    assert_eq!(outcome(world.store.apply(&refused).reply), precondition);
+    assert_eq!(slots(&world), ReceiptSlots::new(3));
+
+    // No slot is left.
+    let full = world.store.snapshot();
+    let resolved = world.store.resolve_and_fence(operation_id(world.epoch, 4));
+    assert_eq!(resolved.outcome, StoreOutcome::PendingOrUnknown);
+    assert!(!resolved.fenced_now);
+    let applied = world.store.apply(&future(5, 9));
+    assert_eq!(outcome(applied.reply), StoreOutcome::PendingOrUnknown);
+    assert!(!applied.wrote);
+    assert_eq!(world.store.snapshot(), full);
+
+    // Collecting the closed epoch gives back the slots of its fence and
+    // of its receipt; the receipt of the epoch now open stays.
+    let closed = world.epoch;
+    open(&mut world.store);
+    assert_eq!(
+        world
+            .store
+            .admin(AdminCommand::CollectClosedEpochs { through: closed }),
+        Ok(AdminDone::Collected)
+    );
+    assert_eq!(slots(&world), ReceiptSlots::new(1));
+    assert_eq!(outcome(world.store.apply(&early).reply), precondition);
+}
+
 /// Every check of this module, in order.
 pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     opening_opens_the_next_epoch_and_closes_the_older_ones(make);
@@ -1271,4 +1501,9 @@ pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     an_identity_of_another_data_set_is_refused(make);
     recovery_reads_bounded_pages_of_durable_facts(make);
     administration_refusals_change_nothing(make);
+    an_admission_without_targets_holds_no_payload_bytes(make);
+    a_deleted_session_frees_its_place(make);
+    a_client_id_longer_than_mqtt_allows_is_refused(make);
+    what_is_established_in_epoch_zero_is_never_collected(make);
+    every_receipt_and_fence_holds_a_receipt_slot(make);
 }

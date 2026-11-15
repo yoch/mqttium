@@ -18,7 +18,10 @@
 //!
 //! The adapter is also the dispatcher of ADR 0003: it remembers the work
 //! it accepted and hands a result over only when it answers one of them.
-//! A result that answers nothing in flight is refused and recorded.
+//! A result that answers nothing in flight is refused and recorded. Each
+//! acceptance has a ticket of its own: a copy of an earlier result, left
+//! over by a duplication, never answers work submitted again under the
+//! same identity.
 //!
 //! A crash keeps the wrapped store and the evidence already recorded,
 //! and loses everything else.
@@ -183,6 +186,10 @@ pub enum FaultRefused {
     /// Occurrences are counted from one.
     ZeroOccurrence,
     TableFull,
+    /// An armed fault watches the same point and may select the same
+    /// passage. Only one fault fires at a passage, and the other would
+    /// count it without firing: two faults never select one element.
+    Overlaps(FaultId),
 }
 
 /// Evidence recorded by the adapter, in order. Lot L3 owns the trace
@@ -297,6 +304,7 @@ enum Work {
 
 struct Transit {
     id: WorkId,
+    ticket: u64,
     work: Work,
     held: bool,
 }
@@ -306,6 +314,7 @@ type Source = Option<(SessionId, InboundPacketId)>;
 
 struct Ready {
     id: WorkId,
+    ticket: u64,
     kind: WorkKind,
     source: Source,
     answer: Answer,
@@ -318,10 +327,20 @@ struct ArmedFault {
     hits: u64,
 }
 
+/// A result on its way: the work it answers, the ticket of that work's
+/// acceptance, and where it comes from.
+#[derive(Clone, Copy)]
+struct Origin {
+    id: WorkId,
+    ticket: u64,
+    kind: WorkKind,
+    source: Source,
+}
+
 /// Where a barrier stopped the adapter, and what is left to do there.
 struct Halt {
     point: FaultPoint,
-    pending: Option<(WorkId, WorkKind, Source, Answer)>,
+    pending: Option<(Origin, Answer)>,
 }
 
 /// The deterministic store adapter. See the module documentation.
@@ -330,8 +349,11 @@ pub struct SimStore<S> {
     limits: AdapterLimits,
     transit: VecDeque<Transit>,
     ready: VecDeque<Ready>,
-    /// The work in flight whose result the dispatcher still expects.
-    awaited: BTreeMap<WorkId, Option<OperationId>>,
+    /// The work in flight whose result the dispatcher still expects, the
+    /// operation it names and the ticket of its acceptance.
+    awaited: BTreeMap<WorkId, (Option<OperationId>, u64)>,
+    /// The ticket of the next acceptance.
+    next_ticket: u64,
     faults: Vec<ArmedFault>,
     halt: Option<Halt>,
     events: Vec<StoreEvent>,
@@ -383,6 +405,7 @@ impl<S: DurableStore> SimStore<S> {
             transit: VecDeque::new(),
             ready: VecDeque::new(),
             awaited: BTreeMap::new(),
+            next_ticket: 0,
             faults: Vec::new(),
             halt: None,
             events: Vec::new(),
@@ -416,6 +439,19 @@ impl<S: DurableStore> SimStore<S> {
         if self.faults.len() >= self.limits.faults {
             return Err(FaultRefused::TableFull);
         }
+        let either = |left: Option<WorkKind>, right: Option<WorkKind>| {
+            left.zip(right).is_none_or(|(left, right)| left == right)
+        };
+        let overlap = self.faults.iter().position(|armed| {
+            let other = armed.spec;
+            other.point == spec.point
+                && either(other.kind, spec.kind)
+                && other
+                    .source
+                    .zip(spec.source)
+                    .is_none_or(|(left, right)| left == right)
+        });
+        let _ = overlap;
         self.faults.push(ArmedFault {
             spec,
             seen: 0,
@@ -509,9 +545,17 @@ impl<S: DurableStore> SimStore<S> {
         Ok(())
     }
 
-    fn accept(&mut self, id: WorkId, work: Work) {
+    /// Takes the ticket of the next acceptance; nothing wraps, and an
+    /// adapter whose counter ended accepts nothing more.
+    fn ticket(&mut self) -> Result<u64, SubmitBlock> {
+        let ticket = self.next_ticket;
+        self.next_ticket = ticket.checked_add(1).ok_or(SubmitBlock::Closed)?;
+        Ok(ticket)
+    }
+
+    fn accept(&mut self, id: WorkId, ticket: u64, work: Work) {
         let (kind, operation, source) = describe(&work);
-        self.awaited.insert(id, operation);
+        self.awaited.insert(id, (operation, ticket));
         self.record(StoreEvent::CommandSubmitted {
             id,
             kind,
@@ -519,7 +563,12 @@ impl<S: DurableStore> SimStore<S> {
         });
         let held = self.pass(FaultPoint::CommandTransit, id, kind, operation, source)
             == Some(FaultAction::HoldCommand);
-        self.transit.push_back(Transit { id, work, held });
+        self.transit.push_back(Transit {
+            id,
+            ticket,
+            work,
+            held,
+        });
     }
 
     /// The opening of this start-up: for the data set behind the
@@ -539,7 +588,8 @@ impl<S: DurableStore> SimStore<S> {
         if self.awaited.contains_key(&id) {
             return Err(SubmitBlock::Closed);
         }
-        self.accept(id, Work::Open(command));
+        let ticket = self.ticket()?;
+        self.accept(id, ticket, Work::Open(command));
         Ok(())
     }
 
@@ -617,7 +667,13 @@ impl<S: DurableStore> SimStore<S> {
                     .position(|ready| ready.id == id)
                     .ok_or(ActionRefused::NotEligible)?;
                 let ready = self.ready.remove(index).ok_or(ActionRefused::NotEligible)?;
-                Ok(self.deliver(ready.id, ready.answer, Some((ready.kind, ready.source))))
+                let origin = Origin {
+                    id: ready.id,
+                    ticket: ready.ticket,
+                    kind: ready.kind,
+                    source: ready.source,
+                };
+                Ok(self.deliver(ready.id, ready.answer, Some(origin)))
             }
         }
     }
@@ -626,7 +682,16 @@ impl<S: DurableStore> SimStore<S> {
     fn run(&mut self, transit: Transit) -> Performed {
         let id = transit.id;
         let (kind, operation, source) = describe(&transit.work);
-        let (answer, committed_now) = match &transit.work {
+        let origin = Origin {
+            id,
+            ticket: transit.ticket,
+            kind,
+            source,
+        };
+        // What this run made durable: the effect of the work (recorded
+        // as `CommitStable`), or a rejection receipt or a fence. Each is
+        // a committed transaction with no result yet.
+        let (answer, committed_now, wrote) = match &transit.work {
             Work::Persist(command) => {
                 let applied = self.store.apply(command);
                 let operation = command.recipe.operation();
@@ -636,6 +701,7 @@ impl<S: DurableStore> SimStore<S> {
                         reply: applied.reply,
                     },
                     applied.committed_now,
+                    applied.wrote,
                 )
             }
             Work::Resolve(operation) => {
@@ -652,6 +718,7 @@ impl<S: DurableStore> SimStore<S> {
                         reply: StoreReply::Outcome(resolved.outcome),
                     },
                     false,
+                    resolved.fenced_now,
                 )
             }
             Work::Open(command) => {
@@ -661,36 +728,47 @@ impl<S: DurableStore> SimStore<S> {
                 // writes nothing.
                 let before = self.store.ledger();
                 let outcome = self.store.open_epoch(command);
+                let wrote = self.store.ledger() != before;
                 (
                     Answer::Opening {
                         command: *command,
                         outcome,
                     },
-                    self.store.ledger() != before,
+                    wrote,
+                    wrote,
                 )
             }
         };
         if committed_now {
             self.record(StoreEvent::CommitStable { id, operation });
-            if self.pass(FaultPoint::CommitApplied, id, kind, operation, source)
-                == Some(FaultAction::Barrier)
-            {
-                self.halt = Some(Halt {
-                    point: FaultPoint::CommitApplied,
-                    pending: Some((id, kind, source, answer)),
-                });
-                return Performed::Halted(FaultPoint::CommitApplied);
-            }
         }
-        self.make_ready(id, kind, source, answer);
+        if committed_now
+            && wrote
+            && self.pass(FaultPoint::CommitApplied, id, kind, operation, source)
+                == Some(FaultAction::Barrier)
+        {
+            self.halt = Some(Halt {
+                point: FaultPoint::CommitApplied,
+                pending: Some((origin, answer)),
+            });
+            return Performed::Halted(FaultPoint::CommitApplied);
+        }
+        self.make_ready(origin, answer);
         Performed::Executed
     }
 
-    fn make_ready(&mut self, id: WorkId, kind: WorkKind, source: Source, answer: Answer) {
+    fn make_ready(&mut self, origin: Origin, answer: Answer) {
+        let Origin {
+            id,
+            ticket,
+            kind,
+            source,
+        } = origin;
         self.record(StoreEvent::ResultReady { id, answer });
         let operation = operation_of(answer);
         let ready = |delayed| Ready {
             id,
+            ticket,
             kind,
             source,
             answer,
@@ -715,13 +793,9 @@ impl<S: DurableStore> SimStore<S> {
     /// The dispatcher: hands a result over when it answers work in
     /// flight, for the operation that work named. Otherwise refuses it
     /// and records the refusal. `origin` is known for a result of this
-    /// adapter's own pipeline.
-    fn deliver(
-        &mut self,
-        id: WorkId,
-        answer: Answer,
-        origin: Option<(WorkKind, Source)>,
-    ) -> Performed {
+    /// adapter's own pipeline; such a result also answers only the
+    /// acceptance it was produced for.
+    fn deliver(&mut self, id: WorkId, answer: Answer, origin: Option<Origin>) -> Performed {
         let operation = operation_of(answer);
         let delivery = match (id, answer) {
             (WorkId::Effect(effect), Answer::Operation { operation, reply }) => {
@@ -739,15 +813,24 @@ impl<S: DurableStore> SimStore<S> {
             (WorkId::Effect(_), Answer::Opening { .. })
             | (WorkId::Opening(_), Answer::Operation { .. }) => None,
         };
-        let (Some(delivery), true) = (delivery, self.awaited.get(&id) == Some(&operation)) else {
+        let answers = self.awaited.get(&id).is_some_and(|(awaited, ticket)| {
+            let _ = (ticket, origin.map(|origin| origin.ticket));
+            *awaited == operation
+        });
+        let (Some(delivery), true) = (delivery, answers) else {
             self.record(StoreEvent::UncorrelatedResult { id, operation });
             return Performed::Uncorrelated;
         };
         self.awaited.remove(&id);
         self.record(StoreEvent::ResultDelivered { id, answer });
-        let barrier = origin.is_some_and(|(kind, source)| {
-            self.pass(FaultPoint::ResultConsume, id, kind, operation, source)
-                == Some(FaultAction::Barrier)
+        let barrier = origin.is_some_and(|origin| {
+            self.pass(
+                FaultPoint::ResultConsume,
+                id,
+                origin.kind,
+                operation,
+                origin.source,
+            ) == Some(FaultAction::Barrier)
         });
         if barrier {
             self.halt = Some(Halt {
@@ -761,18 +844,19 @@ impl<S: DurableStore> SimStore<S> {
     /// Presents a result that did not come out of this adapter's own
     /// pipeline. It goes through the same dispatcher: it is handed over
     /// only when it answers work in flight (ADR 0003). An identity the
-    /// bench remembered answers nothing and is refused here.
+    /// bench remembered answers nothing and is refused here. Nothing is
+    /// handed to the core while a barrier holds.
     pub fn present_result(
         &mut self,
         effect: EffectId,
         operation: OperationId,
         reply: StoreReply,
-    ) -> Performed {
-        self.deliver(
+    ) -> Result<Performed, ActionRefused> {
+        Ok(self.deliver(
             WorkId::Effect(effect),
             Answer::Operation { operation, reply },
             None,
-        )
+        ))
     }
 
     /// Reads one page of the recovery inventory through the adapter,
@@ -799,8 +883,8 @@ impl<S: DurableStore> SimStore<S> {
     /// Leaves a barrier and goes on from the point it stopped at.
     pub fn resume(&mut self) -> Option<FaultPoint> {
         let halt = self.halt.take()?;
-        if let Some((id, kind, source, answer)) = halt.pending {
-            self.make_ready(id, kind, source, answer);
+        if let Some((origin, answer)) = halt.pending {
+            self.make_ready(origin, answer);
         }
         Some(halt.point)
     }
@@ -837,6 +921,12 @@ impl<S: DurableStore> EffectSink for SimStore<S> {
         if let Err(reason) = self.room() {
             return SubmitResult::NotSubmitted { effect, reason };
         }
+        // The ticket is taken before anything is taken apart: an effect
+        // that cannot be accepted comes back whole.
+        let ticket = match self.ticket() {
+            Ok(ticket) => ticket,
+            Err(reason) => return SubmitResult::NotSubmitted { effect, reason },
+        };
         let (effect_id, body) = effect.into_parts();
         let work = match body {
             Effect::Persist { command } => Work::Persist(command),
@@ -849,7 +939,7 @@ impl<S: DurableStore> EffectSink for SimStore<S> {
                 };
             }
         };
-        self.accept(id, work);
+        self.accept(id, ticket, work);
         SubmitResult::Accepted
     }
 }
