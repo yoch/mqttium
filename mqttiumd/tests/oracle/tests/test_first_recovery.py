@@ -19,6 +19,24 @@ CASE = ORACLE / "cases/later-recovery-cannot-fill-first"
 ASSERTION = "transactional_kill_matches_recovery"
 
 
+def renumber(records):
+    """Keep a modified synthetic history structurally complete."""
+    next_sequence, identities = {}, {}
+    for record in records:
+        origin = (record["origin_component"], record["origin_incarnation"])
+        key = (*origin, record["origin_sequence"])
+        sequence = next_sequence.get(origin, 0)
+        identities[key] = str(sequence)
+        next_sequence[origin] = sequence + 1
+    for index, record in enumerate(records):
+        key = (record["origin_component"], record["origin_incarnation"], record["origin_sequence"])
+        record.update(origin_sequence=identities[key], record_sequence=str(index), time_value=str(index))
+        for parent in record["causal_parents"]:
+            key = (parent["origin_component"], parent["origin_incarnation"], parent["origin_sequence"])
+            parent["origin_sequence"] = identities[key]
+    records[-1]["payload"]["record_count"] = str(len(records))
+
+
 def partial_first_inventory(records):
     """One valid, non-final page in incarnation 2, before its second kill."""
     start = next(index for index, record in enumerate(records)
@@ -36,9 +54,7 @@ def partial_first_inventory(records):
         "origin_component": "store-adapter", "origin_incarnation": "2", "origin_sequence": "1"
     }]
     records[start + 1:start + 1] = [read, delivered]
-    for index, record in enumerate(records):
-        record.update(record_sequence=str(index), time_value=str(index))
-    records[-1]["payload"]["record_count"] = str(len(records))
+    renumber(records)
 
 
 class FirstRecovery(unittest.TestCase):
@@ -60,9 +76,7 @@ class FirstRecovery(unittest.TestCase):
                     records = [record for record in records if not (
                         record["kind"] == "BrokerRecovered" and record["payload"]["run_epoch"] == "2"
                     )]
-                    for index, record in enumerate(records):
-                        record.update(record_sequence=str(index), time_value=str(index))
-                    records[-1]["payload"]["record_count"] = str(len(records))
+                    renumber(records)
                 path.write_text("".join(json.dumps(record) + "\n" for record in records))
             result = subprocess.run(
                 [sys.executable, "-m", "mqttiumd_oracle", "--root", str(root),
