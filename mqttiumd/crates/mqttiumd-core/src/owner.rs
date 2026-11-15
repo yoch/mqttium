@@ -4447,4 +4447,42 @@ mod tests {
         );
         assert!(run(&facts, &starts, FactRank::Operation, end).is_empty());
     }
+
+    // ----- Audit of the first wave -----
+
+    // F4: no path builds two owners of one identity. Two owners built from
+    // one box would issue the same identities from fresh counters, so two
+    // different publications could receive the same `OperationId`.
+    #[test]
+    fn two_owners_of_one_identity_never_issue_one_operation_id() {
+        let mut authority = authority(INCARNATION, EPOCH);
+        let mut outbox = authority
+            .create_outbox(LogicalOwnerId::new(4), nonzero(CAPACITY), bound(ENTRIES))
+            .expect("first box");
+        let mut first = Owner::new(config(), &outbox).expect("large enough");
+        let mut second = Owner::new(config(), &outbox).expect("large enough");
+        let mut operations = Vec::new();
+        for (owner, payload) in [(&mut first, &b"one"[..]), (&mut second, &b"two"[..])] {
+            for input in [
+                page(&fixture(EPOCH), true),
+                connect(CONN, b"p1-producer"),
+                publish_with(CONN, 7, Qos::ExactlyOnce, payload),
+            ] {
+                let outcome = owner.step(input, GRANT, &mut outbox);
+                assert!(
+                    matches!(outcome, StepOutcome::Applied { .. }),
+                    "{outcome:?}"
+                );
+            }
+            let mut sink = Taking(Vec::new());
+            let _ = outbox.dispatch(&mut sink);
+            for effect in sink.0 {
+                if let (_, Effect::Persist { command }) = effect.into_parts() {
+                    operations.push(command.recipe.operation());
+                }
+            }
+        }
+        assert_eq!(operations.len(), 2);
+        assert_ne!(operations[0], operations[1], "one identity, two recipes");
+    }
 }
