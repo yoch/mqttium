@@ -294,6 +294,26 @@ pub enum ReservationError {
     Inconsistent,
 }
 
+/// Why a box refuses a reservation. Nothing changed.
+///
+/// A temporary lack names a wake-up that can happen. The two other
+/// refusals are definitive for this box and name none: waiting cannot end
+/// them. When several refusals hold at once the first of this order is
+/// reported: `LargerThanBox`, `TableExhausted`, then the needs, effect
+/// slots before table entries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReserveRefused {
+    /// A temporary lack: retry after the wake-up it names.
+    Need(CapacityNeed),
+    /// The request exceeds the whole capacity of the box. No dispatch can
+    /// make room for it.
+    LargerThanBox { requested: usize, capacity: usize },
+    /// No entry of the reservation table can ever be taken again: every
+    /// entry is spent, or the table has none. Only a new box, created by
+    /// the authority after this one is retired, reserves again.
+    TableExhausted,
+}
+
 /// A publication that was refused: the same effect and the reason.
 #[derive(PartialEq, Eq, Debug)]
 pub struct PublishRefused {
@@ -407,29 +427,42 @@ impl Outbox {
         self.queue.iter()
     }
 
-    /// Reserves `slots` places, or states what is missing. Nothing changes
-    /// on refusal.
-    pub fn reserve(&mut self, slots: NonZeroUsize) -> Result<EffectReservation, CapacityNeed> {
+    /// Reserves `slots` places, or says why not. Nothing changes on
+    /// refusal.
+    ///
+    /// A held entry counts as one that a release can free, even at its
+    /// last generation: the wake-up happens, and the retry is then told
+    /// that the table is exhausted.
+    pub fn reserve(&mut self, slots: NonZeroUsize) -> Result<EffectReservation, ReserveRefused> {
         let slots = slots.get();
+        let capacity = self.queue.capacity();
+        if slots > capacity {
+            return Err(ReserveRefused::LargerThanBox {
+                requested: slots,
+                capacity,
+            });
+        }
+        let records = self.records.as_slice();
+        let entry = records
+            .iter()
+            .position(|record| !record.held && !record.spent);
+        if entry.is_none() && !records.iter().any(|record| record.held) {
+            return Err(ReserveRefused::TableExhausted);
+        }
         let free = self.free_slots();
         if slots > free {
-            return Err(CapacityNeed {
+            return Err(ReserveRefused::Need(CapacityNeed {
                 resource: Resource::EffectSlots,
                 amount: (slots - free) as u64,
                 wake: WakeCondition::EffectAccepted,
-            });
+            }));
         }
-        let Some(index) = self
-            .records
-            .as_slice()
-            .iter()
-            .position(|record| !record.held && !record.spent)
-        else {
-            return Err(CapacityNeed {
+        let Some(index) = entry else {
+            return Err(ReserveRefused::Need(CapacityNeed {
                 resource: Resource::Reservations,
                 amount: 1,
                 wake: WakeCondition::ResourceReleased,
-            });
+            }));
         };
         let record = &mut self.records.as_mut_slice()[index];
         record.held = true;
@@ -898,11 +931,11 @@ mod tests {
         let need = outbox.reserve(slots(2)).expect_err("only one slot is free");
         assert_eq!(
             need,
-            CapacityNeed {
+            ReserveRefused::Need(CapacityNeed {
                 resource: Resource::EffectSlots,
                 amount: 1,
                 wake: WakeCondition::EffectAccepted,
-            }
+            })
         );
         assert_eq!(snapshot(&outbox), before);
         assert_invariant(&outbox);
@@ -1063,11 +1096,11 @@ mod tests {
         let before = snapshot(&outbox);
         assert_eq!(
             outbox.reserve(slots(1)),
-            Err(CapacityNeed {
+            Err(ReserveRefused::Need(CapacityNeed {
                 resource: Resource::Reservations,
                 amount: 1,
                 wake: WakeCondition::ResourceReleased,
-            })
+            }))
         );
         assert_eq!(snapshot(&outbox), before);
         assert_eq!(outbox.release(first), Ok(1));
@@ -1114,19 +1147,115 @@ mod tests {
         spend_every_entry(&mut outbox);
         assert_eq!(outbox.free_slots(), 4, "the slots themselves are free");
         let before = snapshot(&outbox);
-        let refusal = outbox.reserve(slots(1)).expect_err("no entry is left");
-        assert!(
-            !matches!(
-                refusal,
-                CapacityNeed {
-                    wake: WakeCondition::ResourceReleased,
-                    ..
-                }
-            ),
-            "a definitive exhaustion was reported as a wait: {refusal:?}"
+        assert_eq!(
+            outbox.reserve(slots(1)),
+            Err(ReserveRefused::TableExhausted),
+            "a definitive exhaustion was reported as a wait"
         );
         assert_eq!(snapshot(&outbox), before);
         assert_invariant(&outbox);
+    }
+
+    #[test]
+    fn a_table_of_no_entry_is_exhausted_from_the_start() {
+        let mut outbox = Outbox::with_capacity(box_id(0), EffectSlots::new(4), 0).expect("small");
+        let before = snapshot(&outbox);
+        assert_eq!(
+            outbox.reserve(slots(1)),
+            Err(ReserveRefused::TableExhausted)
+        );
+        assert_eq!(snapshot(&outbox), before);
+    }
+
+    #[test]
+    fn a_spent_table_is_reported_before_a_lack_of_slots() {
+        // The box is full as well: dispatching would free slots, and no
+        // reservation could use them.
+        let mut outbox = filled(2, 2);
+        spend_every_entry_of_a_full_box(&mut outbox);
+        assert_eq!(outbox.free_slots(), 0);
+        let before = snapshot(&outbox);
+        assert_eq!(
+            outbox.reserve(slots(1)),
+            Err(ReserveRefused::TableExhausted)
+        );
+        assert_eq!(snapshot(&outbox), before);
+    }
+
+    /// Marks every entry spent without reserving: the box has no free slot.
+    fn spend_every_entry_of_a_full_box(outbox: &mut Outbox) {
+        for record in outbox.records.as_mut_slice() {
+            assert!(!record.held);
+            record.spent = true;
+        }
+    }
+
+    #[test]
+    fn a_table_with_a_held_entry_left_is_a_wait_until_that_entry_is_spent() {
+        let mut outbox = Outbox::with_capacity(box_id(0), EffectSlots::new(4), 2).expect("small");
+        for record in outbox.records.as_mut_slice() {
+            record.generation = u64::MAX;
+        }
+        let spent = outbox.reserve(slots(1)).expect("an entry is left");
+        let held = outbox.reserve(slots(1)).expect("an entry is left");
+        assert_eq!(outbox.release(spent), Ok(1));
+
+        // One entry is spent and the other is held: a release can happen.
+        let before = snapshot(&outbox);
+        assert_eq!(
+            outbox.reserve(slots(1)),
+            Err(ReserveRefused::Need(CapacityNeed {
+                resource: Resource::Reservations,
+                amount: 1,
+                wake: WakeCondition::ResourceReleased,
+            }))
+        );
+        assert_eq!(snapshot(&outbox), before);
+
+        // The release happens; the held entry was at its last generation.
+        assert_eq!(outbox.release(held), Ok(1));
+        assert_eq!(
+            outbox.reserve(slots(1)),
+            Err(ReserveRefused::TableExhausted)
+        );
+        assert_invariant(&outbox);
+    }
+
+    #[test]
+    fn a_request_larger_than_the_box_is_not_reported_as_a_wait() {
+        let mut outbox = filled(3, 1);
+        let before = snapshot(&outbox);
+        assert_eq!(
+            outbox.reserve(slots(4)),
+            Err(ReserveRefused::LargerThanBox {
+                requested: 4,
+                capacity: 3
+            })
+        );
+        // The whole capacity is a wait while an effect holds a slot.
+        assert_eq!(
+            outbox.reserve(slots(3)),
+            Err(ReserveRefused::Need(CapacityNeed {
+                resource: Resource::EffectSlots,
+                amount: 1,
+                wake: WakeCondition::EffectAccepted,
+            }))
+        );
+        assert_eq!(snapshot(&outbox), before);
+
+        // Larger than the box comes first, even on a spent table.
+        spend_every_entry_of_a_full_box(&mut outbox);
+        assert_eq!(
+            outbox.reserve(slots(4)),
+            Err(ReserveRefused::LargerThanBox {
+                requested: 4,
+                capacity: 3
+            })
+        );
+        assert_eq!(
+            outbox.reserve(slots(1)),
+            Err(ReserveRefused::TableExhausted)
+        );
     }
 
     #[test]
