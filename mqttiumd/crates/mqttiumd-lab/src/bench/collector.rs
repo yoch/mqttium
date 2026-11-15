@@ -599,6 +599,16 @@ mod tests {
     }
 
     #[test]
+    fn the_failure_kinds_accept_the_schemas_constant_origin() {
+        let schema = crate::strict::parse(include_bytes!("../../../../contracts/schema/v1/trace-record.schema.json")).unwrap();
+        let kinds = KindTable::from_schema(&schema).unwrap();
+        for kind in ["DurableReadFailed", "ProcessControlFailed"] {
+            assert!(kinds.allows(kind, Origin::BenchSupervisor), "{kind} must reach the surviving collector");
+            assert!(!kinds.allows(kind, Origin::BrokerCore), "the child may not forge supervisor failures");
+        }
+    }
+
+    #[test]
     fn the_budget_bounds_the_trace() {
         let mut collector = Collector::new("run", kinds(), 64);
         assert_eq!(
