@@ -43,6 +43,16 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # The kill points of the SQLite store exist in a build with the feature
+      # `kill-points` only, which no manifest may turn on: a product build
+      # never carries them. The tests of the crate are run with it, among
+      # them a child killed with every row of a command written and COMMIT
+      # not called.
+      - name: Kill points stay out of the product and hold in the store
+        run: |
+          tools/check_kill_points.sh
+          cargo clippy -p mqttiumd-store-sqlite --all-targets --features kill-points --locked -- -D warnings
+          cargo test -p mqttiumd-store-sqlite --features kill-points --locked
       - name: Validate the contracts and scenario P1-02
         run: >-
           cargo run --quiet --locked -p mqttiumd-lab -- validate

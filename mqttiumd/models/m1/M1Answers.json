@@ -1,0 +1,24 @@
+{
+  "module": "M1Answers.tla",
+  "status": "refinement",
+  "summary": "Which answers of its resolutions an operation applies (audit F3): at most 1 + R + L retained effects, nothing applied outside them, and progress out of AdmissionPending under I3, a uniform lag bound measured in newer resolutions; without that bound the counterexample stays.",
+  "issues": [647],
+  "tests": ["mqttiumd/crates/mqttiumd-core/src/owner.rs"],
+  "replays": [{"file": "mqttiumd/crates/mqttiumd-core/src/owner.rs", "test": "resolutions_whose_answers_arrive_after_four_newer_ones_still_commit"}, {"file": "mqttiumd/crates/mqttiumd-core/src/owner.rs", "test": "resolutions_progress_under_a_finite_lag_with_losses_and_duplicates"}, {"file": "mqttiumd/crates/mqttiumd-core/src/owner.rs", "test": "the_next_landmark_progresses_when_the_answer_of_one_is_lost"}, {"file": "mqttiumd/crates/mqttiumd-core/src/owner.rs", "test": "resolutions_progress_when_their_answers_arrive_out_of_order"}, {"file": "mqttiumd/crates/mqttiumd-core/src/owner.rs", "test": "an_operation_retains_a_bounded_number_of_answers"}, {"file": "mqttiumd/crates/mqttiumd-core/src/owner.rs", "test": "a_late_commit_after_a_refusal_of_one_admission_is_a_fault"}, {"file": "mqttiumd/crates/mqttiumd-core/src/owner.rs", "test": "review_individually_finite_delays_do_not_imply_a_uniform_lag_bound"}],
+  "configs": [
+    {"config": "M1Answers-i3.cfg", "expect": "pass", "invariants": ["TypeOK", "BoundedRetention", "RetentionMatchesSpec", "NothingForged", "ProgressWithinBound", "NoStarvationWithEveryEvictedAnswerDelivered"]},
+    {"config": "M1Answers-i3-reduced.cfg", "expect": "pass", "invariants": ["TypeOK", "BoundedRetention", "RetentionMatchesSpec", "NothingForged", "ProgressWithinBound", "NoStarvationWithEveryEvictedAnswerDelivered"]},
+    {"config": "M1Answers-i3-pair.cfg", "expect": "pass", "invariants": ["TypeOK", "BoundedRetention", "RetentionMatchesSpec", "NothingForged", "ProgressWithinBound", "NoStarvationWithEveryEvictedAnswerDelivered"]},
+    {"config": "M1Answers-i3-pair-reduced.cfg", "expect": "pass", "invariants": ["TypeOK", "BoundedRetention", "RetentionMatchesSpec", "NothingForged", "ProgressWithinBound", "NoStarvationWithEveryEvictedAnswerDelivered"]},
+    {"config": "M1Answers-i3-liveness.cfg", "expect": "pass", "property": "LeavesAdmissionPending"},
+    {"config": "M1Answers-unbounded.cfg", "expect": "violation", "invariant": "NoStarvationWithEveryEvictedAnswerDelivered"},
+    {"config": "M1Answers-unbounded-reduced.cfg", "expect": "violation", "invariant": "NoStarvationWithEveryEvictedAnswerDelivered"},
+    {"config": "M1Answers-reach-landmark-commit.cfg", "expect": "violation", "invariant": "NoLandmarkCommit"},
+    {"config": "M1Answers-reach-next-landmark-after-loss.cfg", "expect": "violation", "invariant": "NoNextLandmarkAfterLoss"},
+    {"config": "M1Answers-reach-out-of-order.cfg", "expect": "violation", "invariant": "NoOutOfOrder"},
+    {"config": "M1Answers-mut-no-landmarks.cfg", "expect": "violation", "invariant": "ProgressWithinBound"},
+    {"config": "M1Answers-mut-landmark-slot-by-rank.cfg", "expect": "violation", "invariant": "RetentionMatchesSpec"},
+    {"config": "M1Answers-mut-apply-any.cfg", "expect": "violation", "invariant": "NothingForged"},
+    {"config": "M1Answers-mut-keep-evicted.cfg", "expect": "violation", "invariant": "BoundedRetention"}
+  ]
+}
