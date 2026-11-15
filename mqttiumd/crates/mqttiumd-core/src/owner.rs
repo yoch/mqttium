@@ -4172,10 +4172,12 @@ mod tests {
         );
     }
 
-    // Finding 1: a release refused for a reason that a new preparation
-    // cannot change is not prepared again.
+    // inbound_qos2.release_pending.rejected.definitive.stop: a release
+    // refused for a reason that a new preparation cannot change is not
+    // prepared again; the owner stops, publishes nothing and changes
+    // nothing (finding 1 of the review of the core).
     #[test]
-    fn a_release_refused_for_a_reason_a_new_preparation_cannot_change_stops_the_owner() {
+    fn rule_inbound_qos2_release_pending_rejected_definitive_stop() {
         for reason in [
             RejectReason::PreconditionFailed,
             RejectReason::EpochClosed,
@@ -4192,10 +4194,12 @@ mod tests {
         }
     }
 
-    // Finding 1: a fenced release is prepared again, a bounded number of
-    // times.
+    // inbound_qos2.release_pending.rejected.fenced_at_bound.stop: a fenced
+    // release is prepared again until the bound of preparations; one more
+    // fence stops the owner, which publishes nothing and changes nothing
+    // (finding 1 of the review of the core).
     #[test]
-    fn a_fenced_release_is_prepared_again_a_bounded_number_of_times() {
+    fn rule_inbound_qos2_release_pending_rejected_fenced_at_bound_stop() {
         let mut world = World::release_pending();
         let mut release = world.flights[1];
         for _ in 1..MAX_RELEASE_PREPARATIONS {
