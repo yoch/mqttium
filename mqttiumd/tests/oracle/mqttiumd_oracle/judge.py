@@ -1290,6 +1290,108 @@ CHILD = frozenset(
 )
 
 
+def transactional_kill_matches_recovery(run):
+    """Match the interrupted command, its acknowledged point and complete recovery.
+
+    This checks observed operation identities. The full DurableState equality
+    against the deterministic store is an independent store test, not a claim
+    calculated by the runner or inferred from a commit counter.
+    """
+    points = {"store.commit.prepared", "store.commit.logged", "store.commit.applied"}
+    faults = [fault for fault in run.scenario["faults"] if fault["point"] in points]
+    if not faults:
+        return Status(OUT_OF_SCOPE, ["the scenario declares no deterministic transaction point"])
+    if run.trace.broker != "child-process":
+        return Status(FAIL, ["a deterministic transaction kill requires a child process"])
+    statuses, reasons = [], []
+    for fault in faults:
+        hits = [
+            hit for hit in run.trace.of_kind("FaultHit")
+            if hit.payload["fault_id"] == fault["id"]
+        ]
+        if len(hits) != 1 or "operation_id" not in hits[0].payload:
+            statuses.append(INCONCLUSIVE)
+            reasons.append(f"{fault['id']}: no unique FaultHit identifies its command")
+            continue
+        hit = hits[0]
+        if hit.payload["point"] != fault["point"]:
+            statuses.append(FAIL)
+            reasons.append(f"{fault['id']}: FaultHit does not match its declared point")
+            continue
+        operation = _key(hit.payload["operation_id"])
+        kills = [kill for kill in run.trace.of_kind("BrokerKilled") if run.trace.before(hit, kill) is True]
+        if not kills:
+            statuses.append(INCONCLUSIVE)
+            reasons.append(f"{fault['id']}: no kill follows its acknowledged point")
+            continue
+        kill = min(kills, key=lambda record: record.sequence)
+        if kill.payload["wait_status"]["signal"] != 9:
+            statuses.append(FAIL)
+            reasons.append(f"{fault['id']}: wait status does not report signal 9")
+        stable = [
+            record for record in run.trace.of_kind("StoreCommitStable")
+            if _key(record.payload["operation_id"]) == operation
+            and run.trace.before(record, kill) is True
+        ]
+        if fault["point"] == "store.commit.applied":
+            if len(stable) != 1 or run.trace.before(stable[0], hit) is not True:
+                statuses.append(FAIL)
+                reasons.append(f"{fault['id']}: no StoreCommitStable before the applied point")
+        elif stable:
+            statuses.append(FAIL)
+            reasons.append(f"{fault['id']}: StoreCommitStable before kill at {fault['point']}")
+        ready = [
+            record for record in run.trace.of_kind("StoreResultReady")
+            if _key(record.payload["operation_id"]) == operation
+            and run.trace.before(record, kill) is True
+        ]
+        if ready:
+            statuses.append(FAIL)
+            reasons.append(f"{fault['id']}: the interrupted command already has StoreResultReady")
+        # Only the first new incarnation's complete inventory answers this
+        # kill; another restart or a later retransmission cannot supply it.
+        pages = [
+            page for page in run.trace.of_kind("RecoveryPageDelivered")
+            if page.origin[1] > hit.origin[1] and run.trace.before(kill, page) is True
+        ]
+        if pages:
+            incarnation = min(page.origin[1] for page in pages)
+            pages = [page for page in pages if page.origin[1] == incarnation]
+        pages.sort(key=lambda page: int(page.payload["page"]))
+        complete = (
+            bool(pages)
+            and [int(page.payload["page"]) for page in pages] == list(range(len(pages)))
+            and pages[-1].payload["last"]
+            and not any(page.payload["last"] for page in pages[:-1])
+        )
+        reads = run.trace.of_kind("RecoveryPageRead")
+        corroborated = all(
+            any(
+                read.origin[1] == page.origin[1]
+                and read.payload == page.payload
+                and run.trace.before(read, page) is True
+                for read in reads
+            )
+            for page in pages
+        )
+        if not complete or not corroborated:
+            statuses.append(INCONCLUSIVE)
+            reasons.append(f"{fault['id']}: no complete corroborated recovery inventory")
+            continue
+        found = [
+            fact["knowledge"] for page in pages for fact in page.payload["facts"]
+            if fact["kind"] == "Operation" and _key(fact["operation_id"]) == operation
+        ]
+        if fault["point"] == "store.commit.prepared":
+            if found:
+                statuses.append(FAIL)
+                reasons.append(f"{fault['id']}: interrupted operation {operation} was recovered at K1")
+        elif found != ["Committed"]:
+            statuses.append(FAIL)
+            reasons.append(f"{fault['id']}: interrupted operation {operation} was not recovered Committed")
+    return Status(_worst(statuses), reasons)
+
+
 def broker_killed_for_real(run):
     """A run that claims its broker runs as a child process shows its kill (record 0019).
 
@@ -1424,6 +1526,7 @@ ASSERTIONS = {
     "terminal_knowledge_never_regresses": terminal_knowledge_never_regresses,
     "scenario_reaches_its_end": scenario_reaches_its_end,
     "broker_killed_for_real": broker_killed_for_real,
+    "transactional_kill_matches_recovery": transactional_kill_matches_recovery,
     "all_required_faults_hit": all_required_faults_hit,
     "trace_complete": trace_complete,
 }

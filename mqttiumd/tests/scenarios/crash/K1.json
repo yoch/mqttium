@@ -1,0 +1,107 @@
+{
+  "format": "mqttiumd.scenario",
+  "schema_version": 1,
+  "id": "K1",
+  "profile": "p1-durable-mqtt5-without-expiry",
+  "initial_fixture": "tests/fixtures/p1/three-persistent-sessions.json",
+  "budgets": {
+    "max_steps": "4096",
+    "max_trace_bytes": "16777216"
+  },
+  "faults": [
+    {
+      "id": "transaction_cut",
+      "point": "store.commit.prepared",
+      "match": {
+        "command_kind": "AdmitPublication",
+        "publication_binding": "pub_A"
+      },
+      "occurrence": "1",
+      "action": "barrier",
+      "bind_operation_as": "op_A",
+      "expected_hits": "1"
+    }
+  ],
+  "steps": [
+    {
+      "kind": "ClientResumeSession",
+      "client": "producer",
+      "expect_session_present": true,
+      "max_steps": "512"
+    },
+    {
+      "kind": "ClientPublish",
+      "client": "producer",
+      "topic": "p1/example",
+      "qos": 2,
+      "retain": false,
+      "packet_id": 7,
+      "payload_hex": "7061796c6f6164",
+      "bind_exchange_as": "pub_A"
+    },
+    {
+      "kind": "DriveUntil",
+      "event": "FaultHit",
+      "binding": "transaction_cut",
+      "max_steps": "512"
+    },
+    {
+      "kind": "CrashBroker",
+      "failure_model": "process"
+    },
+    {
+      "kind": "RestartBroker",
+      "workers": 1
+    },
+    {
+      "kind": "ClientResumeSession",
+      "client": "producer",
+      "expect_session_present": true,
+      "max_steps": "512"
+    },
+    {
+      "kind": "ClientResumeExchange",
+      "client": "producer",
+      "exchange": "pub_A"
+    },
+    {
+      "kind": "DriveUntil",
+      "event": "PeerPacketObserved",
+      "client": "producer",
+      "packet_kind": "PUBREC",
+      "packet_id": 7,
+      "max_steps": "512"
+    },
+    {
+      "kind": "InspectDurableState",
+      "checkpoint": "after_retransmission"
+    },
+    {
+      "kind": "ClientSendPubrel",
+      "client": "producer",
+      "packet_id": 7
+    },
+    {
+      "kind": "DriveUntil",
+      "event": "PeerPacketObserved",
+      "client": "producer",
+      "packet_kind": "PUBCOMP",
+      "packet_id": 7,
+      "max_steps": "512"
+    },
+    {
+      "kind": "InspectDurableState",
+      "checkpoint": "final"
+    }
+  ],
+  "assertions": [
+    "one_admission_per_observed_inbound_exchange",
+    "same_required_obligations_at_both_checkpoints",
+    "no_positive_ack_before_confirmed_commit",
+    "no_pubrec_observed_before_crash",
+    "all_required_faults_hit",
+    "trace_complete",
+    "transactional_kill_matches_recovery",
+    "broker_killed_for_real"
+  ]
+}

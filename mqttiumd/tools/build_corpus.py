@@ -147,6 +147,9 @@ def rule(
 # ------------------------------------------------------------------ examples
 BASE = json.loads((ROOT / "tests/scenarios/p1/P1-02.json").read_text())
 valid = [
+    "tests/scenarios/crash/K1.json",
+    "tests/scenarios/crash/K2b.json",
+    "tests/scenarios/crash/K3.json",
     "tests/scenarios/p1/P1-02.json",
     "tests/scenarios/qabs/QABS-A.json",
     "tests/scenarios/qabs/QABS-B.json",
