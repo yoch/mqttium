@@ -1,8 +1,9 @@
 //! What the bench does not play yet is refused, explicitly and before
 //! anything is written: the repeated faults of decision 0018
-//! (`from_occurrence`, `expected_hits_at_least`, `lag`) and the deadlines a
-//! `DriveUntil` fires itself (`fire_deadlines`). A scenario the contracts
-//! accept is never played by ignoring a member.
+//! (`from_occurrence`, `expected_hits_at_least`, `lag`). A scenario the
+//! contracts accept is never played by ignoring a member. The deadlines a
+//! `DriveUntil` fires itself (`fire_deadlines`) are played: see
+//! `bench_fire_deadlines.rs`.
 
 #[path = "bench_support.rs"]
 mod bench_support;
@@ -37,32 +38,4 @@ fn a_repeated_fault_of_decision_0018_is_refused_before_anything_is_written() {
     );
     assert!(why.contains("from_occurrence"), "{why}");
     assert!(why.contains("not played"), "{why}");
-}
-
-#[test]
-fn a_wait_that_fires_its_own_deadlines_is_refused_before_anything_is_written() {
-    let root = bench_support::root();
-    let mut scenario: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(root.join("tests/scenarios/p1/P1-02.json")).unwrap())
-            .unwrap();
-    let wait = scenario["steps"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|step| step["kind"] == "DriveUntil")
-        .unwrap();
-    wait["fire_deadlines"] = serde_json::json!(true);
-    let relative = format!(
-        "target/bench-scenarios/fire-deadlines-{}.json",
-        std::process::id()
-    );
-    std::fs::create_dir_all(root.join("target/bench-scenarios")).unwrap();
-    std::fs::write(
-        root.join(&relative),
-        serde_json::to_vec_pretty(&scenario).unwrap(),
-    )
-    .unwrap();
-    let why = refused(&relative, "unplayed-fire");
-    let _ = std::fs::remove_file(root.join(&relative));
-    assert!(why.contains("fire_deadlines"), "{why}");
 }
