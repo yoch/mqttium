@@ -915,6 +915,40 @@ pub fn a_release_ends_the_inbound_exchange<S: DurableStore>(
     );
 }
 
+/// Every account equals what the state holds: a receipt slot per receipt
+/// and per fence, an exchange slot per inbound marker, a reference per
+/// obligation, the bytes of the payloads kept. Returns the first account
+/// that differs.
+pub fn accounts_match_what_is_held(state: &DurableState) -> Result<(), &'static str> {
+    let count = |n: usize| u64::try_from(n).expect("a count fits u64");
+    let held = Accounts {
+        payload_bytes: PayloadBytes::new(
+            state
+                .payloads
+                .values()
+                .map(|payload| count(payload.bytes.len()))
+                .sum(),
+        ),
+        references: References::new(count(state.obligations.len())),
+        exchange_slots: ExchangeSlots::new(count(state.inbound.len())),
+        receipt_slots: ReceiptSlots::new(count(state.operations.len() + state.fences.len())),
+    };
+    let accounts = state.accounts;
+    if accounts.payload_bytes != held.payload_bytes {
+        return Err("payload bytes");
+    }
+    if accounts.references != held.references {
+        return Err("references");
+    }
+    if accounts.exchange_slots != held.exchange_slots {
+        return Err("exchange slots");
+    }
+    if accounts.receipt_slots != held.receipt_slots {
+        return Err("receipt slots");
+    }
+    Ok(())
+}
+
 fn inbound_released<S: DurableStore>(world: &World<S>) -> StoreOutcome {
     StoreOutcome::Committed(CommitFacts::InboundReleased {
         exchange: ExchangeId {
