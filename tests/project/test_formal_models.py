@@ -289,7 +289,9 @@ def test_unusable_sidecar_is_refused(
     _no_tlc(monkeypatch)
     _write_model(tmp_path, "Bad", [{"config": "Bad.cfg", **entry}])
     (tmp_path / "Bad.json").write_text(
-        json.dumps({"module": "Bad.tla", "status": "refinement", "configs": [entry]}),
+        json.dumps(
+            {"module": "Bad.tla", "status": "refinement", "summary": "Bad.", "configs": [entry]}
+        ),
         encoding="utf-8",
     )
     if remove is not None:
