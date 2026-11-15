@@ -535,6 +535,15 @@ impl Outbox {
         self.id
     }
 
+    /// The slots the box was created with: filled, reserved and free
+    /// together. It never changes. An owner compares it, once, with the
+    /// largest reservation one of its transitions makes (ADR 0006,
+    /// amendment).
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.queue.capacity()
+    }
+
     /// Slots neither filled nor reserved.
     #[must_use]
     pub fn free_slots(&self) -> usize {
@@ -2352,6 +2361,26 @@ mod authority_tests {
         authority.retire(third).expect("empty and unreserved");
         authority.retire(second).expect("empty and unreserved");
         assert_eq!(authority.active_owners(), 0);
+    }
+
+    // ADR 0006, amendment: the constructor of an owner compares the
+    // capacity of its box with its largest reservation, whatever the box
+    // holds at that moment.
+    #[test]
+    fn the_capacity_of_a_box_is_what_it_was_created_with_whatever_it_holds() {
+        let mut authority = authority(1);
+        let mut outbox = authority
+            .create_outbox(owner(1), slots(4), entries(2))
+            .expect("first box");
+        assert_eq!(outbox.capacity(), 4);
+        let key = outbox.reserve(slots(3)).expect("room");
+        assert_eq!(outbox.capacity(), 4, "three slots reserved");
+        assert_eq!(outbox.publish(key, effect(1)).map_err(|_| ()), Ok(2));
+        assert_eq!(outbox.capacity(), 4, "one effect waits, two slots reserved");
+        assert_eq!(outbox.release(key), Ok(2));
+        let _ = outbox.dispatch(&mut taking());
+        assert_eq!(outbox.capacity(), 4, "empty again");
+        assert_eq!(outbox.free_slots(), 4);
     }
 }
 
