@@ -1543,7 +1543,7 @@ snap_case(
 snap_case(
     "decision-unknown-outcome",
     "schema-violation",
-    "/operations/0/decision",
+    "/operations/0/decision/kind",
     "A receipt records a terminal decision; an unknown outcome is not a durable fact.",
     setter(["operations", 0, "decision"], {"kind": "PendingOrUnknown"}),
 )
@@ -1585,7 +1585,7 @@ snap_case(
 snap_case(
     "startup-nonce-too-short",
     "schema-violation",
-    "/meta/opened_by/startup_hex",
+    "/meta/opened_by",
     "A start-up nonce is sixteen bytes.",
     setter(["meta", "opened_by", "startup_hex"], "a7" * 15),
 )

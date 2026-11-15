@@ -66,6 +66,8 @@ pub mod code {
     pub const DUPLICATE_NAME: &str = "duplicate-name";
     /// A name refers to no entry of its catalogue.
     pub const CATALOG_REFERENCE_UNKNOWN: &str = "catalog-reference-unknown";
+    /// The rows of a table are not in the order of their keys.
+    pub const ROWS_OUT_OF_ORDER: &str = "rows-out-of-order";
     /// The requirement identifier is not in the register.
     pub const REQUIREMENT_UNKNOWN: &str = "requirement-unknown";
     /// Two rules of a registry cover the same guard point.
@@ -85,7 +87,7 @@ pub mod code {
     pub const EVIDENCE_MISMATCH: &str = "evidence-mismatch";
 
     /// Every code, so that the example corpus can prove it exercises them.
-    pub const ALL: [&str; 36] = [
+    pub const ALL: [&str; 37] = [
         JSON_SYNTAX,
         DUPLICATE_KEY,
         NUMBER_NOT_INTEGER,
@@ -114,6 +116,7 @@ pub mod code {
         STEP_ORDER_INVALID,
         DUPLICATE_NAME,
         CATALOG_REFERENCE_UNKNOWN,
+        ROWS_OUT_OF_ORDER,
         REQUIREMENT_UNKNOWN,
         REGISTRY_OVERLAP,
         REGISTRY_HOLE,

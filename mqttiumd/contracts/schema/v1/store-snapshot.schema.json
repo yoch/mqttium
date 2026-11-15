@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "mqttiumd store snapshot",
-  "description": "The durable state of a store at one checkpoint, as an independent read sees it (DEM-011, DEM-019). It is evidence for the oracle and never an input of the broker. A snapshot shows what the store holds, sound or not: its soundness is an assertion, not a condition of the format.",
+  "description": "The durable state of a store at one checkpoint, as an independent read sees it (DEM-011, DEM-019). It is evidence for the oracle and never an input of the broker. A snapshot shows what the store holds, sound or not: its soundness is an assertion, not a condition of the format. Rows are in key order, so that two stores in the same state write the same bytes.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -12,13 +12,14 @@
     "backend",
     "meta",
     "sessions",
-    "routes",
+    "route_table",
     "operations",
     "fences",
+    "payloads",
     "publications",
     "obligations",
     "inbound_exchanges",
-    "accounts"
+    "account"
   ],
   "properties": {
     "format": {
@@ -44,19 +45,61 @@
       "additionalProperties": false,
       "required": [
         "incarnation",
-        "epoch"
+        "last_opened_epoch",
+        "opened_by",
+        "collected_through",
+        "state_revision",
+        "next_session"
       ],
       "properties": {
         "incarnation": {
           "$ref": "primitives.schema.json#/$defs/u64"
         },
-        "epoch": {
+        "last_opened_epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64",
+          "description": "The open epoch; every earlier one is closed. \"0\": no epoch was ever opened."
+        },
+        "opened_by": {
+          "description": "The attempt that opened the last epoch: its start-up nonce and its ticket. Null while no epoch is open.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "startup_hex",
+                "ticket"
+              ],
+              "properties": {
+                "startup_hex": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{32}$",
+                  "minLength": 32,
+                  "maxLength": 32
+                },
+                "ticket": {
+                  "$ref": "primitives.schema.json#/$defs/u64"
+                }
+              }
+            }
+          ]
+        },
+        "collected_through": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "state_revision": {
+          "$ref": "primitives.schema.json#/$defs/u64",
+          "description": "Advances at every commit; the frontier a recovery cursor names."
+        },
+        "next_session": {
           "$ref": "primitives.schema.json#/$defs/u64"
         }
       }
     },
     "sessions": {
-      "description": "Persistent sessions.",
+      "description": "Sessions, by SessionId.",
       "type": "array",
       "items": {
         "type": "object",
@@ -64,7 +107,8 @@
         "required": [
           "session",
           "client_id_hex",
-          "revision"
+          "revision",
+          "state"
         ],
         "properties": {
           "session": {
@@ -75,62 +119,78 @@
           },
           "revision": {
             "$ref": "primitives.schema.json#/$defs/u64"
+          },
+          "state": {
+            "description": "A deleted session stays, terminal: its identity is never reused.",
+            "enum": [
+              "Active",
+              "Terminal"
+            ]
           }
         }
       },
       "maxItems": 65536
     },
-    "routes": {
-      "description": "Exact-topic routes and their targets.",
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "topic_hex",
-          "revision",
-          "targets"
-        ],
-        "properties": {
-          "topic_hex": {
-            "$ref": "primitives.schema.json#/$defs/hex_bytes"
-          },
-          "revision": {
-            "$ref": "primitives.schema.json#/$defs/u64"
-          },
-          "targets": {
-            "type": "array",
-            "maxItems": 65535,
-            "items": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "session",
-                "qos"
-              ],
-              "properties": {
-                "session": {
-                  "$ref": "primitives.schema.json#/$defs/u64"
-                },
-                "qos": {
-                  "$ref": "primitives.schema.json#/$defs/qos"
+    "route_table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "routes"
+      ],
+      "properties": {
+        "revision": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "routes": {
+          "description": "Exact-topic routes, by topic bytes.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "topic_hex",
+              "targets"
+            ],
+            "properties": {
+              "topic_hex": {
+                "$ref": "primitives.schema.json#/$defs/hex_bytes"
+              },
+              "targets": {
+                "description": "In the order they were added.",
+                "type": "array",
+                "maxItems": 65535,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "session",
+                    "qos"
+                  ],
+                  "properties": {
+                    "session": {
+                      "$ref": "primitives.schema.json#/$defs/u64"
+                    },
+                    "qos": {
+                      "$ref": "primitives.schema.json#/$defs/qos"
+                    }
+                  }
                 }
               }
             }
-          }
+          },
+          "maxItems": 65536
         }
-      },
-      "maxItems": 65536
+      }
     },
     "operations": {
-      "description": "Operations the store decided: identity, exact recipe, decision.",
+      "description": "Receipts: operations the store decided, by OperationId. A certain rejection is a receipt too.",
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": [
           "operation_id",
-          "command_kind",
           "recipe_hex",
           "decision"
         ],
@@ -138,18 +198,188 @@
           "operation_id": {
             "$ref": "primitives.schema.json#/$defs/operation_id"
           },
-          "command_kind": {
-            "$ref": "primitives.schema.json#/$defs/type_name"
-          },
           "recipe_hex": {
             "$ref": "primitives.schema.json#/$defs/hex_bytes",
-            "description": "The exact canonical bytes of the recipe (DEM-009)."
+            "description": "The exact canonical bytes of the recipe (DEM-009). Its kind byte says which command it is."
           },
           "decision": {
-            "description": "The terminal decision of the receipt. An unknown outcome is not a durable fact.",
-            "enum": [
-              "Committed",
-              "RejectedCertain"
+            "description": "The terminal decision of the receipt, with its content. An unknown outcome is not a durable fact.",
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "Committed",
+                  "RejectedCertain"
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "required": [
+                    "kind"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "const": "Committed"
+                    }
+                  }
+                },
+                "then": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "kind",
+                    "facts"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "const": "Committed"
+                    },
+                    "facts": {
+                      "type": "object",
+                      "required": [
+                        "kind"
+                      ],
+                      "properties": {
+                        "kind": {
+                          "enum": [
+                            "PublicationAdmitted",
+                            "InboundReleased"
+                          ]
+                        }
+                      },
+                      "allOf": [
+                        {
+                          "if": {
+                            "required": [
+                              "kind"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "PublicationAdmitted"
+                              }
+                            }
+                          },
+                          "then": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "kind",
+                              "publication_id",
+                              "exchange"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "PublicationAdmitted"
+                              },
+                              "publication_id": {
+                                "$ref": "primitives.schema.json#/$defs/publication_id"
+                              },
+                              "exchange": {
+                                "$ref": "primitives.schema.json#/$defs/exchange_id"
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "if": {
+                            "required": [
+                              "kind"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "InboundReleased"
+                              }
+                            }
+                          },
+                          "then": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "kind",
+                              "exchange"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "InboundReleased"
+                              },
+                              "exchange": {
+                                "$ref": "primitives.schema.json#/$defs/exchange_id"
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "required": [
+                    "kind"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "const": "RejectedCertain"
+                    }
+                  }
+                },
+                "then": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "kind",
+                    "reason"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "const": "RejectedCertain"
+                    },
+                    "reason": {
+                      "enum": [
+                        "PreconditionFailed",
+                        "CapacityExceeded",
+                        "Fenced",
+                        "EpochClosed"
+                      ]
+                    },
+                    "resource": {
+                      "$ref": "primitives.schema.json#/$defs/name"
+                    }
+                  },
+                  "allOf": [
+                    {
+                      "if": {
+                        "required": [
+                          "reason"
+                        ],
+                        "properties": {
+                          "reason": {
+                            "const": "CapacityExceeded"
+                          }
+                        }
+                      },
+                      "then": {
+                        "required": [
+                          "resource"
+                        ]
+                      },
+                      "else": {
+                        "not": {
+                          "required": [
+                            "resource"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
             ]
           }
         }
@@ -157,7 +387,7 @@
       "maxItems": 65536
     },
     "fences": {
-      "description": "Identities that are definitively not executable.",
+      "description": "Identities fenced without a recipe, by OperationId: definitively not executable.",
       "type": "array",
       "items": {
         "type": "object",
@@ -173,22 +403,60 @@
       },
       "maxItems": 65536
     },
+    "payloads": {
+      "description": "Payload objects, by PayloadId. A payload goes when its last obligation ends.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "payload_id",
+          "length",
+          "sha256",
+          "references"
+        ],
+        "properties": {
+          "payload_id": {
+            "$ref": "primitives.schema.json#/$defs/payload_id"
+          },
+          "length": {
+            "$ref": "primitives.schema.json#/$defs/u64"
+          },
+          "sha256": {
+            "$ref": "primitives.schema.json#/$defs/sha256"
+          },
+          "references": {
+            "$ref": "primitives.schema.json#/$defs/u64",
+            "description": "Live obligations that refer to the payload."
+          }
+        }
+      },
+      "maxItems": 65536
+    },
     "publications": {
-      "description": "Admitted publications and their payload references.",
+      "description": "Admitted publications, by PublicationId. A publication outlives its payload.",
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": [
           "publication_id",
+          "operation_id",
+          "source_session",
           "topic_hex",
           "qos",
           "retain",
-          "payload"
+          "payload_id"
         ],
         "properties": {
           "publication_id": {
             "$ref": "primitives.schema.json#/$defs/publication_id"
+          },
+          "operation_id": {
+            "$ref": "primitives.schema.json#/$defs/operation_id"
+          },
+          "source_session": {
+            "$ref": "primitives.schema.json#/$defs/u64"
           },
           "topic_hex": {
             "$ref": "primitives.schema.json#/$defs/hex_bytes"
@@ -199,32 +467,15 @@
           "retain": {
             "type": "boolean"
           },
-          "payload": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-              "payload_id",
-              "length",
-              "sha256"
-            ],
-            "properties": {
-              "payload_id": {
-                "$ref": "primitives.schema.json#/$defs/payload_id"
-              },
-              "length": {
-                "$ref": "primitives.schema.json#/$defs/u64"
-              },
-              "sha256": {
-                "$ref": "primitives.schema.json#/$defs/sha256"
-              }
-            }
+          "payload_id": {
+            "$ref": "primitives.schema.json#/$defs/payload_id"
           }
         }
       },
       "maxItems": 65536
     },
     "obligations": {
-      "description": "Delivery obligations. `publication_id` and `index` form the DeliveryId.",
+      "description": "Delivery obligations, by DeliveryId (`publication_id`, then `index`).",
       "type": "array",
       "items": {
         "type": "object",
@@ -233,6 +484,7 @@
           "publication_id",
           "index",
           "session",
+          "target_revision",
           "cause",
           "effective_qos",
           "phase"
@@ -247,6 +499,9 @@
             "maximum": 4294967295
           },
           "session": {
+            "$ref": "primitives.schema.json#/$defs/u64"
+          },
+          "target_revision": {
             "$ref": "primitives.schema.json#/$defs/u64"
           },
           "cause": {
@@ -267,7 +522,7 @@
       "maxItems": 65536
     },
     "inbound_exchanges": {
-      "description": "Inbound QoS 2 exchanges that are durably open.",
+      "description": "Inbound QoS 2 exchanges that are durably open, by session, then Packet Identifier. A released exchange has no row.",
       "type": "array",
       "items": {
         "type": "object",
@@ -297,72 +552,83 @@
       },
       "maxItems": 65536
     },
-    "accounts": {
-      "description": "Usage and limits of each account.",
-      "type": "array",
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "account",
-          "used",
-          "limits"
-        ],
-        "properties": {
-          "account": {
-            "$ref": "primitives.schema.json#/$defs/name"
-          },
-          "used": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-              "payload_bytes",
-              "references",
-              "exchange_slots",
-              "receipt_slots"
-            ],
-            "properties": {
-              "payload_bytes": {
-                "$ref": "primitives.schema.json#/$defs/u64"
-              },
-              "references": {
-                "$ref": "primitives.schema.json#/$defs/u64"
-              },
-              "exchange_slots": {
-                "$ref": "primitives.schema.json#/$defs/u64"
-              },
-              "receipt_slots": {
-                "$ref": "primitives.schema.json#/$defs/u64"
-              }
+    "account": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "used",
+        "limits"
+      ],
+      "properties": {
+        "used": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "payload_bytes",
+            "references",
+            "exchange_slots",
+            "receipt_slots"
+          ],
+          "properties": {
+            "payload_bytes": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "references": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "exchange_slots": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "receipt_slots": {
+              "$ref": "primitives.schema.json#/$defs/u64"
             }
-          },
-          "limits": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-              "payload_bytes",
-              "references",
-              "exchange_slots",
-              "receipt_slots"
-            ],
-            "properties": {
-              "payload_bytes": {
-                "$ref": "primitives.schema.json#/$defs/u64"
-              },
-              "references": {
-                "$ref": "primitives.schema.json#/$defs/u64"
-              },
-              "exchange_slots": {
-                "$ref": "primitives.schema.json#/$defs/u64"
-              },
-              "receipt_slots": {
-                "$ref": "primitives.schema.json#/$defs/u64"
-              }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "payload_bytes",
+            "references",
+            "exchange_slots",
+            "receipt_slots",
+            "max_targets_per_admission",
+            "max_topic_bytes",
+            "max_payload_bytes",
+            "max_sessions",
+            "max_route_targets"
+          ],
+          "properties": {
+            "payload_bytes": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "references": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "exchange_slots": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "receipt_slots": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "max_targets_per_admission": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "max_topic_bytes": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "max_payload_bytes": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "max_sessions": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "max_route_targets": {
+              "$ref": "primitives.schema.json#/$defs/u64"
             }
           }
         }
-      },
-      "maxItems": 65536
+      }
     }
   }
 }

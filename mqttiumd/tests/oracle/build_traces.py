@@ -149,62 +149,96 @@ def release_recipe(operation, generation):
 # ------------------------------------------------------------------- snapshots
 def snapshot(run, checkpoint, admissions, releases=(), open_exchange=True, epoch=1):
     """A snapshot holding the given admissions: (operation, publication, payload, generation)."""
+    exchange = lambda generation: {"session": str(PRODUCER), "generation": str(generation)}  # noqa: E731
     return {
         "format": "mqttiumd.store-snapshot",
         "schema_version": 1,
         "run_id": run,
         "checkpoint": checkpoint,
         "backend": "sim-store",
-        "meta": {"incarnation": "1", "epoch": str(epoch)},
+        "meta": {
+            "incarnation": "1",
+            "last_opened_epoch": str(epoch),
+            "opened_by": {"startup_hex": f"{epoch:02x}" * 16, "ticket": "1"},
+            "collected_through": "0",
+            "state_revision": str(len(admissions) + len(releases)),
+            "next_session": "4",
+        },
         "sessions": [
-            {"session": str(session), "client_id_hex": name.encode().hex(), "revision": "1"}
+            {
+                "session": str(session),
+                "client_id_hex": name.encode().hex(),
+                "revision": "1",
+                "state": "Active",
+            }
             for session, name in CLIENT_IDS.items()
         ],
-        "routes": [
-            {
-                "topic_hex": TOPIC.hex(),
-                "revision": "1",
-                "targets": [{"session": str(B), "qos": 1}, {"session": str(C), "qos": 1}],
-            }
-        ],
-        "operations": [
-            {
-                "operation_id": operation,
-                "command_kind": "AdmitPublication",
-                "recipe_hex": admit_recipe(operation, publication, payload, generation),
-                "decision": "Committed",
-            }
-            for operation, publication, payload, generation in admissions
-        ]
-        + [
-            {
-                "operation_id": operation,
-                "command_kind": "ReleaseInbound",
-                "recipe_hex": release_recipe(operation, generation),
-                "decision": "Committed",
-            }
-            for operation, generation in releases
-        ],
+        "route_table": {
+            "revision": "1",
+            "routes": [
+                {
+                    "topic_hex": TOPIC.hex(),
+                    "targets": [{"session": str(B), "qos": 1}, {"session": str(C), "qos": 1}],
+                }
+            ],
+        },
+        "operations": sorted(
+            [
+                {
+                    "operation_id": operation,
+                    "recipe_hex": admit_recipe(operation, publication, payload, generation),
+                    "decision": {
+                        "kind": "Committed",
+                        "facts": {
+                            "kind": "PublicationAdmitted",
+                            "publication_id": publication,
+                            "exchange": exchange(generation),
+                        },
+                    },
+                }
+                for operation, publication, payload, generation in admissions
+            ]
+            + [
+                {
+                    "operation_id": operation,
+                    "recipe_hex": release_recipe(operation, generation),
+                    "decision": {
+                        "kind": "Committed",
+                        "facts": {"kind": "InboundReleased", "exchange": exchange(generation)},
+                    },
+                }
+                for operation, generation in releases
+            ],
+            key=lambda row: [int(part) for part in row["operation_id"].values()],
+        ),
         "fences": [],
+        "payloads": [
+            {
+                "payload_id": payload,
+                "length": str(len(PAYLOAD)),
+                "sha256": hashlib.sha256(PAYLOAD).hexdigest(),
+                "references": "2",
+            }
+            for _, _, payload, _ in admissions
+        ],
         "publications": [
             {
                 "publication_id": publication,
+                "operation_id": operation,
+                "source_session": str(PRODUCER),
                 "topic_hex": TOPIC.hex(),
                 "qos": 2,
                 "retain": False,
-                "payload": {
-                    "payload_id": payload,
-                    "length": str(len(PAYLOAD)),
-                    "sha256": hashlib.sha256(PAYLOAD).hexdigest(),
-                },
+                "payload_id": payload,
             }
-            for _, publication, payload, _ in admissions
+            for operation, publication, payload, _ in admissions
         ],
         "obligations": [
             {
                 "publication_id": publication,
                 "index": index,
                 "session": str(target),
+                "target_revision": "1",
                 "cause": "LiveExact",
                 "effective_qos": 1,
                 "phase": "Queued",
@@ -214,7 +248,7 @@ def snapshot(run, checkpoint, admissions, releases=(), open_exchange=True, epoch
         ],
         "inbound_exchanges": [
             {
-                "exchange": {"session": str(PRODUCER), "generation": str(admissions[-1][3])},
+                "exchange": exchange(admissions[-1][3]),
                 "packet_id": 7,
                 "publication_id": admissions[-1][1],
                 "phase": "AwaitPubrel",
@@ -222,7 +256,25 @@ def snapshot(run, checkpoint, admissions, releases=(), open_exchange=True, epoch
         ]
         if open_exchange
         else [],
-        "accounts": [],
+        "account": {
+            "used": {
+                "payload_bytes": str(len(PAYLOAD) * len(admissions)),
+                "references": str(2 * len(admissions)),
+                "exchange_slots": "1" if open_exchange else "0",
+                "receipt_slots": str(len(admissions) + len(releases)),
+            },
+            "limits": {
+                "payload_bytes": "4096",
+                "references": "16",
+                "exchange_slots": "4",
+                "receipt_slots": "8",
+                "max_targets_per_admission": "4",
+                "max_topic_bytes": "256",
+                "max_payload_bytes": "1024",
+                "max_sessions": "8",
+                "max_route_targets": "8",
+            },
+        },
     }
 
 
@@ -1097,7 +1149,7 @@ case(
 
 
 def other_payload(states):
-    states["final"]["publications"][0]["payload"]["sha256"] = hashlib.sha256(b"other").hexdigest()
+    states["final"]["payloads"][0]["sha256"] = hashlib.sha256(b"other").hexdigest()
 
 
 case(

@@ -143,25 +143,31 @@ the assertion `broker_inputs_have_provenance`, is the oracle's work.
 read from the store independently of the broker; it is evidence for the
 oracle and never an input of the broker.
 
-| Table | Rows |
+| Table | Rows, in the order of their key |
 | - | - |
-| `meta` | Store incarnation and run epoch |
-| `sessions` | SessionId, ClientID bytes, revision |
-| `routes` | Exact topic, revision, target sessions and their QoS |
-| `operations` | OperationId, command kind, the exact canonical bytes of the recipe, the terminal decision |
-| `fences` | Identities that are definitively not executable |
-| `publications` | PublicationId, topic, QoS, retain, payload reference with length and digest |
-| `obligations` | DeliveryId (`publication_id`, `index`), target session, cause, effective QoS, phase |
-| `inbound_exchanges` | ExchangeId, Packet Identifier, publication, phase |
-| `accounts` | Usage and limits |
+| `meta` | Store incarnation; the last opened epoch (every earlier one is closed) and the attempt that opened it; the revision frontier; the next session |
+| `sessions` | SessionId, ClientID bytes, revision, state. A deleted session stays, terminal |
+| `route_table` | Its revision, and each exact topic with its target sessions and their QoS |
+| `operations` | Receipts: OperationId, the exact canonical bytes of the recipe, the terminal decision with its content (commit facts, or the reason of a certain rejection) |
+| `fences` | Identities fenced without a recipe: definitively not executable |
+| `payloads` | PayloadId, length, digest, count of live obligations that refer to it |
+| `publications` | PublicationId, the admission that created it, source session, topic, QoS, retain, PayloadId |
+| `obligations` | DeliveryId (`publication_id`, `index`), target session and its revision, cause, effective QoS, phase |
+| `inbound_exchanges` | ExchangeId, Packet Identifier, publication, phase; a released exchange has no row |
+| `account` | Usage and limits of the one account of S0 |
 
 Every table is present, even empty: an absent table is not an empty one.
-A snapshot shows what the store holds, sound or not. The reader checks
-its form only: 64-bit ranges, and no row listed twice under its key (an
-identity; `publication_id` and `index` for an obligation; session and
-Packet Identifier for an inbound exchange). An obligation without its
-publication, or two admissions for one exchange, is a finding the oracle
-asserts on, not a malformed document.
+What is volatile (a command in transit, a transaction in preparation, a
+result not yet delivered, the control state of an opening) is not in a
+snapshot; the trace shows it.
+
+Rows are in the order of their key, numbers numerically and identities
+component by component, so that two stores in the same state write the
+same bytes. A snapshot shows what the store holds, sound or not. The
+reader checks its form only: 64-bit ranges, no row listed twice under its
+key (`duplicate-name`) and rows in order (`rows-out-of-order`). An
+obligation without its publication, or two admissions for one exchange, is
+a finding the oracle asserts on, not a malformed document.
 
 ### Registry coverage
 

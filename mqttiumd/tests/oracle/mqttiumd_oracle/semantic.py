@@ -762,6 +762,11 @@ def _decimal_members(schemas, file, schema, value, pointer, out, depth=0):
             descend(branch.get("then"), value, pointer)
         else:
             descend(branch.get("else"), value, pointer)
+    # An alternative applies to the values of its type: a nullable member
+    # that holds an object is that object.
+    for branch in schema.get("oneOf", []) + schema.get("anyOf", []):
+        if isinstance(branch, dict) and branch.get("type") in (None, "object", "array"):
+            descend(branch, value, pointer)
     if isinstance(value, dict):
         for key, child in schema.get("properties", {}).items():
             if key in value:
@@ -799,40 +804,69 @@ def _key(value):
     return value
 
 
+# Table, the members that form the key of a row, and where a diagnostic
+# points inside the row.
 _SNAPSHOT_KEYS = [
-    ("sessions", ["session"], "/session"),
-    ("routes", ["topic_hex"], "/topic_hex"),
-    ("operations", ["operation_id"], "/operation_id"),
-    ("fences", ["operation_id"], "/operation_id"),
-    ("publications", ["publication_id"], "/publication_id"),
-    ("obligations", ["publication_id", "index"], ""),
-    ("accounts", ["account"], "/account"),
+    ("/sessions", ["/session"], "/session"),
+    ("/route_table/routes", ["/topic_hex"], "/topic_hex"),
+    ("/operations", ["/operation_id"], "/operation_id"),
+    ("/fences", ["/operation_id"], "/operation_id"),
+    ("/payloads", ["/payload_id"], "/payload_id"),
+    ("/publications", ["/publication_id"], "/publication_id"),
+    ("/obligations", ["/publication_id", "/index"], ""),
+    ("/inbound_exchanges", ["/exchange/session", "/packet_id"], ""),
 ]
+_IDENTITY = ("incarnation", "epoch", "owner", "sequence", "session", "generation")
+
+
+def _sort_key(value):
+    """The key of a row as a tuple that sorts as the store sorts.
+
+    Numbers sort numerically and before bytes; an identity object is its
+    components in their declared order; bytes in hexadecimal sort like the
+    bytes they spell. ``ValueError`` when a number is not one.
+    """
+    if isinstance(value, int):
+        return ((0, value),)
+    if isinstance(value, str):
+        if value.isascii() and value.isdigit():
+            return ((0, u64(value)),)
+        return ((1, value),)
+    parts = ()
+    for name in _IDENTITY:
+        if name in value:
+            parts += _sort_key(value[name])
+    return parts
 
 
 def _store_snapshot(contracts, document, out):
     _by_schema(contracts, document, out)
     for table, members, suffix in _SNAPSHOT_KEYS:
-        _unique(
-            [
-                (f"/{table}/{index}{suffix}", _key([row[member] for member in members]))
-                for index, row in enumerate(document[table])
-            ],
-            f"row of {table}",
-            "duplicate-name",
-            out,
-        )
-    # One inbound exchange per session and Packet Identifier, whatever
-    # generation a row claims.
-    _unique(
-        [
-            (f"/inbound_exchanges/{index}", (row["exchange"]["session"], row["packet_id"]))
-            for index, row in enumerate(document["inbound_exchanges"])
-        ],
-        "inbound slot",
-        "duplicate-name",
-        out,
-    )
+        previous = None
+        for index, row in enumerate(_get(document, table)):
+            try:
+                key = sum((_sort_key(_get(row, member)) for member in members), ())
+            except ValueError:
+                # The range check already reported it.
+                continue
+            if previous is not None and key == previous:
+                out.append(
+                    Diagnostic(
+                        "duplicate-name", f"{table}/{index}{suffix}", "the row is listed twice"
+                    )
+                )
+            elif previous is not None and key < previous:
+                out.append(
+                    Diagnostic(
+                        "rows-out-of-order",
+                        f"{table}/{index}{suffix}",
+                        "the row comes after a row of a greater key",
+                    )
+                )
+            else:
+                # A row out of order does not move the mark: one misplaced
+                # row is one diagnostic.
+                previous = key
 
 
 _RULES = {

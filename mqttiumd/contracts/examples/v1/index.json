@@ -695,7 +695,7 @@
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-decision-unknown-outcome.json",
       "code": "schema-violation",
-      "pointer": "/operations/0/decision",
+      "pointer": "/operations/0/decision/kind",
       "why": "A receipt records a terminal decision; an unknown outcome is not a durable fact."
     },
     {
@@ -731,7 +731,7 @@
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-startup-nonce-too-short.json",
       "code": "schema-violation",
-      "pointer": "/meta/opened_by/startup_hex",
+      "pointer": "/meta/opened_by",
       "why": "A start-up nonce is sixteen bytes."
     },
     {

@@ -313,12 +313,18 @@ def one_admission_per_observed_inbound_exchange(run):
 
 
 def _obligations(snapshot):
-    """DeliveryId -> what identifies the obligation, payload reference included."""
+    """DeliveryId -> what identifies the obligation, payload reference included.
+
+    The payload is the object the publication refers to, with its length and
+    digest when the store still holds it.
+    """
+    stored = {
+        _key(row["payload_id"]): (row["length"], row["sha256"]) for row in snapshot["payloads"]
+    }
     payloads = {
         _key(row["publication_id"]): (
-            _key(row["payload"]["payload_id"]),
-            row["payload"]["length"],
-            row["payload"]["sha256"],
+            _key(row["payload_id"]),
+            stored.get(_key(row["payload_id"])),
         )
         for row in snapshot["publications"]
     }

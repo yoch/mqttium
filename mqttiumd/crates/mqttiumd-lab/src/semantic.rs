@@ -1302,60 +1302,102 @@ fn trace_record(document: &Value, out: &mut Vec<Diagnostic>) {
     decimal_strings(document.get("payload"), "/payload", out);
 }
 
-/// A store snapshot is checked for form only: every 64-bit member is in
-/// range and no row is listed twice under its key. Whether the rows are
-/// sound together is what the oracle asserts, not what makes a snapshot
-/// readable.
-fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
-    const TABLES: [(&str, &[&str], &str, &str); 7] = [
-        ("sessions", &["session"], "/session", "session"),
-        ("routes", &["topic_hex"], "/topic_hex", "route"),
-        (
-            "operations",
-            &["operation_id"],
-            "/operation_id",
-            "operation",
-        ),
-        ("fences", &["operation_id"], "/operation_id", "fence"),
-        (
-            "publications",
-            &["publication_id"],
-            "/publication_id",
-            "publication",
-        ),
-        (
-            "obligations",
-            &["publication_id", "index"],
-            "",
-            "obligation",
-        ),
-        ("accounts", &["account"], "/account", "account"),
+/// One component of the key of a snapshot row: a number, or bytes in
+/// hexadecimal, which sort like the bytes they spell.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum KeyPart {
+    Number(u64),
+    Bytes(String),
+}
+
+/// The key components `value` holds: a decimal string or a small integer
+/// is one number, an identity object is its components in their declared
+/// order, any other string is bytes. `None` when a number is not one: the
+/// range check reports it, and the row is left out of the order check.
+fn key_parts(value: &Value, out: &mut Vec<KeyPart>) -> Option<()> {
+    const IDENTITY: [&str; 6] = [
+        "incarnation",
+        "epoch",
+        "owner",
+        "sequence",
+        "session",
+        "generation",
     ];
-    decimal_strings(Some(document), "", out);
-    let mut duplicate = |table: &str, index: usize, suffix: &str, what: &str, key: String| {
-        out.push(Diagnostic::new(
-            code::DUPLICATE_NAME,
-            format!("/{table}/{index}{suffix}"),
-            format!("{what} {key} is listed twice"),
-        ));
-    };
-    for (table, key, suffix, what) in TABLES {
-        let mut seen = BTreeSet::new();
-        for (index, row) in items(document, table).iter().enumerate() {
-            let identity: Vec<String> = key.iter().map(|member| row[*member].to_string()).collect();
-            let identity = identity.join(" ");
-            if !seen.insert(identity.clone()) {
-                duplicate(table, index, suffix, what, identity);
+    match value {
+        Value::Number(number) => out.push(KeyPart::Number(number.as_u64()?)),
+        Value::String(text) if text.chars().all(|digit| digit.is_ascii_digit()) => {
+            out.push(KeyPart::Number(parse_u64(text).ok()?));
+        }
+        Value::String(text) => out.push(KeyPart::Bytes(text.clone())),
+        Value::Object(members) => {
+            for name in IDENTITY {
+                if let Some(member) = members.get(name) {
+                    key_parts(member, out)?;
+                }
             }
         }
+        _ => return None,
     }
-    // A session has one inbound exchange per Packet Identifier, whatever
-    // generation a row claims.
-    let mut slots = BTreeSet::new();
-    for (index, row) in items(document, "inbound_exchanges").iter().enumerate() {
-        let slot = format!("{} {}", row["exchange"]["session"], row["packet_id"]);
-        if !slots.insert(slot.clone()) {
-            duplicate("inbound_exchanges", index, "", "inbound slot", slot);
+    Some(())
+}
+
+/// A store snapshot is checked for form only: every 64-bit member is in
+/// range, no row is listed twice under its key, and rows are in key
+/// order. Whether the rows are sound together is what the oracle asserts,
+/// not what makes a snapshot readable.
+fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
+    // Table, the members that form its key, and where a diagnostic points
+    // inside a row.
+    const TABLES: [(&str, &[&str], &str); 8] = [
+        ("/sessions", &["/session"], "/session"),
+        ("/route_table/routes", &["/topic_hex"], "/topic_hex"),
+        ("/operations", &["/operation_id"], "/operation_id"),
+        ("/fences", &["/operation_id"], "/operation_id"),
+        ("/payloads", &["/payload_id"], "/payload_id"),
+        ("/publications", &["/publication_id"], "/publication_id"),
+        ("/obligations", &["/publication_id", "/index"], ""),
+        (
+            "/inbound_exchanges",
+            &["/exchange/session", "/packet_id"],
+            "",
+        ),
+    ];
+    decimal_strings(Some(document), "", out);
+    for (table, key, suffix) in TABLES {
+        let rows = document
+            .pointer(table)
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice);
+        let mut previous: Option<Vec<KeyPart>> = None;
+        for (index, row) in rows.iter().enumerate() {
+            let mut parts = Vec::new();
+            let readable = key.iter().all(|member| {
+                row.pointer(member)
+                    .is_some_and(|value| key_parts(value, &mut parts).is_some())
+            });
+            if !readable {
+                continue;
+            }
+            let problem = match &previous {
+                Some(before) if *before == parts => Some((code::DUPLICATE_NAME, "is listed twice")),
+                Some(before) if *before > parts => Some((
+                    code::ROWS_OUT_OF_ORDER,
+                    "comes after a row of a greater key",
+                )),
+                _ => None,
+            };
+            if let Some((code, what)) = problem {
+                out.push(Diagnostic::new(
+                    code,
+                    format!("{table}/{index}{suffix}"),
+                    format!("the row {what}"),
+                ));
+            }
+            // A row out of order does not move the mark: one misplaced row
+            // is one diagnostic.
+            if previous.as_ref().is_none_or(|before| *before < parts) {
+                previous = Some(parts);
+            }
         }
     }
 }
@@ -1363,7 +1405,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
 /// Checks every decimal-looking identity component below `value`. Payload
 /// members that hold 64-bit components are objects of decimal strings.
 fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnostic>) {
-    const COMPONENTS: [&str; 25] = [
+    const COMPONENTS: [&str; 37] = [
         "incarnation",
         "epoch",
         "owner",
@@ -1389,6 +1431,18 @@ fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnosti
         "exchange_slots",
         "receipt_slots",
         "bytes",
+        "last_opened_epoch",
+        "ticket",
+        "collected_through",
+        "state_revision",
+        "next_session",
+        "source_session",
+        "target_revision",
+        "max_targets_per_admission",
+        "max_topic_bytes",
+        "max_payload_bytes",
+        "max_sessions",
+        "max_route_targets",
     ];
     let members = match value {
         Some(Value::Object(members)) => members,
