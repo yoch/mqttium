@@ -253,12 +253,12 @@ fn killed_at(point: &str, durable: bool) -> usize {
     for command in &commands[..cut] {
         let _ = reference.store.apply(command);
     }
-    let before = reference.store.snapshot();
+    let before = reference.store.snapshot().expect("healthy snapshot");
     let mut after_cut = crate::reference();
     for command in &commands[..=cut] {
         let _ = after_cut.store.apply(command);
     }
-    let after = after_cut.store.snapshot();
+    let after = after_cut.store.snapshot().expect("healthy snapshot");
     if durable {
         assert!(reference.store.apply(&commands[cut]).committed_now);
     }
@@ -281,7 +281,7 @@ fn killed_at(point: &str, durable: bool) -> usize {
     assert_eq!(store.apply(&commands[cut]), expected);
     assert_eq!(
         store.try_snapshot().expect("decodes"),
-        reference.store.snapshot()
+        reference.store.snapshot().expect("healthy snapshot")
     );
     cut
 }
@@ -393,7 +393,7 @@ fn full_state_equality_detects_a_missing_obligation_in_a_sound_sqlite_file() {
     let command = commands(&world)[0].clone();
     assert!(world.store.apply(&command).committed_now);
     assert!(expected.store.apply(&command).committed_now);
-    let complete = expected.store.snapshot();
+    let complete = expected.store.snapshot().expect("healthy snapshot");
     assert_eq!(
         world.store.try_snapshot().expect("complete state"),
         complete

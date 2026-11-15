@@ -69,10 +69,10 @@ fn a_store_opened_again_holds_what_was_committed() {
     }
     .admission(1, 7, b"payload", &[world.b, world.c]);
     assert!(store.apply(&command).committed_now);
-    let before = store.snapshot();
+    let before = store.snapshot().expect("healthy snapshot");
     drop(store);
     let reopened = SqliteStore::open(&path).expect("opened again");
-    assert_eq!(reopened.snapshot(), before);
+    assert_eq!(reopened.snapshot().expect("healthy snapshot"), before);
     assert_eq!(accounts_match_what_is_held(&before), Ok(()));
 }
 
@@ -103,7 +103,7 @@ fn a_failing_medium_writes_nothing_and_answers_unknown() {
         SqliteStore::create(&path, incarnation, limits).expect("created")
     });
     let command = world.admission(1, 7, b"payload", &[world.b]);
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy snapshot");
     world.store.set_durability(Durability::Failing);
     let applied = world.store.apply(&command);
     assert_eq!(
@@ -121,7 +121,7 @@ fn a_failing_medium_writes_nothing_and_answers_unknown() {
     );
     let command_open = opening_command(&world.store);
     let _ = world.store.open_epoch(&command_open);
-    assert_eq!(world.store.snapshot(), before);
+    assert_eq!(world.store.snapshot().expect("healthy snapshot"), before);
     world.store.set_durability(Durability::Available);
     assert!(world.store.apply(&command).committed_now);
 }
@@ -223,8 +223,12 @@ fn sqlite_answers_as_the_deterministic_store() {
                     );
                 }
             }
-            let state = sqlite.store.snapshot();
-            assert_eq!(state, memory.store.snapshot(), "{context}");
+            let state = sqlite.store.snapshot().expect("healthy snapshot");
+            assert_eq!(
+                state,
+                memory.store.snapshot().expect("healthy snapshot"),
+                "{context}"
+            );
             assert_eq!(accounts_match_what_is_held(&state), Ok(()), "{context}");
             let mut cursor = None;
             loop {
@@ -259,12 +263,15 @@ fn a_value_that_does_not_decode_is_an_error_of_the_snapshot() {
     let store = SqliteStore::open(&path).expect("the file is sound, a value is not");
     let snapshot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.try_snapshot()));
     assert!(
-        matches!(snapshot, Ok(Err(OpenError::Corrupt))),
+        matches!(
+            snapshot,
+            Ok(Err(mqttiumd_store_api::ReadError::InvalidData))
+        ),
         "{snapshot:?}"
     );
     assert!(matches!(
         SqliteStore::inspect(&path),
-        Err(OpenError::Corrupt)
+        Err(mqttiumd_store_api::ReadError::InvalidData)
     ));
 }
 
@@ -309,7 +316,7 @@ fn a_sixteen_page_autocheckpoint_reaches_the_main_database_while_the_writer_live
     );
     assert!(reference.store.apply(&command).committed_now);
     assert!(world.store.apply(&command).committed_now);
-    let expected = reference.store.snapshot();
+    let expected = reference.store.snapshot().expect("healthy snapshot");
     assert_eq!(world.store.try_snapshot().expect("live state"), expected);
     // An isolated image deliberately omits the WAL. Unlike a crash run,
     // this is only an observation of a checkpoint while the writer is idle.
