@@ -65,7 +65,6 @@ another lot's part.
 | Condition | Closed by | Blocks |
 | - | - | - |
 | The proof that is received is on `release_if_current` as the product really executes it. Tooling may be prepared in parallel; a proof of a separate demonstration function does not receive the lot | L6, with L1 | Reception of L6 |
-| The proof runs in CI, reproducibly, on the production function, after a versioned preflight in which a true property passes and a false one fails on the real production dependency | L6 | Reception of L6 |
 | The lease table holds each `LeaseRecord` exactly once: one record per held lease. Recovery calls `LeaseRecord::from_parts` once per durable row and nothing else calls it outside the proof crate. A test of the table shows that no path builds a second record of a held lease (record 0010, proposed) | L1 | Reception of L6 |
 
 ## Model M1: reception of L5, then L4
