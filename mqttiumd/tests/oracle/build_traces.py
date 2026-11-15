@@ -1351,6 +1351,61 @@ case(
     snapshots=on_sqlite(lambda states: states["final"]["operations"].pop(0)),
 )
 
+# ---------------------------------------------- second wave, finding F2
+
+
+def without(*tables):
+    """The snapshots of every checkpoint lose these tables' rows."""
+
+    def apply(states):
+        for state in states.values():
+            for table in tables:
+                state[table] = []
+
+    return apply
+
+
+case(
+    "payloads-gone-at-both-checkpoints",
+    "F2: the store lost every payload; the obligations still name a payload nobody holds.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=without("payloads"),
+)
+case(
+    "publications-and-payloads-gone",
+    "F2: the store lost publications and payloads, and kept their obligations as orphans.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=without("publications", "payloads"),
+)
+
+
+def other_payload(states):
+    for state in states.values():
+        for row in state["payloads"]:
+            row["sha256"] = "0" * 64
+
+
+case(
+    "payload-is-not-what-the-client-sent",
+    "F2: the payload the store holds is not the one the client published and was acknowledged for.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=other_payload,
+)
+
+
+def everything_gone(states):
+    for state in states.values():
+        for table in ("publications", "payloads", "obligations"):
+            state[table] = []
+
+
+case(
+    "acknowledged-publication-gone",
+    "F2: the client was acknowledged, and the store holds no publication, payload or obligation for it.",
+    {"same_required_obligations_at_both_checkpoints": "FAIL"},
+    snapshots=everything_gone,
+)
+
 # ------------------------------------------------------- positive acknowledgement
 
 
