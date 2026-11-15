@@ -111,6 +111,7 @@ class Contracts:
         }
 
         contracts = cls(root, files, digest, validators, {})
+        contracts.schemas = schemas
         contracts._contract_paths = [
             path.relative_to(root).as_posix() for path in content if path.parent == directory
         ]

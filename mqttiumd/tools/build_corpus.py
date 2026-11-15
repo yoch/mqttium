@@ -386,6 +386,13 @@ bad(
     scenario(setter(["steps", 7, "exchange"], "pub_B")),
 )
 bad(
+    "scenario-exchange-used-before-binding.json",
+    "binding-undefined",
+    "/steps/1/exchange",
+    "An exchange is resumed only after the step that binds it, not merely somewhere in the file.",
+    scenario(lambda v: v["steps"].insert(1, copy.deepcopy(v["steps"][7]))),
+)
+bad(
     "scenario-binding-undefined-fault.json",
     "binding-undefined",
     "/steps/2/binding",
@@ -611,6 +618,18 @@ bad(
     f"/steps/{RELEASE + 1}",
     "A held command is released once.",
     held(lambda v: v["steps"].insert(RELEASE + 1, copy.deepcopy(v["steps"][RELEASE]))),
+)
+bad(
+    "scenario-release-after-second-wait.json",
+    "step-order-invalid",
+    f"/steps/{RELEASE + 2}",
+    "Waiting for the fault again does not make it hold a second command.",
+    held(
+        lambda v: v["steps"].__setitem__(
+            slice(RELEASE + 1, RELEASE + 1),
+            [drive_fault("held_admission"), copy.deepcopy(v["steps"][RELEASE])],
+        )
+    ),
 )
 bad(
     "scenario-deliver-after-crash.json",

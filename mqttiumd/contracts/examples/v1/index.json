@@ -280,6 +280,12 @@
       "why": "ClientResumeExchange refers to an exchange no earlier step bound."
     },
     {
+      "file": "contracts/examples/v1/invalid/scenario-exchange-used-before-binding.json",
+      "code": "binding-undefined",
+      "pointer": "/steps/1/exchange",
+      "why": "An exchange is resumed only after the step that binds it, not merely somewhere in the file."
+    },
+    {
       "file": "contracts/examples/v1/invalid/scenario-binding-undefined-fault.json",
       "code": "binding-undefined",
       "pointer": "/steps/2/binding",
@@ -386,6 +392,12 @@
       "code": "step-order-invalid",
       "pointer": "/steps/6",
       "why": "A held command is released once."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/scenario-release-after-second-wait.json",
+      "code": "step-order-invalid",
+      "pointer": "/steps/7",
+      "why": "Waiting for the fault again does not make it hold a second command."
     },
     {
       "file": "contracts/examples/v1/invalid/scenario-deliver-after-crash.json",
