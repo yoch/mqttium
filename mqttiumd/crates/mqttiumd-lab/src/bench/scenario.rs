@@ -192,6 +192,47 @@ fn work_kind(name: &str) -> Result<WorkKind, String> {
     .ok_or_else(|| format!("the command kind {name} is unknown to the store adapter"))
 }
 
+/// Members of the scenario format the bench does not play yet: a fault
+/// repeated from an occurrence on (decision 0018) and a wait that fires
+/// the deadlines itself. A scenario that holds one is refused, never
+/// played by ignoring it.
+const UNPLAYED_FAULT_MEMBERS: [&str; 3] = ["from_occurrence", "expected_hits_at_least", "lag"];
+const UNPLAYED_STEP_MEMBERS: [&str; 1] = ["fire_deadlines"];
+
+/// Why the bench cannot play `document`, if it cannot: the first member it
+/// does not play, and where.
+#[must_use]
+pub fn unplayed(document: &Value) -> Option<String> {
+    let list = |name: &str| {
+        document
+            .get(name)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    for (index, fault) in list("faults").iter().enumerate() {
+        for member in UNPLAYED_FAULT_MEMBERS {
+            if fault.get(member).is_some() {
+                let id = fault.get("id").and_then(Value::as_str).unwrap_or("?");
+                return Some(format!(
+                    "fault {index} ({id}) has {member}: a repeated fault of decision 0018 is not played by the bench yet"
+                ));
+            }
+        }
+    }
+    for (index, step) in list("steps").iter().enumerate() {
+        for member in UNPLAYED_STEP_MEMBERS {
+            if step.get(member).is_some() {
+                let kind = step.get("kind").and_then(Value::as_str).unwrap_or("?");
+                return Some(format!(
+                    "step {index} ({kind}) has {member}: a wait that fires the deadlines itself is not played by the bench yet"
+                ));
+            }
+        }
+    }
+    None
+}
+
 fn fault(value: &Value) -> Result<Fault, String> {
     let point = point(text(value, "point")?)?;
     let matching = value.get("match").ok_or("a fault without match")?;

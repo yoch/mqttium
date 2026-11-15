@@ -35,7 +35,9 @@ pub trait Backend {
     fn reopen_after_crash(&mut self, store: Self::Store) -> Result<Self::Store, String>;
 
     /// The durable state, read independently of the broker.
-    fn inspect(&self, store: &Self::Store) -> Result<DurableState, String>;
+    /// `store` is the store of the process when it runs in the process of
+    /// the supervisor, `None` when it runs in a child or does not run.
+    fn inspect(&self, store: Option<&Self::Store>) -> Result<DurableState, String>;
 
     /// What the campaign states about the engine: for SQLite its exact
     /// version, compile options and the settings read back (DEM-011).
@@ -68,8 +70,10 @@ impl Backend for Memory {
         Ok(MemoryStore::reopen(store.snapshot()))
     }
 
-    fn inspect(&self, store: &MemoryStore) -> Result<DurableState, String> {
-        Ok(store.snapshot())
+    fn inspect(&self, store: Option<&MemoryStore>) -> Result<DurableState, String> {
+        store.map(MemoryStore::snapshot).ok_or_else(|| {
+            "the deterministic store lives only in the process that runs it".to_owned()
+        })
     }
 
     fn describe(&self) -> Value {
@@ -83,6 +87,25 @@ impl Backend for Memory {
 
 /// How the inspector of the SQLite backend reads the durable state.
 const INSPECTOR: &str = "SqliteStore::inspect: a connection of its own opened read-only (mode=ro, never immutable), one read transaction, closed before the snapshot is written; no checkpoint; never the writer's connection";
+
+/// The settings the SQLite engine read back when `store` was opened, as
+/// the manifest records them and as a child process reports them at its
+/// start-up for the supervisor to compare.
+#[must_use]
+pub fn sqlite_settings(store: &mqttiumd_store_sqlite::SqliteStore) -> Value {
+    let settings = store.effective_settings();
+    json!({
+        "engine": "sqlite",
+        "sqlite_version": settings.sqlite_version,
+        "compile_options": settings.compile_options,
+        "journal_mode": settings.journal_mode,
+        "synchronous": settings.synchronous,
+        "user_version": settings.user_version,
+        "page_size": settings.page_size,
+        "wal_autocheckpoint": settings.wal_autocheckpoint,
+        "read_back": "after they were set, at each opening",
+    })
+}
 
 /// The SQLite store of lot L7, in one file of the campaign.
 #[derive(Clone, Debug)]
@@ -104,18 +127,7 @@ impl Sqlite {
     }
 
     fn remember(&mut self, store: &mqttiumd_store_sqlite::SqliteStore) {
-        let settings = store.effective_settings();
-        self.settings = Some(json!({
-            "engine": "sqlite",
-            "sqlite_version": settings.sqlite_version,
-            "compile_options": settings.compile_options,
-            "journal_mode": settings.journal_mode,
-            "synchronous": settings.synchronous,
-            "user_version": settings.user_version,
-            "page_size": settings.page_size,
-            "wal_autocheckpoint": settings.wal_autocheckpoint,
-            "read_back": "after they were set, at each opening",
-        }));
+        self.settings = Some(sqlite_settings(store));
     }
 }
 
@@ -151,7 +163,7 @@ impl Backend for Sqlite {
         Ok(store)
     }
 
-    fn inspect(&self, _store: &Self::Store) -> Result<DurableState, String> {
+    fn inspect(&self, _store: Option<&Self::Store>) -> Result<DurableState, String> {
         // Without the writer: a connection of its own, read-only, one read
         // transaction, closed before the answer; never a checkpoint.
         mqttiumd_store_sqlite::SqliteStore::inspect(&self.path)

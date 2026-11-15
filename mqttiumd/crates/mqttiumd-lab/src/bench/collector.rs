@@ -413,6 +413,13 @@ impl Collector {
         self.write(channel, &kind, &parents, payload)
     }
 
+    /// Takes the records written since the last call, one line each. The
+    /// child process relays them, each on the channel of its origin, to
+    /// the collector of the supervisor, which numbers them again.
+    pub fn take_lines(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.lines)
+    }
+
     /// Writes the footer and returns the trace. `complete` is what the
     /// caller knows of the run; a refused record makes it false.
     pub fn finish(mut self, complete: bool) -> (Vec<u8>, Vec<Refusal>) {
