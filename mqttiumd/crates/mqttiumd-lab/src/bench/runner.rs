@@ -25,12 +25,12 @@ use serde_json::{Value, json};
 
 use mqttiumd_contract::ids::{ConnectionGeneration, InboundPacketId, SessionId};
 
+use super::backend::Backend;
 use super::collector::{Cause, Collector, Origin};
 use super::mqtt::{Kind, peer};
 use super::process::{Books, Choice, Process, Settings, Stop, Written};
 use super::scenario::{Event, Fault, Scenario, Step};
 use crate::store::adapter::{FaultSpec, WorkKind};
-use crate::store::durable::MemoryStore;
 use crate::store::evidence::{SnapshotContext, snapshot};
 
 /// The version of the scheduler. A change of its choices is a new one.
@@ -115,24 +115,27 @@ pub struct Population {
 }
 
 /// Everything a run needs.
-pub struct Plan<'a> {
+pub struct Plan<'a, B: Backend> {
     pub scenario: &'a Scenario,
+    /// The durable store the campaign runs on.
+    pub backend: B,
     pub settings: Settings,
     pub population: Population,
     /// The data set, installed from the fixture, no epoch open.
-    pub store: MemoryStore,
+    pub store: B::Store,
     pub collector: Collector,
 }
 
-struct Runner<'a> {
+struct Runner<'a, B: Backend> {
     scenario: &'a Scenario,
+    backend: B,
     run_id: &'static str,
     settings: Settings,
     collector: Collector,
     books: Books,
-    process: Option<Process>,
+    process: Option<Process<B::Store>>,
     /// The durable state while no process runs.
-    dormant: Option<MemoryStore>,
+    dormant: Option<B::Store>,
     restarts: u64,
     generator: Generator,
     clients: BTreeMap<String, Client>,
@@ -221,8 +224,8 @@ fn bound_exchanges(
     Ok(bound)
 }
 
-impl Runner<'_> {
-    fn process(&mut self) -> Result<&mut Process, Stop> {
+impl<B: Backend> Runner<'_, B> {
+    fn process(&mut self) -> Result<&mut Process<B::Store>, Stop> {
         self.process
             .as_mut()
             .ok_or_else(|| Stop::new("the broker is not running"))
@@ -657,16 +660,17 @@ impl Runner<'_> {
             }
             Step::InspectDurableState { checkpoint } => {
                 let durable = match (&self.process, &self.dormant) {
-                    (Some(process), _) => process.durable(),
-                    (None, Some(store)) => crate::store::durable::DurableStore::snapshot(store),
+                    (Some(process), _) => self.backend.inspect(process.store()),
+                    (None, Some(store)) => self.backend.inspect(store),
                     (None, None) => return Err(Stop::new("no data set to inspect")),
-                };
+                }
+                .map_err(Stop::new)?;
                 let document = snapshot(
                     &durable,
                     SnapshotContext {
                         run_id: self.run_id,
                         checkpoint,
-                        backend: "sim-store",
+                        backend: self.backend.name(),
                     },
                 );
                 let mut bytes = serde_json::to_vec_pretty(&document)
@@ -714,7 +718,7 @@ impl Runner<'_> {
                         client.connection = None;
                     }
                 }
-                self.dormant = Some(store);
+                self.dormant = Some(self.backend.reopen_after_crash(store).map_err(Stop::new)?);
                 Ok(())
             }
             Step::RestartBroker => {
@@ -731,9 +735,10 @@ impl Runner<'_> {
 
 /// Plays a scenario. The trace, the snapshots and the choice log come
 /// back whatever happens; a run that stopped says why.
-pub fn run(plan: Plan<'_>) -> Outcome {
+pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
     let Plan {
         scenario,
+        backend,
         settings,
         population,
         store,
@@ -741,7 +746,7 @@ pub fn run(plan: Plan<'_>) -> Outcome {
     } = plan;
     let header = json!({
         "scenario_id": scenario.id,
-        "backend": "sim-store",
+        "backend": backend.name(),
         "perimeter": "full",
     });
     let header = collector.emit(Origin::BenchSupervisor, "TraceHeader", &[], header);
@@ -762,6 +767,7 @@ pub fn run(plan: Plan<'_>) -> Outcome {
         .collect();
     let mut runner = Runner {
         scenario,
+        backend,
         run_id: settings.run_id,
         settings,
         collector,

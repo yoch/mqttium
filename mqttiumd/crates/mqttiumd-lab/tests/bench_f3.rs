@@ -17,11 +17,13 @@ use std::collections::VecDeque;
 use std::fs;
 
 use mqttiumd_contract::ids::{ConnectionGeneration, InboundPacketId};
+use mqttiumd_lab::bench::backend::Memory;
 use mqttiumd_lab::bench::campaign::Setup;
 use mqttiumd_lab::bench::collector::{Collector, KindTable, Origin};
 use mqttiumd_lab::bench::mqtt::peer;
 use mqttiumd_lab::bench::process::{Books, Choice, Process};
 use mqttiumd_lab::store::adapter::{FaultAction, FaultPoint, FaultSpec, StoreAction, WorkKind};
+use mqttiumd_lab::store::durable::MemoryStore;
 use serde_json::json;
 
 use bench_support::root;
@@ -32,7 +34,7 @@ const LAG: usize = 4;
 const RESOLUTIONS: usize = 24;
 
 struct Bench {
-    process: Process,
+    process: Process<MemoryStore>,
     collector: Collector,
     books: Books,
 }
@@ -44,7 +46,8 @@ impl Bench {
         };
         let fixture = read("tests/fixtures/p1/three-persistent-sessions.json");
         let schema = read("contracts/schema/v1/trace-record.schema.json");
-        let setup = Setup::from_fixture(&fixture, "bench-f3", 1, 1).expect("the fixture");
+        let setup =
+            Setup::from_fixture(&mut Memory, &fixture, "bench-f3", 1, 1).expect("the fixture");
         let (_, _, producer) = setup
             .population
             .clients
