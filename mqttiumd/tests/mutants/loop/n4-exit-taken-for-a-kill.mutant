@@ -15,9 +15,10 @@ index 50de7afe..0db8a178 100644
          let status = self.wait(self.silence)?;
          let killed = Killed {
              pid: self.pid,
-@@ -670,7 +670,8 @@ impl Child {
+@@ -670,8 +670,9 @@ impl Child {
              signal_sent: "SIGKILL",
              wait_signal: status.signal().unwrap_or(0),
+             transaction: self.parked.clone(),
          };
 -        if status.signal() != Some(9) || status.code().is_some() {
 +        // MUTANT N4: whatever the wait status says is taken for a kill.

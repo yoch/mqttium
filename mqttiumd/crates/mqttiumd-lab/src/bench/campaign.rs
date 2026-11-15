@@ -389,6 +389,10 @@ impl<S: crate::store::durable::DurableStore> Setup<S> {
 /// Runs one campaign. An error is returned when nothing could be run;
 /// a run that stopped still leaves its directory.
 pub fn execute(request: &Request) -> Result<Report, String> {
+    // Cargo can enable a dependency's feature without enabling the lab's
+    // forwarding feature. That binary cannot be described or rebuilt as
+    // the default lab binary. Refuse before opening or writing anything.
+    super::rebuild::check_features()?;
     refuse_inside_work_tree(&request.root, &request.out)?;
     match (request.process.as_str(), request.backend.as_str()) {
         ("in-process", _) | ("child", "sqlite") => {}
