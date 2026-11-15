@@ -16,10 +16,12 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use mqttiumd_contract::capacity::{PayloadBytes, ReceiptSlots, References};
-use mqttiumd_contract::command::{Command as StoreCommand, FrozenRecipe, Recipe};
+use mqttiumd_contract::command::Command as StoreCommand;
 use mqttiumd_contract::packet::SharedBytes;
 use mqttiumd_lab::manifest::sha256_hex;
-use mqttiumd_lab::store::conformance::{World, accounts_match_what_is_held, fixture_limits};
+use mqttiumd_lab::store::conformance::{
+    World, accounts_match_what_is_held, altered, fixture_limits,
+};
 use mqttiumd_lab::store::durable::{DurableState, DurableStore, Limits, MemoryStore};
 use mqttiumd_store_sqlite::SqliteStore;
 use serde_json::{Value, json};
@@ -73,12 +75,10 @@ fn admission<S>(world: &World<S>, n: u64) -> StoreCommand {
         b"",
         &[world.b, world.c],
     );
-    let Recipe::AdmitPublication(mut recipe) = command.recipe.get().clone() else {
-        unreachable!("the fixture constructed an admission")
-    };
-    recipe.payload.length = PayloadBytes::new(PAYLOAD as u64);
-    recipe.costs.payload_bytes = recipe.payload.length;
-    command.recipe = FrozenRecipe::freeze(Recipe::AdmitPublication(recipe)).expect("well formed");
+    command = altered(&command, |recipe| {
+        recipe.payload.length = PayloadBytes::new(PAYLOAD as u64);
+        recipe.costs.payload_bytes = recipe.payload.length;
+    });
     command.payload = Some(SharedBytes::copy_from(&vec![0x5a; PAYLOAD], PAYLOAD).expect("bounded"));
     command
 }
