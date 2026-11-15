@@ -39,10 +39,23 @@ and checked arithmetic are verified against borrowed SQLite values before
 application-owned copies, within the same read transaction. Row count and
 logical bytes do not claim a bound on SQLite's internal page cache.
 
+The positional recovery cursor retains a finite S0 inventory ceiling of
+65,536 facts (`MAX_RECOVERY_INVENTORY_ROWS`), including fixed facts. A bounded
+count can discover one extra row to refuse a larger inventory; prior facts
+are not constructed or copied while skipping a prefix. This avoids an
+unbounded scan without introducing a keyset-cursor redesign in this increment.
+Snapshot accounting charges one 256-byte metadata row, then 128 bytes per
+durable row plus encoded cell bytes; page accounting charges 128 bytes per
+fact plus dynamic field bytes. All counters use checked arithmetic. Opening
+does not prevalidate later inventory facts, so a valid first page can be
+observed before an error on the next page.
+
 ## Observation and lifecycle contract
 
-The shared read phases are Open, Ledger, Opening, Snapshot, Inspect and
-Recovery. A failure preserves its stable code, phase, relevant process
+The shared read phases are Open, Ledger, Opening, Lookup, Snapshot, Inspect
+and Recovery. The fixture wrapper also preserves ReadError when it cannot
+inspect the partially installed data set; earlier legitimate fixture commits
+are not silently rolled back or recreated. A failure preserves its stable code, phase, relevant process
 incarnation and, where established, page number. It must survive an error
 before Started. Human-readable bounded text may accompany these fields;
 neither the supervisor nor the oracle extracts machine meaning from it.
