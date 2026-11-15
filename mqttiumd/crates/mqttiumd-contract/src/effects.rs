@@ -685,17 +685,28 @@ impl OwnerAuthority {
         capacity: EffectSlots,
         max_reservations: u32,
     ) -> Result<Outbox, CreateRefused> {
-        // Interface only: the precondition of lot L0 behind the authority.
-        // Nothing is recorded and the serial does not advance yet.
+        // Every check and every allocation comes before the entry is
+        // published; nothing below the last `?` can fail.
         let serial = self.next_serial.ok_or(CreateRefused::SerialsExhausted)?;
+        if self.active.as_slice().iter().any(|e| e.owner == owner) {
+            return Err(CreateRefused::OwnerAlreadyActive);
+        }
+        if self.active.is_full() {
+            return Err(CreateRefused::TableFull);
+        }
         let id = OutboxId {
             incarnation: self.incarnation,
             epoch: self.epoch,
             owner,
             serial,
         };
-        Outbox::with_capacity(id, capacity, max_reservations)
-            .map_err(|_| CreateRefused::AllocationFailed)
+        let outbox = Outbox::with_capacity(id, capacity, max_reservations)
+            .map_err(|_| CreateRefused::AllocationFailed)?;
+        let published = self.active.try_push(ActiveBox { owner, serial });
+        debug_assert!(published.is_ok(), "the table was checked not full");
+        // The serial is spent whatever follows; the last one leaves `None`.
+        self.next_serial = serial.checked_next().ok();
+        Ok(outbox)
     }
 
     /// Retires a box: its owner is no longer active and may be given a new
@@ -706,8 +717,30 @@ impl OwnerAuthority {
     /// effects already accepted still belong to the owner, and retiring
     /// the box does not end its life cycle.
     pub fn retire(&mut self, outbox: Outbox) -> Result<(), RetireRefused> {
-        // Interface only: no condition is checked yet.
-        let _ = outbox;
+        let id = outbox.id();
+        let refuse = |outbox, reason| Err(RetireRefused { outbox, reason });
+        if id.incarnation != self.incarnation || id.epoch != self.epoch {
+            return refuse(outbox, RetireRefusal::ForeignAuthority);
+        }
+        let entry = ActiveBox {
+            owner: id.owner,
+            serial: id.serial,
+        };
+        let Some(index) = self.active.as_slice().iter().position(|e| *e == entry) else {
+            return refuse(outbox, RetireRefusal::NotActiveEntry);
+        };
+        if !outbox.is_empty() {
+            return refuse(outbox, RetireRefusal::PendingEffects);
+        }
+        if outbox.has_live_reservations() {
+            return refuse(outbox, RetireRefusal::LiveReservations);
+        }
+        // Remove the entry: move the last one into its place, then drop
+        // the last. The table keeps no order.
+        let last = self.active.len() - 1;
+        self.active.as_mut_slice().swap(index, last);
+        let removed = self.active.pop();
+        debug_assert!(removed == Some(entry), "another entry was removed");
         Ok(())
     }
 }
