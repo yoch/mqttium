@@ -883,10 +883,10 @@ ARMED = record(
     {"effect_id": {"epoch": "1", "owner": "0", "sequence": "2"}, "token": "1", "after": "30"},
 )
 ok("trace-record-deadline-armed.json", ARMED)
-ok(
-    "trace-record-deadline-delivered.json",
-    record(11, "broker-core", 2, "DeadlineDelivered", {"token": "1", "now": "30"}, [("timer", 0)]),
+FIRED = record(
+    11, "broker-core", 2, "DeadlineDelivered", {"token": "1", "now": "30"}, [("timer", 0)]
 )
+ok("trace-record-deadline-delivered.json", FIRED)
 PAGE = {
     "run_epoch": "2",
     "page": "0",
@@ -1003,7 +1003,7 @@ trace_case(
 trace_case(
     "recovered-fact-unknown-kind",
     PAGE_READ,
-    "/payload/facts/3",
+    "/payload/facts/3/kind",
     "Recovered facts are a closed union: a remembered binding is not one of them.",
     setter(["payload", "facts", 3], {"kind": "RememberedOperation", "operation_id": OP}),
 )
@@ -1059,6 +1059,25 @@ trace_case(
     setter(["payload", "facts", 1, "revision"], "18446744073709551616"),
     code="u64-out-of-range",
 )
+OVER = "18446744073709551616"
+for case_name, base, path in [
+    ("deadline-time-overflow", FIRED, ["payload", "now"]),
+    ("deadline-delay-overflow", ARMED, ["payload", "after"]),
+    ("recovery-page-number-overflow", PAGE_READ, ["payload", "page"]),
+    (
+        "packet-delivered-connection-overflow",
+        DELIVERED_PACKET,
+        ["payload", "connection_generation"],
+    ),
+]:
+    trace_case(
+        case_name,
+        base,
+        "".join(f"/{key}" for key in path),
+        "Every 64-bit member of a payload is range-checked, whatever its name.",
+        setter(path, OVER),
+        code="u64-out-of-range",
+    )
 
 
 def rec(edit):

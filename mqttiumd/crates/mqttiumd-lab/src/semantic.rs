@@ -1189,7 +1189,7 @@ fn trace_record(document: &Value, out: &mut Vec<Diagnostic>) {
 /// Checks every decimal-looking identity component below `value`. Payload
 /// members that hold 64-bit components are objects of decimal strings.
 fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnostic>) {
-    const COMPONENTS: [&str; 12] = [
+    const COMPONENTS: [&str; 19] = [
         "incarnation",
         "epoch",
         "owner",
@@ -1202,9 +1202,24 @@ fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnosti
         "occurrence",
         "run_epoch",
         "time_value",
+        "connection_generation",
+        "ingress_order",
+        "token",
+        "after",
+        "now",
+        "page",
+        "revision",
     ];
-    let Some(Value::Object(members)) = value else {
-        return;
+    let members = match value {
+        Some(Value::Object(members)) => members,
+        // The facts of a recovery page are objects in a list.
+        Some(Value::Array(items)) => {
+            for (index, item) in items.iter().enumerate() {
+                decimal_strings(Some(item), &format!("{pointer}/{index}"), out);
+            }
+            return;
+        }
+        _ => return,
     };
     for (key, member) in members {
         let child = format!("{pointer}/{key}");
@@ -1222,7 +1237,7 @@ fn decimal_strings(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnosti
                     format!("{raw:?} is not a canonical decimal string ({error:?})"),
                 )),
             },
-            Value::Object(_) => decimal_strings(Some(member), &child, out),
+            Value::Object(_) | Value::Array(_) => decimal_strings(Some(member), &child, out),
             _ => {}
         }
     }

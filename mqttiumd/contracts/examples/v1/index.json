@@ -476,7 +476,7 @@
     {
       "file": "contracts/examples/v1/invalid/trace-record-recovered-fact-unknown-kind.json",
       "code": "schema-violation",
-      "pointer": "/payload/facts/3",
+      "pointer": "/payload/facts/3/kind",
       "why": "Recovered facts are a closed union: a remembered binding is not one of them."
     },
     {
@@ -520,6 +520,30 @@
       "code": "u64-out-of-range",
       "pointer": "/payload/facts/1/revision",
       "why": "Identity components inside a recovered fact are 64-bit as well."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-deadline-time-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/now",
+      "why": "Every 64-bit member of a payload is range-checked, whatever its name."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-deadline-delay-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/after",
+      "why": "Every 64-bit member of a payload is range-checked, whatever its name."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovery-page-number-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/page",
+      "why": "Every 64-bit member of a payload is range-checked, whatever its name."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-packet-delivered-connection-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/connection_generation",
+      "why": "Every 64-bit member of a payload is range-checked, whatever its name."
     },
     {
       "file": "contracts/examples/v1/invalid/trace-record-store-truth-from-core.json",

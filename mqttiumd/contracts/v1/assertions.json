@@ -48,6 +48,15 @@
       ]
     },
     {
+      "name": "broker_inputs_have_provenance",
+      "meaning": "Every input the core consumed is a recovery page the store adapter read, a result or a deadline answering an effect still in flight, or a packet from bytes the transport received; and no input was refused for lack of correlation.",
+      "requirements": [
+        "DEM-008",
+        "DEM-012",
+        "V3-004"
+      ]
+    },
+    {
       "name": "all_required_faults_hit",
       "meaning": "Every declared injection was reached exactly as many times as expected; otherwise the run is inconclusive.",
       "requirements": [

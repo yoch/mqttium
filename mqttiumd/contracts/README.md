@@ -77,6 +77,29 @@ These steps give the broker nothing it could not know (ADR 0003): a fired
 deadline carries the token the core armed, a released command is the one
 the adapter accepted, a delivered result answers an effect still in flight.
 
+### Trace records and the provenance of broker inputs
+
+Every kind of record is stated by one origin only. The audit of ADR 0003
+reads the trace as chains, from what happened outside the core to what the
+core consumed:
+
+| Input of the core | Record of the core | What must precede it |
+| - | - | - |
+| Packet | `PacketDelivered` | `ClientBytesReceived` of the transport, itself after `PeerPacketSent` of the peer |
+| Store result | `StoreResultDelivered` | `CommandSubmitted` or `ResolveSubmitted` of the store adapter with the same effect and operation, not answered before |
+| Deadline | `DeadlineDelivered` | `DeadlineArmed` of the timer with the same token, not delivered before |
+| Recovery page | `RecoveryPageDelivered` | `RecoveryPageRead` of the store adapter with the same content |
+
+`InputRefused` is what the dispatcher records when it refuses a result
+that answers no effect in flight. `StoreCommitStable`, `StoreFenceStable`
+and `StoreResultReady` are hidden truth of the store: they judge a run and
+are never an input. `FaultHit` names the operation and effect it stopped,
+when there is one, and `HeldItemReleased` the fault whose command or
+result a step handed over.
+
+A record says what its emitter claims. Checking a trace as a whole, and
+the assertion `broker_inputs_have_provenance`, is the oracle's work.
+
 ### Registry coverage
 
 For each machine, state class and event class, the guard domain is the

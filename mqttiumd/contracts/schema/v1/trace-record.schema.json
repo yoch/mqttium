@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "mqttiumd trace record",
-  "description": "One line of a JSON Lines trace: header, versioned record or footer (DEM-016). The digest of the trace lives in the external artifact inventory, never inside the trace.",
+  "description": "One line of a JSON Lines trace: header, versioned record or footer (DEM-016). Each kind is stated by one origin only; hidden store truth and the inputs the core consumed never share an origin (ADR 0003). The digest of the trace lives in the external artifact inventory, never inside the trace.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -35,10 +35,12 @@
       "enum": [
         "bench-supervisor",
         "broker-core",
+        "dispatcher",
         "fault-injector",
         "peer",
         "store-adapter",
         "store-evidence",
+        "timer",
         "transport"
       ]
     },
@@ -63,10 +65,12 @@
             "enum": [
               "bench-supervisor",
               "broker-core",
+              "dispatcher",
               "fault-injector",
               "peer",
               "store-adapter",
               "store-evidence",
+              "timer",
               "transport"
             ]
           },
@@ -103,7 +107,20 @@
         "PeerPacketObserved",
         "FaultHit",
         "BrokerCrashed",
-        "BrokerRecovered"
+        "BrokerRecovered",
+        "PeerConnectionOpened",
+        "PeerConnectionClosed",
+        "PeerPacketSent",
+        "ClientBytesReceived",
+        "PacketDelivered",
+        "ResolveSubmitted",
+        "StoreFenceStable",
+        "DeadlineArmed",
+        "DeadlineDelivered",
+        "RecoveryPageRead",
+        "RecoveryPageDelivered",
+        "InputRefused",
+        "HeldItemReleased"
       ]
     },
     "payload": {
@@ -398,6 +415,318 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "PeerConnectionOpened"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PeerConnectionOpened"
+          },
+          "origin_component": {
+            "enum": [
+              "peer"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "PeerConnectionClosed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PeerConnectionClosed"
+          },
+          "origin_component": {
+            "enum": [
+              "peer"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "PeerPacketSent"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PeerPacketSent"
+          },
+          "origin_component": {
+            "enum": [
+              "peer"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "ClientBytesReceived"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ClientBytesReceived"
+          },
+          "origin_component": {
+            "enum": [
+              "transport"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "PacketDelivered"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/PacketDelivered"
+          },
+          "origin_component": {
+            "enum": [
+              "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "ResolveSubmitted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ResolveSubmitted"
+          },
+          "origin_component": {
+            "enum": [
+              "store-adapter"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "StoreFenceStable"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/StoreFenceStable"
+          },
+          "origin_component": {
+            "enum": [
+              "store-evidence"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "DeadlineArmed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/DeadlineArmed"
+          },
+          "origin_component": {
+            "enum": [
+              "timer"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "DeadlineDelivered"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/DeadlineDelivered"
+          },
+          "origin_component": {
+            "enum": [
+              "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "RecoveryPageRead"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/RecoveryPageRead"
+          },
+          "origin_component": {
+            "enum": [
+              "store-adapter"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "RecoveryPageDelivered"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/RecoveryPageDelivered"
+          },
+          "origin_component": {
+            "enum": [
+              "broker-core"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "InputRefused"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/InputRefused"
+          },
+          "origin_component": {
+            "enum": [
+              "dispatcher"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "HeldItemReleased"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/HeldItemReleased"
+          },
+          "origin_component": {
+            "enum": [
+              "fault-injector"
+            ]
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -460,11 +789,15 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "operation_id"
+        "operation_id",
+        "command_kind"
       ],
       "properties": {
         "operation_id": {
           "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "command_kind": {
+          "$ref": "primitives.schema.json#/$defs/type_name"
         }
       }
     },
@@ -472,10 +805,14 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "effect_id",
         "operation_id",
         "outcome"
       ],
       "properties": {
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
         "operation_id": {
           "$ref": "primitives.schema.json#/$defs/operation_id"
         },
@@ -528,8 +865,63 @@
         },
         "packet_id": {
           "$ref": "primitives.schema.json#/$defs/packet_id"
+        },
+        "reason": {
+          "description": "The outcome the frame carries, in the vocabulary of the subset.",
+          "enum": [
+            "Success",
+            "PacketIdentifierNotFound",
+            "QuotaExceeded"
+          ]
+        },
+        "session_present": {
+          "type": "boolean"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "packet_kind"
+            ],
+            "properties": {
+              "packet_kind": {
+                "const": "CONNACK"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "session_present"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "reason"
+                  ]
+                },
+                {
+                  "required": [
+                    "packet_id"
+                  ]
+                }
+              ]
+            }
+          },
+          "else": {
+            "required": [
+              "reason",
+              "packet_id"
+            ],
+            "not": {
+              "required": [
+                "session_present"
+              ]
+            }
+          }
+        }
+      ]
     },
     "FrameWriteProgress": {
       "type": "object",
@@ -561,6 +953,7 @@
       "required": [
         "client",
         "packet_kind",
+        "reason_code",
         "bytes_hex"
       ],
       "properties": {
@@ -577,10 +970,53 @@
         "packet_id": {
           "$ref": "primitives.schema.json#/$defs/packet_id"
         },
+        "reason_code": {
+          "description": "The reason code the peer decoded; 0 when the packet omits it.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "session_present": {
+          "type": "boolean"
+        },
         "bytes_hex": {
           "$ref": "primitives.schema.json#/$defs/hex_bytes"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "packet_kind"
+            ],
+            "properties": {
+              "packet_kind": {
+                "const": "CONNACK"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "session_present"
+            ],
+            "not": {
+              "required": [
+                "packet_id"
+              ]
+            }
+          },
+          "else": {
+            "required": [
+              "packet_id"
+            ],
+            "not": {
+              "required": [
+                "session_present"
+              ]
+            }
+          }
+        }
+      ]
     },
     "FaultHit": {
       "type": "object",
@@ -599,6 +1035,12 @@
         },
         "occurrence": {
           "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
         }
       }
     },
@@ -625,6 +1067,470 @@
       "properties": {
         "run_epoch": {
           "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "PeerConnectionOpened": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client"
+      ],
+      "properties": {
+        "client": {
+          "$ref": "primitives.schema.json#/$defs/name"
+        }
+      }
+    },
+    "PeerConnectionClosed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client"
+      ],
+      "properties": {
+        "client": {
+          "$ref": "primitives.schema.json#/$defs/name"
+        }
+      }
+    },
+    "PeerPacketSent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client",
+        "packet_kind",
+        "bytes_hex"
+      ],
+      "properties": {
+        "client": {
+          "$ref": "primitives.schema.json#/$defs/name"
+        },
+        "packet_kind": {
+          "enum": [
+            "CONNECT",
+            "PUBLISH",
+            "PUBREL"
+          ]
+        },
+        "packet_id": {
+          "$ref": "primitives.schema.json#/$defs/packet_id"
+        },
+        "dup": {
+          "type": "boolean"
+        },
+        "bytes_hex": {
+          "$ref": "primitives.schema.json#/$defs/hex_bytes"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "packet_kind"
+            ],
+            "properties": {
+              "packet_kind": {
+                "const": "PUBLISH"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "dup"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "dup"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "packet_kind"
+            ],
+            "properties": {
+              "packet_kind": {
+                "const": "PUBREL"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "packet_id"
+            ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "packet_kind"
+            ],
+            "properties": {
+              "packet_kind": {
+                "const": "CONNECT"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "packet_id"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "ClientBytesReceived": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connection_generation",
+        "bytes_hex"
+      ],
+      "properties": {
+        "connection_generation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "bytes_hex": {
+          "$ref": "primitives.schema.json#/$defs/hex_bytes"
+        }
+      }
+    },
+    "PacketDelivered": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connection_generation",
+        "ingress_order",
+        "packet_kind"
+      ],
+      "properties": {
+        "connection_generation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "ingress_order": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "packet_kind": {
+          "enum": [
+            "CONNECT",
+            "PUBLISH",
+            "PUBREL"
+          ]
+        },
+        "packet_id": {
+          "$ref": "primitives.schema.json#/$defs/packet_id"
+        }
+      }
+    },
+    "ResolveSubmitted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_id",
+        "operation_id"
+      ],
+      "properties": {
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        }
+      }
+    },
+    "StoreFenceStable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation_id"
+      ],
+      "properties": {
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        }
+      }
+    },
+    "DeadlineArmed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effect_id",
+        "token",
+        "after"
+      ],
+      "properties": {
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
+        "token": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "after": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "DeadlineDelivered": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "token",
+        "now"
+      ],
+      "properties": {
+        "token": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "now": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "recovered_fact": {
+      "description": "One fact of a recovery page, as the store adapter reads it from the store the broker opened.",
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "Epoch",
+            "Session",
+            "InboundExchange",
+            "Operation"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Epoch"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "incarnation",
+              "epoch"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Epoch"
+              },
+              "incarnation": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "epoch": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Session"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "session",
+              "client_id_hex",
+              "revision"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Session"
+              },
+              "session": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "client_id_hex": {
+                "$ref": "primitives.schema.json#/$defs/hex_bytes"
+              },
+              "revision": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "InboundExchange"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "exchange",
+              "packet_id",
+              "publication",
+              "phase"
+            ],
+            "properties": {
+              "kind": {
+                "const": "InboundExchange"
+              },
+              "exchange": {
+                "$ref": "primitives.schema.json#/$defs/exchange_id"
+              },
+              "packet_id": {
+                "$ref": "primitives.schema.json#/$defs/packet_id"
+              },
+              "publication": {
+                "$ref": "primitives.schema.json#/$defs/publication_id"
+              },
+              "phase": {
+                "enum": [
+                  "AwaitPubrel"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Operation"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "operation_id",
+              "knowledge"
+            ],
+            "properties": {
+              "kind": {
+                "const": "Operation"
+              },
+              "operation_id": {
+                "$ref": "primitives.schema.json#/$defs/operation_id"
+              },
+              "knowledge": {
+                "enum": [
+                  "Unknown",
+                  "Retired",
+                  "Committed",
+                  "RejectedCertain"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "recovery_page": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_epoch",
+        "page",
+        "last",
+        "facts"
+      ],
+      "properties": {
+        "run_epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "page": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "last": {
+          "type": "boolean"
+        },
+        "facts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/recovered_fact"
+          },
+          "maxItems": 4096
+        }
+      }
+    },
+    "RecoveryPageRead": {
+      "$ref": "#/$defs/recovery_page"
+    },
+    "RecoveryPageDelivered": {
+      "$ref": "#/$defs/recovery_page"
+    },
+    "InputRefused": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input",
+        "effect_id",
+        "operation_id",
+        "reason"
+      ],
+      "properties": {
+        "input": {
+          "enum": [
+            "StoreResult"
+          ]
+        },
+        "effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        },
+        "operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "reason": {
+          "enum": [
+            "no-effect-in-flight",
+            "operation-mismatch"
+          ]
+        }
+      }
+    },
+    "HeldItemReleased": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fault_id"
+      ],
+      "properties": {
+        "fault_id": {
+          "$ref": "primitives.schema.json#/$defs/name"
         }
       }
     }
