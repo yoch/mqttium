@@ -6,11 +6,10 @@ import json
 import unittest
 
 from mqttiumd_oracle import judge, results
-from mqttiumd_oracle.trace import read
 
 from . import test_judge_rules as rules
+from . import test_results as existing_results
 from .support import ROOT
-from .test_results import Results
 
 corpus = rules.corpus
 ACK = "no_positive_ack_before_confirmed_commit"
@@ -20,11 +19,11 @@ READS = "durable_reads_complete"
 class ReadFailures(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        Results.setUpClass.__func__(cls)
+        existing_results.Results.setUpClass.__func__(cls)
 
-    setUp = Results.setUp
-    write = Results.write
-    refusals = Results.refusals
+    setUp = existing_results.Results.setUp
+    write = existing_results.Results.write
+    refusals = existing_results.Results.refusals
 
     def trace_with_failures(self, kind="DurableReadFailed", *, early_ack=False,
                             incomplete=False, count=1, missing_core_record=False):
@@ -66,11 +65,11 @@ class ReadFailures(unittest.TestCase):
         return path, records
 
     def run_of(self, **options):
-        path, records = self.trace_with_failures(**options)
-        trace = read(self.contracts, corpus.lines(records))
-        self.assertEqual(trace.unreadable, [])
-        fixture = json.loads((ROOT / "tests/fixtures/p1/three-persistent-sessions.json").read_text())
-        return path, judge.Run(self.contracts, corpus.P1_02, fixture, trace)
+        path, _ = self.trace_with_failures(**options)
+        scenario = self.write("scenario.json", corpus.P1_02)
+        run = judge.Run.load(self.contracts, scenario, path)
+        self.assertEqual(run.trace.unreadable, [])
+        return path, run
 
     def produce(self, **options):
         path, _ = self.run_of(**options)
