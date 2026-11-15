@@ -134,9 +134,12 @@
       ],
       "process": "child",
       "not_on": "the mutation is in the child process, which runs on sqlite only",
-      "expect": "survives-known",
-      "finding": "decision 0019 (lot L3): the record BrokerKilled and the assertion that a run claiming a real kill shows one",
-      "note": "The trace says nothing of the kill yet: the oracle judges it PASS, and only campaign.json shows a wait status of signal 0. Once BrokerKilled is in the contract and the bench writes it from the observed status, the oracle must reject this run."
+      "expect": "rejected",
+      "note": "Since decision 0019 the bench writes BrokerKilled from the wait status it observed. A child that exited has no terminating signal: the record states signal 0, which the contract refuses, and the oracle concludes nothing from the trace. Closed by BrokerKilled; an assertion of lot L3 on a child-process run may make it a FAIL.",
+      "verdict": "INCONCLUSIVE",
+      "assertion": "one_admission_per_observed_inbound_exchange",
+      "assertion_status": "INCONCLUSIVE",
+      "reason": "schema-violation at /payload/wait_status/signal: 0 is less than the minimum of 1"
     }
   ]
 }

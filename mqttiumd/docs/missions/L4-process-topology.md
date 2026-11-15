@@ -151,9 +151,12 @@ next child on the same file only once the end of the killed one is
 confirmed. `campaign.json` states it: `covers.crash` ("process killed:
 SIGKILL to pid …, wait status signal 9"), `kills` (process identifier,
 start-up, signal sent, wait status) and `failure_model` with the
-statement above. The process identifier never enters the trace. A
-contract record of the kill (`BrokerKilled`) is asked of lot L3; until it
-exists, the trace carries none. A child that stops without a crash exits
+statement above. The process identifier never enters the trace.  The
+trace carries the kill as `BrokerKilled` (decision 0019): the signal
+sent and the wait status observed, written after the wait and before
+`BrokerCrashed`; the header of the trace and the run manifest state
+`broker: child-process`. An in-process run states neither, and its trace
+does not change. A child that stops without a crash exits
 on its own with a status of success.
 
 Two controls of `tests/mutants/loop/`, played on SQLite with
@@ -169,9 +172,9 @@ the obligations at both checkpoints agree, because the second admission
 writes them again). `n3`: no signal is sent and the child exits on its
 own; the supervisor refuses a wait status other than signal 9 with no
 exit code, and the run stops (INCONCLUSIVE). `n4`: the same, with that
-check removed, survives today, since the trace says nothing of the kill:
-the known survivor that the record `BrokerKilled` (decision 0019, lot L3)
-must close.
+check removed: the bench writes `BrokerKilled` from the status it
+observed, which has no terminating signal (signal 0); the contract
+refuses it and the oracle concludes nothing (INCONCLUSIVE).
 
 ## Causal parents of the supervisor and the peers
 

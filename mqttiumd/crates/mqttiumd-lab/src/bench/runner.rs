@@ -828,6 +828,18 @@ impl<B: Backend> Runner<'_, B> {
                         open.sort_by_key(|(generation, _)| generation.get());
                         let open = open.into_iter().map(|(_, name)| name).collect();
                         let killed = child.kill()?;
+                        // The kill as the wait status showed it, before the
+                        // crash (decision 0019); its process identifier goes
+                        // to campaign.json only.
+                        self.emit(
+                            Origin::BenchSupervisor,
+                            "BrokerKilled",
+                            &[],
+                            json!({
+                                "signal_sent": killed.signal_sent,
+                                "wait_status": {"signal": killed.wait_signal},
+                            }),
+                        )?;
                         self.kills.push(killed);
                         (None, open)
                     }
@@ -879,11 +891,16 @@ pub fn run<B: Backend>(plan: Plan<'_, B>) -> Outcome {
         mut collector,
         child,
     } = plan;
-    let header = json!({
+    let mut header = json!({
         "scenario_id": scenario.id,
         "backend": backend.name(),
         "perimeter": "full",
     });
+    // Where the broker runs (decision 0019); absent means in-process, so
+    // that an in-process trace does not change.
+    if child.is_some() {
+        header["broker"] = json!("child-process");
+    }
     let header = collector.emit(Origin::BenchSupervisor, "TraceHeader", &[], header);
     let clients = population
         .clients

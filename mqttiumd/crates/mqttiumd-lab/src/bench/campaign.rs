@@ -674,6 +674,9 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     if let Some(built_from) = &built_from {
         run_manifest["artifact"]["built_from"] = built_from.clone();
     }
+    if in_child {
+        run_manifest["broker"] = json!("child-process");
+    }
     run_manifest["oracle"] = oracle.clone();
     run_manifest["generators"] = generators.clone();
     run_manifest["scenario"] = artifact(out, &scenario_path)?;
