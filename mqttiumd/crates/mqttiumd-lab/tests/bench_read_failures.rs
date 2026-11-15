@@ -542,9 +542,9 @@ fn receive(root: &Path, out: &Path, case: Case) {
             "PASS"
         }
     );
-    if case.code.is_some() {
+    if let Some(code) = case.code {
         assert_eq!(verdict["failure_count"], "1");
-        assert_eq!(verdict["failures"][0]["code"], case.code.unwrap());
+        assert_eq!(verdict["failures"][0]["code"], code);
         assert_eq!(
             verdict["assertions"]["durable_reads_complete"]["status"],
             "INCONCLUSIVE"

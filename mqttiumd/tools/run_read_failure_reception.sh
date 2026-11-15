@@ -23,6 +23,10 @@ cargo test --locked -p mqttiumd-store-sqlite --test reader_errors -- --nocapture
     >"$out/store-readers.log" 2>&1
 cargo test --locked -p mqttiumd-lab --lib review_control_probe -- --nocapture \
     >"$out/process-control.log" 2>&1
+cargo test --locked -p mqttiumd-lab --lib setup_failure_tests -- --nocapture \
+    >"$out/setup-readers.log" 2>&1
+cargo test --locked -p mqttiumd-lab --lib process_read_tests -- --nocapture \
+    >"$out/partial-recovery.log" 2>&1
 python3 -m unittest discover -t tests/oracle -s tests/oracle/tests \
     -p test_first_recovery.py >"$out/first-recovery.log" 2>&1
 MQTTIUMD_READ_RECEPTION_OUT="$out/cases" \
