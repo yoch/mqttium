@@ -541,9 +541,11 @@ fn a_result_handed_over_follows_the_result_the_store_produced() {
     perform(&mut bench, StoreAction::EnterWriter(fenced));
     perform(&mut bench, StoreAction::ReleaseResult(fenced));
     perform(&mut bench, StoreAction::DeliverResult(fenced));
-    // A result from outside, for work in flight.
+    // A result from outside, for work in flight whose own result the
+    // store already produced: the outside one answers it first.
     let other = operation_id(bench.epoch, 10);
     let outside = resolve(&mut bench, 3, other);
+    perform(&mut bench, StoreAction::EnterWriter(outside));
     let WorkId::Effect(outside_effect) = outside else {
         panic!("an effect");
     };
@@ -555,6 +557,10 @@ fn a_result_handed_over_follows_the_result_the_store_produced() {
         ),
     );
     assert!(matches!(presented, Ok(Performed::Delivered { .. })));
+    assert_eq!(
+        perform(&mut bench, StoreAction::DeliverResult(outside)),
+        Performed::Uncorrelated
+    );
 
     let events = bench.store.take_events();
     let written = TraceWriter::new("k1-handover", 1, 1, &names).write(&events);
@@ -564,9 +570,9 @@ fn a_result_handed_over_follows_the_result_the_store_produced() {
     }
     let ready = of_kind(&written.records, "StoreResultReady");
     let handed = of_kind(&written.records, "StoreResultHandedOver");
-    assert_eq!(ready.len(), 2);
+    assert_eq!(ready.len(), 3);
     assert_eq!(handed.len(), 3, "{:#?}", written.unwritten);
-    for (handover, produced) in handed.iter().zip(&ready) {
+    for (handover, produced) in handed.iter().zip(&ready).take(2) {
         assert_eq!(handover["origin_component"], "store-adapter");
         assert_eq!(handover["payload"], produced["payload"]);
         assert_eq!(
@@ -599,6 +605,8 @@ fn a_result_handed_over_follows_the_result_the_store_produced() {
 #[test]
 fn an_opening_is_written_as_submitted_then_opened_once() {
     let mut bench = adapter_bench();
+    // One more epoch, so that `after` differs from the incarnation.
+    mqttiumd_lab::store::conformance::open(bench.store.store_mut());
     let mut opening = bench.store.begin_opening(startup_nonce(7, 1));
     let command = opening
         .submit(bench.store.store().ledger().last_opened())
@@ -620,6 +628,7 @@ fn an_opening_is_written_as_submitted_then_opened_once() {
         "startup_hex": "00000000000000070000000000000001",
         "ticket": command.attempt.ticket.get().to_string(),
     });
+    assert_ne!(command.after.get(), command.incarnation.get());
     let submitted = of_kind(&written.records, "OpeningSubmitted");
     assert_eq!(submitted.len(), 2);
     for record in &submitted {
