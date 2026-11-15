@@ -131,7 +131,7 @@ class Produce(unittest.TestCase):
             self.unmet(result),
             [
                 "not qualifying: nothing establishes that the binary was built from the "
-                "recorded content (no member of run-manifest v1 says so)"
+                "recorded content (the manifest has no artifact.built_from)"
             ],
         )
         self.assertEqual({entry["status"] for entry in result["assertions"]}, {"PASS"})
@@ -208,9 +208,11 @@ class Campaign(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.campaign.parent, ignore_errors=True)
         shutil.copytree(ROOT / "contracts", self.campaign / "contracts")
         scenario = json.loads((ROOT / SCENARIO).read_text())
-        for path in (SCENARIO, scenario["initial_fixture"], f"{TRACES}/p1-02-good/trace.jsonl"):
+        for path in (SCENARIO, scenario["initial_fixture"]):
             (self.campaign / path).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ROOT / path, self.campaign / path)
+        # The trace with the snapshots it names.
+        shutil.copytree(ROOT / TRACES / "p1-02-good", self.campaign / TRACES / "p1-02-good")
         self.contracts = Contracts.open(self.campaign)
 
     def cite(self, path):
@@ -292,7 +294,8 @@ class Campaign(unittest.TestCase):
 
     def test_a_source_that_differs_is_named(self):
         member = self.rebuilt()
-        self.keep("source.tar", b"another source\n")
+        # The same size, other bytes: only the digest tells them apart.
+        self.keep("source.tar", b"the source of the binarY\n")
         self.assertEqual(
             self.produce(member),
             [
