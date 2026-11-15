@@ -28,6 +28,15 @@ pub const BUILD_FEATURES: &[&str] = if cfg!(feature = "kill-points") {
     &[]
 };
 
+/// A dependency feature unified by Cargo must not be lost at rebuild.
+/// The forwarding lab feature is the one supported invocation.
+pub fn check_features() -> Result<(), String> {
+    if mqttiumd_store_sqlite::KILL_POINTS_ENABLED != cfg!(feature = "kill-points") {
+        return Err("Cargo feature unification enabled SQLite kill-points without the lab feature; rebuild mqttiumd-lab with --features kill-points".to_owned());
+    }
+    Ok(())
+}
+
 /// The command that builds the binary of a campaign from its `source.tar`.
 #[must_use]
 pub fn build_command() -> String {
@@ -272,6 +281,7 @@ fn build(tar: &Path, work: &Path) -> Result<(PathBuf, String), String> {
 /// Assembles the source of the run, packs it, and builds the binary.
 /// `work` is a directory of its own, removed by the caller.
 pub fn rebuild(root: &Path, work: &Path, exclude: &[PathBuf]) -> Result<Rebuilt, String> {
+    check_features()?;
     let source = work.join("source");
     let revision = assemble(root, &source, exclude)?;
     let tar = work.join("source.tar");

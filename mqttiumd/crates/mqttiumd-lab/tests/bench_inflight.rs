@@ -172,4 +172,9 @@ fn dependency_feature_unification_cannot_silently_change_the_rebuilt_binary() {
     let why = execute(&request).expect_err("the store carries unrecorded test instrumentation");
     assert!(why.contains("Cargo feature unification"), "{why}");
     assert!(!out.exists(), "the mismatch must be refused before writes");
+    let work = bench_support::fresh("unified-rebuild-refused");
+    let why = mqttiumd_lab::bench::rebuild::rebuild(&bench_support::root(), &work, &[])
+        .expect_err("rebuild cannot silently remove instrumentation either");
+    assert!(why.contains("Cargo feature unification"), "{why}");
+    assert!(!work.exists(), "refusal must precede source assembly");
 }
