@@ -73,20 +73,23 @@ pub enum CoreFault {
     StalePlan,
     /// An input that the adapters can never produce in this state.
     ImpossibleInput,
-    /// A transition asked for more effect slots than its whole box has.
-    /// The constructor of an owner refuses such a box, so this is a fault
-    /// of the core and never a wait (ADR 0006, amendment).
-    BoxTooSmall,
+    /// A transition asked, in its one reservation, for more effect slots
+    /// than its whole box has. The constructor of an owner refuses such a
+    /// box, so this is a fault of the core and never a wait (ADR 0006,
+    /// amendment).
+    BoxTooSmall { requested: usize, capacity: usize },
 }
 
 /// What is exhausted when a step answers `Exhausted`. No wake-up ends it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Exhaustion {
     /// The reservation table of the owner's effect box. The holder of the
-    /// creation authority may renew the box: dispatch it until it is
-    /// empty, retire it, create a box for the same owner and present the
-    /// input again. No counter of the owner is reset. Otherwise the owner
-    /// stops.
+    /// creation authority may renew the box: publish or release every
+    /// reservation the box still holds, dispatch it until it is empty,
+    /// retire it, create a box for the same owner and present the input
+    /// again. The retirement is refused while a reservation lives or an
+    /// effect waits. No counter of the owner is reset. Otherwise the
+    /// owner stops.
     ReservationTable,
     /// An identity counter of the owner reached its end. It is not
     /// renewable within a run epoch: the owner stops, and the next epoch
@@ -125,7 +128,12 @@ pub enum StepOutcome {
 impl StepOutcome {
     /// The outcome of a step whose reservation of effect slots was
     /// refused. This is the one place where a refusal of the box crosses
-    /// the boundary of a step.
+    /// the boundary of a step. A transition makes one reservation, for all
+    /// the slots its plan needs, so one refusal decides the step.
+    ///
+    /// A request larger than the box is `Fatal`: like every fault it
+    /// hands back neither the input nor `work_used`, since the owner
+    /// stops; the fault keeps the two sizes for the diagnostic.
     pub fn reservation_refused(
         input: OwnedInput,
         refusal: ReserveRefused,
@@ -142,7 +150,13 @@ impl StepOutcome {
                 exhaustion: Exhaustion::ReservationTable,
                 work_used,
             },
-            ReserveRefused::LargerThanBox { .. } => Self::Fatal(CoreFault::BoxTooSmall),
+            ReserveRefused::LargerThanBox {
+                requested,
+                capacity,
+            } => Self::Fatal(CoreFault::BoxTooSmall {
+                requested,
+                capacity,
+            }),
         }
     }
 }
@@ -188,7 +202,13 @@ mod tests {
             },
             WorkUnits::new(1),
         );
-        assert_eq!(outcome, StepOutcome::Fatal(CoreFault::BoxTooSmall));
+        assert_eq!(
+            outcome,
+            StepOutcome::Fatal(CoreFault::BoxTooSmall {
+                requested: 4,
+                capacity: 3,
+            })
+        );
     }
 
     #[test]
