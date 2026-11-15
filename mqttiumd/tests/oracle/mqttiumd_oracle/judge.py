@@ -409,8 +409,8 @@ def one_admission_per_observed_inbound_exchange(run):
     # record an incomplete trace lacks.
     stands = False
 
-    def attribute(operation, commit):
-        """Places the admission of ``operation``, evidenced by ``commit``, in its exchange."""
+    def attribute(operation, commit, *, peer_source=False):
+        """Place a durable admission by its commit or its observed PUBLISH source."""
         kind, session, packet_id = slots.get(operation, (None, None, None))
         if kind != "AdmitPublication" or session not in clients:
             statuses.append(INCONCLUSIVE)
@@ -421,7 +421,10 @@ def one_admission_per_observed_inbound_exchange(run):
         for exchange in exchanges:
             if (exchange.client, exchange.packet_id) != slot:
                 continue
-            opened = run.trace.before(exchange.opened, commit)
+            opened = (
+                True if peer_source and exchange.opened.key == commit.key
+                else run.trace.before(exchange.opened, commit)
+            )
             ended = exchange.closed is not None and run.trace.before(exchange.closed, commit)
             if opened is None or ended is None:
                 unknown.append(exchange)
@@ -517,7 +520,50 @@ def one_admission_per_observed_inbound_exchange(run):
                 stands = True
                 continue
             found.add(operation)
-            attribute(operation, page)
+            if run.trace.backend == "sqlite":
+                # Recovery establishes the durable outcome, while the
+                # acknowledged submission and its peer PUBLISH establish
+                # which client exchange issued this immutable recipe. The
+                # recovery page need not be causally after that peer record.
+                submitted = [
+                    command for command in run.trace.of_kind("CommandSubmitted")
+                    if _key(command.payload["operation_id"]) == operation
+                    and command.payload["command_kind"] == "AdmitPublication"
+                    and any(
+                        order is True and run.trace.before(command, kill) is True
+                        for kill, order in zip(kills, follows)
+                    )
+                ]
+                source = None
+                if submitted:
+                    command = min(submitted, key=lambda record: (record.origin[1], record.origin_sequence))
+                    ancestors = run.trace.ancestors(command)
+                    _, session, packet_id = slots[operation]
+                    sent = [
+                        record for record in run.trace.of_kind("PeerPacketSent")
+                        if record.key in ancestors
+                        and record.payload["packet_kind"] == "PUBLISH"
+                        and (record.payload["client"], record.payload["packet_id"])
+                        == (clients.get(session), packet_id)
+                    ]
+                    latest = [
+                        record for record in sent
+                        if not any(run.trace.before(record, other) is True for other in sent)
+                    ]
+                    if len(latest) == 1:
+                        source = latest[0]
+                if source is None:
+                    statuses.append(INCONCLUSIVE)
+                    reasons.append(f"the recovered admission {operation} has no observed PUBLISH source")
+                    _, session, packet_id = slots[operation]
+                    placeable.update(
+                        id(exchange) for exchange in exchanges
+                        if (exchange.client, exchange.packet_id) == (clients.get(session), packet_id)
+                    )
+                    continue
+                attribute(operation, source, peer_source=True)
+            else:
+                attribute(operation, page)
     for exchange in exchanges:
         admissions = counts[id(exchange)]
         name = f"exchange {exchange.ordinal} of {exchange.client}, Packet Identifier {exchange.packet_id}"

@@ -323,3 +323,8 @@ rank is distinct from the epoch inside a durable operation identity. The
 oracle still requires the exact matching page read before delivery. It
 does not infer a product cause from collector order, and does not change
 `Trace.before` when kill and recovery pages are causally unordered.
+The original `CommandSubmitted` with the same durable operation identity
+and its causally observed peer PUBLISH identify the exchange for an
+admission found only at SQLite recovery. The peer's local history locates
+that PUBLISH within its exchange, independently of the unordered recovery
+page. Missing or ambiguous submission/source evidence is inconclusive.

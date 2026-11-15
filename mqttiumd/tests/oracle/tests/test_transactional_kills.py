@@ -56,7 +56,7 @@ class TransactionalKills(unittest.TestCase):
                 self.assertEqual(self.decide(run).status, "PASS")
 
     def test_sqlite_kill_requires_an_unambiguous_matching_startup(self):
-        for problem in ("wrong-epoch", "wrong-incarnation", "absent", "reused-epoch"):
+        for problem in ("wrong-epoch", "wrong-incarnation", "absent", "contradictory-core", "reused-epoch"):
             with self.subTest(problem=problem):
                 def edit(events):
                     sqlite_lifecycle(events)
@@ -67,6 +67,8 @@ class TransactionalKills(unittest.TestCase):
                             events[corpus.at(events, label)]["inc"] = 3
                     elif problem == "absent":
                         del events[corpus.at(events, "restart")]
+                    elif problem == "contradictory-core":
+                        events[corpus.at(events, "restart")]["parents"] = ["boot.grant"]
                     else:
                         duplicate = copy.deepcopy(events[corpus.at(events, "restart")])
                         duplicate["label"] = "restart.reused"

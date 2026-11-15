@@ -64,6 +64,14 @@ as causality nor adds an edge from the supervisor into product startup;
 `Trace.before` is unchanged. The simulated backend retains its declared
 total observation order.
 
+For an admission observed only through SQLite recovery, the Committed
+operation is joined by `OperationId` to its acknowledged original
+`CommandSubmitted`. The causally observed peer PUBLISH of that submission
+and the peer's own local order identify its exchange. Recovery establishes
+the durable outcome; its collector position is not used to place the
+admission in the client's history. Missing or ambiguous source evidence
+leaves that attribution inconclusive.
+
 ## Test instrumentation and checkpoint policy
 
 The lab's `kill-points` feature forwards to the store feature and is off
