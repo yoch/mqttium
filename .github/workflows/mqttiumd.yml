@@ -76,13 +76,13 @@ jobs:
       # killed.
       - name: Campaigns on the deterministic store
         run: |
-          for scenario in p1/P1-02 p1/P1-02b qabs/QABS-A qabs/QABS-B qabs/QABS-C audit/F3-steady-lag; do
+          for scenario in p1/P1-02 p1/P1-02b qabs/QABS-A qabs/QABS-B qabs/QABS-C audit/F3-steady-lag audit/P1-02b-interposed; do
             tools/run_campaign.sh "tests/scenarios/$scenario.json" \
               "$RUNNER_TEMP/campaigns/sim-store/$(basename "$scenario")"
           done
       - name: Campaigns on the SQLite store
         run: |
-          for scenario in p1/P1-02 p1/P1-02b qabs/QABS-A qabs/QABS-B qabs/QABS-C audit/F3-steady-lag; do
+          for scenario in p1/P1-02 p1/P1-02b qabs/QABS-A qabs/QABS-B qabs/QABS-C audit/F3-steady-lag audit/P1-02b-interposed; do
             tools/run_campaign.sh "tests/scenarios/$scenario.json" \
               "$RUNNER_TEMP/campaigns/sqlite/$(basename "$scenario")" 1 sqlite
           done
