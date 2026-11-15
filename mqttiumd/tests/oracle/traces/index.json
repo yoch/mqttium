@@ -1407,6 +1407,25 @@
       "why": "A run that claims no child process records a kill."
     },
     {
+      "name": "store-evidence-writes-after-its-kill",
+      "scenario": "tests/oracle/traces/scenarios/p1-02.json",
+      "trace": "tests/oracle/traces/store-evidence-writes-after-its-kill/trace.jsonl",
+      "expected": {
+        "one_admission_per_observed_inbound_exchange": "PASS",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+        "same_recipe_for_op_A": "PASS",
+        "no_positive_ack_before_confirmed_commit": "PASS",
+        "no_pubrec_observed_before_crash": "PASS",
+        "broker_inputs_have_provenance": "PASS",
+        "all_required_faults_hit": "PASS",
+        "trace_complete": "PASS",
+        "one_grant_per_opened_epoch": "PASS",
+        "scenario_reaches_its_end": "PASS",
+        "broker_killed_for_real": "FAIL"
+      },
+      "why": "The evidence of the store, which runs in the child, writes for the killed incarnation after the kill."
+    },
+    {
       "name": "child-writes-after-its-kill",
       "scenario": "tests/oracle/traces/scenarios/p1-02.json",
       "trace": "tests/oracle/traces/child-writes-after-its-kill/trace.jsonl",
