@@ -106,6 +106,14 @@
       "requirements": [
         "ARC-011"
       ]
+    },
+    {
+      "name": "one_grant_per_opened_epoch",
+      "meaning": "At most one grant is handed over per opened epoch, and each follows, among its causes in the same incarnation of the core, a committed reply for that epoch to an attempt whose epoch the store opened.",
+      "every_run": true,
+      "requirements": [
+        "DEM-012"
+      ]
     }
   ]
 }
