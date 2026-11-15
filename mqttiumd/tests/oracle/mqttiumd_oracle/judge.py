@@ -1664,6 +1664,19 @@ def one_grant_per_opened_epoch(run):
     return Status(FAIL if reasons else PASS, reasons)
 
 
+def durable_reads_complete(run):
+    """A refusal to establish the state is missing evidence, never absence."""
+    failures = [record for record in run.trace.records
+                if record.kind in {"DurableReadFailed", "ProcessControlFailed"}]
+    if not failures:
+        return Status(PASS)
+    return Status(INCONCLUSIVE, [
+        f"record {record.sequence}: {record.kind} {record.payload['code']} "
+        f"during {record.payload['phase']} of process {record.payload['process_incarnation']}"
+        for record in failures[:64]
+    ])
+
+
 ASSERTIONS = {
     "fenced_operation_never_executed": fenced_operation_never_executed,
     "certain_rejection_has_a_closure": certain_rejection_has_a_closure,
@@ -1681,6 +1694,7 @@ ASSERTIONS = {
     "transactional_kill_matches_recovery": transactional_kill_matches_recovery,
     "all_required_faults_hit": all_required_faults_hit,
     "trace_complete": trace_complete,
+    "durable_reads_complete": durable_reads_complete,
 }
 
 

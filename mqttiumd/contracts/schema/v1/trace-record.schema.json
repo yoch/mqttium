@@ -130,7 +130,9 @@
         "OpeningAbandoned",
         "EpochGrantHandedOver",
         "StepBlocked",
-        "BrokerKilled"
+        "BrokerKilled",
+        "DurableReadFailed",
+        "ProcessControlFailed"
       ]
     },
     "payload": {
@@ -974,6 +976,50 @@
             "enum": [
               "bench-supervisor"
             ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "DurableReadFailed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/DurableReadFailed"
+          },
+          "origin_component": {
+            "const": "bench-supervisor"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "ProcessControlFailed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/ProcessControlFailed"
+          },
+          "origin_component": {
+            "const": "bench-supervisor"
           }
         }
       }
@@ -2376,6 +2422,57 @@
               "maximum": 64
             }
           }
+        }
+      }
+    },
+    "DurableReadFailed": {
+      "description": "An observed refusal to establish complete evidence. The code and context, never the optional text, carry its meaning. The process incarnation can be reported before Started.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "phase",
+        "process_incarnation"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "primitives.schema.json#/$defs/durableReadCode"
+        },
+        "phase": {
+          "$ref": "primitives.schema.json#/$defs/durableReadPhase"
+        },
+        "process_incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "message": {
+          "$ref": "primitives.schema.json#/$defs/text"
+        },
+        "page": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "ProcessControlFailed": {
+      "description": "An observed refusal to establish complete evidence. The code and context, never the optional text, carry its meaning. The process incarnation can be reported before Started.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "phase",
+        "process_incarnation"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "primitives.schema.json#/$defs/processControlCode"
+        },
+        "phase": {
+          "$ref": "primitives.schema.json#/$defs/processControlPhase"
+        },
+        "process_incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "message": {
+          "$ref": "primitives.schema.json#/$defs/text"
         }
       }
     }
