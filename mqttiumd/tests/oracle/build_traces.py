@@ -2101,6 +2101,82 @@ case(
     events=resolved_from_the_bench,
 )
 
+# ---------------------------------------------- a violation of the store (f)
+
+
+def release_violates(events):
+    # The store reports RecipeMismatch for the release, along the whole
+    # chain, and the core acknowledges the release all the same.
+    deepcopy_payloads(events)
+    for label in ("release.ready", "release.delivered.handed", "release.delivered"):
+        events[at(events, label)]["payload"].update(outcome="Violation", violation="RecipeMismatch")
+    del events[at(events, "release.stable")]
+    events[at(events, "release.ready")]["parents"] = ["release.submitted"]
+
+
+case(
+    "pubcomp-after-a-recipe-mismatch",
+    "The store reports a violation for the release, not a commit, and the core acknowledges it.",
+    {
+        "no_positive_ack_before_confirmed_commit": "FAIL",
+        "same_required_obligations_at_both_checkpoints": "PASS",
+    },
+    events=release_violates,
+)
+
+# ---------------------------------------------- a run that stopped (d)
+END = "scenario_reaches_its_end"
+
+
+def blocked(cause):
+    def edit(events):
+        events.append(
+            ev(
+                "blocked",
+                "bench-supervisor",
+                "StepBlocked",
+                {
+                    "step": "19",
+                    "step_kind": "DriveUntil",
+                    "cause": cause,
+                    "armed_deadlines": "0",
+                    "holding_faults": [],
+                },
+            )
+        )
+
+    return edit
+
+
+case(
+    "run-blocked-with-nothing-eligible",
+    "The bench stopped: nothing was eligible and the awaited event had not happened, which refutes what the DriveUntil step asserted.",
+    {END: "FAIL"},
+    events=blocked("quiescent"),
+)
+case(
+    "run-stopped-by-its-budget",
+    "The bench stopped because the steps ran out: nothing is established about the product.",
+    {END: "INCONCLUSIVE"},
+    events=blocked("budget"),
+)
+
+
+def stuck_and_cut(events):
+    # The run stops right after the crash; the bench declares the trace
+    # incomplete, and says the product was stuck.
+    del events[at(events, "restart") :]
+    blocked("quiescent")(events)
+
+
+case(
+    "run-blocked-on-a-cut-trace",
+    "The product was stuck and the trace is incomplete: the block stands, nothing else is concluded.",
+    {**ALL_INCONCLUSIVE, END: "FAIL"},
+    events=stuck_and_cut,
+    raw=lambda records: records[-1]["payload"].update(complete=False),
+)
+
 # ------------------------------------------ the opening of an epoch
 GRANT = "one_grant_per_opened_epoch"
 

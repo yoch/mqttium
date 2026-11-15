@@ -632,6 +632,13 @@ def qabs_a(edit):
 
 
 bad(
+    "scenario-fence-fault-of-a-command-nobody-selected.json",
+    "fault-match-invalid",
+    "/faults/1/match",
+    "A fence fault names the resolved operation by its command, which an earlier fault must select.",
+    qabs_a(setter(["faults", 1, "match", "command_kind"], "ReleaseInbound")),
+)
+bad(
     "scenario-leave-of-a-held-command.json",
     "held-item-mismatch",
     f"/steps/{LEAVE}/fault",
@@ -1174,6 +1181,23 @@ ok(
         [("broker-core", 0)],
     ),
 )
+# A run that stopped before its last step says why (the bench): no action
+# was eligible and the awaited event had not happened, or the budget of
+# steps ran out.
+BLOCKED = record(
+    9,
+    "bench-supervisor",
+    3,
+    "StepBlocked",
+    {
+        "step": "19",
+        "step_kind": "DriveUntil",
+        "cause": "quiescent",
+        "armed_deadlines": "1",
+        "holding_faults": ["hold_result"],
+    },
+)
+ok("trace-record-step-blocked.json", BLOCKED)
 REJECTED = record(
     7,
     "store-evidence",
@@ -1188,6 +1212,23 @@ REJECTED = record(
     [("store-evidence", 0)],
 )
 ok("trace-record-store-result-rejected.json", REJECTED)
+# The store refuses a recipe that differs from the one an OperationId
+# already designates: no outcome, a violation (StoreViolation).
+VIOLATION = record(
+    7,
+    "store-evidence",
+    1,
+    "StoreResultReady",
+    {
+        "effect_id": EFFECT,
+        "operation_id": OP,
+        "outcome": "Violation",
+        "violation": "RecipeMismatch",
+    },
+    [("store-evidence", 0)],
+)
+ok("trace-record-store-result-violation.json", VIOLATION)
+
 ok(
     "trace-record-store-result-delivered-rejected.json",
     record(
@@ -1482,6 +1523,64 @@ trace_case(
     "/payload",
     "What the adapter hands over is the result the store produced, reason included.",
     setter(["payload", "outcome"], "RejectedCertain"),
+)
+trace_case(
+    "step-blocked-for-an-unknown-cause",
+    BLOCKED,
+    "/payload/cause",
+    "A run stops because nothing was eligible or because its budget ran out.",
+    setter(["payload", "cause"], "timeout"),
+)
+trace_case(
+    "step-blocked-overflow",
+    BLOCKED,
+    "/payload/step",
+    "The index of a step is 64-bit.",
+    setter(["payload", "step"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "step-blocked-deadlines-overflow",
+    BLOCKED,
+    "/payload/armed_deadlines",
+    "The count of armed deadlines is 64-bit.",
+    setter(["payload", "armed_deadlines"], "18446744073709551616"),
+    code="u64-out-of-range",
+)
+trace_case(
+    "step-blocked-without-what-waits",
+    BLOCKED,
+    "/payload",
+    "A stopped run says what still waits: the deadlines armed and not fired.",
+    dropped("payload", "armed_deadlines"),
+)
+trace_case(
+    "step-blocked-without-what-is-held",
+    BLOCKED,
+    "/payload",
+    "A stopped run says which faults still hold an item.",
+    dropped("payload", "holding_faults"),
+)
+trace_case(
+    "step-blocked-naming-a-fault-twice",
+    BLOCKED,
+    "/payload/holding_faults",
+    "Each fault that holds an item is named once.",
+    setter(["payload", "holding_faults"], ["hold_result", "hold_result"]),
+)
+trace_case(
+    "violation-without-its-kind",
+    VIOLATION,
+    "/payload",
+    "A violation says which one: the store reports no outcome, a violation of the contract.",
+    dropped("payload", "violation"),
+)
+trace_case(
+    "commit-with-a-violation",
+    VIOLATION,
+    "/payload",
+    "Only a violation names a violation.",
+    setter(["payload", "outcome"], "Committed"),
 )
 trace_case(
     "rejection-without-its-reason",
@@ -2633,6 +2732,7 @@ for kind_name, origin in [
     ("opening-reply-delivered", "store-adapter"),
     ("opening-abandoned", "bench-supervisor"),
     ("epoch-grant-handed-over", "store-evidence"),
+    ("step-blocked", "broker-core"),
 ]:
     trace_case(
         f"{kind_name}-stated-by-{origin}",

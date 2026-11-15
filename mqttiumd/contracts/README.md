@@ -123,8 +123,9 @@ At `store.fence.transit`, `match.command_kind` and
 the bench knows it, from the fault that selected that command earlier in
 the scenario (`store.command.transit` in QABS-A, B and C). The runner of
 the bench maps the selection to the operation; the store is handed only
-the identity. No semantic rule yet refuses a scenario whose fence fault
-names a command no earlier fault selected.
+the identity. Both readers refuse a fence fault whose command kind and
+publication no fault at `store.command.transit` selects
+(`fault-match-invalid`).
 
 **One fault per item.** Two faults of a scenario never select the same
 command or result. Two selections on one point, for one command kind, with
@@ -196,6 +197,15 @@ contract crate, and the assertion
 rejection a refusing frame answers is the latest certain rejection among
 its causes, delivered to the same incarnation of the core.
 
+A store may answer with no outcome at all: a contract violation
+(`StoreReply::Violation`), today only `RecipeMismatch`, for an
+`OperationId` presented again with a different recipe. The three result
+records then carry the outcome `Violation` and name it in `violation`,
+which no other outcome has. A violation is not a commit: an
+acknowledgement that follows from it fails
+`no_positive_ack_before_confirmed_commit`, and it is no terminal
+knowledge. The store adapter hands it over unchanged, as any result.
+
 A `CommandSubmitted` or `ResolveSubmitted` has as a parent the record of
 the core, in the same incarnation, that consumed the input the effect
 comes from (`PacketDelivered` for an admission or a release,
@@ -219,6 +229,21 @@ stopped waiting, which is not terminal; `EpochGrantHandedOver` the one
 creation authority. `one_grant_per_opened_epoch`, owed by every run,
 holds when each epoch is granted at most once, after a committed reply
 the ledger confirms.
+
+A run the bench stops before the last step of its scenario ends with
+`StepBlocked {step, step_kind, cause, armed_deadlines, holding_faults}`
+of the bench supervisor, before the footer: `quiescent` when no action
+was eligible and the awaited event had not happened, `budget` when the
+steps ran out. The assertion `scenario_reaches_its_end`, owed by every
+run, fails on `quiescent` and is inconclusive on `budget`. The FAIL says
+what one finished run establishes: a `DriveUntil` step asserts that the
+awaited event comes with no stimulus beyond what the scenario has already
+injected, and nothing eligible with the wait unmet refutes that for this
+run (no missing record undoes it). It does not say the product is stuck
+for ever. For diagnosis only, the record counts the deadlines armed and
+not fired and names the faults that still hold an item, so that a reader
+can tell a stopped product from a scenario that did not fire a deadline
+it armed or release what it holds; the verdict depends on `cause` alone.
 
 `InputRefused` is what the dispatcher records when it refuses a result
 that answers no effect in flight. `StoreCommitStable`, `StoreFenceStable`,
