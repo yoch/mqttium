@@ -327,7 +327,12 @@ def provisional(result, conditions):
 
 
 def recompute(contracts, result_path):
-    """The reasons a result is refused as evidence; empty when it stands."""
+    """The reasons a result is refused as evidence; empty when it stands.
+
+    The assertions, the faults and the trace are judged again, and the
+    conditions of a qualifying run (``unmet``) are checked again: a result
+    stands only while every one of them holds.
+    """
     try:
         data = contracts.read(result_path)
     except Refused as refusal:
@@ -391,4 +396,15 @@ def recompute(contracts, result_path):
                     f"{entry['id']} was reached {counted.get(entry['id'])} times in the trace",
                 )
             )
+    # R1: a qualifying result is evidence only while the conditions it was
+    # produced under hold. They are checked again from the scenario and the
+    # manifest it cites, as produce checks them; a broken one refuses it.
+    for condition in unmet(contracts, result["scenario"]["path"], result["manifest"]["path"]):
+        out.append(
+            Diagnostic(
+                "result-not-qualifying",
+                "/manifest",
+                _text(f"a condition of a qualifying run no longer holds: {condition}"),
+            )
+        )
     return out

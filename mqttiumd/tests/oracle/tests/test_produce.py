@@ -318,6 +318,100 @@ class Campaign(unittest.TestCase):
         self.assertEqual(self.contracts.check_file("run-result.json"), [])
         self.assertEqual(results.recompute(self.contracts, "run-result.json"), [])
 
+    # R1 of the audit of a4aea95f: recompute checks the conditions of a
+    # qualifying run again, not only the assertions and the faults. Each
+    # result below qualified when it was produced; one condition is then
+    # broken, and recompute refuses it for that condition alone.
+
+    def refused(self):
+        """What recompute says of the result produced, as (code, text) pairs."""
+        return [
+            (diagnostic.code, diagnostic.message)
+            for diagnostic in results.recompute(self.contracts, "run-result.json")
+        ]
+
+    def qualified(self, **checkout):
+        self.assertEqual(self.produce_rebuilt(**checkout), [])
+        self.assertEqual(self.result["qualification"], "qualifying")
+        self.assertEqual(self.refused(), [])
+
+    def unqualified(self, condition):
+        return [
+            (
+                "result-not-qualifying",
+                f"a condition of a qualifying run no longer holds: {condition}",
+            )
+        ]
+
+    def test_recompute_refuses_a_result_whose_source_is_gone(self):
+        self.qualified()
+        (self.campaign / "source.tar").unlink()
+        self.assertEqual(
+            self.refused(),
+            self.unqualified("the source the manifest names, source.tar, is not in the campaign"),
+        )
+
+    def test_recompute_refuses_a_result_whose_source_changed_by_one_byte(self):
+        self.qualified()
+        data = bytearray((self.campaign / "source.tar").read_bytes())
+        data[0] ^= 1
+        (self.campaign / "source.tar").write_bytes(bytes(data))
+        self.assertEqual(
+            self.refused(),
+            self.unqualified(
+                "source.tar of the campaign is not the source the manifest names: "
+                "its digest or its size differs"
+            ),
+        )
+
+    def test_recompute_refuses_a_result_judged_by_another_oracle(self):
+        self.qualified()
+        # The oracle that runs now differs from the one the manifest names
+        # in one file: a checkout of it with judge.py changed.
+        checkout = self.campaign.parent / "checkout"
+        shutil.copytree(ROOT / "tests/oracle/mqttiumd_oracle", checkout / ORACLE)
+        (checkout / ORACLE / "judge.py").write_bytes(b"# another judge\n")
+        shutil.copy(ROOT / "tests/oracle/requirements.txt", checkout / "tests/oracle")
+        with (
+            mock.patch.object(results, "CHECKOUT", checkout),
+            mock.patch.object(results, "PACKAGE", checkout / ORACLE),
+        ):
+            refused = self.refused()
+        self.assertEqual(
+            refused,
+            self.unqualified(
+                f"the oracle that judged is not the one the manifest identifies: {ORACLE}/judge.py"
+            ),
+        )
+
+    def test_recompute_refuses_a_result_whose_kept_untracked_file_is_gone(self):
+        self.keep("modified/untracked/tools/probe.txt", b"probe\n")
+        member = self.rebuilt(self.archive(extra={"tools/probe.txt": b"probe\n"}))
+        self.assertEqual(
+            self.produce(
+                member,
+                rustflags=REMAPPED,
+                tree_state="modified",
+                modified_paths=["tools/probe.txt"],
+            ),
+            [],
+        )
+        self.assertEqual(self.refused(), [])
+        (self.campaign / "modified/untracked/tools/probe.txt").unlink()
+        self.assertEqual(
+            self.refused(),
+            self.unqualified("the modified path tools/probe.txt is not kept in the run directory"),
+        )
+
+    def test_recompute_refuses_a_result_whose_kept_patch_is_gone(self):
+        self.keep("modified/tracked.patch", b"diff --git a/crates/x.rs b/crates/x.rs\n")
+        self.qualified(tree_state="modified", modified_paths=["crates/x.rs"])
+        (self.campaign / "modified/tracked.patch").unlink()
+        self.assertEqual(
+            self.refused(),
+            self.unqualified("the modified path crates/x.rs is not kept in the run directory"),
+        )
+
     def test_a_source_the_campaign_does_not_hold_is_named(self):
         member = self.rebuilt()
         (self.campaign / "source.tar").unlink()
