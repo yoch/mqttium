@@ -618,9 +618,16 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     // executed as it stands, it plays this campaign and no other.
     let rebuilt = request.built_from.is_some();
     let replay = format!(
-        "cargo run -p mqttiumd-lab --locked -- run --contracts {contracts} --scenario {scenario_path} --seed {} --run-id {run_id} --backend {}{} --out <empty directory outside the work tree>",
+        "cargo run -p mqttiumd-lab --locked -- run --contracts {contracts} --scenario {scenario_path} --seed {} --run-id {run_id} --backend {}{}{} --out <empty directory outside the work tree>",
         request.seed,
         request.backend,
+        // A run in a child process is replayed in a child; the default,
+        // in-process, is not named.
+        if request.process == "child" {
+            " --process child"
+        } else {
+            ""
+        },
         if rebuilt { " --rebuild" } else { "" }
     );
     let replay_scope = if rebuilt {

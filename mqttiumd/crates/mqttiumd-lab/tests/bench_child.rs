@@ -239,5 +239,9 @@ fn the_crash_of_a_child_is_a_real_sigkill_and_the_next_child_reads_the_same_file
             .any(|kind| kind == "BrokerRecovered")
     );
     assert_eq!(kinds.last().unwrap(), "TraceFooter");
+    // Replayed, it runs in a child again: the recorded command says so.
+    let replay = campaign["commands"]["replay"].as_str().unwrap();
+    assert!(replay.contains(" --process child"), "{replay}");
+    assert!(replay.contains(" --backend sqlite"), "{replay}");
     let _ = std::fs::remove_dir_all(&out);
 }
