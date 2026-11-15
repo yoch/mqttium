@@ -78,6 +78,15 @@ refused input, the rejection a refusing PUBREC answers, the committed
 reply a grant follows. Those that ask only what came first read `before`:
 the closure before a refusal, the commit before an inspection, the crash
 before an observed PUBREC, a resolution after a terminal result.
+`broker_killed_for_real` (record 0019), owed by every run, reads the
+claim of the trace header. A run in-process has nothing to show, and a
+kill it records fails. A run whose broker is a child process shows, for
+each crash, a `BrokerKilled` before it and after the previous crash
+(missing: inconclusive), with the status of signal 9 (another: FAIL), and
+no record of an origin of the child (the core, the transport, the timer,
+the store adapter, the dispatcher, the fault injector; not the evidence
+of the store, which outlives the broker) of the killed incarnation after
+the kill (FAIL; unordered with it: inconclusive).
 `terminal_knowledge_never_regresses` counts as a reaction to a late
 unknown answer only a record of the product that names it among its
 parents: an inspection, a crash or a packet the bench orders after it is

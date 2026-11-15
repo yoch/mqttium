@@ -48,6 +48,8 @@ class Trace:
     backend: str | None = None
     scenario_id: str | None = None
     perimeter: str | None = None
+    # Where the broker ran, as the header claims it (record 0019).
+    broker: str = "in-process"
     run_id: str | None = None
     # Why the trace cannot be read at all.
     unreadable: list = field(default_factory=list)
@@ -236,6 +238,7 @@ def _check_whole(trace: Trace) -> None:
         trace.backend = records[0].payload["backend"]
         trace.scenario_id = records[0].payload["scenario_id"]
         trace.perimeter = records[0].payload["perimeter"]
+        trace.broker = records[0].payload.get("broker", "in-process")
     if any(record.kind == "TraceHeader" for record in records[1:]):
         problems.append("a second header")
 
