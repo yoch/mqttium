@@ -188,8 +188,15 @@ A result is `provisional` or `qualifying`.
 - A **qualifying** result is offered as evidence. It names its scenario,
   manifest and trace by path, digest and size, and the contract digest. The
   files must exist with those digests, the contracts must be the ones in
-  use, its assertions and faults must be exactly those of the scenario, and
-  none of them may be out of scope.
+  use, its faults must be exactly those of the scenario, its assertions
+  exactly those of the scenario and those every run owes, and none of them
+  may be out of scope.
+
+Each entry of the assertion catalogue says whether `every_run` owes it.
+`trace_complete` and `broker_inputs_have_provenance` are owed by every
+run: a scenario cannot opt out of them by not listing them, and P1-02,
+which is the text of the specification and lists only the first, owes
+both (ADR 0003).
 
 For both, the verdict must equal the one the assertions and injections
 determine: FAIL if any assertion failed; otherwise INCONCLUSIVE if any is

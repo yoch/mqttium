@@ -33,10 +33,14 @@ fn passing(name: &str) -> (std::path::PathBuf, String, Value) {
     fs::write(directory.join("trace.jsonl"), b"{}\n").expect("trace");
     let scenario: Value =
         serde_json::from_slice(&fs::read(root().join(SCENARIO)).expect("P1-02")).expect("JSON");
+    // The assertions of the scenario, and the one every run owes that
+    // P1-02 does not list.
     let assertions: Vec<Value> = scenario["assertions"]
         .as_array()
         .expect("assertions")
         .iter()
+        .cloned()
+        .chain([json!("broker_inputs_have_provenance")])
         .map(|name| json!({"name": name, "status": "PASS"}))
         .collect();
     let result = json!({

@@ -33,6 +33,8 @@ pub struct Catalogs {
     pub profiles: BTreeSet<String>,
     /// Assertion names.
     pub assertions: BTreeSet<String>,
+    /// Assertions every run owes, whether or not its scenario lists them.
+    pub every_run: BTreeSet<String>,
     /// Requirement, scenario, mutation, model, gate and lot identifiers.
     pub requirements: BTreeSet<String>,
 }
@@ -279,6 +281,15 @@ impl Workspace {
             command_kinds: strings(faults, "command_kinds", ""),
             profiles: strings(profiles, "profiles", "id"),
             assertions: strings(assertions, "assertions", "name"),
+            every_run: assertions
+                .get("assertions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|entry| entry["every_run"] == true)
+                .filter_map(|entry| entry["name"].as_str())
+                .map(str::to_owned)
+                .collect(),
             requirements: strings(requirements, "entries", "id"),
         };
         Ok(workspace)

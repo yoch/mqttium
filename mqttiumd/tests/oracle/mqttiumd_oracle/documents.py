@@ -144,6 +144,11 @@ class Contracts:
             "assertions": {
                 entry["name"] for entry in loaded["mqttiumd.assertion-catalog"]["assertions"]
             },
+            "every_run": [
+                entry["name"]
+                for entry in loaded["mqttiumd.assertion-catalog"]["assertions"]
+                if entry["every_run"]
+            ],
             "requirements": {
                 entry["id"] for entry in loaded["mqttiumd.requirement-register"]["entries"]
             },

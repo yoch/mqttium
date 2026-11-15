@@ -1190,9 +1190,13 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
         }
     };
 
-    // Every assertion of the scenario is mandatory for a run of it: none
-    // may be missing, added, or declared out of scope.
-    let required: BTreeSet<&str> = names(&scenario, "assertions").into_iter().collect();
+    // Every assertion of the scenario is mandatory for a run of it, and so
+    // is every assertion that every run owes: none may be missing, added,
+    // or declared out of scope.
+    let required: BTreeSet<&str> = names(&scenario, "assertions")
+        .into_iter()
+        .chain(workspace.catalogs().every_run.iter().map(String::as_str))
+        .collect();
     let reported: BTreeSet<&str> = items(document, "assertions")
         .iter()
         .map(|assertion| text(assertion, "name"))

@@ -73,7 +73,10 @@ class QualifyingResult(Scratch):
             "exit_code": 0,
             "scope": "P1-02, built by the tests of the oracle",
             "reasons": [],
-            "assertions": [{"name": name, "status": "PASS"} for name in scenario["assertions"]],
+            "assertions": [
+                {"name": name, "status": "PASS"}
+                for name in [*scenario["assertions"], "broker_inputs_have_provenance"]
+            ],
             "faults": [{"id": "lost_admission_result", "expected_hits": "1", "hits": "1"}],
             "scenario": self.cite(SCENARIO),
             "manifest": self.cite(self.write("manifest.json", manifest)),

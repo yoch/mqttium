@@ -203,6 +203,7 @@
               "required": [
                 "name",
                 "meaning",
+                "every_run",
                 "requirements"
               ],
               "properties": {
@@ -211,6 +212,10 @@
                 },
                 "meaning": {
                   "$ref": "primitives.schema.json#/$defs/text"
+                },
+                "every_run": {
+                  "description": "Whether every run owes the assertion, or only a run of a scenario that lists it. A qualifying result reports the assertions of its scenario and those every run owes.",
+                  "type": "boolean"
                 },
                 "requirements": {
                   "type": "array",

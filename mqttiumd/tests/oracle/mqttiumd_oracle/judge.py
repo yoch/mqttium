@@ -641,7 +641,10 @@ def judge(run: Run) -> dict:
     trace = run.trace
     required = run.scenario.get("perimeter", "full")
     statuses = {}
-    for name in run.scenario["assertions"]:
+    # The assertions of the scenario, then those every run owes.
+    owed = list(run.scenario["assertions"])
+    owed += [name for name in run.contracts.catalogs["every_run"] if name not in owed]
+    for name in owed:
         decide = ASSERTIONS.get(name)
         if decide is None:
             statuses[name] = Status(INCONCLUSIVE, ["the oracle does not decide this assertion"])

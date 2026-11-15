@@ -657,12 +657,13 @@ def _run_result(contracts, document, out):
         return
 
     reported = {assertion["name"] for assertion in document["assertions"]}
-    if set(scenario["assertions"]) != reported:
+    if set(scenario["assertions"]) | set(contracts.catalogs["every_run"]) != reported:
         out.append(
             Diagnostic(
                 "result-incomplete",
                 "/assertions",
-                "the result does not report exactly the assertions of its scenario",
+                "the result does not report exactly the assertions of its scenario "
+                "and those every run owes",
             )
         )
     for index, status in enumerate(statuses):
