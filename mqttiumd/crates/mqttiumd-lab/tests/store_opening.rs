@@ -3,17 +3,19 @@
 //! the writer, the reply, `EpochOpening::observe`, then `hand_over`. No
 //! test here builds a grant, or a committed reply, by hand.
 
-use mqttiumd_contract::command::{EpochLedger, EpochPhase, OpenEpoch, OpeningTicket};
+use mqttiumd_contract::command::{
+    EpochLedger, EpochPhase, OpenEpoch, OpeningAttempt, OpeningRejection, OpeningTicket,
+};
 use mqttiumd_contract::effects::RecoveredFact;
 use mqttiumd_contract::ids::{RunEpoch, StoreIncarnation};
 use mqttiumd_contract::outcome::{
-    EpochGrant, EpochOpened, EpochOpening, HandOverRefused, Observed, OpeningOutcome,
-    OpeningRejection, OpeningReply, OpeningStage, RecoveredEpochCheck, RejectReason, ReplyRefused,
-    StoreOutcome, StoreReply, SubmitRefused,
+    EpochGrant, EpochOpened, EpochOpening, HandOverRefused, Observed, OpeningOutcome, OpeningReply,
+    OpeningStage, RecoveredEpochCheck, RejectReason, ReplyRefused, StoreOutcome, StoreReply,
+    SubmitRefused,
 };
 use mqttiumd_lab::store::adapter::{
     AdapterLimits, Answer, Delivery, FaultAction, FaultPoint, FaultSpec, Performed, SimStore,
-    StoreAction, StoreEvent, WorkId, WorkKind,
+    StoreAction, StoreEvent, WorkId, WorkKind, startup_nonce,
 };
 use mqttiumd_lab::store::conformance::{INCARNATION, World, fixture_limits};
 use mqttiumd_lab::store::durable::{Durability, DurableStore, Limits, MemoryStore};
@@ -40,9 +42,12 @@ fn ledger(sim: &Sim) -> EpochLedger {
     sim.store().ledger()
 }
 
-/// Start-up verified the data set it opened: the opening is for it.
+/// The seed of the run, from which each start-up draws its nonce.
+const SEED: u64 = 7;
+
+/// The opening of the first start-up of the run on this store.
 fn opening_for(sim: &Sim) -> EpochOpening {
-    EpochOpening::new(ledger(sim).incarnation())
+    sim.begin_opening(startup_nonce(SEED, 0))
 }
 
 fn opening_fault(point: FaultPoint, action: FaultAction) -> FaultSpec {
@@ -62,7 +67,7 @@ fn submit(sim: &mut Sim, opening: &mut EpochOpening) -> (WorkId, OpenEpoch) {
         .submit(ledger(sim).last_opened())
         .expect("an attempt may start");
     sim.submit_opening(command).expect("room");
-    (WorkId::Opening(command.ticket), command)
+    (WorkId::Opening(command.attempt), command)
 }
 
 fn enter(sim: &mut Sim, id: WorkId) {
@@ -120,8 +125,19 @@ fn a_committed_opening_hands_over_one_grant_for_the_epoch_the_store_opened() {
     assert_eq!(ledger(&sim).open_epoch(), Some(grant.epoch()));
     assert_eq!(opening.hand_over(), Err(HandOverRefused::AlreadyHandedOver));
 
-    let id = WorkId::Opening(OpeningTicket::new(1));
-    let answer = Answer::Opening(OpeningOutcome::Committed(grant.opened()));
+    let attempt = OpeningAttempt {
+        startup: startup_nonce(SEED, 0),
+        ticket: OpeningTicket::new(1),
+    };
+    let id = WorkId::Opening(attempt);
+    let answer = Answer::Opening {
+        command: OpenEpoch {
+            attempt,
+            incarnation: INCARNATION,
+            after: RunEpoch::new(0),
+        },
+        outcome: OpeningOutcome::Committed(grant.opened()),
+    };
     assert_eq!(
         sim.take_events(),
         [
@@ -264,7 +280,7 @@ fn a_held_older_attempt_cannot_close_the_epoch_of_a_grant_handed_over() {
     assert_eq!(
         opening.observe(late),
         Err(ReplyRefused::Uncorrelated {
-            ticket: late.ticket
+            attempt: late.command.attempt
         })
     );
     assert_eq!(opening.stage(), OpeningStage::HandedOver(grant.opened()));
@@ -316,7 +332,7 @@ fn an_older_attempt_applied_first_makes_the_newer_one_read_again() {
             assert_eq!(
                 opening.observe(late),
                 Err(ReplyRefused::Uncorrelated {
-                    ticket: late.ticket
+                    attempt: late.command.attempt
                 })
             );
             assert!(opening.hand_over().is_err());
@@ -370,7 +386,7 @@ fn the_late_reply_of_an_abandoned_attempt_gives_no_authority() {
     assert_eq!(
         opening.observe(late),
         Err(ReplyRefused::Uncorrelated {
-            ticket: late.ticket
+            attempt: late.command.attempt
         })
     );
     assert!(opening.hand_over().is_err());
@@ -415,7 +431,7 @@ fn an_opening_for_another_data_set_is_refused_by_the_store() {
     let mut sim = started();
     let before = sim.store().snapshot();
     let foreign = OpeningRejection::ForeignIncarnation;
-    let mut elsewhere = EpochOpening::new(StoreIncarnation::new(2));
+    let mut elsewhere = EpochOpening::new(StoreIncarnation::new(2), startup_nonce(SEED, 0));
     let id = attempt(&mut sim, &mut elsewhere);
     let refused = reply(&mut sim, id);
     assert_eq!(refused.outcome, OpeningOutcome::RejectedCertain(foreign));
@@ -436,7 +452,7 @@ fn an_exhausted_epoch_counter_refuses_the_opening_for_good() {
     // No sequence of commands reaches the last epoch: this state is
     // written directly, for this test only.
     let mut durable = memory(INCARNATION, fixture_limits()).snapshot();
-    durable.ledger = EpochLedger::from_durable(INCARNATION, RunEpoch::new(u64::MAX - 1));
+    durable.ledger = EpochLedger::from_durable(INCARNATION, RunEpoch::new(u64::MAX - 1), None);
     let mut sim = SimStore::new(MemoryStore::reopen(durable), LIMITS);
 
     let mut last = opening_for(&sim);
@@ -482,7 +498,7 @@ fn after_a_crash_a_new_epoch_is_opened_and_the_older_one_is_not_entered_again() 
     let mut sim = SimStore::new(MemoryStore::reopen(crashed.store.snapshot()), LIMITS);
     assert_eq!(sim.store().snapshot(), durable);
 
-    let mut opening = opening_for(&sim);
+    let mut opening = sim.begin_opening(startup_nonce(SEED, 1));
     let grant = open_and_hand_over(&mut sim, &mut opening);
     assert!(grant.epoch() > first_epoch);
     assert_eq!(ledger(&sim).phase_of(first_epoch), EpochPhase::Closed);
@@ -524,4 +540,141 @@ fn after_a_crash_a_new_epoch_is_opened_and_the_older_one_is_not_entered_again() 
     );
     assert!(!late.committed_now);
     assert_eq!(sim.store().snapshot(), before);
+}
+
+/// The ordinary path of DEM-012, with the scenario of the review: a
+/// process dies while its first opening is on its way; its successor
+/// starts its tickets again and reads the same value. The command of
+/// the dead process reaches the writer before or after the successor's.
+/// The successor is answered for its own command only, is never
+/// faulted, and ends with one grant for an epoch that is open.
+#[test]
+fn a_restart_is_not_confused_with_the_process_that_died() {
+    for dead_command_first in [true, false] {
+        let mut first_process = started();
+        let mut dead_opening = first_process.begin_opening(startup_nonce(SEED, 0));
+        let (_, dead_command) = submit(&mut first_process, &mut dead_opening);
+        // The process dies; its command is still on its way to the
+        // writer, which the bench delivers by hand below.
+        let crashed = first_process.crash();
+
+        let mut sim = SimStore::new(MemoryStore::reopen(crashed.store.snapshot()), LIMITS);
+        let mut opening = sim.begin_opening(startup_nonce(SEED, 1));
+        let (id, command) = submit(&mut sim, &mut opening);
+        assert_eq!(command.attempt.ticket, dead_command.attempt.ticket);
+        assert_eq!(command.after, dead_command.after);
+        assert_ne!(command, dead_command);
+
+        let stray = |outcome| OpeningReply {
+            command: dead_command,
+            outcome,
+        };
+        let refused = Err(ReplyRefused::Uncorrelated {
+            attempt: dead_command.attempt,
+        });
+        if dead_command_first {
+            assert_eq!(sim.store_mut().open_epoch(&dead_command), committed(1));
+            enter(&mut sim, id);
+            let rejected = reply(&mut sim, id);
+            assert_eq!(rejected.outcome, MOVED);
+            opening.observe(rejected).expect("its own reply");
+            // The reply to the dead process's command, should it ever
+            // reach this one, answers nothing here.
+            assert_eq!(opening.observe(stray(committed(1))), refused);
+            assert!(opening.hand_over().is_err());
+            // It reads again and opens after the epoch nobody holds.
+            let grant = open_and_hand_over(&mut sim, &mut opening);
+            assert_eq!(grant.epoch(), RunEpoch::new(2));
+        } else {
+            enter(&mut sim, id);
+            let own = reply(&mut sim, id);
+            opening.observe(own).expect("its own reply");
+            let grant = opening.hand_over().expect("committed");
+            assert_eq!(grant.epoch(), RunEpoch::new(1));
+            let before = sim.store().snapshot();
+            assert_eq!(sim.store_mut().open_epoch(&dead_command), MOVED);
+            assert_eq!(sim.store().snapshot(), before);
+            assert_eq!(opening.observe(stray(MOVED)), refused);
+        }
+        let open = ledger(&sim).open_epoch().expect("an epoch is open");
+        assert_eq!(
+            opening.stage(),
+            OpeningStage::HandedOver(EpochOpened {
+                incarnation: INCARNATION,
+                epoch: open,
+            }),
+            "the successor does not hold the open epoch"
+        );
+    }
+}
+
+/// A command the writer receives twice opens one epoch, and both
+/// deliveries answer the same commit: the opening is never told that
+/// its own committed attempt was rejected.
+#[test]
+fn an_opening_delivered_twice_to_the_writer_is_one_opening() {
+    let mut sim = started();
+    let mut opening = opening_for(&sim);
+    let (id, command) = submit(&mut sim, &mut opening);
+    enter(&mut sim, id);
+    let before = sim.store().snapshot();
+    // The second delivery, by hand: the adapter has no fault for it.
+    let again = sim.store_mut().open_epoch(&command);
+    assert_eq!(again, committed(1));
+    assert_eq!(sim.store().snapshot(), before);
+
+    let first = reply(&mut sim, id);
+    assert_eq!(first.outcome, again);
+    opening.observe(first).expect("the answer");
+    let grant = opening.hand_over().expect("committed");
+    assert_eq!(
+        opening.observe(OpeningReply {
+            command,
+            outcome: again
+        }),
+        Ok(Observed::Unchanged)
+    );
+    assert_eq!(opening.stage(), OpeningStage::HandedOver(grant.opened()));
+}
+
+/// An attempt held past a later opening is superseded: the store does
+/// not say that it opened nothing, and the opening gets no grant from
+/// it, not even from the commit it might have had.
+#[test]
+fn an_attempt_held_past_a_later_opening_is_superseded() {
+    let mut sim = started();
+    sim.arm(opening_fault(
+        FaultPoint::CommandTransit,
+        FaultAction::HoldCommand,
+    ))
+    .expect("allowed");
+    let mut opening = opening_for(&sim);
+    let (held, _) = submit(&mut sim, &mut opening);
+
+    // Two other start-ups open epochs 1 and 2 meanwhile.
+    for restart in [1, 2] {
+        let mut other = sim.begin_opening(startup_nonce(SEED, restart));
+        let grant = open_and_hand_over(&mut sim, &mut other);
+        assert_eq!(grant.epoch(), RunEpoch::new(restart));
+    }
+    assert_eq!(
+        sim.perform(StoreAction::ReleaseCommand(held)),
+        Ok(Performed::Released)
+    );
+    enter(&mut sim, held);
+    let late = reply(&mut sim, held);
+    assert_eq!(late.outcome, OpeningOutcome::Superseded);
+    assert_eq!(
+        opening.observe(late),
+        Ok(Observed::Advanced(OpeningStage::Superseded))
+    );
+    assert!(opening.hand_over().is_err());
+    assert_eq!(ledger(&sim).open_epoch(), Some(RunEpoch::new(2)));
+    // The value it read is stale for good: it must read again.
+    assert_eq!(
+        opening.submit(RunEpoch::new(0)),
+        Err(SubmitRefused::ConditionUnchanged)
+    );
+    let grant = open_and_hand_over(&mut sim, &mut opening);
+    assert_eq!(grant.epoch(), RunEpoch::new(3));
 }

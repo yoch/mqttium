@@ -16,8 +16,8 @@ use mqttiumd_contract::capacity::{
     BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References, Resource,
 };
 use mqttiumd_contract::command::{
-    AdmitPublication, Command, DeliveryCause, EpochLedger, EpochPhase, OpenEpoch, Recipe,
-    ReleaseInbound,
+    AdmitPublication, Command, DeliveryCause, EpochLedger, EpochPhase, LedgerOpening, OpenEpoch,
+    Recipe, ReleaseInbound,
 };
 use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
 use mqttiumd_contract::ids::{
@@ -25,8 +25,7 @@ use mqttiumd_contract::ids::{
     RunEpoch, SessionId, StoreIncarnation,
 };
 use mqttiumd_contract::outcome::{
-    CommitFacts, EpochOpened, Knowledge, OpeningOutcome, RejectReason, StoreOutcome, StoreReply,
-    StoreViolation,
+    CommitFacts, Knowledge, OpeningOutcome, RejectReason, StoreOutcome, StoreReply, StoreViolation,
 };
 use mqttiumd_contract::packet::{Qos, SharedBytes};
 
@@ -260,8 +259,9 @@ pub trait DurableStore {
     fn ledger(&self) -> EpochLedger;
 
     /// Opens the epoch after the one the command expects and closes
-    /// every older one, atomically, or rejects the command for certain
-    /// when the last opened epoch is no longer the one it expects.
+    /// every older one, atomically, or changes nothing. The command
+    /// that opened the last epoch, presented again, gets the same
+    /// commit; see `EpochLedger::open` for every other case.
     fn open_epoch(&mut self, command: &OpenEpoch) -> OpeningOutcome;
 
     /// Applies a frozen command.
@@ -852,21 +852,30 @@ impl DurableStore for MemoryStore {
     }
 
     fn open_epoch(&mut self, command: &OpenEpoch) -> OpeningOutcome {
-        // The condition and the transition are the contract's: the
-        // same function decides for every store.
-        let ledger = match self.committed.ledger.open(command) {
-            Ok(ledger) => ledger,
-            Err(reason) => return OpeningOutcome::RejectedCertain(reason),
-        };
-        let mut staged = self.committed.clone();
-        staged.ledger = ledger;
-        if !self.commit(staged) {
-            return OpeningOutcome::Unknown;
+        // The decision is the contract's: the same function decides for
+        // every store. Only an opening writes; the command that opened
+        // the last epoch, presented again, reads its own result.
+        let decision = self.committed.ledger.open(command);
+        if let LedgerOpening::Opens { ledger, .. } = decision {
+            let mut staged = self.committed.clone();
+            staged.ledger = ledger;
+            if !self.commit(staged) {
+                return OpeningOutcome::Unknown;
+            }
         }
-        OpeningOutcome::Committed(EpochOpened {
-            incarnation: ledger.incarnation(),
-            epoch: ledger.last_opened(),
-        })
+        // Skeleton: whatever does not open is called a moved
+        // predecessor, as before the second review.
+        match decision {
+            LedgerOpening::Opens { .. } => {
+                OpeningOutcome::of(self.committed.ledger.incarnation(), decision)
+            }
+            LedgerOpening::Rejected(reason) => OpeningOutcome::RejectedCertain(reason),
+            LedgerOpening::AlreadyOpened { .. }
+            | LedgerOpening::Superseded
+            | LedgerOpening::Undecided => OpeningOutcome::RejectedCertain(
+                mqttiumd_contract::command::OpeningRejection::PredecessorMoved,
+            ),
+        }
     }
 
     fn apply(&mut self, command: &Command) -> Applied {

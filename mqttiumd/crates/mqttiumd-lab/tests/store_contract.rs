@@ -17,8 +17,18 @@ fn opening_opens_the_next_epoch_and_closes_the_older_ones() {
 }
 
 #[test]
-fn an_opening_that_expected_another_epoch_is_rejected() {
-    conformance::an_opening_that_expected_another_epoch_is_rejected(&memory);
+fn an_opening_that_expected_another_epoch_opens_nothing() {
+    conformance::an_opening_that_expected_another_epoch_opens_nothing(&memory);
+}
+
+#[test]
+fn an_opening_delivered_again_returns_its_commit() {
+    conformance::an_opening_delivered_again_returns_its_commit(&memory);
+}
+
+#[test]
+fn the_first_command_of_a_restart_is_not_its_predecessors() {
+    conformance::the_first_command_of_a_restart_is_not_its_predecessors(&memory);
 }
 
 #[test]

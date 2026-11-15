@@ -25,12 +25,12 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use mqttiumd_contract::command::{Command, OpenEpoch, OpeningTicket, Recipe};
+use mqttiumd_contract::command::{Command, OpenEpoch, OpeningAttempt, Recipe, StartupNonce};
 use mqttiumd_contract::effects::{
     Effect, EffectSink, Input, OwnedEffect, RecoveredFact, SubmitBlock, SubmitResult,
 };
 use mqttiumd_contract::ids::{EffectId, InboundPacketId, OperationId, SessionId};
-use mqttiumd_contract::outcome::{OpeningOutcome, OpeningReply, StoreReply};
+use mqttiumd_contract::outcome::{EpochOpening, OpeningOutcome, OpeningReply, StoreReply};
 
 use super::durable::{DurableStore, RecoveryCursor, RecoveryPage, RecoveryRefused};
 
@@ -126,11 +126,23 @@ impl WorkKind {
 }
 
 /// The stable identity of one piece of work: the effect that carried
-/// it, or the ticket of an opening.
+/// it, or the attempt of an opening.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum WorkId {
     Effect(EffectId),
-    Opening(OpeningTicket),
+    Opening(OpeningAttempt),
+}
+
+/// The nonce of one start-up of the process under test, drawn from the
+/// seed of the run and the number of restarts before it. The bench is
+/// the trusted code that draws it: two start-ups of one run never share
+/// a nonce, and the same run draws the same ones again.
+#[must_use]
+pub fn startup_nonce(seed: u64, restart: u64) -> StartupNonce {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&seed.to_be_bytes());
+    bytes[8..].copy_from_slice(&restart.to_be_bytes());
+    StartupNonce::new(bytes)
 }
 
 /// What the store answered to one piece of work.
@@ -140,7 +152,10 @@ pub enum Answer {
         operation: OperationId,
         reply: StoreReply,
     },
-    Opening(OpeningOutcome),
+    Opening {
+        command: OpenEpoch,
+        outcome: OpeningOutcome,
+    },
 }
 
 /// Which passages a fault watches. A passage that every set field
@@ -354,7 +369,7 @@ fn describe(work: &Work) -> (WorkKind, Option<OperationId>, Source) {
 fn operation_of(answer: Answer) -> Option<OperationId> {
     match answer {
         Answer::Operation { operation, .. } => Some(operation),
-        Answer::Opening(_) => None,
+        Answer::Opening { .. } => None,
     }
 }
 
@@ -507,11 +522,20 @@ impl<S: DurableStore> SimStore<S> {
         self.transit.push_back(Transit { id, work, held });
     }
 
+    /// The opening of this start-up: for the data set behind the
+    /// adapter, which start-up verified by reading its ledger, and with
+    /// the nonce this start-up drew.
+    #[must_use]
+    pub fn begin_opening(&self, startup: StartupNonce) -> EpochOpening {
+        EpochOpening::new(self.store.ledger().incarnation(), startup)
+    }
+
     /// Submits the opening of an epoch. It travels like a command: in
-    /// transit, through the writer, then as a ready result.
+    /// transit, through the writer, then as a ready result, which
+    /// carries the whole command back.
     pub fn submit_opening(&mut self, command: OpenEpoch) -> Result<(), SubmitBlock> {
         self.room()?;
-        let id = WorkId::Opening(command.ticket);
+        let id = WorkId::Opening(command.attempt);
         if self.awaited.contains_key(&id) {
             return Err(SubmitBlock::Closed);
         }
@@ -633,7 +657,10 @@ impl<S: DurableStore> SimStore<S> {
             Work::Open(command) => {
                 let outcome = self.store.open_epoch(command);
                 (
-                    Answer::Opening(outcome),
+                    Answer::Opening {
+                        command: *command,
+                        outcome,
+                    },
                     matches!(outcome, OpeningOutcome::Committed(_)),
                 )
             }
@@ -699,10 +726,12 @@ impl<S: DurableStore> SimStore<S> {
                     reply,
                 }))
             }
-            (WorkId::Opening(ticket), Answer::Opening(outcome)) => {
-                Some(Delivery::Opening(OpeningReply { ticket, outcome }))
+            (WorkId::Opening(attempt), Answer::Opening { command, outcome })
+                if command.attempt == attempt =>
+            {
+                Some(Delivery::Opening(OpeningReply { command, outcome }))
             }
-            (WorkId::Effect(_), Answer::Opening(_))
+            (WorkId::Effect(_) | WorkId::Opening(_), Answer::Opening { .. })
             | (WorkId::Opening(_), Answer::Operation { .. }) => None,
         };
         let (Some(delivery), true) = (delivery, self.awaited.get(&id) == Some(&operation)) else {
