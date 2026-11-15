@@ -520,24 +520,6 @@ pub fn outcome_fields(reply: StoreReply) -> OutcomeFields {
     }
 }
 
-/// The `outcome` and the `reject_reason` of a store result, `None` for a
-/// violation. Kept while the bench moves to `outcome_fields`, which also
-/// writes a violation; the two agree on every other outcome.
-#[must_use]
-pub fn store_outcome(reply: StoreReply) -> Option<(&'static str, Option<&'static str>)> {
-    match reply {
-        StoreReply::Outcome(StoreOutcome::Committed(_)) => Some(("Committed", None)),
-        StoreReply::Outcome(StoreOutcome::RejectedCertain(rejected)) => {
-            Some(("RejectedCertain", Some(reason(rejected))))
-        }
-        StoreReply::Outcome(StoreOutcome::PendingOrUnknown) => Some(("PendingOrUnknown", None)),
-        StoreReply::Outcome(StoreOutcome::RetiredOutcomeUnavailable) => {
-            Some(("RetiredOutcomeUnavailable", None))
-        }
-        StoreReply::Violation(_) => None,
-    }
-}
-
 impl<'a> TraceWriter<'a> {
     /// A writer whose first record is numbered `first_record`, for the
     /// process incarnation `origin_incarnation` of run `run_id`.
