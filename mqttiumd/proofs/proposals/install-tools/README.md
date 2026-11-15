@@ -41,7 +41,7 @@ The expected lines were read from the pinned tools as installed here:
 `test-install-tools.sh [installer]` installs nothing real: it runs the
 installer for cargo-fuzz against fake tools on a private `PATH`.
 
-Against the current installer it fails five checks (the three forms of a
-wrongly recognised tool, the shadowed installation, the installation that
+Against the current installer it fails six checks (the three forms of a
+wrongly recognised tool, the shadowed installation twice, the installation that
 provides nothing); against the corrected one it passes all twelve. Test
 first: commit the test while it fails, then the correction.
