@@ -24,19 +24,10 @@ if [[ ! -f $campaign/source.tar ]]; then
     exit 2
 fi
 digest=$(sha256sum "$campaign/source.tar" | cut -c1-64)
-# The directory is named by the archive, as the run named it: its path
-# reaches the binary in spite of the remapped prefix, so a check in
-# another directory builds another binary. Two checks of one archive
-# therefore share it, and take turns: the lock is held until this script
-# ends, and released by the kernel if it is killed.
-dir="${TMPDIR:-/tmp}/mqttiumd-source-${digest:0:16}"
-exec 9> "$dir.lock"
-if ! flock 9; then
-    echo "no lock on $dir.lock: two checks of one archive could not be told apart" >&2
-    exit 2
-fi
-rm -rf "${dir:?}"
-mkdir -p "$dir"
+# A directory of this check alone, whose name the run never saw: the
+# binary must not depend on where its source was unpacked, and two checks
+# of one archive, run side by side, share nothing.
+dir=$(mktemp -d "${TMPDIR:-/tmp}/mqttiumd-check-${digest:0:16}.XXXXXX")
 trap 'rm -rf "${dir:?}"' EXIT
 tar -x -f "$campaign/source.tar" -C "$dir"
 # The build is the one the run recorded, whatever the caller exported: it

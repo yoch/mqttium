@@ -151,6 +151,16 @@ contract record of the kill (`BrokerKilled`) is asked of lot L3; until it
 exists, the trace carries none. A child that stops without a crash exits
 on its own with a status of success.
 
+Two controls of `tests/mutants/loop/`, played on SQLite with
+`--process child`, show what this evidence does when it is wrong. `n1`:
+the child never relays its `StoreCommitStable`; the next record of
+`store-evidence` arrives out of the local order of its origin, the
+collector of the supervisor refuses it, the run stops before the kill
+and the trace is cut, so the oracle concludes nothing (INCONCLUSIVE,
+`trace_complete`). `n2`: the child restarted after the kill opens a copy
+of the data set taken before the commit; the exchange is admitted twice
+and the epoch opened twice (FAIL, `one_admission_per_observed_inbound_exchange`).
+
 ## Causal parents of the supervisor and the peers
 
 > The supervisor names what it had read when it acted: the last record

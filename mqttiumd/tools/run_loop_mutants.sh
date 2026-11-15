@@ -47,6 +47,7 @@ for id in $ids; do
     fi
     patch="$here/tests/mutants/loop/$(field patch)"
     scenario=$(field scenario)
+    process=$(field process)
     tree="$work/tree-$id"
     git -C "$repository" worktree add -q --detach "$tree" HEAD
     if ! git -C "$tree" apply "$patch"; then
@@ -56,7 +57,8 @@ for id in $ids; do
     fi
     campaign="$work/campaign-$id"
     if ! (cd "$tree/mqttiumd" && CARGO_TARGET_DIR="$work/target" cargo run -q -p mqttiumd-lab --locked -- \
-        run --contracts contracts/v1 --scenario "$scenario" --out "$campaign" --backend "$backend" >/dev/null); then
+        run --contracts contracts/v1 --scenario "$scenario" --out "$campaign" --backend "$backend" \
+        ${process:+--process "$process"} >/dev/null); then
         echo "$id: no campaign was written"
         failures=$((failures + 1))
         continue
