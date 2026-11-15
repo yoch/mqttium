@@ -13,7 +13,7 @@
 //! the shape that makes this checkable: a pure plan, then an infallible
 //! application.
 
-use crate::capacity::{CapacityNeed, Resource, WakeCondition, WorkUnits};
+use crate::capacity::{CapacityNeed, WorkUnits};
 use crate::effects::{Input, ReserveRefused};
 use crate::ids::{LogicalOwnerId, OperationId, Revision};
 
@@ -131,25 +131,18 @@ impl StepOutcome {
         refusal: ReserveRefused,
         work_used: WorkUnits,
     ) -> Self {
-        // Interface only: every refusal is still a wait, as a transition
-        // would have had to write it before `Exhausted` existed.
-        let need = match refusal {
-            ReserveRefused::Need(need) => need,
-            ReserveRefused::LargerThanBox { .. } => CapacityNeed {
-                resource: Resource::EffectSlots,
-                amount: 1,
-                wake: WakeCondition::EffectAccepted,
+        match refusal {
+            ReserveRefused::Need(need) => Self::NeedCapacity {
+                input,
+                need,
+                work_used,
             },
-            ReserveRefused::TableExhausted => CapacityNeed {
-                resource: Resource::Reservations,
-                amount: 1,
-                wake: WakeCondition::ResourceReleased,
+            ReserveRefused::TableExhausted => Self::Exhausted {
+                input,
+                exhaustion: Exhaustion::ReservationTable,
+                work_used,
             },
-        };
-        Self::NeedCapacity {
-            input,
-            need,
-            work_used,
+            ReserveRefused::LargerThanBox { .. } => Self::Fatal(CoreFault::BoxTooSmall),
         }
     }
 }
@@ -157,6 +150,7 @@ impl StepOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capacity::{Resource, WakeCondition};
     use crate::ids::SessionId;
 
     fn input() -> Input {
