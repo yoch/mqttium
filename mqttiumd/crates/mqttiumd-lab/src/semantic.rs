@@ -23,6 +23,42 @@ use crate::workspace::{
     REGISTRY_CATALOG, RESULT_MANIFEST, RESULT_SCENARIO, SCENARIO_FIXTURE, Workspace,
 };
 
+/// The first occurrence a fault selects, and whether it selects every
+/// later one (record 0018). An occurrence that is not a 64-bit decimal is
+/// reported by the range check; here it compares as its text.
+fn occurrences(fault: &Value) -> (Option<u64>, &str, bool) {
+    let (key, every) = if fault.get("from_occurrence").is_some() {
+        ("from_occurrence", true)
+    } else {
+        ("occurrence", false)
+    };
+    let raw = text(fault, key);
+    (raw.parse().ok(), raw, every)
+}
+
+/// Whether two faults can select the same occurrence.
+fn same_occurrence(fault: &Value, earlier: &Value) -> bool {
+    let (first, first_raw, every) = occurrences(fault);
+    let (other, other_raw, every_other) = occurrences(earlier);
+    match (every, every_other, first, other) {
+        (true, true, _, _) => true,
+        (true, false, Some(first), Some(other)) => other >= first,
+        (false, true, Some(first), Some(other)) => first >= other,
+        (false, false, _, _) => first_raw == other_raw,
+        _ => true,
+    }
+}
+
+/// How often a fault of a scenario or a result is expected: exactly, or
+/// at least (record 0018).
+fn expectation(fault: &Value) -> (&'static str, &str) {
+    if fault.get("expected_hits_at_least").is_some() {
+        ("at_least", text(fault, "expected_hits_at_least"))
+    } else {
+        ("exactly", text(fault, "expected_hits"))
+    }
+}
+
 fn text<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
 }
@@ -262,11 +298,24 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
     let mut holds: BTreeMap<&str, (Option<&str>, Held, bool)> = BTreeMap::new();
     for (index, fault) in faults.iter().enumerate() {
         let base = format!("/faults/{index}");
-        u64_at(document, &format!("{base}/occurrence"), out);
-        let expected = u64_at(document, &format!("{base}/expected_hits"), out);
+        // Record 0018: a repeated fault is reached at least so often; a
+        // repeated delay delivers each answer by its lag, so it holds no
+        // one item a step could hand over.
+        let repeated = fault.get("from_occurrence").is_some();
+        let expected = if repeated {
+            u64_at(document, &format!("{base}/from_occurrence"), out);
+            u64_at(document, &format!("{base}/expected_hits_at_least"), out)
+        } else {
+            u64_at(document, &format!("{base}/occurrence"), out);
+            u64_at(document, &format!("{base}/expected_hits"), out)
+        };
         definitions.push((format!("{base}/id"), text(fault, "id")));
         fault_ids.insert(text(fault, "id"));
-        let item = held_item(text(fault, "action"));
+        let item = if repeated {
+            None
+        } else {
+            held_item(text(fault, "action"))
+        };
         holds
             .entry(text(fault, "id"))
             .or_insert((item, Held::NotYet, expected != Some(0)));
@@ -352,7 +401,7 @@ fn scenario(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>) 
                 && same("/match/command_kind")
                 && compatible(&bindings.0, &bindings.1)
                 && compatible(&effects.0, &effects.1)
-                && (same("/occurrence")
+                && (same_occurrence(fault, earlier)
                     || effects.0.is_some() != effects.1.is_some()
                     || bindings.0.is_some() != bindings.1.is_some())
             {
@@ -1159,11 +1208,21 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
         .map(|assertion| text(assertion, "status"))
         .collect();
     let mut injections_reached = true;
-    for index in 0..items(document, "faults").len() {
-        let expected = u64_at(document, &format!("/faults/{index}/expected_hits"), out);
+    for (index, fault) in items(document, "faults").iter().enumerate() {
         let hits = u64_at(document, &format!("/faults/{index}/hits"), out);
         // An injection that was not reached as announced proves nothing.
-        injections_reached &= expected.is_some() && expected == hits;
+        if fault.get("expected_hits_at_least").is_some() {
+            let least = u64_at(
+                document,
+                &format!("/faults/{index}/expected_hits_at_least"),
+                out,
+            );
+            injections_reached &=
+                matches!((least, hits), (Some(least), Some(hits)) if hits >= least);
+        } else {
+            let expected = u64_at(document, &format!("/faults/{index}/expected_hits"), out);
+            injections_reached &= expected.is_some() && expected == hits;
+        }
     }
     for index in 0..items(document, "artifacts").len() {
         u64_at(document, &format!("/artifacts/{index}/bytes"), out);
@@ -1268,13 +1327,13 @@ fn run_result(workspace: &Workspace, document: &Value, out: &mut Vec<Diagnostic>
             ));
         }
     }
-    let declared: BTreeMap<&str, &str> = items(&scenario, "faults")
+    let declared: BTreeMap<&str, (&str, &str)> = items(&scenario, "faults")
         .iter()
-        .map(|fault| (text(fault, "id"), text(fault, "expected_hits")))
+        .map(|fault| (text(fault, "id"), expectation(fault)))
         .collect();
-    let observed: BTreeMap<&str, &str> = items(document, "faults")
+    let observed: BTreeMap<&str, (&str, &str)> = items(document, "faults")
         .iter()
-        .map(|fault| (text(fault, "id"), text(fault, "expected_hits")))
+        .map(|fault| (text(fault, "id"), expectation(fault)))
         .collect();
     if declared != observed {
         out.push(Diagnostic::new(
@@ -1637,7 +1696,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
 /// Names of the members that hold a 64-bit decimal string, in a trace
 /// payload or a snapshot. A test walks the schemas and fails when one of
 /// their 64-bit members is missing here.
-const COMPONENTS: [&str; 38] = [
+const COMPONENTS: [&str; 40] = [
     "incarnation",
     "epoch",
     "owner",
@@ -1648,6 +1707,8 @@ const COMPONENTS: [&str; 38] = [
     "bytes_confirmed",
     "bytes_total",
     "occurrence",
+    "from_occurrence",
+    "expected_hits_at_least",
     "run_epoch",
     "time_value",
     "connection_generation",

@@ -31,6 +31,7 @@ import traceback
 
 from . import judge, results
 from .documents import Contracts, ContractsUnreadable, contained
+from .semantic import reached as reached_by
 from .semantic import verdict_of
 from .strict import Refused
 
@@ -81,7 +82,7 @@ def _main(arguments) -> int:
         print(f"error: {error}", file=sys.stderr)
         return results.EXIT_CODES["INCONCLUSIVE"]
     statuses, faults = results._observed(run)
-    reached = all(fault["hits"] == fault["expected_hits"] for fault in faults)
+    reached = all(reached_by(fault, fault["hits"]) for fault in faults)
     verdict = verdict_of([status.status for status in statuses.values()], reached)
     report = {
         "contracts": f"sha256:{contracts.digest}",

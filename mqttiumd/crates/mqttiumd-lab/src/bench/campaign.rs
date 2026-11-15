@@ -538,10 +538,20 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
     let modified = keep_modifications(root, out)?;
 
     let out_text = out.display().to_string();
+    // The command names every parameter of the run, the store among them:
+    // executed as it stands, it plays this campaign and no other.
+    let rebuilt = request.built_from.is_some();
     let replay = format!(
-        "cargo run -p mqttiumd-lab --locked -- run --contracts {contracts} --scenario {scenario_path} --seed {} --run-id {run_id} --out <empty directory outside the work tree>",
-        request.seed
+        "cargo run -p mqttiumd-lab --locked -- run --contracts {contracts} --scenario {scenario_path} --seed {} --run-id {run_id} --backend {}{} --out <empty directory outside the work tree>",
+        request.seed,
+        request.backend,
+        if rebuilt { " --rebuild" } else { "" }
     );
+    let replay_scope = if rebuilt {
+        "the same scenario, seed, run and store, with a lab binary rebuilt from an archive of the checkout the command is run in: it is the binary of this campaign only on a clean checkout of the recorded revision, which tools/check_campaign_binary.sh checks against source.tar; the result of the replay is provisional until the oracle produces it, as tools/run_qualifying_campaign.sh does"
+    } else {
+        "the same scenario, seed, run and store, with the lab binary of the checkout the command is run in, whatever its revision: an ordinary replay, whose result is provisional; a qualifying run is rebuilt from its source (run --rebuild, tools/run_qualifying_campaign.sh)"
+    };
     let judge = format!(
         "PYTHONPATH=tests/oracle python -m mqttiumd_oracle --root {out_text} --contracts {contracts} judge --scenario {scenario_path} --trace trace.jsonl"
     );
@@ -712,7 +722,7 @@ fn execute_with<B: Backend>(request: &Request, mut backend: B) -> Result<Report,
         "records_refused": outcome.refused,
         "events_without_record": outcome.unwritten,
         "modified": modified,
-        "commands": {"replay": replay, "judge": judge},
+        "commands": {"replay": replay, "replay_scope": replay_scope, "judge": judge},
         "limits": [
             match request.built_from {
                 Some(_) => "the binary that ran was built by run --rebuild from source.tar of this campaign; that a build elsewhere gives the same digest is not established".to_owned(),

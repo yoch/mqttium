@@ -32,6 +32,7 @@ its source; a test fails when the register and the records drift apart.
 | [0015](0015-scenario-vocabulary-and-fence-point.md) | Proposed | Scenario steps of P1-02b, what a fault holds, the fence point; corrects step 3 of P1-02b in 0001 | L2, L3, L4, L5 |
 | [0016](0016-evidence-formats.md) | Proposed | Trace records of the input audit, what every run owes, the perimeter of a run, the store snapshot | L2, L3, L4, L7 |
 | [0017](0017-binary-tied-to-its-source.md) | Proposed | `artifact.built_from` in the run manifest: the binary of a run tied to the source it was rebuilt from; what a qualifying result establishes | L3, L4 |
+| [0018](0018-permanent-delay.md) | Proposed | Repeated faults, a lag on a repeated `delay_result`, a `DriveUntil` that fires deadlines: a permanent delay stated without fixing the delivery at which the core progresses; completes 0015 | L3, L4 |
 
 What each record leaves open is tracked in
 [`../reception/open-conditions.md`](../reception/open-conditions.md).

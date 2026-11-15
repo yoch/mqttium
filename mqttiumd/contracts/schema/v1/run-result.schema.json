@@ -91,7 +91,6 @@
         "additionalProperties": false,
         "required": [
           "id",
-          "expected_hits",
           "hits"
         ],
         "properties": {
@@ -101,10 +100,26 @@
           "expected_hits": {
             "$ref": "primitives.schema.json#/$defs/u64"
           },
+          "expected_hits_at_least": {
+            "description": "For a repeated fault: the minimum its scenario expects (record 0018).",
+            "$ref": "primitives.schema.json#/$defs/u64"
+          },
           "hits": {
             "$ref": "primitives.schema.json#/$defs/u64"
           }
-        }
+        },
+        "oneOf": [
+          {
+            "required": [
+              "expected_hits"
+            ]
+          },
+          {
+            "required": [
+              "expected_hits_at_least"
+            ]
+          }
+        ]
       },
       "maxItems": 64
     },
