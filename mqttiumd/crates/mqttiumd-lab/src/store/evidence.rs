@@ -25,7 +25,7 @@ use mqttiumd_contract::outcome::{
 };
 use mqttiumd_contract::packet::Qos;
 
-use super::adapter::{Answer, FaultId, StoreEvent, Uncorrelated, WorkId, WorkKind};
+use super::adapter::{Answer, FaultId, FaultPoint, StoreEvent, Uncorrelated, WorkId, WorkKind};
 use super::durable::{Decision, DurableState, ObligationPhase, SessionState};
 
 /// A 64-bit value, as every JSON format of the bench writes it.
@@ -449,6 +449,9 @@ pub struct TraceWriter<'a> {
     /// The record that took each piece of work in, for its parents, and
     /// the kind of command it was submitted as.
     submitted: BTreeMap<WorkId, (Origin, &'static str)>,
+    /// The actual stable write of work that reached CommitApplied. An
+    /// applied FaultHit must name that write across the two origins.
+    stable: BTreeMap<WorkId, Origin>,
     /// The record of each fault that was reached.
     hits: BTreeMap<FaultId, Origin>,
     /// The `StoreResultReady` of each piece of work, the parent of its
@@ -538,6 +541,7 @@ impl<'a> TraceWriter<'a> {
             fault_names,
             sequences: BTreeMap::new(),
             submitted: BTreeMap::new(),
+            stable: BTreeMap::new(),
             hits: BTreeMap::new(),
             ready: BTreeMap::new(),
             causes: Vec::new(),
@@ -715,18 +719,17 @@ impl<'a> TraceWriter<'a> {
                 // effects carry an operation.
                 let parents = self.parent_of(*id);
                 let (_, kind) = *self.submitted.get(id)?;
-                Some(
-                    self.record(
-                        "store-evidence",
-                        "StoreCommitStable",
-                        &parents,
-                        json!({
-                            "operation_id": operation_id(*operation),
-                            "command_kind": kind,
-                        }),
-                    )
-                    .0,
-                )
+                let (record, origin) = self.record(
+                    "store-evidence",
+                    "StoreCommitStable",
+                    &parents,
+                    json!({
+                        "operation_id": operation_id(*operation),
+                        "command_kind": kind,
+                    }),
+                );
+                self.stable.insert(*id, origin);
+                Some(record)
             }
             StoreEvent::FenceStable { id, operation } => {
                 let parents = self.parent_of(*id);
@@ -816,7 +819,12 @@ impl<'a> TraceWriter<'a> {
                 if let WorkId::Effect(effect) = id {
                     payload["effect_id"] = effect_id(*effect);
                 }
-                let parents = self.parent_of(*id);
+                let mut parents = self.parent_of(*id);
+                if *point == FaultPoint::CommitApplied
+                    && let Some(stable) = self.stable.get(id)
+                {
+                    parents.push(*stable);
+                }
                 let (record, origin) = self.record("fault-injector", "FaultHit", &parents, payload);
                 self.hits.insert(*fault, origin);
                 Some(record)
