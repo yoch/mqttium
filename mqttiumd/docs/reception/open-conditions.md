@@ -66,7 +66,6 @@ another lot's part.
 | - | - | - |
 | The proof that is received is on `release_if_current` as the product really executes it. Tooling may be prepared in parallel; a proof of a separate demonstration function does not receive the lot | L6, with L1 | Reception of L6 |
 | The proof runs in CI, reproducibly, on the production function, after a versioned preflight in which a true property passes and a false one fails on the real production dependency | L6 | Reception of L6 |
-| `tools/install-tools.sh`: `present()` ignores the exit code of the command it runs and accepts the pinned version as a substring of any output; nothing checks that the tool found is the one `PATH` selects | L6, through the integration owner | Start of L6 |
 
 ## Model M1: reception of L5, then L4
 
