@@ -26,10 +26,14 @@ class ReadFailures(unittest.TestCase):
     refusals = existing_results.Results.refusals
 
     def trace_with_failures(self, kind="DurableReadFailed", *, early_ack=False,
-                            incomplete=False, count=1, missing_core_record=False):
+                            incomplete=False, count=1, missing_core_record=False,
+                            partial_recovery=False):
         events = corpus.p1_02()
         if early_ack:
             corpus.early_pubrec(events)
+        if partial_recovery:
+            for label in ("recovery.read", "recovery.in"):
+                events[corpus.at(events, label)]["payload"]["last"] = False
         for index in range(count):
             payload = {
                 "code": "InvalidData" if kind == "DurableReadFailed" else "TruncatedFrame",
@@ -102,6 +106,10 @@ class ReadFailures(unittest.TestCase):
     def test_a_missing_core_record_does_not_establish_an_unjustified_ack(self):
         _, run = self.run_of(early_ack=True, incomplete=True, missing_core_record=True)
         self.assertEqual(judge.judge(run)[ACK].status, "INCONCLUSIVE")
+
+    def test_a_partial_recovery_does_not_authorize_a_positive_ack(self):
+        _, run = self.run_of(partial_recovery=True, incomplete=True)
+        self.assertEqual(judge.judge(run)[ACK].status, "FAIL")
 
     def test_produce_preserves_the_typed_failure_context(self):
         produced = self.produce(incomplete=True)
