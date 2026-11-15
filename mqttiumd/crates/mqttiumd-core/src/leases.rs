@@ -98,11 +98,9 @@ impl LeaseTable {
         })
     }
 
-    /// The slot `key` names when it holds exactly that lease.
+    /// The slot `key` names when it holds exactly that lease: the whole
+    /// key is compared, account and generation included.
     fn locate(&self, key: LeaseKey) -> Option<usize> {
-        if key.account != self.account.id() {
-            return None;
-        }
         let index = usize::try_from(key.slot).ok()?;
         let record = self.slots.as_slice().get(index)?.record.as_ref()?;
         (record.key() == key).then_some(index)
@@ -572,6 +570,28 @@ mod tests {
         );
     }
 
+    // Control mutation L7: an exhausted table is reported even when the
+    // account also lacks room, since no release ends the exhaustion.
+    #[test]
+    fn an_exhausted_table_is_reported_before_a_lack_of_credits() {
+        let mut table = table_at_last_generation(2);
+        let last = table.reserve(credits(60, 1)).expect("a generation is left");
+        let _other = table.reserve(credits(30, 1)).expect("a generation is left");
+        assert_eq!(table.release(last), Ok(ReleaseOutcome::Released));
+        // Thirty bytes are in use: fifty more would be a temporary lack on
+        // a table with a slot left.
+        let before = state(&table);
+        assert_eq!(
+            table.check(credits(80, 1)),
+            Err(LeaseRefused::TableExhausted)
+        );
+        assert_eq!(
+            table.reserve(credits(80, 1)),
+            Err(LeaseRefused::TableExhausted)
+        );
+        assert_eq!(state(&table), before);
+    }
+
     fn table_at_last_generation(max_leases: u32) -> LeaseTable {
         let mut table = table(100, 8, max_leases);
         for slot in table.slots.as_mut_slice() {
@@ -651,6 +671,27 @@ mod tests {
         }
         assert_eq!(table.restore(key(0, 4), credits(40, 1)), Ok(()));
         assert_invariant(&table);
+    }
+
+    // Control mutation L5: a spent slot used every generation, so no
+    // durable row can name one it did not use.
+    #[test]
+    fn a_spent_slot_is_never_restored() {
+        let mut table = table(100, 4, 1);
+        assert_eq!(table.restore(key(0, u64::MAX), credits(1, 1)), Ok(()));
+        assert_eq!(
+            table.release(key(0, u64::MAX)),
+            Ok(ReleaseOutcome::Released)
+        );
+        let before = state(&table);
+        for generation in [0, 7, u64::MAX] {
+            assert_eq!(
+                table.restore(key(0, generation), credits(1, 1)),
+                Err(RestoreRefused::GenerationReused),
+                "generation {generation}"
+            );
+            assert_eq!(state(&table), before);
+        }
     }
 
     #[test]
