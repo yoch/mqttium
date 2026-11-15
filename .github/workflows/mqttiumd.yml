@@ -51,8 +51,8 @@ jobs:
       - name: Kill points stay out of the product and hold in the store
         run: |
           tools/check_kill_points.sh
-          cargo clippy -p mqttiumd-store-sqlite --all-targets --features kill-points --locked -- -D warnings
-          cargo test -p mqttiumd-store-sqlite --features kill-points --locked
+          cargo clippy --workspace --all-targets --features mqttiumd-lab/kill-points --locked -- -D warnings
+          cargo test --workspace --features mqttiumd-lab/kill-points --locked
       - name: Validate the contracts and scenario P1-02
         run: >-
           cargo run --quiet --locked -p mqttiumd-lab -- validate
@@ -132,6 +132,12 @@ jobs:
         run: |
           tools/run_killed_campaign.sh tests/scenarios/p1/P1-02.json \
             "$RUNNER_TEMP/campaigns/killed"
+      - name: Transaction points qualify and reject contradictory observations
+        run: tools/run_transactional_reception.sh "$RUNNER_TEMP/campaigns/transactions"
+      - name: Bounded exploratory process kills
+        run: tools/run_k2a_sweep.sh "$RUNNER_TEMP/campaigns/k2a"
+      - name: Artificial WAL prefix images
+        run: tools/run_wal_prefix_experiment.sh "$RUNNER_TEMP/campaigns/wal-prefixes"
       - name: Keep the campaign directories
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
