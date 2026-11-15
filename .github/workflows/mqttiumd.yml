@@ -133,7 +133,9 @@ jobs:
           tools/run_killed_campaign.sh tests/scenarios/p1/P1-02.json \
             "$RUNNER_TEMP/campaigns/killed"
       - name: Transaction points qualify and reject contradictory observations
-        run: tools/run_transactional_reception.sh "$RUNNER_TEMP/campaigns/transactions"
+        run: |
+          python tools/test_transactional_negative.py
+          tools/run_transactional_reception.sh "$RUNNER_TEMP/campaigns/transactions"
       - name: Bounded exploratory process kills
         run: tools/run_k2a_sweep.sh "$RUNNER_TEMP/campaigns/k2a"
       - name: Artificial WAL prefix images

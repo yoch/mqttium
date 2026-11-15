@@ -17,6 +17,11 @@ import subprocess
 import sys
 
 
+def scenario_file(campaign: Path) -> str:
+    """The manifest cites the file; campaign.scenario is only its ID."""
+    return json.loads((campaign / "run-manifest.json").read_text())["scenario"]["path"]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("campaign", type=Path)
@@ -25,10 +30,7 @@ def main() -> None:
     if options.out.exists():
         parser.error("negative-control directory must not exist")
     shutil.copytree(options.campaign, options.out)
-    campaign = json.loads((options.out / "campaign.json").read_text())
-    scenario_path = campaign["scenario"]
-    if isinstance(scenario_path, dict):
-        scenario_path = scenario_path["path"]
+    scenario_path = scenario_file(options.out)
     scenario = json.loads((options.out / scenario_path).read_text())
     selected = next(
         fault for fault in scenario["faults"]
