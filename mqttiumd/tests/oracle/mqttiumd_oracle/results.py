@@ -8,6 +8,9 @@ refused. The verdict of a result is never taken from the result.
 
 from __future__ import annotations
 
+import hashlib
+import pathlib
+
 
 from . import judge
 from .semantic import verdict_of
@@ -117,18 +120,85 @@ def unmet(contracts, scenario_path, manifest_path):
     for member in ("oracle", "generators"):
         if member not in manifest:
             out.append(f"the manifest does not identify the {member}")
-    for entry in manifest.get("oracle", {}).get("files", []):
+    if "oracle" in manifest:
+        out += _oracle_unmet(manifest["oracle"]["files"])
+    if manifest["checkout"]["tree_state"] != "clean":
+        out += _kept_unmet(contracts, manifest["checkout"]["modified_paths"])
+    out.append(UNTIED_BINARY)
+    return out
+
+
+# The checkout directory the bench names files from (``mqttiumd``), and the
+# package of the oracle that runs now, below it.
+CHECKOUT = pathlib.Path(__file__).resolve().parents[3]
+PACKAGE = pathlib.Path(__file__).resolve().parent
+
+
+def _oracle_unmet(listed):
+    """Whether the files the manifest lists are those of the oracle that runs.
+
+    The oracle that judges is this one: its files are read from where it
+    runs, not from the campaign, and each module of its package must be
+    listed with its digest.
+    """
+    out = []
+    named = {entry["path"] for entry in listed}
+    for path in sorted(PACKAGE.glob("*.py")):
+        relative = path.relative_to(CHECKOUT).as_posix()
+        if relative not in named:
+            out.append(f"the manifest does not list the oracle file {relative}")
+    for entry in listed:
+        path = CHECKOUT / entry["path"]
         try:
-            sha256, _ = contracts.hash_evidence(entry["path"])
-        except Refused:
+            inside = path.resolve(strict=True).is_relative_to(CHECKOUT)
+            sha256 = hashlib.sha256(path.read_bytes()).hexdigest() if inside else None
+        except OSError:
             sha256 = None
         if sha256 != entry["sha256"]:
             out.append(
                 f"the oracle that judged is not the one the manifest identifies: {entry['path']}"
             )
-    if manifest["checkout"]["tree_state"] != "clean":
-        out.append("the tree was modified and its content is not kept in the run directory")
-    out.append(UNTIED_BINARY)
+    return out
+
+
+# A header of a diff is short; any longer line is the content of a diff.
+MAX_HEADER_BYTES = 8192
+
+
+def _headers(stream):
+    """The beginnings of the lines of ``stream``: a line longer than the bound is skipped whole."""
+    while line := stream.readline(MAX_HEADER_BYTES + 1):
+        if len(line) > MAX_HEADER_BYTES and not line.endswith(b"\n"):
+            while (rest := stream.readline(MAX_HEADER_BYTES)) and not rest.endswith(b"\n"):
+                pass
+            continue
+        yield line
+
+
+def _kept_unmet(contracts, modified):
+    """The modified paths the campaign does not keep, as the bench keeps them.
+
+    An untracked path is kept as ``modified/untracked/<path>``; a tracked
+    one, by its diff in ``modified/tracked.patch``.
+    """
+    diffed = set()
+    patch = contracts.root / "modified/tracked.patch"
+    if patch.is_file() and patch.resolve().is_relative_to(contracts.root):
+        # A patch has no bound, a binary one has long lines: it is read by
+        # bounded lines, and only the headers of its diffs are kept.
+        with patch.open("rb") as stream:
+            for line in _headers(stream):
+                if line.startswith(b"diff --git a/"):
+                    head = line.rstrip(b"\n")[len(b"diff --git a/") :]
+                    diffed.add(head.split(b" b/", 1)[0].decode("utf-8", "replace"))
+    out = []
+    for path in modified:
+        if path in diffed:
+            continue
+        try:
+            contracts.hash_evidence(f"modified/untracked/{path}")
+        except Refused:
+            out.append(f"the modified path {path} is not kept in the run directory")
     return out
 
 
