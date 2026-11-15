@@ -434,7 +434,13 @@ fn a_file_of_the_schema_directory_that_is_not_a_schema_is_refused() {
         }
     }
     assert!(Workspace::open(&base, Path::new("contracts/v1")).is_ok());
-    fs::write(base.join("contracts/schema/v1/notes.json"), b"{}\n").expect("write");
+    // The foreign file is itself a valid local schema: only its place
+    // refuses it.
+    fs::write(
+        base.join("contracts/schema/v1/notes.json"),
+        b"{\"$schema\": \"https://json-schema.org/draft/2020-12/schema\"}\n",
+    )
+    .expect("write");
     let refused = Workspace::open(&base, Path::new("contracts/v1"));
     let _ = fs::remove_dir_all(&base);
     let diagnostic = refused
