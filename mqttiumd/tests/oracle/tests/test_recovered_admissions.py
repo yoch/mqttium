@@ -66,6 +66,22 @@ class RecoveredAdmissions(unittest.TestCase):
 
                 self.assertEqual(self.recovered(edit).status, "INCONCLUSIVE")
 
+    def test_sqlite_recovery_requires_the_original_observed_publication_source(self):
+        for problem in ("no-submission", "no-publish-source"):
+            with self.subTest(problem=problem):
+                def edit(events):
+                    sqlite_lifecycle(events)
+                    if problem == "no-submission":
+                        del events[corpus.at(events, "admit.submitted")]
+                        for event in events:
+                            event["parents"] = [parent for parent in event["parents"] if parent != "admit.submitted"]
+                    else:
+                        events[corpus.at(events, "admit.submitted")]["parents"] = []
+
+                result = self.recovered(edit)
+                self.assertEqual(result.status, "INCONCLUSIVE")
+                self.assertTrue(any("PUBLISH source" in reason for reason in result.reasons))
+
     def test_an_admission_visible_only_at_recovery_counts(self):
         self.assertEqual(self.recovered().status, "PASS")
 
