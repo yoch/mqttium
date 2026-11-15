@@ -2128,6 +2128,70 @@ case(
     events=resolved_from_the_bench,
 )
 
+# --------------------------------- an admission found again at the recovery
+ADMISSION = "one_admission_per_observed_inbound_exchange"
+
+
+def durable_without_its_record(events):
+    # K2b of the kill inside a transaction: the commit of op_A is durable,
+    # the child is killed before the store writes StoreCommitStable or a
+    # result. After the restart the recovery shows the operation Committed
+    # and the exchange AwaitPubrel; the replay is answered from it.
+    # The fault that binds op_A is reached by the submission, as the fault
+    # at the commit point of K2b is.
+    for label in ("admit.stable", "admit.ready"):
+        del events[at(events, label)]
+    events[at(events, "hit.lost_admission_result")]["parents"] = ["admit.submitted"]
+
+
+case(
+    "admission-found-again-at-the-recovery",
+    "K2b: the commit is durable and the store wrote no StoreCommitStable before the kill; "
+    "the recovery shows it, and the replay is answered from it: one admission.",
+    events=durable_without_its_record,
+)
+
+
+def applied_then_killed(events):
+    # K3: the commit is stable, the child is killed before the result.
+    del events[at(events, "admit.ready")]
+    events[at(events, "hit.lost_admission_result")]["parents"] = ["admit.stable"]
+
+
+case(
+    "admission-stable-then-killed",
+    "K3: StoreCommitStable is written, the child is killed before the result; one admission.",
+    events=applied_then_killed,
+)
+
+
+def found_again_and_admitted_again(events):
+    # The recovered admission, then a second commit of the same exchange
+    # after the restart: two admissions.
+    durable_without_its_record(events)
+    insert_after(
+        events,
+        "replay.in",
+        [
+            ev(
+                "again.stable",
+                "store-evidence",
+                "StoreCommitStable",
+                {"operation_id": OP_ADMIT, "command_kind": "AdmitPublication"},
+                ["replay.in"],
+                2,
+            )
+        ],
+    )
+
+
+case(
+    "admission-found-again-and-committed-again",
+    "The recovery shows the admission, and the replay is committed a second time: two admissions.",
+    {ADMISSION: "FAIL"},
+    events=found_again_and_admitted_again,
+)
+
 # ------------------------------------------------- a real kill (record 0019)
 KILL = "broker_killed_for_real"
 CHILD = (
