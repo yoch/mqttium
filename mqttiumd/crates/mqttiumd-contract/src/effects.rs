@@ -12,7 +12,8 @@ use core::mem::size_of;
 use core::num::{NonZeroU32, NonZeroUsize};
 
 use crate::capacity::{
-    AllocationFailed, BoundedQueue, BoundedVec, CapacityNeed, Resource, WakeCondition, WorkUnits,
+    AllocationFailed, BoundedQueue, BoundedVec, CapacityNeed, PayloadBytes, Resource,
+    WakeCondition, WorkUnits,
 };
 use crate::command::Command;
 use crate::ids::{
@@ -21,7 +22,7 @@ use crate::ids::{
     PublicationId, Revision, RunEpoch, SessionId, StoreIncarnation,
 };
 use crate::outcome::{EpochGrant, Knowledge, StoreReply};
-use crate::packet::{InboundPacket, OutboundFrame, SharedBytes};
+use crate::packet::{InboundPacket, OutboundFrame, Qos, SharedBytes};
 
 /// Durable phase of an inbound QoS 2 exchange.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -30,14 +31,36 @@ pub enum InboundPhase {
     AwaitPubrel,
 }
 
-/// One fact read from durable data during recovery. Identities found here
-/// come from the store, never from the bench (DEM-012).
+/// One fact read from durable data during recovery. Identities, limits and
+/// routes found here come from the store, never from the bench (DEM-012).
+///
+/// The inventory of a recovery is ordered: see [`FactRank`] and
+/// [`RecoveryOrder`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum RecoveredFact {
     /// The data set and the run epoch opened for this run.
     Epoch {
         incarnation: StoreIncarnation,
         epoch: RunEpoch,
+    },
+    /// The limits the store enforces on an admission. They come before
+    /// everything they bound.
+    Limits {
+        max_targets_per_admission: u32,
+        max_topic_bytes: u32,
+        max_payload_bytes: PayloadBytes,
+    },
+    /// The durable revision of the route table. The routes that follow
+    /// belong to it.
+    RouteTable { revision: Revision },
+    /// One target of one topic, at the revision of the table that precedes
+    /// it. Routes are sorted by the bytes of their topic; the targets of one
+    /// topic keep the order in which they were added.
+    Route {
+        topic: SharedBytes,
+        target: SessionId,
+        target_revision: Revision,
+        max_qos: Qos,
     },
     /// A persistent session.
     Session {
@@ -57,6 +80,107 @@ pub enum RecoveredFact {
         operation: OperationId,
         knowledge: Knowledge,
     },
+}
+
+/// The place of a kind of fact in the inventory of a recovery, first to
+/// last.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum FactRank {
+    Epoch,
+    Limits,
+    RouteTable,
+    Route,
+    Session,
+    InboundExchange,
+    Operation,
+}
+
+impl FactRank {
+    /// Whether an inventory holds at most one fact of this rank.
+    #[must_use]
+    pub const fn at_most_once(self) -> bool {
+        matches!(self, Self::Epoch | Self::Limits | Self::RouteTable)
+    }
+}
+
+impl RecoveredFact {
+    /// The rank of this fact in the inventory of a recovery.
+    #[must_use]
+    pub const fn rank(&self) -> FactRank {
+        match self {
+            Self::Epoch { .. } => FactRank::Epoch,
+            Self::Limits { .. } => FactRank::Limits,
+            Self::RouteTable { .. } => FactRank::RouteTable,
+            Self::Route { .. } => FactRank::Route,
+            Self::Session { .. } => FactRank::Session,
+            Self::InboundExchange { .. } => FactRank::InboundExchange,
+            Self::Operation { .. } => FactRank::Operation,
+        }
+    }
+}
+
+/// Why a fact is out of place in an inventory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OrderRefused {
+    /// A fact of rank `found` follows a fact of the later rank `previous`.
+    RankDecreased { previous: FactRank, found: FactRank },
+    /// A second fact of a rank an inventory holds at most once.
+    Repeated(FactRank),
+    /// The topic of a route sorts before the topic of the route before it.
+    RoutesUnsorted,
+}
+
+/// The order of the facts of a recovery, as one rule for the store that
+/// writes them, the readers of a trace and the core that consumes them.
+///
+/// Ranks never decrease; `Epoch`, `Limits` and `RouteTable` appear at most
+/// once; routes are sorted by the bytes of their topic. Equal topics are
+/// accepted, since a topic has several targets and their order of addition
+/// is not visible in the facts.
+///
+/// The same value checks one page, when it starts fresh, or a whole
+/// inventory, when it is carried from page to page. It does not require
+/// that a fact is present: whether an inventory may lack its epoch, its
+/// limits or the table of its routes is for whoever reads the whole of it.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct RecoveryOrder {
+    last: Option<FactRank>,
+    last_topic: Option<SharedBytes>,
+}
+
+impl RecoveryOrder {
+    /// Before the first fact.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            last: None,
+            last_topic: None,
+        }
+    }
+
+    /// Accepts `fact` as the next of the inventory, or says why it is out
+    /// of place. A refusal changes nothing.
+    pub fn admit(&mut self, fact: &RecoveredFact) -> Result<(), OrderRefused> {
+        let found = fact.rank();
+        if let Some(previous) = self.last {
+            if found < previous {
+                return Err(OrderRefused::RankDecreased { previous, found });
+            }
+            if found == previous && found.at_most_once() {
+                return Err(OrderRefused::Repeated(found));
+            }
+        }
+        if let RecoveredFact::Route { topic, .. } = fact {
+            if let Some(previous) = &self.last_topic
+                && topic.as_slice() < previous.as_slice()
+            {
+                return Err(OrderRefused::RoutesUnsorted);
+            }
+            self.last_topic = Some(topic.clone());
+        }
+        self.last = Some(found);
+        Ok(())
+    }
 }
 
 /// What an adapter confirms about a frame. Progress does not prove that the
@@ -2228,5 +2352,179 @@ mod authority_tests {
         authority.retire(third).expect("empty and unreserved");
         authority.retire(second).expect("empty and unreserved");
         assert_eq!(authority.active_owners(), 0);
+    }
+}
+
+#[cfg(test)]
+mod recovery_order_tests {
+    use super::*;
+    use crate::ids::{ExchangeGeneration, OperationSeq, PublicationSeq};
+    use crate::outcome::Knowledge;
+
+    fn route(topic: &[u8], target: u64) -> RecoveredFact {
+        RecoveredFact::Route {
+            topic: SharedBytes::copy_from(topic, 16).expect("short topic"),
+            target: SessionId::new(target),
+            target_revision: Revision::new(1),
+            max_qos: Qos::ExactlyOnce,
+        }
+    }
+
+    /// One fact of each rank, first to last.
+    fn one_of_each() -> [RecoveredFact; 7] {
+        [
+            RecoveredFact::Epoch {
+                incarnation: StoreIncarnation::new(1),
+                epoch: RunEpoch::new(2),
+            },
+            RecoveredFact::Limits {
+                max_targets_per_admission: 4,
+                max_topic_bytes: 64,
+                max_payload_bytes: PayloadBytes::new(1024),
+            },
+            RecoveredFact::RouteTable {
+                revision: Revision::new(3),
+            },
+            route(b"a/b", 7),
+            RecoveredFact::Session {
+                session: SessionId::new(7),
+                client_id: SharedBytes::copy_from(b"client", 16).expect("short identifier"),
+                revision: Revision::new(1),
+            },
+            RecoveredFact::InboundExchange {
+                exchange: ExchangeId {
+                    session: SessionId::new(7),
+                    generation: ExchangeGeneration::new(1),
+                },
+                packet_id: InboundPacketId::new(5).expect("non-zero"),
+                publication: PublicationId::new(
+                    StoreIncarnation::new(1),
+                    RunEpoch::new(1),
+                    LogicalOwnerId::new(1),
+                    PublicationSeq::new(9),
+                ),
+                phase: InboundPhase::AwaitPubrel,
+            },
+            RecoveredFact::Operation {
+                operation: OperationId::new(
+                    StoreIncarnation::new(1),
+                    RunEpoch::new(1),
+                    LogicalOwnerId::new(1),
+                    OperationSeq::new(4),
+                ),
+                knowledge: Knowledge::Unknown,
+            },
+        ]
+    }
+
+    #[test]
+    fn the_ranks_follow_the_order_of_the_inventory() {
+        let ranks = one_of_each().map(|fact| fact.rank());
+        assert_eq!(
+            ranks,
+            [
+                FactRank::Epoch,
+                FactRank::Limits,
+                FactRank::RouteTable,
+                FactRank::Route,
+                FactRank::Session,
+                FactRank::InboundExchange,
+                FactRank::Operation,
+            ]
+        );
+        assert!(ranks.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn an_inventory_in_order_is_accepted_whole_or_page_by_page() {
+        let facts = one_of_each();
+        let mut whole = RecoveryOrder::new();
+        for fact in &facts {
+            assert_eq!(whole.admit(fact), Ok(()));
+        }
+        // A later page starts anywhere: a fresh check accepts every suffix.
+        for start in 0..facts.len() {
+            let mut page = RecoveryOrder::new();
+            for fact in &facts[start..] {
+                assert_eq!(page.admit(fact), Ok(()));
+            }
+        }
+    }
+
+    #[test]
+    fn a_fact_of_an_earlier_rank_is_refused_after_a_later_one() {
+        let facts = one_of_each();
+        for later in 1..facts.len() {
+            for earlier in 0..later {
+                let mut order = RecoveryOrder::new();
+                assert_eq!(order.admit(&facts[later]), Ok(()));
+                assert_eq!(
+                    order.admit(&facts[earlier]),
+                    Err(OrderRefused::RankDecreased {
+                        previous: facts[later].rank(),
+                        found: facts[earlier].rank(),
+                    }),
+                    "{:?} after {:?}",
+                    facts[earlier].rank(),
+                    facts[later].rank()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_epoch_the_limits_and_the_route_table_appear_at_most_once() {
+        for fact in one_of_each() {
+            let mut order = RecoveryOrder::new();
+            assert_eq!(order.admit(&fact), Ok(()));
+            let again = order.admit(&fact);
+            if fact.rank().at_most_once() {
+                assert_eq!(again, Err(OrderRefused::Repeated(fact.rank())));
+            } else {
+                assert_eq!(again, Ok(()), "{:?} may repeat", fact.rank());
+            }
+        }
+        let once: [bool; 7] = one_of_each().map(|fact| fact.rank().at_most_once());
+        assert_eq!(once, [true, true, true, false, false, false, false]);
+    }
+
+    #[test]
+    fn routes_are_sorted_by_the_bytes_of_their_topic() {
+        let mut order = RecoveryOrder::new();
+        assert_eq!(order.admit(&route(b"a", 1)), Ok(()));
+        // A topic has several targets.
+        assert_eq!(order.admit(&route(b"a", 2)), Ok(()));
+        // Bytes, not text: a prefix sorts first, and 0xff after any ASCII.
+        assert_eq!(order.admit(&route(b"a/b", 1)), Ok(()));
+        assert_eq!(order.admit(&route(b"b", 1)), Ok(()));
+        assert_eq!(order.admit(&route(&[0xff], 1)), Ok(()));
+        assert_eq!(
+            order.admit(&route(b"b", 2)),
+            Err(OrderRefused::RoutesUnsorted)
+        );
+        let mut prefix = RecoveryOrder::new();
+        assert_eq!(prefix.admit(&route(b"a/b", 1)), Ok(()));
+        assert_eq!(
+            prefix.admit(&route(b"a", 1)),
+            Err(OrderRefused::RoutesUnsorted)
+        );
+    }
+
+    #[test]
+    fn a_refused_fact_changes_nothing() {
+        let facts = one_of_each();
+        let mut order = RecoveryOrder::new();
+        assert_eq!(order.admit(&route(b"m", 1)), Ok(()));
+        let before = order.clone();
+        assert!(order.admit(&facts[0]).is_err());
+        assert!(order.admit(&route(b"a", 1)).is_err());
+        assert_eq!(order, before);
+        // The route that was refused did not lower the bar for the next.
+        assert_eq!(
+            order.admit(&route(b"b", 1)),
+            Err(OrderRefused::RoutesUnsorted)
+        );
+        assert_eq!(order.admit(&route(b"m", 2)), Ok(()));
+        assert_eq!(order.admit(&facts[4]), Ok(()));
     }
 }

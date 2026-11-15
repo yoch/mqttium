@@ -60,3 +60,43 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check -r tools/requirements.txt
           python tools/check_schemas.py
+
+  # Everything under mqttiumd/proofs/ is a workspace of its own: the checks
+  # of the `contracts` job do not see it, and this job is its only
+  # verification. `run.sh` fails when a file the proof analyses differs
+  # from the digests recorded in proofs/credits/BODY.sha256: a change to
+  # those files is reviewed and recorded again before this job is green.
+  pilot-proof:
+    name: pilot proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose
+      # Kani brings its own compiler; it never builds the product.
+      - name: Install the pinned Kani
+        run: tools/install-tools.sh kani
+      - name: The preflight refuses a wrong tool
+        run: proofs/preflight-selftest.sh
+      # Runs the preflight first, then the allocation test, the harnesses
+      # with their witnesses, the coverage and the recorded digests.
+      - name: Pilot proof of release_if_current
+        run: proofs/credits/run.sh
+      - name: Mutants, each caught as aimed
+        run: python3 proofs/credits/mutants.py
+      # Breaks one thing per case in a copy and expects the scripts above
+      # to refuse it: what their PASS is worth.
+      - name: The proof scripts refuse what they claim to check
+        run: python3 proofs/credits/selftest.py
+      - name: The proof workspace is formatted and lint-clean
+        working-directory: mqttiumd/proofs
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
