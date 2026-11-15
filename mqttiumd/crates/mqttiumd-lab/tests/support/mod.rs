@@ -1,7 +1,8 @@
 //! Helpers shared by the integration tests that build their own documents.
 //!
-//! Documents are written below the target directory, which is below the
-//! mqttiumd root, so that they can be referenced like any other document.
+//! Documents are written below the root's ignored target directory so that
+//! they can be referenced like any other document. Cargo's compilation
+//! directory may be elsewhere and is independent of these fixture paths.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,10 @@ pub fn root() -> PathBuf {
 /// Creates an empty directory for one test and returns it with its path
 /// relative to the mqttiumd root.
 pub fn scratch(name: &str) -> (PathBuf, String) {
-    let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let directory = root()
+        .join("target/contract-test-documents")
+        .join(std::process::id().to_string())
+        .join(name);
     let _ = fs::remove_dir_all(&directory);
     fs::create_dir_all(&directory).expect("scratch directory");
     let canonical_root = root().canonicalize().expect("root");
@@ -23,7 +27,7 @@ pub fn scratch(name: &str) -> (PathBuf, String) {
         .canonicalize()
         .expect("scratch directory")
         .strip_prefix(&canonical_root)
-        .expect("the target directory is below the mqttiumd root")
+        .expect("test documents are below the mqttiumd root")
         .to_string_lossy()
         .into_owned();
     (directory, relative)
