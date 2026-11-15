@@ -524,12 +524,20 @@ def committed(tag, inc, effect_sequence, operation, kind, cause=None):
     ]
 
 
+def result(effect_id, operation, outcome):
+    """The payload of a result; a certain rejection of this corpus is a fence."""
+    payload = {"effect_id": effect_id, "operation_id": operation, "outcome": outcome}
+    if outcome == "RejectedCertain":
+        payload["reject_reason"] = "Fenced"
+    return payload
+
+
 def delivered(tag, inc, effect_sequence, operation, outcome="Committed", cause=None, label=None):
     return ev(
         label or f"{tag}.delivered",
         "broker-core",
         "StoreResultDelivered",
-        {"effect_id": effect(inc, effect_sequence), "operation_id": operation, "outcome": outcome},
+        result(effect(inc, effect_sequence), operation, outcome),
         [cause or f"{tag}.ready"],
         inc,
     )
@@ -1947,7 +1955,7 @@ def ready(label, effect_sequence, outcome, cause):
         label,
         "store-evidence",
         "StoreResultReady",
-        {"effect_id": effect(1, effect_sequence), "operation_id": OP_ADMIT, "outcome": outcome},
+        result(effect(1, effect_sequence), OP_ADMIT, outcome),
         [cause],
     )
 
@@ -2174,6 +2182,59 @@ def cut(**standing):
     return expected
 
 
+REASON = "refusal_carries_the_reason_of_its_rejection"
+
+
+def refused_with(reason, code):
+    """The refusing PUBREC carries ``reason``, and the peer decodes ``code``."""
+
+    def edit(events):
+        deepcopy_payloads(events)
+        events[at(events, "refusal")]["payload"]["reason"] = reason
+        observed = next(
+            event
+            for event in events[at(events, "refusal") :]
+            if event["kind"] == "PeerPacketObserved"
+        )
+        observed["payload"]["reason_code"] = code
+        observed["payload"]["bytes_hex"] = f"50030007{code:02x}"
+
+    return edit
+
+
+def reason_of(rejection):
+    def edit(events):
+        deepcopy_payloads(events)
+        for event in events:
+            if event["payload"].get("reject_reason"):
+                event["payload"]["reject_reason"] = rejection
+
+    return edit
+
+
+qabs(
+    "refusal-with-a-quota-for-a-fence",
+    "The admission is refused because it was fenced, and the PUBREC says a quota is the cause.",
+    {REASON: "FAIL"},
+    letter="B",
+    events=refused_with("QuotaExceeded", 0x97),
+)
+qabs(
+    "refusal-for-lack-of-capacity",
+    "The admission is refused for lack of capacity: the PUBREC says a quota is the cause.",
+    letter="B",
+    events=lambda events: (
+        reason_of("CapacityExceeded")(events),
+        refused_with("QuotaExceeded", 0x97)(events),
+    ),
+)
+qabs(
+    "refusal-for-lack-of-capacity-without-the-quota",
+    "The admission is refused for lack of capacity, and the PUBREC hides that a quota is the cause.",
+    {REASON: "FAIL"},
+    letter="B",
+    events=reason_of("CapacityExceeded"),
+)
 qabs(
     "certain-rejection-without-a-fence-on-a-cut-trace",
     "The trace is cut: the fence that closes the refusal may be the record that is missing.",

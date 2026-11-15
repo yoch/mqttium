@@ -1048,6 +1048,36 @@ ok(
         [("store-evidence", 0)],
     ),
 )
+REJECTED = record(
+    7,
+    "store-evidence",
+    1,
+    "StoreResultReady",
+    {
+        "effect_id": EFFECT,
+        "operation_id": OP,
+        "outcome": "RejectedCertain",
+        "reject_reason": "Fenced",
+    },
+    [("store-evidence", 0)],
+)
+ok("trace-record-store-result-rejected.json", REJECTED)
+ok(
+    "trace-record-store-result-delivered-rejected.json",
+    record(
+        8,
+        "broker-core",
+        2,
+        "StoreResultDelivered",
+        {
+            "effect_id": EFFECT,
+            "operation_id": OP,
+            "outcome": "RejectedCertain",
+            "reject_reason": "CapacityExceeded",
+        },
+        [("store-evidence", 1)],
+    ),
+)
 ok(
     "trace-record-store-fence-stable.json",
     record(
@@ -1293,6 +1323,27 @@ trace_case(
     "Identity components inside a recovered fact are 64-bit as well.",
     setter(["payload", "facts", 1, "revision"], "18446744073709551616"),
     code="u64-out-of-range",
+)
+trace_case(
+    "rejection-without-its-reason",
+    REJECTED,
+    "/payload",
+    "A certain rejection says why: the reason of the refusing PUBREC follows from it.",
+    dropped("payload", "reject_reason"),
+)
+trace_case(
+    "commit-with-a-rejection-reason",
+    REJECTED,
+    "/payload",
+    "Only a certain rejection has a reason.",
+    setter(["payload", "outcome"], "Committed"),
+)
+trace_case(
+    "rejection-of-an-unknown-reason",
+    REJECTED,
+    "/payload/reject_reason",
+    "The reasons of a rejection are those of the contract.",
+    setter(["payload", "reject_reason"], "Busy"),
 )
 trace_case(
     "recovered-facts-rank-decreases",
