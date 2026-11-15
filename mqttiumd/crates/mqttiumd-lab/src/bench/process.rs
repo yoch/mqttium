@@ -35,8 +35,10 @@ use mqttiumd_contract::ids::{
     AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, EffectId, LogicalDuration,
     LogicalOwnerId, LogicalTime, OperationId, RunEpoch,
 };
+use mqttiumd_contract::opening::OpeningRejection;
 use mqttiumd_contract::outcome::{
-    EpochOpening, Observed as OpeningObserved, OpeningStage, RecoveredEpochCheck, StoreReply,
+    EpochOpening, Observed as OpeningObserved, OpeningOutcome, OpeningReply, OpeningStage,
+    RecoveredEpochCheck, StoreReply,
 };
 use mqttiumd_contract::packet::OutboundFrame;
 use mqttiumd_contract::step::{StepOutcome, TurnGrant};
@@ -49,7 +51,7 @@ use crate::store::adapter::{
     StoreEvent, WorkId, startup_nonce,
 };
 use crate::store::durable::{DurableStore, MemoryStore};
-use crate::store::evidence::{TraceWriter, recovered_fact, store_outcome};
+use crate::store::evidence::{Cause as EvidenceCause, TraceWriter, recovered_fact, store_outcome};
 
 /// Why the run cannot go on. The trace is then declared incomplete.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -150,6 +152,39 @@ fn delivered_json(effect: EffectId, operation: OperationId, reply: &StoreReply) 
     Some(payload)
 }
 
+/// The payload of `OpeningReplyDelivered`: the whole command the reply
+/// answers and its outcome.
+fn opening_reply_json(reply: &OpeningReply) -> Value {
+    let command = reply.command;
+    let mut payload = json!({
+        "attempt": {
+            "startup_hex": hex(&command.attempt.startup.to_bytes()),
+            "ticket": decimal(command.attempt.ticket.get()),
+        },
+        "incarnation": decimal(command.incarnation.get()),
+        "after": decimal(command.after.get()),
+    });
+    let outcome = match reply.outcome {
+        OpeningOutcome::Committed(opened) => {
+            payload["epoch"] = decimal(opened.epoch.get());
+            "Committed"
+        }
+        OpeningOutcome::RejectedCertain(rejection) => {
+            payload["reject_reason"] = json!(match rejection {
+                OpeningRejection::EpochsExhausted => "EpochsExhausted",
+                OpeningRejection::ForeignIncarnation => "ForeignIncarnation",
+                OpeningRejection::PredecessorMoved => "PredecessorMoved",
+                OpeningRejection::AttemptReused => "AttemptReused",
+            });
+            "RejectedCertain"
+        }
+        OpeningOutcome::Superseded => "Superseded",
+        OpeningOutcome::Unknown => "Unknown",
+    };
+    payload["outcome"] = json!(outcome);
+    payload
+}
+
 fn ack_reason(frame: OutboundFrame) -> Option<&'static str> {
     use mqttiumd_contract::packet::AckReason;
     let reason = match frame {
@@ -213,10 +248,11 @@ struct Transport {
 pub struct Books {
     /// The core record whose step published each effect.
     published_by: BTreeMap<EffectId, Cause>,
-    /// The `StoreResultReady` record of each piece of work, the latest.
-    ready: BTreeMap<WorkId, Cause>,
-    /// The `HeldItemReleased` record of each piece of work.
-    released: BTreeMap<WorkId, Cause>,
+    /// The `StoreResultHandedOver` record of each piece of work whose
+    /// result the adapter handed towards the core, the latest.
+    handed: BTreeMap<WorkId, Cause>,
+    /// The `OpeningSubmitted` record of each opening attempt.
+    opening_submitted: BTreeMap<WorkId, Cause>,
     /// For each fault of this incarnation, the scenario fault it is.
     pub scenario_fault: Vec<usize>,
     /// Hits of each scenario fault, over the whole run.
@@ -306,17 +342,15 @@ pub struct Pending {
 /// to, by its variant (record 0016).
 fn channel_of(event: &StoreEvent) -> Option<Origin> {
     Some(match event {
-        StoreEvent::CommandSubmitted { .. } | StoreEvent::RecoveryPageRead { .. } => {
-            Origin::StoreAdapter
-        }
+        StoreEvent::CommandSubmitted { .. }
+        | StoreEvent::RecoveryPageRead { .. }
+        | StoreEvent::ResultDelivered { .. } => Origin::StoreAdapter,
         StoreEvent::CommitStable { .. }
         | StoreEvent::FenceStable { .. }
         | StoreEvent::FenceRefused { .. }
         | StoreEvent::ResultReady { .. } => Origin::StoreEvidence,
         StoreEvent::FaultHit { .. } | StoreEvent::HeldItemReleased { .. } => Origin::FaultInjector,
         StoreEvent::UncorrelatedResult { .. } => Origin::Dispatcher,
-        // The core states what it consumed itself.
-        StoreEvent::ResultDelivered { .. } => return None,
     })
 }
 
@@ -349,8 +383,28 @@ fn flush(
     }
     let mut page = None;
     for event in store.take_events() {
-        let written = writer.write(core::slice::from_ref(&event));
-        let (Some(channel), Some(record)) = (channel_of(&event), written.records.first()) else {
+        // A submission names, as its cause, the record of the core input
+        // whose step published the effect it carries (record 0016).
+        let causes: Vec<EvidenceCause> = match &event {
+            StoreEvent::CommandSubmitted {
+                id: WorkId::Effect(effect),
+                ..
+            } => books
+                .published_by
+                .get(effect)
+                .map(|cause| EvidenceCause {
+                    component: cause.origin.name(),
+                    incarnation: cause.incarnation,
+                    sequence: cause.sequence,
+                })
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        };
+        let record = writer.write_caused(&event, &causes).map_err(|refused| {
+            Stop::new(format!("the store writer refused causes: {refused:?}"))
+        })?;
+        let (Some(channel), Some(record)) = (channel_of(&event), record.as_ref()) else {
             *books
                 .unwritten
                 .entry(event_name(&event).to_owned())
@@ -361,14 +415,18 @@ fn flush(
             .accept(channel, record)
             .map_err(|refusal| Stop::new(format!("the collector refused a record: {refusal}")))?;
         match event {
-            StoreEvent::ResultReady { id, .. } => {
-                books.ready.insert(id, cause);
+            StoreEvent::ResultDelivered { id, .. } => {
+                books.handed.insert(id, cause);
+            }
+            StoreEvent::CommandSubmitted {
+                id: id @ WorkId::Opening(_),
+                ..
+            } => {
+                books.opening_submitted.insert(id, cause);
             }
             StoreEvent::HeldItemReleased { fault } => {
-                if let Some(scenario) = books.scenario_fault.get(fault.0).copied()
-                    && let Some(id) = books.held.remove(&scenario)
-                {
-                    books.released.insert(id, cause);
+                if let Some(scenario) = books.scenario_fault.get(fault.0).copied() {
+                    books.held.remove(&scenario);
                 }
             }
             StoreEvent::FaultHit {
@@ -574,6 +632,16 @@ impl Process {
         choices: &mut Vec<String>,
     ) -> Result<Self, Stop> {
         let mut sim = SimStore::new(store, settings.adapter);
+        // The writer of the store's evidence lives as long as the
+        // process; the faults are named in the order they are armed.
+        let names: Vec<&'static str> = faults.iter().map(|(_, _, name)| *name).collect();
+        let names: &'static [&'static str] = Box::leak(names.into_boxed_slice());
+        let mut writer = TraceWriter::new(
+            settings.run_id,
+            collector.incarnation(Origin::StoreAdapter),
+            0,
+            names,
+        );
         // The opening: read the ledger, submit, writer, reply, grant.
         let mut opening = sim.begin_opening(startup_nonce(settings.seed, rank));
         let command = opening
@@ -582,20 +650,45 @@ impl Process {
         sim.submit_opening(command).map_err(|blocked| {
             Stop::new(format!("the adapter refused the opening: {blocked:?}"))
         })?;
+        flush(&mut sim, &mut writer, collector, books)?;
         let id = WorkId::Opening(command.attempt);
+        let mut reply_cause = None;
         for action in [StoreAction::EnterWriter(id), StoreAction::DeliverResult(id)] {
             choices.push(Choice::Store(action).describe());
-            match sim.perform(action) {
+            let performed = sim.perform(action);
+            flush(&mut sim, &mut writer, collector, books)?;
+            match performed {
                 Ok(Performed::Executed) => {}
                 Ok(Performed::Delivered {
                     delivery: Delivery::Opening(reply),
                     barrier: false,
-                }) => match opening.observe(reply) {
-                    Ok(OpeningObserved::Advanced(OpeningStage::Committed(_))) => {}
-                    other => {
-                        return Err(Stop::new(format!("the opening did not commit: {other:?}")));
+                }) => {
+                    let parent: Vec<Cause> = books
+                        .opening_submitted
+                        .get(&id)
+                        .copied()
+                        .into_iter()
+                        .collect();
+                    let cause = collector
+                        .emit(
+                            Origin::BrokerCore,
+                            "OpeningReplyDelivered",
+                            &parent,
+                            opening_reply_json(&reply),
+                        )
+                        .map_err(|refusal| {
+                            Stop::new(format!("the collector refused a record: {refusal}"))
+                        })?;
+                    reply_cause = Some(cause);
+                    match opening.observe(reply) {
+                        Ok(OpeningObserved::Advanced(OpeningStage::Committed(_))) => {}
+                        other => {
+                            return Err(Stop::new(format!(
+                                "the opening did not commit: {other:?}"
+                            )));
+                        }
                     }
-                },
+                }
                 other => return Err(Stop::new(format!("the opening went wrong: {other:?}"))),
             }
         }
@@ -603,6 +696,17 @@ impl Process {
             .hand_over()
             .map_err(|refused| Stop::new(format!("no grant: {refused:?}")))?;
         let epoch = grant.epoch();
+        collector
+            .emit(
+                Origin::BrokerCore,
+                "EpochGrantHandedOver",
+                &reply_cause.into_iter().collect::<Vec<_>>(),
+                json!({
+                    "incarnation": decimal(grant.incarnation().get()),
+                    "epoch": decimal(epoch.get()),
+                }),
+            )
+            .map_err(|refusal| Stop::new(format!("the collector refused a record: {refusal}")))?;
         let mut authority = OwnerAuthority::from_grant(grant, NonZeroU32::MIN)
             .map_err(|_| Stop::new("the authority could not be allocated"))?;
         let outbox = authority
@@ -614,21 +718,13 @@ impl Process {
         // The faults of the scenario act on the broker's work; they are
         // armed once the epoch is open.
         books.scenario_fault.clear();
-        let names: Vec<&'static str> = faults.iter().map(|(_, _, name)| *name).collect();
         for (scenario, spec, name) in faults {
             let armed = sim.arm(*spec).map_err(|refused| {
-                Stop::new(format!("the fault {name} was refused: {refused:?}"))
+                Stop::new(format!("the fault {name} was not armed: {refused:?}"))
             })?;
             debug_assert_eq!(armed, FaultId(books.scenario_fault.len()));
             books.scenario_fault.push(*scenario);
         }
-        let names: &'static [&'static str] = Box::leak(names.into_boxed_slice());
-        let writer = TraceWriter::new(
-            settings.run_id,
-            collector.incarnation(Origin::StoreAdapter),
-            0,
-            names,
-        );
         let mut process = Self {
             settings,
             opening,
@@ -642,7 +738,6 @@ impl Process {
             parked: None,
             consuming: None,
         };
-        // The events of the opening have no record in the formats.
         flush(&mut process.store, &mut process.writer, collector, books)?;
         Ok(process)
     }
@@ -1022,10 +1117,7 @@ impl Process {
             return Err(Stop::new("a store delivery that is not a result"));
         };
         let id = WorkId::Effect(*effect);
-        let parent = books
-            .released
-            .remove(&id)
-            .or_else(|| books.ready.get(&id).copied());
+        let parent = books.handed.remove(&id);
         let pending = delivered_json(*effect, *operation, reply).map(|payload| Pending {
             kind: "StoreResultDelivered",
             payload,
