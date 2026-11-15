@@ -338,3 +338,42 @@ fn sessions() -> Vec<(String, mqttiumd_contract::ids::SessionId)> {
         .map(|(name, _, session)| (name, session))
         .collect()
 }
+
+/// Between a kill and the restart nothing opens the database: an
+/// inspection there is refused. The scenario format refuses it first (only
+/// RestartBroker may follow a crash), before anything is written; the
+/// supervisor refuses it again if it ever reached it.
+#[test]
+fn an_inspection_between_the_kill_and_the_restart_is_refused() {
+    let root = bench_support::root();
+    let mut scenario: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(SCENARIOS[0])).unwrap()).unwrap();
+    let steps = scenario["steps"].as_array_mut().unwrap();
+    let crash = steps
+        .iter()
+        .position(|step| step["kind"] == "CrashBroker")
+        .unwrap();
+    steps.insert(
+        crash + 1,
+        serde_json::json!({"kind": "InspectDurableState", "checkpoint": "after_the_kill"}),
+    );
+    let relative = format!(
+        "target/bench-scenarios/inspect-after-kill-{}.json",
+        std::process::id()
+    );
+    std::fs::create_dir_all(root.join("target/bench-scenarios")).unwrap();
+    std::fs::write(
+        root.join(&relative),
+        serde_json::to_vec_pretty(&scenario).unwrap(),
+    )
+    .unwrap();
+    let out = bench_support::fresh("inspect-after-kill");
+    let refused =
+        execute(&request(&relative, out.clone(), "sqlite", "child")).expect_err("refused");
+    let _ = std::fs::remove_file(root.join(&relative));
+    assert!(
+        refused.contains("only RestartBroker may follow"),
+        "{refused}"
+    );
+    let _ = std::fs::remove_dir_all(&out);
+}

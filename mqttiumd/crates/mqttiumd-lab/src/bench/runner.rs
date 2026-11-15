@@ -761,7 +761,13 @@ impl<B: Backend> Runner<'_, B> {
                     // without it, read-only.
                     (Some(Broker::Child(_)), _) => self.backend.inspect(None),
                     (None, Some(store)) => self.backend.inspect(Some(store)),
-                    (None, None) if self.child.is_some() => self.backend.inspect(None),
+                    // A rule of the supervisor: between a kill and the
+                    // restart nothing opens the database.
+                    (None, None) if self.child.is_some() => {
+                        return Err(Stop::new(
+                            "between the kill and the restart nothing opens the database: an inspection there is refused",
+                        ));
+                    }
                     (None, None) => return Err(Stop::new("no data set to inspect")),
                 }
                 .map_err(Stop::new)?;

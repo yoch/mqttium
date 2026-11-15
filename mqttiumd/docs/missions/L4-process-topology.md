@@ -127,7 +127,12 @@ the supervisor takes it with `accept`, checks the origin against the
 socket and the sequence against the origin, and numbers it in the
 trace. At the end of each action the child waits until every frame is
 acknowledged before it reads the next action, so that between two
-actions it is drained. Every read of the supervisor has a deadline (30
+actions it is drained. "Acknowledged" means received by the supervisor:
+it acknowledges a frame as soon as it reads it, and keeps the frames of
+an action in the trace when the action ends, in emission order. A kill
+is allowed only after that, and `Child::kill` checks it: the last action
+ended, the sequencer is empty and nothing waits unread on a descriptor,
+or the run stops. Every read of the supervisor has a deadline (30
 seconds): a child that writes nothing stops the run. The settings the
 child's engine read back are compared by the supervisor to those the
 manifest records. The child computes its settings and its faults from
@@ -159,7 +164,14 @@ collector of the supervisor refuses it, the run stops before the kill
 and the trace is cut, so the oracle concludes nothing (INCONCLUSIVE,
 `trace_complete`). `n2`: the child restarted after the kill opens a copy
 of the data set taken before the commit; the exchange is admitted twice
-and the epoch opened twice (FAIL, `one_admission_per_observed_inbound_exchange`).
+and the epoch opened twice (FAIL, `one_admission_per_observed_inbound_exchange`;
+the obligations at both checkpoints agree, because the second admission
+writes them again). `n3`: no signal is sent and the child exits on its
+own; the supervisor refuses a wait status other than signal 9 with no
+exit code, and the run stops (INCONCLUSIVE). `n4`: the same, with that
+check removed, survives today, since the trace says nothing of the kill:
+the known survivor that the record `BrokerKilled` (decision 0019, lot L3)
+must close.
 
 ## Causal parents of the supervisor and the peers
 
@@ -216,8 +228,9 @@ trace and not only in a counter; the footer then declares the trace
 incomplete.
 
 Between the kill and the restart nothing opens, copies, moves or deletes
-the database or its `-wal` and `-shm` files: recovering the WAL belongs
-to the restarted child. A proof drawn from a copy of the database
+the database, its `-wal` and `-shm` files or its writer lock
+(`<database>.writer-lock`): recovering the WAL belongs to the restarted
+child. A proof drawn from a copy of the database
 without its `-wal` is false.
 
 `RestartBroker` starts a new child with the next rank. On SQLite the
@@ -227,9 +240,20 @@ when they differ; reads back the engine version and the options, which
 the supervisor compares to the manifest; runs `PRAGMA quick_check`;
 decodes the meta row. The bench then starts the core: the incarnation is
 the one of the fixture, the recovery pages are read, and the new epoch
-opens (`EpochOpening`). One writer only: `busy_timeout = 0` and
-`BEGIN IMMEDIATE`, so that a second writer is refused instead of
-waiting. Its origins start a new incarnation, and the supervisor writes
+opens (`EpochOpening`). One writer only, by two means. The store holds
+an exclusive advisory lock on `<database>.writer-lock` for the whole life
+of a `SqliteStore` (lot L7): `create` and `open` refuse at once with
+`OpenError::WriterAlive` while another writer lives, and the kernel
+releases the lock when the process dies; `inspect` does not take it.
+`busy_timeout = 0` and `BEGIN IMMEDIATE` then only serialize the
+transactions of that one writer; alone they would not keep a second
+process from opening the file. The supervisor never has two children
+alive: the next one starts only once the end of the previous one is
+confirmed, and a child started while another lives is refused by the
+store (tested). No child outlives a run: one that does not exit when its
+standard input closes is killed and waited for, which is not a kill of
+the scenario and enters neither `kills` nor the trace. The lock follows
+the descriptor, so the child never forks without exec. Its origins start a new incarnation, and the supervisor writes
 `BrokerRecovered`.
 
 ## Inspection
@@ -238,8 +262,10 @@ The inspector reads without the writer. On SQLite it uses
 `SqliteStore::inspect(path) -> Result<DurableState, OpenError>` of lot L7: the database
 opened with `mode=ro`, never `immutable=1`; one read transaction; the
 connection closed at once; never a checkpoint. No inspector is open at a
-kill, and between a kill and the restart an inspection is refused on
-SQLite. The in-process runner already reads this way, and states it in
+kill. Between a kill and the restart an inspection is refused: a rule of
+the supervisor, not of the store, which the scenario format enforces
+first (only `RestartBroker` may follow a crash) and the supervisor again
+if it ever reached one. The in-process runner already reads this way, and states it in
 `backend_settings` of `campaign.json`. On `sim-store` the child answers
 an inspection action with the durable state of its store, read without
 the writer.
