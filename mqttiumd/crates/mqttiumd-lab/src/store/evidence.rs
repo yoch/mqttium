@@ -430,6 +430,9 @@ pub struct TraceWriter<'a> {
     submitted: BTreeMap<WorkId, (Origin, &'static str)>,
     /// The record of each fault that was reached.
     hits: BTreeMap<FaultId, Origin>,
+    /// The `StoreResultReady` of each piece of work, the parent of its
+    /// handover.
+    ready: BTreeMap<WorkId, Origin>,
 }
 
 /// What a writer produced from a list of events.
@@ -481,6 +484,7 @@ impl<'a> TraceWriter<'a> {
             sequences: BTreeMap::new(),
             submitted: BTreeMap::new(),
             hits: BTreeMap::new(),
+            ready: BTreeMap::new(),
         }
     }
 
@@ -548,6 +552,46 @@ impl<'a> TraceWriter<'a> {
 
     fn one(&mut self, event: &StoreEvent) -> Option<Value> {
         match event {
+            StoreEvent::CommandSubmitted {
+                id: id @ WorkId::Opening(_),
+                kind: WorkKind::OpenEpoch,
+                opening: Some(command),
+                ..
+            } => {
+                let (record, origin) = self.record(
+                    "store-adapter",
+                    "OpeningSubmitted",
+                    &[],
+                    json!({
+                        "attempt": opened_by(Some(command.attempt)),
+                        "incarnation": decimal(command.incarnation.get()),
+                        "after": decimal(command.after.get()),
+                    }),
+                );
+                self.submitted
+                    .insert(*id, (origin, kind_name(WorkKind::OpenEpoch)));
+                Some(record)
+            }
+            StoreEvent::CommitStable {
+                id: id @ WorkId::Opening(attempt),
+                opened: Some(opened),
+                ..
+            } => {
+                let parents = self.parent_of(*id);
+                Some(
+                    self.record(
+                        "store-evidence",
+                        "StoreEpochOpened",
+                        &parents,
+                        json!({
+                            "incarnation": decimal(opened.incarnation.get()),
+                            "epoch": decimal(opened.epoch.get()),
+                            "attempt": opened_by(Some(*attempt)),
+                        }),
+                    )
+                    .0,
+                )
+            }
             StoreEvent::CommandSubmitted {
                 id: id @ WorkId::Effect(effect),
                 kind,
@@ -645,8 +689,35 @@ impl<'a> TraceWriter<'a> {
                     payload["reject_reason"] = json!(rejected);
                 }
                 let parents = self.parent_of(*id);
+                let (record, origin) =
+                    self.record("store-evidence", "StoreResultReady", &parents, payload);
+                self.ready.insert(*id, origin);
+                Some(record)
+            }
+            StoreEvent::ResultDelivered {
+                id: id @ WorkId::Effect(effect),
+                answer: Answer::Operation { operation, reply },
+                produced,
+            } => {
+                // What the adapter hands over has the content of what the
+                // store produced; a result presented from outside follows
+                // no `StoreResultReady`.
+                let (outcome, rejected) = store_outcome(*reply)?;
+                let mut payload = json!({
+                    "effect_id": effect_id(*effect),
+                    "operation_id": operation_id(*operation),
+                    "outcome": outcome,
+                });
+                if let Some(rejected) = rejected {
+                    payload["reject_reason"] = json!(rejected);
+                }
+                let parents: Vec<Origin> = if *produced {
+                    self.ready.get(id).copied().into_iter().collect()
+                } else {
+                    Vec::new()
+                };
                 Some(
-                    self.record("store-evidence", "StoreResultReady", &parents, payload)
+                    self.record("store-adapter", "StoreResultHandedOver", &parents, payload)
                         .0,
                 )
             }

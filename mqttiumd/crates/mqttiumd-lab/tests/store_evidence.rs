@@ -267,15 +267,9 @@ fn the_evidence_of_a_run_is_written_as_accepted_trace_records() {
     let events = bench.store.take_events();
     let mut writer = TraceWriter::new("p1-02-example", 1, 1, &names);
     let written = writer.write(&events);
-    // The delivery of a result is the core's record, not the adapter's.
-    assert!(
-        written
-            .unwritten
-            .iter()
-            .all(|event| matches!(event, StoreEvent::ResultDelivered { .. })),
-        "{:#?}",
-        written.unwritten
-    );
+    // Every event is written: a delivery as the adapter's handover; the
+    // core writes what it consumed.
+    assert!(written.unwritten.is_empty(), "{:#?}", written.unwritten);
     let workspace = workspace();
     let mut kinds = Vec::new();
     for (index, record) in written.records.iter().enumerate() {
@@ -299,6 +293,7 @@ fn the_evidence_of_a_run_is_written_as_accepted_trace_records() {
             "StoreCommitStable",
             "StoreFenceRefused",
             "StoreFenceStable",
+            "StoreResultHandedOver",
             "StoreResultReady",
         ]
     );
