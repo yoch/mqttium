@@ -60,6 +60,11 @@ pub const CHILD_ORIGINS: [Origin; 7] = [
     Origin::Transport,
 ];
 
+/// One bounded receive queue shared by the seven origins and control.
+pub const ARRIVAL_CAPACITY: usize = (CHILD_ORIGINS.len() + 1) * super::protocol::WINDOW as usize;
+/// Reports buffered while one action is outstanding.
+pub const REPORTS_PER_ACTION: usize = super::protocol::WINDOW as usize;
+
 /// What a child needs to know, the same at every start-up of a run.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -269,7 +274,7 @@ impl Child {
         let pid = process.id();
         let actions = process.stdin.take().ok_or_else(|| stop("no stdin"))?;
         let reports = process.stdout.take().ok_or_else(|| stop("no stdout"))?;
-        let (sender, received) = mpsc::sync_channel(8 * super::protocol::WINDOW as usize);
+        let (sender, received) = mpsc::sync_channel(ARRIVAL_CAPACITY);
         reader(reports, None, sender.clone());
         // From here every way out goes through `Drop for Child`, which makes
         // sure the process does not outlive the run.
@@ -448,7 +453,7 @@ impl Child {
                     end = Some(Some(last_emission));
                 }
                 Ok(Arrival::Report(report)) => {
-                    if reports.len() >= super::protocol::WINDOW as usize {
+                    if reports.len() >= REPORTS_PER_ACTION {
                         return Err(stop("the child exceeded the bounded action report list"));
                     }
                     reports.push(report);
