@@ -62,6 +62,7 @@
     "contracts/examples/v1/valid/run-result-provisional-out-of-scope.json",
     "contracts/examples/v1/valid/run-result-provisional-nothing-evaluated.json",
     "contracts/examples/v1/valid/run-manifest-content-only.json",
+    "contracts/examples/v1/valid/run-manifest-with-oracle-and-generators.json",
     "contracts/examples/v1/valid/toy.catalog.json",
     "contracts/examples/v1/valid/toy.transitions.complete.json",
     "contracts/examples/v1/valid/toy.transitions.seed-with-hole.json",
@@ -1207,6 +1208,24 @@
       "code": "evidence-mismatch",
       "pointer": "/contracts_digest",
       "why": "The contract digest is the digest of the files the manifest lists."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-oracle-of-other-files.json",
+      "code": "evidence-mismatch",
+      "pointer": "/oracle/sha256",
+      "why": "The digest of the oracle is the digest of the files it lists."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-generators-out-of-order.json",
+      "code": "evidence-mismatch",
+      "pointer": "/generators/files/1",
+      "why": "The files of a generator are listed once each, in path order."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/run-manifest-oracle-without-files.json",
+      "code": "schema-violation",
+      "pointer": "/oracle",
+      "why": "An identity names the files it is the digest of."
     },
     {
       "file": "contracts/examples/v1/invalid/toy.transitions.hole.json",
