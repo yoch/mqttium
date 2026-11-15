@@ -80,13 +80,13 @@ fn a_second_writer_in_the_same_process_is_refused() {
     refused_as_alive(SqliteStore::open(&path));
     refused_as_alive(SqliteStore::create(&path, INCARNATION, roomy()));
     // The refused attempts changed nothing.
-    let state = first.store.snapshot();
+    let state = first.store.snapshot().expect("healthy snapshot");
     assert_eq!(SqliteStore::inspect(&path).expect("inspected"), state);
     drop(first);
     // The lock file stays; it alone holds nothing back.
     assert!(with_suffix(&path, ".writer-lock").exists());
     let again = SqliteStore::open(&path).expect("reopened once the first is gone");
-    assert_eq!(again.snapshot(), state);
+    assert_eq!(again.snapshot().expect("healthy snapshot"), state);
     refused_as_alive(SqliteStore::open(&path));
 }
 
@@ -97,13 +97,13 @@ fn an_inspection_reads_while_the_writer_lives() {
     exchange(&mut writer, 1);
     assert_eq!(
         SqliteStore::inspect(&path).expect("inspected"),
-        writer.store.snapshot()
+        writer.store.snapshot().expect("healthy snapshot")
     );
     // The writer still commits after the inspection.
     exchange(&mut writer, 2);
     assert_eq!(
         SqliteStore::inspect(&path).expect("inspected"),
-        writer.store.snapshot()
+        writer.store.snapshot().expect("healthy snapshot")
     );
 }
 

@@ -264,9 +264,9 @@ fn digest(state: &DurableState) -> String {
 fn reference(target: Target) -> (DurableState, DurableState, String) {
     let mut world = World::with_limits(&MemoryStore::create, limits());
     let command = prepare(&mut world, target);
-    let before = world.store.snapshot();
+    let before = world.store.snapshot().expect("healthy snapshot");
     assert!(world.store.apply(&command).committed_now);
-    let after = world.store.snapshot();
+    let after = world.store.snapshot().expect("healthy snapshot");
     (before, after, format!("{:?}", command.recipe.operation()))
 }
 
@@ -538,7 +538,13 @@ mod tests {
         assert_eq!(command.payload.as_ref().unwrap().len(), PAYLOAD);
         assert!(world.store.apply(&command).committed_now);
         assert_eq!(
-            world.store.snapshot().accounts.payload_bytes.get(),
+            world
+                .store
+                .snapshot()
+                .expect("healthy snapshot")
+                .accounts
+                .payload_bytes
+                .get(),
             PAYLOAD as u64
         );
     }

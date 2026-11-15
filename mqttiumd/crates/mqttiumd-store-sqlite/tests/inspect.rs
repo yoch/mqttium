@@ -66,7 +66,7 @@ fn exchange(world: &mut World<SqliteStore>, n: u64) {
 fn an_inspection_reads_one_state_while_the_writer_commits() {
     let path = fresh_path();
     let mut writer = world(&path);
-    let before = writer.store.snapshot();
+    let before = writer.store.snapshot().expect("healthy snapshot");
     assert_eq!(SqliteStore::inspect(&path).expect("inspected"), before);
     let done = Arc::new(AtomicBool::new(false));
     let finished = Arc::clone(&done);
@@ -91,7 +91,7 @@ fn an_inspection_reads_one_state_while_the_writer_commits() {
     assert!(inspections > 0);
     assert_eq!(
         SqliteStore::inspect(&path).expect("inspected"),
-        writer.store.snapshot()
+        writer.store.snapshot().expect("healthy snapshot")
     );
 }
 
@@ -112,7 +112,7 @@ fn an_inspection_writes_nothing_and_holds_nothing() {
     let (db_before, wal_before) = (bytes(&path), bytes(&wal));
     assert!(!wal_before.is_empty(), "the WAL holds the commits");
     let state = SqliteStore::inspect(&path).expect("inspected");
-    assert_eq!(state, writer.store.snapshot());
+    assert_eq!(state, writer.store.snapshot().expect("healthy snapshot"));
     assert_eq!(bytes(&path), db_before);
     assert_eq!(bytes(&wal), wal_before);
     // Nothing reads any more: the whole WAL can be checkpointed and reset.
@@ -147,7 +147,7 @@ fn an_inspection_refuses_what_is_not_this_store() {
         .expect("set");
     assert!(matches!(
         SqliteStore::inspect(&path),
-        Err(OpenError::SchemaVersion(2))
+        Err(mqttiumd_store_api::ReadError::InvalidData)
     ));
 }
 
