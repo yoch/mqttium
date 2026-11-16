@@ -1,5 +1,6 @@
 """Independent wire-observer invariants for the outgoing PI reception."""
 import unittest
+from unittest.mock import patch
 import json
 from pathlib import Path
 import tempfile
@@ -131,6 +132,91 @@ print('mqttiumd features=' if sys.argv[1]=='tree' else 'cargo-test-stub')
             cursor = FinishCursor(SimpleNamespace(events_path=path, process=SimpleNamespace(pid=7)))
             cursor.read()
             self.assertEqual(cursor.last_sequence, 1)
+
+    def read_reused_event_inode(self, *, replacement_larger):
+        def encoded(*rows):
+            return ''.join(json.dumps(row) + '\n' for row in rows).encode()
+
+        def rotated(sequence, retained_from, previous_last):
+            return {"seq": str(sequence), "pid": 7, "kind": "log_rotated",
+                    "details": {"retained_from": str(retained_from),
+                                "previous_last_seq": str(previous_last),
+                                "discarded_through": str(retained_from - 1)}}
+
+        queued = {"seq": "3", "pid": 7, "kind": "frame_queued", "connection": "1",
+                  "details": {"packet_kind": "PUBLISH", "packet_id": 1, "dup": False,
+                              "claim": "1/1/0/2", "delivery": "1/1/0/1/0", "effect": "1/0/3"}}
+        finished = {"seq": "5", "pid": 7, "kind": "core_finish_observed",
+                    "operation": {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "4"},
+                    "details": {"delivery": "1/1/0/1/0"}}
+        fresh_prefix = encoded(rotated(4, 2, 3), finished)
+        old_size = len(fresh_prefix) + (0 if replacement_larger else 512)
+        starting = {"seq": "1", "pid": 7, "kind": "starting", "details": {"padding": ""}}
+        starting['details']['padding'] = 'x' * (old_size - len(encoded(starting)))
+        self.assertLessEqual(old_size, 2048)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "broker.events.jsonl"
+            previous = root / "broker.events.jsonl.previous"
+            retired = root / "retired-log"  # Kept outside the collector's glob.
+            path.write_bytes(encoded(starting))
+            original_inode = path.stat().st_ino
+            self.assertEqual(path.stat().st_size, old_size)
+            cursor = FinishCursor(SimpleNamespace(events_path=path,
+                                  process=SimpleNamespace(pid=7, poll=lambda: None)))
+            cursor.read()
+            os.link(path, retired)
+            path.rename(previous)
+            path.write_bytes(encoded(rotated(2, 1, 1), queued))
+            cursor.read()
+            self.assertEqual(cursor.last_sequence, 3)
+            self.assertEqual(len(cursor.active), 1)
+
+            previous.unlink()
+            path.rename(previous)
+            # Reintroduce the retained real inode deterministically, then give
+            # it the new generation that an allocator may reuse it for.
+            os.link(retired, path)
+            duplicate = encoded({**finished, "seq": "6"}) if replacement_larger else b''
+            path.write_bytes(fresh_prefix + duplicate)
+            self.assertEqual(path.stat().st_ino, original_inode)
+            if replacement_larger:
+                self.assertGreater(path.stat().st_size, old_size)
+            else:
+                self.assertLess(path.stat().st_size, old_size)
+            # One deterministic poll reproduces the old durable-Finish timeout
+            # without sleeping; the larger case seeks to the duplicate record
+            # and exposes a gap instead, so a size-only reset cannot pass.
+            with patch('pi_reception.time.monotonic', side_effect=[0, 0, 2]), \
+                    patch('pi_reception.time.sleep') as sleep:
+                try:
+                    entry = cursor.take(1, timeout=1)
+                except ReceiptFailure as error:
+                    self.fail('log_rotated seq=4 and its durable Finish were skipped after inode reuse: '
+                              + error.code)
+            sleep.assert_not_called()
+            self.assertEqual(entry['finish']['event_sequence'], '5')
+            self.assertEqual(cursor.last_sequence, 6 if replacement_larger else 5)
+            self.assertEqual(cursor.counts['log_rotated'], 2)
+            self.assertEqual(cursor.finishes, 1)
+            self.assertEqual(cursor.duplicate_finishes, int(replacement_larger))
+            self.assertFalse(cursor.active)
+            self.assertFalse(cursor.by_identifier)
+            self.assertEqual(len(cursor.offsets), 2)
+            cursor.read()
+            self.assertEqual(cursor.finishes, 1)
+            self.assertEqual(cursor.duplicate_finishes, int(replacement_larger))
+            with path.open('ab') as stream:
+                stream.write(encoded({"seq": str(cursor.last_sequence + 2), "pid": 7, "kind": "stopped"}))
+            with self.assertRaises(ReceiptFailure) as raised:
+                cursor.read()
+            self.assertEqual(raised.exception.code, 'product_event_observation_gap')
+
+    def test_product_cursor_observes_shorter_generation_on_recycled_inode(self):
+        self.read_reused_event_inode(replacement_larger=False)
+
+    def test_product_cursor_observes_larger_generation_on_recycled_inode(self):
+        self.read_reused_event_inode(replacement_larger=True)
 
     def test_finish_duplicates_do_not_inflate_distinct_delivery_count(self):
         operation = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "4"}
