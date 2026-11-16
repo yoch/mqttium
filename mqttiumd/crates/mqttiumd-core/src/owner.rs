@@ -2577,7 +2577,7 @@ mod tests {
         continuation: (Option<crate::contract::ids::ContinuationId>, bool),
         subscription: Option<ControlSnapshot>,
         leases: (Credits, Vec<crate::leases::LeaseSlotView>),
-        receipts: receipts::Snapshot,
+        receipts: receipts::test_support::Snapshot,
         finished: Vec<Finished>,
         closed: Vec<ConnectionGeneration>,
         waiting: Vec<EffectId>,
@@ -8529,45 +8529,81 @@ mod tests {
 
     #[test]
     fn receipt_full_window_consumes_a_fenced_release_before_preparing_its_retry() {
-        let mut facts=fixture(EPOCH);
-        facts.push(exchange_fact(PRODUCER,7,1));
-        let mut world=World::cold(EPOCH,CAPACITY);
-        world.applied(page(&facts,true));
-        world.applied(connect(CONN,b"p1-producer"));
-        let _=world.drain();
+        let mut facts = fixture(EPOCH);
+        facts.push(exchange_fact(PRODUCER, 7, 1));
+        let mut world = World::cold(EPOCH, CAPACITY);
+        world.applied(page(&facts, true));
+        world.applied(connect(CONN, b"p1-producer"));
+        let _ = world.drain();
         gc_register(&mut world);
-        let release=world.submit(pubrel(7));
-        assert_eq!(release.operation.sequence().get(),1);
+        let release = world.submit(pubrel(7));
+        assert_eq!(release.operation.sequence().get(), 1);
         world.owner.receipts.test_fill_consumed_window();
-        world.owner.counters.operation=Some(OperationSeq::new(1025));
-        assert_eq!(world.owner.receipt_status().unwrap().1,1024);
-        let fenced=result(&release,StoreOutcome::RejectedCertain(RejectReason::Fenced));
-        let outcome=world.owner.step(fenced,GC_GRANT);
-        assert!(matches!(outcome,StepOutcome::Applied {..}),
-            "terminal consumption must progress at full receipt window: {outcome:?}");
+        world.owner.counters.operation = Some(OperationSeq::new(1025));
+        assert_eq!(world.owner.receipt_status().unwrap().1, 1024);
+        let fenced = result(
+            &release,
+            StoreOutcome::RejectedCertain(RejectReason::Fenced),
+        );
+        let outcome = world.owner.step(fenced, GC_GRANT);
+        assert!(
+            matches!(outcome, StepOutcome::Applied { .. }),
+            "terminal consumption must progress at full receipt window: {outcome:?}"
+        );
         assert!(!world.owner.deadline_is_live(release.deadline));
-        assert!(world.drain().is_empty(),"new release waits for a confirmed collection");
-        assert_eq!(world.owner.receipt_status().unwrap().2,0);
-        assert_eq!(world.phase(7),Some(ExchangePhase::ReleasePending));
-        gc_apply(&mut world,Input::MaintainReceipts);
-        let collection_effects=world.drain();
-        let Effect::CollectReceipts {collection}=collection_effects[0].1 else {panic!("collection frees the control window")};
-        assert_eq!(collection.closure.through.get(),128);
-        gc_apply(&mut world,Input::ReceiptsCollected {effect:collection_effects[0].0,collection,
-            reply:crate::contract::receipts::ReceiptCollectionReply::Applied {
-                closure:collection.closure,removed:128,retained:896,more:false,
-            }});
-        gc_apply(&mut world,Input::MaintainReceipts);
-        let continuation=world.drain();
-        let Effect::Continue {continuation}=continuation[0].1 else {panic!("bounded release continuation")};
-        gc_apply(&mut world,Input::Continue {continuation,budget:WorkUnits::new(100_000)});
-        let retry=world.drain();
-        assert_eq!(kinds(&retry),["Persist","ArmDeadline"]);
-        let Effect::Persist {command}=&retry[0].1 else {panic!("release retry")};
-        let Recipe::ReleaseInbound(command)=command.recipe.get() else {panic!("same business termination")};
-        assert_eq!(command.operation.sequence().get(),1025);
-        assert_eq!(command.exchange, match release.facts {CommitFacts::InboundReleased {exchange}=>exchange,_=>panic!("release")});
-        assert_eq!(world.owner.receipt_status().unwrap().1,897);
+        assert!(
+            world.drain().is_empty(),
+            "new release waits for a confirmed collection"
+        );
+        assert_eq!(world.owner.receipt_status().unwrap().2, 0);
+        assert_eq!(world.phase(7), Some(ExchangePhase::ReleasePending));
+        gc_apply(&mut world, Input::MaintainReceipts);
+        let collection_effects = world.drain();
+        let Effect::CollectReceipts { collection } = collection_effects[0].1 else {
+            panic!("collection frees the control window")
+        };
+        assert_eq!(collection.closure.through.get(), 128);
+        gc_apply(
+            &mut world,
+            Input::ReceiptsCollected {
+                effect: collection_effects[0].0,
+                collection,
+                reply: crate::contract::receipts::ReceiptCollectionReply::Applied {
+                    closure: collection.closure,
+                    removed: 128,
+                    retained: 896,
+                    more: false,
+                },
+            },
+        );
+        gc_apply(&mut world, Input::MaintainReceipts);
+        let continuation = world.drain();
+        let Effect::Continue { continuation } = continuation[0].1 else {
+            panic!("bounded release continuation")
+        };
+        gc_apply(
+            &mut world,
+            Input::Continue {
+                continuation,
+                budget: WorkUnits::new(100_000),
+            },
+        );
+        let retry = world.drain();
+        assert_eq!(kinds(&retry), ["Persist", "ArmDeadline"]);
+        let Effect::Persist { command } = &retry[0].1 else {
+            panic!("release retry")
+        };
+        let Recipe::ReleaseInbound(command) = command.recipe.get() else {
+            panic!("same business termination")
+        };
+        assert_eq!(command.operation.sequence().get(), 1025);
+        assert_eq!(
+            command.exchange,
+            match release.facts {
+                CommitFacts::InboundReleased { exchange } => exchange,
+                _ => panic!("release"),
+            }
+        );
+        assert_eq!(world.owner.receipt_status().unwrap().1, 897);
     }
-
 }

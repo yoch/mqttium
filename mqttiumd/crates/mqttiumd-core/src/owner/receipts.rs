@@ -42,46 +42,7 @@ pub(super) enum Change {
     Confirm { closure: ReceiptClosure, more: bool },
 }
 
-#[cfg(test)]
-#[derive(PartialEq, Eq, Debug)]
-pub(super) struct Snapshot {
-    enabled: bool,
-    registered: bool,
-    acknowledged: ReceiptClosure,
-    entries: alloc::vec::Vec<Entry>,
-    pending: Option<Flight>,
-    sweep: bool,
-}
-
 impl State {
-    #[cfg(test)]
-    pub(super) fn test_fill_consumed_window(&mut self) {
-        let first = self.entries.as_slice()[0].boundary;
-        while self.entries.len() < RECEIPT_WINDOW {
-            let sequence = first.through.get() + u64::try_from(self.entries.len()).unwrap();
-            self.entries.try_push(Entry {boundary:ReceiptClosure {
-                through:OperationSeq::new(sequence), ..first
-            },consumed:true}).unwrap();
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn test_request_sweep(&mut self) {
-        self.sweep = true;
-    }
-
-    #[cfg(test)]
-    pub(super) fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            enabled: self.enabled,
-            registered: self.registered,
-            acknowledged: self.acknowledged,
-            entries: self.entries.as_slice().to_vec(),
-            pending: self.pending,
-            sweep: self.sweep,
-        }
-    }
-
     pub(super) fn new(origin: ReceiptOrigin) -> Result<Self, AllocationFailed> {
         Ok(Self {
             enabled: false,
@@ -401,6 +362,52 @@ impl Owner {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    #[derive(PartialEq, Eq, Debug)]
+    pub(crate) struct Snapshot {
+        enabled: bool,
+        registered: bool,
+        acknowledged: ReceiptClosure,
+        entries: alloc::vec::Vec<Entry>,
+        pending: Option<Flight>,
+        sweep: bool,
+    }
+    impl State {
+        pub(crate) fn test_fill_consumed_window(&mut self) {
+            let first = self.entries.as_slice()[0].boundary;
+            while self.entries.len() < RECEIPT_WINDOW {
+                let sequence = first.through.get() + u64::try_from(self.entries.len()).unwrap();
+                self.entries
+                    .try_push(Entry {
+                        boundary: ReceiptClosure {
+                            through: OperationSeq::new(sequence),
+                            ..first
+                        },
+                        consumed: true,
+                    })
+                    .unwrap();
+            }
+        }
+
+        pub(crate) fn test_request_sweep(&mut self) {
+            self.sweep = true;
+        }
+
+        pub(crate) fn snapshot(&self) -> Snapshot {
+            Snapshot {
+                enabled: self.enabled,
+                registered: self.registered,
+                acknowledged: self.acknowledged,
+                entries: self.entries.as_slice().to_vec(),
+                pending: self.pending,
+                sweep: self.sweep,
+            }
+        }
     }
 }
 
