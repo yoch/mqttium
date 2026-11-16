@@ -1,0 +1,10 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "14",
+  "kind": "session_shutdown_completed",
+  "pid": 1,
+  "details": {
+    "persistent_sessions": 128
+  }
+}

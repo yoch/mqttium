@@ -616,6 +616,134 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "session_shutdown_completed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "persistent_sessions",
+              "owner_bindings"
+            ],
+            "properties": {
+              "persistent_sessions": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 128
+              },
+              "owner_bindings": {
+                "const": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind",
+          "details"
+        ],
+        "properties": {
+          "kind": {
+            "const": "shutdown_incomplete"
+          },
+          "details": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "const": "pending_or_unknown"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "code",
+              "phase",
+              "lifecycle_pending",
+              "retired_flights",
+              "in_flight",
+              "closing_inputs"
+            ],
+            "properties": {
+              "code": {
+                "const": "pending_or_unknown"
+              },
+              "phase": {
+                "const": "Shutdown"
+              },
+              "lifecycle_pending": {
+                "type": "boolean"
+              },
+              "retired_flights": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 256
+              },
+              "in_flight": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 17
+              },
+              "closing_inputs": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 32
+              }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "details": {
+                  "required": [
+                    "lifecycle_pending"
+                  ],
+                  "properties": {
+                    "lifecycle_pending": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "operation"
+              ]
+            }
+          }
+        ]
+      }
     }
   ],
   "$defs": {

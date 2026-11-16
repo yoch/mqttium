@@ -542,6 +542,16 @@ progress while preventing later application packets from consuming the ordinary
 owner queue. This is separate from the bounded reader channel and socket bytes
 that the reactor has not yet collected.
 
+Orderly shutdown gives accepted work and zero-policy session ends at most
+`session_shutdown_timeout_ms = 2000` before writer release. The bounded
+`session_shutdown_completed` inventory reports at most 128 persistent sessions
+and zero owner bindings. `shutdown_incomplete` with `code=pending_or_unknown`
+retains phase Shutdown, the lifecycle-pending flag, bounded retired/in-flight/
+closing counts and the original operation when a lifecycle is pending. It does
+not claim certain rejection or complete cleanup. The older writer-deadline
+shape (`code=writer_deadline`, `accepted_outcome=unknown`) remains readable.
+These observations remain product-system facts, outside fixture qualification.
+
 The following control-file catalogue is product-system instrumentation behind
 `mqttiumd/test-hooks`, absent from the normal build. It does not add selectors
 to the fixture-based fault catalogue or widen that qualifier. Capture controls

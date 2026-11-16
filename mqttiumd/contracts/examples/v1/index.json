@@ -119,6 +119,10 @@
     "contracts/examples/v1/valid/product-maintenance-read-refused.json",
     "contracts/examples/v1/valid/product-ack-receipt.json",
     "contracts/examples/v1/valid/product-puback-credit.json",
+    "contracts/examples/v1/valid/product-session-shutdown-completed.json",
+    "contracts/examples/v1/valid/product-session-shutdown-unknown.json",
+    "contracts/examples/v1/valid/product-session-shutdown-business-unknown.json",
+    "contracts/examples/v1/valid/product-writer-shutdown-deadline.json",
     "contracts/examples/v1/valid/product-session-change-copied.json",
     "contracts/examples/v1/valid/product-session-change-replayed.json",
     "contracts/examples/v1/valid/product-session-close-copied.json",
@@ -1969,6 +1973,12 @@
       "why": "The configured bound matches the declared runtime queue rather than historical traffic."
     },
     {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-session_shutdown_timeout_ms.json",
+      "code": "schema-violation",
+      "pointer": "/session_shutdown_timeout_ms",
+      "why": "The configured bound matches the declared runtime queue rather than historical traffic."
+    },
+    {
       "file": "contracts/examples/v1/invalid/product-session-transitions-wrong-decision.json",
       "code": "schema-violation",
       "pointer": "/decision",
@@ -2177,6 +2187,54 @@
       "code": "u64-out-of-range",
       "pointer": "/operation/sequence",
       "why": "Product event identities retain the shared 64-bit range."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-shutdown-invalid-persistent-sessions.json",
+      "code": "schema-violation",
+      "pointer": "/details/persistent_sessions",
+      "why": "Completed session shutdown retains a bounded persistent inventory and no transport binding."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-shutdown-invalid-owner-bindings.json",
+      "code": "schema-violation",
+      "pointer": "/details/owner_bindings",
+      "why": "Completed session shutdown retains a bounded persistent inventory and no transport binding."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-shutdown-missing-binding-count.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "A completion must state the absence of owner transport bindings."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-shutdown-invalid-phase.json",
+      "code": "schema-violation",
+      "pointer": "/details/phase",
+      "why": "Uncertain session shutdown retains its phase and configured resource bounds."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-shutdown-invalid-retired-flights.json",
+      "code": "schema-violation",
+      "pointer": "/details/retired_flights",
+      "why": "Uncertain session shutdown retains its phase and configured resource bounds."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-shutdown-invalid-in-flight.json",
+      "code": "schema-violation",
+      "pointer": "/details/in_flight",
+      "why": "Uncertain session shutdown retains its phase and configured resource bounds."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-shutdown-invalid-closing-inputs.json",
+      "code": "schema-violation",
+      "pointer": "/details/closing_inputs",
+      "why": "Uncertain session shutdown retains its phase and configured resource bounds."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-shutdown-missing-original-operation.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "A pending lifecycle retains its original operation rather than losing correlation at shutdown."
     },
     {
       "file": "contracts/examples/v1/invalid/product-session-change-copied-missing-identity.json",

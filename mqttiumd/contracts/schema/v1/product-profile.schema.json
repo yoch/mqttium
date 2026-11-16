@@ -59,7 +59,8 @@
     "closing_input_slots",
     "terminal_input_slots",
     "frame_registration_slots",
-    "pre_connack_packet_slots"
+    "pre_connack_packet_slots",
+    "session_shutdown_timeout_ms"
   ],
   "properties": {
     "format": {
@@ -253,6 +254,9 @@
     },
     "pre_connack_packet_slots": {
       "const": 1
+    },
+    "session_shutdown_timeout_ms": {
+      "const": 2000
     }
   }
 }

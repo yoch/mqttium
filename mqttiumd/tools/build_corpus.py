@@ -3451,7 +3451,8 @@ for kind_name, origin in [
 ok("product-profile.json", json.loads((V1 / "product-profile.json").read_text()))
 product_profile = json.loads((V1 / "product-profile.json").read_text())
 for field, expected in (("closing_input_slots", 32), ("terminal_input_slots", 336),
-                        ("frame_registration_slots", 208), ("pre_connack_packet_slots", 1)):
+                        ("frame_registration_slots", 208), ("pre_connack_packet_slots", 1),
+                        ("session_shutdown_timeout_ms", 2000)):
     bad(f"product-profile-wrong-{field}.json", "schema-violation", f"/{field}",
         "The configured bound matches the declared runtime queue rather than historical traffic.",
         {**product_profile, field: expected + 1})
@@ -3582,6 +3583,32 @@ for pointer, edit in [
 ]:
     bad("product-event-overflow-" + pointer.rsplit("/", 1)[1] + ".json", "u64-out-of-range", pointer,
         "Product event identities retain the shared 64-bit range.", edit)
+# Shutdown preserves uncertainty without inventing an operation or success.
+shutdown_completed = env("mqttiumd.product-event", seq="14", kind="session_shutdown_completed", pid=1,
+    details={"persistent_sessions":128, "owner_bindings":0})
+ok("product-session-shutdown-completed.json", shutdown_completed)
+for member, value in (("persistent_sessions",129),("owner_bindings",1)):
+    bad("product-session-shutdown-invalid-" + member.replace("_","-") + ".json", "schema-violation", "/details/"+member,
+        "Completed session shutdown retains a bounded persistent inventory and no transport binding.",
+        edited(shutdown_completed, lambda v, key=member, value=value: v["details"].update({key:value})))
+bad("product-session-shutdown-missing-binding-count.json", "schema-violation", "/details",
+    "A completion must state the absence of owner transport bindings.",
+    edited(shutdown_completed, lambda v: v["details"].pop("owner_bindings")))
+shutdown_unknown = env("mqttiumd.product-event", seq="15", kind="shutdown_incomplete", pid=1,
+    operation=OP, details={"code":"pending_or_unknown", "phase":"Shutdown", "lifecycle_pending":True,
+    "retired_flights":256, "in_flight":17, "closing_inputs":32})
+ok("product-session-shutdown-unknown.json", shutdown_unknown)
+ok("product-session-shutdown-business-unknown.json", edited(shutdown_unknown,
+    lambda v: (v.pop("operation"), v["details"].update(lifecycle_pending=False))))
+ok("product-writer-shutdown-deadline.json", env("mqttiumd.product-event", seq="16", kind="shutdown_incomplete", pid=1,
+    details={"code":"writer_deadline", "accepted_outcome":"unknown"}))
+for member, value in (("phase","Recovery"),("retired_flights",257),("in_flight",18),("closing_inputs",33)):
+    bad("product-session-shutdown-invalid-"+member.replace("_","-")+".json", "schema-violation", "/details/"+member,
+        "Uncertain session shutdown retains its phase and configured resource bounds.",
+        edited(shutdown_unknown, lambda v, key=member, value=value: v["details"].update({key:value})))
+bad("product-session-shutdown-missing-original-operation.json", "schema-violation", "",
+    "A pending lifecycle retains its original operation rather than losing correlation at shutdown.",
+    edited(shutdown_unknown, lambda v: v.pop("operation")))
 # Lifecycle observations keep exact identities and bounded resource inventories.
 for observed_kind in ("session_change_copied", "session_change_replayed",
                       "session_close_copied", "session_close_replayed"):

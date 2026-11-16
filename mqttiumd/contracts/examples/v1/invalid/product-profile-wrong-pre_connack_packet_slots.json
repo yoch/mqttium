@@ -74,5 +74,6 @@
   "closing_input_slots": 32,
   "terminal_input_slots": 336,
   "frame_registration_slots": 208,
-  "pre_connack_packet_slots": 2
+  "pre_connack_packet_slots": 2,
+  "session_shutdown_timeout_ms": 2000
 }
