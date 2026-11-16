@@ -12,7 +12,6 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import socket
 import sqlite3
 import subprocess
 import sys
@@ -558,6 +557,7 @@ def subscription_recovery(binary: Path, case: Path) -> dict:
                 target = session_key(state, "grant-recovery")
                 rows = [row for row in state["tables"]["routes"] if row["session"] == target]
                 require(len(rows) == 1 and rows[0]["qos"] == grant, "recovered_grant_changed")
+                write_json(case / f"grant-recovery-{iteration}-before.json", state)
                 sent = publish(resumed, case, f"grant-publisher-{iteration}", "mqttium" if grant else "paho",
                                topic, f"restored-grant-{grant}".encode(), 2)
                 message = subscriber.next_publication()
@@ -566,8 +566,10 @@ def subscription_recovery(binary: Path, case: Path) -> dict:
                 if grant == 1:
                     subscriber.subscribe(3, [(topic, 0)], expected=(0,))
                 results.append({"restored_grant": grant, "public_client": sent,
-                                "no_subscribe_before_delivery": True, "message": message.observation()})
-            drained(resumed, case, admissions=iteration + 1)
+                                "no_subscribe_before_delivery": True, "message": message.observation(),
+                                "durable_before": f"grant-recovery-{iteration}-before.json"})
+            finished = drained(resumed, case, admissions=iteration + 1)
+            write_json(case / f"grant-recovery-{iteration}-finished.json", finished)
             resumed.stop()
         writer_available(broker.db)
         return {"criterion": "G-recovery", "status": "PASS", "restarts": results,
