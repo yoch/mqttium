@@ -1,0 +1,16 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "2",
+  "kind": "barrier_hit",
+  "pid": 1,
+  "connection": "1",
+  "point": "ack.receipt",
+  "details": {
+    "effect": "2/0/7",
+    "packet_id": 1,
+    "publish_order": "3",
+    "bytes": 4,
+    "socket_write_complete": true
+  }
+}

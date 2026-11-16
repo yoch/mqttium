@@ -3227,6 +3227,12 @@ ok("product-profile.json", json.loads((V1 / "product-profile.json").read_text())
 product_event = env("mqttiumd.product-event", seq="1", kind="startup_refused", pid=1,
                     cause="InvalidData", phase="Snapshot", details={"code": "durable_read"})
 ok("product-event.json", product_event)
+ok("product-ack-receipt.json", env("mqttiumd.product-event", seq="2", kind="barrier_hit", pid=1,
+   connection="1", point="ack.receipt", details={"effect":"2/0/7", "packet_id":1,
+   "publish_order":"3", "bytes":4, "socket_write_complete":True}))
+ok("product-puback-credit.json", env("mqttiumd.product-event", seq="3", kind="receive_credit", pid=1,
+   connection="1", details={"packet_kind":"PUBACK", "effect":"2/0/7", "packet_id":1,
+   "publish_order":"3", "released":False}))
 bad("product-event-untyped-cause.json", "schema-violation", "/cause",
     "A durable cause is a stable code, never an SQL message.",
     {**product_event, "cause": "qos 99"})

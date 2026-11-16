@@ -650,7 +650,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--mode", choices=("basic", "complete"), default="basic")
+    parser.add_argument("--mode", choices=("basic", "normal", "complete"), default="basic")
     parser.add_argument("--case", choices=("A", "B", "C", "D", "E", "F", "G-concurrency", "G-generation", "H"))
     args = parser.parse_args()
     require(args.binary.is_file(), "binary_missing", str(args.binary))
@@ -662,6 +662,9 @@ def main() -> int:
               "mode": args.mode, "cases": []}
     try:
         cases = [("A", paho)]
+        if args.mode == "normal" and args.case is None:
+            cases += [("B", framing), ("E", reuse), ("F", invalid_startup),
+                      ("G-concurrency", concurrency)]
         if args.mode == "complete" or args.case:
             cases += [("B", framing), ("C", barriers), ("D", recovery), ("E", reuse),
                       ("F", invalid_startup), ("G-concurrency", concurrency),

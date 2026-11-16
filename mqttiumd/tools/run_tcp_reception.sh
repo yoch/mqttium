@@ -91,7 +91,7 @@ tcp_run() {
         "${tcp_command[@]}"
     fi
 }
-tcp_run normal "$tcp_output/binaries/mqttiumd-normal" basic
+tcp_run normal "$tcp_output/binaries/mqttiumd-normal" normal
 tcp_run product "$tcp_output/binaries/mqttiumd-hooks" complete
 
 for tcp_mutation in early-ack stale-generation; do
@@ -155,13 +155,14 @@ summary = {'format': 'mqttiumd.tcp-system-reception-index', 'schema_version': 1,
            'status': 'PASS', 'qualification': 'system-test-only', 'source_head': sys.argv[2],
            'source_archive': {'path': 'source.tar', 'sha256': hashlib.sha256((out / 'source.tar').read_bytes()).hexdigest()},
            'commands': 'commands.jsonl',
-           'independent_client': {'name': 'paho-mqtt', 'version': version('paho-mqtt')},
+           'independent_clients': {'primary': 'mqttium 1.3.0 from identified checkout',
+                                   'secondary': {'name': 'paho-mqtt', 'version': version('paho-mqtt')}},
            'system_witnesses': 'same-run-strace' if int(sys.argv[3]) else 'process-wait-status-only',
            'receipts': {name: {'path': f'{name}/receipt.json', 'status': receipt['status'],
                               'binary': receipt['binary'], 'failure': receipt.get('failure')}
                         for name, receipt in receipts.items()},
            'cases': receipts['product']['cases'],
-           'limitations': ['No subscriber delivery, QoS 1 or complete MQTT conformance claim.',
+           'limitations': ['No subscriber delivery or complete MQTT conformance claim. QoS 1 has its own system receipt.',
                            'Process kills do not establish storage or power-loss guarantees.',
                            'Finite system tests are distinct from qualifying fixture-based oracle campaigns.']}
 (out / 'index.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')

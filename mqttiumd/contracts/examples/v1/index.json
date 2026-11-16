@@ -86,7 +86,9 @@
     "contracts/examples/v1/valid/toy.transitions.seed-with-hole.json",
     "contracts/examples/v1/valid/wide.catalog.json",
     "contracts/examples/v1/valid/product-profile.json",
-    "contracts/examples/v1/valid/product-event.json"
+    "contracts/examples/v1/valid/product-event.json",
+    "contracts/examples/v1/valid/product-ack-receipt.json",
+    "contracts/examples/v1/valid/product-puback-credit.json"
   ],
   "invalid": [
     {

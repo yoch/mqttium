@@ -222,9 +222,9 @@ jobs:
           cargo clippy --workspace --all-targets --locked -- -D warnings
 
   tcp-product:
-    name: product TCP QoS 2
+    name: product TCP QoS 1 and QoS 2
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -243,6 +243,8 @@ jobs:
         run: cargo clippy -p mqttiumd --all-targets --features test-hooks --locked -- -D warnings
       - name: Real product TCP reception and precise negative controls
         run: tools/run_tcp_reception.sh "$RUNNER_TEMP/tcp-product"
+      - name: Durable QoS 1 with mqttium, Paho and precise negative controls
+        run: tools/run_qos1_reception.sh "$RUNNER_TEMP/tcp-qos1"
       - name: Keep each product run's own evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -252,4 +254,14 @@ jobs:
             ${{ runner.temp }}/tcp-product
             ${{ runner.temp }}/tcp-product.tar.gz
             ${{ runner.temp }}/tcp-product.tar.gz.sha256
+          if-no-files-found: error
+      - name: Keep each QoS 1 run's own evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-tcp-qos1-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/tcp-qos1
+            ${{ runner.temp }}/tcp-qos1.tar.gz
+            ${{ runner.temp }}/tcp-qos1.tar.gz.sha256
           if-no-files-found: error

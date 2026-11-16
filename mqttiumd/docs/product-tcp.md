@@ -1,9 +1,9 @@
-# Experimental durable incoming QoS 2 over TCP
+# Experimental durable incoming QoS 1 and QoS 2 over TCP
 
 The product executable receives MQTT 5 publications durably. It does not
 subscribe clients or deliver publications to subscribers. This experimental
 subset is not a conforming complete MQTT 5 broker or a Mosquitto replacement:
-MQTT 5 also requires lower QoS support. QoS 1 is the next increment.
+QoS 0 and subscriber delivery are still outside this profile.
 
 ## Launch and external client
 
@@ -14,7 +14,8 @@ cargo build --locked -p mqttiumd
 ./target/debug/mqttiumd --db /tmp/mqttiumd.sqlite \
   --listen 127.0.0.1:1883 --events /tmp/mqttiumd.events.jsonl
 python -m pip install -r tests/system/requirements.txt
-python tests/system/external_paho.py --port 1883 --client-id example-client
+python tests/system/external_mqttium.py --port 1883 --client-id example-client --qos 1 --qos 2
+python tests/system/external_paho.py --port 1883 --client-id second-client --qos 1
 ```
 
 The database path may be absent. Its parent directory must exist. An existing
@@ -30,14 +31,14 @@ before a successful CONNACK with Session Present 0. Known sessions resume
 with Session Present 1. An unknown creation result closes the connection;
 it is never blindly retried. A later connection performs a new durable lookup.
 
-The profile accepts non-retained QoS 2 PUBLISH, PUBREL, PINGREQ and ordinary
+The profile accepts non-retained QoS 1/2 PUBLISH, PUBREL, PINGREQ and ordinary
 DISCONNECT. It supports Keep Alive: a valid completed packet resets the
 1.5-times-Keep-Alive deadline; fragments do not. Keep Alive 0 disables that
 MQTT timer, not the absolute partial-packet or write deadlines. PINGREQ goes
 through the core and produces PINGRESP.
 
 No Will, authentication, retained messages, subscriptions, topic aliases,
-PUBLISH properties, QoS 0 or QoS 1 are implemented. Necessary CONNECT properties
+PUBLISH properties or QoS 0 are implemented. Necessary CONNECT properties
 are parsed and validated. Client Maximum Packet Size constrains every emitted
 response. Receive Maximum, Topic Alias Maximum and Request Problem Information
 are checked; with no outgoing PUBLISH and no diagnostic strings their advertised
@@ -70,6 +71,31 @@ A full queue cannot silently discard a core effect: the Outbox retains the same
 identity until accepted or the closed generation receives an explicit failed
 frame result. Store results stay correlated after socket closure.
 
+QoS 1 uses the same owner admission and writer as QoS 2. A positive PUBACK
+requires a known admission commit. A certain refusal carries Quota Exceeded
+(0x97) or Implementation Specific Error (0x83); an unknown outcome emits
+neither success nor certain rejection and retains its OperationId for
+resolution. QoS 1 creates no durable AwaitPubrel marker, charges no durable
+exchange slot and never submits ReleaseInbound. Its volatile admission and
+pending PUBACK still hold one bounded owner lease until their own completion
+or generation closure. Publications without obligations are collected normally.
+
+Once PUBACK is eligible, another PUBLISH using that Packet Identifier is a
+new occurrence, even with DUP set or identical bytes. This permits a client
+that received PUBACK to proceed before its internal write receipt arrives.
+Each occurrence has fresh operation/publication/exchange identities. A retained
+frame carries its core-frozen PUBLISH ingress order; an old receipt cannot end
+the new occurrence or return its receive credit. Receive Maximum completion
+also checks packet kind: PUBACK for QoS 1, PUBCOMP or negative PUBREC for QoS 2.
+Before an admission's outcome is known, its replay keeps the same operation;
+an identifier still active in that phase cannot change QoS.
+
+After a lost PUBACK or broker restart, MQTT QoS 1 retransmission may admit a
+second application occurrence. MQTT-4.3.2-5 requires a new publication after
+PUBACK is sent, regardless of DUP. No permanent deduplication by Packet
+Identifier is promised. Repeating the same internal OperationId remains
+idempotent. A local socket write receipt does not establish peer receipt.
+
 Connection generations never repeat. The runtime validates ingress against
 its current live map, including immediately before the core consumes it; this
 continues after the core forgets an old closed generation. Late durable results
@@ -93,14 +119,24 @@ has no graceful drain and relies on SQLite recovery plus MQTT retransmission.
 
 ```bash
 tools/run_tcp_reception.sh /tmp/mqttiumd-tcp-reception
+tools/run_qos1_reception.sh /tmp/mqttiumd-qos1-reception
 ```
 
 The receipt is a system test, not a qualifying result of the fixture-based
-lab oracle. It retains the actual executable hashes, commands, Paho version,
+lab oracle. mqttium 1.3.0 is the primary client, using only its public API;
+Paho 2.1.0 remains a second implementation. The receipts retain imported client
+source/version/hash, actual executable hashes, commands,
 client bytes, product events, database facts and process receipts of its runs.
 Test hooks require `--features mqttiumd/test-hooks` and are absent by default;
 Cargo's effective SQLite feature is recorded independently. Before-commit and
 committed-before-PUBREC holds are acknowledged by synced events; the supervisor
 releases a hold or actually kills that same process. Mutant controls run in
 isolated worktrees and are rejected for premature ACK/stale-generation reasons.
+The QoS 1 receipt additionally holds one internal PUBACK write receipt without
+blocking the reactor and detects premature PUBACK/stale-receipt mutations.
+Its independent proxy observes a real PUBACK and withholds it from the client;
+bounded automatic reconnect preserves the mqttium process and original receipt.
+Normal binaries execute nominal, identifier-reuse and mixed-QoS paths too.
+Quota interventions are isolated system controls, recorded after readiness,
+and restored; their outcomes are not ordinary production configuration changes.
 Existing K1/K2b/K3 campaigns retain their separate qualification scope.

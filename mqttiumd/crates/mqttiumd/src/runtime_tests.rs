@@ -540,6 +540,150 @@ fn a_real_puback_write_receipt_returns_its_receive_credit() {
     });
 }
 
+#[test]
+fn a_peer_reuses_qos1_identifier_before_the_old_internal_written_receipt() {
+    with_runtime(4, |runtime, _| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"qos1-reuse-race"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        let session = runtime.sessions[b"qos1-reuse-race".as_slice()].id;
+        let id = InboundPacketId::new(1).unwrap();
+        runtime.packet(generation, 0x32, publish_body(1)).unwrap();
+        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        // This read proves the client can legally reuse PI 1. Deliberately do
+        // not poll the socket's internal Written channel before the new input.
+        assert_eq!(read_frame(&mut client), (0x40, vec![0, 1]));
+        let old = *runtime
+            .frames
+            .iter()
+            .find(|(_, f)| f.kind == "PUBACK")
+            .unwrap()
+            .0;
+        runtime.packet(generation, 0x3a, publish_body(1)).unwrap();
+        let serial = runtime.peers[&generation].receiving.serial(1);
+        runtime.drain_inputs().unwrap();
+        assert_eq!(
+            runtime.inflight.len(),
+            1,
+            "a new internal operation was submitted"
+        );
+        let new_operation = *runtime.inflight.values().next().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.frames.contains_key(&old) && Instant::now() < deadline {
+            runtime.connections().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !runtime.frames.contains_key(&old),
+            "the actual old Written arrived"
+        );
+        runtime.drain_inputs().unwrap();
+        assert_eq!(
+            runtime.peers[&generation].receiving.serial(1),
+            serial,
+            "old receipt cannot return the new PUBLISH receive credit"
+        );
+        assert_eq!(runtime.inflight.values().next(), Some(&new_operation));
+        assert_eq!(
+            runtime.owner.exchange(session, id).unwrap().1,
+            ExchangePhase::AdmissionPending
+        );
+        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        assert_eq!(read_frame(&mut client), (0x40, vec![0, 1]));
+    });
+}
+
+#[test]
+fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_failure() {
+    with_runtime(4, |runtime, directory| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"qos1-output-full"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        until(runtime, |r| r.frames.is_empty());
+        runtime.packet(generation, 0x32, publish_body(1)).unwrap();
+        runtime.drain_inputs().unwrap();
+        assert_eq!(runtime.inflight.len(), 1);
+        // Hold the connection adapter at the receiver side of its real bounded
+        // channel. This isolates Sink's PUBACK queue refusal; the separate G
+        // system run establishes saturation by an actual TCP nonreader.
+        let (blocked, receiver) = std::sync::mpsc::sync_channel(net::OUTPUT_SLOTS);
+        for _ in 0..net::OUTPUT_SLOTS {
+            blocked
+                .try_send(net::Write {
+                    correlation: None,
+                    bytes: vec![0xd0, 0],
+                })
+                .unwrap();
+        }
+        let original = std::mem::replace(
+            &mut runtime.peers.get_mut(&generation).unwrap().io.outgoing,
+            blocked,
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !runtime.inflight.is_empty() && Instant::now() < deadline {
+            runtime.writer_results().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(runtime.inflight.is_empty());
+        runtime.drain_inputs().unwrap();
+        let retained: Vec<_> = runtime
+            .owner
+            .outbox()
+            .unwrap()
+            .pending()
+            .filter(|e| {
+                matches!(
+                    e.effect(),
+                    Effect::EmitFrame {
+                        frame: OutboundFrame::Puback { .. },
+                        ..
+                    }
+                )
+            })
+            .map(OwnedEffect::id)
+            .collect();
+        assert_eq!(
+            retained.len(),
+            1,
+            "the full queue retains the same PUBACK effect"
+        );
+        assert!(!runtime.peers.contains_key(&generation));
+        runtime.drain_inputs().unwrap();
+        runtime.dispatch().unwrap();
+        assert!(runtime.owner.outbox().unwrap().is_empty());
+        let events: Vec<serde_json::Value> =
+            std::fs::read_to_string(directory.join("events.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        let effect = effect_text(retained[0]);
+        assert!(events.iter().any(|e| e["kind"] == "effect_retained"
+            && e["details"]["effect"] == effect
+            && e["details"]["packet_kind"] == "PUBACK"));
+        assert!(
+            events
+                .iter()
+                .any(|e| e["kind"] == "frame_failed" && e["details"]["effect"] == effect)
+        );
+        let state =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert_eq!(
+            state.operations.len(),
+            1,
+            "transport failure does not cancel the admission"
+        );
+        assert!(state.inbound.is_empty() && state.publications.is_empty());
+        drop((original, receiver));
+    });
+}
+
 fn connect_then_subscribe(client_id: &[u8]) -> Vec<u8> {
     let mut body = vec![
         0, 4, b'M', b'Q', b'T', b'T', 5, 0, 0, 10, 5, 0x11, 255, 255, 255, 255,
