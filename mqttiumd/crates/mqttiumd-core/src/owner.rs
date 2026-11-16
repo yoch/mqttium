@@ -1075,6 +1075,7 @@ impl Owner {
             };
         }
         match input {
+            Input::Qos0EmitRefused { .. } => Ok(Change::Nothing),
             Input::ConnectionSettings {
                 connection,
                 receive_maximum,
@@ -1999,6 +2000,7 @@ impl Owner {
                     target,
                     target_revision,
                     claim,
+                    ..
                 } => self.valid_outbound_fact(
                     *delivery,
                     *target,
@@ -2335,6 +2337,7 @@ impl Owner {
                 target,
                 target_revision,
                 claim,
+                ..
             } => self.add_outbound_fact(*delivery, *target, *target_revision, *claim)?,
             RecoveredFact::Epoch { .. } => self.epoch_recovered = true,
             RecoveredFact::Limits {
@@ -2699,6 +2702,8 @@ mod tests {
             Effect::ResolveAndFence { .. } => "ResolveAndFence",
             Effect::LoadWork { .. } => "LoadWork",
             Effect::EmitPublish { .. } => "EmitPublish",
+            Effect::EmitQos0 { .. } => "EmitQos0",
+            Effect::Qos0Dropped { .. } => "Qos0Dropped",
             Effect::CloseConnection { .. } => "CloseConnection",
             Effect::ArmDeadline { .. } => "ArmDeadline",
             Effect::Continue { .. } => "Continue",
@@ -2851,6 +2856,8 @@ mod tests {
             assert_eq!(*after, LogicalDuration::new(5));
             let facts = match command.recipe.get() {
                 Recipe::ChangeSubscriptions(_)
+                | Recipe::UpdateSubscriptions(_)
+                | Recipe::ConsumeDelivery(_)
                 | Recipe::ClaimDelivery(_)
                 | Recipe::FinishDelivery(_) => panic!("pubsub command needs its own facts"),
                 Recipe::AdmitPublication(admit) => {
@@ -2882,7 +2889,8 @@ mod tests {
         /// for an admission.
         fn refusal_of(&self, flight: &Flight) -> StoreOutcome {
             let reason = match flight.facts {
-                CommitFacts::SubscriptionsChanged { .. }
+                CommitFacts::DeliveryConsumed { .. }
+                | CommitFacts::SubscriptionsChanged { .. }
                 | CommitFacts::DeliveryClaimed { .. }
                 | CommitFacts::DeliveryFinished { .. } => RejectReason::PreconditionFailed,
                 CommitFacts::InboundReleased { .. } => RejectReason::Fenced,
@@ -6537,6 +6545,7 @@ mod tests {
             },
             target: SessionId::new(PRODUCER),
             target_revision: Revision::new(PRODUCER + 10),
+            qos: Qos::AtLeastOnce,
             topic: bytes(b"fresh"),
             payload: bytes(b"payload"),
             claim: None,
@@ -6805,6 +6814,7 @@ mod tests {
             delivery: item.delivery,
             target: item.target,
             target_revision: item.target_revision,
+            qos: item.qos,
             claim: item.claim,
         });
         world.applied(page(&inventory, true));
@@ -6837,6 +6847,7 @@ mod tests {
             delivery: item.delivery,
             target: item.target,
             target_revision: item.target_revision,
+            qos: item.qos,
             claim: None,
         });
         world.applied(page(&inventory, true));
