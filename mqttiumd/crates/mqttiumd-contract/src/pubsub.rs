@@ -1,5 +1,7 @@
 //! Bounded exact-subscription and outgoing QoS 1 data (ADR 0025).
-use crate::ids::{ConnectionKey, DeliveryId, OperationId, OutboundPacketId, Revision, SessionId};
+use crate::ids::{
+    ConnectionKey, DeliveryId, EffectId, OperationId, OutboundPacketId, Revision, SessionId,
+};
 use crate::packet::{Qos, SharedBytes, TooLarge};
 use alloc::sync::Arc;
 
@@ -131,6 +133,17 @@ impl Qos0DropReason {
 pub struct DeliveryClaim {
     pub operation: OperationId,
     pub packet_id: OutboundPacketId,
+}
+
+/// An immutable association of a validated PUBACK observation with one
+/// outgoing occurrence (ADR 0028). The Packet Identifier is recyclable;
+/// none of these causal identities is. The connection and packet number
+/// travel in `Input::ObservedPuback` alongside this target.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PubackTarget {
+    pub delivery: DeliveryId,
+    pub claim: OperationId,
+    pub frame: EffectId,
 }
 
 /// A coherent bounded work read; payload is loaded only for online work,

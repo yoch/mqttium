@@ -23,7 +23,7 @@ use crate::ids::{
 };
 use crate::outcome::{EpochGrant, Knowledge, StoreReply};
 use crate::packet::{InboundPacket, OutboundFrame, Qos, SharedBytes};
-use crate::pubsub::{DeliveryClaim, Qos0DropReason, Qos0Origin, WorkItem};
+use crate::pubsub::{DeliveryClaim, PubackTarget, Qos0DropReason, Qos0Origin, WorkItem};
 
 /// Durable phase of an inbound QoS 2 exchange.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -254,6 +254,17 @@ pub enum Input {
         connection: ConnectionGeneration,
         ingress_order: u64,
         packet: InboundPacket,
+    },
+    /// A PUBACK whose association was frozen by the adapter before entering
+    /// its input queue. `None` is a completed observation without a target,
+    /// never a request to look up the current occupant later. Product TCP
+    /// observes after dequeue/validation of the reader channel, not at the
+    /// earlier socket read. This carries no authority for unobserved bytes.
+    ObservedPuback {
+        connection: ConnectionKey,
+        packet_id: OutboundPacketId,
+        reason: u8,
+        target: Option<PubackTarget>,
     },
     /// The store's answer to one effect, for one operation.
     StoreResult {
