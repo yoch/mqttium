@@ -2,7 +2,7 @@
 from types import SimpleNamespace
 import unittest
 
-from receipt_reception import stable_receipt_pressure, wait_control_or_pressure
+from receipt_reception import stable_receipt_pressure, wait_committed_resolution, wait_control_or_pressure
 from tcp_probe import Frame, ReceiptFailure
 
 
@@ -48,6 +48,21 @@ class Broker:
 
 
 class ReceiptControlWaitTests(unittest.TestCase):
+    def test_interim_unknown_resolution_does_not_hide_later_commit(self):
+        operation = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "13"}
+        unknown = {"kind": "store_resolved", "seq": "10", "operation": operation,
+                   "details": {"outcome": "pendingorunknown"}}
+        committed = {**unknown, "seq": "11", "details": {"outcome": "committed"}}
+        self.assertIs(wait_committed_resolution(Broker([unknown, committed]), operation, after=1), committed)
+
+    def test_contradictory_terminal_resolution_cannot_be_skipped(self):
+        operation = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "13"}
+        refused = {"kind": "store_resolved", "seq": "10", "operation": operation,
+                   "details": {"outcome": "rejectedcertain"}}
+        committed = {**refused, "seq": "11", "details": {"outcome": "committed"}}
+        with self.assertRaises(ReceiptFailure):
+            wait_committed_resolution(Broker([refused, committed]), operation, after=1)
+
     def test_late_suback_without_pressure_is_still_consumed(self):
         clock = Clock()
         wire = Wire(clock, [None, ACK])

@@ -641,6 +641,13 @@ def stable_receipt_pressure(event: dict, state: dict, unknown_sequence: int) -> 
             and int(event["details"].get("unconsumed_holes", 0)) >= 1)
 
 
+def wait_committed_resolution(broker, operation: dict, *, after: int, timeout: float = 3):
+    resolved = broker.wait_event("store_resolved", after=after, timeout=timeout)
+    require(resolved["operation"] == operation and resolved["details"]["outcome"].lower() == "committed",
+            "unknown_resolution_changed_operation")
+    return resolved
+
+
 def unknown_hole(binary: Path, case: Path) -> dict:
     broker = Broker(binary, case, test_control=True)
     held = HeldBusiness(broker, case)
@@ -722,9 +729,7 @@ def unknown_hole(binary: Path, case: Path) -> dict:
             (broker.control / "hold-admission-result").unlink()
             broker.observations.record("held_result_release", operation=operation)
             require(source.wait(0x40, 1, timeout=15).ack() == (1, 0), "same_operation_resolution_did_not_ack")
-            resolved = broker.wait_event("store_resolved", after=int(hit["seq"]), timeout=3)
-            require(resolved["operation"] == operation and resolved["details"]["outcome"].lower() == "committed",
-                    "unknown_resolution_changed_operation")
+            resolved = wait_committed_resolution(broker, operation, after=int(hit["seq"]))
             result["same_operation_resolution"] = resolved
         advanced = until(lambda: (state if operation_floor(state, operation) >= int(operation["sequence"]) else None)
                          if (state := durable(broker.db)) else None,
