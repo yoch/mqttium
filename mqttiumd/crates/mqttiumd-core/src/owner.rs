@@ -714,7 +714,7 @@ fn capacity_of(bound: usize) -> u64 {
 /// the first of them was seen and end where a later kind starts.
 fn run<'a>(
     facts: &'a [RecoveredFact],
-    starts: &[Option<usize>; 7],
+    starts: &[Option<usize>; 8],
     rank: FactRank,
     upto: usize,
 ) -> &'a [RecoveredFact] {
@@ -950,7 +950,9 @@ impl Owner {
             let compared = match fact.rank() {
                 FactRank::Route => routes,
                 FactRank::Session => sessions,
-                FactRank::InboundExchange => sessions.saturating_add(slots),
+                FactRank::InboundExchange | FactRank::OutboundDelivery => {
+                    sessions.saturating_add(slots)
+                }
                 FactRank::Epoch | FactRank::Limits | FactRank::RouteTable | FactRank::Operation => {
                     0
                 }
@@ -1051,6 +1053,7 @@ impl Owner {
             };
         }
         match input {
+            Input::ConnectionSettings { .. } | Input::WorkPage { .. } => Err(IMPOSSIBLE),
             Input::SessionEstablished {
                 connection,
                 session,
@@ -1285,6 +1288,9 @@ impl Owner {
             generation: connection,
         };
         match packet {
+            InboundPacket::Subscribe { .. }
+            | InboundPacket::Unsubscribe { .. }
+            | InboundPacket::Puback { .. } => protocol_error(draft),
             InboundPacket::ConnectResume { .. } => Err(IMPOSSIBLE),
             InboundPacket::Pingreq => {
                 draft.frame(key, OutboundFrame::Pingresp)?;
@@ -1916,7 +1922,7 @@ impl Owner {
         let mut epoch_recovered = self.epoch_recovered;
         let mut limits = self.limits.is_some();
         let mut route_table = self.route_revision.is_some();
-        let mut starts = [None; 7];
+        let mut starts = [None; 8];
         let session_named = |sessions: &[RecoveredFact], id: SessionId| {
             self.sessions.as_slice().iter().any(|held| held.id == id)
                 || sessions.iter().any(
@@ -1934,6 +1940,7 @@ impl Owner {
             // The earlier facts of this kind on this page.
             let same = run(facts, &starts, rank, position);
             let valid = match fact {
+                RecoveredFact::OutboundDelivery { .. } => false,
                 RecoveredFact::Epoch { incarnation, epoch } => {
                     epoch_recovered = true;
                     *incarnation == self.incarnation && *epoch == self.epoch
@@ -2255,6 +2262,7 @@ impl Owner {
             order.admit(fact).map_err(|_| STALE)?;
         }
         match fact {
+            RecoveredFact::OutboundDelivery { .. } => return Err(CoreFault::ImpossibleInput),
             RecoveredFact::Epoch { .. } => self.epoch_recovered = true,
             RecoveredFact::Limits {
                 max_targets_per_admission,
@@ -2603,10 +2611,13 @@ mod tests {
             Effect::Persist { .. } => "Persist",
             Effect::ResolveAndFence { .. } => "ResolveAndFence",
             Effect::LoadWork { .. } => "LoadWork",
+            Effect::EmitPublish { .. } => "EmitPublish",
             Effect::CloseConnection { .. } => "CloseConnection",
             Effect::ArmDeadline { .. } => "ArmDeadline",
             Effect::Continue { .. } => "Continue",
             Effect::EmitFrame { frame, .. } => match frame {
+                OutboundFrame::Suback { .. } => "EmitSuback",
+                OutboundFrame::Unsuback { .. } => "EmitUnsuback",
                 OutboundFrame::Puback { .. } => "EmitPuback",
                 OutboundFrame::Pingresp => "EmitPingresp",
                 OutboundFrame::Connack { .. } => "EmitConnack",
@@ -2752,6 +2763,9 @@ mod tests {
             };
             assert_eq!(*after, LogicalDuration::new(5));
             let facts = match command.recipe.get() {
+                Recipe::ChangeSubscriptions(_)
+                | Recipe::ClaimDelivery(_)
+                | Recipe::FinishDelivery(_) => panic!("pubsub command needs its own facts"),
                 Recipe::AdmitPublication(admit) => {
                     assert!(command.payload.is_some());
                     CommitFacts::PublicationAdmitted {
@@ -2781,6 +2795,9 @@ mod tests {
         /// for an admission.
         fn refusal_of(&self, flight: &Flight) -> StoreOutcome {
             let reason = match flight.facts {
+                CommitFacts::SubscriptionsChanged { .. }
+                | CommitFacts::DeliveryClaimed { .. }
+                | CommitFacts::DeliveryFinished { .. } => RejectReason::PreconditionFailed,
                 CommitFacts::InboundReleased { .. } => RejectReason::Fenced,
                 CommitFacts::PublicationAdmitted { .. } => {
                     RejectReason::CapacityExceeded(Resource::PayloadBytes)
@@ -5899,7 +5916,7 @@ mod tests {
     fn the_facts_of_one_kind_are_the_run_they_form_on_a_page() {
         let mut facts = fixture(EPOCH);
         facts.push(exchange_fact(1, 7, 1));
-        let mut starts = [None; 7];
+        let mut starts = [None; 8];
         for (position, fact) in facts.iter().enumerate() {
             let start = &mut starts[fact.rank() as usize];
             if start.is_none() {
