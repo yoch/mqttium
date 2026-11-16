@@ -1642,3 +1642,28 @@ fn four_blocked_ordinary_deadlines_cannot_occupy_the_collectors_reserved_reply_l
         assert_eq!(runtime.owner.receipt_status().unwrap().0.through.get(),64);
     });
 }
+
+#[test]
+fn a_full_maintenance_input_lane_leaves_the_real_reply_in_reserved_transport() {
+    with_runtime(8,|runtime,path| {
+        runtime.queue(Input::MaintainReceipts).unwrap();
+        runtime.drain_inputs().unwrap();
+        for _ in 0..crate::writer::CONTROL_QUEUE { runtime.queue(Input::MaintainReceipts).unwrap(); }
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap().receipt_frontiers.is_empty() && Instant::now()<deadline {thread::sleep(Duration::from_millis(1));}
+        assert_eq!(mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap().receipt_frontiers.len(),1,"the actual registration committed while its transport reply remains pending");
+        // Two ordinary read markers establish transport order: even when the
+        // worker was waiting on its ordinary receiver, it checks the reserved
+        // request before processing marker two, and flushes the reserved reply
+        // before publishing that marker's ordinary response. No elapsed-time
+        // assumption establishes that the collector reached its reply channel.
+        for _ in 0..2 { runtime.writer.sender.send(Request::Recovery(None)).unwrap(); }
+        for _ in 0..2 { assert!(matches!(runtime.writer.receiver.recv_timeout(Duration::from_secs(2)),Ok(Response::Recovery(Ok(_))))); }
+        let result=runtime.writer_results();
+        assert!(result.is_ok(),"a full reserved input lane must backpressure its reply receiver, not consume then lose the reply: {:?}",result.err());
+        assert_eq!(runtime.control_inputs.len(),crate::writer::CONTROL_QUEUE);
+        assert!(!runtime.owner.collection_ready());
+        runtime.drain_inputs().unwrap();
+        until(runtime,|r|r.owner.collection_ready());
+    });
+}
