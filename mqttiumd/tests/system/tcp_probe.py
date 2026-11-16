@@ -170,17 +170,33 @@ class Observations:
 class Wire:
     def __init__(self, address: tuple[str, int], observations: Observations, label: str,
                  *, receive_buffer: int | None = None):
-        self.socket = socket.create_connection(address, timeout=3)
-        self.socket.settimeout(3)
-        if receive_buffer is not None:
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
+        # The pilot uses the product's explicit IPv4 loopback address. Apply
+        # receive limits before SYN; reducing RCVBUF after connect leaves the
+        # handshake's larger advertised receive window outside this control.
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        clamp = getattr(socket, "TCP_WINDOW_CLAMP", None)
+        try:
+            self.socket.settimeout(3)
+            if receive_buffer is not None:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, receive_buffer)
+                if clamp is not None:
+                    self.socket.setsockopt(socket.IPPROTO_TCP, clamp, receive_buffer)
+            before = self.socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+            self.socket.connect(address)
+        except BaseException:
+            self.socket.close()
+            raise
         self.observations = observations
         self.label = label
         self.decoder = FrameDecoder()
         self.frames: list[Frame] = []
         self.closed = False
         observations.record("socket_open", label=label, address=list(address),
-                            receive_buffer=self.socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
+                            receive_buffer=self.socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF),
+                            receive_buffer_requested=receive_buffer or 0,
+                            receive_buffer_before_connect=before,
+                            receive_window_clamp_requested=receive_buffer if receive_buffer and clamp is not None else 0,
+                            receive_window_clamp=self.socket.getsockopt(socket.IPPROTO_TCP, clamp) if clamp is not None else 0)
 
     def send(self, data: bytes, *, stride: int | None = None, record: bool = True) -> None:
         if record:

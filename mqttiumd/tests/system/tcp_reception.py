@@ -514,21 +514,52 @@ def concurrency(binary: Path, case: Path) -> dict:
             stalled.socket.settimeout(.1)
             sent = 0
             maximum = 128 * 1024
-            deadline = time.monotonic() + 3
-            chunk = b"\xc0\x00" * 128
-            while sent < maximum and time.monotonic() < deadline:
-                try:
-                    stalled.socket.sendall(chunk)
-                    sent += len(chunk)
-                except OSError:
-                    break
-                if any(event["kind"] == "effect_retained" and int(event["seq"]) > before for event in broker.events()):
-                    break
-            broker.observations.record("nonreader_flood", bytes_sent=sent, byte_budget=maximum)
-            client("after-pressure-client", 10)
+            started = time.monotonic()
+            deadline = started + 12
+            upload = b"\xc0\x00" * (maximum // 2)
+            generation = queued["connection"]
+            broker.observations.record("nonreader_pressure_started", byte_budget=maximum,
+                                       deadline_ms=12000, deadline_monotonic_ns=str(int(deadline * 1_000_000_000)),
+                                       target="output_queue_full", connection=generation)
+            retained = []
+            send_error = None
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                healthy = pool.submit(client, "after-pressure-client", 10)
+                while time.monotonic() < deadline:
+                    events = [event for event in broker.events() if int(event["seq"]) > before
+                              and event.get("connection") == generation]
+                    retained = [event for event in events if event["kind"] == "effect_retained"]
+                    closed = [event for event in events if event["kind"] == "connection_closed"]
+                    if retained or closed:
+                        break
+                    if sent < maximum and send_error is None:
+                        try:
+                            # Track actual partial sends, preserving the exact
+                            # stream offset. A queued upload is not evidence
+                            # that its MQTT packets have reached the core.
+                            count = stalled.socket.send(upload[sent:min(sent + 256, maximum)])
+                            if count == 0:
+                                send_error = "zero_write"
+                            sent += count
+                        except (TimeoutError, BlockingIOError):
+                            pass
+                        except OSError as error:
+                            send_error = type(error).__name__
+                    # Continue observing after reaching the byte cap, bounded
+                    # by the same deadline, until the actual pressure event.
+                    time.sleep(.002)
+                healthy.result(timeout=10)
+            broker.observations.record("nonreader_flood", bytes_sent=sent, byte_budget=maximum,
+                                       deadline_ms=12000, elapsed_ms=int((time.monotonic() - started) * 1000),
+                                       send_error=send_error or "none", output_queue_full=bool(retained))
+            require(not any(event["kind"] == "connection_closed"
+                            and event.get("details", {}).get("code") == "input_queue_full" for event in events),
+                    "input_saturation_instead_of_output")
+            require(retained, "output_saturation_not_reached")
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
-                events = [event for event in broker.events() if int(event["seq"]) > before]
+                events = [event for event in broker.events() if int(event["seq"]) > before
+                          and event.get("connection") == generation]
                 retained = [event for event in events if event["kind"] == "effect_retained"]
                 if retained and any(event["kind"] == "frame_failed" and event.get("details", {}).get("effect")
                                    in {r["details"]["effect"] for r in retained} for event in events):
@@ -560,6 +591,7 @@ def concurrency(binary: Path, case: Path) -> dict:
         return {"criterion": "G-concurrency", "status": "PASS", "two_clients_completed": True,
                 "partial_reader_timeout": True, "output_queue_saturation_reached": True,
                 "retained_effects_terminal": len(retained_ids), "flood_bytes": sent, "flood_budget": maximum,
+                "pressure_deadline_ms": 12000, "receive_buffer_requested": 1024,
                 "unread_pubrec_operation": admission["operation"], "unread_pubrec_packet_identifier": 55,
                 "pressure_retransmission_admissions": 0, "pressure_exchange_completed": True}
     finally:

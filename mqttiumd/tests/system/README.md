@@ -55,8 +55,14 @@ build. The driver always kills and reaps a broker left behind by a failed case.
 | G-generation | Eighteen takeovers, exceeding the core's remembered window, then replay of an actual captured old CONNECT; runtime rejects its generation while the current connection progresses. |
 | H | Graceful shutdown with an accepted admission held before commit, released writer, uncertain submitted work preserved and reconciled after restart without a second admission. |
 
-The nonreader sends at most 128 KiB over three seconds; the partial-packet wait
-is bounded by seven seconds, and replay by three. Test barriers have the
+The nonreader configures its receive buffer and, on Linux, window clamp before
+the TCP handshake. Requested and effective values are retained. Its pressure
+phase sends at most 128 KiB and observes for at most twelve seconds until the
+actual `output_queue_full` effect-retention event, including after the byte
+budget is exhausted. Buffered bytes alone are not proof that MQTT packets have
+reached the core; input-queue saturation is a distinct failure. Another client
+progresses concurrently. The partial-packet wait is bounded by seven seconds,
+and replay by three. Test barriers have the
 product's 30-second cancellation budget. Product limits and client socket buffer
 values are retained in their respective observations. Large probe byte records
 keep their exact digest and size rather than exceeding the observer log budget.
