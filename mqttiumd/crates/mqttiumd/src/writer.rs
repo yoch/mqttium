@@ -1165,6 +1165,61 @@ mod tests {
             .unwrap();
         let lifecycle_reply = writer.control_receiver.recv_timeout(Duration::from_secs(2));
         let lifecycle_visible = SqliteStore::inspect(&db).unwrap().sessions.len() == 66;
+        let resolution_effect = EffectId {
+            sequence: EffectSeq::new(3),
+            ..effect
+        };
+        writer
+            .control_sender
+            .send(ControlRequest::Lifecycle(OwnedEffect::new(
+                resolution_effect,
+                Effect::ResolveAndFence { operation },
+            )))
+            .unwrap();
+        let resolution_reply = writer.control_receiver.recv_timeout(Duration::from_secs(2));
+        let session = SqliteStore::inspect(&db)
+            .unwrap()
+            .sessions
+            .into_iter()
+            .find(|(_, value)| value.client_id == b"reserved-lifecycle")
+            .map(|(id, _)| id);
+        let close_operation = OperationId::new(
+            origin.incarnation,
+            origin.epoch,
+            origin.owner,
+            mqttiumd_contract::ids::OperationSeq::new(2),
+        );
+        let close_effect = EffectId {
+            sequence: EffectSeq::new(4),
+            ..effect
+        };
+        let close_reply = session.map(|session| {
+            let recipe = Recipe::SessionLifecycle(mqttiumd_contract::session::SessionLifecycle {
+                operation: close_operation,
+                action: SessionAction::Close {
+                    guard: mqttiumd_contract::session::SessionGuard {
+                        session,
+                        opened_by: Some(operation),
+                    },
+                    reason: mqttiumd_contract::session::SessionEndReason::Disconnect,
+                },
+            });
+            writer
+                .control_sender
+                .send(ControlRequest::Lifecycle(OwnedEffect::new(
+                    close_effect,
+                    Effect::Persist {
+                        command: mqttiumd_contract::command::Command {
+                            recipe: mqttiumd_contract::command::FrozenRecipe::freeze(recipe)
+                                .unwrap(),
+                            payload: None,
+                        },
+                    },
+                )))
+                .unwrap();
+            writer.control_receiver.recv_timeout(Duration::from_secs(2))
+        });
+        let close_visible = SqliteStore::inspect(&db).unwrap().sessions.len() == 65;
         // Cleanup before asserting: even the original blocked implementation
         // must release its writer and terminate when the semantic test fails.
         cancel.store(true, Ordering::Relaxed);
@@ -1199,6 +1254,25 @@ mod tests {
                 ) }) if effect == lifecycle_effect && returned == operation
             ),
             "reserved lifecycle must correlate its committed result while all ordinary results remain unread"
+        );
+        assert!(
+            matches!(resolution_reply,
+            Ok(ControlResponse::Lifecycle {effect, operation: returned, reply: StoreReply::Outcome(
+                mqttiumd_contract::outcome::StoreOutcome::Committed(_))})
+                if effect == resolution_effect && returned == operation),
+            "same-operation resolution must progress in the reserved lane"
+        );
+        assert!(
+            close_visible,
+            "known close must reclaim its durable session under ordinary reply saturation"
+        );
+        assert!(
+            matches!(close_reply,
+            Some(Ok(ControlResponse::Lifecycle {effect, operation: returned, reply: StoreReply::Outcome(
+                mqttiumd_contract::outcome::StoreOutcome::Committed(mqttiumd_contract::outcome::CommitFacts::SessionLifecycle(
+                    mqttiumd_contract::session::SessionChange::Closed { .. }))) }))
+                if effect == close_effect && returned == close_operation),
+            "reserved close must return its own committed result"
         );
     }
     #[test]

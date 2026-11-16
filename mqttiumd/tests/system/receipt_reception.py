@@ -35,6 +35,7 @@ from tcp_reception import Broker, writer_available
 HISTORICAL_RECEIPT_LIMIT = 8192
 BUSINESS_COMMANDS = 32769
 WINDOW_COMMANDS = 1024
+BUSINESS_WINDOW = 640
 
 
 class BusinessTranscript:
@@ -636,8 +637,8 @@ def origin_pressure_state(path: Path, operation: dict) -> dict:
 def stable_receipt_pressure(event: dict, state: dict, unknown_sequence: int) -> bool:
     require(state["durable_floor"] < unknown_sequence, "closure_crossed_unknown")
     require(state["unknown_receipt_present"], "unknown_receipt_deleted")
-    return (state["durable_floor"] == unknown_sequence - 1 and state["retained_span"] >= 768
-            and int(event["details"].get("span", 0)) >= 768
+    return (state["durable_floor"] == unknown_sequence - 1 and state["retained_span"] >= BUSINESS_WINDOW
+            and int(event["details"].get("span", 0)) >= BUSINESS_WINDOW
             and int(event["details"].get("unconsumed_holes", 0)) >= 1)
 
 
@@ -662,7 +663,7 @@ def unknown_hole(binary: Path, case: Path) -> dict:
     broker = Broker(binary, case, test_control=True)
     held = HeldBusiness(broker, case)
     result = {"criterion": "C-pressure", "status": "PASS", "samples": [],
-              "parameters": {"business_window": 768, "total_window": 1024,
+              "parameters": {"business_window": BUSINESS_WINDOW, "total_window": 1024,
                              "attempt_budget": 1025, "result_release_timeout_s": 15,
                              "control_response_timeout_s": 12}}
     try:
@@ -720,7 +721,7 @@ def unknown_hole(binary: Path, case: Path) -> dict:
                             "unknown_receipt_deleted")
                     result["samples"].append({"through_positive": positives, "floor": floor,
                                               "storage": storage_sample(broker)})
-            require(pressure is not None and positives <= 768, "planned_window_pressure_not_reached")
+            require(pressure is not None and positives <= BUSINESS_WINDOW, "planned_window_pressure_not_reached")
             result["positive_commands_while_hole_open"], result["pressure"] = positives, pressure
             result["pressure_measurements"] = pressure_measurements
             blocked = durable(broker.db)

@@ -2,13 +2,13 @@
 from types import SimpleNamespace
 import unittest
 
-from receipt_reception import stable_receipt_pressure, wait_committed_resolution, wait_control_or_pressure
+from receipt_reception import BUSINESS_WINDOW, stable_receipt_pressure, wait_committed_resolution, wait_control_or_pressure
 from tcp_probe import Frame, ReceiptFailure
 
 
 ACK = Frame(0x90, b"\x00\x01\x00\x01")
 PRESSURE = {"kind": "receipt_window_pressure", "seq": "50",
-            "details": {"span": 768, "unconsumed_holes": 1,
+            "details": {"span": BUSINESS_WINDOW, "unconsumed_holes": 1,
                         "code": "receipt_window_business_full"}}
 
 
@@ -89,10 +89,10 @@ class ReceiptControlWaitTests(unittest.TestCase):
         self.assertIsNone(pressure)
 
     def test_durable_prefix_advance_can_make_pressure_transient(self):
-        before = {"durable_floor": 0, "maximum_retained_sequence": 768,
-                  "retained_span": 768, "unknown_receipt_present": True}
-        after = {**before, "durable_floor": 12, "retained_span": 756}
-        full = {**after, "maximum_retained_sequence": 780, "retained_span": 768}
+        before = {"durable_floor": 0, "maximum_retained_sequence": BUSINESS_WINDOW,
+                  "retained_span": BUSINESS_WINDOW, "unknown_receipt_present": True}
+        after = {**before, "durable_floor": 12, "retained_span": BUSINESS_WINDOW - 12}
+        full = {**after, "maximum_retained_sequence": BUSINESS_WINDOW + 12, "retained_span": BUSINESS_WINDOW}
         self.assertFalse(stable_receipt_pressure(PRESSURE, before, 13))
         self.assertFalse(stable_receipt_pressure(PRESSURE, after, 13))
         self.assertTrue(stable_receipt_pressure(PRESSURE, full, 13))

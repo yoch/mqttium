@@ -104,11 +104,44 @@ policy. Sleeping after automatic acknowledgement is not proof of held work.
 
 ## Accepted profile
 
-CONNECT requires MQTT 5, explicit nonempty UTF-8 ClientID, Clean Start 0 and
-Session Expiry Interval `0xffffffff`. A new session is durably created before
-CONNACK success with Session Present 0. Known sessions resume with Session
-Present 1. Unknown creation closes the connection without a blind retry; a
-later connection performs a durable lookup.
+CONNECT requires MQTT 5 and an explicit nonempty UTF-8 ClientID. Both Clean
+Start values are supported. Session Expiry Interval may be absent (zero), zero,
+or `0xffffffff`; intermediate finite values are explicitly outside the profile.
+The existing command-line pub/sub helpers request infinity explicitly.
+
+| Request | Existing session | Public result |
+| - | - | - |
+| Clean Start 0, infinity | Persistent | Resume same SessionId, Session Present 1 |
+| Clean Start 0, zero/absent | Persistent | Resume state/SP1, set zero retention; end on subsequent close |
+| Clean Start 0 | Absent | New SessionId, Session Present 0 |
+| Clean Start 1 | Present or absent | End old incarnation if any; new SessionId, SP0 |
+| DISCONNECT, expiry zero | Persistent connected | Explicit durable termination |
+| Transport close, infinity | Current binding | Preserve session and outstanding responsibilities |
+| Transport close, zero | Current binding | End incarnation and recover capacity |
+
+CONNACK success waits for a correlated known commit applied by the owner. Open,
+replace and close retain one OperationId through unknown outcomes and resolution;
+a lost answer cannot cause a second replacement. The durable attachment token
+and transport generation guard later closes independently of reusable ClientID.
+A takeover closes the old transport first. An old zero-retention session ends
+before Clean Start handling, so Clean Start 0 then creates a new session/SP0.
+
+DISCONNECT without the property preserves the CONNECT policy; explicit infinity
+is supported only when CONNECT was nonzero. CONNECT zero followed by any
+nonzero DISCONNECT expiry is Protocol Error 0x82. Duplicate properties and
+malformed encodings remain protocol/malformed errors, distinct from supported
+encodings of an unsupported intermediate interval. DISCONNECT has no MQTT ACK:
+local client completion alone does not establish durable termination.
+
+Proposed [ADR 0029](decisions/0029-explicit-session-lifecycle.md) defines the
+atomic target-only cancellation and lifecycle authority. Ending a session
+cancels its own filters, deliveries, claims and incoming markers. Publications
+already owed to other destinations survive their producer's termination.
+Cancelled obligations are not counted as successful deliveries. No terminal
+session row is retained per historical ClientID; SessionIds never repeat.
+Actual broker-epoch opening ends previous zero-retention sessions before owner
+recovery/readiness. Persistent sessions remain until explicitly ended; there is
+no automatic eviction and the active quota remains 128.
 
 The profile accepts non-retained QoS 0/1/2 PUBLISH, PUBREL, exact SUBSCRIBE and
 UNSUBSCRIBE, recipient PUBACK, PINGREQ and ordinary DISCONNECT. Completed valid
@@ -145,8 +178,9 @@ Limits are 16 connections, 128 sessions, 128 exact subscriptions, eight filters
 per request and 16 targets per publication/topic. Packets are at most 65,536
 bytes, ClientID/topic/filter 1,024 bytes and payload 32,768 bytes. Per-connection
 input/output queues hold four items; writer queue 32, commands in flight 16,
-timers 512 and physical receipts 8,192. Maintenance has separate four-slot
-writer request/reply lanes and four owner control inputs. The core remembers
+timers 512 and physical receipts 8,192. Maintenance and the single lifecycle flight share reserved four-slot
+writer request/reply lanes. Maintenance has four owner control inputs; closure
+has a separate bounded two-facts-per-transport lane. The core remembers
 eight closed generations. Known terminal operation timers are removed only
 after their corresponding owner transition applies.
 
@@ -296,16 +330,18 @@ obligation cannot appear as absent work. Artificial SQL changes after readiness
 are corruption controls, not supported product operations; typed failures stop
 the runtime safely. Payload reads obey separate byte budgets.
 
-Canonical format 1 adds kind 6 ConsumeDelivery and kind 7 UpdateSubscriptions.
+Canonical format 1 adds kind 6 ConsumeDelivery, kind 7 UpdateSubscriptions and
+kind 8 SessionLifecycle.
 The latter encodes granted QoS in its decision. Existing kinds 1–5 preserve
 their bytes and meanings; kind 3 remains implicit QoS 1 rather than silently
 being reinterpreted. Proposed [ADR 0026](decisions/0026-qos0-volatile-and-consumed.md)
 specifies the layouts and separate volatile/consumed cycles.
 
-SQLite schema **4** stores compact receipt guards. Schemas 1/2/3 and other
+SQLite schema **5** stores compact receipt guards and explicit retention/attachment
+metadata. Schemas 1/2/3/4 and other
 incompatible versions are refused with typed InvalidData before write-affecting
 pragmas. There is no implicit migration, checkpoint, reset or empty replacement.
-Fresh and existing schema 4 files are supported; older-format files remain
+Fresh and existing schema 5 files are supported; older-format files remain
 historical inputs until a separate migration is supplied. Invalid/over-budget current files also refuse
 readiness without resetting partial recovery.
 
@@ -330,7 +366,8 @@ timeouts and history eviction cannot. An offline obligation, an active claim
 or an incoming QoS 2 marker can outlast the full admission/claim receipt.
 
 Each origin has at most 1024 issued but not durably confirmed positions. New
-business stops at span 768, leaving 256 positions for continuations. Ordinary
+business stops at span 640, leaving 384 positions for inbound, outgoing and
+session-termination continuations (128 each). Ordinary
 business cannot spend the final 512 of the unchanged 8192 physical receipt
 slots. Resolution uses its original operation identity. Maintenance itself
 creates neither an OperationId nor another receipt. Its reserved paths can
