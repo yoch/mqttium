@@ -1783,3 +1783,75 @@ fn a_full_maintenance_input_lane_leaves_the_real_reply_in_reserved_transport() {
         until(runtime, |r| r.owner.collection_ready());
     });
 }
+
+/// Capture one real reader-channel PUBACK after the normal decoder queued it,
+/// retaining its complete input rather than manufacturing a target association.
+fn dequeue_puback(runtime:&mut Runtime<'_>, generation:ConnectionGeneration, client:&mut TcpStream, packet_id:u16) -> Input {
+    let [high,low]=packet_id.to_be_bytes();
+    client.write_all(&[0x40,2,high,low]).unwrap();
+    let deadline=Instant::now()+Duration::from_secs(2);
+    loop {
+        runtime.connections().unwrap();
+        if let Some(index)=runtime.inputs.iter().position(|input|matches!(input,Input::Packet {connection,packet:InboundPacket::Puback {packet_id:observed,..},..} if *connection==generation && observed.get()==packet_id)) {
+            return runtime.inputs.remove(index).unwrap();
+        }
+        assert!(Instant::now()<deadline,"the real reader/decode boundary did not observe the requested PUBACK");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+fn duplicate_puback_input(input:&Input)->Input {
+    match input {
+        Input::Packet {connection,ingress_order,packet:InboundPacket::Puback {packet_id,reason}}=>Input::Packet {connection:*connection,ingress_order:*ingress_order,packet:InboundPacket::Puback {packet_id:*packet_id,reason:*reason}},
+        _=>panic!("only a real queued PUBACK observation may be copied"),
+    }
+}
+fn until_publish_was_accepted(runtime:&mut Runtime<'_>, path:&Path, generation:ConnectionGeneration) {
+    let deadline=Instant::now()+Duration::from_secs(2);
+    loop {
+        pump(runtime);
+        let events=std::fs::read_to_string(path.join("events.jsonl")).unwrap();
+        if events.lines().filter_map(|line|serde_json::from_str::<serde_json::Value>(line).ok()).any(|event|event["kind"]=="frame_queued" && event["connection"]==generation.get().to_string() && event["details"]["packet_kind"]=="PUBLISH") {return;}
+        assert!(Instant::now()<deadline,"the actual claim and outgoing adapter acceptance were not reached");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn a_no_target_puback_observed_before_the_first_claim_cannot_bind_to_it_later() {
+    with_runtime(8,|runtime,path| {
+        let (subscriber,mut receiver)=peer(runtime);
+        runtime.connect(subscriber,connect_packet(b"no-target-subscriber")).unwrap();
+        until(runtime,|r|r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut receiver).0,0x20);
+        runtime.packet(subscriber,0x82,vec![0,1,0,0,1,b't',1]).unwrap();
+        until(runtime,|r|r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut receiver).0,0x90);
+        assert!(mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap().outbound.is_empty());
+        let original=dequeue_puback(runtime,subscriber,&mut receiver,1);
+        let stale_copy=duplicate_puback_input(&original);
+        runtime.queue(original).unwrap();
+        runtime.drain_inputs().unwrap();
+        let (publisher,mut source)=peer(runtime);
+        runtime.connect(publisher,connect_packet(b"no-target-publisher")).unwrap();
+        until(runtime,|r|r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut source).0,0x20);
+        runtime.packet(publisher,0x32,publish_body(1)).unwrap();
+        until_publish_was_accepted(runtime,path,subscriber);
+        let (first,body)=read_frame(&mut receiver);
+        assert_eq!(first,0x32);
+        assert_eq!(&body[3..5],&[0,1],"the first real outgoing claim owns Packet Identifier1");
+        let before=mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap();
+        assert_eq!(before.outbound.len(),1);
+        runtime.queue(stale_copy).unwrap();
+        runtime.drain_inputs().unwrap();
+        until(runtime,|r|r.inflight.is_empty() && r.inputs.is_empty());
+        let after=mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap();
+        assert_eq!(after.outbound,before.outbound,"no_target_puback_rebound: an already observed no-target PUBACK cannot acquire the later claim");
+        assert_eq!(after.obligations,before.obligations);
+        let own_ack=dequeue_puback(runtime,subscriber,&mut receiver,1);
+        runtime.queue(own_ack).unwrap();
+        runtime.drain_inputs().unwrap();
+        until(runtime,|r|r.inflight.is_empty() && r.inputs.is_empty());
+        assert!(mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap().outbound.is_empty());
+    });
+}
