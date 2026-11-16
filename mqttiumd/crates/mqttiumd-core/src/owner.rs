@@ -2474,12 +2474,26 @@ mod tests {
         routes: Vec<Route>,
         sessions: Vec<Session>,
         slots: Vec<Slot>,
+        outgoing_connections: Vec<pubsub::Connection>,
+        outgoing_deliveries: Vec<pubsub::Delivery>,
+        subscription: Option<ControlSnapshot>,
         leases: (Credits, Vec<crate::leases::LeaseSlotView>),
         finished: Vec<Finished>,
         closed: Vec<ConnectionGeneration>,
         waiting: Vec<EffectId>,
         free_slots: usize,
         live_reservations: bool,
+    }
+
+    #[derive(PartialEq, Debug)]
+    struct ControlSnapshot {
+        session: SessionId,
+        connection: ConnectionKey,
+        packet_id: InboundPacketId,
+        packet: InboundPacket,
+        results: crate::contract::pubsub::FilterResults,
+        projected: Vec<Route>,
+        in_flight: InFlight,
     }
 
     fn nonzero(count: usize) -> NonZeroUsize {
@@ -2904,6 +2918,17 @@ mod tests {
                 routes: owner.routes.as_slice().to_vec(),
                 sessions: owner.sessions.as_slice().to_vec(),
                 slots: owner.slots.as_slice().to_vec(),
+                outgoing_connections: owner.pubsub.connections.as_slice().to_vec(),
+                outgoing_deliveries: owner.pubsub.deliveries.as_slice().to_vec(),
+                subscription: owner.pubsub.control.as_ref().map(|c| ControlSnapshot {
+                    session: c.session,
+                    connection: c.connection,
+                    packet_id: c.packet_id,
+                    packet: c.packet.clone(),
+                    results: c.results,
+                    projected: c.projected.as_slice().to_vec(),
+                    in_flight: c.in_flight,
+                }),
                 leases: owner.leases.snapshot(),
                 finished: owner.finished.iter().copied().collect(),
                 closed: owner.closed.iter().copied().collect(),
@@ -6475,6 +6500,17 @@ mod tests {
         }
     }
 
+    fn unsubscribe(connection: u64, packet: u16, topic: &[u8]) -> Input {
+        Input::Packet {
+            connection: ConnectionGeneration::new(connection),
+            ingress_order: 1,
+            packet: InboundPacket::Unsubscribe {
+                packet_id: packet_id(packet),
+                filters: crate::contract::pubsub::FilterList::copy_from(&[bytes(topic)]).unwrap(),
+            },
+        }
+    }
+
     fn product_world() -> World {
         let mut cfg = config();
         cfg.max_routes = bound(4);
@@ -6573,6 +6609,305 @@ mod tests {
                 reason,
             },
         }
+    }
+
+    fn queued_product() -> World {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 1));
+        load_work(&mut world, &[work_item(0), work_item(1)], None);
+        world
+    }
+
+    fn product_capacity_refusals(build: fn() -> (World, Input), slots: usize) {
+        for boundary in 0..3 {
+            let (mut world, input) = build();
+            let (_, expected_input) = build();
+            let expected_resource = match boundary {
+                0 => Resource::Work,
+                1 => {
+                    let count = world.outbox().free_slots() - (slots - 1);
+                    world.outbox().reserve(nonzero(count)).unwrap();
+                    Resource::EffectSlots
+                }
+                _ => {
+                    for _ in 0..ENTRIES {
+                        world.outbox().reserve(nonzero(1)).unwrap();
+                    }
+                    Resource::Reservations
+                }
+            };
+            let before = world.snapshot();
+            let grant = if boundary == 0 {
+                TurnGrant {
+                    work_limit: WorkUnits::ZERO,
+                }
+            } else {
+                GRANT
+            };
+            let StepOutcome::NeedCapacity {
+                input: back, need, ..
+            } = world.owner.step(input, grant)
+            else {
+                panic!("capacity refusal")
+            };
+            assert_eq!(back, expected_input, "refusal returns the intact input");
+            assert_eq!(need.resource, expected_resource);
+            assert_eq!(
+                world.snapshot(),
+                before,
+                "every pubsub table, projection, identity, credit and effect remains unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn product_pubsub_reserves_every_effect_before_mutating_the_submachine() {
+        fn control() -> (World, Input) {
+            let mut world = product_world();
+            world.applied(product_settings(CONN, 1));
+            (world, subscribe(CONN, 9, b"fresh"))
+        }
+        fn claim() -> (World, Input) {
+            (queued_product(), work_available())
+        }
+        fn claim_result() -> (World, Input) {
+            let mut world = queued_product();
+            let flight = pubsub_flight(&mut world, work_available());
+            (world, committed(&flight))
+        }
+        fn finish() -> (World, Input) {
+            let (mut world, input) = claim_result();
+            world.applied(input);
+            world.drain();
+            (world, outgoing_puback(CONN, 1, 0))
+        }
+        product_capacity_refusals(control, 2);
+        product_capacity_refusals(claim, 2);
+        product_capacity_refusals(claim_result, 1);
+        product_capacity_refusals(finish, 2);
+    }
+
+    #[test]
+    fn product_pubsub_recovery_preserves_claim_identity_and_skips_a_new_claim() {
+        let mut cfg = config();
+        cfg.max_routes = bound(4);
+        let mut world = World::with(cfg, EPOCH, CAPACITY);
+        let mut item = work_item(0);
+        let claim = crate::contract::pubsub::DeliveryClaim {
+            operation: OperationId::new(
+                StoreIncarnation::new(INCARNATION),
+                RunEpoch::new(EPOCH - 1),
+                LogicalOwnerId::new(4),
+                OperationSeq::new(123),
+            ),
+            packet_id: crate::contract::ids::OutboundPacketId::new(42).unwrap(),
+        };
+        item.claim = Some(claim);
+        let mut inventory = fixture(EPOCH);
+        inventory.push(RecoveredFact::OutboundDelivery {
+            delivery: item.delivery,
+            target: item.target,
+            target_revision: item.target_revision,
+            claim: item.claim,
+        });
+        world.applied(page(&inventory, true));
+        world.applied(product_settings(CONN, 1));
+        assert_eq!(world.sent(connect(CONN, b"p1-producer")), ["EmitConnack"]);
+        load_work(&mut world, &[item.clone()], None);
+        world.applied(work_available());
+        let replay = world.drain();
+        assert_eq!(
+            kinds(&replay),
+            ["EmitPublish"],
+            "restored claim is not created again"
+        );
+        assert!(
+            matches!(&replay[0].1,Effect::EmitPublish {delivery,packet_id,claim:op,dup:true,..} if *delivery==item.delivery&&*packet_id==claim.packet_id&&*op==claim.operation)
+        );
+        assert!(world.sent(work_available()).is_empty());
+        let finish = pubsub_flight(&mut world, outgoing_puback(CONN, 42, 0));
+        assert!(
+            matches!(finish.facts,CommitFacts::DeliveryFinished {claim:op,..} if op==claim.operation)
+        );
+    }
+
+    #[test]
+    fn product_pubsub_recovery_metadata_does_not_enable_legacy_s0_fanout() {
+        let mut world = World::cold(EPOCH, CAPACITY);
+        let item = work_item(0);
+        let mut inventory = fixture(EPOCH);
+        inventory.push(RecoveredFact::OutboundDelivery {
+            delivery: item.delivery,
+            target: item.target,
+            target_revision: item.target_revision,
+            claim: None,
+        });
+        world.applied(page(&inventory, true));
+        assert_eq!(world.sent(connect(CONN, b"p1-producer")), ["EmitConnack"]);
+        assert!(
+            world.sent(work_available()).is_empty(),
+            "product ConnectionSettings explicitly enables network delivery"
+        );
+    }
+
+    #[test]
+    fn product_pubsub_peer_maximum_packet_size_refuses_emission_and_preserves_claim() {
+        let mut world = product_world();
+        world.applied(Input::ConnectionSettings {
+            connection: ConnectionGeneration::new(CONN),
+            receive_maximum: 1,
+            maximum_packet_size: 8,
+        });
+        load_work(&mut world, &[work_item(0)], None);
+        let claim = pubsub_flight(&mut world, work_available());
+        world.applied(committed(&claim));
+        assert_eq!(kinds(&world.drain()), ["CloseConnection"]);
+        world.applied(product_settings(CONN + 1, 1));
+        assert_eq!(
+            world.sent(connect(CONN + 1, b"p1-producer")),
+            ["EmitConnack"]
+        );
+        world.applied(work_available());
+        let publish = world.drain();
+        assert!(
+            matches!(&publish[0].1,Effect::EmitPublish {claim:op,dup:false,..}if *op==claim.operation),
+            "known claim never made eligible still sends DUP=0"
+        );
+    }
+
+    #[test]
+    fn product_pubsub_filter_replacement_and_removal_preserve_preexisting_work() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 1));
+        load_work(&mut world, &[work_item(0)], None);
+        for qos in [Qos::AtLeastOnce, Qos::ExactlyOnce] {
+            let mut input = subscribe(CONN, 9, b"fresh");
+            let Input::Packet {
+                packet: InboundPacket::Subscribe { filters, .. },
+                ..
+            } = &mut input
+            else {
+                panic!("subscribe")
+            };
+            *filters = crate::contract::pubsub::FilterList::copy_from(&[
+                crate::contract::pubsub::SubscriptionFilter {
+                    filter: bytes(b"fresh"),
+                    qos,
+                },
+                crate::contract::pubsub::SubscriptionFilter {
+                    filter: bytes(b"fresh"),
+                    qos,
+                },
+            ])
+            .unwrap();
+            let change = pubsub_flight(&mut world, input);
+            world.applied(committed(&change));
+            let ack = world.drain();
+            assert!(
+                matches!(&ack[0].1,Effect::EmitFrame {frame:OutboundFrame::Suback {results,..},..}if results.as_slice()==Some(&[1,1][..]))
+            );
+            assert_eq!(
+                world
+                    .owner
+                    .routes
+                    .as_slice()
+                    .iter()
+                    .filter(|r| r.topic == bytes(b"fresh")
+                        && r.target == SessionId::new(PRODUCER)
+                        && r.max_qos == Qos::AtLeastOnce)
+                    .count(),
+                1,
+                "replacement never duplicates the route"
+            );
+        }
+        let removal = pubsub_flight(&mut world, unsubscribe(CONN, 9, b"fresh"));
+        assert!(
+            world
+                .owner
+                .routes
+                .as_slice()
+                .iter()
+                .any(|r| r.topic == bytes(b"fresh"))
+        );
+        world.applied(committed(&removal));
+        let ack = world.drain();
+        assert!(
+            matches!(&ack[0].1,Effect::EmitFrame {frame:OutboundFrame::Unsuback {results,..},..}if results.as_slice()==Some(&[0][..]))
+        );
+        assert!(
+            !world
+                .owner
+                .routes
+                .as_slice()
+                .iter()
+                .any(|r| r.topic == bytes(b"fresh"))
+        );
+        let claim = pubsub_flight(&mut world, work_available());
+        assert!(
+            matches!(claim.facts,CommitFacts::DeliveryClaimed {delivery,..}if delivery==work_item(0).delivery),
+            "UNSUBSCRIBE cannot delete an admitted obligation"
+        );
+    }
+
+    #[test]
+    fn product_pubsub_subscription_capacity_refusal_is_atomic_and_has_negative_suback() {
+        let mut world = World::connected();
+        world.applied(product_settings(CONN, 1));
+        let routes = world.owner.routes.as_slice().to_vec();
+        let revision = world.owner.route_revision;
+        world.applied(subscribe(CONN, 9, b"fresh"));
+        let ack = world.drain();
+        assert_eq!(kinds(&ack), ["EmitSuback"]);
+        assert!(
+            matches!(&ack[0].1,Effect::EmitFrame {frame:OutboundFrame::Suback {results,..},..}if results.as_slice()==Some(&[0x97][..]))
+        );
+        assert_eq!(world.owner.routes.as_slice(), routes);
+        assert_eq!(world.owner.route_revision, revision);
+    }
+
+    #[test]
+    fn product_pubsub_same_emitter_control_identifiers_cannot_collide_with_publish() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 1));
+        world.applied(publish(9));
+        world.drain();
+        assert_eq!(
+            world.sent(subscribe(CONN, 9, b"fresh")),
+            ["CloseConnection"]
+        );
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 1));
+        let control = pubsub_flight(&mut world, subscribe(CONN, 9, b"fresh"));
+        assert_eq!(world.sent(publish(9)), ["CloseConnection"]);
+        world.applied(committed(&control));
+        assert!(
+            world.drain().is_empty(),
+            "closed control occurrence cannot emit a late acknowledgment"
+        );
+    }
+
+    #[test]
+    fn product_pubsub_incoming_and_outgoing_identifiers_use_distinct_spaces() {
+        let mut world = queued_product();
+        let outgoing = pubsub_flight(&mut world, work_available());
+        world.applied(committed(&outgoing));
+        world.drain();
+        world.applied(publish_with(CONN, 1, Qos::ExactlyOnce, b"x"));
+        let effects = world.drain();
+        assert_eq!(kinds(&effects), ["Persist", "ArmDeadline"]);
+        let Effect::Persist { command } = &effects[0].1 else {
+            panic!("admission")
+        };
+        assert!(
+            matches!(command.recipe.get(),Recipe::AdmitPublication(admission)if admission.source.packet_id==packet_id(1))
+        );
+        let finish = pubsub_flight(&mut world, outgoing_puback(CONN, 1, 0));
+        world.applied(committed(&finish));
+        assert_eq!(
+            world.phase(1),
+            PENDING,
+            "destination PUBACK cannot complete the opposite-direction QoS 2 exchange"
+        );
     }
 
     #[test]

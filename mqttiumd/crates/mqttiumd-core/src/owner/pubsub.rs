@@ -25,13 +25,13 @@ pub(super) struct Connection {
 
 #[derive(Debug)]
 pub(super) struct Control {
-    session: SessionId,
-    connection: ConnectionKey,
-    packet_id: InboundPacketId,
-    packet: InboundPacket,
-    results: FilterResults,
-    projected: BoundedVec<Route>,
-    in_flight: InFlight,
+    pub(super) session: SessionId,
+    pub(super) connection: ConnectionKey,
+    pub(super) packet_id: InboundPacketId,
+    pub(super) packet: InboundPacket,
+    pub(super) results: FilterResults,
+    pub(super) projected: BoundedVec<Route>,
+    pub(super) in_flight: InFlight,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,7 +43,7 @@ enum Phase {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct Delivery {
+pub(super) struct Delivery {
     id: DeliveryId,
     target: SessionId,
     revision: Revision,
@@ -94,9 +94,9 @@ impl Delivery {
 
 #[derive(Debug)]
 pub(super) struct State {
-    connections: BoundedVec<Connection>,
-    deliveries: BoundedVec<Delivery>,
-    control: Option<Control>,
+    pub(super) connections: BoundedVec<Connection>,
+    pub(super) deliveries: BoundedVec<Delivery>,
+    pub(super) control: Option<Control>,
     payload_limit: PayloadBytes,
 }
 
