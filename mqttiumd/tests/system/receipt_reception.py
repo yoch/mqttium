@@ -639,6 +639,179 @@ def unknown_hole(binary: Path, case: Path) -> dict:
         broker.cleanup()
 
 
+def retired_replays(binary: Path, case: Path) -> dict:
+    broker = Broker(binary, case, test_control=True)
+    result = {"criterion": "E-replay", "status": "PASS", "probes": [],
+              "parameters": {"aging_subscription_budget": 256}}
+    try:
+        result["ready"] = broker.ready()
+        with PubsubWire(broker.address, broker.observations, "retired-qos0-recipient") as subscriber, \
+                PubsubWire(broker.address, broker.observations, "retired-admission-source") as source, \
+                PubsubWire(broker.address, broker.observations, "retired-recipe-aging") as aging:
+            subscriber.connect("receipt-retired-recipient", session_present=False, keep_alive=0)
+            subscriber.subscribe(1, [("reception/receipt-retired", 0)], expected=(0,))
+            source.connect("receipt-retired-source", session_present=False, keep_alive=0)
+            aging.connect("receipt-retired-aging", session_present=False, keep_alive=0)
+            (broker.control / "capture-next-admission").touch(exist_ok=False)
+            source.publish(1, "reception/receipt-retired", b"old-identities-fully-collected", qos=2)
+            captured = broker.wait_event("receipt_replay_captured")
+            publication = subscriber.next_publication()
+            require(publication.qos == 0 and publication.packet_id is None
+                    and publication.payload == b"old-identities-fully-collected",
+                    "retired_replay_seed_not_observed")
+            drained(broker, case / "seed-drained")
+            operation = captured["operation"]
+            old_id = operation_hex(operation)
+            result["captured"], result["first_delivery"] = captured, publication.observation()
+            for identifier in range(1, 257):
+                aging.subscribe(identifier, [("reception/receipt-aging", identifier % 2)])
+            retired = until(lambda: (state if operation_floor(state, operation) >= int(operation["sequence"])
+                                     and not any(row["id"] == old_id for row in state["tables"]["operations"])
+                                     else None) if (state := durable(broker.db)) else None,
+                            "captured_operation_not_retired")
+            require(all(retired["counts"][name] == 0
+                        for name in ("publications", "payloads", "obligations", "inbound", "outbound")),
+                    "old_identity_objects_still_live")
+            write_json(case / "retired-before-replays.json", retired)
+            result["retired_floor"] = operation_floor(retired, operation)
+        # New connection generations are established before old callbacks are
+        # injected. No subsequent business command can collide with the fresh
+        # test-only identities issued by the writer replay probes.
+        with PubsubWire(broker.address, broker.observations, "retired-recipient-new-generation") as resumed:
+            resumed.connect("receipt-retired-recipient", session_present=True, keep_alive=0)
+            (broker.control / "replay-last-consume-result").touch(exist_ok=False)
+            result["old_consume_callback"] = broker.wait_event("consume_result_replayed")
+            resumed.no_publication(.15, code="retired_consume_callback_reemitted")
+            control_progress(resumed)
+            last = int(result["old_consume_callback"]["seq"])
+            for mode, expected, failure in (
+                ("same", "RetiredOutcomeUnavailable", "retired_operation_reexecuted"),
+                ("different", "RetiredOutcomeUnavailable", "retired_operation_reexecuted"),
+                ("publication", "RejectedCertain", "retired_publication_reused"),
+                ("payload", "RejectedCertain", "retired_payload_reused"),
+            ):
+                (broker.control / f"replay-retired-{mode}").touch(exist_ok=False)
+                observed = broker.wait_event("receipt_replay_result", after=last)
+                require(observed["details"]["mode"] == mode, "wrong_replay_probe")
+                require(observed["details"]["outcome"] == expected, failure,
+                        str(observed["details"]["outcome"]))
+                after = durable(broker.db)
+                require(all(after["counts"][name] == 0
+                            for name in ("publications", "payloads", "obligations", "inbound", "outbound")),
+                        failure, "a replay recreated a live business object")
+                accounts_consistent(after)
+                storage_sample(broker)
+                resumed.no_publication(.05, code=failure)
+                result["probes"].append(observed)
+                last = int(observed["seq"])
+        result["final_storage"] = storage_sample(broker)
+        result["stop_status"] = broker.stop()
+        writer_available(broker.db)
+        write_json(case / "observation.json", result)
+        return result
+    finally:
+        broker.cleanup()
+
+
+def close_crash(binary: Path, case: Path, *, committed: bool) -> dict:
+    point = "receipt.close.committed" if committed else "receipt.close.prepared"
+    broker = Broker(binary, case, pauses=(point,))
+    restarted = None
+    held = HeldBusiness(broker, case)
+    result = {"criterion": "F-after" if committed else "F-before", "status": "PASS",
+              "point": point, "parameters": {"trigger_attempt_budget": 128}}
+    try:
+        result["ready"] = broker.ready()
+        result["held_business"] = held.prepare()
+        with PubsubWire(broker.address, broker.observations, "closure-crash-control") as control:
+            control.connect("receipt-close-control", session_present=False, keep_alive=0)
+            hit = None
+            positives = 0
+            for identifier in range(1, 129):
+                control.send(subscribe_packet(identifier, [("reception/receipt-close", identifier % 2)]))
+                frame = control.poll(.3)
+                if frame is not None:
+                    require(frame.kind == 0x90 and decode_filter_ack(frame) == (identifier, (identifier % 2,)),
+                            "close_trigger_business_response")
+                    positives += 1
+                candidates = [event for event in broker.events()
+                              if event["kind"] == "barrier_hit" and event.get("point") == point]
+                if candidates:
+                    hit = candidates[-1]
+                    break
+                require(frame is not None, "closure_trigger_stalled_without_point")
+            require(hit is not None and hit.get("command_kind") == "ReceiptCollection", "closure_point_not_reached")
+            details = hit["details"]
+            operation = {key: details[key] for key in ("incarnation", "epoch", "owner")}
+            operation["sequence"] = details["through"]
+            before = durable(broker.db)
+            floor = operation_floor(before, operation)
+            if committed:
+                deleted_seed_receipts = held.seed_receipts - {row["id"] for row in before["tables"]["operations"]}
+                if floor < int(details["through"]):
+                    require(deleted_seed_receipts, "closure_commit_without_visible_floor")
+                    raise ReceiptFailure("receipt_deleted_without_closure",
+                                         f"{len(deleted_seed_receipts)} known receipts disappeared with visible floor {floor}")
+            else:
+                require(floor < int(details["through"]), "uncommitted_closure_visible")
+            result["hit"], result["positive_subacks_before_hit"], result["visible_floor_at_hit"] = hit, positives, floor
+            result["storage_at_hit"] = storage_sample(broker)
+            write_json(case / "at-close-barrier.json", before)
+            inode = broker.db.stat().st_ino
+            result["kill_status"] = broker.stop(killed=True)
+        held.close()
+        writer_available(broker.db)
+        restarted = Broker(binary, case / "restart", db=broker.db, label="restarted")
+        result["restart_ready"] = restarted.ready()
+        require(restarted.db.stat().st_ino == inode, "closure_crash_replaced_database")
+        recovered = durable(restarted.db)
+        if committed:
+            require(operation_floor(recovered, operation) >= int(details["through"])
+                    or sql_u64(recovered["tables"]["meta"][0]["collected_through"]) >= int(operation["epoch"]),
+                    "committed_closure_lost_on_restart")
+        result["held_after_restart"] = held.after_crash(restarted)
+        result["final_storage"] = storage_sample(restarted)
+        result["restart_stop_status"] = restarted.stop()
+        writer_available(broker.db)
+        write_json(case / "observation.json", result)
+        return result
+    finally:
+        held.close()
+        broker.cleanup()
+        if restarted:
+            restarted.cleanup()
+
+
+def close_result_replay(binary: Path, case: Path) -> dict:
+    broker = Broker(binary, case, test_control=True)
+    result = {"criterion": "F-results", "status": "PASS", "passes": [],
+              "parameters": {"business_budget_per_phase": 256}}
+    try:
+        result["ready"] = broker.ready()
+        with PubsubWire(broker.address, broker.observations, "closure-result-controls") as control:
+            control.connect("receipt-close-results", session_present=False, keep_alive=0)
+            last = -1
+            for file, event_name in (("drop-next-close-result", "receipt_collection_result_dropped"),
+                                     ("duplicate-close-result", "receipt_collection_result_duplicated")):
+                (broker.control / file).touch(exist_ok=False)
+                for identifier in range(1, 257):
+                    control.subscribe(identifier, [("reception/receipt-close-results", identifier % 2)])
+                observed = broker.wait_event(event_name, after=last)
+                control_progress(control)
+                result["passes"].append({"control": file, "injection": observed,
+                                          "storage": storage_sample(broker)})
+                last = int(observed["seq"])
+            result["final_storage"] = storage_sample(broker)
+            require(result["final_storage"]["counts"]["operations"] <= HISTORICAL_RECEIPT_LIMIT,
+                    "maintenance_created_cumulative_receipts")
+        result["stop_status"] = broker.stop()
+        writer_available(broker.db)
+        write_json(case / "observation.json", result)
+        return result
+    finally:
+        broker.cleanup()
+
+
 def table_counts(path: Path) -> dict:
     state = durable(path)
     return {"schema_version": state["schema_version"], "epoch": state["epoch"],
@@ -754,7 +927,8 @@ def main() -> int:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--binary-source-head")
     parser.add_argument("--expected-binary-sha256")
-    parser.add_argument("--case", choices=("A-ceiling", "B-live", "C-pressure"), default="A-ceiling")
+    parser.add_argument("--case", choices=("A-ceiling", "B-live", "C-pressure", "E-replay",
+                                          "F-before", "F-after", "F-results"), default="A-ceiling")
     parser.add_argument("--build-mode", choices=("normal", "test-hooks"), default="normal")
     parser.add_argument("--business-commands", type=int, default=BUSINESS_COMMANDS)
     args = parser.parse_args()
@@ -777,6 +951,15 @@ def main() -> int:
         elif args.case == "C-pressure":
             require(args.build_mode == "test-hooks", "instrumented_build_required")
             observed = unknown_hole(args.binary.resolve(), args.out / args.case)
+        elif args.case == "E-replay":
+            require(args.build_mode == "test-hooks", "instrumented_build_required")
+            observed = retired_replays(args.binary.resolve(), args.out / args.case)
+        elif args.case in ("F-before", "F-after"):
+            require(args.build_mode == "test-hooks", "instrumented_build_required")
+            observed = close_crash(args.binary.resolve(), args.out / args.case, committed=args.case == "F-after")
+        elif args.case == "F-results":
+            require(args.build_mode == "test-hooks", "instrumented_build_required")
+            observed = close_result_replay(args.binary.resolve(), args.out / args.case)
         else:
             observed = historical_ceiling(args.binary.resolve(), args.out / args.case)
         result["cases"].append(observed)
