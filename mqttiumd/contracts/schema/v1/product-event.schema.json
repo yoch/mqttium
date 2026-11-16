@@ -133,6 +133,26 @@
             "maximum": 4294967295
           }
         ]
+      },
+      "properties": {
+        "returned_incarnation": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "returned_epoch": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "returned_owner": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "returned_through": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "returned_publication_through": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "returned_payload_through": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
       }
     }
   },

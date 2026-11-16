@@ -150,6 +150,19 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
                     );
                 }
             }
+            for member in [
+                "returned_incarnation",
+                "returned_epoch",
+                "returned_owner",
+                "returned_through",
+                "returned_publication_through",
+                "returned_payload_through",
+            ] {
+                let pointer = format!("/details/{member}");
+                if document.pointer(&pointer).is_some() {
+                    u64_at(document, &pointer, &mut report.diagnostics);
+                }
+            }
             if matches!(
                 text(document, "kind"),
                 "receipt_collection_submitted"

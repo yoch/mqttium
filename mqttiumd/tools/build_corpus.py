@@ -3406,6 +3406,16 @@ maintenance_event = env("mqttiumd.product-event", seq="8", kind="receipt_collect
     "owner": "0", "through": "64", "publication_through": "32", "payload_through": "32",
     "limit": 128, "attempt": 1, "outcome": "Applied", "removed": 64, "retained": "8", "more": False})
 ok("product-receipt-collection.json", maintenance_event)
+absolute_collection = edited(maintenance_event, lambda v: v["details"].update(
+    through="32", publication_through="16", payload_through="16",
+    returned_incarnation="1", returned_epoch="1", returned_owner="0", returned_through="64",
+    returned_publication_through="32", returned_payload_through="32"))
+ok("product-receipt-collection-returned-closure.json", absolute_collection)
+for member in ("incarnation", "epoch", "owner", "through", "publication_through", "payload_through"):
+    bad(f"product-receipt-returned-{member}-overflow.json", "u64-out-of-range",
+        f"/details/returned_{member}", "The actual returned absolute guard is a bounded u64 decimal identity.",
+        edited(absolute_collection, lambda v, member=member:
+               v["details"].update({"returned_" + member: "18446744073709551616"})))
 ok("product-receipt-prepared.json", env("mqttiumd.product-event", seq="9", kind="barrier_hit", pid=1,
     point="receipt.close.prepared", command_kind="ReceiptCollection", details={
     "incarnation": "1", "epoch": "1", "owner": "0", "through": "64",

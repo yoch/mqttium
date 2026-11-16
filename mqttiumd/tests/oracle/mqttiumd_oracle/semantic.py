@@ -1083,6 +1083,9 @@ def _product_event(contracts, document, out):
     if "operation" in document:
         for member in ("incarnation", "epoch", "owner", "sequence"):
             _u64(document, f"/operation/{member}", out)
+    for member in ("incarnation", "epoch", "owner", "through", "publication_through", "payload_through"):
+        if "returned_" + member in document.get("details", {}):
+            _u64(document, f"/details/returned_{member}", out)
     if document["kind"] in {
         "receipt_collection_submitted", "receipt_collection_result", "receipt_collection_applied",
         "log_rotated",
