@@ -4,8 +4,11 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use mqttiumd_lab::store::conformance::World;
-use mqttiumd_store_api::{DurableStore, MAX_CLIENT_ID_BYTES, ReadError, RecoveryRefused};
+use mqttiumd_contract::outcome::{StoreOutcome, StoreReply};
+use mqttiumd_lab::store::conformance::{World, admission_in};
+use mqttiumd_store_api::{
+    DurableStore, MAX_CLIENT_ID_BYTES, ReadBudget, ReadError, RecoveryRefused,
+};
 use mqttiumd_store_sqlite::SqliteStore;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -32,6 +35,64 @@ fn change(path: &std::path::Path, sql: &str) {
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
         .expect("physical check runs");
     assert_eq!(checked, "ok", "the fixture is physically consistent");
+}
+
+#[test]
+fn an_unreadable_identity_witness_does_not_authorise_an_admission() {
+    for bytes in [7, ReadBudget::SNAPSHOT.max_field_bytes + 1] {
+        let path = fixture("identity-witness");
+        let mut store = SqliteStore::open(&path).expect("healthy fixture");
+        let state = store.snapshot().expect("healthy snapshot");
+        let producer = *state
+            .sessions
+            .iter()
+            .find(|(_, session)| session.client_id == b"p1-producer")
+            .expect("producer")
+            .0;
+        let first = admission_in(
+            state.ledger.last_opened(),
+            state.route_revision,
+            producer,
+            1,
+            7,
+            b"first",
+            &[],
+        );
+        let next = admission_in(
+            state.ledger.last_opened(),
+            state.route_revision,
+            producer,
+            2,
+            8,
+            b"next",
+            &[],
+        );
+        assert!(store.apply(&first).committed_now);
+        drop(store);
+        change(
+            &path,
+            &format!("UPDATE operations SET recipe = zeroblob({bytes})"),
+        );
+        let mut store = SqliteStore::open(&path).expect("physical opening succeeds");
+        let applied = store.apply(&next);
+        assert_eq!(
+            applied.reply,
+            StoreReply::Outcome(StoreOutcome::PendingOrUnknown)
+        );
+        assert!(
+            !applied.wrote,
+            "a failed witness read cannot mutate durable state"
+        );
+        assert_eq!(store.established(next.recipe.operation()), Ok(None));
+        let raw = rusqlite::Connection::open(&path).expect("read-only observation");
+        let count: i64 = raw
+            .query_row("SELECT count(*) FROM inbound", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(
+            count, 1,
+            "the uncertain next admission produced no live marker"
+        );
+    }
 }
 
 #[test]

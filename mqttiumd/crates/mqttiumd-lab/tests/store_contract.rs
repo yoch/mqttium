@@ -4,9 +4,10 @@
 //! store of lot L7 runs the same ones with its own factory.
 
 use mqttiumd_contract::ids::StoreIncarnation;
+use mqttiumd_contract::outcome::{StoreOutcome, StoreReply};
 use mqttiumd_lab::store::conformance::{self, World};
 use mqttiumd_lab::store::durable::{
-    DurableStore, Limits, MAX_CLIENT_ID_BYTES, MemoryStore, ReadError, RecoveryRefused,
+    DurableStore, Limits, MAX_CLIENT_ID_BYTES, MemoryStore, ReadBudget, ReadError, RecoveryRefused,
 };
 
 fn memory(incarnation: StoreIncarnation, limits: Limits) -> MemoryStore {
@@ -121,6 +122,51 @@ fn the_suite_runs_every_check() {
 #[test]
 fn an_admission_without_targets_holds_no_payload_bytes() {
     conformance::an_admission_without_targets_holds_no_payload_bytes(&memory);
+}
+
+#[test]
+fn a_completed_unrouted_exchange_releases_its_publication() {
+    conformance::a_completed_unrouted_exchange_releases_its_publication(&memory);
+}
+
+#[test]
+fn publication_metadata_lives_until_its_last_relation_ends() {
+    conformance::publication_metadata_lives_until_its_last_relation_ends(&memory);
+}
+
+#[test]
+fn collected_publication_identities_never_enter_a_new_epoch() {
+    conformance::collected_publication_identities_never_enter_a_new_epoch(&memory);
+}
+
+#[test]
+fn an_unreadable_identity_witness_does_not_authorise_an_admission() {
+    for recipe in [
+        b"invalid".to_vec(),
+        vec![0; ReadBudget::SNAPSHOT.max_field_bytes + 1],
+    ] {
+        let mut world = World::new(&memory);
+        let first = world.admission(1, 7, b"payload", &[]);
+        assert!(world.store.apply(&first).committed_now);
+        let next = world.admission(2, 8, b"next", &[]);
+        let mut durable = world.store.snapshot().expect("healthy snapshot");
+        durable
+            .operations
+            .get_mut(&first.recipe.operation())
+            .expect("receipt")
+            .recipe = recipe;
+        let mut reopened = MemoryStore::reopen(durable);
+        let applied = reopened.apply(&next);
+        assert_eq!(
+            applied.reply,
+            StoreReply::Outcome(StoreOutcome::PendingOrUnknown)
+        );
+        assert!(
+            !applied.wrote,
+            "a failed witness read cannot mutate durable state"
+        );
+        assert_eq!(reopened.established(next.recipe.operation()), Ok(None));
+    }
 }
 
 #[test]

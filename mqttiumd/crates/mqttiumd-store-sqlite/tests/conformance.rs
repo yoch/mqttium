@@ -161,6 +161,21 @@ fn an_admission_without_targets_holds_no_payload_bytes() {
 }
 
 #[test]
+fn a_completed_unrouted_exchange_releases_its_publication() {
+    conformance::a_completed_unrouted_exchange_releases_its_publication(&sqlite);
+}
+
+#[test]
+fn publication_metadata_lives_until_its_last_relation_ends() {
+    conformance::publication_metadata_lives_until_its_last_relation_ends(&sqlite);
+}
+
+#[test]
+fn collected_publication_identities_never_enter_a_new_epoch() {
+    conformance::collected_publication_identities_never_enter_a_new_epoch(&sqlite);
+}
+
+#[test]
 fn a_deleted_session_frees_its_place() {
     conformance::a_deleted_session_frees_its_place(&sqlite);
 }

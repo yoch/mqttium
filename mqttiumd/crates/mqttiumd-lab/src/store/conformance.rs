@@ -1578,6 +1578,159 @@ pub fn an_admission_without_targets_holds_no_payload_bytes<S: DurableStore>(
     );
 }
 
+/// Once PUBREL ends an unrouted exchange, no live fact needs its publication
+/// metadata. The admission receipt still resolves replay and forbids reusing
+/// either immutable identity; reusing the packet identifier starts a new exchange.
+pub fn a_completed_unrouted_exchange_releases_its_publication<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut world = World::new(make);
+    let admission = world.admission(1, 7, b"payload", &[]);
+    assert!(world.store.apply(&admission).committed_now);
+    let admitted_state = world.store.snapshot().expect("healthy snapshot");
+    assert_eq!(admitted_state.publications.len(), 1);
+    assert_eq!(admitted_state.inbound.len(), 1);
+    assert!(admitted_state.payloads.is_empty());
+    assert!(world.store.apply(&world.release(2, 7, 1)).committed_now);
+    let completed = world.store.snapshot().expect("healthy snapshot");
+    assert!(
+        completed.publications.is_empty(),
+        "a completed unrouted exchange must not retain publication metadata"
+    );
+    assert!(completed.inbound.is_empty());
+    assert!(completed.payloads.is_empty());
+    assert!(completed.obligations.is_empty());
+    assert_eq!(accounts_match_what_is_held(&completed), Ok(()));
+
+    let replay = world.store.apply(&admission);
+    assert_eq!(
+        outcome(replay.reply),
+        StoreOutcome::Committed(admitted(&admission))
+    );
+    assert!(!replay.committed_now);
+    assert_eq!(world.store.snapshot().expect("healthy snapshot"), completed);
+
+    let publication_reused = altered(&world.admission(3, 7, b"new", &[]), |admit| {
+        admit.publication = publication_id(world.epoch, 1);
+    });
+    assert_eq!(
+        outcome(world.store.apply(&publication_reused).reply),
+        StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed),
+        "collecting metadata must not make a publication identity reusable"
+    );
+    let payload_reused = altered(&world.admission(4, 7, b"new", &[]), |admit| {
+        admit.payload.id = PayloadId::new(INCARNATION, world.epoch, OWNER, PayloadSeq::new(1));
+    });
+    assert_eq!(
+        outcome(world.store.apply(&payload_reused).reply),
+        StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed),
+        "collecting metadata must not make a payload identity reusable"
+    );
+    let new_exchange = world.admission(5, 7, b"new", &[]);
+    assert!(world.store.apply(&new_exchange).committed_now);
+    assert!(world.store.apply(&world.release(6, 7, 5)).committed_now);
+    let completed_again = world.store.snapshot().expect("healthy snapshot");
+    assert!(completed_again.publications.is_empty());
+    assert_eq!(accounts_match_what_is_held(&completed_again), Ok(()));
+}
+
+/// Metadata lives until both relations end, irrespective of their order. A
+/// producer deletion also ends its own marker, but never another session's
+/// obligation (which the existing deletion test checks separately).
+pub fn publication_metadata_lives_until_its_last_relation_ends<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    for release_first in [false, true] {
+        let mut world = World::new(make);
+        let admission = world.admission(1, 7, b"payload", &[world.b]);
+        assert!(world.store.apply(&admission).committed_now);
+        if release_first {
+            assert!(world.store.apply(&world.release(2, 7, 1)).committed_now);
+        } else {
+            assert_eq!(
+                world
+                    .store
+                    .admin(AdminCommand::DeleteSession { session: world.b }),
+                Ok(AdminDone::SessionDeleted)
+            );
+        }
+        let partial = world.store.snapshot().expect("healthy snapshot");
+        assert_eq!(partial.publications.len(), 1, "one relation still exists");
+        if release_first {
+            assert_eq!(
+                world
+                    .store
+                    .admin(AdminCommand::DeleteSession { session: world.b }),
+                Ok(AdminDone::SessionDeleted)
+            );
+        } else {
+            assert!(world.store.apply(&world.release(2, 7, 1)).committed_now);
+        }
+        let complete = world.store.snapshot().expect("healthy snapshot");
+        assert!(complete.publications.is_empty(), "both relations ended");
+        assert!(complete.payloads.is_empty());
+        assert_eq!(accounts_match_what_is_held(&complete), Ok(()));
+    }
+
+    let mut world = World::new(make);
+    let admission = world.admission(1, 7, b"payload", &[]);
+    assert!(world.store.apply(&admission).committed_now);
+    assert_eq!(
+        world.store.admin(AdminCommand::DeleteSession {
+            session: world.producer
+        }),
+        Ok(AdminDone::SessionDeleted)
+    );
+    let complete = world.store.snapshot().expect("healthy snapshot");
+    assert!(
+        complete.publications.is_empty(),
+        "deletion ended the last marker"
+    );
+    assert_eq!(accounts_match_what_is_held(&complete), Ok(()));
+}
+
+/// Closed-epoch collection can forget a completed admission's receipt: its
+/// publication and payload identities cannot have the scope of a new operation.
+pub fn collected_publication_identities_never_enter_a_new_epoch<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut world = World::new(make);
+    let admission = world.admission(1, 7, b"payload", &[]);
+    assert!(world.store.apply(&admission).committed_now);
+    assert!(world.store.apply(&world.release(2, 7, 1)).committed_now);
+    let closed = world.epoch;
+    world.epoch = open(&mut world.store);
+    assert_eq!(
+        world
+            .store
+            .admin(AdminCommand::CollectClosedEpochs { through: closed }),
+        Ok(AdminDone::Collected)
+    );
+    let state = world.store.snapshot().expect("healthy snapshot");
+    assert!(state.operations.is_empty());
+    assert!(state.publications.is_empty());
+
+    for (sequence, payload) in [(3, false), (4, true)] {
+        let reused = altered(&world.admission(sequence, 7, b"new", &[]), |admit| {
+            if payload {
+                admit.payload.id = PayloadId::new(INCARNATION, closed, OWNER, PayloadSeq::new(1));
+            } else {
+                admit.publication = publication_id(closed, 1);
+            }
+        });
+        assert_eq!(
+            outcome(world.store.apply(&reused).reply),
+            StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed)
+        );
+    }
+    assert!(
+        world
+            .store
+            .apply(&world.admission(5, 7, b"new", &[]))
+            .committed_now
+    );
+}
+
 /// `max_sessions` bounds the sessions that are active. A deleted session
 /// is terminal and frees its place; its identity is never used again.
 pub fn a_deleted_session_frees_its_place<S: DurableStore>(
@@ -2117,6 +2270,9 @@ pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     recovery_reads_bounded_pages_of_durable_facts(make);
     administration_refusals_change_nothing(make);
     an_admission_without_targets_holds_no_payload_bytes(make);
+    a_completed_unrouted_exchange_releases_its_publication(make);
+    publication_metadata_lives_until_its_last_relation_ends(make);
+    collected_publication_identities_never_enter_a_new_epoch(make);
     a_deleted_session_frees_its_place(make);
     a_client_id_longer_than_mqtt_allows_is_refused(make);
     what_is_established_in_epoch_zero_is_never_collected(make);
