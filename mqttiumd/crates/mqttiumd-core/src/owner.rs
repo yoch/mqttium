@@ -1198,6 +1198,12 @@ impl Owner {
             // A wake-up carries no authority, and this perimeter keeps no
             // work behind one.
             Input::WorkAvailable { session } => self.plan_work(*session, draft),
+            Input::ObservedPuback {
+                connection,
+                packet_id,
+                reason,
+                target,
+            } => self.plan_observed_puback(*connection, *packet_id, *reason, *target, draft),
             Input::Packet {
                 connection,
                 ingress_order,
@@ -7969,12 +7975,13 @@ mod tests {
         };
         assert_eq!(
             packet_id.get(),
-            2,
-            "no live-generation network identifier reuse"
+            1,
+            "known Finish application makes the resource number reusable"
         );
+        assert_ne!(claim.operation, next.operation);
         assert_eq!(delivery, work_item(1).delivery);
-        // A delayed duplicate acknowledgment on the old network identifier
-        // cannot finish the second occurrence.
+        // A new claim that has not committed has no eligible emission target,
+        // even though it reuses the previous occurrence's resource number.
         assert!(world.sent(outgoing_puback(CONN, 1, 0)).is_empty());
         world.applied(committed(&next));
         assert_eq!(kinds(&world.drain()), ["EmitPublish"]);
