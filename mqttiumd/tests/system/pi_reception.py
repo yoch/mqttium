@@ -637,7 +637,8 @@ def uncertainty(binary: Path, case: Path, *, finish: bool):
                         "incoming_packet_released_outgoing_identifier")
                 # B was sent before C: terminal ACKs retain that wire order.
                 target.acknowledge(second)
-                target.acknowledge(third)
+                target.acknowledge(third, reason=0x80)
+                result["negative_puback_terminal_reason"] = 0x80
                 result["publications"] = [first.observation(), second.observation(), third.observation()]
             else:
                 received = [target.next_publication(timeout=15), target.next_publication(timeout=15)]
