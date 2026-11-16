@@ -1,0 +1,97 @@
+{
+  "module": "MPacketReuse.tla",
+  "status": "specification",
+  "summary": "Finite outgoing QoS1 Packet Identifier reservation and reuse, immutable ACK observation targets, independent causal identities and exact terminal credit under claim/finish uncertainty.",
+  "issues": [
+    648
+  ],
+  "tests": [],
+  "configs": [
+    {
+      "config": "MPacketReuse-live.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "UniqueLivePacket",
+        "ReservationHeld",
+        "ReleasedOnlyAfterKnownFinish",
+        "CreditsExact",
+        "RecoveredClaimsReserved",
+        "NoWrongFinish",
+        "EmissionRegistered",
+        "ActiveFrameGuard",
+        "FreshFrameDupZero",
+        "RecoveredFrameDup",
+        "NoWrongWritten"
+      ]
+    },
+    {
+      "config": "MPacketReuse-recovery.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "UniqueLivePacket",
+        "ReservationHeld",
+        "ReleasedOnlyAfterKnownFinish",
+        "CreditsExact",
+        "RecoveredClaimsReserved",
+        "NoWrongFinish",
+        "EmissionRegistered",
+        "ActiveFrameGuard",
+        "FreshFrameDupZero",
+        "RecoveredFrameDup",
+        "NoWrongWritten"
+      ]
+    },
+    {
+      "config": "MPacketReuse-reach-reuse.cfg",
+      "expect": "violation",
+      "invariant": "NoReuseWitness"
+    },
+    {
+      "config": "MPacketReuse-reach-ack-before-written.cfg",
+      "expect": "violation",
+      "invariant": "NoAckBeforeWrittenWitness"
+    },
+    {
+      "config": "MPacketReuse-reach-stale-copy.cfg",
+      "expect": "violation",
+      "invariant": "NoStaleCopyWitness"
+    },
+    {
+      "config": "MPacketReuse-reach-none.cfg",
+      "expect": "violation",
+      "invariant": "NoNoneWitness"
+    },
+    {
+      "config": "MPacketReuse-reach-recovery-before-payload.cfg",
+      "expect": "violation",
+      "invariant": "NoRecoveryBeforePayloadWitness"
+    },
+    {
+      "config": "MPacketReuse-mut-early-free.cfg",
+      "expect": "violation",
+      "invariant": "ReleasedOnlyAfterKnownFinish"
+    },
+    {
+      "config": "MPacketReuse-mut-occupied.cfg",
+      "expect": "violation",
+      "invariant": "UniqueLivePacket"
+    },
+    {
+      "config": "MPacketReuse-mut-rebind-copy.cfg",
+      "expect": "violation",
+      "invariant": "NoWrongFinish"
+    },
+    {
+      "config": "MPacketReuse-mut-rebind-none.cfg",
+      "expect": "violation",
+      "invariant": "NoWrongFinish"
+    },
+    {
+      "config": "MPacketReuse-mut-old-callback.cfg",
+      "expect": "violation",
+      "invariant": "NoWrongWritten"
+    }
+  ]
+}
