@@ -72,6 +72,10 @@ def _named(document, table, key):
     return [(f"/{table}/{index}/{key}", row[key]) for index, row in enumerate(document[table])]
 
 
+def _product_registry(contracts, document, out):
+    _unique(_named(document, "rules", "id"), "product rule", "duplicate-name", out)
+
+
 def _requirements(contracts, holder, base, keys, out):
     for key in keys:
         for index, identifier in enumerate(holder.get(key, [])):
@@ -1084,6 +1088,7 @@ _RULES = {
     "mqttiumd.scenario": _scenario,
     "mqttiumd.fixture": _fixture,
     "mqttiumd.transition-registry": _registry,
+    "mqttiumd.product-transition-registry": _product_registry,
     "mqttiumd.transition-catalog": _transition_catalog,
     "mqttiumd.run-result": _run_result,
     "mqttiumd.run-manifest": _run_manifest,

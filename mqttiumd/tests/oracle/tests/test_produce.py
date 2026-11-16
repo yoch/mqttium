@@ -331,6 +331,10 @@ class Campaign(unittest.TestCase):
                 value = json.loads(snapshot_path.read_text())
                 if snapshot_edit is not None:
                     snapshot_edit(value)
+                    value["operations"].sort(key=lambda row: tuple(
+                        int(row["operation_id"][member])
+                        for member in ("incarnation", "epoch", "owner", "sequence")
+                    ))
                     snapshot_path.write_text(json.dumps(value))
                     cited.update(self.cite(cited["path"]))
             if recovery_edit is not None and record["kind"] in (
@@ -378,6 +382,28 @@ class Campaign(unittest.TestCase):
             })
 
         self.revise_evidence(snapshot_edit=subscriptions)
+        self.assertEqual(self.produce_rebuilt(), [
+            "not qualifying: the fixture-based qualifier does not cover outgoing claims "
+            "or subscription mutations"
+        ])
+        self.assertEqual(self.result["verdict"], "INCONCLUSIVE")
+
+    def test_finished_delivery_receipt_without_a_live_claim_cannot_qualify(self):
+        source = ROOT / "contracts/examples/v1/valid/store-snapshot-delivery-finish-receipt.json"
+        finished = json.loads(source.read_text())["operations"][-1]
+        self.revise_evidence(snapshot_edit=lambda value: value["operations"].append(finished))
+        self.assertEqual(self.produce_rebuilt(), [
+            "not qualifying: the fixture-based qualifier does not cover outgoing claims "
+            "or subscription mutations"
+        ])
+        self.assertTrue(all(entry["status"] == "PASS" for entry in self.result["assertions"]))
+        self.assertEqual(self.result["verdict"], "INCONCLUSIVE")
+
+    def test_rejected_claim_recipe_without_commit_facts_cannot_qualify(self):
+        source = ROOT / "contracts/examples/v1/valid/store-snapshot-delivery-claim-receipt.json"
+        claim = json.loads(source.read_text())["operations"][-1]
+        claim["decision"] = {"kind": "RejectedCertain", "reason": "PreconditionFailed"}
+        self.revise_evidence(snapshot_edit=lambda value: value["operations"].append(claim))
         self.assertEqual(self.produce_rebuilt(), [
             "not qualifying: the fixture-based qualifier does not cover outgoing claims "
             "or subscription mutations"

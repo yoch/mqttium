@@ -42,6 +42,7 @@ INDEX = ROOT / "contracts" / "examples" / "v1" / "index.json"
 FORMATS = {
     "mqttiumd.product-event": "product-event.schema.json",
     "mqttiumd.product-profile": "product-profile.schema.json",
+    "mqttiumd.product-transition-registry": "product-transitions.schema.json",
     "mqttiumd.scenario": "scenario.schema.json",
     "mqttiumd.fixture": "fixture.schema.json",
     "mqttiumd.trace-record": "trace-record.schema.json",

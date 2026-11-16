@@ -1,0 +1,258 @@
+{
+  "format": "mqttiumd.product-transition-registry",
+  "schema_version": 1,
+  "id": "tcp-exact-pubsub-v1",
+  "decision": "0025",
+  "scope": "qualifying",
+  "partition_complete": false,
+  "description": "Added exact persistent subscription and outgoing QoS 1 paths. States name logical cuts, including transient committed/terminal cuts. Action names include store mutations and effect eligibility, not only Rust Effect variants. Reception groups refer to finite system tests; this table neither claims their execution nor completes P1/P2, extends S0 qualification, accepts ADR 0025, or supplies a formal runtime proof.",
+  "rules": [
+    {
+      "id": "subscription.idle.change",
+      "machine": "SubscriptionMutation",
+      "state_class": "Idle",
+      "event_class": "SubscribeOrUnsubscribe",
+      "guard": "Current durable session and revision; bounded exact filters; packet identifier is available in the client sender space.",
+      "next_state_class": "ChangePending",
+      "required_actions": [
+        "PersistChangeSubscriptions",
+        "ArmDeadline"
+      ],
+      "forbidden_actions": [
+        "PositiveSubscriptionAck"
+      ],
+      "reception_groups": [
+        "A",
+        "G",
+        "F"
+      ]
+    },
+    {
+      "id": "subscription.pending.unknown",
+      "machine": "SubscriptionMutation",
+      "state_class": "ChangePending",
+      "event_class": "UnknownOutcome",
+      "guard": "The operation is still uncertain; preserve its canonical recipe and OperationId.",
+      "next_state_class": "ChangePending",
+      "required_actions": [
+        "ResolveAndFence"
+      ],
+      "forbidden_actions": [
+        "NewOperationIdentity",
+        "PositiveSubscriptionAck"
+      ],
+      "reception_groups": [
+        "D"
+      ]
+    },
+    {
+      "id": "subscription.pending.committed",
+      "machine": "SubscriptionMutation",
+      "state_class": "ChangePending",
+      "event_class": "KnownCommit",
+      "guard": "Correlated commit. Install the committed route projection before making the ordered per-filter acknowledgement eligible; reply only to the original live connection generation.",
+      "next_state_class": "Committed",
+      "required_actions": [
+        "InstallRouteProjection",
+        "EligibleSubscriptionAck"
+      ],
+      "forbidden_actions": [
+        "AckBeforeProjection"
+      ],
+      "reception_groups": [
+        "A",
+        "G"
+      ]
+    },
+    {
+      "id": "subscription.pending.rejected",
+      "machine": "SubscriptionMutation",
+      "state_class": "ChangePending",
+      "event_class": "CertainRejection",
+      "guard": "Correlated certain rejection. Existing route projection remains unchanged.",
+      "next_state_class": "Idle",
+      "required_actions": [
+        "NegativeSubscriptionAck"
+      ],
+      "forbidden_actions": [
+        "InstallUncommittedProjection"
+      ],
+      "reception_groups": [
+        "G",
+        "H"
+      ]
+    },
+    {
+      "id": "delivery.queued.claim",
+      "machine": "OutgoingQos1",
+      "state_class": "Queued",
+      "event_class": "WorkDiscovered",
+      "guard": "Bounded durable work read; current destination session/revision; available destination and local window; packet fits the destination maximum.",
+      "next_state_class": "ClaimPending",
+      "required_actions": [
+        "PersistClaimDelivery",
+        "ArmDeadline"
+      ],
+      "forbidden_actions": [
+        "EmitPublish"
+      ],
+      "reception_groups": [
+        "B",
+        "D",
+        "H"
+      ]
+    },
+    {
+      "id": "delivery.claim.unknown",
+      "machine": "OutgoingQos1",
+      "state_class": "ClaimPending",
+      "event_class": "UnknownOutcome",
+      "guard": "The original claim operation remains uncertain; no fresh identity may bypass it.",
+      "next_state_class": "ClaimPending",
+      "required_actions": [
+        "ResolveAndFence"
+      ],
+      "forbidden_actions": [
+        "EmitPublish",
+        "ReleaseOutboundCredit"
+      ],
+      "reception_groups": [
+        "D"
+      ]
+    },
+    {
+      "id": "delivery.claim.committed",
+      "machine": "OutgoingQos1",
+      "state_class": "ClaimPending",
+      "event_class": "KnownCommit",
+      "guard": "Matching delivery, target revision, packet identifier and claim operation are durably known; current connection generation is authorized.",
+      "next_state_class": "AwaitPuback",
+      "required_actions": [
+        "EligiblePublish"
+      ],
+      "forbidden_actions": [
+        "EndObligation"
+      ],
+      "reception_groups": [
+        "A",
+        "D"
+      ]
+    },
+    {
+      "id": "delivery.await.written",
+      "machine": "OutgoingQos1",
+      "state_class": "AwaitPuback",
+      "event_class": "LocalWriteComplete",
+      "guard": "A matching local write receipt records socket progress; it is not MQTT acknowledgement or proof of client receipt.",
+      "next_state_class": "AwaitPuback",
+      "required_actions": [],
+      "forbidden_actions": [
+        "EndObligation",
+        "ReleaseOutboundCredit",
+        "PeriodicPublishRetry"
+      ],
+      "reception_groups": [
+        "C",
+        "F"
+      ]
+    },
+    {
+      "id": "delivery.await.puback",
+      "machine": "OutgoingQos1",
+      "state_class": "AwaitPuback",
+      "event_class": "DestinationPuback",
+      "guard": "Current connection generation, packet identifier and claim slot match. A valid positive or negative PUBACK terminates the delivery conditionally.",
+      "next_state_class": "FinishPending",
+      "required_actions": [
+        "PersistFinishDelivery",
+        "ArmDeadline"
+      ],
+      "forbidden_actions": [
+        "ReleaseOutboundCredit"
+      ],
+      "reception_groups": [
+        "C",
+        "F"
+      ]
+    },
+    {
+      "id": "delivery.finish.unknown",
+      "machine": "OutgoingQos1",
+      "state_class": "FinishPending",
+      "event_class": "UnknownOutcome",
+      "guard": "The original finish operation remains uncertain; preserve slot and credits while reconciling.",
+      "next_state_class": "FinishPending",
+      "required_actions": [
+        "ResolveAndFence"
+      ],
+      "forbidden_actions": [
+        "ReleaseOutboundCredit",
+        "ReusePacketIdentifier"
+      ],
+      "reception_groups": [
+        "D"
+      ]
+    },
+    {
+      "id": "delivery.finish.committed",
+      "machine": "OutgoingQos1",
+      "state_class": "FinishPending",
+      "event_class": "KnownCommit",
+      "guard": "Correlated conditional finish committed. The store ends the obligation and decrements its payload reference exactly once; the final reference releases the payload.",
+      "next_state_class": "Terminal",
+      "required_actions": [
+        "EndObligation",
+        "ReleaseOutboundCredit"
+      ],
+      "forbidden_actions": [
+        "RecreateObligation"
+      ],
+      "reception_groups": [
+        "D",
+        "G",
+        "H"
+      ]
+    },
+    {
+      "id": "delivery.recovery.claimed",
+      "machine": "OutgoingQos1",
+      "state_class": "AwaitPuback",
+      "event_class": "RecoveredClaim",
+      "guard": "Same durable obligation, claim operation and packet identifier; a new live connection authorizes retransmission with DUP=true. No timer retries PUBLISH on a continuously live MQTT 5 connection.",
+      "next_state_class": "AwaitPuback",
+      "required_actions": [
+        "EligibleDuplicatePublish"
+      ],
+      "forbidden_actions": [
+        "NewClaimIdentity",
+        "RecreateObligation",
+        "PeriodicPublishRetry"
+      ],
+      "reception_groups": [
+        "B",
+        "E",
+        "F",
+        "H"
+      ]
+    },
+    {
+      "id": "delivery.await.closed",
+      "machine": "OutgoingQos1",
+      "state_class": "AwaitPuback",
+      "event_class": "ConnectionClosed",
+      "guard": "Closing or taking over a connection preserves the durable claim. Old generations cannot emit or finish a different occurrence.",
+      "next_state_class": "AwaitPuback",
+      "required_actions": [
+        "PreserveDeliveryIdentity"
+      ],
+      "forbidden_actions": [
+        "EmitOnClosedConnection",
+        "EndObligation"
+      ],
+      "reception_groups": [
+        "E",
+        "F"
+      ]
+    }
+  ]
+}

@@ -674,6 +674,7 @@ fn the_adapter_refuses_past_its_bounds_and_hands_the_effect_back() {
             Effect::LoadWork {
                 session: target,
                 limit: 4,
+                after: None,
             },
         )
     };

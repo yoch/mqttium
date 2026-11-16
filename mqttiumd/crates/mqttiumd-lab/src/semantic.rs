@@ -153,6 +153,12 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
         "mqttiumd.scenario" => scenario(workspace, document, &mut report.diagnostics),
         "mqttiumd.fixture" => fixture(workspace, document, &mut report.diagnostics),
         "mqttiumd.transition-registry" => registry(workspace, document, report),
+        "mqttiumd.product-transition-registry" => unique(
+            &entry_names(document, "rules", "id"),
+            "product rule",
+            code::DUPLICATE_NAME,
+            &mut report.diagnostics,
+        ),
         "mqttiumd.transition-catalog" => transition_catalog(document, &mut report.diagnostics),
         "mqttiumd.run-result" => run_result(workspace, document, &mut report.diagnostics),
         "mqttiumd.run-manifest" => run_manifest(document, &mut report.diagnostics),

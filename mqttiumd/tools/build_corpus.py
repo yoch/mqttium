@@ -3304,6 +3304,17 @@ for kind_name, origin in [
     )
 # Product system evidence is separate from fixture-based qualifying campaigns.
 ok("product-profile.json", json.loads((V1 / "product-profile.json").read_text()))
+product_transitions = json.loads((V1 / "pubsub.transitions.json").read_text())
+ok("product-pubsub-transitions.json", product_transitions)
+bad("product-transitions-claiming-complete.json", "schema-violation", "/partition_complete",
+    "The product transition subset is not a complete guard partition.",
+    {**product_transitions, "partition_complete": True})
+bad("product-transitions-claiming-qualification.json", "schema-violation", "/scope",
+    "Product system tests do not extend fixture-based qualification.",
+    {**product_transitions, "scope": "qualifying"})
+bad("product-transitions-duplicate-rule.json", "duplicate-name", "/rules/1/id",
+    "Each documented product transition has one stable identifier.",
+    edited(product_transitions, lambda v: v["rules"].insert(1, copy.deepcopy(v["rules"][0]))))
 product_event = env("mqttiumd.product-event", seq="1", kind="startup_refused", pid=1,
                     cause="InvalidData", phase="Snapshot", details={"code": "durable_read"})
 ok("product-event.json", product_event)

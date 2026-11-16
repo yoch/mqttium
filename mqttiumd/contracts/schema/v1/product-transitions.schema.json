@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Bounded product pub/sub transition subset",
+  "description": "Descriptive product transitions with system-test scope. This is a subset, not a complete guard partition or an extension of the fixture-based qualifier.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "schema_version",
+    "id",
+    "decision",
+    "scope",
+    "partition_complete",
+    "description",
+    "rules"
+  ],
+  "properties": {
+    "format": {
+      "const": "mqttiumd.product-transition-registry"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "id": {
+      "const": "tcp-exact-pubsub-v1"
+    },
+    "decision": {
+      "const": "0025"
+    },
+    "scope": {
+      "const": "product-system-tests"
+    },
+    "partition_complete": {
+      "const": false
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "machine",
+          "state_class",
+          "event_class",
+          "guard",
+          "next_state_class",
+          "required_actions",
+          "forbidden_actions",
+          "reception_groups"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "primitives.schema.json#/$defs/dotted_name"
+          },
+          "machine": {
+            "enum": [
+              "SubscriptionMutation",
+              "OutgoingQos1"
+            ]
+          },
+          "state_class": {
+            "enum": [
+              "Idle",
+              "ChangePending",
+              "Committed",
+              "Queued",
+              "ClaimPending",
+              "AwaitPuback",
+              "FinishPending",
+              "Terminal"
+            ]
+          },
+          "event_class": {
+            "$ref": "primitives.schema.json#/$defs/type_name"
+          },
+          "guard": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "next_state_class": {
+            "enum": [
+              "Idle",
+              "ChangePending",
+              "Committed",
+              "Queued",
+              "ClaimPending",
+              "AwaitPuback",
+              "FinishPending",
+              "Terminal"
+            ]
+          },
+          "required_actions": {
+            "type": "array",
+            "maxItems": 16,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "primitives.schema.json#/$defs/type_name"
+            }
+          },
+          "forbidden_actions": {
+            "type": "array",
+            "maxItems": 16,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "primitives.schema.json#/$defs/type_name"
+            }
+          },
+          "reception_groups": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "uniqueItems": true,
+            "items": {
+              "enum": [
+                "A",
+                "B",
+                "C",
+                "D",
+                "E",
+                "F",
+                "G",
+                "H"
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

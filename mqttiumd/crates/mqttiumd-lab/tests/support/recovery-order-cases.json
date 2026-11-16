@@ -3,7 +3,7 @@
   "cases": [
     {
       "name": "an inventory in order",
-      "facts": [["Epoch"], ["Limits"], ["RouteTable"], ["Route", "7031"], ["Route", "7031"], ["Route", "70312f61"], ["Session"], ["Session"], ["InboundExchange"], ["Operation"]],
+      "facts": [["Epoch"], ["Limits"], ["RouteTable"], ["Route", "7031"], ["Route", "7031"], ["Route", "70312f61"], ["Session"], ["Session"], ["InboundExchange"], ["OutboundDelivery"], ["Operation"]],
       "refused": []
     },
     {"name": "a route after a session", "facts": [["Epoch"], ["Session"], ["Route", "7031"]], "refused": [[2, "RankDecreased"]]},
@@ -16,6 +16,9 @@
     {"name": "0xff after every ASCII byte", "facts": [["Route", "ff"], ["Route", "7a"]], "refused": [[1, "RoutesUnsorted"]]},
     {"name": "a refused fact changes nothing", "facts": [["Epoch"], ["Session"], ["Limits"], ["Session"]], "refused": [[2, "RankDecreased"]]},
     {"name": "an empty topic first", "facts": [["Route", ""], ["Route", "00"]], "refused": []},
-    {"name": "no fact is required", "facts": [["Operation"], ["Operation"]], "refused": []}
+    {"name": "no fact is required", "facts": [["Operation"], ["Operation"]], "refused": []},
+    {"name": "outgoing metadata before operation knowledge", "facts": [["InboundExchange"], ["OutboundDelivery"], ["OutboundDelivery"], ["Operation"]], "refused": []},
+    {"name": "inbound exchange after outgoing metadata", "facts": [["OutboundDelivery"], ["InboundExchange"], ["Operation"]], "refused": [[1, "RankDecreased"]]},
+    {"name": "outgoing metadata after operation knowledge", "facts": [["Operation"], ["OutboundDelivery"]], "refused": [[1, "RankDecreased"]]}
   ]
 }

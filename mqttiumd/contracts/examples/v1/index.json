@@ -92,6 +92,7 @@
     "contracts/examples/v1/valid/toy.transitions.seed-with-hole.json",
     "contracts/examples/v1/valid/wide.catalog.json",
     "contracts/examples/v1/valid/product-profile.json",
+    "contracts/examples/v1/valid/product-pubsub-transitions.json",
     "contracts/examples/v1/valid/product-event.json",
     "contracts/examples/v1/valid/product-ack-receipt.json",
     "contracts/examples/v1/valid/product-puback-credit.json"
@@ -1812,6 +1813,24 @@
       "code": "schema-violation",
       "pointer": "/origin_component",
       "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-transitions-claiming-complete.json",
+      "code": "schema-violation",
+      "pointer": "/partition_complete",
+      "why": "The product transition subset is not a complete guard partition."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-transitions-claiming-qualification.json",
+      "code": "schema-violation",
+      "pointer": "/scope",
+      "why": "Product system tests do not extend fixture-based qualification."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-transitions-duplicate-rule.json",
+      "code": "duplicate-name",
+      "pointer": "/rules/1/id",
+      "why": "Each documented product transition has one stable identifier."
     },
     {
       "file": "contracts/examples/v1/invalid/product-event-untyped-cause.json",
