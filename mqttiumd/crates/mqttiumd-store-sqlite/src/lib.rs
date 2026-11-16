@@ -296,30 +296,32 @@ impl From<Corrupt> for Fault {
 /// could not go on.
 enum Abort<E> {
     Refused(E),
+    /// Preserve durable-read causes through controls such as epoch opening.
+    Read(ReadError),
     Fault,
 }
 
 impl<E> From<rusqlite::Error> for Abort<E> {
-    fn from(_: rusqlite::Error) -> Self {
-        Self::Fault
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Read(reader::sql_error(&error))
     }
 }
 
 impl<E> From<Corrupt> for Abort<E> {
     fn from(_: Corrupt) -> Self {
-        Self::Fault
+        Self::Read(ReadError::InvalidData)
     }
 }
 
 impl<E> From<ReadError> for Abort<E> {
-    fn from(_: ReadError) -> Self {
-        Self::Fault
+    fn from(error: ReadError) -> Self {
+        Self::Read(error)
     }
 }
 
 impl<E> From<Fault> for Abort<E> {
-    fn from(_: Fault) -> Self {
-        Self::Fault
+    fn from(error: Fault) -> Self {
+        Self::Read(error.read_error())
     }
 }
 
@@ -682,20 +684,27 @@ fn session_row(
     let row = conn
         .prepare_cached("SELECT revision, state, expiry, opened_by FROM sessions WHERE id = ?1")?
         .query_row([session.to_be_bytes().as_slice()], |row| {
-            sessions::decode_expiry(row.get(2)?).map_err(|_| rusqlite::Error::InvalidQuery)?;
             let binding = reader::optional_blob(row, 3, 32)?;
-            if let Some(bytes) = binding {
-                OperationId::from_be_slice(&bytes).map_err(|_| rusqlite::Error::InvalidQuery)?;
-            }
-            Ok((blob(row, 0)?, row.get::<_, i64>(1)?))
+            Ok((
+                blob(row, 0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                binding,
+            ))
         })
         .optional()?;
     match row {
         None => Ok(None),
-        Some((revision, state)) => Ok(Some((
-            Revision::new(blob_u64(&revision)?),
-            code_session_state(state)?,
-        ))),
+        Some((revision, state, expiry, binding)) => {
+            sessions::decode_expiry(expiry)?;
+            if let Some(bytes) = binding {
+                OperationId::from_be_slice(&bytes).map_err(|_| Corrupt)?;
+            }
+            Ok(Some((
+                Revision::new(blob_u64(&revision)?),
+                code_session_state(state)?,
+            )))
+        }
     }
 }
 
@@ -1736,6 +1745,7 @@ impl SqliteStore {
                 Ok(value) => value,
                 // Dropping the transaction rolls it back.
                 Err(Abort::Refused(refusal)) => return Ok(Err(refusal)),
+                Err(Abort::Read(error)) => return Err(Some(error)),
                 Err(Abort::Fault) => return Err(None),
             };
             meta.revision = meta.revision.checked_add(1).ok_or(None)?;

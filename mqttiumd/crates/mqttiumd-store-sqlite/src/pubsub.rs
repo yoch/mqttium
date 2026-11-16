@@ -208,6 +208,7 @@ pub(super) fn finish(
         return refused(failed);
     }
     end_obligation(conn, meta, &publication, index).map_err(|error| match error {
+        Abort::Read(error) => Abort::Read(error),
         Abort::Fault => Abort::Fault,
         Abort::Refused(_) => Abort::Refused(failed),
     })?;
@@ -259,6 +260,7 @@ pub(super) fn consume(
         return refused(failed);
     }
     end_obligation(conn, meta, &publication, index).map_err(|error| match error {
+        Abort::Read(error) => Abort::Read(error),
         Abort::Fault => Abort::Fault,
         Abort::Refused(_) => Abort::Refused(failed),
     })?;

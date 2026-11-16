@@ -278,6 +278,7 @@ fn lifecycle_erase(
     session: SessionId,
 ) -> Guard<SessionCancellations> {
     erase(conn, meta, session).map_err(|error| match error {
+        Abort::Read(error) => Abort::Read(error),
         Abort::Fault => Abort::Fault,
         Abort::Refused(_) => Abort::Refused(RejectReason::PreconditionFailed),
     })
@@ -401,11 +402,14 @@ pub(super) fn expire(conn: &Connection, meta: &mut Meta) -> Result<(), Abort<()>
     )
     .map_err(|_| Corrupt)?])?;
     let mut expired = Vec::new();
+    expired
+        .try_reserve_exact(meta.limits.max_sessions.min(MAX_RECOVERY_INVENTORY_ROWS))
+        .map_err(|_| ReadError::AllocationFailed)?;
     let mut count = 0usize;
     while let Some(row) = rows.next()? {
         count = count.checked_add(1).ok_or(Corrupt)?;
         if count > meta.limits.max_sessions || count > MAX_RECOVERY_INVENTORY_ROWS {
-            return Err(Abort::Fault);
+            return Err(ReadError::LimitExceeded.into());
         }
         let expiry = decode_expiry(row.get(1)?)?;
         code_session_state(row.get(2)?)?;
@@ -420,7 +424,12 @@ pub(super) fn expire(conn: &Connection, meta: &mut Meta) -> Result<(), Abort<()>
     drop(rows);
     drop(stmt);
     for session in expired {
-        erase(conn, meta, session).map_err(|_| Abort::Fault)?;
+        erase(conn, meta, session).map_err(|error| match error {
+            Abort::Read(error) => Abort::Read(error),
+            Abort::Fault => Abort::Fault,
+            Abort::Refused(AdminRefused::WriteFailed) => Abort::Read(ReadError::AllocationFailed),
+            Abort::Refused(_) => Abort::Read(ReadError::InvalidData),
+        })?;
     }
     Ok(())
 }
