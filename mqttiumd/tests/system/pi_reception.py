@@ -761,11 +761,30 @@ def crash_delivery(binary: Path, case: Path, mode: str):
             if mode == "finish":
                 target.acknowledge(first)
                 result["hit"] = broker.wait_event("barrier_hit", point=point)
+            if mode == "reuse":
+                first_fact = queued_publication(broker)
+                target.acknowledge(first)
+                result["first_known_finish"] = known_finish(broker, first_fact["details"]["delivery"])
+                source.wait(0x50, 1)
+                source.send(pubrel_packet(1)); source.wait(0x70, 1)
+                source.publish(2, "reception/pi-crash", b"reused-occurrence-B", qos=2)
+                reused = target.next_publication()
+                require(reused.packet_id == 1 and not reused.dup and reused.payload == b"reused-occurrence-B",
+                        "new_claim_not_reused_before_crash")
+                # The unacknowledged live claim must survive its own receipt
+                # retirement; only its durable business record reserves PI1.
+                for identifier in range(1, 129):
+                    source.subscribe(identifier, [("reception/pi-crash-aging", identifier % 2)])
+                result["reused_publish_before_crash"] = reused.observation()
         before = durable(broker.db)
         session = session_key(before, "pi-crash-target")
         if mode != "finish":
             saved = assignment(before, session)
             result["saved_assignment"] = saved
+            if mode == "reuse":
+                require(not any(row["id"] == saved["row"]["claim"] for row in before["tables"]["operations"]),
+                        "live_claim_receipt_not_collected")
+                result["live_claim_receipt_collected"] = True
         else:
             require(before["counts"]["outbound"] == before["counts"]["obligations"] == 0,
                     "finish_barrier_did_not_commit")
@@ -785,16 +804,23 @@ def crash_delivery(binary: Path, case: Path, mode: str):
             replay = target.next_publication()
             after = durable(restarted.db)
             require(assignment(after, session) == saved and replay.packet_id == 1 and replay.dup
-                    and replay.payload == b"crash-occurrence-A", "recovered_claim_or_identifier_changed")
+                    and replay.payload == (b"reused-occurrence-B" if mode == "reuse" else b"crash-occurrence-A"),
+                    "recovered_claim_or_identifier_changed")
             target.acknowledge(replay)
             result["retransmission"] = replay.observation()
+            publication = saved["row"]["publication"]
+            delivery = '/'.join(str(int(publication[offset:offset + 16], 16)) for offset in range(0, 64, 16))
+            delivery += '/' + str(saved["row"]["idx"])
+            result["recovered_finish"] = known_finish(restarted, delivery)
         source = PubsubWire(restarted.address, restarted.observations, "recovered-source")
         source.connect("pi-crash-source", session_present=True, keep_alive=0)
-        source.publish(1, "reception/pi-crash", b"crash-occurrence-A", qos=2, dup=True)
+        if mode != "reuse":
+            source.publish(1, "reception/pi-crash", b"crash-occurrence-A", qos=2, dup=True)
         until(lambda: durable(restarted.db)["counts"]["outbound"] == 0, "recovered_finish_missing")
-        source.publish(2, "reception/pi-crash", b"new-occurrence-B", qos=2)
+        new_payload = b"after-reuse-C" if mode == "reuse" else b"new-occurrence-B"
+        source.publish(3 if mode == "reuse" else 2, "reception/pi-crash", new_payload, qos=2)
         newer = target.next_publication()
-        require(newer.packet_id == 1 and not newer.dup and newer.payload == b"new-occurrence-B",
+        require(newer.packet_id == 1 and not newer.dup and newer.payload == new_payload,
                 "new_occurrence_not_fresh_after_restart")
         target.acknowledge(newer)
         drained(restarted, case / "final")
@@ -816,7 +842,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--binary-source-head")
     parser.add_argument("--case", choices=("B", "reverse", "smoke", "C-claim", "C-finish", "D-copy", "D-none", "D-takeover",
-                                          "E-claim", "E-observed", "E-finish"), default="B")
+                                          "E-claim", "E-observed", "E-finish", "E-reuse"), default="B")
     parser.add_argument("--count", type=int)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
