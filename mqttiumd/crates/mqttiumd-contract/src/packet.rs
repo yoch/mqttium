@@ -150,7 +150,9 @@ impl AckReason {
     #[must_use]
     pub const fn refusing(rejection: RejectReason) -> Self {
         match rejection {
-            RejectReason::CapacityExceeded(_) => Self::QuotaExceeded,
+            RejectReason::CapacityExceeded(_) | RejectReason::SessionCapacityExceeded => {
+                Self::QuotaExceeded
+            }
             RejectReason::Fenced | RejectReason::PreconditionFailed | RejectReason::EpochClosed => {
                 Self::ImplementationSpecificError
             }
@@ -171,7 +173,9 @@ impl PubackReason {
     #[must_use]
     pub const fn refusing(rejection: RejectReason) -> Self {
         match rejection {
-            RejectReason::CapacityExceeded(_) => Self::QuotaExceeded,
+            RejectReason::CapacityExceeded(_) | RejectReason::SessionCapacityExceeded => {
+                Self::QuotaExceeded
+            }
             RejectReason::Fenced | RejectReason::PreconditionFailed | RejectReason::EpochClosed => {
                 Self::ImplementationSpecificError
             }
