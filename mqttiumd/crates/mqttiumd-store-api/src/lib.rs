@@ -26,6 +26,10 @@ use mqttiumd_contract::outcome::{
 };
 use mqttiumd_contract::packet::Qos;
 use mqttiumd_contract::pubsub::WorkItem;
+use mqttiumd_contract::receipts::{
+    ClosedReceiptCollection, ClosedReceiptReply, ReceiptClosure, ReceiptCollection,
+    ReceiptCollectionReply, ReceiptOrigin,
+};
 
 /// The longest ClientID MQTT can carry: a UTF-8 string with a two-byte
 /// length. A session never holds a longer one, and a recovered session
@@ -72,6 +76,7 @@ pub enum ReadPhase {
     Inspect,
     Recovery,
     Work,
+    Maintenance,
 }
 
 impl ReadPhase {
@@ -86,6 +91,7 @@ impl ReadPhase {
             Self::Inspect => "Inspect",
             Self::Recovery => "Recovery",
             Self::Work => "Work",
+            Self::Maintenance => "Maintenance",
         }
     }
 }
@@ -289,6 +295,8 @@ pub struct DurableState {
     /// Identities closed by `ResolveAndFence` before any command arrived.
     /// Each holds one receipt slot, like a receipt.
     pub fences: BTreeSet<OperationId>,
+    /// Compact non-execution guards, distinct from physical retained rows.
+    pub receipt_frontiers: BTreeMap<ReceiptOrigin, ReceiptClosure>,
     pub publications: BTreeMap<PublicationId, PublicationRecord>,
     pub payloads: BTreeMap<PayloadId, PayloadRecord>,
     pub obligations: BTreeMap<DeliveryId, ObligationRecord>,
@@ -435,6 +443,33 @@ impl RecoveryRefused {
 /// The writer of a store. Each method is one step in the single order
 /// of authority; a method either commits entirely or changes nothing.
 pub trait DurableStore {
+    /// Confirm an origin's contiguous consumed prefix and sweep at most limit
+    /// physical receipt/fence rows atomically. No receipt is created. A retry
+    /// reports absolute durable knowledge, never a second credit grant.
+    fn collect_receipts(
+        &mut self,
+        _collection: ReceiptCollection,
+    ) -> Result<ReceiptCollectionReply, ReadError> {
+        Err(ReadError::Unavailable)
+    }
+
+    /// Read one compact durable origin guard, including after a lost reply.
+    fn receipt_frontier(
+        &self,
+        _origin: ReceiptOrigin,
+    ) -> Result<Option<ReceiptClosure>, ReadError> {
+        Err(ReadError::Unavailable)
+    }
+
+    /// Sweep old epochs only after durable startup closed their authority.
+    /// Each call bounds rows and allocates no operation identity or receipt.
+    fn collect_closed_receipts(
+        &mut self,
+        _collection: ClosedReceiptCollection,
+    ) -> Result<ClosedReceiptReply, ReadError> {
+        Err(ReadError::Unavailable)
+    }
+
     /// The incarnation of the data set and the last epoch opened in it:
     /// what start-up reads before it opens anything.
     fn ledger(&self) -> Result<EpochLedger, ReadError>;

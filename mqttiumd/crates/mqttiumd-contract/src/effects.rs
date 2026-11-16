@@ -39,6 +39,8 @@ pub enum InboundPhase {
 /// [`RecoveryOrder`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum RecoveredFact {
+    /// Durable retirement does not mean that an old command was rejected.
+    ReceiptFrontier(crate::receipts::ReceiptClosure),
     OutboundDelivery {
         delivery: DeliveryId,
         target: SessionId,
@@ -101,6 +103,7 @@ pub enum FactRank {
     Session,
     InboundExchange,
     OutboundDelivery,
+    ReceiptFrontier,
     Operation,
 }
 
@@ -124,6 +127,7 @@ impl RecoveredFact {
             Self::Session { .. } => FactRank::Session,
             Self::InboundExchange { .. } => FactRank::InboundExchange,
             Self::OutboundDelivery { .. } => FactRank::OutboundDelivery,
+            Self::ReceiptFrontier(_) => FactRank::ReceiptFrontier,
             Self::Operation { .. } => FactRank::Operation,
         }
     }
@@ -208,6 +212,14 @@ pub enum FrameProgress {
 /// It is moved, never copied: a step either consumes it or hands it back.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Input {
+    /// Enable/pump bounded live receipt collection. Only product adapters that
+    /// implement the control invoke it; ordinary S0 fixture runs do not.
+    MaintainReceipts,
+    ReceiptsCollected {
+        effect: EffectId,
+        collection: crate::receipts::ReceiptCollection,
+        reply: crate::receipts::ReceiptCollectionReply,
+    },
     /// Adapter refused or failed this exact volatile attempt. The owner decides its loss.
     Qos0EmitRefused {
         effect: EffectId,
@@ -290,6 +302,10 @@ pub enum CloseReason {
 /// An effect: a responsibility transferred to an adapter.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Effect {
+    /// A dedicated control lane; it never consumes a business receipt slot.
+    CollectReceipts {
+        collection: crate::receipts::ReceiptCollection,
+    },
     /// One volatile attempt. No Packet Identifier, durable claim, or retry permission.
     EmitQos0 {
         connection: ConnectionKey,
