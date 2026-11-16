@@ -3386,6 +3386,11 @@ product_transitions = json.loads((V1 / "pubsub.transitions.json").read_text())
 ok("product-pubsub-transitions.json", product_transitions)
 receipt_transitions = json.loads((V1 / "receipts.transitions.json").read_text())
 ok("product-receipt-transitions.json", receipt_transitions)
+pi_transitions = json.loads((V1 / "pi.transitions.json").read_text())
+ok("product-pi-transitions.json", pi_transitions)
+bad("product-pi-transitions-wrong-decision.json", "schema-violation", "/decision",
+    "The recyclable identifier subset refers to Proposed 0028 without relabeling earlier subsets.",
+    {**pi_transitions, "decision": "0027"})
 bad("product-receipt-transitions-wrong-decision.json", "schema-violation", "/decision",
     "The receipt subset refers to its own proposed decision, without relabeling the pub/sub subset.",
     {**receipt_transitions, "decision": "0026"})
@@ -3401,6 +3406,57 @@ bad("product-transitions-duplicate-rule.json", "duplicate-name", "/rules/1/id",
 product_event = env("mqttiumd.product-event", seq="1", kind="startup_refused", pid=1,
                     cause="InvalidData", phase="Snapshot", details={"code": "durable_read"})
 ok("product-event.json", product_event)
+puback_target = {
+    "delivery_id": {"publication_id": PUBLICATION, "index": 0},
+    "claim_operation_id": {"incarnation": "1", "epoch": "2", "owner": "0", "sequence": "3"},
+    "frame_effect_id": {"epoch": "3", "owner": "0", "sequence": "4"},
+}
+puback_event = env("mqttiumd.product-event", seq="5", kind="puback_observed", pid=1, connection="7",
+    details={"authority": "reader_dequeue"}, puback={
+        "connection": {"session": "2", "generation": "7"}, "packet_id": 1,
+        "reason_code": 0, "target": puback_target})
+ok("product-puback-observed.json", puback_event)
+ok("product-puback-no-target.json", edited(puback_event, lambda v: v["puback"].update(target=None)))
+ok("product-puback-ignored-historical-target.json", edited(puback_event, lambda v: v.update(kind="puback_ignored")))
+ok("product-puback-retained-copy.json", edited(puback_event, lambda v: v["puback"].update(source_observation_sequence="99")))
+ok("product-puback-negative.json", edited(puback_event, lambda v: v["puback"].update(reason_code=0x97)))
+bad("product-puback-missing-observation.json", "schema-violation", "",
+    "A claimed PUBACK observation includes its immutable connection/PI/reason/target tuple.",
+    edited(puback_event, lambda v: v.pop("puback")))
+bad("product-puback-implicit-target.json", "schema-violation", "/puback",
+    "No target is represented by null; omitting the association cannot permit a later lookup.",
+    edited(puback_event, lambda v: v["puback"].pop("target")))
+bad("product-puback-opaque-target.json", "schema-violation", "/puback/target",
+    "The association has individually bounded durable and frame identities, not an opaque token.",
+    edited(puback_event, lambda v: v["puback"].update(target="1/2/3")))
+bad("product-puback-partial-target.json", "schema-violation", "/puback/target",
+    "All delivery, claim and frame guards belong to the same immutable observation.",
+    edited(puback_event, lambda v: v["puback"]["target"].pop("frame_effect_id")))
+bad("product-puback-rebinding-field.json", "schema-violation", "/puback",
+    "A no-target observation has no field that can attach a newer replacement target.",
+    edited(puback_event, lambda v: v["puback"].update(target=None, replacement_target=puback_target)))
+bad("product-puback-wrong-authority.json", "schema-violation", "/details/authority",
+    "Unobserved reader-channel and socket bytes are upstream of the documented runtime-dequeue authority.",
+    edited(puback_event, lambda v: v["details"].update(authority="socket_bytes")))
+bad("product-puback-generation-mismatch.json", "evidence-mismatch", "/connection",
+    "An optional envelope generation cannot contradict its immutable nested connection key.",
+    edited(puback_event, lambda v: v.update(connection="8")))
+for name, member, value in (("zero", "packet_id", 0), ("too-large", "packet_id", 65536),
+                            ("wrong-role-reason", "reason_code", 0x92)):
+    bad(f"product-puback-{name}.json", "schema-violation", f"/puback/{member}",
+        "A network PI is nonzero u16; only reason codes permitted for PUBACK describe a validated observation.",
+        edited(puback_event, lambda v, member=member, value=value: v["puback"].update({member: value})))
+for pointer in (("connection", "session"), ("connection", "generation"),
+                ("target", "delivery_id", "publication_id", "sequence"),
+                ("target", "claim_operation_id", "sequence"),
+                ("target", "frame_effect_id", "sequence"), ("source_observation_sequence",)):
+    value = copy.deepcopy(puback_event)
+    at = value["puback"]
+    for member in pointer[:-1]:
+        at = at[member]
+    at[pointer[-1]] = "18446744073709551616"
+    bad("product-puback-overflow-" + "-".join(pointer) + ".json", "u64-out-of-range",
+        "/puback/" + "/".join(pointer), "Causal and observation identities never wrap when a resource PI is reused.", value)
 maintenance_event = env("mqttiumd.product-event", seq="8", kind="receipt_collection_applied", pid=1,
     command_kind="ReceiptCollection", details={"effect": "1/0/9", "incarnation": "1", "epoch": "1",
     "owner": "0", "through": "64", "publication_through": "32", "payload_through": "32",

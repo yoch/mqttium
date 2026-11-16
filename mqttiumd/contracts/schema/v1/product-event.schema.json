@@ -154,6 +154,9 @@
           "$ref": "primitives.schema.json#/$defs/u64"
         }
       }
+    },
+    "puback": {
+      "$ref": "#/$defs/puback_observation"
     }
   },
   "allOf": [
@@ -175,6 +178,108 @@
           ]
         }
       }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "puback_observed",
+              "puback_ignored"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "puback",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "required": [
+              "authority"
+            ],
+            "properties": {
+              "authority": {
+                "const": "reader_dequeue"
+              }
+            }
+          }
+        }
+      }
     }
-  ]
+  ],
+  "$defs": {
+    "puback_target": {
+      "description": "Immutable internal target selected after runtime reader-channel dequeue and decoding, before the owner-input queue. These identities are absent from the MQTT PUBACK wire packet. An older target is readable evidence, never automatically rebound to a current Packet Identifier occupant.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "delivery_id",
+        "claim_operation_id",
+        "frame_effect_id"
+      ],
+      "properties": {
+        "delivery_id": {
+          "$ref": "primitives.schema.json#/$defs/delivery_id"
+        },
+        "claim_operation_id": {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        },
+        "frame_effect_id": {
+          "$ref": "primitives.schema.json#/$defs/effect_id"
+        }
+      }
+    },
+    "puback_observation": {
+      "description": "A validated PUBACK observed at runtime dequeue. The complete connection/number/reason/optional target survives internal delay or replay unchanged. Null is explicit no-target knowledge. Upstream reader-channel/socket bytes are outside this association boundary.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connection",
+        "packet_id",
+        "reason_code",
+        "target"
+      ],
+      "properties": {
+        "connection": {
+          "$ref": "primitives.schema.json#/$defs/connection_key"
+        },
+        "packet_id": {
+          "$ref": "primitives.schema.json#/$defs/packet_id"
+        },
+        "reason_code": {
+          "enum": [
+            0,
+            16,
+            128,
+            131,
+            135,
+            144,
+            145,
+            151,
+            153
+          ]
+        },
+        "target": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/puback_target"
+            }
+          ]
+        },
+        "source_observation_sequence": {
+          "$ref": "primitives.schema.json#/$defs/u64",
+          "description": "Optional identifier of the original runtime-dequeue observation within this process, used to link a retained internal copy. This is not event.seq, a wire field, or a causal-order claim."
+        }
+      }
+    }
+  }
 }

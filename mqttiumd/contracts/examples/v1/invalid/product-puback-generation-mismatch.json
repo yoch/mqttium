@@ -1,0 +1,41 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "5",
+  "kind": "puback_observed",
+  "pid": 1,
+  "connection": "8",
+  "details": {
+    "authority": "reader_dequeue"
+  },
+  "puback": {
+    "connection": {
+      "session": "2",
+      "generation": "7"
+    },
+    "packet_id": 1,
+    "reason_code": 0,
+    "target": {
+      "delivery_id": {
+        "publication_id": {
+          "incarnation": "1",
+          "epoch": "1",
+          "owner": "0",
+          "sequence": "1"
+        },
+        "index": 0
+      },
+      "claim_operation_id": {
+        "incarnation": "1",
+        "epoch": "2",
+        "owner": "0",
+        "sequence": "3"
+      },
+      "frame_effect_id": {
+        "epoch": "3",
+        "owner": "0",
+        "sequence": "4"
+      }
+    }
+  }
+}

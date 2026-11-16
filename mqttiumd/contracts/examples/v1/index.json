@@ -100,7 +100,13 @@
     "contracts/examples/v1/valid/product-profile.json",
     "contracts/examples/v1/valid/product-pubsub-transitions.json",
     "contracts/examples/v1/valid/product-receipt-transitions.json",
+    "contracts/examples/v1/valid/product-pi-transitions.json",
     "contracts/examples/v1/valid/product-event.json",
+    "contracts/examples/v1/valid/product-puback-observed.json",
+    "contracts/examples/v1/valid/product-puback-no-target.json",
+    "contracts/examples/v1/valid/product-puback-ignored-historical-target.json",
+    "contracts/examples/v1/valid/product-puback-retained-copy.json",
+    "contracts/examples/v1/valid/product-puback-negative.json",
     "contracts/examples/v1/valid/product-receipt-collection.json",
     "contracts/examples/v1/valid/product-receipt-collection-returned-closure.json",
     "contracts/examples/v1/valid/product-receipt-prepared.json",
@@ -1886,6 +1892,12 @@
       "why": "A kind of record is stated by its one origin; another may not state it."
     },
     {
+      "file": "contracts/examples/v1/invalid/product-pi-transitions-wrong-decision.json",
+      "code": "schema-violation",
+      "pointer": "/decision",
+      "why": "The recyclable identifier subset refers to Proposed 0028 without relabeling earlier subsets."
+    },
+    {
       "file": "contracts/examples/v1/invalid/product-receipt-transitions-wrong-decision.json",
       "code": "schema-violation",
       "pointer": "/decision",
@@ -1908,6 +1920,102 @@
       "code": "duplicate-name",
       "pointer": "/rules/1/id",
       "why": "Each documented product transition has one stable identifier."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-missing-observation.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "A claimed PUBACK observation includes its immutable connection/PI/reason/target tuple."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-implicit-target.json",
+      "code": "schema-violation",
+      "pointer": "/puback",
+      "why": "No target is represented by null; omitting the association cannot permit a later lookup."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-opaque-target.json",
+      "code": "schema-violation",
+      "pointer": "/puback/target",
+      "why": "The association has individually bounded durable and frame identities, not an opaque token."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-partial-target.json",
+      "code": "schema-violation",
+      "pointer": "/puback/target",
+      "why": "All delivery, claim and frame guards belong to the same immutable observation."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-rebinding-field.json",
+      "code": "schema-violation",
+      "pointer": "/puback",
+      "why": "A no-target observation has no field that can attach a newer replacement target."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-wrong-authority.json",
+      "code": "schema-violation",
+      "pointer": "/details/authority",
+      "why": "Unobserved reader-channel and socket bytes are upstream of the documented runtime-dequeue authority."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-generation-mismatch.json",
+      "code": "evidence-mismatch",
+      "pointer": "/connection",
+      "why": "An optional envelope generation cannot contradict its immutable nested connection key."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-zero.json",
+      "code": "schema-violation",
+      "pointer": "/puback/packet_id",
+      "why": "A network PI is nonzero u16; only reason codes permitted for PUBACK describe a validated observation."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-too-large.json",
+      "code": "schema-violation",
+      "pointer": "/puback/packet_id",
+      "why": "A network PI is nonzero u16; only reason codes permitted for PUBACK describe a validated observation."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-wrong-role-reason.json",
+      "code": "schema-violation",
+      "pointer": "/puback/reason_code",
+      "why": "A network PI is nonzero u16; only reason codes permitted for PUBACK describe a validated observation."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-overflow-connection-session.json",
+      "code": "u64-out-of-range",
+      "pointer": "/puback/connection/session",
+      "why": "Causal and observation identities never wrap when a resource PI is reused."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-overflow-connection-generation.json",
+      "code": "u64-out-of-range",
+      "pointer": "/puback/connection/generation",
+      "why": "Causal and observation identities never wrap when a resource PI is reused."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-overflow-target-delivery_id-publication_id-sequence.json",
+      "code": "u64-out-of-range",
+      "pointer": "/puback/target/delivery_id/publication_id/sequence",
+      "why": "Causal and observation identities never wrap when a resource PI is reused."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-overflow-target-claim_operation_id-sequence.json",
+      "code": "u64-out-of-range",
+      "pointer": "/puback/target/claim_operation_id/sequence",
+      "why": "Causal and observation identities never wrap when a resource PI is reused."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-overflow-target-frame_effect_id-sequence.json",
+      "code": "u64-out-of-range",
+      "pointer": "/puback/target/frame_effect_id/sequence",
+      "why": "Causal and observation identities never wrap when a resource PI is reused."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-puback-overflow-source_observation_sequence.json",
+      "code": "u64-out-of-range",
+      "pointer": "/puback/source_observation_sequence",
+      "why": "Causal and observation identities never wrap when a resource PI is reused."
     },
     {
       "file": "contracts/examples/v1/invalid/product-receipt-returned-incarnation-overflow.json",

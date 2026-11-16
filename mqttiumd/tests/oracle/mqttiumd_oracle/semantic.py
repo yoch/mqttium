@@ -1083,6 +1083,20 @@ def _product_event(contracts, document, out):
     if "operation" in document:
         for member in ("incarnation", "epoch", "owner", "sequence"):
             _u64(document, f"/operation/{member}", out)
+    if "puback" in document:
+        _decimal_members(contracts.schemas, "product-event.schema.json",
+                         contracts.schemas["product-event.schema.json"]["$defs"]["puback_observation"],
+                         document["puback"], "/puback", out)
+        if "connection" in document:
+            try:
+                outer = u64(document["connection"])
+                inner = u64(document["puback"]["connection"]["generation"])
+            except ValueError:
+                pass
+            else:
+                if outer != inner:
+                    out.append(Diagnostic("evidence-mismatch", "/connection",
+                                          "the envelope generation contradicts its immutable PUBACK observation"))
     for member in ("incarnation", "epoch", "owner", "through", "publication_through", "payload_through"):
         if "returned_" + member in document.get("details", {}):
             _u64(document, f"/details/returned_{member}", out)

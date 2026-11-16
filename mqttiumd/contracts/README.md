@@ -344,6 +344,19 @@ recipes can be unavailable after collection; retained canonical bytes are still
 compared. Positive live frontiers remain outside the existing fixture-based
 qualifier. Empty frontiers and zero registration do not extend that scope.
 
+Product events for Proposed ADR 0028 carry an explicit `puback` observation:
+the full connection key, nonzero u16 Packet Identifier, PUBACK reason and
+either null or the complete delivery/claim/frame target. The authoritative
+boundary is runtime reader-channel dequeue and codec validation before the
+owner-input queue. Reader-channel and socket bytes are upstream. Delayed
+internal copies retain this association; a null target cannot acquire one
+later. A historical target is readable descriptive evidence, not a format
+error or permission to finish a current delivery. The optional
+`source_observation_sequence` names an original observation within that
+process; it does not establish wire causality or an ordering against event
+`seq`. An optional envelope connection generation must agree with the nested
+connection. These product system tests do not extend fixture qualification.
+
 The revision of the route table is what the store writes; the oracle
 never computes it. The store advances it at each `AddRoute`, so the
 fixture of P1, whose one route has two targets, is at revision 2 in the

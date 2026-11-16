@@ -150,6 +150,23 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
                     );
                 }
             }
+            if let Some(puback) = document.get("puback") {
+                decimal_strings(Some(puback), "/puback", &mut report.diagnostics);
+                let outer = document.get("connection").and_then(Value::as_str);
+                let inner = puback
+                    .pointer("/connection/generation")
+                    .and_then(Value::as_str);
+                if let (Some(outer), Some(inner)) = (outer, inner)
+                    && let (Ok(outer), Ok(inner)) = (parse_u64(outer), parse_u64(inner))
+                    && outer != inner
+                {
+                    report.diagnostics.push(Diagnostic::new(
+                        code::EVIDENCE_MISMATCH,
+                        "/connection",
+                        "the envelope generation contradicts its immutable PUBACK observation",
+                    ));
+                }
+            }
             for member in [
                 "returned_incarnation",
                 "returned_epoch",
@@ -1807,7 +1824,8 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
 /// Names of the members that hold a 64-bit decimal string, in a trace
 /// payload or a snapshot. A test walks the schemas and fails when one of
 /// their 64-bit members is missing here.
-const COMPONENTS: [&str; 46] = [
+const COMPONENTS: [&str; 47] = [
+    "source_observation_sequence",
     "through",
     "publication_through",
     "payload_through",

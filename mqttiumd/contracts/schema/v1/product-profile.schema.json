@@ -50,7 +50,9 @@
     "receipt_collection_rows",
     "receipt_collection_trigger",
     "max_receipt_origins",
-    "receipt_collection_bytes"
+    "receipt_collection_bytes",
+    "outgoing_packet_identifier_max",
+    "outgoing_packet_identifier_probe_limit"
   ],
   "properties": {
     "format": {
@@ -208,6 +210,12 @@
       "type": "integer",
       "minimum": 1,
       "maximum": 2147483647
+    },
+    "outgoing_packet_identifier_max": {
+      "const": 65535
+    },
+    "outgoing_packet_identifier_probe_limit": {
+      "const": 129
     }
   }
 }

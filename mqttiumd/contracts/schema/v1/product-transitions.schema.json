@@ -24,13 +24,15 @@
     "id": {
       "enum": [
         "tcp-qos0-exact-pubsub-v1",
-        "tcp-receipt-maintenance-v1"
+        "tcp-receipt-maintenance-v1",
+        "tcp-outgoing-pi-reuse-v1"
       ]
     },
     "decision": {
       "enum": [
         "0026",
-        "0027"
+        "0027",
+        "0028"
       ]
     },
     "scope": {
@@ -72,7 +74,8 @@
               "OutgoingQos1",
               "VolatileQos0",
               "ConsumedQos0",
-              "ReceiptMaintenance"
+              "ReceiptMaintenance",
+              "OutgoingPacketIdentifier"
             ]
           },
           "state_class": {
@@ -94,7 +97,12 @@
               "FrontierKnown",
               "ClosedEpochPending",
               "ControlWindowFull",
-              "ReleaseRetryDeferred"
+              "ReleaseRetryDeferred",
+              "Free",
+              "Reserved",
+              "Observed",
+              "NoTarget",
+              "Ignored"
             ]
           },
           "event_class": {
@@ -124,7 +132,12 @@
               "FrontierKnown",
               "ClosedEpochPending",
               "ControlWindowFull",
-              "ReleaseRetryDeferred"
+              "ReleaseRetryDeferred",
+              "Free",
+              "Reserved",
+              "Observed",
+              "NoTarget",
+              "Ignored"
             ]
           },
           "required_actions": {
@@ -200,6 +213,25 @@
         "properties": {
           "decision": {
             "const": "0027"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "const": "tcp-outgoing-pi-reuse-v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "const": "0028"
           }
         }
       }
