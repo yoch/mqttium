@@ -524,6 +524,7 @@ def operation_floor(state: dict, operation: dict) -> int:
     """Read the compact origin guard, independently of the writer's reply."""
     matching = []
     prefix = operation_hex(operation)[:48]
+    incarnation = sql_u64(state["tables"]["meta"][0]["incarnation"])
     for name, rows in state["tables"].items():
         if not any(part in name for part in ("frontier", "origin")):
             continue
@@ -531,8 +532,10 @@ def operation_floor(state: dict, operation: dict) -> int:
             same = row.get("origin") == prefix or all(
                 key in row and sql_u64(row[key]) == int(operation[key])
                 for key in ("incarnation", "epoch", "owner"))
+            same = same or (incarnation == int(operation["incarnation"]) and all(
+                key in row and sql_u64(row[key]) == int(operation[key]) for key in ("epoch", "owner")))
             if same:
-                for field in ("through", "operation_through", "operation_floor", "op_floor"):
+                for field in ("consumed_through", "through", "operation_through", "operation_floor", "op_floor"):
                     if field in row:
                         matching.append(sql_u64(row[field]))
                         break
@@ -713,16 +716,18 @@ def retired_replays(binary: Path, case: Path) -> dict:
         broker.cleanup()
 
 
-def close_crash(binary: Path, case: Path, *, committed: bool) -> dict:
+def close_crash(binary: Path, case: Path, *, committed: bool, limit_one: bool = False) -> dict:
     point = "receipt.close.committed" if committed else "receipt.close.prepared"
     broker = Broker(binary, case, pauses=(point,))
     restarted = None
     held = HeldBusiness(broker, case)
-    result = {"criterion": "F-after" if committed else "F-before", "status": "PASS",
+    result = {"criterion": "F-credit" if limit_one else "F-after" if committed else "F-before", "status": "PASS",
               "point": point, "parameters": {"trigger_attempt_budget": 128}}
     try:
         result["ready"] = broker.ready()
         result["held_business"] = held.prepare()
+        if limit_one:
+            (broker.control / "receipt-collection-limit-one").touch(exist_ok=False)
         with PubsubWire(broker.address, broker.observations, "closure-crash-control") as control:
             control.connect("receipt-close-control", session_present=False, keep_alive=0)
             hit = None
@@ -742,6 +747,8 @@ def close_crash(binary: Path, case: Path, *, committed: bool) -> dict:
                 require(frame is not None, "closure_trigger_stalled_without_point")
             require(hit is not None and hit.get("command_kind") == "ReceiptCollection", "closure_point_not_reached")
             details = hit["details"]
+            if limit_one:
+                require(details["limit"] == 1, "single_row_pass_not_reached")
             operation = {key: details[key] for key in ("incarnation", "epoch", "owner")}
             operation["sequence"] = details["through"]
             before = durable(broker.db)
@@ -928,7 +935,7 @@ def main() -> int:
     parser.add_argument("--binary-source-head")
     parser.add_argument("--expected-binary-sha256")
     parser.add_argument("--case", choices=("A-ceiling", "B-live", "C-pressure", "E-replay",
-                                          "F-before", "F-after", "F-results"), default="A-ceiling")
+                                          "F-before", "F-after", "F-credit", "F-results"), default="A-ceiling")
     parser.add_argument("--build-mode", choices=("normal", "test-hooks"), default="normal")
     parser.add_argument("--business-commands", type=int, default=BUSINESS_COMMANDS)
     args = parser.parse_args()
@@ -954,9 +961,10 @@ def main() -> int:
         elif args.case == "E-replay":
             require(args.build_mode == "test-hooks", "instrumented_build_required")
             observed = retired_replays(args.binary.resolve(), args.out / args.case)
-        elif args.case in ("F-before", "F-after"):
+        elif args.case in ("F-before", "F-after", "F-credit"):
             require(args.build_mode == "test-hooks", "instrumented_build_required")
-            observed = close_crash(args.binary.resolve(), args.out / args.case, committed=args.case == "F-after")
+            observed = close_crash(args.binary.resolve(), args.out / args.case,
+                                   committed=args.case != "F-before", limit_one=args.case == "F-credit")
         elif args.case == "F-results":
             require(args.build_mode == "test-hooks", "instrumented_build_required")
             observed = close_result_replay(args.binary.resolve(), args.out / args.case)
