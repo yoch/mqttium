@@ -642,10 +642,20 @@ def stable_receipt_pressure(event: dict, state: dict, unknown_sequence: int) -> 
 
 
 def wait_committed_resolution(broker, operation: dict, *, after: int, timeout: float = 3):
-    resolved = broker.wait_event("store_resolved", after=after, timeout=timeout)
-    require(resolved["operation"] == operation and resolved["details"]["outcome"].lower() == "committed",
-            "unknown_resolution_changed_operation")
-    return resolved
+    def find():
+        for event in broker.events():
+            if (event["kind"] != "store_resolved" or int(event["seq"]) <= after
+                    or event.get("operation") != operation):
+                continue
+            outcome = event["details"]["outcome"].lower()
+            if outcome == "committed":
+                broker.observations.record("event_retained", event=event)
+                return event
+            # Pending results are expected while the hold file remains. A
+            # contradictory terminal result is not hidden by a later commit.
+            require(outcome == "pendingorunknown", "unknown_resolution_changed_operation", outcome)
+        return None
+    return until(find, "committed_resolution_missing", timeout)
 
 
 def unknown_hole(binary: Path, case: Path) -> dict:
@@ -726,10 +736,12 @@ def unknown_hole(binary: Path, case: Path) -> dict:
                   "reserved_finish_did_not_progress")
             result["controls_and_terminations_progressed"] = True
             write_json(case / "hole-at-pressure.json", blocked)
+            release_after = max(int(event["seq"]) for event in broker.events())
             (broker.control / "hold-admission-result").unlink()
-            broker.observations.record("held_result_release", operation=operation)
+            broker.observations.record("held_result_release", operation=operation,
+                                       product_after=str(release_after))
             require(source.wait(0x40, 1, timeout=15).ack() == (1, 0), "same_operation_resolution_did_not_ack")
-            resolved = wait_committed_resolution(broker, operation, after=int(hit["seq"]))
+            resolved = wait_committed_resolution(broker, operation, after=release_after)
             result["same_operation_resolution"] = resolved
         advanced = until(lambda: (state if operation_floor(state, operation) >= int(operation["sequence"]) else None)
                          if (state := durable(broker.db)) else None,
