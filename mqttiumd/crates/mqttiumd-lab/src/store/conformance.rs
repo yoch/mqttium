@@ -2282,6 +2282,8 @@ pub fn recovery_field_limits_include_fixed_identities<S: DurableStore>(
 
 /// Every check of this module, in order.
 pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
+    qos0_grants_and_consumption_preserve_durable_delivery_identity(make);
+    qos0_consumption_preserves_unknown_and_atomic_capacity(make);
     subscriptions_replace_and_remove_without_duplicate_or_hole(make);
     qos1_claim_and_finish_are_conditional_and_idempotent(make);
     outgoing_work_is_bounded_and_independent_of_notifications(make);
@@ -2325,6 +2327,306 @@ pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     snapshot_fields_include_the_opening_identity(make);
     recovery_field_limits_apply_to_the_selected_page(make);
     recovery_field_limits_include_fixed_identities(make);
+}
+
+/// Typed grants replace atomically; an old obligation keeps its admitted QoS.
+/// QoS 0 consumption has a receipt, but no outgoing packet/claim/exchange slot.
+pub fn qos0_grants_and_consumption_preserve_durable_delivery_identity<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::command::{
+        ChangeSubscriptions, ClaimDelivery, ConsumeDelivery, FinishDelivery, UpdateSubscriptions,
+    };
+    use mqttiumd_contract::ids::OutboundPacketId;
+    use mqttiumd_contract::pubsub::{GrantedSubscriptionChange, SubscriptionChange};
+    let mut limits = fixture_limits();
+    limits.receipt_slots = ReceiptSlots::new(64);
+    let mut world = World::with_limits(make, limits);
+    let freeze = |recipe| Command {
+        recipe: FrozenRecipe::freeze(recipe).unwrap(),
+        payload: None,
+    };
+    let update = |seq, revision, granted| {
+        freeze(Recipe::UpdateSubscriptions(UpdateSubscriptions {
+            operation: operation_id(world.epoch, seq),
+            session: world.b,
+            session_revision: Revision::new(1),
+            route_revision: revision,
+            changes: BoundedVec::from_slice(
+                &[GrantedSubscriptionChange {
+                    topic: SharedBytes::copy_from(TOPIC, 256).unwrap(),
+                    granted,
+                }],
+                8,
+            )
+            .unwrap(),
+        }))
+    };
+    let first = update(1, world.route_revision, Some(Qos::AtMostOnce));
+    assert!(
+        world.store.apply(&first).committed_now,
+        "typed QoS0 subscription must commit"
+    );
+    world.route_revision = world.route_revision.checked_next().unwrap();
+    let stable = world.store.snapshot().unwrap();
+    assert_eq!(
+        stable.routes[TOPIC]
+            .iter()
+            .find(|r| r.session == world.b)
+            .unwrap()
+            .qos,
+        Qos::AtMostOnce
+    );
+    assert!(!world.store.apply(&first).committed_now);
+    assert_eq!(world.store.snapshot().unwrap(), stable);
+    // Old kind3 keeps its original grant1 meaning even after kind7 exists.
+    let legacy = freeze(Recipe::ChangeSubscriptions(ChangeSubscriptions {
+        operation: operation_id(world.epoch, 2),
+        session: world.b,
+        session_revision: Revision::new(1),
+        route_revision: world.route_revision,
+        changes: BoundedVec::from_slice(
+            &[SubscriptionChange {
+                topic: SharedBytes::copy_from(TOPIC, 256).unwrap(),
+                subscribe: true,
+            }],
+            8,
+        )
+        .unwrap(),
+    }));
+    assert!(world.store.apply(&legacy).committed_now);
+    world.route_revision = world.route_revision.checked_next().unwrap();
+    assert_eq!(
+        world.store.snapshot().unwrap().routes[TOPIC]
+            .iter()
+            .find(|r| r.session == world.b)
+            .unwrap()
+            .qos,
+        Qos::AtLeastOnce
+    );
+    assert!(
+        world
+            .store
+            .apply(&update(3, world.route_revision, Some(Qos::AtMostOnce)))
+            .committed_now
+    );
+    world.route_revision = world.route_revision.checked_next().unwrap();
+    let admission = altered(&world.admission(4, 7, b"first", &[world.b, world.c]), |a| {
+        a.targets.as_mut_slice()[0].effective_qos = Qos::AtMostOnce
+    });
+    assert!(world.store.apply(&admission).committed_now);
+    let old = DeliveryId {
+        publication: publication_id(world.epoch, 4),
+        index: 0,
+    };
+    assert!(
+        world
+            .store
+            .apply(&update(5, world.route_revision, Some(Qos::AtLeastOnce)))
+            .committed_now
+    );
+    world.route_revision = world.route_revision.checked_next().unwrap();
+    let second = world.admission(6, 8, b"second", &[world.b]);
+    assert!(world.store.apply(&second).committed_now);
+    let newer = DeliveryId {
+        publication: publication_id(world.epoch, 6),
+        index: 0,
+    };
+    let state = world.store.snapshot().unwrap();
+    assert_eq!(state.obligations[&old].qos, Qos::AtMostOnce);
+    assert_eq!(state.obligations[&newer].qos, Qos::AtLeastOnce);
+    let page = world.store.read_work(world.b, None, 8).unwrap();
+    assert_eq!(
+        page.items
+            .as_slice()
+            .iter()
+            .map(|i| (i.delivery, i.qos, i.claim))
+            .collect::<Vec<_>>(),
+        [
+            (old, Qos::AtMostOnce, None),
+            (newer, Qos::AtLeastOnce, None)
+        ]
+    );
+    let recovery = world.store.recover(None, 64).unwrap();
+    assert!(recovery.facts.as_slice().iter().any(|f|matches!(f,RecoveredFact::OutboundDelivery{delivery,qos:Qos::AtMostOnce,claim:None,..} if *delivery==old)));
+    let consume = |seq, delivery, target| {
+        freeze(Recipe::ConsumeDelivery(ConsumeDelivery {
+            operation: operation_id(world.epoch, seq),
+            delivery,
+            target,
+            target_revision: Revision::new(1),
+        }))
+    };
+    let wrong_type = consume(7, newer, world.b);
+    let before = world.store.snapshot().unwrap();
+    assert_eq!(
+        outcome(world.store.apply(&wrong_type).reply),
+        StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed)
+    );
+    let after = world.store.snapshot().unwrap();
+    assert_eq!(after.obligations, before.obligations);
+    assert_eq!(after.payloads, before.payloads);
+    assert_eq!(
+        after.accounts.exchange_slots,
+        before.accounts.exchange_slots
+    );
+    let consumed = consume(8, old, world.b);
+    let applied = world.store.apply(&consumed);
+    assert_eq!(
+        outcome(applied.reply),
+        StoreOutcome::Committed(CommitFacts::DeliveryConsumed {
+            delivery: old,
+            target: world.b
+        })
+    );
+    assert!(applied.committed_now);
+    let after = world.store.snapshot().unwrap();
+    assert!(!after.obligations.contains_key(&old));
+    assert!(after.outbound.is_empty());
+    assert_eq!(
+        after.accounts.exchange_slots,
+        before.accounts.exchange_slots
+    );
+    assert_eq!(after.accounts.references.get(), 2);
+    assert_eq!(accounts_match_what_is_held(&after), Ok(()));
+    assert!(!world.store.apply(&consumed).committed_now);
+    assert_eq!(world.store.snapshot().unwrap(), after);
+    assert_eq!(
+        world
+            .store
+            .resolve_and_fence(consumed.recipe.operation())
+            .outcome,
+        StoreOutcome::Committed(CommitFacts::DeliveryConsumed {
+            delivery: old,
+            target: world.b
+        })
+    );
+    assert_eq!(
+        outcome(world.store.apply(&consume(9, old, world.b)).reply),
+        StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed)
+    );
+    let c = DeliveryId {
+        publication: old.publication,
+        index: 1,
+    };
+    let claim = freeze(Recipe::ClaimDelivery(ClaimDelivery {
+        operation: operation_id(world.epoch, 10),
+        delivery: c,
+        target: world.c,
+        target_revision: Revision::new(1),
+        packet_id: OutboundPacketId::new(7).unwrap(),
+    }));
+    assert!(world.store.apply(&claim).committed_now);
+    let finish = freeze(Recipe::FinishDelivery(FinishDelivery {
+        operation: operation_id(world.epoch, 11),
+        delivery: c,
+        target: world.c,
+        target_revision: Revision::new(1),
+        packet_id: OutboundPacketId::new(7).unwrap(),
+        claim: claim.recipe.operation(),
+    }));
+    assert!(world.store.apply(&finish).committed_now);
+    let after = world.store.snapshot().unwrap();
+    assert_eq!(after.payloads.len(), 1);
+    assert_eq!(after.accounts.payload_bytes.get(), 6);
+    assert_eq!(accounts_match_what_is_held(&after), Ok(()));
+    assert!(world.store.apply(&world.release(12, 7, 4)).committed_now);
+    assert!(
+        !world
+            .store
+            .snapshot()
+            .unwrap()
+            .publications
+            .contains_key(&old.publication)
+    );
+    assert_eq!(
+        world
+            .store
+            .read_work(world.b, None, 8)
+            .unwrap()
+            .items
+            .as_slice()[0]
+            .delivery,
+        newer
+    );
+}
+
+/// Failure/unknown outcomes preserve the same operation and release no subset.
+pub fn qos0_consumption_preserves_unknown_and_atomic_capacity<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::command::ConsumeDelivery;
+    for receipts in [1, 8] {
+        let mut limits = fixture_limits();
+        limits.receipt_slots = ReceiptSlots::new(receipts);
+        let mut world = World::with_limits(make, limits);
+        let admission = altered(&world.admission(1, 7, b"payload", &[world.b]), |a| {
+            a.qos = Qos::AtLeastOnce;
+            a.costs.exchange_slots = ExchangeSlots::ZERO;
+            a.targets.as_mut_slice()[0].effective_qos = Qos::AtMostOnce;
+        });
+        assert!(world.store.apply(&admission).committed_now);
+        let delivery = DeliveryId {
+            publication: publication_id(world.epoch, 1),
+            index: 0,
+        };
+        let consume = Command {
+            recipe: FrozenRecipe::freeze(Recipe::ConsumeDelivery(ConsumeDelivery {
+                operation: operation_id(world.epoch, 2),
+                delivery,
+                target: world.b,
+                target_revision: Revision::new(1),
+            }))
+            .unwrap(),
+            payload: None,
+        };
+        let before = world.store.snapshot().unwrap();
+        world
+            .store
+            .set_durability(super::durable::Durability::Failing);
+        assert_eq!(
+            outcome(world.store.apply(&consume).reply),
+            StoreOutcome::PendingOrUnknown
+        );
+        assert_eq!(world.store.snapshot().unwrap(), before);
+        world
+            .store
+            .set_durability(super::durable::Durability::Available);
+        if receipts == 1 {
+            assert_eq!(
+                outcome(world.store.apply(&consume).reply),
+                StoreOutcome::PendingOrUnknown
+            );
+            assert_eq!(
+                world.store.snapshot().unwrap(),
+                before,
+                "full receipt account cannot partially consume"
+            );
+        } else {
+            assert!(world.store.apply(&consume).committed_now);
+            assert_eq!(
+                world
+                    .store
+                    .resolve_and_fence(consume.recipe.operation())
+                    .outcome,
+                StoreOutcome::Committed(CommitFacts::DeliveryConsumed {
+                    delivery,
+                    target: world.b
+                })
+            );
+            let after = world.store.snapshot().unwrap();
+            assert!(
+                after.obligations.is_empty()
+                    && after.outbound.is_empty()
+                    && after.publications.is_empty()
+                    && after.payloads.is_empty()
+            );
+            assert_eq!(after.accounts.references, References::ZERO);
+            assert_eq!(after.accounts.exchange_slots, ExchangeSlots::ZERO);
+            assert!(!world.store.apply(&consume).committed_now);
+            assert_eq!(world.store.snapshot().unwrap(), after);
+        }
+    }
 }
 
 /// A network subscription mutation is a normal receipted operation: replacing
