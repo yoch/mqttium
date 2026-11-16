@@ -14,6 +14,7 @@ import tarfile
 
 
 from . import judge
+from . import recipe as recipes
 from .trace import lines_of
 from .semantic import reached as reached_by
 from .semantic import verdict_of
@@ -187,9 +188,12 @@ def _scope_unmet(contracts, scenario_path, trace_path):
             recipe = bytes.fromhex(operation["recipe_hex"])
             if recipe[:6] == b"MQDR\x00\x01" and len(recipe) >= 7:
                 unsupported |= recipe[6] in (3, 4, 5)
-                # The canonical AdmitPublication QoS byte follows its fixed
-                # identifiers and source/route fields (DEM-009).
-                non_qos2 |= recipe[6] == 1 and len(recipe) > 137 and recipe[137] != 2
+            try:
+                decoded = recipes.decode(recipe)
+            except recipes.RecipeError:
+                pass
+            else:
+                non_qos2 |= isinstance(decoded, recipes.Admit) and decoded.qos != 2
             facts = operation["decision"].get("facts", {})
             unsupported |= facts.get("kind") in {
                 "SubscriptionsChanged", "DeliveryClaimed", "DeliveryFinished"

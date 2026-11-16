@@ -145,6 +145,12 @@ it judges. One file of cases,
 two together: a Rust test runs it through `admit`, a Python test through
 the copy.
 
+`OutboundDelivery` metadata follows inbound exchanges and precedes operation
+knowledge. It describes both queued obligations and durable outgoing claims.
+Snapshot `outbound` rows preserve each claim's delivery, destination revision,
+packet identifier and operation. `MayHaveStarted` is conservative durable
+intent; it does not assert that a client received any bytes.
+
 The pages the core received during one recovery are one inventory
 (record 0014), in the order it received them. The oracle carries the
 order of the facts from page to page, and requires a route table before
@@ -181,6 +187,15 @@ show; the two assertions that need what peers observed
 (`one_admission_per_observed_inbound_exchange`,
 `no_pubrec_observed_before_crash`) stay out of scope there, and the
 provenance of packets is not asked of a run that has no transport.
+
+The fixture-based qualifier covers the existing incoming QoS 2 profile. Reading
+the product's subscription, claim and finish recipes does not add assertions for
+their semantics. Runs containing those operations, nonempty outgoing claims,
+or product subscription/outgoing traffic cannot receive fixture qualification.
+Incoming QoS 1 and pub/sub reception remain separately scoped system tests.
+Queued recovery metadata is compatible with the original profile only when
+an ordered snapshot from that recovery epoch corroborates its delivery and
+destination identities. `recompute` checks this scope condition again.
 
 ## The assertions
 

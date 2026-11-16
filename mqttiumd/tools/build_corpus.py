@@ -2342,6 +2342,45 @@ for suffix, code, pointer, rows in [
     bad(f"store-snapshot-outbound-{suffix}.json", code, pointer,
         "Outgoing claim rows retain bounded identities, unique DeliveryIds and valid packet identifiers.",
         edited(snapshot, lambda v, rows=rows: v.update(outbound=rows)))
+# Descriptive canonical examples for the product extension. These snapshots
+# are format examples, not fixture-based qualifying campaign results.
+def product_operation(sequence, kind, body, facts):
+    return {
+        "operation_id": {**OP, "sequence": str(sequence)},
+        "recipe_hex": b"MQDR".hex() + be(1, 2) + be(kind, 1) + scoped(sequence) + body,
+        "decision": {"kind": "Committed", "facts": facts},
+    }
+
+
+subscription_operation = product_operation(
+    20, 3, be(2) + be(1) + be(2) + be(1, 1) + be(1, 1) + be(10, 2) + b"p1/example".hex(),
+    {"kind": "SubscriptionsChanged", "session": "2", "route_revision": "3"},
+)
+subscription_snapshot = copy.deepcopy(snapshot)
+subscription_snapshot["operations"].append(subscription_operation)
+subscription_snapshot["route_table"]["revision"] = "3"
+subscription_snapshot["account"]["used"]["receipt_slots"] = "2"
+ok("store-snapshot-subscription-receipt.json", subscription_snapshot)
+delivery_body = scoped(1) + be(0, 4) + be(2) + be(1) + be(5, 2)
+claim_operation = product_operation(21, 4, delivery_body, {
+    "kind": "DeliveryClaimed", "delivery_id": OUTBOUND_SLOT["delivery_id"],
+    "target_session": "2", "packet_id": 5, "claim_operation_id": {**OP, "sequence": "21"},
+})
+claimed_snapshot = copy.deepcopy(snapshot)
+claimed_snapshot["operations"].append(claim_operation)
+claimed_snapshot["outbound"] = [{**OUTBOUND_SLOT, "packet_id": 5,
+                                 "claim_operation_id": claim_operation["operation_id"]}]
+claimed_snapshot["account"]["used"].update(exchange_slots="2", receipt_slots="2")
+ok("store-snapshot-delivery-claim-receipt.json", claimed_snapshot)
+finished_snapshot = copy.deepcopy(claimed_snapshot)
+finished_snapshot["operations"].append(product_operation(22, 5, delivery_body + scoped(21), {
+    **claim_operation["decision"]["facts"], "kind": "DeliveryFinished",
+}))
+finished_snapshot["outbound"] = []
+finished_snapshot["obligations"].pop(0)
+finished_snapshot["payloads"][0]["references"] = "1"
+finished_snapshot["account"]["used"].update(references="1", exchange_slots="1", receipt_slots="3")
+ok("store-snapshot-delivery-finish-receipt.json", finished_snapshot)
 ok(
     "store-snapshot-empty.json",
     env(

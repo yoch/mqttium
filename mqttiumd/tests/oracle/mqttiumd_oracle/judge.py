@@ -261,6 +261,12 @@ class Run:
                 except recipes.RecipeError:
                     slots.add(None)
                     continue
+                if not isinstance(recipe, (recipes.Admit, recipes.Release)):
+                    # New product recipes are readable descriptive evidence;
+                    # the fixture assertions still describe incoming exchanges.
+                    # results.unmet excludes their semantics from qualification.
+                    slots.add(None)
+                    continue
                 slots.add((recipe.kind, recipe.session, recipe.packet_id))
             if len(slots) == 1 and None not in slots:
                 found[operation] = next(iter(slots))

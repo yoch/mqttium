@@ -14,6 +14,9 @@ MAGIC = b"MQDR"
 FORMAT = 1
 ADMIT_PUBLICATION = 1
 RELEASE_INBOUND = 2
+CHANGE_SUBSCRIPTIONS = 3
+CLAIM_DELIVERY = 4
+FINISH_DELIVERY = 5
 
 
 class RecipeError(ValueError):
@@ -58,6 +61,42 @@ class Release:
     exchange_generation: int
 
     kind = "ReleaseInbound"
+
+
+@dataclass(frozen=True)
+class SubscriptionChange:
+    topic: bytes
+    subscribe: bool
+
+
+@dataclass(frozen=True)
+class Subscriptions:
+    operation: tuple
+    session: int
+    session_revision: int
+    route_revision: int
+    changes: tuple
+
+    kind = "ChangeSubscriptions"
+
+
+@dataclass(frozen=True)
+class Claim:
+    operation: tuple
+    publication: tuple
+    index: int
+    target: int
+    target_revision: int
+    packet_id: int
+
+    kind = "ClaimDelivery"
+
+
+@dataclass(frozen=True)
+class Finish(Claim):
+    claim: tuple
+
+    kind = "FinishDelivery"
 
 
 class _Reader:
@@ -129,6 +168,30 @@ def decode(data: bytes):
         recipe = Release(reader.scoped(), reader.number(8), reader.number(2), reader.number(8))
         if recipe.packet_id == 0:
             raise RecipeError("invalid field")
+    elif kind == CHANGE_SUBSCRIPTIONS:
+        operation = reader.scoped()
+        session, revision, route_revision = (reader.number(8) for _ in range(3))
+        count = reader.number(1)
+        if not 1 <= count <= 8:
+            raise RecipeError("invalid subscription count")
+        changes = []
+        for _ in range(count):
+            subscribe = reader.number(1)
+            topic = reader.take(reader.number(2))
+            try:
+                topic.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as error:
+                raise RecipeError("invalid exact filter") from error
+            if subscribe not in (0, 1) or not topic or any(byte in topic for byte in (0, 35, 43)):
+                raise RecipeError("invalid exact filter")
+            changes.append(SubscriptionChange(topic, bool(subscribe)))
+        recipe = Subscriptions(operation, session, revision, route_revision, tuple(changes))
+    elif kind in (CLAIM_DELIVERY, FINISH_DELIVERY):
+        fields = (reader.scoped(), reader.scoped(), reader.number(4),
+                  reader.number(8), reader.number(8), reader.number(2))
+        if fields[-1] == 0:
+            raise RecipeError("invalid outbound packet identifier")
+        recipe = Claim(*fields) if kind == CLAIM_DELIVERY else Finish(*fields, reader.scoped())
     else:
         raise RecipeError("unknown kind")
     if reader.at != len(data):
