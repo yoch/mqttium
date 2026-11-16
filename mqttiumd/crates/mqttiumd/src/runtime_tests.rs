@@ -1945,6 +1945,10 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
         runtime.connect(second,connect_packet(b"takeover-pressure-b")).unwrap();
         until(runtime,|r|r.session_requests.is_empty());
         assert_eq!(read_frame(&mut second_client).0,0x20);
+        let (third,mut third_client)=peer(runtime);
+        runtime.connect(third,connect_packet(b"takeover-pressure-c")).unwrap();
+        until(runtime,|r|r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut third_client).0,0x20);
         for identifier in 1..=8 {
             runtime.packet(first,0x32,publish_body(identifier)).unwrap();
             runtime.drain_inputs().unwrap();
@@ -1952,7 +1956,7 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
             runtime.drain_inputs().unwrap();
         }
         assert_eq!(runtime.inflight.len(),IN_FLIGHT,"sixteen actual submissions block the ordinary effect head until their correlated replies are collected");
-        runtime.packet(old_generation,0x32,publish_body(1)).unwrap();
+        runtime.packet(third,0x32,publish_body(1)).unwrap();
         runtime.drain_inputs().unwrap();
         assert!(!runtime.owner.outbox().unwrap().is_empty());
         let (new_generation,mut new)=peer(runtime);
