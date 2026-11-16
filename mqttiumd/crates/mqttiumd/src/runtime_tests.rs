@@ -515,6 +515,22 @@ fn a_real_delayed_pubcomp_write_receipt_cannot_release_a_new_packet_identifier_u
     });
 }
 
+#[test]
+fn a_real_puback_write_receipt_returns_its_receive_credit() {
+    with_runtime(8, |runtime, _| {
+        let (generation, mut client) = peer(runtime);
+        runtime.connect(generation, connect_packet(b"qos1-credit")).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        runtime.packet(generation, 0x32, publish_body(1)).unwrap();
+        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        assert_eq!(read_frame(&mut client).0, 0x40);
+        until(runtime, |r| !r.frames.values().any(|p| p.kind == "PUBACK"));
+        assert_eq!(runtime.peers[&generation].receiving.serial(1), None,
+            "a terminal PUBACK must return the QoS 1 receive credit");
+    });
+}
+
 fn connect_then_subscribe(client_id: &[u8]) -> Vec<u8> {
     let mut body = vec![
         0, 4, b'M', b'Q', b'T', b'T', 5, 0, 0, 10, 5, 0x11, 255, 255, 255, 255,
