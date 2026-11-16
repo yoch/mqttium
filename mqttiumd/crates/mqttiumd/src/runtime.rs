@@ -2109,7 +2109,16 @@ impl Runtime<'_> {
                     return Err(Failure::plain("uncorrelated_work_page"));
                 }
                 let page = result.map_err(|e| Failure::read(e, ReadPhase::Work))?;
+                self.session_cardinality_dirty = true;
+                if !self.sessions.values().any(|cached| cached.id == session) {
+                    self.events.emit("work_page_ignored", json!({"details":{"session":session.get().to_string(),"effect":effect_text(effect),"code":"retired_session"}})).map_err(event_failure)?;
+                    continue;
+                }
                 for item in page.items.as_slice() {
+                    if self.work_cache.len() >= 128 && !self.work_cache.contains_key(&item.delivery)
+                    {
+                        return Err(Failure::plain("work_cache_budget"));
+                    }
                     self.work_cache.insert(item.delivery, item.clone());
                 }
                 self.queue(Input::WorkPage {
