@@ -117,6 +117,12 @@ done
 pi_small_domain=owner::pubsub::tests::the_complete_small_domain_counts_unknown_finish_and_unloaded_recovered_claims
 pi_record core-small-domain cargo test -p mqttiumd-core --lib --locked --target-dir "$pi_targets/core-mutants" "$pi_small_domain" -- --exact --nocapture
 cargo test -p mqttiumd-core --lib --locked --target-dir "$pi_targets/core-mutants" "$pi_small_domain" -- --exact --nocapture >"$pi_out/core-small-domain.log" 2>&1
+PYTHONPATH="$pi_root/tests/system${PYTHONPATH:+:$PYTHONPATH}" "$pi_python" - "$pi_out/core-small-domain.log" <<'PY_CHECK'
+from pathlib import Path
+import sys
+from pi_reception import verify_small_domain
+verify_small_domain(Path(sys.argv[1]).read_text())
+PY_CHECK
 pi_record core-transition-mutants "$pi_python" "$pi_root/tools/run_pi_core_mutants.py" "$pi_out/core-mutants" --target-dir "$pi_targets/core-mutants"
 "$pi_python" "$pi_root/tools/run_pi_core_mutants.py" "$pi_out/core-mutants" --target-dir "$pi_targets/core-mutants" >"$pi_out/core-mutants.log" 2>&1
 pi_mutant_source="$pi_out/runtime-mutant-worktree"

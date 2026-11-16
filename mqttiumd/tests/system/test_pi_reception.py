@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from pi_reception import FinishCursor, WireOccurrences, verify_normal_bounds
+from pi_reception import FinishCursor, WireOccurrences, verify_normal_bounds, verify_small_domain
 from tcp_probe import Frame, FrameDecoder, ReceiptFailure, packet, utf8
 
 
@@ -28,6 +28,13 @@ def publish(number, identifier=1):
 
 
 class PiWireTests(unittest.TestCase):
+    def test_zero_filtered_tests_cannot_receive_the_small_identifier_domain(self):
+        with self.assertRaises(ReceiptFailure) as raised:
+            verify_small_domain('test result: ok. 0 passed; 0 failed; 1 filtered out;')
+        self.assertEqual(raised.exception.code, 'small_domain_not_executed')
+        verify_small_domain('test owner::pubsub::tests::the_complete_small_domain_counts_unknown_finish_and_unloaded_recovered_claims ... ok\n'
+                            'test result: ok. 1 passed; 0 failed; 200 filtered out;')
+
     def test_wrapper_build_uses_pinned_source_when_caller_commits_during_build(self):
         tool = Path(__file__).resolve().parents[2] / 'tools/run_pi_reception.sh'
         with tempfile.TemporaryDirectory() as directory:

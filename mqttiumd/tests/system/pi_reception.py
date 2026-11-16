@@ -442,6 +442,13 @@ async def numbered_deliveries(broker: Broker, case: Path, count: int):
                     result["wire"] = proxy.summary()
 
 
+def verify_small_domain(output: str):
+    name = "owner::pubsub::tests::the_complete_small_domain_counts_unknown_finish_and_unloaded_recovered_claims"
+    require(f"test {name} ... ok" in output
+            and "test result: ok. 1 passed; 0 failed;" in output,
+            "small_domain_not_executed")
+
+
 def verify_normal_bounds(evidence: dict, final_storage: dict):
     """Explicit long-run receipt/quota evidence, independent of traffic count."""
     samples = [window["storage"] for window in evidence["windows"]] + [final_storage]
