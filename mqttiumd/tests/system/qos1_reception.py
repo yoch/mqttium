@@ -450,10 +450,9 @@ def late_receipt(binary: Path, case: Path) -> dict:
                     "receive_window_not_filled")
             write_json(case / "before-old-receipt.json", before)
             broker.release("ack.receipt")
-            # An unrelated PING confirms that ingress continues after releasing
-            # the deferred receipt; it is not a timing-only acknowledgement.
-            wire.send(b"\xc0\x00")
-            wire.expect(0xD0)
+            released = broker.wait_event("barrier_released", point="ack.receipt", after=int(hit["seq"]))
+            require(released.get("details", {}).get("effect") == hit.get("details", {}).get("effect"),
+                    "wrong_deferred_receipt_released")
             wire.send(publish_packet("reception/late", b"ninth", 9, qos=1))
             frame = wire.poll(3)
             require(frame is not None, "receive_maximum_refusal_missing")
@@ -467,6 +466,7 @@ def late_receipt(binary: Path, case: Path) -> dict:
             require(after["admissions"] == before["admissions"], "stale_receipt_released")
         broker.stop()
         return {"criterion": "C-late-receipt", "status": "PASS", "deferred_ack": hit,
+                "released_ack": released,
                 "active_new_qos2": 8, "ninth_identifier_refused": True,
                 "client_received_first_puback": True}
     finally:
