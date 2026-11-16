@@ -6680,6 +6680,14 @@ mod tests {
             panic!("deadline")
         };
         let facts = match command.recipe.get() {
+            Recipe::ConsumeDelivery(c) => CommitFacts::DeliveryConsumed {
+                delivery: c.delivery,
+                target: c.target,
+            },
+            Recipe::UpdateSubscriptions(c) => CommitFacts::SubscriptionsChanged {
+                session: c.session,
+                route_revision: c.route_revision.checked_next().unwrap(),
+            },
             Recipe::ClaimDelivery(c) => CommitFacts::DeliveryClaimed {
                 delivery: c.delivery,
                 target: c.target,
@@ -6715,6 +6723,125 @@ mod tests {
                 reason,
             },
         }
+    }
+
+    fn qos0_packet(connection: u64, order: u64, topic: &[u8]) -> Input {
+        Input::Packet {
+            connection: ConnectionGeneration::new(connection),
+            ingress_order: order,
+            packet: InboundPacket::Publish {
+                qos: Qos::AtMostOnce,
+                dup: false,
+                retain: false,
+                topic: bytes(topic),
+                packet_id: None,
+                payload: bytes(b"payload"),
+            },
+        }
+    }
+
+    #[test]
+    fn product_qos0_fanout_is_volatile_and_absence_is_an_owner_decision() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 1));
+        let _ = world.drain();
+        world.applied(product_settings(11, 1));
+        let _ = world.drain();
+        world.applied(connect(11, b"p1-b"));
+        let _ = world.drain();
+        world.applied(qos0_packet(CONN, 1, b"p1/example"));
+        let mut effects = world.drain();
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            let mut continuations = Vec::new();
+            for (id, effect) in effects {
+                match effect {
+                    Effect::Continue { continuation } => continuations.push(continuation),
+                    other => seen.push((id, other)),
+                }
+            }
+            if continuations.is_empty() {
+                break;
+            }
+            for continuation in continuations {
+                world.applied(Input::Continue {
+                    continuation,
+                    budget: WorkUnits::new(65536),
+                });
+            }
+            effects = world.drain();
+        }
+        assert_eq!(
+            kinds(&seen),
+            ["EmitQos0", "Qos0Dropped"],
+            "no durable recipe, invented PI, or ACK for a pure QoS0 publication"
+        );
+        assert!(
+            matches!(&seen[1].1,Effect::Qos0Dropped{target:Some(target),reason:crate::contract::pubsub::Qos0DropReason::DestinationAbsent,..} if target.get()==3)
+        );
+        assert!(world.owner.slots.is_empty());
+    }
+
+    #[test]
+    fn product_qos0_subscription_grants_zero_after_known_commit() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 8));
+        let _ = world.drain();
+        let mut input = subscribe(CONN, 9, b"fresh");
+        if let Input::Packet {
+            packet: InboundPacket::Subscribe { filters, .. },
+            ..
+        } = &mut input
+        {
+            *filters = crate::contract::pubsub::FilterList::copy_from(&[
+                crate::contract::pubsub::SubscriptionFilter {
+                    filter: bytes(b"fresh"),
+                    qos: Qos::AtMostOnce,
+                },
+            ])
+            .unwrap();
+        }
+        let flight = pubsub_flight(&mut world, input);
+        assert!(
+            world
+                .owner
+                .routes
+                .as_slice()
+                .iter()
+                .all(|r| r.topic != bytes(b"fresh"))
+        );
+        world.applied(committed(&flight));
+        let effects = world.drain();
+        assert!(
+            matches!(&effects[0].1,Effect::EmitFrame{frame:OutboundFrame::Suback{results,..},..} if results.as_slice()==Some(&[0][..]))
+        );
+        assert_eq!(
+            world
+                .owner
+                .routes
+                .as_slice()
+                .iter()
+                .find(|r| r.topic == bytes(b"fresh"))
+                .unwrap()
+                .max_qos,
+            Qos::AtMostOnce
+        );
+    }
+
+    #[test]
+    fn product_qos0_durable_work_consumes_instead_of_claiming() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 1));
+        let _ = world.drain();
+        let mut item = work_item(0);
+        item.qos = Qos::AtMostOnce;
+        load_work(&mut world, &[item], None);
+        world.applied(work_available());
+        let effects = world.drain();
+        assert!(
+            matches!(&effects[0].1,Effect::Persist{command} if matches!(command.recipe.get(),Recipe::ConsumeDelivery(_))),
+            "QoS0 work consumes before emission and never claims a QoS1 slot"
+        );
     }
 
     fn queued_product() -> World {
