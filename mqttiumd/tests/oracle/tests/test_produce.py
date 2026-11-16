@@ -399,6 +399,31 @@ class Campaign(unittest.TestCase):
         self.assertTrue(all(entry["status"] == "PASS" for entry in self.result["assertions"]))
         self.assertEqual(self.result["verdict"], "INCONCLUSIVE")
 
+    def test_consumed_qos0_receipt_is_readable_but_not_fixture_qualified(self):
+        source = ROOT / "contracts/examples/v1/valid/store-snapshot-delivery-consume-receipt.json"
+        consumed = json.loads(source.read_text())["operations"][-1]
+        self.revise_evidence(snapshot_edit=lambda value: value["operations"].append(consumed))
+        self.assertEqual(self.produce_rebuilt(), [
+            "not qualifying: the fixture-based qualifier does not cover volatile or consumed QoS 0 delivery",
+        ])
+        self.assertTrue(all(entry["status"] == "PASS" for entry in self.result["assertions"]))
+        self.assertEqual((self.result["qualification"], self.result["verdict"]),
+                         ("provisional", "INCONCLUSIVE"))
+        self.result.update(qualification="qualifying", verdict="PASS", exit_code=0, reasons=[])
+        (self.campaign / "run-result.json").write_text(json.dumps(self.result))
+        self.assertEqual(self.refused(), self.unqualified(results.FIXTURE_QOS0_SCOPE))
+
+    def test_new_qos_grant_recipe_is_readable_without_extending_qualification(self):
+        source = ROOT / "contracts/examples/v1/valid/store-snapshot-subscription-qos0-receipt.json"
+        update = json.loads(source.read_text())["operations"][-1]
+        self.revise_evidence(snapshot_edit=lambda value: value["operations"].append(update))
+        self.assertEqual(self.produce_rebuilt(), [
+            "not qualifying: the fixture-based qualifier does not cover outgoing claims "
+            "or subscription mutations",
+        ])
+        self.assertTrue(all(entry["status"] == "PASS" for entry in self.result["assertions"]))
+        self.assertEqual(self.result["verdict"], "INCONCLUSIVE")
+
     def test_rejected_claim_recipe_without_commit_facts_cannot_qualify(self):
         source = ROOT / "contracts/examples/v1/valid/store-snapshot-delivery-claim-receipt.json"
         claim = json.loads(source.read_text())["operations"][-1]

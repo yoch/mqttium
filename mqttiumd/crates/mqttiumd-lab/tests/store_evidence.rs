@@ -9,23 +9,24 @@ use serde_json::Value;
 
 use mqttiumd_contract::capacity::{BoundedVec, References};
 use mqttiumd_contract::command::{
-    ChangeSubscriptions, ClaimDelivery, Command, FinishDelivery, FrozenRecipe, Recipe,
+    ChangeSubscriptions, ClaimDelivery, Command, ConsumeDelivery, FinishDelivery, FrozenRecipe,
+    Recipe, UpdateSubscriptions,
 };
 use mqttiumd_contract::effects::{Effect, EffectSink, OwnedEffect, SubmitResult};
 use mqttiumd_contract::ids::{
     DeliveryId, EffectId, EffectSeq, LogicalOwnerId, OperationId, OutboundPacketId, Revision,
-    StoreIncarnation,
+    SessionId, StoreIncarnation,
 };
-use mqttiumd_contract::packet::SharedBytes;
-use mqttiumd_contract::pubsub::SubscriptionChange;
+use mqttiumd_contract::packet::{Qos, SharedBytes};
+use mqttiumd_contract::pubsub::{GrantedSubscriptionChange, SubscriptionChange};
 use mqttiumd_lab::store::adapter::{
     AdapterLimits, Answer, FaultAction, FaultPoint, FaultSpec, Performed, SimStore, StoreAction,
     StoreEvent, WorkId, WorkKind, startup_nonce,
 };
 use mqttiumd_lab::store::conformance::{
-    World, altered, fixture_limits, operation_id, publication_id,
+    World, altered, fixture_limits, open, operation_id, publication_id,
 };
-use mqttiumd_lab::store::durable::{AdminCommand, DurableStore, Limits, MemoryStore};
+use mqttiumd_lab::store::durable::{AdminCommand, AdminDone, DurableStore, Limits, MemoryStore};
 use mqttiumd_lab::store::evidence::{
     Cause, CauseRefused, SnapshotContext, TraceWriter, outcome_fields, recovered_fact, snapshot,
 };
@@ -209,6 +210,129 @@ fn subscription_commit_facts_preserve_session_and_route_revision() {
     accepted(&workspace(), &written);
     let expected = example("store-snapshot-subscription-receipt.json");
     for member in ["operations", "route_table", "account", "outbound"] {
+        assert_eq!(written[member], expected[member], "{member}");
+    }
+}
+
+#[test]
+fn qos0_grant_snapshot_matches_the_new_canonical_kind_without_changing_old_work() {
+    let mut limits = fixture_limits();
+    limits.max_route_targets = 8;
+    let mut world = World::with_limits(&memory, limits);
+    let admission = world.admission(1, 7, b"payload", &[world.b, world.c]);
+    assert!(world.store.apply(&admission).committed_now);
+    let changes = BoundedVec::from_slice(
+        &[GrantedSubscriptionChange {
+            topic: SharedBytes::copy_from(b"p1/example", 256).unwrap(),
+            granted: Some(Qos::AtMostOnce),
+        }],
+        1,
+    )
+    .unwrap();
+    let command = Command {
+        recipe: FrozenRecipe::freeze(Recipe::UpdateSubscriptions(UpdateSubscriptions {
+            operation: operation_id(world.epoch, 24),
+            session: world.b,
+            session_revision: Revision::new(1),
+            route_revision: world.route_revision,
+            changes,
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    assert!(world.store.apply(&command).committed_now);
+    let written = snapshot(&world.store.snapshot().unwrap(), CONTEXT);
+    accepted(&workspace(), &written);
+    let expected = example("store-snapshot-subscription-qos0-receipt.json");
+    for member in [
+        "operations",
+        "route_table",
+        "obligations",
+        "account",
+        "outbound",
+    ] {
+        assert_eq!(written[member], expected[member], "{member}");
+    }
+}
+
+#[test]
+fn qos0_consumption_snapshot_has_no_claim_and_matches_the_canonical_example() {
+    let mut limits = fixture_limits();
+    limits.max_route_targets = 8;
+    let mut store = memory(StoreIncarnation::new(1), limits);
+    let mut sessions = [SessionId::new(0); 3];
+    for (index, client) in [b"p1-producer".as_slice(), b"p1-b", b"p1-c"]
+        .iter()
+        .enumerate()
+    {
+        let AdminDone::SessionCreated { session, .. } = store
+            .admin(AdminCommand::CreateSession {
+                client_id: client.to_vec(),
+            })
+            .unwrap()
+        else {
+            panic!("session creation");
+        };
+        sessions[index] = session;
+    }
+    let mut revision = Revision::new(0);
+    for (session, qos) in [
+        (sessions[1], Qos::AtMostOnce),
+        (sessions[2], Qos::AtLeastOnce),
+    ] {
+        let AdminDone::RouteAdded { route_revision } = store
+            .admin(AdminCommand::AddRoute {
+                topic: b"p1/example".to_vec(),
+                session,
+                qos,
+            })
+            .unwrap()
+        else {
+            panic!("route creation");
+        };
+        revision = route_revision;
+    }
+    let epoch = open(&mut store);
+    let mut world = World {
+        store,
+        producer: sessions[0],
+        b: sessions[1],
+        c: sessions[2],
+        epoch,
+        route_revision: revision,
+    };
+    let admission = altered(
+        &world.admission(1, 7, b"payload", &[world.b, world.c]),
+        |admit| {
+            admit.targets.as_mut_slice()[0].effective_qos = Qos::AtMostOnce;
+        },
+    );
+    assert!(world.store.apply(&admission).committed_now);
+    let command = Command {
+        recipe: FrozenRecipe::freeze(Recipe::ConsumeDelivery(ConsumeDelivery {
+            operation: operation_id(world.epoch, 25),
+            delivery: DeliveryId {
+                publication: publication_id(world.epoch, 1),
+                index: 0,
+            },
+            target: world.b,
+            target_revision: Revision::new(1),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    assert!(world.store.apply(&command).committed_now);
+    let written = snapshot(&world.store.snapshot().unwrap(), CONTEXT);
+    accepted(&workspace(), &written);
+    let expected = example("store-snapshot-delivery-consume-receipt.json");
+    for member in [
+        "operations",
+        "route_table",
+        "obligations",
+        "payloads",
+        "account",
+        "outbound",
+    ] {
         assert_eq!(written[member], expected[member], "{member}");
     }
 }
