@@ -2234,4 +2234,270 @@ mod tests {
             "the allocator prefers the smallest free number"
         );
     }
+
+    fn operation(sequence: u64) -> OperationId {
+        OperationId::new(
+            StoreIncarnation::new(1),
+            RunEpoch::new(2),
+            LogicalOwnerId::new(4),
+            OperationSeq::new(sequence),
+        )
+    }
+    fn flight(sequence: u64) -> InFlight {
+        InFlight {
+            operation: operation(sequence),
+            phase: CommandPhase::Indeterminate,
+            deadline: DeadlineToken::new(sequence),
+            answers: Answers::new(EffectId {
+                epoch: RunEpoch::new(2),
+                owner: LogicalOwnerId::new(4),
+                sequence: EffectSeq::new(sequence),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_complete_small_domain_counts_unknown_finish_and_unloaded_recovered_claims() {
+        let mut owner = world();
+        for raw in 1..=4 {
+            let claim = DeliveryClaim {
+                operation: operation(u64::from(raw)),
+                packet_id: OutboundPacketId::new(raw).unwrap(),
+            };
+            let mut item = Delivery::metadata(
+                delivery(u32::from(raw)),
+                TARGET,
+                Revision::new(1),
+                Qos::AtLeastOnce,
+                Some(claim),
+            );
+            item.phase = match raw {
+                1 => Phase::ClaimPending(flight(1)),
+                2 => Phase::AwaitPuback,
+                3 => Phase::FinishPending(flight(5)),
+                _ => Phase::AwaitPuback,
+            };
+            assert!(
+                item.payload.is_none(),
+                "recovered claims reserve before payload loading"
+            );
+            owner.pubsub.deliveries.try_push(item).unwrap();
+        }
+        assert_eq!(
+            owner.pubsub.free_packet_id(TARGET, 4),
+            None,
+            "occupied_pi_reused"
+        );
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 5).unwrap().get(), 5);
+        assert_eq!(
+            owner
+                .pubsub
+                .free_packet_id(SessionId::new(2), 4)
+                .unwrap()
+                .get(),
+            1,
+            "destinations have independent sender identifier spaces"
+        );
+        let mut pure_zero = Delivery::metadata(
+            delivery(10),
+            TARGET,
+            Revision::new(1),
+            Qos::AtMostOnce,
+            None,
+        );
+        pure_zero.payload = Some(bytes(b"zero"));
+        owner.pubsub.deliveries.try_push(pure_zero).unwrap();
+        assert_eq!(
+            owner.pubsub.free_packet_id(TARGET, 4),
+            None,
+            "QoS0 neither returns nor takes a QoS1 identifier"
+        );
+        let ping = apply(
+            &mut owner,
+            Input::Packet {
+                connection: CONNECTION,
+                ingress_order: 4,
+                packet: InboundPacket::Pingreq,
+            },
+        );
+        assert!(
+            matches!(
+                ping[0].1,
+                Effect::EmitFrame {
+                    frame: OutboundFrame::Pingresp,
+                    ..
+                }
+            ),
+            "a genuinely full finite domain does not block control transitions"
+        );
+    }
+
+    #[test]
+    fn a_finish_committed_but_not_known_and_its_resolution_keep_the_identifier_reserved() {
+        let mut owner = world();
+        queued(&mut owner, 0);
+        let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command } = &claim[0].1 else {
+            panic!("claim")
+        };
+        let claim_operation = command.recipe.operation();
+        let _ = known(&mut owner, claim[0].0, command);
+        let finish = apply(
+            &mut owner,
+            Input::Packet {
+                connection: CONNECTION,
+                ingress_order: 1,
+                packet: InboundPacket::Puback {
+                    packet_id: OutboundPacketId::new(1).unwrap(),
+                    reason: 0x80,
+                },
+            },
+        );
+        let Effect::Persist { command } = &finish[0].1 else {
+            panic!("negative ACK still has durable termination")
+        };
+        let finish_operation = command.recipe.operation();
+        assert_ne!(claim_operation, finish_operation);
+        assert!(
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect: finish[0].0,
+                    operation: finish_operation,
+                    reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown)
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(),
+            2,
+            "finish_unknown_freed_pi"
+        );
+        let Effect::ArmDeadline { token, .. } = finish[1].1 else {
+            panic!("finish deadline")
+        };
+        let resolution = apply(
+            &mut owner,
+            Input::Deadline {
+                token,
+                now: crate::contract::ids::LogicalTime::new(10),
+            },
+        );
+        assert!(
+            matches!(resolution[0].1,Effect::ResolveAndFence {operation} if operation==finish_operation)
+        );
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(), 2);
+        assert!(known(&mut owner, resolution[0].0, command).is_empty());
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(), 1);
+        queued(&mut owner, 1);
+        let next = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command } = &next[0].1 else {
+            panic!("new claim")
+        };
+        let Recipe::ClaimDelivery(new) = command.recipe.get() else {
+            panic!("claim")
+        };
+        assert_eq!(new.packet_id.get(), 1);
+        assert_ne!(new.operation, claim_operation);
+        assert_ne!(new.operation, finish_operation);
+    }
+
+    #[test]
+    fn a_submitted_unknown_claim_reserves_its_identifier_before_any_publish_or_callback() {
+        let mut owner = world();
+        queued(&mut owner, 0);
+        queued(&mut owner, 1);
+        let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command } = &claim[0].1 else {
+            panic!("claim")
+        };
+        let op = command.recipe.operation();
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(), 2);
+        assert!(
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect: claim[0].0,
+                    operation: op,
+                    reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown)
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(),
+            2,
+            "unknown_claim_pi_reused"
+        );
+        assert!(
+            apply(&mut owner, Input::WorkAvailable { session: TARGET }).is_empty(),
+            "later delivery cannot overtake the earlier unknown claim"
+        );
+    }
+
+    #[test]
+    fn collecting_a_known_claim_receipt_does_not_free_the_live_packet_identifier() {
+        use crate::contract::receipts::ReceiptCollectionReply;
+        let mut owner = world();
+        let registration = apply(&mut owner, Input::MaintainReceipts);
+        let Effect::CollectReceipts { collection } = registration[0].1 else {
+            panic!("registration")
+        };
+        let _ = apply(
+            &mut owner,
+            Input::ReceiptsCollected {
+                effect: registration[0].0,
+                collection,
+                reply: ReceiptCollectionReply::Applied {
+                    closure: collection.closure,
+                    removed: 0,
+                    retained: 0,
+                    more: false,
+                },
+            },
+        );
+        queued(&mut owner, 0);
+        let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command } = &claim[0].1 else {
+            panic!("claim")
+        };
+        let _ = known(&mut owner, claim[0].0, command);
+        owner.receipts.test_request_sweep();
+        let gc = apply(&mut owner, Input::MaintainReceipts);
+        let Effect::CollectReceipts { collection } = gc[0].1 else {
+            panic!("claim receipt collection")
+        };
+        assert_eq!(collection.closure.through.get(), 1);
+        let _ = apply(
+            &mut owner,
+            Input::ReceiptsCollected {
+                effect: gc[0].0,
+                collection,
+                reply: ReceiptCollectionReply::Applied {
+                    closure: collection.closure,
+                    removed: 1,
+                    retained: 0,
+                    more: false,
+                },
+            },
+        );
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(), 2);
+        let finish = apply(
+            &mut owner,
+            Input::Packet {
+                connection: CONNECTION,
+                ingress_order: 1,
+                packet: InboundPacket::Puback {
+                    packet_id: OutboundPacketId::new(1).unwrap(),
+                    reason: 0,
+                },
+            },
+        );
+        let Effect::Persist { command } = &finish[0].1 else {
+            panic!("finish after claim receipt retirement")
+        };
+        assert!(known(&mut owner, finish[0].0, command).is_empty());
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(), 1);
+    }
 }
