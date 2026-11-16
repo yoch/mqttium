@@ -70,6 +70,7 @@
     "contracts/examples/v1/valid/trace-record-durable-lookup-failed.json",
     "contracts/examples/v1/valid/trace-record-header-core-without-bytes.json",
     "contracts/examples/v1/valid/store-snapshot-after-commit.json",
+    "contracts/examples/v1/valid/store-snapshot-legacy-session-defaults.json",
     "contracts/examples/v1/valid/store-snapshot-outbound-claim.json",
     "contracts/examples/v1/valid/store-snapshot-subscription-receipt.json",
     "contracts/examples/v1/valid/store-snapshot-delivery-claim-receipt.json",
@@ -118,6 +119,7 @@
     "contracts/examples/v1/valid/product-maintenance-read-refused.json",
     "contracts/examples/v1/valid/product-ack-receipt.json",
     "contracts/examples/v1/valid/product-puback-credit.json",
+    "contracts/examples/v1/valid/product-session-open-submitted.json",
     "contracts/examples/v1/valid/product-session-opened.json",
     "contracts/examples/v1/valid/product-session-closed.json",
     "contracts/examples/v1/valid/product-session-refused.json",
@@ -2145,6 +2147,18 @@
       "code": "u64-out-of-range",
       "pointer": "/operation/sequence",
       "why": "Product event identities retain the shared 64-bit range."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-expected-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/details/expected_session",
+      "why": "A nonnull expected session retains the same checked identity domain."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-null-expected-wrong-kind.json",
+      "code": "schema-violation",
+      "pointer": "/kind",
+      "why": "Null is accepted only for the named optional identity in its event context."
     },
     {
       "file": "contracts/examples/v1/invalid/product-session-session-overflow.json",

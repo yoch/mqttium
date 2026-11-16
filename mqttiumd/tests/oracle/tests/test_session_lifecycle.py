@@ -89,9 +89,10 @@ class SessionFormats(unittest.TestCase):
         self.assertEqual(self.contracts.check_value(value), [])
 
     def test_legacy_session_policy_omissions_remain_readable(self):
-        self.assertNotIn("expiry", self.snapshot["sessions"][0])
-        self.assertNotIn("opened_by", self.snapshot["sessions"][0])
-        self.assertEqual(self.contracts.check_value(self.snapshot), [])
+        legacy = json.loads((ROOT / "contracts/examples/v1/valid/store-snapshot-legacy-session-defaults.json").read_text())
+        self.assertNotIn("expiry", legacy["sessions"][0])
+        self.assertNotIn("opened_by", legacy["sessions"][0])
+        self.assertEqual(self.contracts.check_value(legacy), [])
 
     def test_opening_attachment_components_remain_u64(self):
         value = copy.deepcopy(self.snapshot)
@@ -127,6 +128,12 @@ class SessionQualificationScope(unittest.TestCase):
         snapshot["operations"] = [{"recipe_hex": opened().hex(), "decision": {"kind": "Committed", "facts": {
             "kind": "SessionLifecycle"}}}]
         self.assert_scope(self.unmet(snapshots=[snapshot]))
+
+    def test_lifecycle_command_is_readable_but_cannot_extend_qualification(self):
+        record = json.loads((ROOT / "contracts/examples/v1/valid/trace-record-store-commit-stable.json").read_text())
+        record["payload"]["command_kind"] = "SessionLifecycle"
+        self.assertEqual(Contracts.open(ROOT).check_value(record), [])
+        self.assert_scope(self.unmet(records=[SimpleNamespace(kind=record["kind"], payload=record["payload"])]))
 
     def test_lifecycle_recovery_fact_cannot_extend_qualification(self):
         record = SimpleNamespace(kind="RecoveryPageDelivered", payload={"facts": [{
@@ -166,6 +173,16 @@ class SessionCorpus(unittest.TestCase):
         self.assertLess(int(value["publications"][0]["source_session"]), int(value["meta"]["next_session"]))
         self.assertEqual([row["session"] for row in value["obligations"]], ["2", "3"])
         self.assertEqual(value["payloads"][0]["references"], "2")
+
+    def test_optional_expected_identity_is_bounded_and_contextual(self):
+        value = self.example("product-session-open-submitted")
+        self.assertEqual(self.contracts.check_value(value), [])
+        value["details"]["expected_session"] = "18446744073709551616"
+        self.assertEqual([(d.code, d.pointer) for d in self.contracts.check_value(value)],
+                         [("u64-out-of-range", "/details/expected_session")])
+        value["details"]["expected_session"] = None
+        value["kind"] = "runtime_refused"
+        self.assertTrue(self.contracts.check_value(value))
 
     def test_session_refusal_cannot_fabricate_a_durable_identity(self):
         value = self.example("product-session-refused")

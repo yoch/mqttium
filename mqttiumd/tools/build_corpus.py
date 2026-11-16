@@ -2279,6 +2279,8 @@ snapshot = env(
             "client_id_hex": client_id.encode().hex(),
             "revision": "1",
             "state": "Active",
+            "expiry": "Never",
+            "opened_by": None,
         }
         for number, client_id in SESSIONS
     ],
@@ -2357,6 +2359,11 @@ snapshot = env(
     },
 )
 ok("store-snapshot-after-commit.json", snapshot)
+legacy_session_snapshot = copy.deepcopy(snapshot)
+for row in legacy_session_snapshot["sessions"]:
+    row.pop("expiry")
+    row.pop("opened_by")
+ok("store-snapshot-legacy-session-defaults.json", legacy_session_snapshot)
 OUTBOUND_SLOT = {
     "delivery_id": {"publication_id": PUBLICATION, "index": 0},
     "target_session": "2",
@@ -3570,6 +3577,16 @@ for pointer, edit in [
     bad("product-event-overflow-" + pointer.rsplit("/", 1)[1] + ".json", "u64-out-of-range", pointer,
         "Product event identities retain the shared 64-bit range.", edit)
 # Lifecycle observations keep exact identities and bounded resource inventories.
+session_open_submitted = env("mqttiumd.product-event", seq="10", kind="command_submitted", pid=1,
+    operation={**OP, "sequence": "26"}, details={"recipe_kind": "SessionOpen", "action": "Open",
+    "clean_start": True, "expiry": "OnDisconnect", "expected_session": None})
+ok("product-session-open-submitted.json", session_open_submitted)
+bad("product-session-expected-overflow.json", "u64-out-of-range", "/details/expected_session",
+    "A nonnull expected session retains the same checked identity domain.",
+    edited(session_open_submitted, lambda v: v["details"].update(expected_session=OVER)))
+bad("product-session-null-expected-wrong-kind.json", "schema-violation", "/kind",
+    "Null is accepted only for the named optional identity in its event context.",
+    {**session_open_submitted, "kind": "runtime_refused"})
 session_changed = env("mqttiumd.product-event", seq="11", kind="session_changed", pid=1,
     operation=open_operation, connection="1", details={
     "action": "Opened", "session": "4", "route_revision": "2", "revision": "1",

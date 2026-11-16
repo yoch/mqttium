@@ -21,25 +21,33 @@
       "session": "1",
       "client_id_hex": "70312d70726f6475636572",
       "revision": "1",
-      "state": "Active"
+      "state": "Active",
+      "expiry": "Never",
+      "opened_by": null
     },
     {
       "session": "10",
       "client_id_hex": "7a",
       "revision": "1",
-      "state": "Active"
+      "state": "Active",
+      "expiry": "Never",
+      "opened_by": null
     },
     {
       "session": "2",
       "client_id_hex": "70312d62",
       "revision": "1",
-      "state": "Active"
+      "state": "Active",
+      "expiry": "Never",
+      "opened_by": null
     },
     {
       "session": "3",
       "client_id_hex": "70312d63",
       "revision": "1",
-      "state": "Active"
+      "state": "Active",
+      "expiry": "Never",
+      "opened_by": null
     }
   ],
   "route_table": {

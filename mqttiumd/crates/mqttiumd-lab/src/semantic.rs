@@ -180,7 +180,25 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
                     u64_at(document, &pointer, &mut report.diagnostics);
                 }
             }
-            if text(document, "kind") == "session_changed" {
+            if text(document, "kind") == "command_submitted"
+                && document
+                    .pointer("/details/expected_session")
+                    .is_some_and(Value::is_string)
+            {
+                u64_at(
+                    document,
+                    "/details/expected_session",
+                    &mut report.diagnostics,
+                );
+            }
+            if matches!(
+                text(document, "kind"),
+                "session_changed"
+                    | "session_change_copied"
+                    | "session_change_replayed"
+                    | "session_close_copied"
+                    | "session_close_replayed"
+            ) {
                 for member in ["session", "route_revision", "revision", "retired_session"] {
                     let pointer = format!("/details/{member}");
                     if document.pointer(&pointer).is_some_and(Value::is_string) {

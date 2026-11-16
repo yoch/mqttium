@@ -177,6 +177,16 @@
               "$ref": "primitives.schema.json#/$defs/u64"
             }
           ]
+        },
+        "expected_session": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            }
+          ]
         }
       }
     },
@@ -474,6 +484,58 @@
                 "maximum": 4096
               }
             }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "required": [
+              "expected_session"
+            ],
+            "properties": {
+              "expected_session": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "kind": {
+            "const": "command_submitted"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "required": [
+              "retired_session"
+            ],
+            "properties": {
+              "retired_session": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "kind": {
+            "const": "session_changed"
           }
         }
       }
