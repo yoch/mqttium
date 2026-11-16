@@ -37,6 +37,43 @@ fn memory(incarnation: StoreIncarnation, limits: Limits) -> MemoryStore {
 }
 
 #[test]
+fn completed_publications_match_the_deterministic_state_after_reopening() {
+    let path = fresh_path();
+    let mut sqlite = World::new(&|incarnation, limits| {
+        SqliteStore::create(&path, incarnation, limits).expect("created")
+    });
+    let mut memory = World::new(&memory);
+    let first = memory.admission(1, 7, b"unrouted", &[]);
+    let commands = [
+        &first,
+        &memory.release(2, 7, 1),
+        &memory.admission(3, 7, b"routed", &[memory.b]),
+        &memory.release(4, 7, 3),
+    ];
+    for command in commands {
+        assert_eq!(sqlite.store.apply(command), memory.store.apply(command));
+        assert_eq!(
+            sqlite.store.snapshot().expect("healthy snapshot"),
+            memory.store.snapshot().expect("healthy snapshot")
+        );
+    }
+    let deletion = AdminCommand::DeleteSession { session: memory.b };
+    assert_eq!(
+        sqlite.store.admin(deletion.clone()),
+        memory.store.admin(deletion)
+    );
+    let complete = memory.store.snapshot().expect("healthy snapshot");
+    assert!(complete.publications.is_empty());
+    assert!(complete.payloads.is_empty());
+    assert_eq!(accounts_match_what_is_held(&complete), Ok(()));
+    drop(sqlite.store);
+    let mut reopened = SqliteStore::open(&path).expect("same file reopened");
+    assert_eq!(reopened.snapshot().expect("healthy snapshot"), complete);
+    assert_eq!(reopened.apply(&first), memory.store.apply(&first));
+    assert_eq!(reopened.snapshot().expect("healthy snapshot"), complete);
+}
+
+#[test]
 fn the_settings_in_force_are_read_back() {
     let store = SqliteStore::create(&fresh_path(), INCARNATION, fixture_limits()).expect("created");
     let settings = store.effective_settings();

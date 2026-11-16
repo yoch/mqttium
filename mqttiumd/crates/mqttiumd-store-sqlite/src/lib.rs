@@ -62,12 +62,12 @@ use mqttiumd_contract::capacity::{
 };
 use mqttiumd_contract::command::{
     AdmitPublication, Command, EpochLedger, EpochPhase, LedgerOpening, OpenEpoch, Recipe,
-    ReleaseInbound,
+    RecipeError, ReleaseInbound,
 };
 use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
 use mqttiumd_contract::ids::{
-    DeliveryId, InboundPacketId, OperationId, PayloadId, PublicationId, Revision, RunEpoch,
-    SessionId, StoreIncarnation,
+    DeliveryId, InboundPacketId, OperationId, OperationSeq, PayloadId, PublicationId, Revision,
+    RunEpoch, SessionId, StoreIncarnation,
 };
 use mqttiumd_contract::outcome::{
     CommitFacts, Knowledge, OpeningOutcome, RejectReason, StoreOutcome, StoreReply, StoreViolation,
@@ -656,6 +656,87 @@ fn exists(conn: &Connection, sql: &str, key: &[u8]) -> Result<bool, Fault> {
         .is_some())
 }
 
+/// A completed publication can lose its metadata while its admission receipt
+/// remains an exact identity witness. Only this operation's scope can contain
+/// either incoming identity; collected scopes can never execute again.
+fn admission_identity_was_used(
+    conn: &Connection,
+    meta: &Meta,
+    admit: &AdmitPublication,
+) -> Result<bool, Fault> {
+    let operation = admit.operation;
+    let bound = |sequence| {
+        OperationId::new(
+            operation.incarnation(),
+            operation.epoch(),
+            operation.owner(),
+            OperationSeq::new(sequence),
+        )
+        .to_be_bytes()
+    };
+    let mut statement = conn.prepare_cached(
+        "SELECT id, recipe, decision, publication, exchange, reason, resource
+           FROM operations WHERE id >= ?1 AND id <= ?2 ORDER BY id",
+    )?;
+    let mut rows = statement.query(params![bound(0).as_slice(), bound(u64::MAX).as_slice()])?;
+    let mut meter = reader::Meter::new(ReadBudget::SNAPSHOT);
+    while let Some(row) = rows.next()? {
+        let recipe = reader::borrow_blob(row, 1, ReadBudget::SNAPSHOT.max_field_bytes)?;
+        meter.charge(
+            256usize
+                .checked_add(recipe.len())
+                .ok_or(ReadError::LimitExceeded)?,
+        )?;
+        let id =
+            OperationId::from_be_slice(reader::borrow_blob(row, 0, 32)?).map_err(|_| Corrupt)?;
+        if let Decision::Committed(CommitFacts::PublicationAdmitted {
+            publication,
+            exchange,
+        }) = decision_of(row, 2)?.decode()?
+        {
+            let stored = Recipe::decode_canonical(
+                recipe,
+                meta.limits.max_targets_per_admission,
+                meta.limits.max_topic_bytes,
+            )
+            .map_err(|error| {
+                Fault::Read(match error {
+                    RecipeError::AllocationFailed => ReadError::AllocationFailed,
+                    RecipeError::TooManyTargets { .. } | RecipeError::TopicTooLong(_) => {
+                        ReadError::LimitExceeded
+                    }
+                    _ => ReadError::InvalidData,
+                })
+            })?;
+            let Recipe::AdmitPublication(stored) = stored else {
+                return Err(Fault::Corrupt);
+            };
+            if stored.operation != id
+                || stored.publication != publication
+                || stored.source.exchange != exchange
+            {
+                return Err(Fault::Corrupt);
+            }
+            if stored.publication == admit.publication || stored.payload.id == admit.payload.id {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Metadata is live while either the inbound exchange or an obligation needs
+/// it. Payload bytes are released separately with their final obligation.
+fn discard_completed_publication(conn: &Connection, publication: &[u8]) -> Result<(), Fault> {
+    conn.prepare_cached(
+        "DELETE FROM publications WHERE id = ?1
+           AND NOT EXISTS (SELECT 1 FROM inbound WHERE publication = ?1)
+           AND NOT EXISTS (SELECT 1 FROM obligations WHERE publication = ?1)",
+    )?
+    .execute([publication])?;
+    Ok(())
+}
+
 fn stage_admission(
     conn: &Connection,
     meta: &mut Meta,
@@ -710,6 +791,10 @@ fn stage_admission(
         return refused(failed);
     }
     active_session(conn, admit.source.session, admit.source.session_revision)?;
+
+    if admission_identity_was_used(conn, meta, admit)? {
+        return refused(failed);
+    }
 
     // A payload identity names one payload, kept or not.
     let publication = admit.publication.to_be_bytes();
@@ -824,6 +909,7 @@ fn stage_admission(
             .checked_sub(admit.costs.payload_bytes)
             .ok_or(Abort::Refused(failed))?;
     }
+    discard_completed_publication(conn, &publication)?;
     Ok(CommitFacts::PublicationAdmitted {
         publication: admit.publication,
         exchange: admit.source.exchange,
@@ -840,18 +926,21 @@ fn stage_release(
     let packet = i64::from(release.packet_id.get());
     let marker = conn
         .prepare_cached(
-            "SELECT exchange, phase FROM inbound WHERE session = ?1 AND packet_id = ?2",
+            "SELECT exchange, phase, publication FROM inbound WHERE session = ?1 AND packet_id = ?2",
         )?
         .query_row(params![session.as_slice(), packet], |row| {
-            Ok((blob(row, 0)?, row.get::<_, i64>(1)?))
+            Ok((blob(row, 0)?, row.get::<_, i64>(1)?, reader::copy_blob(row, 2, 32)?))
         })
         .optional()?;
-    match marker {
-        Some((exchange, phase))
+    let publication = match marker {
+        Some((exchange, phase, publication))
             if blob_exchange(&exchange)? == release.exchange
-                && code_inbound_phase(phase)? == InboundPhase::AwaitPubrel => {}
+                && code_inbound_phase(phase)? == InboundPhase::AwaitPubrel =>
+        {
+            publication
+        }
         _ => return refused(failed),
-    }
+    };
     conn.prepare_cached("DELETE FROM inbound WHERE session = ?1 AND packet_id = ?2")?
         .execute(params![session.as_slice(), packet])?;
     meta.accounts.exchange_slots = meta
@@ -861,6 +950,7 @@ fn stage_release(
         .ok_or(Abort::Refused(failed))?;
     // The receipt of the release holds a slot like every receipt.
     charge(meta, Accounts::RECEIPT)?;
+    discard_completed_publication(conn, &publication)?;
     Ok(CommitFacts::InboundReleased {
         exchange: release.exchange,
     })
@@ -912,6 +1002,7 @@ fn end_obligation(
         conn.prepare_cached("UPDATE payloads SET refs = ?2 WHERE id = ?1")?
             .execute(params![payload.as_slice(), u64_blob(refs).as_slice()])?;
     }
+    discard_completed_publication(conn, publication)?;
     Ok(())
 }
 
@@ -1035,6 +1126,17 @@ fn stage_admin(
                     session_state_code(SessionState::Terminal)
                 ])?;
             // The session's own inbound markers, with their slots.
+            // Remove metadata that these markers alone kept, without copying
+            // an inventory into application containers. The markers themselves
+            // are deleted immediately below in this same transaction.
+            conn.prepare_cached(
+                "DELETE FROM publications WHERE id IN
+                     (SELECT publication FROM inbound WHERE session = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM obligations WHERE publication = publications.id)
+                   AND NOT EXISTS (SELECT 1 FROM inbound
+                     WHERE publication = publications.id AND session != ?1)",
+            )?
+            .execute([key.as_slice()])?;
             let markers = conn
                 .prepare_cached("DELETE FROM inbound WHERE session = ?1")?
                 .execute([key.as_slice()])?;

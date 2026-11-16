@@ -18,11 +18,12 @@ use mqttiumd_contract::capacity::{
 };
 use mqttiumd_contract::command::{
     AdmitPublication, Command, EpochLedger, EpochPhase, LedgerOpening, OpenEpoch, Recipe,
-    ReleaseInbound,
+    RecipeError, ReleaseInbound,
 };
 use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
 use mqttiumd_contract::ids::{
-    DeliveryId, OperationId, Revision, RunEpoch, SessionId, StoreIncarnation,
+    DeliveryId, OperationId, OperationSeq, PublicationId, Revision, RunEpoch, SessionId,
+    StoreIncarnation,
 };
 use mqttiumd_contract::outcome::{
     CommitFacts, Knowledge, OpeningOutcome, RejectReason, StoreOutcome, StoreReply, StoreViolation,
@@ -81,6 +82,62 @@ impl MemoryStore {
     /// Sets whether the medium accepts writes.
     pub fn set_durability(&mut self, durability: Durability) {
         self.durability = durability;
+    }
+
+    /// Completed metadata is collectible, but the exact admission receipt
+    /// remains an identity witness until its epoch is closed and collected.
+    /// Check the whole relevant scope before treating an identity as unused.
+    fn admission_identity_was_used(&self, admit: &AdmitPublication) -> Result<bool, ReadError> {
+        let operation = admit.operation;
+        let bound = |sequence| {
+            OperationId::new(
+                operation.incarnation(),
+                operation.epoch(),
+                operation.owner(),
+                OperationSeq::new(sequence),
+            )
+        };
+        let mut meter = ReadMeter::new(ReadBudget::SNAPSHOT);
+        for (id, record) in self.committed.operations.range(bound(0)..=bound(u64::MAX)) {
+            meter.field(record.recipe.len(), ReadBudget::SNAPSHOT.max_field_bytes)?;
+            meter.charge(
+                256usize
+                    .checked_add(record.recipe.len())
+                    .ok_or(ReadError::LimitExceeded)?,
+            )?;
+            if let Decision::Committed(CommitFacts::PublicationAdmitted {
+                publication,
+                exchange,
+            }) = record.decision
+            {
+                let stored = Recipe::decode_canonical(
+                    &record.recipe,
+                    self.committed.limits.max_targets_per_admission,
+                    self.committed.limits.max_topic_bytes,
+                )
+                .map_err(|error| match error {
+                    RecipeError::AllocationFailed => ReadError::AllocationFailed,
+                    RecipeError::TooManyTargets { .. } | RecipeError::TopicTooLong(_) => {
+                        ReadError::LimitExceeded
+                    }
+                    _ => ReadError::InvalidData,
+                })?;
+                let Recipe::AdmitPublication(stored) = stored else {
+                    return Err(ReadError::InvalidData);
+                };
+                if stored.operation != *id
+                    || stored.publication != publication
+                    || stored.source.exchange != exchange
+                {
+                    return Err(ReadError::InvalidData);
+                }
+                if stored.publication == admit.publication || stored.payload.id == admit.payload.id
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Commits a staged copy: it becomes the committed state, one
@@ -383,6 +440,7 @@ trait Staging {
         payload: Option<&SharedBytes>,
     ) -> Guard<CommitFacts>;
     fn stage_release(&mut self, release: &ReleaseInbound) -> Guard<CommitFacts>;
+    fn discard_completed_publication(&mut self, publication: PublicationId);
     fn end_obligation(&mut self, delivery: DeliveryId) -> Result<(), AdminRefused>;
     fn stage_admin(&mut self, command: AdminCommand) -> Result<AdminDone, AdminRefused>;
     fn inventory(&self) -> impl Iterator<Item = FactRef<'_>>;
@@ -595,6 +653,7 @@ impl Staging for DurableState {
                 .checked_sub(admit.costs.payload_bytes)
                 .ok_or(failed)?;
         }
+        self.discard_completed_publication(admit.publication);
         Ok(CommitFacts::PublicationAdmitted {
             publication: admit.publication,
             exchange: admit.source.exchange,
@@ -604,12 +663,15 @@ impl Staging for DurableState {
     fn stage_release(&mut self, release: &ReleaseInbound) -> Guard<CommitFacts> {
         let failed = RejectReason::PreconditionFailed;
         let slot = (release.source_session, release.packet_id);
-        match self.inbound.get(&slot) {
+        let publication = match self.inbound.get(&slot) {
             Some(marker)
                 if marker.exchange == release.exchange
-                    && marker.phase == InboundPhase::AwaitPubrel => {}
+                    && marker.phase == InboundPhase::AwaitPubrel =>
+            {
+                marker.publication
+            }
             _ => return Err(failed),
-        }
+        };
         self.inbound.remove(&slot);
         self.accounts.exchange_slots = self
             .accounts
@@ -620,9 +682,24 @@ impl Staging for DurableState {
         // Short of one, the guard fails in the staged copy, and the
         // rejection finds no slot either: nothing is written.
         self.charge(Accounts::RECEIPT)?;
+        self.discard_completed_publication(publication);
         Ok(CommitFacts::InboundReleased {
             exchange: release.exchange,
         })
+    }
+
+    fn discard_completed_publication(&mut self, publication: PublicationId) {
+        if !self
+            .inbound
+            .values()
+            .any(|marker| marker.publication == publication)
+            && !self
+                .obligations
+                .keys()
+                .any(|delivery| delivery.publication == publication)
+        {
+            self.publications.remove(&publication);
+        }
     }
 
     /// Ends one obligation and releases exactly what it held.
@@ -650,6 +727,7 @@ impl Staging for DurableState {
                 .checked_sub(PayloadBytes::new(length))
                 .ok_or(broken)?;
         }
+        self.discard_completed_publication(delivery.publication);
         Ok(())
     }
 
@@ -731,12 +809,16 @@ impl Staging for DurableState {
                     .copied()
                     .collect();
                 for slot in markers {
-                    self.inbound.remove(&slot);
+                    let marker = self
+                        .inbound
+                        .remove(&slot)
+                        .ok_or(AdminRefused::Inconsistent)?;
                     self.accounts.exchange_slots = self
                         .accounts
                         .exchange_slots
                         .checked_sub(ExchangeSlots::new(1))
                         .ok_or(AdminRefused::Inconsistent)?;
+                    self.discard_completed_publication(marker.publication);
                 }
                 // Obligations end by their destination, never by the
                 // session that produced the publication.
@@ -916,6 +998,20 @@ impl DurableStore for MemoryStore {
                 canonical,
                 RejectReason::PreconditionFailed,
             ));
+        }
+
+        if let Recipe::AdmitPublication(admit) = recipe {
+            match self.admission_identity_was_used(admit) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return rejected(self.commit_rejection(
+                        operation,
+                        canonical,
+                        RejectReason::PreconditionFailed,
+                    ));
+                }
+                Err(_) => return settled(StoreOutcome::PendingOrUnknown),
+            }
         }
 
         // 2 to 5. Guards, capacities and every row, on a staged copy.
