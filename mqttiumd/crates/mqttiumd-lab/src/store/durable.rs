@@ -36,6 +36,10 @@ use mqttiumd_contract::receipts::{
     RECEIPT_CONTROL_RESERVE, RECEIPT_DATA_WINDOW, RECEIPT_WINDOW, ReceiptClass, ReceiptClosure,
     ReceiptCollection, ReceiptCollectionRefusal, ReceiptCollectionReply, ReceiptOrigin,
 };
+use mqttiumd_contract::session::{
+    SessionAction, SessionCancellations, SessionChange, SessionEndReason, SessionExpiry,
+    SessionGuard, SessionLifecycle,
+};
 
 pub use mqttiumd_store_api::*;
 
@@ -309,6 +313,8 @@ impl FactRef<'_> {
                     client_id: SharedBytes::copy_from(&record.client_id, MAX_CLIENT_ID_BYTES)
                         .map_err(|_| ReadError::LimitExceeded)?,
                     revision: record.revision,
+                    expiry: record.expiry,
+                    opened_by: record.opened_by,
                 }
             }
             Self::Inbound(packet_id, marker) => {
@@ -380,6 +386,15 @@ fn delivery_claim(
 }
 
 fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
+    for row in state.sessions.values() {
+        if row.opened_by.is_some_and(|id| {
+            id.incarnation() != state.ledger.incarnation()
+                || id.epoch().get() == 0
+                || id.epoch() > state.ledger.last_opened()
+        }) {
+            return Err(ReadError::InvalidData);
+        }
+    }
     if state.receipt_frontiers.len() > MAX_RECEIPT_ORIGINS {
         return Err(ReadError::LimitExceeded);
     }
@@ -439,6 +454,7 @@ fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
 }
 
 fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadError> {
+    check_inventory_bound(state)?;
     let mut meter = ReadMeter::new(budget);
     budget.check_field(8)?;
     if state.ledger.opened_by().is_some() {
@@ -448,8 +464,9 @@ fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadEr
     for record in state.sessions.values() {
         meter.field(record.client_id.len(), MAX_CLIENT_ID_BYTES)?;
         meter.charge(
-            152usize
-                .checked_add(record.client_id.len())
+            160usize
+                .checked_add(if record.opened_by.is_some() { 32 } else { 0 })
+                .and_then(|n| n.checked_add(record.client_id.len()))
                 .ok_or(ReadError::LimitExceeded)?,
         )?;
     }
@@ -563,6 +580,7 @@ trait Staging {
     fn discard_completed_publication(&mut self, publication: PublicationId);
     fn end_obligation(&mut self, delivery: DeliveryId) -> Result<(), AdminRefused>;
     fn stage_admin(&mut self, command: AdminCommand) -> Result<AdminDone, AdminRefused>;
+    fn stage_session(&mut self, command: &SessionLifecycle) -> Guard<CommitFacts>;
     fn inventory(&self) -> impl Iterator<Item = FactRef<'_>>;
 }
 
@@ -1049,6 +1067,8 @@ impl Staging for DurableState {
                         client_id,
                         revision,
                         state: SessionState::Active,
+                        expiry: SessionExpiry::Never,
+                        opened_by: None,
                     },
                 );
                 Ok(AdminDone::SessionCreated { session, revision })
@@ -1082,58 +1102,7 @@ impl Staging for DurableState {
                 })
             }
             AdminCommand::DeleteSession { session } => {
-                let record = match self.sessions.get_mut(&session) {
-                    Some(record) if record.state == SessionState::Active => record,
-                    _ => return Err(AdminRefused::UnknownSession),
-                };
-                record.revision = record
-                    .revision
-                    .checked_next()
-                    .map_err(|_| AdminRefused::Exhausted)?;
-                record.state = SessionState::Terminal;
-                // The session's own inbound markers, with their slots.
-                let markers: Vec<_> = self
-                    .inbound
-                    .keys()
-                    .filter(|(owner, _)| *owner == session)
-                    .copied()
-                    .collect();
-                for slot in markers {
-                    let marker = self
-                        .inbound
-                        .remove(&slot)
-                        .ok_or(AdminRefused::Inconsistent)?;
-                    self.accounts.exchange_slots = self
-                        .accounts
-                        .exchange_slots
-                        .checked_sub(ExchangeSlots::new(1))
-                        .ok_or(AdminRefused::Inconsistent)?;
-                    self.discard_completed_publication(marker.publication);
-                }
-                // Obligations end by their destination, never by the
-                // session that produced the publication.
-                let ended: Vec<_> = self
-                    .obligations
-                    .iter()
-                    .filter(|(_, obligation)| obligation.target == session)
-                    .map(|(delivery, _)| *delivery)
-                    .collect();
-                for delivery in ended {
-                    self.end_obligation(delivery)?;
-                }
-                let mut routes_changed = false;
-                for targets in self.routes.values_mut() {
-                    let before = targets.len();
-                    targets.retain(|target| target.session != session);
-                    routes_changed |= targets.len() != before;
-                }
-                self.routes.retain(|_, targets| !targets.is_empty());
-                if routes_changed {
-                    self.route_revision = self
-                        .route_revision
-                        .checked_next()
-                        .map_err(|_| AdminRefused::Exhausted)?;
-                }
+                cancel_session(self, session)?;
                 Ok(AdminDone::SessionDeleted)
             }
             AdminCommand::CollectClosedEpochs { through } => {
@@ -1167,6 +1136,110 @@ impl Staging for DurableState {
                 Ok(AdminDone::Collected)
             }
         }
+    }
+
+    fn stage_session(&mut self, command: &SessionLifecycle) -> Guard<CommitFacts> {
+        let failed = RejectReason::PreconditionFailed;
+        let change = match &command.action {
+            SessionAction::Open {
+                client_id,
+                expected,
+                clean_start,
+                expiry,
+            } => {
+                let mut found = self.sessions.iter().filter(|(_, r)| {
+                    r.state == SessionState::Active && r.client_id == client_id.as_slice()
+                });
+                let current = found.next().map(|(id, record)| (*id, record.clone()));
+                if found.next().is_some()
+                    || current.as_ref().map(|(session, record)| SessionGuard {
+                        session: *session,
+                        opened_by: record.opened_by,
+                    }) != *expected
+                {
+                    return Err(failed);
+                }
+                let replace = current
+                    .as_ref()
+                    .is_some_and(|(_, r)| *clean_start || r.expiry == SessionExpiry::OnDisconnect);
+                let mut cancelled = SessionCancellations::default();
+                let retired = if replace {
+                    let id = current.as_ref().ok_or(failed)?.0;
+                    cancelled = cancel_session(self, id).map_err(|_| failed)?;
+                    Some(id)
+                } else {
+                    None
+                };
+                let (session, revision, session_present) =
+                    if let Some((id, record)) = current.filter(|_| !replace) {
+                        let row = self.sessions.get_mut(&id).ok_or(failed)?;
+                        row.expiry = *expiry;
+                        row.opened_by = Some(command.operation);
+                        (id, record.revision, true)
+                    } else {
+                        if self
+                            .sessions
+                            .values()
+                            .filter(|r| r.state == SessionState::Active)
+                            .count()
+                            >= self.limits.max_sessions
+                        {
+                            return Err(RejectReason::SessionCapacityExceeded);
+                        }
+                        let session = self.next_session;
+                        self.next_session = session.checked_next().map_err(|_| failed)?;
+                        let mut bytes = Vec::new();
+                        bytes
+                            .try_reserve_exact(client_id.len())
+                            .map_err(|_| failed)?;
+                        bytes.extend_from_slice(client_id.as_slice());
+                        let revision = Revision::new(1);
+                        self.sessions.insert(
+                            session,
+                            SessionRecord {
+                                client_id: bytes,
+                                revision,
+                                state: SessionState::Active,
+                                expiry: *expiry,
+                                opened_by: Some(command.operation),
+                            },
+                        );
+                        (session, revision, false)
+                    };
+                SessionChange::Opened {
+                    session,
+                    revision,
+                    session_present,
+                    expiry: *expiry,
+                    retired,
+                    route_revision: self.route_revision,
+                    cancelled,
+                }
+            }
+            SessionAction::Close { guard, reason } => {
+                let row = self
+                    .sessions
+                    .get(&guard.session)
+                    .filter(|r| r.state == SessionState::Active)
+                    .ok_or(failed)?;
+                if row.opened_by != guard.opened_by
+                    || (matches!(
+                        reason,
+                        SessionEndReason::TransportLost | SessionEndReason::Startup
+                    ) && row.expiry != SessionExpiry::OnDisconnect)
+                {
+                    return Err(failed);
+                }
+                let cancelled = cancel_session(self, guard.session).map_err(|_| failed)?;
+                SessionChange::Closed {
+                    session: guard.session,
+                    route_revision: self.route_revision,
+                    cancelled,
+                }
+            }
+        };
+        self.charge(Accounts::RECEIPT)?;
+        Ok(CommitFacts::SessionLifecycle(change))
     }
 
     /// The recovery inventory, in the order of record 0014: the epoch,
@@ -1234,6 +1307,99 @@ impl Staging for DurableState {
     }
 }
 
+/// Bounded target-only cancellation, shared by explicit administration and
+/// receipted lifecycle commands. A staged caller rolls back every partial error.
+fn cancel_session(
+    state: &mut DurableState,
+    session: SessionId,
+) -> Result<SessionCancellations, AdminRefused> {
+    let broken = AdminRefused::Inconsistent;
+    let row = state
+        .sessions
+        .get(&session)
+        .filter(|r| r.state == SessionState::Active)
+        .ok_or(AdminRefused::UnknownSession)?;
+    row.revision
+        .checked_next()
+        .map_err(|_| AdminRefused::Exhausted)?;
+    let markers = state
+        .inbound
+        .keys()
+        .filter(|(owner, _)| *owner == session)
+        .count();
+    let deliveries = state
+        .obligations
+        .values()
+        .filter(|r| r.target == session)
+        .count();
+    let routes = state
+        .routes
+        .values()
+        .flat_map(|targets| targets.iter())
+        .filter(|t| t.session == session)
+        .count();
+    let total = markers
+        .checked_add(deliveries)
+        .and_then(|n| n.checked_add(routes))
+        .ok_or(broken)?;
+    if total > MAX_RECOVERY_INVENTORY_ROWS
+        || u64::try_from(markers).map_err(|_| broken)? > state.limits.exchange_slots.get()
+        || u64::try_from(deliveries).map_err(|_| broken)? > state.limits.references.get()
+    {
+        return Err(broken);
+    }
+    let mut marker_keys = Vec::new();
+    marker_keys
+        .try_reserve_exact(markers)
+        .map_err(|_| AdminRefused::WriteFailed)?;
+    marker_keys.extend(
+        state
+            .inbound
+            .keys()
+            .filter(|(owner, _)| *owner == session)
+            .copied(),
+    );
+    let mut delivery_keys = Vec::new();
+    delivery_keys
+        .try_reserve_exact(deliveries)
+        .map_err(|_| AdminRefused::WriteFailed)?;
+    delivery_keys.extend(
+        state
+            .obligations
+            .iter()
+            .filter(|(_, r)| r.target == session)
+            .map(|(id, _)| *id),
+    );
+    for key in marker_keys {
+        let marker = state.inbound.remove(&key).ok_or(broken)?;
+        state.accounts.exchange_slots = state
+            .accounts
+            .exchange_slots
+            .checked_sub(ExchangeSlots::new(1))
+            .ok_or(broken)?;
+        state.discard_completed_publication(marker.publication);
+    }
+    for delivery in delivery_keys {
+        state.end_obligation(delivery)?;
+    }
+    for targets in state.routes.values_mut() {
+        targets.retain(|target| target.session != session);
+    }
+    state.routes.retain(|_, targets| !targets.is_empty());
+    if routes != 0 {
+        state.route_revision = state
+            .route_revision
+            .checked_next()
+            .map_err(|_| AdminRefused::Exhausted)?;
+    }
+    state.sessions.remove(&session).ok_or(broken)?;
+    Ok(SessionCancellations {
+        inbound: u32::try_from(markers).map_err(|_| broken)?,
+        deliveries: u32::try_from(deliveries).map_err(|_| broken)?,
+        routes: u32::try_from(routes).map_err(|_| broken)?,
+    })
+}
+
 impl DurableStore for MemoryStore {
     fn collect_receipts(
         &mut self,
@@ -1267,6 +1433,34 @@ impl DurableStore for MemoryStore {
         if let LedgerOpening::Opens { ledger } = self.committed.ledger.open(command) {
             let mut staged = self.committed.clone();
             staged.ledger = ledger;
+            // All transports of the previous process are gone. Expiry is part
+            // of this actual opening, never a repeated AlreadyOpened lookup.
+            let count = staged
+                .sessions
+                .values()
+                .filter(|r| {
+                    r.state == SessionState::Active && r.expiry == SessionExpiry::OnDisconnect
+                })
+                .count();
+            if count > staged.limits.max_sessions || count > MAX_RECOVERY_INVENTORY_ROWS {
+                return Err(ReadError::LimitExceeded);
+            }
+            let mut expired = Vec::new();
+            expired
+                .try_reserve_exact(count)
+                .map_err(|_| ReadError::AllocationFailed)?;
+            expired.extend(
+                staged
+                    .sessions
+                    .iter()
+                    .filter(|(_, r)| {
+                        r.state == SessionState::Active && r.expiry == SessionExpiry::OnDisconnect
+                    })
+                    .map(|(id, _)| *id),
+            );
+            for session in expired {
+                cancel_session(&mut staged, session).map_err(|_| ReadError::InvalidData)?;
+            }
             // A write that fails leaves the ledger as it was, and the
             // answer is read from it: no commit is reported.
             let _written = self.commit(staged);
@@ -1364,6 +1558,7 @@ impl DurableStore for MemoryStore {
             Recipe::FinishDelivery(command) => staged.stage_finish(command),
             Recipe::ConsumeDelivery(command) => staged.stage_consume(command),
             Recipe::UpdateSubscriptions(command) => staged.stage_updates(command),
+            Recipe::SessionLifecycle(command) => staged.stage_session(command),
         };
         match facts {
             Ok(facts) => {

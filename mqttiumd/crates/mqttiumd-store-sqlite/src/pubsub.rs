@@ -1,4 +1,4 @@
-//! Schema-3 subscription and outgoing delivery transactions and bounded reads.
+//! Schema-5 subscription and outgoing delivery transactions and bounded reads.
 use super::*;
 use mqttiumd_contract::command::{
     ChangeSubscriptions, ClaimDelivery, ConsumeDelivery, FinishDelivery, UpdateSubscriptions,
@@ -274,6 +274,7 @@ pub(super) fn consume(
 pub(super) fn facts_blob(facts: CommitFacts) -> Option<(i64, Vec<u8>)> {
     let mut bytes = Vec::new();
     let code = match facts {
+        CommitFacts::SessionLifecycle(change) => return Some((8, sessions::encode(change))),
         CommitFacts::DeliveryConsumed { delivery, target } => {
             bytes.extend_from_slice(&delivery.publication.to_be_bytes());
             bytes.extend_from_slice(&delivery.index.to_be_bytes());
@@ -317,6 +318,9 @@ pub(super) fn facts_blob(facts: CommitFacts) -> Option<(i64, Vec<u8>)> {
 }
 
 pub(super) fn decode_facts(code: i64, bytes: &[u8]) -> Result<CommitFacts, Corrupt> {
+    if code == 8 {
+        return sessions::decode(bytes);
+    }
     if code == 7 && bytes.len() == 44 {
         return Ok(CommitFacts::DeliveryConsumed {
             delivery: DeliveryId {
@@ -374,6 +378,7 @@ pub(super) fn work(
     }
     let read = conn.unchecked_transaction()?;
     let meta = read_meta(&read)?;
+    sessions::validate_metadata(&read, &meta, Some(session))?;
     // Check the target's finite metadata domain before either the QoS or
     // cursor selection can turn an invalid obligation into apparent absence.
     // SQL inspects scalars only; no offending value or payload is copied.

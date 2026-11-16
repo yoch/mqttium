@@ -168,6 +168,7 @@ pub const fn reason_codes(reason: RejectReason) -> (i64, Option<i64>) {
         RejectReason::CapacityExceeded(resource) => (2, Some(resource_code(resource))),
         RejectReason::Fenced => (3, None),
         RejectReason::EpochClosed => (4, None),
+        RejectReason::SessionCapacityExceeded => (5, None),
     }
 }
 
@@ -180,6 +181,7 @@ pub const fn codes_reason(reason: i64, resource: Option<i64>) -> Result<RejectRe
         },
         (3, None) => Ok(RejectReason::Fenced),
         (4, None) => Ok(RejectReason::EpochClosed),
+        (5, None) => Ok(RejectReason::SessionCapacityExceeded),
         _ => Err(Corrupt),
     }
 }

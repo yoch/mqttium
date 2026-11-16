@@ -203,8 +203,8 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
     meter.charge(256)?;
     let tables: [(&str, &[(usize, usize)]); 10] = [
         (
-            "SELECT id, client_id, revision, state FROM sessions",
-            &[(0, 8), (1, MAX_CLIENT_ID_BYTES), (2, 8)],
+            "SELECT id, client_id, revision, state, expiry, opened_by FROM sessions",
+            &[(0, 8), (1, MAX_CLIENT_ID_BYTES), (2, 8), (5, 32)],
         ),
         (
             "SELECT topic, session, qos FROM routes",

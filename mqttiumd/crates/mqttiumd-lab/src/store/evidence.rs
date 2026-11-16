@@ -25,6 +25,7 @@ use mqttiumd_contract::outcome::{
 };
 use mqttiumd_contract::packet::Qos;
 use mqttiumd_contract::receipts::ReceiptClosure;
+use mqttiumd_contract::session::{SessionChange, SessionExpiry};
 
 use super::adapter::{Answer, FaultId, FaultPoint, StoreEvent, Uncorrelated, WorkId, WorkKind};
 use super::durable::{Decision, DurableState, ObligationPhase, SessionState};
@@ -132,11 +133,39 @@ fn reason(reason: RejectReason) -> &'static str {
         RejectReason::CapacityExceeded(_) => "CapacityExceeded",
         RejectReason::Fenced => "Fenced",
         RejectReason::EpochClosed => "EpochClosed",
+        RejectReason::SessionCapacityExceeded => "SessionCapacityExceeded",
     }
 }
 
 fn facts(facts: CommitFacts) -> Value {
     match facts {
+        CommitFacts::SessionLifecycle(change) => {
+            let change = match change {
+                SessionChange::Opened {
+                    session: id,
+                    revision,
+                    session_present,
+                    expiry,
+                    retired,
+                    route_revision,
+                    cancelled,
+                } => json!({
+                    "kind": "Opened", "session": session(id), "revision": decimal(revision.get()),
+                    "session_present": session_present, "expiry": match expiry { SessionExpiry::OnDisconnect => "OnDisconnect", SessionExpiry::Never => "Never" },
+                    "retired": retired.map(session), "route_revision": decimal(route_revision.get()),
+                    "cancelled": { "inbound": cancelled.inbound, "deliveries": cancelled.deliveries, "routes": cancelled.routes },
+                }),
+                SessionChange::Closed {
+                    session: id,
+                    route_revision,
+                    cancelled,
+                } => json!({
+                    "kind": "Closed", "session": session(id), "route_revision": decimal(route_revision.get()),
+                    "cancelled": { "inbound": cancelled.inbound, "deliveries": cancelled.deliveries, "routes": cancelled.routes },
+                }),
+            };
+            json!({"kind": "SessionLifecycle", "change": change})
+        }
         CommitFacts::DeliveryConsumed { delivery, target } => json!({
             "kind": "DeliveryConsumed", "delivery_id": delivery_id(delivery),
             "target_session": session(target),
@@ -241,6 +270,8 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
                 "session": session(*id),
                 "client_id_hex": hex(&record.client_id),
                 "revision": decimal(record.revision.get()),
+                "expiry": match record.expiry { SessionExpiry::OnDisconnect => "OnDisconnect", SessionExpiry::Never => "Never" },
+                "opened_by": record.opened_by.map(operation_id),
                 "state": match record.state {
                     SessionState::Active => "Active",
                     SessionState::Terminal => "Terminal",

@@ -50,6 +50,7 @@ mod pubsub;
 mod reader;
 mod receipts;
 mod schema;
+mod sessions;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, TryLockError};
@@ -310,6 +311,12 @@ impl<E> From<Corrupt> for Abort<E> {
     }
 }
 
+impl<E> From<ReadError> for Abort<E> {
+    fn from(_: ReadError) -> Self {
+        Self::Fault
+    }
+}
+
 impl<E> From<Fault> for Abort<E> {
     fn from(_: Fault) -> Self {
         Self::Fault
@@ -548,7 +555,7 @@ impl DecisionColumns {
                 self.reason.ok_or(Corrupt)?,
                 self.resource,
             )?)),
-            4..=7 => Ok(Decision::Committed(pubsub::decode_facts(
+            4..=8 => Ok(Decision::Committed(pubsub::decode_facts(
                 self.decision,
                 self.facts.as_deref().ok_or(Corrupt)?,
             )?)),
@@ -673,8 +680,13 @@ fn session_row(
     session: SessionId,
 ) -> Result<Option<(Revision, SessionState)>, Fault> {
     let row = conn
-        .prepare_cached("SELECT revision, state FROM sessions WHERE id = ?1")?
+        .prepare_cached("SELECT revision, state, expiry, opened_by FROM sessions WHERE id = ?1")?
         .query_row([session.to_be_bytes().as_slice()], |row| {
+            sessions::decode_expiry(row.get(2)?).map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let binding = reader::optional_blob(row, 3, 32)?;
+            if let Some(bytes) = binding {
+                OperationId::from_be_slice(&bytes).map_err(|_| rusqlite::Error::InvalidQuery)?;
+            }
             Ok((blob(row, 0)?, row.get::<_, i64>(1)?))
         })
         .optional()?;
@@ -1106,7 +1118,7 @@ fn stage_admin(
                 .map_err(|_| Abort::Refused(AdminRefused::Exhausted))?;
             let revision = Revision::new(1);
             conn.prepare_cached(
-                "INSERT INTO sessions (id, revision, state, client_id) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO sessions (id, revision, state, client_id, expiry, opened_by) VALUES (?1, ?2, ?3, ?4, 1, NULL)",
             )?
             .execute(params![
                 session.to_be_bytes().as_slice(),
@@ -1175,67 +1187,7 @@ fn stage_admin(
             })
         }
         AdminCommand::DeleteSession { session } => {
-            let revision = match session_row(conn, session)? {
-                Some((revision, SessionState::Active)) => revision,
-                _ => return admin_refused(AdminRefused::UnknownSession),
-            };
-            let revision = revision
-                .checked_next()
-                .map_err(|_| Abort::Refused(AdminRefused::Exhausted))?;
-            let key = session.to_be_bytes();
-            conn.prepare_cached("UPDATE sessions SET revision = ?2, state = ?3 WHERE id = ?1")?
-                .execute(params![
-                    key.as_slice(),
-                    revision.to_be_bytes().as_slice(),
-                    session_state_code(SessionState::Terminal)
-                ])?;
-            // The session's own inbound markers, with their slots.
-            // Remove metadata that these markers alone kept, without copying
-            // an inventory into application containers. The markers themselves
-            // are deleted immediately below in this same transaction.
-            conn.prepare_cached(
-                "DELETE FROM publications WHERE id IN
-                     (SELECT publication FROM inbound WHERE session = ?1)
-                   AND NOT EXISTS (SELECT 1 FROM obligations WHERE publication = publications.id)
-                   AND NOT EXISTS (SELECT 1 FROM inbound
-                     WHERE publication = publications.id AND session != ?1)",
-            )?
-            .execute([key.as_slice()])?;
-            let markers = conn
-                .prepare_cached("DELETE FROM inbound WHERE session = ?1")?
-                .execute([key.as_slice()])?;
-            for _ in 0..markers {
-                meta.accounts.exchange_slots = meta
-                    .accounts
-                    .exchange_slots
-                    .checked_sub(ExchangeSlots::new(1))
-                    .ok_or(Abort::Refused(AdminRefused::Inconsistent))?;
-            }
-            // Obligations end by their destination, never by the session
-            // that produced the publication.
-            let mut ended = Vec::new();
-            {
-                let mut statement = conn.prepare_cached(
-                    "SELECT publication, idx FROM obligations WHERE target = ?1
-                      ORDER BY publication, idx",
-                )?;
-                let mut rows = statement.query([key.as_slice()])?;
-                while let Some(row) = rows.next()? {
-                    ended.push((blob(row, 0)?, row.get::<_, i64>(1)?));
-                }
-            }
-            for (publication, index) in ended {
-                end_obligation(conn, meta, &publication, index)?;
-            }
-            let removed = conn
-                .prepare_cached("DELETE FROM routes WHERE session = ?1")?
-                .execute([key.as_slice()])?;
-            if removed > 0 {
-                meta.route_revision = meta
-                    .route_revision
-                    .checked_next()
-                    .map_err(|_| Abort::Refused(AdminRefused::Exhausted))?;
-            }
+            sessions::erase(conn, meta, session)?;
             Ok(AdminDone::SessionDeleted)
         }
         AdminCommand::CollectClosedEpochs { through } => {
@@ -1882,6 +1834,7 @@ impl SqliteStore {
         if orphan {
             return Err(Fault::Corrupt);
         }
+        sessions::validate_metadata(conn, meta, None)?;
         let mut out = Vec::new();
         out.try_reserve_exact(count)
             .map_err(|_| ReadError::AllocationFailed)?;
@@ -2007,7 +1960,7 @@ impl SqliteStore {
             },
         )?;
         section(
-            "SELECT id, client_id, revision, state FROM sessions
+            "SELECT id, client_id, revision, state, expiry, opened_by FROM sessions
               WHERE (state = ?1 OR state NOT IN (1, 2)) AND ?2 = ?2 ORDER BY id",
             &mut out,
             &mut position,
@@ -2032,6 +1985,11 @@ impl SqliteStore {
                     session,
                     client_id,
                     revision: Revision::new(blob_u64(reader::borrow_blob(row, 2, 8)?)?),
+                    expiry: sessions::decode_expiry(row.get(4)?)?,
+                    opened_by: sessions::attachment(
+                        reader::optional_blob(row, 5, 32)?.as_deref(),
+                        meta,
+                    )?,
                 }))
             },
         )?;
@@ -2191,8 +2149,9 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
         reader::snapshot(conn, &meta, budget)?;
         let mut sessions = BTreeMap::new();
         {
-            let mut statement =
-                conn.prepare("SELECT id, client_id, revision, state FROM sessions")?;
+            let mut statement = conn.prepare(
+                "SELECT id, client_id, revision, state, expiry, opened_by FROM sessions",
+            )?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 sessions.insert(
@@ -2202,6 +2161,11 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                         client_id: reader::copy_blob(row, 1, budget.max_field_bytes)?,
                         revision: Revision::new(blob_u64(reader::borrow_blob(row, 2, 8)?)?),
                         state: code_session_state(row.get(3)?)?,
+                        expiry: sessions::decode_expiry(row.get(4)?)?,
+                        opened_by: sessions::attachment(
+                            reader::optional_blob(row, 5, 32)?.as_deref(),
+                            &meta,
+                        )?,
                     },
                 );
             }
@@ -2429,8 +2393,9 @@ impl DurableStore for SqliteStore {
     fn open_epoch(&mut self, command: &OpenEpoch) -> Result<OpeningOutcome, ReadError> {
         // The decision is the contract's; only an opening writes.
         if let LedgerOpening::Opens { ledger } = self.read_ledger()?.open(command)
-            && let Txn::ReadFailed(error) = self.transact(|_, meta| {
+            && let Txn::ReadFailed(error) = self.transact(|conn, meta| {
                 meta.ledger = ledger;
+                sessions::expire(conn, meta)?;
                 Ok::<(), Abort<()>>(())
             })
         {
@@ -2534,6 +2499,7 @@ impl DurableStore for SqliteStore {
                 Recipe::FinishDelivery(command) => pubsub::finish(conn, meta, command)?,
                 Recipe::ConsumeDelivery(command) => pubsub::consume(conn, meta, command)?,
                 Recipe::UpdateSubscriptions(command) => pubsub::updates(conn, meta, command)?,
+                Recipe::SessionLifecycle(command) => sessions::stage(conn, meta, command)?,
             };
             insert_operation(conn, operation, &canonical, Decision::Committed(facts))?;
             Ok(facts)

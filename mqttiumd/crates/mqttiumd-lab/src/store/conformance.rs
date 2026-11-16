@@ -1164,10 +1164,7 @@ pub fn deleting_the_producer_deletes_no_obligation_of_another_session<S: Durable
         Ok(AdminDone::SessionDeleted)
     );
     let state = world.store.snapshot().expect("healthy durable snapshot");
-    assert_eq!(
-        state.sessions[&world.producer].state,
-        SessionState::Terminal
-    );
+    assert!(!state.sessions.contains_key(&world.producer));
     assert_eq!(state.obligations, before.obligations);
     assert_eq!(state.publications, before.publications);
     assert_eq!(state.payloads, before.payloads);
