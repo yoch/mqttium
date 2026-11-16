@@ -6604,6 +6604,45 @@ mod tests {
         assert!(!world.owner.has_ready_work(session));
     }
 
+    #[test]
+    fn an_invalidated_page_requests_one_rescan_without_periodic_polling() {
+        let mut world = product_world();
+        let session = SessionId::new(PRODUCER);
+        world.applied(product_settings(CONN, 8));
+        let _ = world.drain();
+        let first = work_item(0);
+        load_work(
+            &mut world,
+            core::slice::from_ref(&first),
+            Some(first.delivery),
+        );
+        let claim = pubsub_flight(&mut world, work_available());
+        world.applied(committed(&claim));
+        let _ = world.drain();
+        world.applied(work_available());
+        let scan = world.drain();
+        assert_eq!(kinds(&scan), ["LoadWork"]);
+        let finish = pubsub_flight(&mut world, outgoing_puback(CONN, 1, 0));
+        world.applied(committed(&finish));
+        let _ = world.drain();
+        world.applied(Input::WorkPage {
+            effect: scan[0].0,
+            session,
+            items: BoundedVec::from_slice(&[work_item(1)], 8).unwrap(),
+            next: None,
+        });
+        assert!(world.drain().is_empty());
+        assert!(
+            world.owner.has_ready_work(session),
+            "discarding a finish-invalidated page preserves one useful rescan"
+        );
+        load_work(&mut world, &[], None);
+        assert!(
+            !world.owner.has_ready_work(session),
+            "the valid empty rescan consumes the hint"
+        );
+    }
+
     fn load_work(
         world: &mut World,
         items: &[crate::contract::pubsub::WorkItem],
