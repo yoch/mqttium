@@ -309,8 +309,9 @@ readiness without resetting partial recovery.
 
 Publication metadata is collected after its final marker/obligation reference;
 a zero-target admission does not archive payload. Live command-result retirement
-removes the cumulative receipt ceiling described below. Session capacity,
-outgoing Packet Identifiers and checked identity counters remain finite.
+removes the cumulative receipt ceiling described below. Outgoing QoS 1 numbers
+are recycled after known durable Finish application; session capacity, active
+claims, checked causal identities and storage budgets remain finite.
 
 SIGINT/SIGTERM closes sockets and drains accepted writer work before releasing
 the writer. Accepted commands are not called certainly rejected. Shutdown has
@@ -403,13 +404,58 @@ are labeled rather than presented as ordinary product configuration changes.
 
 These are finite system tests. Existing K1/K2b/K3 qualifications and proof/model
 limits stay separate; no new path automatically qualifies all P1/P2. ADRs
-0024/0025/0026/0027 retain Proposed status and guard partitions stay incomplete.
+0024/0025/0026/0027/0028 retain Proposed status and guard partitions stay incomplete.
 Legacy epoch-zero/session collection, indefinite operation, outgoing QoS 2,
 wildcard/shared/retained delivery, Will/authentication, finite expiry, deployment
 security and performance remain separate. Process SIGKILL is not a power-loss
 or universal storage guarantee.
 
-Outgoing QoS 1 Packet Identifier recycling is the next operational increment.
-The current connection still exhausts its 1..65535 space instead of reusing
-completed identifiers indefinitely; reconnect remains necessary. Live receipt
-retirement does not remove that limit or the 128-session lifetime bound.
+## Recyclable outgoing QoS 1 identifiers
+
+Proposed [ADR 0028](decisions/0028-outgoing-packet-identifier-reuse.md) removes
+the cumulative 65535-delivery connection limit. The owner selects the smallest
+free PI in 1..65535 for the target session. Selection consults all live claims,
+including pending/unknown Claim, pending/unknown Finish and recovered metadata
+before payload loading. It tries at most the live claim count plus one
+candidates (129 with this product's unchanged 128-entry metadata budget).
+There is no per-historically-sent-message allocation table or wrapping causal
+counter. QoS 0 does not reserve, release or await an acknowledgement for a PI.
+
+A known Finish commit must be applied by the owner before its PI can be
+reused. A writer submission, timeout, PUBACK alone, local Written callback or
+physical receipt deletion is insufficient. The next occupant has another
+DeliveryId/claim OperationId/frame EffectId and its initial PUBLISH has DUP 0.
+An interrupted live claim instead recovers with its original PI/claim and
+conservative DUP 1. There is no periodic in-session retransmission. Valid
+negative PUBACK reasons keep the existing durable terminal behavior.
+
+The TCP adapter freezes a PUBACK's full occurrence target, or explicit absence
+of target, after dequeuing and decoding the reader-channel packet and before
+enqueueing the owner input. Accepted emission metadata is registered before
+the socket writer can send the frame, so a legitimate early PUBACK does not
+wait for the local Written callback. Already associated observations, store
+results, write callbacks and connection generations cannot migrate to a later
+occupant of the same resource number. Bytes still in the earlier reader
+channel/socket are outside this observation boundary. Arbitrary identical
+wire ACKs first observed after reuse carry no internal claim identity; the
+broker cannot promise to distinguish them as old packets.
+
+The autonomous finite reception uses normal mqttium/Paho public clients and a
+separate bounded TCP observer, requiring at least 65537 numbered outgoing QoS 1
+receives and known durable terminations on one subscriber connection, process
+and file, with active receipt collection and unchanged quotas:
+
+```bash
+tools/run_pi_reception.sh /tmp/mqttiumd-outgoing-pi-reception
+```
+
+Its index identifies the exact source/binaries, client modules, connection
+counts, wire PI/DUP/ACKs, new claim identities, distinct Finish facts, final
+SQL state, resource windows, separate crashes and precise mutation reasons.
+See [report 0012](reports/0012-outgoing-pi-reuse.md). This is system reception,
+not an extension of the fixture oracle's qualifying scope. The existing
+receipt, QoS 0/1/2 and pub/sub receptions remain separate regression gates.
+
+The 128 persistent infinite-expiry session limit remains. The next operational
+increment is an explicit session lifecycle that can release an eligible
+terminal session without evicting an absent session's live responsibilities.

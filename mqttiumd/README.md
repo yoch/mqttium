@@ -8,7 +8,7 @@ for is durably committed.
 **Status: experimental exact-topic pub/sub over TCP, plus the S0 validation lab.** Incoming QoS 0/1/2 feeds subscriptions granted 0/1 and outgoing QoS 0/1. Initially QoS 0 follows a bounded volatile path; QoS 1/2 admissions retain durable responsibilities. The pure Rust core runs
 against a deterministic store and SQLite. The lab and independent Python
 oracle receive bounded scenarios, including real process kills. This is
-a bounded product, not a complete MQTT broker or a conformance or performance claim. Live receipt retirement recovers command capacity without restarting the broker. See [the product profile and commands](docs/product-tcp.md), [QoS 0 reception](docs/reports/0010-qos0-product.md) and [receipt retirement reception](docs/reports/0011-live-receipt-retirement.md).
+a bounded product, not a complete MQTT broker or a conformance or performance claim. Live receipt retirement recovers command capacity without restarting the broker, and outgoing QoS 1 Packet Identifiers are reused after known durable Finish application. See [the product profile and commands](docs/product-tcp.md), [QoS 0 reception](docs/reports/0010-qos0-product.md), [receipt retirement reception](docs/reports/0011-live-receipt-retirement.md) and [protected identifier reuse](docs/reports/0012-outgoing-pi-reuse.md).
 
 ## What exists
 
