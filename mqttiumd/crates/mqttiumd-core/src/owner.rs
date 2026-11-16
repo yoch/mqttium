@@ -6378,4 +6378,79 @@ mod tests {
         assert_eq!(delivered, 507);
         let _ = max_pending;
     }
+
+    // Product pub/sub regressions: contracts compile, old behavior refuses
+    // these valid inputs rather than creating durable operations.
+    fn product_settings(connection: u64, receive_maximum: u16) -> Input {
+        Input::ConnectionSettings {
+            connection: ConnectionGeneration::new(connection),
+            receive_maximum,
+            maximum_packet_size: 65536,
+        }
+    }
+
+    fn subscribe(connection: u64, packet: u16, topic: &[u8]) -> Input {
+        use crate::contract::pubsub::{FilterList, SubscriptionFilter};
+        Input::Packet {
+            connection: ConnectionGeneration::new(connection),
+            ingress_order: 1,
+            packet: InboundPacket::Subscribe {
+                packet_id: packet_id(packet),
+                filters: FilterList::copy_from(&[SubscriptionFilter {
+                    filter: bytes(topic),
+                    qos: Qos::AtLeastOnce,
+                }])
+                .unwrap(),
+            },
+        }
+    }
+
+    #[test]
+    fn product_pubsub_settings_enable_bounded_durable_work_discovery() {
+        let mut world = World::connected();
+        world.applied(product_settings(CONN, 1));
+        let effects = world.sent(Input::WorkAvailable {
+            session: SessionId::new(PRODUCER),
+        });
+        assert_eq!(
+            effects,
+            ["LoadWork"],
+            "a live product connection must query durable work independently of traffic"
+        );
+    }
+
+    #[test]
+    fn product_pubsub_suback_requires_commit_then_routing_projection() {
+        let mut world = World::connected();
+        world.applied(product_settings(CONN, 1));
+        world.applied(subscribe(CONN, 9, b"fresh"));
+        let effects = world.drain();
+        assert_eq!(
+            kinds(&effects),
+            ["Persist", "ArmDeadline"],
+            "no SUBACK before subscription commit"
+        );
+        let (effect, Effect::Persist { command }) = &effects[0] else {
+            panic!("subscription recipe")
+        };
+        let Recipe::ChangeSubscriptions(change) = command.recipe.get() else {
+            panic!("same durable operation path")
+        };
+        assert_eq!(change.session, SessionId::new(PRODUCER));
+        let operation = change.operation;
+        world.applied(Input::StoreResult {
+            effect: *effect,
+            operation,
+            reply: StoreReply::Outcome(StoreOutcome::Committed(
+                CommitFacts::SubscriptionsChanged {
+                    session: SessionId::new(PRODUCER),
+                    route_revision: Revision::new(4),
+                },
+            )),
+        });
+        assert!(world.owner.routes.as_slice().iter().any(
+            |route| route.topic == bytes(b"fresh") && route.target == SessionId::new(PRODUCER)
+        ));
+        assert_eq!(kinds(&world.drain()), ["EmitSuback"]);
+    }
 }
