@@ -130,6 +130,8 @@ if set(by_criterion)!=set('ABCD'):
 fault_criteria={item['criterion']:item for item in faults['cases']}
 if set(fault_criteria)!=set('EF'):
     raise SystemExit('authentic unknown results or product crash criteria missing')
+if fault_criteria['E'].get('source_admission_unknown', {}).get('status')!='PASS':
+    raise SystemExit('committed unknown source admission did not survive session termination')
 cycles=by_criterion['B']
 if cycles['completed_cycles']<512 or not cycles['long_requirement_met'] or cycles['session_quota']!=128:
     raise SystemExit('512 complete sessions with unchanged quota required')

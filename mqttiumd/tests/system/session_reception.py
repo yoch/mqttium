@@ -732,6 +732,119 @@ async def loaded_termination(binary, case):
         broker.cleanup()
 
 
+async def uncertain_source_admission(broker, cursor, case):
+    """A real committed admission outlives its source and original result hole."""
+    topic, payload = 'lifecycle/unknown-source', b'committed-before-source-session-ended'
+    target_name, source_name = 'unknown-source-target', 'unknown-source-owner'
+    target = replacement = source = recipient = None
+    hold = broker.control / 'hold-admission-result'
+    try:
+        target = MqttiumSession(broker.address, target_name, expiry=INFINITE,
+                                 events_path=case / 'unknown-source-target-setup.jsonl')
+        await target.open(False)
+        await target.subscribe(topic)
+        target_row = session_row(session_snapshot(broker), target_name)
+        await target.disconnect()
+        source = SessionWire(broker.address, broker.observations, 'unknown-admission-old-source')
+        cursor.read();before_open = cursor.last
+        source.session_connect(source_name, expiry=0, expected_present=False)
+        old_row = session_row(session_snapshot(broker), source_name)
+        old_open = await fact(broker, cursor, 'session_changed', after=before_open,
+                              predicate=lambda e: e.get('details', {}).get('action') == 'Opened'
+                              and e['details'].get('session') == str(identity(old_row)))
+        hold.touch(exist_ok=False)
+        cursor.read();before_admission = cursor.last
+        source.send(publish_packet(topic, payload, 19, qos=2))
+        held = await fact(broker, cursor, 'store_result_held', after=before_admission,
+                          predicate=lambda e: e.get('command_kind') == 'Admission')
+        operation = held['operation']
+        require(held['details']['outcome'] == 'Committed', 'source_admission_not_really_committed')
+        committed = durable(broker.db)
+        receipt = [row for row in committed['tables']['operations']
+                   if row['id'] == operation_hex(operation)]
+        owed = [row for row in committed['tables']['obligations']
+                if row['target'] == target_row['id']]
+        require(len(receipt) == 1 and receipt[0]['decision'] == 1,
+                'source_unknown_committed_receipt_missing')
+        require(len(owed) == 1 and len(committed['tables']['payloads']) == 1
+                and any(row['source'] == old_row['id'] for row in committed['tables']['publications']),
+                'source_unknown_other_destination_missing')
+        require(source.poll(.02) is None, 'source_unknown_admission_acknowledged')
+        cursor.read();before_close = cursor.last
+        source.session_disconnect(0);source = None
+        await gone(broker, cursor, source_name)
+        closed = await fact(broker, cursor, 'session_changed', after=before_close,
+                            predicate=lambda e: e.get('details', {}).get('action') == 'Closed'
+                            and e['details'].get('session') == str(identity(old_row)))
+        retired = await fact(broker, cursor, 'session_cardinality', after=int(closed['seq']),
+                             predicate=lambda e: e.get('details', {}).get('retired_flights', 0) >= 1)
+        after_close = durable(broker.db)
+        require([row for row in after_close['tables']['obligations']
+                 if row['target'] == target_row['id']] == owed
+                and after_close['tables']['payloads'] == committed['tables']['payloads'],
+                'unknown_source_end_lost_other_responsibility')
+        require(not any(row['session'] == old_row['id'] for row in after_close['tables']['inbound']),
+                'unknown_source_end_retained_marker')
+        require(any(row['id'] == operation_hex(operation)
+                    for row in after_close['tables']['operations']),
+                'unknown_source_result_hole_collected')
+        replacement = SessionWire(broker.address, broker.observations, 'unknown-admission-new-source')
+        replacement.session_connect(source_name, expiry=0, expected_present=False)
+        new_row = session_row(session_snapshot(broker), source_name)
+        require(new_row['id'] != old_row['id'], 'unknown_source_identity_reused')
+        hold.unlink()
+        broker.observations.record('source_admission_result_released', operation=operation)
+        resolved = await fact(broker, cursor, 'store_resolved', after=int(held['seq']),
+                              predicate=lambda e: e.get('operation') == operation
+                              and e.get('details', {}).get('outcome') == 'committed')
+        settled = await fact(broker, cursor, 'session_cardinality', after=int(resolved['seq']),
+                             predicate=lambda e: e.get('details', {}).get('retired_flights') == 0)
+        cursor.read()
+        require(not any(e['kind'] in ('frame_queued', 'frame_written')
+                        and e.get('connection') == old_open['connection']
+                        and e.get('details', {}).get('packet_kind') in ('PUBREC', 'PUBACK')
+                        for e in cursor.recent if int(e['seq']) > int(held['seq'])),
+                'retired_source_admission_emitted_ack')
+        replacement.send(b'\xc0\x00')
+        require(replacement.wait(0xD0).body == b'', 'old_source_result_changed_new_connection')
+        require(replacement.poll(.02) is None, 'old_source_result_acknowledged_new_incarnation')
+        stable = session_row(session_snapshot(broker), source_name)
+        require(stable['id'] == new_row['id'] and stable['opened_by'] == new_row['opened_by'],
+                'old_source_result_rebound')
+        after_resolution = durable(broker.db)
+        require([row for row in after_resolution['tables']['obligations']
+                 if row['target'] == target_row['id']] == owed
+                and after_resolution['tables']['payloads'] == committed['tables']['payloads'],
+                'source_resolution_changed_surviving_responsibility')
+        recipient = MqttiumSession(broker.address, target_name, expiry=0,
+                                   events_path=case / 'unknown-source-target-resume.jsonl')
+        await recipient.open(True)
+        received = await recipient.receive(payload)
+        await until_state(broker, cursor, lambda state: all(state['counts'][name] == 0
+                          for name in ('outbound', 'obligations', 'inbound', 'payloads', 'publications')))
+        await recipient.disconnect()
+        await gone(broker, cursor, target_name)
+        replacement.session_disconnect(0);replacement = None
+        await gone(broker, cursor, source_name)
+        write_json(case / 'unknown-source-before-close.json', committed)
+        write_json(case / 'unknown-source-after-close.json', after_close)
+        write_json(case / 'unknown-source-after-resolution.json', after_resolution)
+        return {'status': 'PASS', 'held_operation': operation, 'held': held,
+                'old_source': old_row, 'new_source': new_row, 'target': target_row,
+                'source_closed': closed, 'retired_unknown': retired, 'resolved': resolved,
+                'retired_settled': settled, 'surviving_obligation': owed[0], 'received': received,
+                'target_clients': [target.result, recipient.result]}
+    finally:
+        if hold.exists():
+            hold.unlink()
+        for wire in (source, replacement):
+            if wire is not None:
+                wire.close()
+        for client in (target, recipient):
+            if client is not None and not client.closed:
+                await client.disconnect()
+
+
 async def uncertain_lifecycle(binary, case):
     """Authentic committed results stay unknown until same-OperationId resolve."""
     broker = Broker(binary, case, test_control=True)
@@ -827,12 +940,14 @@ async def uncertain_lifecycle(binary, case):
         rows.append({'case': 'unknown-close', 'before': old, 'held': held,
                      'sql_while_unknown': state, 'unknown_resolution': resolved, 'known': known})
         takeover = await takeover_and_old_events(broker, cursor)
+        source_unknown = await uncertain_source_admission(broker, cursor, case)
         independent.session_disconnect(0);independent = None
         final = await gone(broker, cursor, 'unknown-independent')
         assert_drained(final)
         broker.stop()
         return {'criterion': 'E', 'status': 'PASS', 'startup': startup, 'cases': rows,
                 'takeovers_and_old_events': takeover,
+                'source_admission_unknown': source_unknown,
                 'final_sql': final, 'clients': [c.result for c in clients],
                 'stop_status': broker.process.returncode}
     finally:
