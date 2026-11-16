@@ -353,8 +353,16 @@ async def matrix(binary, case):
 
 async def protocol_matrix(broker, cursor, case):
     observed, observations = [], Observations(case / 'protocol-wire.jsonl')
-    def rejected(wire, kind, code):
-        frame = wire.wait(kind)
+    def rejected(wire, kind, code, *, allow_clean_close=False):
+        try:
+            frame = wire.wait(kind)
+        except ReceiptFailure as error:
+            # An invalid CONNECT does not establish a trusted peer packet
+            # limit. A clean close is permitted, but its typed product cause
+            # must be retained independently; truncation is not an EOF.
+            require(allow_clean_close and error.code == 'peer_closed',
+                    'session_protocol_response_missing', error.code)
+            return {'clean_close': True, 'reason': code}
         actual = frame.body[1] if kind == 0x20 else (frame.body[0] if frame.body else 0)
         require(actual == code, 'session_protocol_reason_mismatch', f'{actual}/{code}')
         return {'header': frame.header, 'reason': actual, 'body': frame.body.hex()}
@@ -371,8 +379,20 @@ async def protocol_matrix(broker, cursor, case):
         ):
             wire = SessionWire(broker.address, observations, name)
             try:
+                cursor.read();before = cursor.last
                 wire.send(command)
-                observed.append({'case': name, 'response': rejected(wire, 0x20, reason)})
+                response = rejected(wire, 0x20, reason, allow_clean_close=name != 'finite_connect')
+                cursor.read()
+                refusals = [event for event in cursor.recent if int(event['seq']) > before
+                            and event['kind'] == 'packet_refused']
+                require(len(refusals) == 1, 'session_protocol_cause_missing')
+                event = refusals[0]
+                expected = {'finite_connect': 'ConnectOutsideProfile',
+                            'duplicate_connect_expiry': 'DuplicateProperty',
+                            'truncated_connect_expiry': 'TruncatedField'}[name]
+                require(event['details']['reason'] == reason and event['details']['code'] == expected,
+                        'session_protocol_cause_mismatch')
+                observed.append({'case': name, 'response': response, 'refusal': event})
             finally:
                 wire.close()
             owner.send(b'\xc0\x00')
