@@ -382,6 +382,16 @@ def lost_ack_live_client(binary: Path, case: Path) -> dict:
         proxy.upstream = second.address
         proxy.reconnect_allowed.set()
         receipt = collect_client(client, case)
+        require(receipt["pid"] == client.pid, "client_process_replaced")
+        publications = [event for event in receipt["events"] if event["kind"] == "publish"]
+        completions = [event for event in receipt["events"] if event["kind"] == "receipt_success"]
+        connacks = [event for event in receipt["events"] if event["kind"] == "connack"]
+        require(len(publications) == len(completions) == 1 and
+                publications[0]["packet_id"] == completions[0]["packet_id"] and
+                completions[0]["is_done"], "original_receipt_not_completed")
+        require(len(connacks) >= 2 and not connacks[0]["session_present"] and
+                all(event["session_present"] and event["reason_code"] == 0 for event in connacks[1:]),
+                "live_client_session_not_resumed")
         after = database(second.db)
         write_json(case / "durable.json", after)
         require(len(after["admissions"]) == 2 and after["counts"]["inbound"] == 0,
