@@ -146,6 +146,17 @@ pub fn collection_details(collection: ReceiptCollection) -> serde_json::Value {
     json!({"incarnation":closure.origin.incarnation.get().to_string(),"epoch":closure.origin.epoch.get().to_string(),"owner":closure.origin.owner.get().to_string(),"through":closure.through.get().to_string(),"publication_through":closure.publication_through.get().to_string(),"payload_through":closure.payload_through.get().to_string(),"limit":collection.limit})
 }
 
+pub fn returned_closure_details(
+    details: &mut serde_json::Value,
+    closure: mqttiumd_contract::receipts::ReceiptClosure,
+) {
+    details["returned_incarnation"] = json!(closure.origin.incarnation.get().to_string());
+    details["returned_epoch"] = json!(closure.origin.epoch.get().to_string());
+    details["returned_owner"] = json!(closure.origin.owner.get().to_string());
+    details["returned_through"] = json!(closure.through.get().to_string());
+    details["returned_publication_through"] = json!(closure.publication_through.get().to_string());
+    details["returned_payload_through"] = json!(closure.payload_through.get().to_string());
+}
 #[derive(Clone, Default)]
 pub struct Hooks {
     pub directory: Option<PathBuf>,
@@ -243,6 +254,8 @@ impl Writer {
                 #[cfg(feature="test-hooks")]
                 let mut duplicate_control: Option<ControlResponse> = None;
                 loop {
+                    #[cfg(feature="test-hooks")]
+                    if replay_controls(&mut store,&state,&hooks,&events).is_err() { cancel.store(true,Ordering::Relaxed); }
                     if let Some(reply) = pending_control.take() {
                         match cctx.try_send(reply) {
                             Ok(()) => {}
@@ -510,6 +523,168 @@ fn identity_text(incarnation: u64, epoch: u64, owner: u64, sequence: u64) -> Str
     format!("{incarnation}/{epoch}/{owner}/{sequence}")
 }
 
+#[cfg(feature = "test-hooks")]
+fn replay_controls(
+    store: &mut SqliteStore,
+    state: &BusinessState,
+    hooks: &Hooks,
+    events: &Events,
+) -> Result<(), Failure> {
+    use mqttiumd_contract::command::{Command, FrozenRecipe};
+    use mqttiumd_contract::ids::{
+        ExchangeGeneration, OperationSeq, PayloadId, PayloadSeq, PublicationId, PublicationSeq,
+        RequestId, RequestSeq,
+    };
+    let Some(directory) = &hooks.directory else {
+        return Ok(());
+    };
+    for mode in ["same", "different", "publication", "payload"] {
+        if !consume_file(&directory.join(format!("replay-retired-{mode}"))) {
+            continue;
+        }
+        let captured = state
+            .captured
+            .as_ref()
+            .ok_or_else(|| Failure::plain("receipt_replay_capture_missing"))?;
+        let before = store
+            .snapshot()
+            .map_err(|e| Failure::read(e, ReadPhase::Snapshot))?;
+        let mut bytes = Vec::new();
+        captured
+            .recipe
+            .get()
+            .encode_canonical(&mut bytes)
+            .map_err(|_| Failure::plain("receipt_replay_recipe"))?;
+        let mut recipe = Recipe::decode_canonical(&bytes, 16, MAX_TOPIC)
+            .map_err(|_| Failure::plain("receipt_replay_recipe"))?;
+        let Recipe::AdmitPublication(ref mut admission) = recipe else {
+            return Err(Failure::plain("receipt_replay_kind"));
+        };
+        let old = admission.operation;
+        let origin = mqttiumd_contract::receipts::ReceiptOrigin::of(old);
+        let frontier = before
+            .receipt_frontiers
+            .get(&origin)
+            .ok_or_else(|| Failure::plain("receipt_replay_origin_missing"))?;
+        // These probes target retired identities, never a remaining live key or
+        // an unrelated stale routing/session guard. They run at the end of an
+        // isolated reception: no later owner command may use these new IDs.
+        if frontier.through < old.sequence()
+            || before.operations.contains_key(&old)
+            || before.publications.contains_key(&admission.publication)
+            || before.payloads.contains_key(&admission.payload.id)
+        {
+            return Err(Failure::plain("receipt_replay_not_retired"));
+        }
+        if mode == "different" {
+            admission.topic = SharedBytes::copy_from(b"replay/different", MAX_TOPIC)
+                .map_err(|_| Failure::plain("receipt_replay_recipe"))?;
+        } else if matches!(mode, "publication" | "payload") {
+            let next_op = before
+                .operations
+                .keys()
+                .chain(before.fences.iter())
+                .filter(|id| mqttiumd_contract::receipts::ReceiptOrigin::of(**id) == origin)
+                .map(|id| id.sequence().get())
+                .chain([frontier.through.get()])
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| Failure::plain("receipt_replay_exhausted"))?;
+            let mut next_publication = frontier.publication_through.get();
+            let mut next_payload = frontier.payload_through.get();
+            // The recent recipes above the closed prefix also own identities.
+            // Refresh the unrelated identity above both the compact guard and
+            // every retained recipe, even when its business object was freed.
+            for record in before.operations.values() {
+                if let Recipe::AdmitPublication(a) =
+                    Recipe::decode_canonical(&record.recipe, 16, MAX_TOPIC)
+                        .map_err(|_| Failure::plain("receipt_replay_recipe"))?
+                    && mqttiumd_contract::receipts::ReceiptOrigin::of(a.operation) == origin
+                {
+                    next_publication = next_publication.max(a.publication.sequence().get());
+                    next_payload = next_payload.max(a.payload.id.sequence().get());
+                }
+            }
+            next_publication = next_publication
+                .checked_add(1)
+                .ok_or_else(|| Failure::plain("receipt_replay_exhausted"))?;
+            next_payload = next_payload
+                .checked_add(1)
+                .ok_or_else(|| Failure::plain("receipt_replay_exhausted"))?;
+            admission.operation = OperationId::new(
+                origin.incarnation,
+                origin.epoch,
+                origin.owner,
+                OperationSeq::new(next_op),
+            );
+            admission.request = RequestId::new(
+                origin.incarnation,
+                origin.epoch,
+                origin.owner,
+                RequestSeq::new(next_op),
+            );
+            admission.route_revision = before.route_revision;
+            admission.source.session_revision = before
+                .sessions
+                .get(&admission.source.session)
+                .filter(|s| s.state == SessionState::Active)
+                .ok_or_else(|| Failure::plain("receipt_replay_source_missing"))?
+                .revision;
+            admission.source.exchange.generation = ExchangeGeneration::new(next_op);
+            if mode == "publication" {
+                admission.payload.id = PayloadId::new(
+                    origin.incarnation,
+                    origin.epoch,
+                    origin.owner,
+                    PayloadSeq::new(next_payload),
+                );
+            } else {
+                admission.publication = PublicationId::new(
+                    origin.incarnation,
+                    origin.epoch,
+                    origin.owner,
+                    PublicationSeq::new(next_publication),
+                );
+            }
+            for target in admission.targets.as_mut_slice() {
+                target.delivery.publication = admission.publication;
+                target.session_revision = before
+                    .sessions
+                    .get(&target.session)
+                    .filter(|s| s.state == SessionState::Active)
+                    .ok_or_else(|| Failure::plain("receipt_replay_target_missing"))?
+                    .revision;
+            }
+        }
+        let probe = Command {
+            recipe: FrozenRecipe::freeze(recipe)
+                .map_err(|_| Failure::plain("receipt_replay_recipe"))?,
+            payload: captured.payload.clone(),
+        };
+        let applied = store.apply(&probe);
+        let after = store
+            .snapshot()
+            .map_err(|e| Failure::read(e, ReadPhase::Snapshot))?;
+        let business_changed = before.publications != after.publications
+            || before.payloads != after.payloads
+            || before.obligations != after.obligations
+            || before.inbound != after.inbound
+            || before.outbound != after.outbound
+            || before.accounts.references != after.accounts.references
+            || before.accounts.payload_bytes != after.accounts.payload_bytes
+            || before.accounts.exchange_slots != after.accounts.exchange_slots;
+        let reason = match applied.reply {
+            StoreReply::Outcome(mqttiumd_contract::outcome::StoreOutcome::RejectedCertain(
+                reason,
+            )) => format!("{reason:?}"),
+            _ => String::new(),
+        };
+        events.emit("receipt_replay_result",json!({"operation":operation(probe.recipe.operation()),"command_kind":"Admission","details":{"mode":mode,"outcome":outcome_name(applied.reply),"reason":reason,"business_changed":business_changed,"wrote":applied.wrote,"committed_now":applied.committed_now,"before_receipts":before.accounts.receipt_slots.get().to_string(),"after_receipts":after.accounts.receipt_slots.get().to_string(),"before_references":before.accounts.references.get().to_string(),"after_references":after.accounts.references.get().to_string(),"before_payload_bytes":before.accounts.payload_bytes.get().to_string(),"after_payload_bytes":after.accounts.payload_bytes.get().to_string(),"before_publications":before.publications.len(),"after_publications":after.publications.len(),"before_payloads":before.payloads.len(),"after_payloads":after.payloads.len(),"before_obligations":before.obligations.len(),"after_obligations":after.obligations.len(),"current_route_revision":before.route_revision.get().to_string(),"closure_through":frontier.through.get().to_string(),"publication_through":frontier.publication_through.get().to_string(),"payload_through":frontier.payload_through.get().to_string()}})).map_err(|_|Failure::plain("events_unavailable"))?;
+    }
+    Ok(())
+}
+
 fn control_response(
     store: &mut SqliteStore,
     request: ControlRequest,
@@ -567,11 +742,12 @@ fn control_response(
             ));
             match result {
                 Ok(ReceiptCollectionReply::Applied {
+                    closure,
                     removed,
                     retained,
                     more,
-                    ..
                 }) => {
+                    returned_closure_details(&mut details, closure);
                     details["outcome"] = json!("Applied");
                     details["removed"] = json!(removed);
                     details["retained"] = json!(retained.to_string());

@@ -269,13 +269,13 @@ impl Runtime<'_> {
                     collection,
                     reply:
                         ReceiptCollectionReply::Applied {
+                            closure,
                             removed,
                             retained,
                             more,
-                            ..
                         },
                 } if self.owner.collection_reply_is_live(*effect, *collection) => {
-                    Some((*collection, *removed, *retained, *more))
+                    Some((*collection, *closure, *removed, *retained, *more))
                 }
                 _ => None,
             };
@@ -292,8 +292,9 @@ impl Runtime<'_> {
                     if wakes_business && self.owner.collection_ready() {
                         self.maintenance_needed = true;
                     }
-                    if let Some((collection, removed, retained, more)) = collected {
+                    if let Some((collection, closure, removed, retained, more)) = collected {
                         let mut details = crate::writer::collection_details(collection);
+                        crate::writer::returned_closure_details(&mut details, closure);
                         details["removed"] = json!(removed);
                         details["retained"] = json!(retained.to_string());
                         details["more"] = json!(more);
