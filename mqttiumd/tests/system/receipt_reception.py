@@ -105,6 +105,10 @@ def storage_sample(broker: Broker) -> dict:
         require(len(meta_rows) == 1, "measurement_metadata_invalid")
         metadata = {column: value.hex() if isinstance(value, bytes) else value
                     for column, value in zip(meta_columns, meta_rows[0])}
+        used_receipts = int(metadata["used_receipt_slots"], 16)
+        require(used_receipts == counts.get("operations", 0) + counts.get("fences", 0),
+                "receipt_credit_double_returned",
+                f"metadata={used_receipts}, physical={counts.get('operations', 0) + counts.get('fences', 0)}")
         connection.execute("COMMIT")
     finally:
         connection.close()
