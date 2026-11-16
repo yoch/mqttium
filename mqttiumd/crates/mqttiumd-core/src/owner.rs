@@ -2500,6 +2500,8 @@ mod tests {
         slots: Vec<Slot>,
         outgoing_connections: Vec<pubsub::Connection>,
         outgoing_deliveries: Vec<pubsub::Delivery>,
+        volatile: Vec<pubsub::Volatile>,
+        continuation: (Option<crate::contract::ids::ContinuationId>, bool),
         subscription: Option<ControlSnapshot>,
         leases: (Credits, Vec<crate::leases::LeaseSlotView>),
         finished: Vec<Finished>,
@@ -2949,6 +2951,11 @@ mod tests {
                 slots: owner.slots.as_slice().to_vec(),
                 outgoing_connections: owner.pubsub.connections.as_slice().to_vec(),
                 outgoing_deliveries: owner.pubsub.deliveries.as_slice().to_vec(),
+                volatile: owner.pubsub.volatile.as_slice().to_vec(),
+                continuation: (
+                    owner.pubsub.continuation,
+                    owner.pubsub.continuations_started,
+                ),
                 subscription: owner.pubsub.control.as_ref().map(|c| ControlSnapshot {
                     session: c.session,
                     connection: c.connection,
@@ -6953,6 +6960,346 @@ mod tests {
             world.owner.connection_of(SessionId::new(PRODUCER)),
             Some(ConnectionGeneration::new(CONN + 1))
         );
+    }
+
+    fn volatile_world() -> World {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 1));
+        let _ = world.drain();
+        world.applied(product_settings(11, 1));
+        let _ = world.drain();
+        world.applied(connect(11, b"p1-b"));
+        let _ = world.drain();
+        world
+    }
+
+    fn begin_volatile(world: &mut World, order: u64) -> Vec<(EffectId, Effect)> {
+        world.applied(qos0_packet(CONN, order, b"p1/example"));
+        let first = world.drain();
+        assert_eq!(kinds(&first), ["Continue"]);
+        let Effect::Continue { continuation } = first[0].1 else {
+            panic!("continuation");
+        };
+        world.applied(Input::Continue {
+            continuation,
+            budget: WorkUnits::new(65536),
+        });
+        let effects = world.drain();
+        let mut result = Vec::new();
+        for (id, effect) in effects {
+            if let Effect::Continue { continuation } = effect {
+                world.applied(Input::Continue {
+                    continuation,
+                    budget: WorkUnits::new(65536),
+                });
+                result.extend(world.drain());
+            } else {
+                result.push((id, effect));
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn product_qos0_write_failure_is_observed_once_and_does_not_touch_mqtt_credits() {
+        let mut world = volatile_world();
+        let before = world.owner.leases.snapshot();
+        let effects = begin_volatile(&mut world, 1);
+        let (effect, connection, origin) = effects
+            .iter()
+            .find_map(|(id, e)| {
+                if let Effect::EmitQos0 {
+                    connection, origin, ..
+                } = e
+                {
+                    Some((*id, *connection, *origin))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        world.applied(Input::Qos0EmitRefused {
+            effect,
+            connection,
+            reason: crate::contract::pubsub::Qos0DropReason::OutputSaturated,
+        });
+        assert_eq!(kinds(&world.drain()), ["Qos0Dropped"]);
+        assert!(world.owner.pubsub.volatile.is_empty());
+        assert_eq!(world.owner.leases.snapshot(), before);
+        world.applied(Input::Qos0EmitRefused {
+            effect,
+            connection,
+            reason: crate::contract::pubsub::Qos0DropReason::OutputSaturated,
+        });
+        assert!(world.drain().is_empty());
+        let next = begin_volatile(&mut world, 2);
+        let (_, next_connection, next_origin) = next
+            .iter()
+            .find_map(|(id, e)| {
+                if let Effect::EmitQos0 {
+                    connection, origin, ..
+                } = e
+                {
+                    Some((*id, *connection, *origin))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_ne!(
+            origin, next_origin,
+            "identical bytes have different occurrence identities"
+        );
+        assert_eq!(connection, next_connection);
+        world.applied(Input::FrameResult {
+            effect,
+            connection,
+            progress: FrameProgress::Written {
+                confirmed: 9,
+                total: 9,
+            },
+        });
+        assert!(world.drain().is_empty());
+        assert_eq!(
+            world.owner.pubsub.volatile.len(),
+            1,
+            "the old receipt cannot free the new occurrence"
+        );
+    }
+
+    #[test]
+    fn product_qos0_fanout_never_moves_to_a_replacement_generation() {
+        let mut world = volatile_world();
+        world.applied(qos0_packet(CONN, 1, b"p1/example"));
+        let first = world.drain();
+        world.applied(product_settings(12, 1));
+        let _ = world.drain();
+        world.applied(connect(12, b"p1-b"));
+        let _ = world.drain();
+        let Effect::Continue { continuation } = first[0].1 else {
+            panic!("continue");
+        };
+        world.applied(Input::Continue {
+            continuation,
+            budget: WorkUnits::new(65536),
+        });
+        let effects = world.drain();
+        assert!(effects.iter().any(|(_, e)| matches!(
+            e,
+            Effect::Qos0Dropped {
+                reason: crate::contract::pubsub::Qos0DropReason::ConnectionClosed,
+                ..
+            }
+        )));
+        assert!(
+            !effects
+                .iter()
+                .any(|(_, e)| matches!(e, Effect::EmitQos0 { .. }))
+        );
+    }
+
+    #[test]
+    fn product_qos0_old_page_and_old_consumption_result_never_resurrect_work() {
+        let mut world = qos0_work_world();
+        let consume = pubsub_flight(&mut world, work_available());
+        world.applied(committed(&consume));
+        let emission = world.drain();
+        world.applied(work_available());
+        let read = world.drain();
+        assert_eq!(kinds(&read), ["LoadWork"]);
+        let connection = ConnectionKey {
+            session: SessionId::new(PRODUCER),
+            generation: ConnectionGeneration::new(CONN),
+        };
+        world.applied(Input::FrameResult {
+            effect: emission[0].0,
+            connection,
+            progress: FrameProgress::Written {
+                confirmed: 9,
+                total: 9,
+            },
+        });
+        assert!(world.drain().is_empty());
+        let mut old = work_item(0);
+        old.qos = Qos::AtMostOnce;
+        world.applied(Input::WorkPage {
+            effect: read[0].0,
+            session: SessionId::new(PRODUCER),
+            items: BoundedVec::from_slice(&[old], 8).unwrap(),
+            next: None,
+        });
+        assert!(world.drain().is_empty());
+        assert!(world.owner.pubsub.deliveries.is_empty());
+        world.applied(committed(&consume));
+        assert!(world.drain().is_empty());
+    }
+
+    #[test]
+    fn product_qos0_historical_consumption_receipt_is_not_a_recovery_emission_permission() {
+        let mut product_config = config();
+        product_config.max_routes = bound(4);
+        let mut world = World::with(product_config, EPOCH, CAPACITY);
+        let mut inventory = fixture(EPOCH);
+        let item = work_item(0);
+        let operation = OperationId::new(
+            StoreIncarnation::new(INCARNATION),
+            RunEpoch::new(EPOCH - 1),
+            LogicalOwnerId::new(4),
+            OperationSeq::new(99),
+        );
+        inventory.push(RecoveredFact::Operation {
+            operation,
+            knowledge: crate::contract::outcome::Knowledge::Committed(
+                CommitFacts::DeliveryConsumed {
+                    delivery: item.delivery,
+                    target: item.target,
+                },
+            ),
+        });
+        world.applied(page(&inventory, true));
+        world.applied(product_settings(CONN, 1));
+        assert_eq!(world.sent(connect(CONN, b"p1-producer")), ["EmitConnack"]);
+        load_work(&mut world, &[], None);
+        assert!(world.owner.pubsub.deliveries.is_empty());
+        assert!(!world.owner.has_ready_work(SessionId::new(PRODUCER)));
+    }
+
+    #[test]
+    fn product_qos0_effects_and_consumption_reserve_before_mutation() {
+        fn source() -> (World, Input) {
+            (volatile_world(), qos0_packet(CONN, 1, b"p1/example"))
+        }
+        fn continuation() -> (World, Input) {
+            let mut world = volatile_world();
+            world.applied(qos0_packet(CONN, 1, b"p1/example"));
+            let effects = world.drain();
+            let Effect::Continue { continuation } = effects[0].1 else {
+                panic!("continue");
+            };
+            (
+                world,
+                Input::Continue {
+                    continuation,
+                    budget: WorkUnits::new(65536),
+                },
+            )
+        }
+        fn consume() -> (World, Input) {
+            (qos0_work_world(), work_available())
+        }
+        fn consumed() -> (World, Input) {
+            let mut world = qos0_work_world();
+            let flight = pubsub_flight(&mut world, work_available());
+            (world, committed(&flight))
+        }
+        product_capacity_refusals(source, 1);
+        product_capacity_refusals(continuation, 2);
+        product_capacity_refusals(consume, 2);
+        product_capacity_refusals(consumed, 1);
+    }
+
+    #[test]
+    fn product_qos0_does_not_hold_or_release_the_qos1_receive_window() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 1));
+        let _ = world.drain();
+        let first = work_item(0);
+        let mut second = work_item(1);
+        second.qos = Qos::AtMostOnce;
+        load_work(&mut world, &[first.clone(), second], None);
+        let claim = pubsub_flight(&mut world, work_available());
+        world.applied(committed(&claim));
+        assert_eq!(kinds(&world.drain()), ["EmitPublish"]);
+        let consume = pubsub_flight(&mut world, work_available());
+        assert!(matches!(
+            consume.facts,
+            CommitFacts::DeliveryConsumed { .. }
+        ));
+        world.applied(committed(&consume));
+        let q0 = world.drain();
+        assert_eq!(
+            kinds(&q0),
+            ["EmitQos0"],
+            "QoS1's full window does not become a QoS0 credit"
+        );
+        let connection = ConnectionKey {
+            session: SessionId::new(PRODUCER),
+            generation: ConnectionGeneration::new(CONN),
+        };
+        world.applied(Input::FrameResult {
+            effect: q0[0].0,
+            connection,
+            progress: FrameProgress::Written {
+                confirmed: 9,
+                total: 9,
+            },
+        });
+        assert!(world.drain().is_empty());
+        let finish = pubsub_flight(&mut world, outgoing_puback(CONN, 1, 0));
+        assert!(
+            matches!(finish.facts,CommitFacts::DeliveryFinished{delivery,..} if delivery==first.delivery),
+            "QoS0 completion leaves the original QoS1 claim intact"
+        );
+    }
+
+    #[test]
+    fn product_qos0_filter_replacement_preserves_the_qos_of_existing_work() {
+        for (old, new) in [
+            (Qos::AtMostOnce, Qos::AtLeastOnce),
+            (Qos::AtLeastOnce, Qos::AtMostOnce),
+        ] {
+            let mut world = product_world();
+            world.applied(product_settings(CONN, 1));
+            let _ = world.drain();
+            let mut item = work_item(0);
+            item.qos = old;
+            load_work(&mut world, &[item], None);
+            let mut mutation = subscribe(CONN, 9, b"fresh");
+            if let Input::Packet {
+                packet: InboundPacket::Subscribe { filters, .. },
+                ..
+            } = &mut mutation
+            {
+                *filters = crate::contract::pubsub::FilterList::copy_from(&[
+                    crate::contract::pubsub::SubscriptionFilter {
+                        filter: bytes(b"fresh"),
+                        qos: new,
+                    },
+                ])
+                .unwrap();
+            }
+            let route = pubsub_flight(&mut world, mutation);
+            world.applied(committed(&route));
+            let _ = world.drain();
+            let prior = pubsub_flight(&mut world, work_available());
+            assert_eq!(
+                matches!(prior.facts, CommitFacts::DeliveryConsumed { .. }),
+                old == Qos::AtMostOnce,
+                "replacement never changes admitted work"
+            );
+            let mut incoming = publish_with(CONN, 71, Qos::ExactlyOnce, b"p");
+            if let Input::Packet {
+                packet: InboundPacket::Publish { topic, .. },
+                ..
+            } = &mut incoming
+            {
+                *topic = bytes(b"fresh");
+            }
+            world.applied(incoming);
+            let effects = world.drain();
+            let (.., Effect::Persist { command }) = &effects[0] else {
+                panic!("admission");
+            };
+            let Recipe::AdmitPublication(admission) = command.recipe.get() else {
+                panic!("admission");
+            };
+            assert_eq!(admission.targets.len(), 1);
+            assert_eq!(
+                admission.targets.as_slice()[0].session,
+                SessionId::new(PRODUCER)
+            );
+            assert_eq!(admission.targets.as_slice()[0].effective_qos, new);
+        }
     }
 
     fn queued_product() -> World {

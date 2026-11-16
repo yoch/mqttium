@@ -133,8 +133,8 @@ pub(super) struct State {
     pub(super) control: Option<Control>,
     payload_limit: PayloadBytes,
     pub(super) volatile: BoundedVec<Volatile>,
-    continuation: Option<ContinuationId>,
-    continuations_started: bool,
+    pub(super) continuation: Option<ContinuationId>,
+    pub(super) continuations_started: bool,
 }
 
 #[derive(Debug)]
@@ -240,7 +240,8 @@ impl State {
                     ..
                 }
         );
-        if !new && self.connections.is_empty() && self.control.is_none() {
+        if !new && self.connections.is_empty() && self.control.is_none() && self.volatile.is_empty()
+        {
             return 0;
         }
         let slots = capacity_of(self.deliveries.capacity());
