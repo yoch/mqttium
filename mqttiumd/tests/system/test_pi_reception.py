@@ -65,7 +65,9 @@ print('mqttiumd features=' if sys.argv[1]=='tree' else 'cargo-test-stub')
 ''')
             cargo.chmod(0o755)
             rustc = controls / 'rustc'; rustc.write_text('#!/bin/sh\necho rustc-test-stub\n'); rustc.chmod(0o755)
-            environment = dict(os.environ, PATH=str(controls) + os.pathsep + os.environ['PATH'],
+            inherited = {key: value for key, value in os.environ.items()
+                         if not key.startswith('MQTTIUMD_PI_PIN_') and key != 'MQTTIUMD_PI_CALLER_SOURCE'}
+            environment = dict(inherited, PATH=str(controls) + os.pathsep + os.environ['PATH'],
                                PYTHON=sys.executable, PI_WRAPPER_TEST_CONTROL=str(control),
                                MQTTIUMD_PI_TARGET_ROOT=str(root / 'targets'))
             process = subprocess.Popen([str(target_tool), str(root / 'out')], cwd=product,
