@@ -256,7 +256,8 @@ impl State {
     pub(super) fn work_bound(&self, input: &Input, routes: usize) -> u64 {
         let new = matches!(
             input,
-            Input::ConnectionSettings { .. }
+            Input::ObservedPuback { .. }
+                | Input::ConnectionSettings { .. }
                 | Input::WorkPage { .. }
                 | Input::Packet {
                     packet: InboundPacket::Subscribe { .. }
@@ -843,21 +844,42 @@ impl Owner {
         connection: ConnectionKey,
         packet_id: OutboundPacketId,
         reason: u8,
-        _target: Option<PubackTarget>,
+        target: Option<PubackTarget>,
         draft: &mut Draft,
     ) -> Result<super::Change, Stop> {
-        let Some(session) = self.sessions.as_slice().iter().position(|session| {
-            session.id == connection.session && session.connection == Some(connection.generation)
-        }) else {
+        if self.connection_of(connection.session) != Some(connection.generation) {
+            return Ok(super::Change::Nothing);
+        }
+        if !matches!(
+            reason,
+            0 | 0x10 | 0x80 | 0x83 | 0x87 | 0x90 | 0x91 | 0x97 | 0x99
+        ) {
+            return Self::plan_close(
+                connection.generation,
+                self.session_of(connection.generation),
+                CloseReason::ProtocolError,
+                draft,
+            );
+        }
+        let Some(target) = target else {
             return Ok(super::Change::Nothing);
         };
-        // Baseline behavior: the reusable wire integer is looked up again.
-        self.plan_pubsub_packet(
-            session,
-            connection.generation,
-            &InboundPacket::Puback { packet_id, reason },
-            draft,
-        )
+        if self.puback_target(connection, packet_id) != Some(target) {
+            return Ok(super::Change::Nothing);
+        }
+        let slot = self.pubsub.delivery(target.delivery).ok_or(IMPOSSIBLE)?;
+        let delivery = &self.pubsub.deliveries.as_slice()[slot];
+        let operation = self.operation(draft)?;
+        let recipe = Recipe::FinishDelivery(FinishDelivery {
+            operation,
+            delivery: target.delivery,
+            target: delivery.target,
+            target_revision: delivery.revision,
+            packet_id,
+            claim: target.claim,
+        });
+        let in_flight = self.plan_submission(operation, recipe, None, draft)?;
+        Ok(changed(Change::Finish { slot, in_flight }))
     }
 
     pub(super) fn plan_pubsub_packet(
@@ -873,42 +895,15 @@ impl Owner {
             generation: connection,
         };
         if let InboundPacket::Puback { packet_id, reason } = packet {
-            if !matches!(
+            // Legacy synchronous adapters associate and consume in this
+            // single transition. Product input freezes the target earlier.
+            return self.plan_observed_puback(
+                key,
+                *packet_id,
                 *reason,
-                0 | 0x10 | 0x80 | 0x83 | 0x87 | 0x90 | 0x91 | 0x97 | 0x99
-            ) {
-                return Self::plan_close(
-                    connection,
-                    Some(session_index),
-                    CloseReason::ProtocolError,
-                    draft,
-                );
-            }
-            let found = self.pubsub.deliveries.as_slice().iter().position(|d| {
-                d.target == session.id
-                    && d.claim.is_some_and(|claim| claim.packet_id == *packet_id)
-                    && d.window == Some(connection)
-                    && d.frame.is_some_and(|(_, sent)| sent == key)
-            });
-            let Some(slot) = found else {
-                return Ok(super::Change::Nothing);
-            };
-            let d = &self.pubsub.deliveries.as_slice()[slot];
-            if d.phase != Phase::AwaitPuback {
-                return Ok(super::Change::Nothing);
-            }
-            let claim = d.claim.ok_or(IMPOSSIBLE)?;
-            let operation = self.operation(draft)?;
-            let recipe = Recipe::FinishDelivery(FinishDelivery {
-                operation,
-                delivery: d.id,
-                target: d.target,
-                target_revision: d.revision,
-                packet_id: claim.packet_id,
-                claim: claim.operation,
-            });
-            let in_flight = self.plan_submission(operation, recipe, None, draft)?;
-            return Ok(changed(Change::Finish { slot, in_flight }));
+                self.puback_target(key, *packet_id),
+                draft,
+            );
         }
         let (packet_id, subscribing) = match packet {
             InboundPacket::Subscribe { packet_id, .. } => (*packet_id, true),
