@@ -334,8 +334,14 @@ def read_events(path: Path) -> list[dict]:
         require(isinstance(event.get("pid"), int) and event["pid"] > 0, "product_event_pid")
         details = event.get("details", {})
         require(isinstance(details, dict) and len(details) <= 32, "product_event_details")
-        require(all(isinstance(value, (str, int, bool)) and (not isinstance(value, str) or len(value) <= 256)
-                    for value in details.values()), "product_event_details")
+        # Only these typed optional identities admit null. A missing old or
+        # expected incarnation is a fact, not an empty diagnostic string.
+        nullable = {("command_submitted", "expected_session"),
+                    ("session_changed", "retired_session")}
+        require(all((value is None and (event["kind"], name) in nullable)
+                    or (isinstance(value, (str, int, bool))
+                        and (not isinstance(value, str) or len(value) <= 256))
+                    for name, value in details.items()), "product_event_details")
         result.append(event)
     return result
 
