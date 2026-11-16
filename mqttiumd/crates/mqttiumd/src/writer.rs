@@ -120,7 +120,11 @@ pub enum ControlRequest {
 }
 #[derive(Clone)]
 pub enum ControlResponse {
-    Lifecycle { effect: EffectId, operation: OperationId, reply: StoreReply },
+    Lifecycle {
+        effect: EffectId,
+        operation: OperationId,
+        reply: StoreReply,
+    },
     Failed(Failure),
     Collected {
         effect: EffectId,
@@ -453,7 +457,10 @@ fn business_response(
                     let mut reply = applied.reply;
                     #[cfg(feature = "test-hooks")]
                     if applied.committed_now
-                        && matches!(kind, "Claim" | "Finish" | "Consume" | "SessionOpen" | "SessionClose")
+                        && matches!(
+                            kind,
+                            "Claim" | "Finish" | "Consume" | "SessionOpen" | "SessionClose"
+                        )
                         && let Some(dir) = &hooks.directory
                     {
                         let file_name = match kind {
@@ -522,8 +529,16 @@ fn hold_business_reply(
 ) -> StoreReply {
     let reply = hold_admission_reply(state, hooks, id, kind, reply, events);
     for (name, file, held) in [
-        ("SessionOpen", "hold-session-open-result", &mut state.held_session_open),
-        ("SessionClose", "hold-session-close-result", &mut state.held_session_close),
+        (
+            "SessionOpen",
+            "hold-session-open-result",
+            &mut state.held_session_open,
+        ),
+        (
+            "SessionClose",
+            "hold-session-close-result",
+            &mut state.held_session_close,
+        ),
         ("Claim", "hold-claim-result", &mut state.held_claim),
         ("Finish", "hold-finish-result", &mut state.held_finish),
     ] {
@@ -763,8 +778,20 @@ fn control_response(
     match request {
         ControlRequest::Lifecycle(effect) => {
             match business_response(store, Request::Effect(effect), events, hooks, cancel, state) {
-                Response::Store { effect, operation, reply, .. } => ControlResponse::Lifecycle {effect, operation, reply},
-                _ => { cancel.store(true, Ordering::Relaxed); ControlResponse::Failed(Failure::plain("invalid_lifecycle_control")) }
+                Response::Store {
+                    effect,
+                    operation,
+                    reply,
+                    ..
+                } => ControlResponse::Lifecycle {
+                    effect,
+                    operation,
+                    reply,
+                },
+                _ => {
+                    cancel.store(true, Ordering::Relaxed);
+                    ControlResponse::Failed(Failure::plain("invalid_lifecycle_control"))
+                }
             }
         }
         ControlRequest::Closed(collection) => ControlResponse::Closed {

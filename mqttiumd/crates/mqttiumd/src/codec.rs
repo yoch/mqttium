@@ -79,7 +79,9 @@ impl Error {
             && self.disconnect_expiry.is_some_and(|value| value != 0)
         {
             protocol("SessionExpiryIncreaseForbidden")
-        } else { self }
+        } else {
+            self
+        }
     }
 }
 
@@ -618,7 +620,10 @@ fn disconnect(body: &[u8]) -> Result<Packet, Error> {
             .expiry
             .is_some_and(|n| SessionExpiry::from_wire(n).is_none())
     {
-        return Err(Error { disconnect_expiry: props.expiry, ..unsupported("DisconnectOutsideProfile") });
+        return Err(Error {
+            disconnect_expiry: props.expiry,
+            ..unsupported("DisconnectOutsideProfile")
+        });
     }
     Ok(Packet::Disconnect {
         expiry: props.expiry.and_then(SessionExpiry::from_wire),
@@ -1134,11 +1139,23 @@ mod tests {
     #[test]
     fn zero_connect_context_rejects_any_nonzero_disconnect_before_profile_refusal() {
         let error = decode(0xe0, &[0, 5, 0x11, 0, 0, 0, 7], BOUNDS).unwrap_err();
-        assert_eq!(error.in_session(SessionExpiry::OnDisconnect).code(), "SessionExpiryIncreaseForbidden");
-        assert_eq!(error.in_session(SessionExpiry::OnDisconnect).reason_code(), 0x82);
-        assert_eq!(error.in_session(SessionExpiry::Never).kind(), ErrorKind::Unsupported);
+        assert_eq!(
+            error.in_session(SessionExpiry::OnDisconnect).code(),
+            "SessionExpiryIncreaseForbidden"
+        );
+        assert_eq!(
+            error.in_session(SessionExpiry::OnDisconnect).reason_code(),
+            0x82
+        );
+        assert_eq!(
+            error.in_session(SessionExpiry::Never).kind(),
+            ErrorKind::Unsupported
+        );
         let malformed = decode(0xe0, &[0, 5, 0x11, 0], BOUNDS).unwrap_err();
-        assert_eq!(malformed.in_session(SessionExpiry::OnDisconnect).kind(), ErrorKind::Malformed);
+        assert_eq!(
+            malformed.in_session(SessionExpiry::OnDisconnect).kind(),
+            ErrorKind::Malformed
+        );
     }
 
     fn kind(result: Result<Packet, Error>, expected: ErrorKind) {
@@ -1460,6 +1477,7 @@ mod tests {
             code: "UnsupportedProtocolVersion",
             reason: 0x84,
             peer_maximum: None,
+            disconnect_expiry: None,
         };
         assert_eq!(refusal(version, true), [0x20, 3, 0, 0x84, 0]);
         assert_eq!(refusal(version, false), [0xe0, 2, 0x83, 0]);
