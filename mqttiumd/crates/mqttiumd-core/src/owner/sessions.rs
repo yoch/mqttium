@@ -1149,6 +1149,64 @@ mod tests {
         assert!(drain(&mut owner).is_empty());
     }
     #[test]
+    fn reused_client_id_does_not_retarget_old_lifecycle_or_transport_facts() {
+        let mut owner = world();
+        let first = submit(&mut owner, 1, b"reusable", SessionExpiry::OnDisconnect);
+        let original = owner.lifecycle.clone().unwrap();
+        let (old_token, _) = known(&mut owner, &first, opened(1, SessionExpiry::OnDisconnect));
+        let close = apply(
+            &mut owner,
+            Input::ConnectionClosed {
+                connection: ConnectionGeneration::new(1),
+            },
+        );
+        let old_close = owner.lifecycle.clone().unwrap();
+        known(&mut owner, &close, closed(1));
+        let next = submit(&mut owner, 2, b"reusable", SessionExpiry::Never);
+        let (new_token, _) = known(&mut owner, &next, opened(2, SessionExpiry::Never));
+        let old_inputs = [
+            Input::EndSession {
+                connection: ConnectionKey {
+                    session: SessionId::new(1),
+                    generation: ConnectionGeneration::new(1),
+                },
+                opened_by: Some(old_token),
+                reason: SessionEndReason::Disconnect,
+            },
+            Input::ConnectionClosed {
+                connection: ConnectionGeneration::new(1),
+            },
+            Input::StoreResult {
+                effect: original.in_flight.answers.persist,
+                operation: old_token,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                    opened(1, SessionExpiry::OnDisconnect),
+                ))),
+            },
+            Input::StoreResult {
+                effect: old_close.in_flight.answers.persist,
+                operation: old_close.command.operation,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                    closed(1),
+                ))),
+            },
+        ];
+        for input in old_inputs {
+            assert!(
+                apply(&mut owner, input).is_empty(),
+                "old_incarnation_fact_retargeted"
+            );
+            assert_eq!(owner.sessions.len(), 1);
+            assert_eq!(owner.sessions.as_slice()[0].id, SessionId::new(2));
+            assert_eq!(owner.sessions.as_slice()[0].opened_by, Some(new_token));
+            assert_eq!(
+                owner.sessions.as_slice()[0].connection,
+                Some(ConnectionGeneration::new(2))
+            );
+            assert!(owner.lifecycle.is_none());
+        }
+    }
+    #[test]
     fn refused_takeover_still_closes_the_disconnected_ephemeral_incarnation() {
         let mut owner = world();
         let first = submit(&mut owner, 1, b"ephemeral", SessionExpiry::OnDisconnect);
