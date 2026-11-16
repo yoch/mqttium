@@ -1340,3 +1340,19 @@ fn fresh_connect_pipeline_cannot_send_disconnect_before_core_connack() {
 fn known_connect_pipeline_cannot_send_disconnect_before_core_connack() {
     concatenated_subscription_waits_for_connack(true);
 }
+
+
+#[test]
+fn terminal_admission_results_retire_deadlines_after_the_owner_applies_them() {
+    with_runtime(8, |runtime, _| {
+        let (generation, mut client) = peer(runtime);
+        runtime.connect(generation, connect_packet(b"receipt-timer-prune")).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        runtime.packet(generation, 0x32, publish_body(1)).unwrap();
+        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        assert_eq!(read_frame(&mut client).0, 0x40);
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert!(runtime.timers.is_empty(), "a consumed terminal admission must not retain a dead resolution timer until its ten-second deadline");
+    });
+}

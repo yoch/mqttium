@@ -1586,6 +1586,7 @@ impl EffectSink for Sink<'_> {
                 let _ = effect.into_parts();
                 SubmitResult::Accepted
             }
+            Effect::CollectReceipts { .. } => refused(effect, SubmitBlock::Closed),
             Effect::ArmDeadline { token, after } => {
                 if self.timers.len() >= TIMERS {
                     return refused(effect, SubmitBlock::QueueFull);
