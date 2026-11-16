@@ -463,6 +463,18 @@ async def live_public_workload(broker: Broker, case: Path, terminal_commands: in
         require(len({window["storage"]["pid"] for window in result["windows"]}) == 1
                 and len({window["storage"]["file_inode"] for window in result["windows"]}) == 1,
                 "live_process_or_file_changed")
+        if terminal_commands > 4 * HISTORICAL_RECEIPT_LIMIT:
+            floors = [max((sql_u64(row["consumed_through"])
+                           for row in window["storage"]["retirement"].get("receipt_origins", [])), default=0)
+                      for window in result["windows"]]
+            result["durable_frontier_windows"] = floors
+            result["frontier_advances_observed"] = sum(right > left for left, right in zip([0] + floors, floors))
+            require(result["frontier_advances_observed"] >= 4, "multiple_collection_cycles_not_observed")
+            require(all(sql_u64(window["storage"]["metadata"]["limit_receipt_slots"]) == HISTORICAL_RECEIPT_LIMIT
+                        for window in result["windows"]), "receipt_budget_changed_during_live_run")
+            require({row["incoming_qos"] for row in result["mixed_exchanges"]} == {1, 2}
+                    and {row["mqttium_outgoing"]["qos"] for row in result["mixed_exchanges"]} == {0, 1},
+                    "live_mixed_qos_paths_missing")
         result["elapsed_ms"] = (time.monotonic_ns() - started) / 1e6
         result["transcript"] = transcript.identity()
         return result
