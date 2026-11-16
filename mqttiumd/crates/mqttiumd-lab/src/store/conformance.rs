@@ -2284,6 +2284,7 @@ pub fn recovery_field_limits_include_fixed_identities<S: DurableStore>(
 pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     qos0_grants_and_consumption_preserve_durable_delivery_identity(make);
     qos0_consumption_preserves_unknown_and_atomic_capacity(make);
+    replacing_and_removing_qos0_routes_preserves_older_work(make);
     subscriptions_replace_and_remove_without_duplicate_or_hole(make);
     qos1_claim_and_finish_are_conditional_and_idempotent(make);
     outgoing_work_is_bounded_and_independent_of_notifications(make);
@@ -2616,6 +2617,141 @@ pub fn qos0_consumption_preserves_unknown_and_atomic_capacity<S: DurableStore>(
             assert_eq!(world.store.snapshot().unwrap(), after);
         }
     }
+}
+
+/// Both replacement directions keep admitted QoS immutable. Removing the
+/// route does not prevent either old delivery cycle from completing.
+pub fn replacing_and_removing_qos0_routes_preserves_older_work<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::command::{
+        ClaimDelivery, ConsumeDelivery, FinishDelivery, UpdateSubscriptions,
+    };
+    use mqttiumd_contract::ids::OutboundPacketId;
+    use mqttiumd_contract::pubsub::GrantedSubscriptionChange;
+    let mut limits = fixture_limits();
+    limits.receipt_slots = ReceiptSlots::new(64);
+    let mut world = World::with_limits(make, limits);
+    let first = world.admission(1, 7, b"older-qos1", &[world.b]);
+    assert!(world.store.apply(&first).committed_now);
+    let freeze = |recipe| Command {
+        recipe: FrozenRecipe::freeze(recipe).unwrap(),
+        payload: None,
+    };
+    let update = |seq, revision, granted| {
+        freeze(Recipe::UpdateSubscriptions(UpdateSubscriptions {
+            operation: operation_id(world.epoch, seq),
+            session: world.b,
+            session_revision: Revision::new(1),
+            route_revision: revision,
+            changes: BoundedVec::from_slice(
+                &[GrantedSubscriptionChange {
+                    topic: SharedBytes::copy_from(TOPIC, 256).unwrap(),
+                    granted,
+                }],
+                8,
+            )
+            .unwrap(),
+        }))
+    };
+    let original_revision = world.route_revision;
+    let downgraded = update(2, original_revision, Some(Qos::AtMostOnce));
+    assert!(world.store.apply(&downgraded).committed_now);
+    world.route_revision = world.route_revision.checked_next().unwrap();
+    let frozen = world.store.snapshot().unwrap();
+    let mismatch = update(2, original_revision, Some(Qos::AtLeastOnce));
+    assert_eq!(
+        world.store.apply(&mismatch).reply,
+        StoreReply::Violation(StoreViolation::RecipeMismatch)
+    );
+    assert_eq!(
+        world.store.snapshot().unwrap(),
+        frozen,
+        "granted QoS is part of the canonical operation identity"
+    );
+    let second = altered(&world.admission(3, 8, b"newer-qos0", &[world.b]), |a| {
+        a.targets.as_mut_slice()[0].effective_qos = Qos::AtMostOnce
+    });
+    assert!(world.store.apply(&second).committed_now);
+    assert!(
+        world
+            .store
+            .apply(&update(4, world.route_revision, None))
+            .committed_now
+    );
+    world.route_revision = world.route_revision.checked_next().unwrap();
+    let state = world.store.snapshot().unwrap();
+    assert_eq!(
+        state.routes[TOPIC]
+            .iter()
+            .map(|r| r.session)
+            .collect::<Vec<_>>(),
+        [world.c]
+    );
+    let first_delivery = DeliveryId {
+        publication: publication_id(world.epoch, 1),
+        index: 0,
+    };
+    let second_delivery = DeliveryId {
+        publication: publication_id(world.epoch, 3),
+        index: 0,
+    };
+    assert_eq!(state.obligations[&first_delivery].qos, Qos::AtLeastOnce);
+    assert_eq!(state.obligations[&second_delivery].qos, Qos::AtMostOnce);
+    assert_eq!(
+        world
+            .store
+            .read_work(world.b, None, 8)
+            .unwrap()
+            .items
+            .as_slice()
+            .iter()
+            .map(|w| (w.delivery, w.qos))
+            .collect::<Vec<_>>(),
+        [
+            (first_delivery, Qos::AtLeastOnce),
+            (second_delivery, Qos::AtMostOnce)
+        ]
+    );
+    let claim = freeze(Recipe::ClaimDelivery(ClaimDelivery {
+        operation: operation_id(world.epoch, 5),
+        delivery: first_delivery,
+        target: world.b,
+        target_revision: Revision::new(1),
+        packet_id: OutboundPacketId::new(7).unwrap(),
+    }));
+    assert!(world.store.apply(&claim).committed_now);
+    let consume = freeze(Recipe::ConsumeDelivery(ConsumeDelivery {
+        operation: operation_id(world.epoch, 6),
+        delivery: second_delivery,
+        target: world.b,
+        target_revision: Revision::new(1),
+    }));
+    assert!(world.store.apply(&consume).committed_now);
+    let after = world.store.snapshot().unwrap();
+    assert_eq!(after.outbound.len(), 1);
+    assert_eq!(after.accounts.exchange_slots.get(), 3);
+    assert_eq!(accounts_match_what_is_held(&after), Ok(()));
+    let finish = freeze(Recipe::FinishDelivery(FinishDelivery {
+        operation: operation_id(world.epoch, 7),
+        delivery: first_delivery,
+        target: world.b,
+        target_revision: Revision::new(1),
+        packet_id: OutboundPacketId::new(7).unwrap(),
+        claim: claim.recipe.operation(),
+    }));
+    assert!(world.store.apply(&finish).committed_now);
+    assert!(world.store.apply(&world.release(8, 7, 1)).committed_now);
+    assert!(world.store.apply(&world.release(9, 8, 3)).committed_now);
+    let ended = world.store.snapshot().unwrap();
+    assert!(
+        ended.obligations.is_empty()
+            && ended.outbound.is_empty()
+            && ended.payloads.is_empty()
+            && ended.publications.is_empty()
+            && ended.inbound.is_empty()
+    );
+    assert_eq!(accounts_match_what_is_held(&ended), Ok(()));
 }
 
 /// A network subscription mutation is a normal receipted operation: replacing
