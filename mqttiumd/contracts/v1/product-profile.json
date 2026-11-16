@@ -46,5 +46,8 @@
   "granted_subscription_qos": [
     0,
     1
-  ]
+  ],
+  "max_volatile_deliveries": 128,
+  "volatile_payload_reference_bytes": 4194304,
+  "outbox_slots": 128
 }

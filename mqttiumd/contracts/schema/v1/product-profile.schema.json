@@ -40,7 +40,10 @@
     "work_page_items",
     "max_targets_per_admission",
     "outgoing_qos",
-    "granted_subscription_qos"
+    "granted_subscription_qos",
+    "max_volatile_deliveries",
+    "volatile_payload_reference_bytes",
+    "outbox_slots"
   ],
   "properties": {
     "format": {
@@ -166,6 +169,15 @@
         0,
         1
       ]
+    },
+    "max_volatile_deliveries": {
+      "const": 128
+    },
+    "volatile_payload_reference_bytes": {
+      "const": 4194304
+    },
+    "outbox_slots": {
+      "const": 128
     }
   }
 }
