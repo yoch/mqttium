@@ -187,6 +187,8 @@ def _scope_unmet(contracts, scenario_path, trace_path):
     unsupported, non_qos2, uncorroborated, qos0_delivery = False, False, False, False
     for _, snapshot in run.snapshots.values():
         unsupported |= bool(snapshot["outbound"])
+        qos0_delivery |= any(row.get("effective_qos") == 0
+                             for row in snapshot.get("obligations", ()))
         for operation in snapshot["operations"]:
             recipe = bytes.fromhex(operation["recipe_hex"])
             if recipe[:6] == b"MQDR\x00\x01" and len(recipe) >= 7:
@@ -233,6 +235,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
                     and obligation["index"] == fact["delivery_id"]["index"]
                     and obligation["session"] == fact["target_session"]
                     and obligation["target_revision"] == fact["target_revision"]
+                    and obligation.get("effective_qos", 1) == fact.get("qos", 1)
                     for obligation in snapshot["obligations"]
                 )
                 for inspection, snapshot in run.snapshots.values()
