@@ -483,6 +483,66 @@ def late_receipt(binary: Path, case: Path) -> dict:
         broker.cleanup()
 
 
+def late_same_qos_receipt(binary: Path, case: Path) -> dict:
+    broker = Broker(binary, case, pauses=("admission.prepared", "ack.receipt"))
+    try:
+        broker.ready()
+        with Wire(broker.address, broker.observations, "late-same-qos") as wire:
+            wire.connect("qos1-late-same-qos", session_present=False)
+            wire.send(publish_packet("reception/late-same", b"same-payload", 7, qos=1))
+            first = broker.wait_event("barrier_hit", point="admission.prepared")
+            broker.release("admission.prepared")
+            wire.expect(0x40, 7)
+            deferred = broker.wait_event("barrier_hit", point="ack.receipt", after=int(first["seq"]))
+            require(deferred["details"]["packet_id"] == 7 and
+                    deferred["details"]["socket_write_complete"], "wrong_deferred_ack")
+            # MQTT-4.3.2-5: the client has received PUBACK, so even an equal
+            # payload with DUP=1 and the same PI is a new publication. Retain
+            # its actual SQL transaction while the old Written result arrives.
+            wire.send(publish_packet("reception/late-same", b"same-payload", 7, qos=1, dup=True))
+            second = broker.wait_event("barrier_hit", point="admission.prepared", after=int(deferred["seq"]))
+            require(second["operation"] != first["operation"], "new_occurrence_reused_operation")
+            before = database(broker.db)
+            write_json(case / "second-command-before-commit.json", before)
+            require(len(before["admissions"]) == 1 and
+                    before["admissions"][0]["id"] == operation_hex(first["operation"]),
+                    "second_admission_visible_before_commit")
+            broker.release("ack.receipt")
+            released = broker.wait_event("barrier_released", point="ack.receipt", after=int(second["seq"]))
+            require(released["details"]["effect"] == deferred["details"]["effect"],
+                    "wrong_deferred_receipt_released")
+            old_credits = [event for event in broker.events() if event["kind"] == "receive_credit" and
+                           event.get("details", {}).get("effect") == deferred["details"]["effect"]]
+            require(len(old_credits) == 1 and not old_credits[0]["details"]["released"],
+                    "stale_receipt_released")
+            frame = wire.poll(.15)
+            assert_no_positive_ack([frame] if frame else [], 0x40, 7)
+            require(frame is None, "unexpected_frame_while_held")
+            require(database(broker.db)["admissions"] == before["admissions"],
+                    "second_admission_visible_before_commit")
+            broker.release("admission.prepared")
+            wire.expect(0x40, 7)
+            credit = broker.wait_event("receive_credit", after=int(released["seq"]))
+            require(credit["details"]["packet_kind"] == "PUBACK" and
+                    credit["details"]["packet_id"] == 7 and credit["details"]["released"] and
+                    credit["details"]["effect"] != deferred["details"]["effect"] and
+                    credit["details"]["publish_order"] != deferred["details"]["publish_order"],
+                    "new_occurrence_credit_not_released")
+            after = finished_state(broker, case, admissions=2, releases=0)
+            require({row["id"] for row in after["admissions"]} ==
+                    {operation_hex(first["operation"]), operation_hex(second["operation"])},
+                    "wrong_durable_admission_identity")
+        broker.stop()
+        writer_available(broker.db)
+        return {"criterion": "C-late-same-qos", "status": "PASS", "first_prepared": first,
+                "second_prepared": second, "deferred_ack": deferred, "released_ack": released,
+                "old_credit": old_credits[0], "new_credit": credit, "admissions": 2,
+                "client_received_first_puback": True, "second_publish_dup": True,
+                "same_packet_identifier": 7, "same_payload": True, "writer_released": True}
+    finally:
+        broker.cleanup()
+
+
 def quota_refusal(binary: Path, case: Path) -> dict:
     broker = Broker(binary, case)
     original = None
@@ -652,6 +712,7 @@ def main() -> int:
     cases = [("A", nominal), ("C-reuse", reuse), ("E-concurrency", concurrency)]
     if args.mode == "complete" or args.case:
         cases += [("B", precommit), ("C-late-receipt", late_receipt),
+                  ("C-late-same-qos", late_same_qos_receipt),
                   ("D-before-ack", restart_before_ack), ("D-lost-ack", lost_ack_live_client),
                   ("E-refusal", quota_refusal), ("E-unknown", unknown_outcome),
                   ("E-takeover", takeover_late_commit)]
