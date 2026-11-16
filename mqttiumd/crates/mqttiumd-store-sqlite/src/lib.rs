@@ -1967,6 +1967,7 @@ impl SqliteStore {
                     delivery,
                     target,
                     target_revision,
+                    qos,
                     claim,
                 }))
             },
@@ -2342,6 +2343,9 @@ impl DurableStore for SqliteStore {
                 Recipe::ChangeSubscriptions(command) => pubsub::subscriptions(conn, meta, command)?,
                 Recipe::ClaimDelivery(command) => pubsub::claim(conn, meta, command)?,
                 Recipe::FinishDelivery(command) => pubsub::finish(conn, meta, command)?,
+                Recipe::ConsumeDelivery(_) | Recipe::UpdateSubscriptions(_) => {
+                    return Err(Abort::Refused(RejectReason::PreconditionFailed));
+                }
             };
             insert_operation(conn, operation, &canonical, Decision::Committed(facts))?;
             Ok(facts)

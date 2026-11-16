@@ -124,6 +124,7 @@ fn subscriptions_claims_and_last_reference_survive_reopen_without_resurrection()
                 delivery: delivery(1),
                 target: memory.c,
                 target_revision: Revision::new(1),
+                qos: Qos::AtLeastOnce,
                 claim: Some(recovered_claim)
             })
     );

@@ -377,6 +377,7 @@ pub(super) fn work(
                     delivery,
                     target: session,
                     target_revision: revision,
+                    qos: Qos::AtLeastOnce,
                     topic: SharedBytes::copy_from(topic, meta.limits.max_topic_bytes)
                         .map_err(|_| ReadError::LimitExceeded)?,
                     payload: SharedBytes::copy_from(payload, meta.limits.max_payload_bytes)

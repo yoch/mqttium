@@ -317,6 +317,7 @@ impl FactRef<'_> {
                     delivery,
                     target: record.target,
                     target_revision: record.target_revision,
+                    qos: record.qos,
                     claim,
                 }
             }
@@ -1211,6 +1212,9 @@ impl DurableStore for MemoryStore {
             Recipe::ChangeSubscriptions(command) => staged.stage_subscriptions(command),
             Recipe::ClaimDelivery(command) => staged.stage_claim(command),
             Recipe::FinishDelivery(command) => staged.stage_finish(command),
+            Recipe::ConsumeDelivery(_) | Recipe::UpdateSubscriptions(_) => {
+                Err(RejectReason::PreconditionFailed)
+            }
         };
         match facts {
             Ok(facts) => {
@@ -1390,6 +1394,7 @@ impl DurableStore for MemoryStore {
                     delivery: *delivery,
                     target: record.target,
                     target_revision: record.target_revision,
+                    qos: record.qos,
                     topic: SharedBytes::copy_from(&publication.topic, state.limits.max_topic_bytes)
                         .map_err(|_| ReadError::LimitExceeded)?,
                     payload: SharedBytes::copy_from(&payload.bytes, state.limits.max_payload_bytes)
