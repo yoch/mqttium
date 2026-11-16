@@ -1743,7 +1743,7 @@ impl MemoryStore {
             {
                 return refused(ReceiptCollectionRefusal::InvalidFrontier);
             }
-            let mut meter = ReadMeter::new(ReadBudget::PAGE);
+            let mut meter = ReadMeter::new(ReadBudget::COLLECTION);
             for seq in prior.through.get() + 1..=request.through.get() {
                 let operation = OperationId::new(
                     origin.incarnation,
@@ -1763,7 +1763,7 @@ impl MemoryStore {
                     meter.charge(32)?;
                     continue;
                 };
-                meter.field(record.recipe.len(), ReadBudget::PAGE.max_field_bytes)?;
+                meter.field(record.recipe.len(), ReadBudget::COLLECTION.max_field_bytes)?;
                 meter.charge(
                     128usize
                         .checked_add(record.recipe.len())

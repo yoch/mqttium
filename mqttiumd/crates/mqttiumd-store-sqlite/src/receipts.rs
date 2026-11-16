@@ -348,7 +348,7 @@ pub(crate) fn prepare(
         {
             return refused(ReceiptCollectionRefusal::InvalidFrontier);
         }
-        let mut meter = reader::Meter::new(ReadBudget::PAGE);
+        let mut meter = reader::Meter::new(ReadBudget::COLLECTION);
         for seq in prior.through.get() + 1..=request.through.get() {
             let operation = OperationId::new(
                 origin.incarnation,
@@ -409,14 +409,14 @@ fn read_operation_bounded(
     let Some(row) = rows.next()? else {
         return Ok(None);
     };
-    let recipe = reader::borrow_blob(row, 0, ReadBudget::PAGE.max_field_bytes)?;
+    let recipe = reader::borrow_blob(row, 0, ReadBudget::COLLECTION.max_field_bytes)?;
     meter.charge(
         128usize
             .checked_add(recipe.len())
             .ok_or(ReadError::LimitExceeded)?,
     )?;
     Ok(Some(OperationRecord {
-        recipe: reader::copy_blob(row, 0, ReadBudget::PAGE.max_field_bytes)?,
+        recipe: reader::copy_blob(row, 0, ReadBudget::COLLECTION.max_field_bytes)?,
         decision: decision_of(row, 1)?.decode()?,
     }))
 }
