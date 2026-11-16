@@ -6549,6 +6549,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ready_work_reports_only_useful_loaded_or_cursor_progress() {
+        let mut world = product_world();
+        let session = SessionId::new(PRODUCER);
+        assert!(!world.owner.has_ready_work(session));
+        world.applied(product_settings(CONN, 1));
+        assert!(world.drain().is_empty());
+        assert!(
+            !world.owner.has_ready_work(session),
+            "an empty known destination is not polled eagerly"
+        );
+        let first = work_item(0);
+        load_work(&mut world, &[first.clone()], Some(first.delivery));
+        assert!(
+            world.owner.has_ready_work(session),
+            "a loaded queued item can be claimed without a tick"
+        );
+        let claim = pubsub_flight(&mut world, work_available());
+        assert!(
+            !world.owner.has_ready_work(session),
+            "an unknown claim is not busy-retried"
+        );
+        world.applied(result(&claim, StoreOutcome::Committed(claim.facts)));
+        assert_eq!(kinds(&world.drain()), ["EmitPublish"]);
+        assert!(
+            !world.owner.has_ready_work(session),
+            "the live receive window is full"
+        );
+        let finish = pubsub_flight(&mut world, outgoing_puback(CONN, 1, 0));
+        assert!(
+            !world.owner.has_ready_work(session),
+            "finish uncertainty still owns the window"
+        );
+        world.applied(result(&finish, StoreOutcome::Committed(finish.facts)));
+        assert!(world.drain().is_empty());
+        assert!(
+            world.owner.has_ready_work(session),
+            "known finish makes the next page cursor ready"
+        );
+        load_work(&mut world, &[], None);
+        assert!(
+            !world.owner.has_ready_work(session),
+            "an exhausted empty page never self-rearms"
+        );
+        world.applied(Input::ConnectionClosed {
+            connection: ConnectionGeneration::new(CONN),
+        });
+        let _ = world.drain();
+        assert!(!world.owner.has_ready_work(session));
+    }
+
     fn load_work(
         world: &mut World,
         items: &[crate::contract::pubsub::WorkItem],

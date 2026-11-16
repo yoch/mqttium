@@ -303,6 +303,14 @@ fn exact(topic: &SharedBytes) -> bool {
 }
 
 impl Owner {
+    /// Whether a bounded work wake-up can advance already known online work.
+    /// Empty scans are deliberately excluded; external notifications and the
+    /// periodic fallback supply the authority to start a new discovery scan.
+    #[must_use]
+    pub fn has_ready_work(&self, _session: SessionId) -> bool {
+        false
+    }
+
     pub(super) fn plan_settings(
         &self,
         connection: ConnectionGeneration,
