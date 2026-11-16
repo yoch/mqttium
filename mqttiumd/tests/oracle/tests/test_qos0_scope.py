@@ -30,7 +30,7 @@ class Qos0QualificationScope(unittest.TestCase):
             "decision": {"facts": {"kind": "DeliveryConsumed"}},
         }]}
         self.assertEqual(self.unmet(snapshots=[(None, snapshot)]), [
-            results.FIXTURE_PUBSUB_SCOPE,
+            "the fixture-based qualifier does not cover volatile or consumed QoS 0 delivery",
         ])
 
     def test_corroborated_queued_qos0_remains_outside_fixture_scope(self):
@@ -44,7 +44,7 @@ class Qos0QualificationScope(unittest.TestCase):
         }, "target_session": "2", "target_revision": "1", "qos": 0, "claim": None}
         record = SimpleNamespace(kind="RecoveryPageRead", payload={"run_epoch": "2", "facts": [fact]})
         self.assertEqual(self.unmet(snapshots=[(None, snapshot)], records=[record]), [
-            results.FIXTURE_PUBSUB_SCOPE,
+            "the fixture-based qualifier does not cover volatile or consumed QoS 0 delivery",
         ])
 
     def test_corroborated_queued_qos1_keeps_existing_scope(self):

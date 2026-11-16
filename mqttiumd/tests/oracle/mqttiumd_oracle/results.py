@@ -162,6 +162,9 @@ def unmet(contracts, scenario_path, manifest_path, trace_path=None):
 FIXTURE_PUBSUB_SCOPE = (
     "the fixture-based qualifier does not cover outgoing claims or subscription mutations"
 )
+FIXTURE_QOS0_SCOPE = (
+    "the fixture-based qualifier does not cover volatile or consumed QoS 0 delivery"
+)
 UNCORROBORATED_QUEUED = (
     "queued recovery delivery metadata is not corroborated by a durable snapshot"
 )
@@ -181,13 +184,14 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         # The ordinary readers and assertions retain their own missing-proof
         # diagnostics. This condition adds no verdict for unreadable evidence.
         return []
-    unsupported, non_qos2, uncorroborated = False, False, False
+    unsupported, non_qos2, uncorroborated, qos0_delivery = False, False, False, False
     for _, snapshot in run.snapshots.values():
         unsupported |= bool(snapshot["outbound"])
         for operation in snapshot["operations"]:
             recipe = bytes.fromhex(operation["recipe_hex"])
             if recipe[:6] == b"MQDR\x00\x01" and len(recipe) >= 7:
-                unsupported |= recipe[6] in (3, 4, 5)
+                unsupported |= recipe[6] in (3, 4, 5, 7)
+                qos0_delivery |= recipe[6] == 6
             try:
                 decoded = recipes.decode(recipe)
             except recipes.RecipeError:
@@ -198,11 +202,16 @@ def _scope_unmet(contracts, scenario_path, trace_path):
             unsupported |= facts.get("kind") in {
                 "SubscriptionsChanged", "DeliveryClaimed", "DeliveryFinished"
             }
+            qos0_delivery |= facts.get("kind") == "DeliveryConsumed"
     for record in run.trace.records:
         payload = record.payload
         unsupported |= payload.get("command_kind") in {
-            "ChangeSubscriptions", "ClaimDelivery", "FinishDelivery"
+            "ChangeSubscriptions", "ChangeSubscriptionsQos", "ClaimDelivery", "FinishDelivery"
         }
+        qos0_delivery |= payload.get("command_kind") == "ConsumeDelivery"
+        non_qos2 |= (record.kind == "ClientBytesReceived"
+                     and payload.get("packet_kind") == "PUBLISH"
+                     and payload.get("qos", 2) != 2)
         unsupported |= payload.get("packet_kind") in {
             "SUBSCRIBE", "SUBACK", "UNSUBSCRIBE", "UNSUBACK"
         }
@@ -212,6 +221,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         for fact in payload["facts"]:
             if fact["kind"] != "OutboundDelivery":
                 continue
+            qos0_delivery |= fact.get("qos", 1) == 0
             if fact["claim"] is not None:
                 unsupported = True
                 continue
@@ -230,7 +240,9 @@ def _scope_unmet(contracts, scenario_path, trace_path):
             uncorroborated |= not supported
     return ([FIXTURE_PUBSUB_SCOPE] if unsupported else []) + (
         ["the fixture-based qualifier covers incoming QoS 2 only"] if non_qos2 else []
-    ) + ([UNCORROBORATED_QUEUED] if uncorroborated else [])
+    ) + ([UNCORROBORATED_QUEUED] if uncorroborated else []) + (
+        [FIXTURE_QOS0_SCOPE] if qos0_delivery else []
+    )
 
 
 def _broker_unmet(contracts, manifest, trace_path):
