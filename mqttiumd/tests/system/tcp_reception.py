@@ -194,8 +194,7 @@ def framing(binary: Path, case: Path) -> dict:
                 wire.send(message[split:])
                 wire.expect(0x50, 19)
                 wire.send(pubrel_packet(19) + b"\xc0\x00")
-                wire.expect(0x70, 19)
-                wire.expect(0xD0)
+                wire.expect_batch([(0x70, 19), (0xD0, None)])
         # A valid MQTT feature outside the narrow profile must not be confused
         # with a syntactically malformed fixed header.
         start = len(broker.events())

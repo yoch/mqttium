@@ -226,6 +226,22 @@ class Wire:
             require(reason == 0, "negative_business_ack", str(reason))
         return frame
 
+    def expect_batch(self, expected: list[tuple[int, int | None]], timeout: float = 5) -> None:
+        # Responses to independent MQTT control packets may interleave while
+        # PUBREL waits for its durable result. Require the exact multiset.
+        pending = expected.copy()
+        deadline = time.monotonic() + timeout
+        while pending:
+            frame = self.poll(max(0, deadline - time.monotonic()))
+            require(frame is not None, "missing_frame", repr(pending))
+            identifier = None
+            if frame.kind in (0x50, 0x70):
+                identifier, reason = frame.ack()
+                require(reason == 0, "negative_business_ack", str(reason))
+            actual = (frame.kind, identifier)
+            require(actual in pending, "unexpected_frame", repr(actual))
+            pending.remove(actual)
+
     def connect(self, client_id: str, *, session_present: bool | None = None,
                 keep_alive: int = 30, stride: int | None = None) -> bool:
         self.send(connect_packet(client_id, keep_alive), stride=stride)
@@ -243,10 +259,7 @@ class Wire:
         self.send(publish_packet(topic, payload, identifier), stride=stride)
         self.expect(0x50, identifier)
         self.send(pubrel_packet(identifier) + (b"\xc0\x00\xc0\x00" if concat else b""), stride=stride)
-        self.expect(0x70, identifier)
-        if concat:
-            self.expect(0xD0)
-            self.expect(0xD0)
+        self.expect_batch([(0x70, identifier)] + ([(0xD0, None)] * 2 if concat else []))
 
     def close(self) -> None:
         self.socket.close()
