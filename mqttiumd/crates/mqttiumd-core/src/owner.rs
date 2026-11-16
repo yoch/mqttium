@@ -732,7 +732,7 @@ fn capacity_of(bound: usize) -> u64 {
 /// the first of them was seen and end where a later kind starts.
 fn run<'a>(
     facts: &'a [RecoveredFact],
-    starts: &[Option<usize>; 8],
+    starts: &[Option<usize>; 9],
     rank: FactRank,
     upto: usize,
 ) -> &'a [RecoveredFact] {
@@ -976,7 +976,7 @@ impl Owner {
                 FactRank::InboundExchange | FactRank::OutboundDelivery => {
                     sessions.saturating_add(slots)
                 }
-                FactRank::Epoch | FactRank::Limits | FactRank::RouteTable | FactRank::Operation => {
+                FactRank::Epoch | FactRank::Limits | FactRank::RouteTable | FactRank::ReceiptFrontier | FactRank::Operation => {
                     0
                 }
             };
@@ -1077,6 +1077,7 @@ impl Owner {
             };
         }
         match input {
+            Input::MaintainReceipts | Input::ReceiptsCollected { .. } => Ok(Change::Nothing),
             Input::Qos0EmitRefused {
                 effect,
                 connection,
@@ -1995,7 +1996,7 @@ impl Owner {
         let mut epoch_recovered = self.epoch_recovered;
         let mut limits = self.limits.is_some();
         let mut route_table = self.route_revision.is_some();
-        let mut starts = [None; 8];
+        let mut starts = [None; 9];
         let session_named = |sessions: &[RecoveredFact], id: SessionId| {
             self.sessions.as_slice().iter().any(|held| held.id == id)
                 || sessions.iter().any(
@@ -2013,6 +2014,7 @@ impl Owner {
             // The earlier facts of this kind on this page.
             let same = run(facts, &starts, rank, position);
             let valid = match fact {
+                RecoveredFact::ReceiptFrontier(closure) => closure.origin.incarnation == self.incarnation && closure.origin.epoch < self.epoch,
                 RecoveredFact::OutboundDelivery {
                     delivery,
                     target,
@@ -2430,7 +2432,7 @@ impl Owner {
             // What an older epoch established about its operations
             // changes nothing here: a committed admission is found through
             // its exchange, and no operation of a closed epoch executes.
-            RecoveredFact::Operation { .. } => {}
+            RecoveredFact::Operation { .. } | RecoveredFact::ReceiptFrontier(_) => {}
         }
         Ok(())
     }
@@ -2718,6 +2720,7 @@ mod tests {
     /// The name the catalogue of the registry gives an effect.
     fn kind(effect: &Effect) -> &'static str {
         match effect {
+            Effect::CollectReceipts { .. } => "CollectReceipts",
             Effect::Persist { .. } => "Persist",
             Effect::ResolveAndFence { .. } => "ResolveAndFence",
             Effect::LoadWork { .. } => "LoadWork",
@@ -6047,7 +6050,7 @@ mod tests {
     fn the_facts_of_one_kind_are_the_run_they_form_on_a_page() {
         let mut facts = fixture(EPOCH);
         facts.push(exchange_fact(1, 7, 1));
-        let mut starts = [None; 8];
+        let mut starts = [None; 9];
         for (position, fact) in facts.iter().enumerate() {
             let start = &mut starts[fact.rank() as usize];
             if start.is_none() {
@@ -8078,4 +8081,32 @@ mod tests {
         ));
         assert_eq!(kinds(&world.drain()), ["EmitSuback"]);
     }
+
+    #[test]
+    fn receipt_collection_registers_empty_origin_before_business() {
+        let mut world = World::connected();
+        world.applied(Input::MaintainReceipts);
+        let effects = world.drain();
+        assert_eq!(kinds(&effects), ["CollectReceipts", "ArmDeadline"]);
+        let Effect::CollectReceipts { collection } = &effects[0].1 else {
+            panic!("registration control")
+        };
+        assert_eq!(collection.closure.through.get(), 0);
+        assert_eq!(collection.closure.publication_through.get(), 0);
+        assert_eq!(collection.closure.payload_through.get(), 0);
+        assert_eq!(world.owner.counters.operation, Some(OperationSeq::new(1)));
+    }
+
+    #[test]
+    fn receipt_collection_unconfirmed_registration_preserves_business_input() {
+        let mut world = World::connected();
+        world.applied(Input::MaintainReceipts);
+        let _ = world.drain();
+        let input = publish(7);
+        let before = world.snapshot();
+        assert!(matches!(world.step(input), StepOutcome::NeedCapacity { .. }),
+            "business cannot precede the durable empty-origin registration");
+        assert_eq!(world.snapshot(), before);
+    }
+
 }
