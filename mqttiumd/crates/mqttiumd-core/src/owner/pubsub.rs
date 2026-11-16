@@ -176,9 +176,31 @@ impl State {
         if !new && self.connections.is_empty() && self.control.is_none() {
             return 0;
         }
-        capacity_of(self.connections.capacity())
-            .saturating_add(capacity_of(self.deliveries.capacity()).saturating_mul(2))
-            .saturating_add(capacity_of(routes).saturating_mul(MAX_FILTERS as u64))
+        let slots = capacity_of(self.deliveries.capacity());
+        let connection_work = capacity_of(self.connections.capacity());
+        if let Input::WorkPage { items, .. } = input {
+            let count = capacity_of(items.len());
+            return connection_work
+                .saturating_add(slots.saturating_mul(count.saturating_add(1)))
+                .saturating_add(count.saturating_mul(count));
+        }
+        let filters = match input {
+            Input::Packet {
+                packet: InboundPacket::Subscribe { filters, .. },
+                ..
+            } => capacity_of(filters.len()),
+            Input::Packet {
+                packet: InboundPacket::Unsubscribe { filters, .. },
+                ..
+            } => capacity_of(filters.len()),
+            _ => 0,
+        };
+        // Packet allocation skips at most the bounded number of restored
+        // claims. Each candidate is checked against that same table.
+        connection_work
+            .saturating_add(slots.saturating_mul(slots.saturating_add(4)))
+            .saturating_add(capacity_of(routes).saturating_mul(filters))
+            .saturating_add(filters.saturating_mul(filters))
     }
     pub(super) fn new(config: OwnerConfig) -> Result<Self, AllocationFailed> {
         Ok(Self {
@@ -719,6 +741,9 @@ impl Owner {
         }
         if items.len() > WORK_PAGE_LIMIT as usize
             || items.windows(2).any(|w| w[0].delivery >= w[1].delivery)
+            || settings
+                .after
+                .is_some_and(|after| items.first().is_some_and(|first| first.delivery <= after))
             || next.is_some_and(|id| items.last().is_none_or(|last| last.delivery != id))
         {
             return Err(IMPOSSIBLE);
@@ -732,7 +757,7 @@ impl Owner {
         let mut total = self.pubsub.loaded_bytes().ok_or(IMPOSSIBLE)?;
         let mut added = 0usize;
         let limits = self.limits.ok_or(IMPOSSIBLE)?;
-        for item in items {
+        for (position, item) in items.iter().enumerate() {
             if item.target != session
                 || item.target_revision != target.revision
                 || item.topic.len() as u64 > u64::from(limits.max_topic_bytes)
@@ -742,7 +767,20 @@ impl Owner {
             }
             if let Some(claim) = item.claim
                 && (claim.operation.incarnation() != self.incarnation
-                    || claim.operation.epoch() > self.epoch)
+                    || claim.operation.epoch() > self.epoch
+                    || self.pubsub.deliveries.as_slice().iter().any(|d| {
+                        d.id != item.delivery
+                            && d.claim.is_some_and(|other| {
+                                other.operation == claim.operation
+                                    || (d.target == item.target
+                                        && other.packet_id == claim.packet_id)
+                            })
+                    })
+                    || items[..position].iter().any(|other| {
+                        other.claim.is_some_and(|other| {
+                            other.operation == claim.operation || other.packet_id == claim.packet_id
+                        })
+                    }))
             {
                 return Err(IMPOSSIBLE);
             }
@@ -764,7 +802,7 @@ impl Owner {
                 {
                     return Err(IMPOSSIBLE);
                 }
-                if known.claim.is_some() && item.claim.is_some() && known.claim != item.claim {
+                if item.claim.is_some() && known.claim != item.claim {
                     return Err(IMPOSSIBLE);
                 }
             } else {
