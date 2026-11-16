@@ -505,7 +505,12 @@ Cancellations are not successful deliveries. Product `session_changed` carries
 the original OperationId and the applied facts; an Open's attachment is this
 OperationId. `session_refused` carries a negative CONNACK reason and no invented
 SessionId. `session_cardinality` records bounded live/cleanup inventories without
-historical ClientIDs.
+historical ClientIDs. Only `command_submitted.details.expected_session` and
+`session_changed.details.retired_session` admit null optional identities. Their
+nonnull forms remain checked u64 strings; arbitrary null or object-valued
+diagnostics are refused by the independent product reader. Current snapshot
+examples emit explicit Never/null defaults, while a separate historical example
+preserves omitted-field compatibility.
 
 Absent CONNECT expiry means0. Clean Start0 may resume a persistent incarnation
 and set policy0, retaining its business state until later closure. Clean Start1
