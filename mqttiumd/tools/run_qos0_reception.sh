@@ -118,7 +118,7 @@ PY
     case "$q0_mutation" in
         early-qos0) q0_case=D-consume; q0_expected=premature_qos0_publish;;
         replay-qos0) q0_case=E-after; q0_expected=consumed_qos0_reemitted;;
-        qos0-accounting) q0_case=H; q0_expected=qos0_entered_qos1_accounting;;
+        qos0-accounting) q0_case=B; q0_expected=qos0_entered_qos1_accounting;;
     esac
     q0_status=0
     q0_run "$q0_mutation" "$q0_out/binaries/mqttiumd-$q0_mutation" --case "$q0_case" || q0_status=$?

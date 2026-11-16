@@ -5,10 +5,10 @@ associated with MQTTium. Its central contract: in Durable mode, a positive
 acknowledgement becomes eligible only after every responsibility it stands
 for is durably committed.
 
-**Status: experimental durable exact-topic pub/sub over TCP, plus the S0 validation lab.** Incoming QoS 1/2 feeds persistent subscriptions and outgoing QoS 1. The pure Rust core runs
+**Status: experimental exact-topic pub/sub over TCP, plus the S0 validation lab.** Incoming QoS 0/1/2 feeds subscriptions granted 0/1 and outgoing QoS 0/1. Initially QoS 0 follows a bounded volatile path; QoS 1/2 admissions retain durable responsibilities. The pure Rust core runs
 against a deterministic store and SQLite. The lab and independent Python
 oracle receive bounded scenarios, including real process kills. This is
-a bounded product, not a complete MQTT broker or a conformance or performance claim. See [the product profile and commands](docs/product-tcp.md) and [its reception](docs/reports/0009-durable-exact-pubsub.md).
+a bounded product, not a complete MQTT broker or a conformance or performance claim. See [the product profile and commands](docs/product-tcp.md) and [its reception](docs/reports/0010-qos0-product.md).
 
 ## What exists
 
