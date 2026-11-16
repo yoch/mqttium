@@ -303,7 +303,7 @@ specifies the layouts and separate volatile/consumed cycles.
 SQLite schema **4** stores compact receipt guards. Schemas 1/2/3 and other
 incompatible versions are refused with typed InvalidData before write-affecting
 pragmas. There is no implicit migration, checkpoint, reset or empty replacement.
-Fresh and existing schema4 files are supported; older-format files remain
+Fresh and existing schema 4 files are supported; older-format files remain
 historical inputs until a separate migration is supplied. Invalid/over-budget current files also refuse
 readiness without resetting partial recovery.
 
