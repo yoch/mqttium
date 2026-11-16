@@ -24,8 +24,9 @@ import threading
 import time
 
 from external_mqttium import client_identity
-from pubsub_probe import PubsubWire, decode_filter_ack, durable, subscribe_packet
-from tcp_probe import ReceiptFailure, require, write_json
+from pubsub_probe import PubsubWire, decode_filter_ack, durable, session_key, subscribe_packet
+from pubsub_reception import accounts_consistent, assignment, delivery_keys, drained
+from tcp_probe import ReceiptFailure, publish_packet, require, write_json
 from tcp_reception import Broker, writer_available
 
 
@@ -209,6 +210,116 @@ class PahoPeer:
         self.client.loop_stop()
 
 
+class HeldBusiness:
+    """Live responsibilities deliberately older than several receipt cycles."""
+    def __init__(self, broker: Broker, case: Path):
+        self.broker, self.case = broker, case
+        self.claim_subscriber = None
+        self.source = None
+        self.seed = None
+
+    def prepare(self) -> dict:
+        broker = self.broker
+        with PubsubWire(broker.address, broker.observations, "old-offline-subscription") as offline:
+            offline.connect("receipt-old-offline", session_present=False, keep_alive=0)
+            offline.subscribe(1, [("reception/receipt-offline", 1)])
+            old_sequence = max(int(event["seq"]) for event in broker.events())
+            offline.send(b"\xe0\x00")
+        broker.wait_event("connection_closed", after=old_sequence)
+        self.claim_subscriber = PubsubWire(broker.address, broker.observations, "old-unacknowledged-claim")
+        self.claim_subscriber.connect("receipt-old-claim", session_present=False, receive_maximum=1,
+                                      keep_alive=0)
+        self.claim_subscriber.subscribe(1, [("reception/receipt-claim", 1)])
+        self.source = PubsubWire(broker.address, broker.observations, "old-qos2-source")
+        self.source.connect("receipt-old-source", session_present=False, keep_alive=0)
+        self.source.publish(1, "reception/receipt-offline", b"old-offline-obligation", qos=2)
+        self.source.publish(2, "reception/receipt-claim", b"old-claimed-obligation", qos=2)
+        self.first_claim = self.claim_subscriber.next_publication()
+        require(self.first_claim.payload == b"old-claimed-obligation" and self.first_claim.qos == 1,
+                "held_claim_publish_wrong")
+        self.source.send(publish_packet("reception/receipt-inbound", b"old-await-pubrel", 77, qos=2))
+        require(self.source.wait(0x50, 77).ack() == (77, 0), "held_inbound_not_admitted")
+        with PubsubWire(broker.address, broker.observations, "old-consumed-qos0") as qos0:
+            qos0.connect("receipt-old-consumed", session_present=False, keep_alive=0)
+            qos0.subscribe(1, [("reception/receipt-consumed", 0)], expected=(0,))
+            self.source.publish(3, "reception/receipt-consumed", b"already-consumed-once", qos=2)
+            consumed = qos0.next_publication()
+            require(consumed.qos == 0 and consumed.packet_id is None
+                    and consumed.payload == b"already-consumed-once", "held_qos0_not_consumed")
+        self.seed = durable(broker.db)
+        self.offline_key = session_key(self.seed, "receipt-old-offline")
+        self.claim_key = session_key(self.seed, "receipt-old-claim")
+        self.source_key = session_key(self.seed, "receipt-old-source")
+        self.claim = assignment(self.seed, self.claim_key)
+        self.inbound = [row for row in self.seed["tables"]["inbound"] if row["session"] == self.source_key]
+        require(len(self.inbound) == 1 and self.inbound[0]["packet_id"] == 77,
+                "held_inbound_marker_missing")
+        require(len(self.seed["tables"]["obligations"]) == 2
+                and self.seed["counts"]["outbound"] == 1, "held_business_setup_incomplete")
+        accounts_consistent(self.seed)
+        self.seed_receipts = {row["id"] for row in self.seed["tables"]["operations"]}
+        write_json(self.case / "held-before-cycles.json", self.seed)
+        return {"offline_session": self.offline_key, "claim_session": self.claim_key,
+                "source_session": self.source_key, "claim": self.claim,
+                "incoming": self.inbound, "seed_receipt_ids": sorted(self.seed_receipts),
+                "first_publish": self.first_claim.observation(),
+                "consumed_qos0_observed": consumed.observation()}
+
+    def after_cycles(self) -> dict:
+        state = durable(self.broker.db)
+        accounts_consistent(state)
+        require(delivery_keys(state) == delivery_keys(self.seed), "live_obligation_lost_during_collection")
+        require(assignment(state, self.claim_key) == self.claim,
+                "live_claim_changed_during_collection")
+        require([row for row in state["tables"]["inbound"] if row["session"] == self.source_key] == self.inbound,
+                "await_pubrel_lost_during_collection")
+        retained = self.seed_receipts & {row["id"] for row in state["tables"]["operations"]}
+        require(not retained, "live_object_pinned_historical_receipt", repr(sorted(retained))[:256])
+        write_json(self.case / "held-after-cycles.json", state)
+        return {"old_receipts_collected": len(self.seed_receipts),
+                "delivery_identities": sorted(delivery_keys(state)),
+                "claim": self.claim, "incoming": self.inbound}
+
+    def after_crash(self, restarted: Broker) -> dict:
+        before = durable(restarted.db)
+        accounts_consistent(before)
+        require(delivery_keys(before) == delivery_keys(self.seed), "collection_crash_lost_obligation")
+        require(assignment(before, self.claim_key) == self.claim, "collection_crash_changed_claim")
+        require([row for row in before["tables"]["inbound"] if row["session"] == self.source_key] == self.inbound,
+                "collection_crash_lost_await_pubrel")
+        with PubsubWire(restarted.address, restarted.observations, "old-claim-after-restart") as claimed:
+            claimed.connect("receipt-old-claim", session_present=True, receive_maximum=1, keep_alive=0)
+            replay = claimed.next_publication()
+            require(replay.payload == self.first_claim.payload and replay.topic == self.first_claim.topic
+                    and replay.qos == 1 and replay.packet_id == self.first_claim.packet_id and replay.dup,
+                    "collected_claim_not_resumed_with_same_exchange")
+            claimed.acknowledge(replay)
+        with PubsubWire(restarted.address, restarted.observations, "old-offline-after-restart") as offline:
+            offline.connect("receipt-old-offline", session_present=True, keep_alive=0)
+            queued = offline.next_publication()
+            require(queued.topic == "reception/receipt-offline" and queued.payload == b"old-offline-obligation"
+                    and queued.qos == 1, "collected_admission_lost_offline_work")
+            offline.acknowledge(queued)
+        with PubsubWire(restarted.address, restarted.observations, "old-inbound-after-restart") as source:
+            source.connect("receipt-old-source", session_present=True, keep_alive=0)
+            source.publish(77, "reception/receipt-inbound", b"old-await-pubrel", qos=2, dup=True)
+        with PubsubWire(restarted.address, restarted.observations, "consumed-not-rebuilt") as consumed:
+            consumed.connect("receipt-old-consumed", session_present=True, keep_alive=0)
+            consumed.no_publication(.2, code="consumed_qos0_rebuilt_after_collection")
+            control_progress(consumed)
+        state = drained(restarted, self.case / "held-final")
+        return {"criterion": "D-live", "status": "PASS", "claim_retransmission": replay.observation(),
+                "offline_delivery": queued.observation(), "resources_final": state["counts"],
+                "consumed_qos0_not_rebuilt": True,
+                "same_obligations_finished_after_receipt_retirement": True}
+
+    def close(self):
+        if self.claim_subscriber:
+            self.claim_subscriber.close()
+        if self.source:
+            self.source.close()
+
+
 async def live_public_workload(broker: Broker, case: Path, terminal_commands: int) -> dict:
     """Public mqttium APIs drive business operations while two clients stay up."""
     from mqttium import MQTTProtocolVersion
@@ -317,29 +428,38 @@ async def live_public_workload(broker: Broker, case: Path, terminal_commands: in
 def live_receipts(binary: Path, case: Path, terminal_commands: int = BUSINESS_COMMANDS) -> dict:
     require(4 * HISTORICAL_RECEIPT_LIMIT < terminal_commands <= 40000, "insufficient_business_budget")
     broker = Broker(binary, case)
+    restarted = None
+    held = HeldBusiness(broker, case)
     try:
         ready = broker.ready()
         require(ready["details"]["receipt_slots"] == HISTORICAL_RECEIPT_LIMIT, "receipt_budget_changed")
         result = {"criterion": "B-live", "status": "PASS", "ready": ready,
                   "normal_build_required": True, "qualification": "system-test-only"}
+        result["held_before_cycles"] = held.prepare()
         async def bounded():
             async with asyncio.timeout(900):
                 return await live_public_workload(broker, case, terminal_commands)
         result["workload"] = asyncio.run(bounded())
-        deadline = time.monotonic() + 5
-        while True:
-            result["final_storage"] = storage_sample(broker)
-            if all(result["final_storage"]["counts"][name] == 0
-                   for name in ("publications", "payloads", "obligations", "outbound", "inbound")):
-                break
-            require(time.monotonic() < deadline, "live_objects_not_drained")
-            time.sleep(.01)
-        result["stop_status"] = broker.stop()
+        result["held_after_cycles"] = held.after_cycles()
+        result["final_storage_before_crash"] = storage_sample(broker)
+        inode = broker.db.stat().st_ino
+        result["stop_status"] = broker.stop(killed=True)
+        held.close()
+        writer_available(broker.db)
+        restarted = Broker(binary, case / "restart", db=broker.db, label="restarted")
+        result["restart_ready"] = restarted.ready()
+        require(restarted.db.stat().st_ino == inode, "live_restart_replaced_database")
+        result["held_reception"] = held.after_crash(restarted)
+        result["final_storage"] = storage_sample(restarted)
+        result["restart_stop_status"] = restarted.stop()
         writer_available(broker.db)
         write_json(case / "observation.json", result)
         return result
     finally:
+        held.close()
         broker.cleanup()
+        if restarted:
+            restarted.cleanup()
 
 
 def table_counts(path: Path) -> dict:
