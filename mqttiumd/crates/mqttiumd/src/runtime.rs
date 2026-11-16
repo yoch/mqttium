@@ -126,7 +126,7 @@ struct Runtime<'a> {
     #[cfg(feature = "test-hooks")]
     deferred_work: VecDeque<Response>,
     #[cfg(feature = "test-hooks")]
-    emission_barriers: BTreeMap<EffectId, (Instant, bool)>,
+    emission_barriers: VecDeque<HeldEmission>,
     #[cfg(feature = "test-hooks")]
     last_consume_result: Option<(EffectId, OperationId, StoreReply)>,
     started: Instant,
@@ -303,6 +303,8 @@ impl Runtime<'_> {
             hooks: &self.hooks,
             #[cfg(feature = "test-hooks")]
             emission_barriers: &mut self.emission_barriers,
+            #[cfg(feature = "test-hooks")]
+            releasing_qos0: false,
             timers: &mut self.timers,
             inputs: &mut self.inputs,
             deferred_count: self.deferred_inputs.len(),
@@ -310,6 +312,8 @@ impl Runtime<'_> {
             close: Vec::new(),
             error: None,
         };
+        #[cfg(feature = "test-hooks")]
+        sink.release_qos0();
         let _ = self.owner.dispatch(&mut sink);
         let close = std::mem::take(&mut sink.close);
         let error = sink.error.take();
@@ -1145,6 +1149,12 @@ impl Runtime<'_> {
         Ok(())
     }
 }
+#[cfg(feature = "test-hooks")]
+struct HeldEmission {
+    effect: OwnedEffect,
+    since: Instant,
+    released: bool,
+}
 struct Sink<'a> {
     writer: &'a Writer,
     peers: &'a mut BTreeMap<ConnectionGeneration, Peer>,
@@ -1157,13 +1167,56 @@ struct Sink<'a> {
     #[cfg(feature = "test-hooks")]
     hooks: &'a Hooks,
     #[cfg(feature = "test-hooks")]
-    emission_barriers: &'a mut BTreeMap<EffectId, (Instant, bool)>,
+    emission_barriers: &'a mut VecDeque<HeldEmission>,
+    #[cfg(feature = "test-hooks")]
+    releasing_qos0: bool,
     timers: &'a mut BTreeMap<DeadlineToken, Instant>,
     inputs: &'a mut VecDeque<Input>,
     deferred_count: usize,
     frames: &'a mut BTreeMap<EffectId, PendingFrame>,
     close: Vec<(ConnectionGeneration, &'static str)>,
     error: Option<Failure>,
+}
+#[cfg(feature = "test-hooks")]
+impl Sink<'_> {
+    fn release_qos0(&mut self) {
+        let Some(front) = self.emission_barriers.front_mut() else {
+            return;
+        };
+        if !front.released {
+            let Some(dir) = &self.hooks.directory else {
+                self.error = Some(Failure::plain("hook_directory"));
+                return;
+            };
+            let release = dir.join("release-consume.emission");
+            if release.exists() {
+                if std::fs::remove_file(release).is_err() {
+                    self.error = Some(Failure::plain("hook_release"));
+                    return;
+                }
+                front.released = true;
+            } else if front.since.elapsed() > Duration::from_secs(30) {
+                self.error = Some(Failure::plain("hook_deadline"));
+                return;
+            } else {
+                return;
+            }
+        }
+        let held = self
+            .emission_barriers
+            .pop_front()
+            .expect("checked bounded queue");
+        self.releasing_qos0 = true;
+        let result = self.try_submit(held.effect);
+        self.releasing_qos0 = false;
+        if let SubmitResult::NotSubmitted { effect, .. } = result {
+            self.emission_barriers.push_front(HeldEmission {
+                effect,
+                since: held.since,
+                released: true,
+            });
+        }
+    }
 }
 impl EffectSink for Sink<'_> {
     fn try_submit(&mut self, effect: OwnedEffect) -> SubmitResult {
@@ -1197,27 +1250,18 @@ impl EffectSink for Sink<'_> {
                     operation: id_op, ..
                 } = origin
                     && self.hooks.pause.iter().any(|p| p == "consume.emission")
+                    && !self.releasing_qos0
                 {
-                    let Some(dir) = &self.hooks.directory else {
-                        self.error = Some(Failure::plain("hook_directory"));
-                        return refused(effect, SubmitBlock::Closed);
-                    };
-                    let entry=self.emission_barriers.entry(id).or_insert_with(||{
-                        let _=self.events.emit("barrier_hit",json!({"point":"consume.emission","command_kind":"Consume","operation":operation(id_op)}));(Instant::now(),false)
-                    });
-                    if !entry.1 {
-                        let release = dir.join("release-consume.emission");
-                        if release.exists() {
-                            if std::fs::remove_file(release).is_err() {
-                                self.error = Some(Failure::plain("hook_release"));
-                            }
-                            entry.1 = true;
-                        } else if entry.0.elapsed() > Duration::from_secs(30) {
-                            self.error = Some(Failure::plain("hook_deadline"));
-                        } else {
-                            return refused(effect, SubmitBlock::QueueFull);
-                        }
+                    if self.emission_barriers.len() >= IN_FLIGHT {
+                        return refused(effect, SubmitBlock::QueueFull);
                     }
+                    if self.events.emit("barrier_hit",json!({"point":"consume.emission","command_kind":"Consume","operation":operation(id_op)})).is_err(){self.error=Some(Failure::plain("events_unavailable"));return refused(effect,SubmitBlock::Closed);}
+                    self.emission_barriers.push_back(HeldEmission {
+                        effect,
+                        since: Instant::now(),
+                        released: false,
+                    });
+                    return SubmitResult::Accepted;
                 }
                 let generation = connection.generation;
                 let result = if let Some(peer) = self.peers.get_mut(&generation).filter(|p| {
@@ -1260,8 +1304,6 @@ impl EffectSink for Sink<'_> {
                 } else {
                     Err(Qos0DropReason::ConnectionClosed)
                 };
-                #[cfg(feature = "test-hooks")]
-                self.emission_barriers.remove(&id);
                 match result {
                     Ok(()) => {
                         self.frames.insert(
@@ -1822,7 +1864,7 @@ fn run_inner(
         #[cfg(feature = "test-hooks")]
         deferred_work: VecDeque::new(),
         #[cfg(feature = "test-hooks")]
-        emission_barriers: BTreeMap::new(),
+        emission_barriers: VecDeque::new(),
         #[cfg(feature = "test-hooks")]
         last_consume_result: None,
         started: Instant::now(),

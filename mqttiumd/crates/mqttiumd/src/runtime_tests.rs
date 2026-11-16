@@ -90,7 +90,7 @@ fn with_runtime(max_exchanges: u32, test: impl FnOnce(&mut Runtime<'_>, &Path)) 
         #[cfg(feature = "test-hooks")]
         deferred_work: VecDeque::new(),
         #[cfg(feature = "test-hooks")]
-        emission_barriers: BTreeMap::new(),
+        emission_barriers: VecDeque::new(),
         #[cfg(feature = "test-hooks")]
         last_consume_result: None,
         started: Instant::now(),
