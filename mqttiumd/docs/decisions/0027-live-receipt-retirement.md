@@ -60,6 +60,9 @@ Startup opens its single new epoch through the existing authority protocol.
 Bounded closed-epoch sweeping can then collapse old origin guards behind the
 existing collected_through ledger, without deleting live business records or
 inventing current-origin consumption. It does not reset an incomplete recovery.
+The product retains a bounded diagnostic history on short healthy restarts;
+at 32 retained origins or 4096 physical receipts it sweeps closed scopes before
+readiness, leaving headroom under the 64-origin and 8192-receipt bounds.
 SQLite schema 4 refuses older formats before write-affecting pragmas; no implicit
 migration/reset. Readers preserve typed failures and bounded rows/bytes.
 
