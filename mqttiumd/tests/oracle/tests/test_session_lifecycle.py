@@ -216,7 +216,8 @@ class FinalLifecycleObservations(unittest.TestCase):
     def test_runtime_resource_limits_are_explicit_profile_fields(self):
         profile = json.loads((ROOT / "contracts/v1/product-profile.json").read_text())
         for key, value in (("closing_input_slots", 32), ("terminal_input_slots", 336),
-                           ("frame_registration_slots", 208), ("pre_connack_packet_slots", 1)):
+                           ("frame_registration_slots", 208), ("pre_connack_packet_slots", 1),
+                           ("session_shutdown_timeout_ms", 2000)):
             with self.subTest(key=key):
                 self.assertEqual(profile.get(key), value)
 
@@ -245,3 +246,56 @@ class FinalLifecycleObservations(unittest.TestCase):
             value = self.event(kind)
             value.pop("operation")
             self.assertEqual(self.contracts.check_value(value), [])
+
+
+class SessionShutdownObservations(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.contracts = Contracts.open(ROOT)
+
+    def event(self, kind, **details):
+        return {"format": "mqttiumd.product-event", "schema_version": 1,
+                "seq": "8", "pid": 1, "kind": kind, "details": details}
+
+    def test_completed_shutdown_requires_bounded_persistent_inventory_without_bindings(self):
+        valid = self.event("session_shutdown_completed", persistent_sessions=128, owner_bindings=0)
+        self.assertEqual(self.contracts.check_value(valid), [])
+        for invalid in (self.event("session_shutdown_completed", persistent_sessions=128),
+                        self.event("session_shutdown_completed", persistent_sessions=129, owner_bindings=0),
+                        self.event("session_shutdown_completed", persistent_sessions=0, owner_bindings=1),
+                        self.event("session_shutdown_completed", persistent_sessions=0, owner_bindings=0,
+                                   client_id="historical-client")):
+            with self.subTest(details=invalid["details"]):
+                self.assertTrue(self.contracts.check_value(invalid))
+
+    def incomplete(self):
+        value = self.event("shutdown_incomplete", code="pending_or_unknown", phase="Shutdown",
+                           lifecycle_pending=True, retired_flights=256, in_flight=17, closing_inputs=32)
+        value["operation"] = {"incarnation": "1", "epoch": "2", "owner": "0", "sequence": "8"}
+        return value
+
+    def test_uncertain_shutdown_keeps_exact_phase_operation_and_finite_counts(self):
+        valid = self.incomplete()
+        self.assertEqual(self.contracts.check_value(valid), [])
+        for key, changed in (("phase", "Recovery"), ("retired_flights", 257),
+                             ("in_flight", 18), ("closing_inputs", 33)):
+            invalid = copy.deepcopy(valid)
+            invalid["details"][key] = changed
+            with self.subTest(key=key):
+                self.assertTrue(self.contracts.check_value(invalid))
+        invalid = copy.deepcopy(valid)
+        invalid.pop("operation")
+        self.assertTrue(self.contracts.check_value(invalid))
+        invalid = copy.deepcopy(valid)
+        invalid["details"].pop("lifecycle_pending")
+        self.assertTrue(self.contracts.check_value(invalid))
+
+    def test_business_only_uncertainty_needs_no_fabricated_lifecycle_operation(self):
+        valid = self.incomplete()
+        valid["details"]["lifecycle_pending"] = False
+        valid.pop("operation")
+        self.assertEqual(self.contracts.check_value(valid), [])
+
+    def test_existing_writer_deadline_observation_remains_readable(self):
+        valid = self.event("shutdown_incomplete", code="writer_deadline", accepted_outcome="unknown")
+        self.assertEqual(self.contracts.check_value(valid), [])
