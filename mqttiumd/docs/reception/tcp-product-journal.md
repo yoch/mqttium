@@ -77,6 +77,11 @@
   DISCONNECT. The output sink now refuses closing generations while consuming
   the correlated commit; the new socket replays its original durable admission.
   A–H and the precise mutants are regenerated after this code change.
+- Fresh and resumed CONNECT pipelines also have real socket regressions:
+  before the fix an unsupported following packet emitted DISCONNECT before
+  core-authorised CONNACK. Pending ingress now lasts through CONNACK acceptance
+  by the ordered output queue (and keeps the CONNECT deadline). Both cases
+  require CONNACK first, then the refusal, with correct Session Present.
 - Final SHA-specific CI and fresh K1/K2b/K3 qualification are retained in the
   updated PR and its workflow artifacts. The final source identity is always
   `index.json.source_head`; development archives are never relabelled.

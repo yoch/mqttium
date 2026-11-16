@@ -251,7 +251,6 @@ impl Runtime<'_> {
                             }
                             self.events.emit("session_established",json!({"connection":pending.connection.get().to_string(),"details":{"request":request.to_string(),"session":session.id.get().to_string(),"session_present":session.present,"source":"writer_confirmation"}})).map_err(event_failure)?;
                             let connection = self.peers.get_mut(&pending.connection).map(|p| {
-                                p.pending = false;
                                 p.connected = true;
                                 pending.connection
                             });
@@ -305,6 +304,7 @@ impl Runtime<'_> {
             self.events.emit("session_established",json!({"connection":generation.get().to_string(),"details":{"session":session.id.get().to_string(),"session_present":true,"source":"durable_cache"}})).map_err(event_failure)?;
             if let Some(p) = self.peers.get_mut(&generation) {
                 p.connected = true;
+                p.pending = true;
             }
             self.queue(Input::Packet {
                 connection: generation,
@@ -540,7 +540,9 @@ impl Runtime<'_> {
                     && since.elapsed() > Duration::from_millis(300)
                 {
                     Some(code)
-                } else if !p.connected && p.created.elapsed() > Duration::from_secs(3) {
+                } else if (p.pending || !p.connected)
+                    && p.created.elapsed() > Duration::from_secs(3)
+                {
                     Some("connect_deadline")
                 } else if p.keep_alive != 0
                     && p.last_packet.elapsed()
@@ -694,7 +696,7 @@ impl EffectSink for Sink<'_> {
                 }
                 let Some(peer) = self
                     .peers
-                    .get(&generation)
+                    .get_mut(&generation)
                     .filter(|peer| peer.closing.is_none())
                 else {
                     let _ = effect.into_parts();
@@ -718,6 +720,11 @@ impl EffectSink for Sink<'_> {
                     bytes,
                 }) {
                     Ok(()) => {
+                        if kind == "CONNACK" {
+                            // Pipeline processing starts only after the core's
+                            // CONNACK occupies the ordered socket output queue.
+                            peer.pending = false;
+                        }
                         self.frames.insert(
                             id,
                             PendingFrame {
