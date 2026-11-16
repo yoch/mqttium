@@ -21,6 +21,7 @@ pub(super) struct Connection {
     next_packet: u32,
     after: Option<DeliveryId>,
     loading: Option<Read>,
+    rescan_needed: bool,
 }
 
 #[derive(Debug)]
@@ -339,7 +340,7 @@ impl Owner {
                 _ => {}
             }
         }
-        room && settings.loading.is_none() && settings.after.is_some()
+        room && settings.loading.is_none() && (settings.after.is_some() || settings.rescan_needed)
     }
 
     pub(super) fn plan_settings(
@@ -367,6 +368,7 @@ impl Owner {
             next_packet: 1,
             after: None,
             loading: None,
+            rescan_needed: false,
         };
         if let Some(index) = index {
             let current = self.pubsub.connections.as_slice()[index];
@@ -1241,12 +1243,14 @@ impl Owner {
                 remember(&mut self.finished, finished)?;
             }
             Change::Scan { connection, read } => {
-                self.pubsub
+                let state = self
+                    .pubsub
                     .connections
                     .as_mut_slice()
                     .get_mut(connection)
-                    .ok_or(stale)?
-                    .loading = Some(read)
+                    .ok_or(stale)?;
+                state.loading = Some(read);
+                state.rescan_needed = false;
             }
             Change::Page {
                 connection,
@@ -1261,6 +1265,7 @@ impl Owner {
                     .ok_or(stale)?;
                 c.loading = None;
                 c.after = next;
+                c.rescan_needed = discard;
                 if !discard {
                     let Input::WorkPage { items, .. } = input else {
                         return Err(stale);
