@@ -2992,3 +2992,82 @@ fn bounded_shutdown_reports_an_authentic_unknown_open_without_fabricating_reject
         );
     });
 }
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn an_actual_held_work_page_cannot_repopulate_a_retired_session_cache() {
+    with_runtime(128, |runtime, directory| {
+        let hooks = directory.join("held-page-hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        runtime.hooks.directory = Some(hooks.clone());
+        let (old, mut subscriber) = peer(runtime);
+        runtime
+            .connect(old, connect_packet(b"old-page-target"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut subscriber).0, 0x20);
+        runtime
+            .packet(old, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
+            .unwrap();
+        until(runtime, |r| {
+            r.inputs.is_empty() && r.inflight.is_empty() && r.work_reads.is_empty()
+        });
+        assert_eq!(read_frame(&mut subscriber).0, 0x90);
+        let old_sid = runtime.peers[&old].session.unwrap();
+        std::fs::write(hooks.join("hold-work-pages"), []).unwrap();
+        let (source, mut publisher) = peer(runtime);
+        runtime
+            .connect(source, connect_packet(b"old-page-source"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut publisher).0, 0x20);
+        runtime.packet(source, 0x32, publish_body(1)).unwrap();
+        until(runtime, |r| {
+            r.deferred_work.iter().any(|response| matches!(response,Response::Work { session,result:Ok(page),.. } if *session==old_sid&&!page.items.is_empty()))
+        });
+        assert_eq!(read_frame(&mut publisher).0, 0x40);
+        let before =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert_eq!(before.obligations.len(), 1);
+        assert!(
+            before.outbound.is_empty(),
+            "actual useful page was held before any claim"
+        );
+        runtime
+            .packet(old, 0xe0, vec![0, 5, 0x11, 0, 0, 0, 0])
+            .unwrap();
+        until(runtime, |r| {
+            !r.sessions.contains_key(b"old-page-target".as_slice())
+                && !r.owner.session_status().lifecycle_pending
+        });
+        let (current, mut current_client) = peer(runtime);
+        let mut connect = connect_packet(b"old-page-target");
+        connect.clean_start = true;
+        runtime.connect(current, connect).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(&read_frame(&mut current_client).1[..2], &[0, 0]);
+        let current_sid = runtime.peers[&current].session.unwrap();
+        assert_ne!(current_sid, old_sid);
+        std::fs::remove_file(hooks.join("hold-work-pages")).unwrap();
+        runtime.controls().unwrap();
+        runtime.drain_inputs().unwrap();
+        assert!(
+            runtime
+                .work_cache
+                .values()
+                .all(|item| item.target != old_sid),
+            "retired_work_page_repopulated_cache"
+        );
+        assert!(
+            runtime
+                .work_reads
+                .values()
+                .all(|session| *session != old_sid),
+            "the real accepted read correlation is consumed exactly once"
+        );
+        assert_eq!(runtime.owner.connection_of(current_sid), Some(current));
+        runtime.packet(current, 0xc0, vec![]).unwrap();
+        runtime.drain_inputs().unwrap();
+        assert_eq!(read_frame(&mut current_client).0, 0xd0);
+    });
+}
