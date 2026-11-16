@@ -1730,6 +1730,14 @@ impl SqliteStore {
                 return Err(Fault::Read(ReadError::LimitExceeded));
             }
         }
+        let claims: i64 = conn.query_row(
+            "SELECT count(*) FROM (SELECT 1 FROM outbound LIMIT ?1)",
+            [i64::try_from(MAX_RECOVERY_INVENTORY_ROWS + 1).map_err(|_| Fault::Corrupt)?],
+            |row| row.get(0),
+        )?;
+        if usize::try_from(claims).map_err(|_| Fault::Corrupt)? > MAX_RECOVERY_INVENTORY_ROWS {
+            return Err(Fault::Read(ReadError::LimitExceeded));
+        }
         let orphan: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM outbound c LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx WHERE o.publication IS NULL LIMIT 1)",
             [], |row| row.get(0),

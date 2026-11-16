@@ -265,6 +265,26 @@ pub(super) fn work(
     }
     let read = conn.unchecked_transaction()?;
     let meta = read_meta(&read)?;
+    // A missing obligation must not turn an already claimed delivery into a
+    // successful empty scan. Bound the target's claim set before checking it.
+    let claims: i64 = read.query_row(
+        "SELECT count(*) FROM (SELECT 1 FROM outbound WHERE target=?1 LIMIT ?2)",
+        params![
+            session.to_be_bytes().as_slice(),
+            i64::try_from(MAX_RECOVERY_INVENTORY_ROWS + 1).map_err(|_| Fault::Corrupt)?
+        ],
+        |row| row.get(0),
+    )?;
+    if usize::try_from(claims).map_err(|_| Fault::Corrupt)? > MAX_RECOVERY_INVENTORY_ROWS {
+        return Err(Fault::Read(ReadError::LimitExceeded));
+    }
+    let broken: bool = read.query_row(
+        "SELECT EXISTS(SELECT 1 FROM outbound c LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx WHERE c.target=?1 AND (o.publication IS NULL OR o.target!=c.target OR o.target_revision!=c.target_revision OR o.qos!=1) LIMIT 1)",
+        [session.to_be_bytes().as_slice()], |row| row.get(0),
+    )?;
+    if broken {
+        return Err(Fault::Corrupt);
+    }
     let sql = "SELECT o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN payloads y ON y.id=p.payload LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.target=?1 AND o.qos=1 AND (?2 IS NULL OR o.publication>?2 OR (o.publication=?2 AND o.idx>?3)) ORDER BY o.publication,o.idx LIMIT ?4";
     let mut items = BoundedVec::with_capacity(limit).map_err(|_| ReadError::AllocationFailed)?;
     let mut meter = reader::Meter::new(budget);
