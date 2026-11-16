@@ -494,6 +494,22 @@ def concurrency(binary: Path, case: Path) -> dict:
         # Kernel buffer values and the reached pressure point remain recorded.
         with Wire(broker.address, broker.observations, "nonreader", receive_buffer=1024) as stalled:
             stalled.connect("nonreader", session_present=False)
+            baseline = database(broker.db)
+            before = max(int(event["seq"]) for event in broker.events())
+            stalled.send(publish_packet("reception/pressure", b"committed-unread", 55))
+            admission = broker.wait_event("store_result", after=before)
+            require(admission.get("command_kind") == "Admission" and admission["details"]["committed_now"],
+                    "nonreader_admission_not_committed")
+            admitted = database(broker.db)
+            target = [row for row in admitted["admissions"] if row["id"] == operation_hex(admission["operation"])]
+            require(len(target) == 1 and len(admitted["admissions"]) == len(baseline["admissions"]) + 1,
+                    "nonreader_durable_admission_identity")
+            queued = broker.wait_event("frame_queued", after=before)
+            require(queued["details"].get("packet_kind") == "PUBREC"
+                    and queued["details"].get("packet_id") == 55, "nonreader_pubrec_not_queued")
+            write_json(case / "nonreader-admission.json", admitted)
+            # The socket has not read since CONNACK: even its committed PUBREC
+            # remains unknown to the client while PING pressure is introduced.
             before = max(int(event["seq"]) for event in broker.events())
             stalled.socket.settimeout(.1)
             sent = 0
@@ -526,10 +542,26 @@ def concurrency(binary: Path, case: Path) -> dict:
             require(any(event["kind"] == "connection_closed" and event.get("details", {}).get("code")
                         in ("outgoing_queue_full", "write_timeout", "write_io") for event in events),
                     "nonreader_not_closed_within_budget")
+            pressure = database(broker.db)
+            require(target[0] in pressure["admissions"], "nonreader_committed_admission_lost")
+            write_json(case / "after-pressure.json", pressure)
+        with Wire(broker.address, broker.observations, "nonreader-resumed") as resumed:
+            resumed.connect("nonreader", session_present=True)
+            resumed.send(publish_packet("reception/pressure", b"committed-unread", 55, dup=True))
+            resumed.expect(0x50, 55)
+            require(database(broker.db)["admissions"] == pressure["admissions"],
+                    "pressure_retransmission_readmitted")
+            resumed.send(pubrel_packet(55));resumed.expect(0x70, 55)
+        final = database(broker.db)
+        require(final["admissions"] == pressure["admissions"] and final["counts"]["inbound"] == 0,
+                "pressure_exchange_not_completed")
+        write_json(case / "after-pressure-recovery.json", final)
         broker.stop()
         return {"criterion": "G-concurrency", "status": "PASS", "two_clients_completed": True,
                 "partial_reader_timeout": True, "output_queue_saturation_reached": True,
-                "retained_effects_terminal": len(retained_ids), "flood_bytes": sent, "flood_budget": maximum}
+                "retained_effects_terminal": len(retained_ids), "flood_bytes": sent, "flood_budget": maximum,
+                "unread_pubrec_operation": admission["operation"], "unread_pubrec_packet_identifier": 55,
+                "pressure_retransmission_admissions": 0, "pressure_exchange_completed": True}
     finally:
         broker.cleanup()
 

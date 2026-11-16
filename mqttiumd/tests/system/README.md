@@ -51,7 +51,7 @@ build. The driver always kills and reaps a broker left behind by a failed case.
 | D | Admission committed before PUBREC, actual broker SIGKILL and wait status -9, same-file restart, duplicate PUBLISH without a second admission, completed PUBREL/PUBCOMP. |
 | E | Completed exchange followed by a new PUBLISH using the same Packet Identifier, with a second publication identity and admission. |
 | F | Copies of a database created through TCP; `quick_check=ok` with invalid session state or an excessive ClientID; typed refusal, no readiness, writer available, no business reset. |
-| G-concurrency | Two simultaneous clients; another progresses while one leaves a packet incomplete; real four-slot egress saturation by a nonreader, bounded closure and retained effect identity accounted for. |
+| G-concurrency | Two simultaneous clients; another progresses while one leaves a packet incomplete; real four-slot egress saturation by a nonreader with a durable admission and unread PUBREC, bounded closure, retained effect identity accounted for, then retransmission and completion without a second admission. |
 | G-generation | Eighteen takeovers, exceeding the core's remembered window, then replay of an actual captured old CONNECT; runtime rejects its generation while the current connection progresses. |
 | H | Graceful shutdown with an accepted admission held before commit, released writer, uncertain submitted work preserved and reconciled after restart without a second admission. |
 
