@@ -1,8 +1,13 @@
 """Discriminating tests for the independent TCP receipt machinery."""
+import hashlib
+import json
+from pathlib import Path
+import socket
+import tempfile
 import unittest
 
 from tcp_probe import (
-    Frame, FrameDecoder, ReceiptFailure, assert_no_positive_ack,
+    Frame, FrameDecoder, Observations, ReceiptFailure, Wire, assert_no_positive_ack,
     assert_stale_filtered, connect_packet, publish_packet, variable_integer,
 )
 
@@ -62,6 +67,25 @@ class ProbeTests(unittest.TestCase):
         )
         self.assertEqual(publish_packet("t", b"x", 7), bytes.fromhex("340700017400070078"))
         self.assertEqual(publish_packet("t", b"x", 7, dup=True)[0], 0x3C)
+
+    def test_large_probe_bytes_keep_bounded_evidence_and_exact_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            left, right = socket.socketpair()
+            try:
+                wire = Wire.__new__(Wire)
+                wire.socket = left
+                wire.label = "large-packet"
+                path = Path(directory) / "observer.jsonl"
+                wire.observations = Observations(path)
+                data = b"x" * 4096
+                wire.send(data)
+                self.assertEqual(right.recv(8192), data)
+                value = json.loads(path.read_text())
+                self.assertEqual(value["byte_count"], len(data))
+                self.assertEqual(value["sha256"], hashlib.sha256(data).hexdigest())
+                self.assertLessEqual(len(path.read_bytes()), 8192)
+            finally:
+                left.close();right.close()
 
 
 if __name__ == "__main__":
