@@ -69,6 +69,7 @@ impl Window {
         false
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn serial(&self, id: u16) -> Option<u64> {
         self.receiving.get(&id).map(|occurrence| occurrence.serial)
     }
