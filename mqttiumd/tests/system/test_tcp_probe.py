@@ -46,9 +46,9 @@ class ProbeTests(unittest.TestCase):
         assert_no_positive_ack([], 0x50, 7)
 
     def test_stale_forwarding_is_detected_even_if_another_guard_later_drops_it(self):
-        events = [{"kind": "stale_input_dropped", "connection": "1"}]
+        events = [{"kind": "stale_generation_ignored", "connection": "1"}]
         assert_stale_filtered(events, "1")
-        events.append({"kind": "input_forwarded", "connection": "1"})
+        events.append({"kind": "stale_generation_accepted", "connection": "1"})
         with self.assertRaises(ReceiptFailure) as failure:
             assert_stale_filtered(events, "1")
         self.assertEqual(failure.exception.code, "stale_generation_forwarded")
