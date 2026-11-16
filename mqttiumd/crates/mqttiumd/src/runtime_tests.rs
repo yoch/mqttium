@@ -251,7 +251,7 @@ fn recipient_puback_preceding_disconnect_is_applied_before_generation_closes() {
         until(runtime,|r|r.session_requests.is_empty());
         assert_eq!(read_frame(&mut sender).0,0x20);
         runtime.packet(publisher,0x32,publish_body(1)).unwrap();
-        until(runtime,|r|r.frames.values().any(|f|f.kind=="PUBLISH"));
+        until(runtime,|_|std::fs::read_to_string(directory.join("events.jsonl")).unwrap().lines().any(|line|line.contains("\"frame_queued\"") && line.contains("\"PUBLISH\"")));
         let (header,body)=read_frame(&mut receiver);
         assert_eq!(header,0x32);
         let packet_id=[body[3],body[4]];
