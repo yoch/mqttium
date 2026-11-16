@@ -78,8 +78,86 @@ fn pending() -> Error {
     }
 }
 
-pub fn header(_: &[u8], _: usize) -> Result<Option<Header>, Error> {
-    Ok(None)
+const fn malformed(code: &'static str) -> Error {
+    Error {
+        kind: ErrorKind::Malformed,
+        code,
+        reason: 0x81,
+    }
+}
+
+const fn protocol(code: &'static str) -> Error {
+    Error {
+        kind: ErrorKind::Protocol,
+        code,
+        reason: 0x82,
+    }
+}
+
+const fn unsupported(code: &'static str) -> Error {
+    Error {
+        kind: ErrorKind::Unsupported,
+        code,
+        reason: 0x83,
+    }
+}
+
+const fn oversized(code: &'static str) -> Error {
+    Error {
+        kind: ErrorKind::Oversized,
+        code,
+        reason: 0x95,
+    }
+}
+
+fn flags(first: u8) -> Result<(), Error> {
+    let low = first & 0x0f;
+    match first >> 4 {
+        0 => Err(malformed("ReservedPacketType")),
+        3 if (first >> 1) & 3 == 3 => Err(malformed("InvalidQos")),
+        3 if (first >> 1) & 3 == 0 && first & 8 != 0 => Err(malformed("DupAtQosZero")),
+        3 => Ok(()),
+        6 | 8 | 10 if low == 2 => Ok(()),
+        6 | 8 | 10 => Err(malformed("InvalidFixedFlags")),
+        _ if low == 0 => Ok(()),
+        _ => Err(malformed("InvalidFixedFlags")),
+    }
+}
+
+/// Inspect at most five bytes. A returned size is checked before the
+/// transport reserves or reads an application-owned body buffer.
+pub fn header(bytes: &[u8], max_packet: usize) -> Result<Option<Header>, Error> {
+    let Some(&first) = bytes.first() else {
+        return Ok(None);
+    };
+    flags(first)?;
+    let mut remaining = 0usize;
+    for digit in 0..4 {
+        let Some(&byte) = bytes.get(digit + 1) else {
+            return Ok(None);
+        };
+        remaining = remaining
+            .checked_add(usize::from(byte & 0x7f) << (digit * 7))
+            .ok_or_else(|| oversized("RemainingLengthOverflow"))?;
+        if byte & 0x80 == 0 {
+            if digit > 0 && byte == 0 {
+                return Err(malformed("NonCanonicalRemainingLength"));
+            }
+            let encoded_len = digit + 2;
+            if remaining
+                .checked_add(encoded_len)
+                .is_none_or(|n| n > max_packet)
+            {
+                return Err(oversized("PacketTooLarge"));
+            }
+            return Ok(Some(Header {
+                first,
+                remaining,
+                encoded_len,
+            }));
+        }
+    }
+    Err(malformed("RemainingLengthTooLong"))
 }
 
 pub fn decode(_: u8, _: &[u8], _: Bounds) -> Result<Packet, Error> {
