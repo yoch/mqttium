@@ -25,7 +25,10 @@ Its witness belongs to that receipt and its recorded broker PIDs and binary
 hash, including the product SIGKILL in case D. Without it, the manifest records
 the narrower process-wait-status witness. Each case retains product events,
 external observer records, client observations and relevant durable snapshots.
-The top-level index, `SHA256SUMS`, archive and archive digest describe this run.
+Each executable is copied into `binaries/` before running that exact copy. The
+source archive is `git archive` of the recorded clean revision; retained command
+arrays, dependency features and toolchain versions describe the builds. The
+top-level index, `SHA256SUMS`, archive and archive digest describe this run.
 
 For one development probe against an already built product:
 
