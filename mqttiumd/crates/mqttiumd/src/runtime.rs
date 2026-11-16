@@ -154,6 +154,34 @@ impl Runtime<'_> {
         code: &'static str,
     ) -> Result<(), Failure> {
         if let Some(peer) = self.peers.remove(&generation) {
+            // Accepted writes may have completed or failed before their local
+            // receipt was collected. Closure ends each exact attempt, never
+            // granting a volatile retry or abandoning its bounded owner row.
+            let pending: Vec<_> = self
+                .frames
+                .iter()
+                .filter(|(_, frame)| frame.connection.generation == generation)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in pending {
+                let frame = self
+                    .frames
+                    .remove(&id)
+                    .ok_or_else(|| Failure::plain("frame_missing_on_close"))?;
+                if frame.kind == "PUBLISH0" {
+                    self.queue(Input::Qos0EmitRefused {
+                        effect: id,
+                        connection: frame.connection,
+                        reason: Qos0DropReason::ConnectionClosed,
+                    })?;
+                } else {
+                    self.queue(Input::FrameResult {
+                        effect: id,
+                        connection: frame.connection,
+                        progress: FrameProgress::Failed,
+                    })?;
+                }
+            }
             self.deferred_inputs.retain(
                 |input| !matches!(input,Input::Packet {connection,..} if *connection==generation),
             );

@@ -245,17 +245,40 @@ fn publish_body(packet_id: u16) -> Vec<u8> {
 }
 #[test]
 fn closing_qos0_without_collecting_written_retires_the_exact_attempt() {
-    with_runtime(128,|runtime,_| {
-        let (generation,mut client)=peer(runtime);
-        runtime.connect(generation,connect_packet(b"qos0-close")).unwrap();
-        until(runtime,|r|r.session_requests.is_empty());assert_eq!(read_frame(&mut client).0,0x20);
-        runtime.packet(generation,0x82,vec![0,1,0,0,1,b't',0]).unwrap();
-        until(runtime,|r|r.inflight.is_empty() && r.inputs.is_empty());assert_eq!(read_frame(&mut client).0,0x90);
-        runtime.packet(generation,0x30,vec![0,1,b't',0,b'v']).unwrap();
-        for _ in 0..8 {runtime.drain_inputs().unwrap();if runtime.frames.values().any(|f|f.kind=="PUBLISH0"){break;}}
-        let effect=*runtime.frames.iter().find(|(_,f)|f.kind=="PUBLISH0").expect("actual adapter accepted QoS0 attempt").0;
-        runtime.close(generation,"test_close_before_written").unwrap();
-        assert!(!runtime.frames.contains_key(&effect),"closed transport must not retain a write receipt forever");
+    with_runtime(128, |runtime, _| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"qos0-close"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        runtime
+            .packet(generation, 0x82, vec![0, 1, 0, 0, 1, b't', 0])
+            .unwrap();
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x90);
+        runtime
+            .packet(generation, 0x30, vec![0, 1, b't', 0, b'v'])
+            .unwrap();
+        for _ in 0..8 {
+            runtime.drain_inputs().unwrap();
+            if runtime.frames.values().any(|f| f.kind == "PUBLISH0") {
+                break;
+            }
+        }
+        let effect = *runtime
+            .frames
+            .iter()
+            .find(|(_, f)| f.kind == "PUBLISH0")
+            .expect("actual adapter accepted QoS0 attempt")
+            .0;
+        runtime
+            .close(generation, "test_close_before_written")
+            .unwrap();
+        assert!(
+            !runtime.frames.contains_key(&effect),
+            "closed transport must not retain a write receipt forever"
+        );
         assert!(runtime.inputs.iter().any(|i|matches!(i,Input::Qos0EmitRefused{effect:e,connection,reason:Qos0DropReason::ConnectionClosed} if *e==effect && connection.generation==generation)),"the owner must receive exact terminal loss, not lose an accepted effect silently");
         runtime.drain_inputs().unwrap();
     });
