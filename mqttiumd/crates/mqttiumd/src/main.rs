@@ -65,6 +65,22 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
     })
 }
 
+fn main() {
+    let config = match arguments() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "mqttiumd: {e}\nusage: mqttiumd --db PATH --listen 127.0.0.1:1883 --events NEW_JSONL_PATH"
+            );
+            std::process::exit(2);
+        }
+    };
+    if let Err(failure) = run(config) {
+        eprintln!("mqttiumd refused: {}", failure.fields());
+        std::process::exit(2);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,20 +107,5 @@ mod tests {
         } else {
             assert!(matches!(result, Err("unknown or unavailable option")));
         }
-    }
-}
-fn main() {
-    let config = match arguments() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "mqttiumd: {e}\nusage: mqttiumd --db PATH --listen 127.0.0.1:1883 --events NEW_JSONL_PATH"
-            );
-            std::process::exit(2);
-        }
-    };
-    if let Err(failure) = run(config) {
-        eprintln!("mqttiumd refused: {}", failure.fields());
-        std::process::exit(2);
     }
 }
