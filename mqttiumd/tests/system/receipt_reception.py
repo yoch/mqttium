@@ -653,15 +653,15 @@ def unknown_hole(binary: Path, case: Path) -> dict:
             require(resolved["operation"] == operation and resolved["details"]["outcome"].lower() == "committed",
                     "unknown_resolution_changed_operation")
             result["same_operation_resolution"] = resolved
+        advanced = until(lambda: (state if operation_floor(state, operation) >= int(operation["sequence"]) else None)
+                         if (state := durable(broker.db)) else None,
+                         "frontier_did_not_reopen_after_resolution")
+        result["frontier_after_resolution"] = operation_floor(advanced, operation)
         with PubsubWire(broker.address, broker.observations, "reopened-business") as reopened:
             reopened.connect("receipt-reopened-control", session_present=False, keep_alive=0)
             for identifier in range(1, 66):
                 reopened.subscribe(identifier, [("reception/receipt-reopened", identifier % 2)])
             control_progress(reopened)
-        advanced = until(lambda: (state if operation_floor(state, operation) >= int(operation["sequence"]) else None)
-                         if (state := durable(broker.db)) else None,
-                         "frontier_did_not_reopen_after_resolution")
-        result["frontier_after_resolution"] = operation_floor(advanced, operation)
         with PubsubWire(broker.address, broker.observations, "old-offline-after-pressure") as offline:
             offline.connect("receipt-old-offline", session_present=True, keep_alive=0)
             message = offline.next_publication()
