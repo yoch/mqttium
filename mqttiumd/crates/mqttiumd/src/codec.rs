@@ -698,6 +698,7 @@ pub fn encode(frame: OutboundFrame) -> Result<Vec<u8>, Error> {
         })
     };
     match frame {
+        OutboundFrame::Suback { .. } | OutboundFrame::Unsuback { .. } => Err(unsupported("PubsubNotEnabled")),
         OutboundFrame::Puback { packet_id, reason } => {
             let [high, low] = packet_id.get().to_be_bytes();
             if reason.to_wire() == 0 {
@@ -766,6 +767,16 @@ pub fn refusal(error: Error, before_connack: bool) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exact_subscriptions_and_recipient_puback_enter_the_pure_core() {
+        use mqttiumd_contract::packet::InboundPacket;
+        assert!(matches!(super::decode(0x82, &[0,7,0,0,1,b't',1], BOUNDS),
+            Ok(super::Packet::Core(InboundPacket::Subscribe { .. }))));
+        assert!(matches!(super::decode(0xa2, &[0,8,0,0,1,b't'], BOUNDS),
+            Ok(super::Packet::Core(InboundPacket::Unsubscribe { .. }))));
+        assert!(matches!(super::decode(0x40, &[0,1,0x97], BOUNDS),
+            Ok(super::Packet::Core(InboundPacket::Puback { reason:0x97, .. }))));
+    }
     use super::*;
     use mqttiumd_contract::ids::InboundPacketId;
     use mqttiumd_contract::packet::{AckReason, PubackReason, Qos};
