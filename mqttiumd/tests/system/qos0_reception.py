@@ -129,12 +129,27 @@ def matrix(binary: Path, case: Path) -> dict:
                                       "effective_qos": effective, "publisher": sender, "subscriber": receiver,
                                       "publisher_receipt": sent, "subscriber_receipt": public,
                                       "independent_wire": observed.observation()})
-        state = drained(broker, case, admissions=8)
+        state = drained(broker, case)
+        # The shared receipt collector may already have retired early cells.
+        # Count each actual committed admission by immutable operation identity;
+        # retained SQL results corroborate it but are not a lifetime counter.
+        admissions = {}
+        for event in broker.events():
+            if (event['kind'] == 'store_result' and event.get('command_kind') == 'Admission'
+                    and event.get('details', {}).get('outcome') == 'Committed'
+                    and event['details'].get('committed_now') is True):
+                admissions.setdefault(operation_hex(event['operation']), event)
+        require(len(admissions) == 8, 'unexpected_admission_count')
+        require(all(row['id'] in admissions for row in state['admissions']),
+                'retained_admission_not_corroborated')
         broker.stop()
         writer_available(broker.db)
         return {"criterion": "A", "status": "PASS", "cells": cells,
                 "all_six_cells_both_public_client_directions": True,
-                "durable_admissions": len(state["admissions"])}
+                "durable_admissions": len(admissions),
+                "retained_admission_receipts": len(state["admissions"]),
+                "known_admission_commits": list(admissions.values()),
+                "receipt_frontiers": state["tables"]["receipt_origins"]}
     finally:
         for client in clients:
             client.cleanup()
