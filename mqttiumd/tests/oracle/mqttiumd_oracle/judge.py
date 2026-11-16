@@ -868,7 +868,18 @@ def same_recipe_for_op_A(run):
             continue
         orders = [run.trace.before(commit, inspection) for commit in commits]
         if any(orders):
-            reasons.append(f"{name}: the committed operation {operation} has no recipe")
+            retired = any(
+                tuple(int(row["origin"][part]) for part in ("incarnation", "epoch", "owner"))
+                == operation[:3] and operation[3] <= int(row["through"])
+                for row in snapshot.get("receipt_frontiers", ())
+            )
+            if retired:
+                # Collection is not rejection and cannot recreate historical
+                # canonical bytes. Existing retained bytes were compared above.
+                # New live-maintenance semantics remain outside qualification.
+                unknown.append(f"{name}: the historical recipe of {operation} was retired")
+            else:
+                reasons.append(f"{name}: the committed operation {operation} has no recipe")
         elif None in orders:
             # The trace does not say whether the commit precedes this
             # inspection: the absence of the recipe proves nothing either way.

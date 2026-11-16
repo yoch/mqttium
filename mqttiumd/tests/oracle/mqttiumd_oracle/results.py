@@ -165,6 +165,7 @@ FIXTURE_PUBSUB_SCOPE = (
 FIXTURE_QOS0_SCOPE = (
     "the fixture-based qualifier does not cover volatile or consumed QoS 0 delivery"
 )
+FIXTURE_RECEIPT_SCOPE = "the fixture-based qualifier does not cover live receipt retirement"
 UNCORROBORATED_QUEUED = (
     "queued recovery delivery metadata is not corroborated by a durable snapshot"
 )
@@ -185,7 +186,12 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         # diagnostics. This condition adds no verdict for unreadable evidence.
         return []
     unsupported, non_qos2, uncorroborated, qos0_delivery = False, False, False, False
+    receipt_retirement = False
     for _, snapshot in run.snapshots.values():
+        # A zero producer registration does not establish collection. A
+        # positive compact boundary belongs to a new, unexamined state machine.
+        receipt_retirement |= any(int(row["through"]) > 0
+                                  for row in snapshot.get("receipt_frontiers", ()))
         unsupported |= bool(snapshot["outbound"])
         qos0_delivery |= any(row.get("effective_qos") == 0
                              for row in snapshot.get("obligations", ()))
@@ -221,6 +227,9 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         if record.kind not in {"RecoveryPageRead", "RecoveryPageDelivered"}:
             continue
         for fact in payload["facts"]:
+            if fact["kind"] == "ReceiptFrontier":
+                receipt_retirement |= int(fact["through"]) > 0
+                continue
             if fact["kind"] != "OutboundDelivery":
                 continue
             qos0_delivery |= fact.get("qos", 1) == 0
@@ -245,7 +254,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         ["the fixture-based qualifier covers incoming QoS 2 only"] if non_qos2 else []
     ) + ([UNCORROBORATED_QUEUED] if uncorroborated else []) + (
         [FIXTURE_QOS0_SCOPE] if qos0_delivery else []
-    )
+    ) + ([FIXTURE_RECEIPT_SCOPE] if receipt_retirement else [])
 
 
 def _broker_unmet(contracts, manifest, trace_path):
