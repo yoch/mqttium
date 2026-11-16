@@ -1130,12 +1130,12 @@ mod tests {
             .send(ControlRequest::Collect { effect, collection })
             .unwrap();
         let reply = writer.control_receiver.recv_timeout(Duration::from_secs(2));
-        let operation = OperationId {
-            incarnation: origin.incarnation,
-            epoch: origin.epoch,
-            owner: origin.owner,
-            sequence: mqttiumd_contract::ids::OperationSeq::new(1),
-        };
+        let operation = OperationId::new(
+            origin.incarnation,
+            origin.epoch,
+            origin.owner,
+            mqttiumd_contract::ids::OperationSeq::new(1),
+        );
         let lifecycle_effect = EffectId {
             sequence: EffectSeq::new(2),
             ..effect
