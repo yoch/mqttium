@@ -2304,6 +2304,65 @@ impl DurableStore for SqliteStore {
 }
 
 #[cfg(test)]
+mod writer_lease_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_the_store_releases_a_lease_even_if_its_descriptor_was_duplicated() {
+        let directory = std::env::temp_dir().join(format!(
+            "mqttiumd-duplicated-writer-lease-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("isolated directory");
+        let path = directory.join("store.sqlite");
+        let store = SqliteStore::create(
+            &path,
+            StoreIncarnation::new(1),
+            Limits {
+                payload_bytes: PayloadBytes::new(4096),
+                references: References::new(16),
+                exchange_slots: ExchangeSlots::new(4),
+                receipt_slots: ReceiptSlots::new(8),
+                max_targets_per_admission: 4,
+                max_topic_bytes: 256,
+                max_payload_bytes: 1024,
+                max_sessions: 8,
+                max_route_targets: 4,
+            },
+        )
+        .expect("healthy store");
+        let before = store.snapshot().expect("healthy snapshot");
+        // A descriptor inherited across fork refers to this same kernel open
+        // file description. Keep a safe duplicate beyond the owner's lifetime
+        // to make that otherwise narrow scheduling window deterministic.
+        let inherited = store
+            ._writer_lock
+            .try_clone()
+            .expect("duplicated descriptor");
+        assert!(matches!(
+            SqliteStore::open(&path),
+            Err(OpenError::WriterAlive)
+        ));
+        drop(store);
+        let reopened = SqliteStore::open(&path);
+        assert!(
+            reopened.is_ok(),
+            "the store dropped, but an inherited descriptor kept its lease: {reopened:?}"
+        );
+        let reopened = reopened.expect("the owner released its lease");
+        assert_eq!(reopened.snapshot().expect("healthy snapshot"), before);
+        drop(inherited);
+        assert!(
+            matches!(SqliteStore::open(&path), Err(OpenError::WriterAlive)),
+            "closing the old duplicate must not release the new owner's lease"
+        );
+        drop(reopened);
+        drop(SqliteStore::open(&path).expect("the next owner also releases its lease"));
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+}
+
+#[cfg(test)]
 mod transaction_read_tests {
     use super::*;
     use mqttiumd_contract::command::{OpeningAttempt, OpeningTicket, StartupNonce};
