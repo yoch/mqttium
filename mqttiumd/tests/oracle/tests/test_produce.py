@@ -320,6 +320,106 @@ class Campaign(unittest.TestCase):
         self.assertEqual(self.contracts.check_file("run-result.json"), [])
         self.assertEqual(results.recompute(self.contracts, "run-result.json"), [])
 
+    def revise_evidence(self, snapshot_edit=None, recovery_edit=None):
+        """Edit descriptive evidence and regenerate its citations, not its verdict."""
+        path = self.campaign / TRACES / "p1-02-good/trace.jsonl"
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        for record in records:
+            if record["kind"] == "DurableStateInspected":
+                cited = record["payload"]["snapshot"]
+                snapshot_path = self.campaign / cited["path"]
+                value = json.loads(snapshot_path.read_text())
+                if snapshot_edit is not None:
+                    snapshot_edit(value)
+                    snapshot_path.write_text(json.dumps(value))
+                    cited.update(self.cite(cited["path"]))
+            if recovery_edit is not None and record["kind"] in (
+                "RecoveryPageRead", "RecoveryPageDelivered"
+            ):
+                recovery_edit(record["payload"])
+        path.write_text("".join(json.dumps(record) + "\n" for record in records))
+
+    def test_outgoing_claims_are_descriptive_but_not_fixture_qualified(self):
+        def claim(value):
+            obligation = value["obligations"][0]
+            value["outbound"] = [{
+                "delivery_id": {"publication_id": obligation["publication_id"],
+                                "index": obligation["index"]},
+                "target_session": obligation["session"], "target_revision": "1",
+                "packet_id": 1, "claim_operation_id": value["operations"][0]["operation_id"],
+                "phase": "AwaitPuback", "emission": "MayHaveStarted",
+            }]
+
+        self.revise_evidence(snapshot_edit=claim)
+        self.assertEqual(self.produce_rebuilt(), [
+            "not qualifying: the fixture-based qualifier does not cover outgoing claims "
+            "or subscription mutations"
+        ])
+        self.assertEqual((self.result["qualification"], self.result["verdict"]),
+                         ("provisional", "INCONCLUSIVE"))
+
+    def test_subscription_receipt_does_not_extend_fixture_qualification(self):
+        def subscriptions(value):
+            operation = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "20"}
+            numbers = (1, 1, 0, 20, 2, 1, 2)
+            body = b"".join(n.to_bytes(8, "big") for n in numbers)
+            canonical = b"MQDR\x00\x01\x03" + body + b"\x01\x01\x00\x01x"
+            value["operations"].append({
+                "operation_id": operation, "recipe_hex": canonical.hex(),
+                "decision": {"kind": "Committed", "facts": {
+                    "kind": "SubscriptionsChanged", "session": "2", "route_revision": "2",
+                }},
+            })
+
+        self.revise_evidence(snapshot_edit=subscriptions)
+        self.assertEqual(self.produce_rebuilt(), [
+            "not qualifying: the fixture-based qualifier does not cover outgoing claims "
+            "or subscription mutations"
+        ])
+        self.assertEqual(self.result["verdict"], "INCONCLUSIVE")
+
+    def test_queued_recovery_metadata_keeps_existing_fixture_qualification(self):
+        snapshot = json.loads((self.campaign / TRACES / "p1-02-good/final.snapshot.json").read_text())
+        obligation = snapshot["obligations"][0]
+
+        def recovered(page):
+            if page["run_epoch"] != "2":
+                return
+            fact = {
+                "kind": "OutboundDelivery",
+                "delivery_id": {"publication_id": obligation["publication_id"],
+                                "index": obligation["index"]},
+                "target_session": obligation["session"], "target_revision": "1", "claim": None,
+            }
+            at = next((i for i, old in enumerate(page["facts"]) if old["kind"] == "Operation"),
+                      len(page["facts"]))
+            page["facts"].insert(at, fact)
+
+        self.revise_evidence(recovery_edit=recovered)
+        self.assertEqual(self.produce_rebuilt(), [])
+        self.assertEqual(self.result["verdict"], "PASS")
+        self.assertEqual(results.recompute(self.contracts, "run-result.json"), [])
+
+    def test_unsubstantiated_queued_recovery_metadata_cannot_qualify(self):
+        def recovered(page):
+            if page["run_epoch"] == "2":
+                at = next((i for i, old in enumerate(page["facts"]) if old["kind"] == "Operation"),
+                          len(page["facts"]))
+                page["facts"].insert(at, {
+                    "kind": "OutboundDelivery",
+                    "delivery_id": {"publication_id": {
+                        "incarnation": "1", "epoch": "1", "owner": "0", "sequence": "900"
+                    }, "index": 0},
+                    "target_session": "2", "target_revision": "1", "claim": None,
+                })
+
+        self.revise_evidence(recovery_edit=recovered)
+        self.assertEqual(self.produce_rebuilt(), [
+            "not qualifying: queued recovery delivery metadata is not corroborated "
+            "by a durable snapshot"
+        ])
+        self.assertEqual(self.result["verdict"], "INCONCLUSIVE")
+
     def test_a_manifest_and_a_trace_that_disagree_on_the_broker_are_named(self):
         # Record 0019: the trace of p1-02-good says nothing, so in-process.
         member = self.rebuilt()
