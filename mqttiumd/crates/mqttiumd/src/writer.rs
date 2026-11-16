@@ -8,6 +8,9 @@ use mqttiumd_contract::outcome::{
     EpochGrant, EpochOpening, OpeningReply, OpeningStage, StoreReply,
 };
 use mqttiumd_contract::packet::SharedBytes;
+use mqttiumd_contract::receipts::{
+    ClosedReceiptCollection, ClosedReceiptReply, ReceiptCollection, ReceiptCollectionReply,
+};
 use mqttiumd_store_api::{
     AdminCommand, AdminDone, DurableStore, Limits, ReadError, ReadPhase, RecoveryCursor,
     RecoveryPage, RecoveryRefused, SessionState, WorkPage,
@@ -19,13 +22,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, Receiver, SyncSender},
+    mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
 };
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 #[cfg(feature = "test-hooks")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 pub const QUEUE: usize = 32;
+pub const CONTROL_QUEUE: usize = 4;
 pub const SESSIONS: usize = 128;
 pub const MAX_CLIENT: usize = 1024;
 pub const MAX_TOPIC: usize = 1024;
@@ -88,12 +93,23 @@ pub struct Session {
 pub struct Boot {
     pub grant: EpochGrant,
     pub sessions: BTreeMap<Vec<u8>, Session>,
+    pub collect_closed: bool,
+    pub sqlite: mqttiumd_store_sqlite::Settings,
 }
 pub enum Request {
     Recovery(Option<RecoveryCursor>),
     Session { request: u64, client: SharedBytes },
     Effect(OwnedEffect),
     Stop,
+}
+/// A reserved lane: maintenance never waits for a network/business slot.
+pub enum ControlRequest {
+    Collect { effect: EffectId, collection: ReceiptCollection },
+    Closed(ClosedReceiptCollection),
+}
+pub enum ControlResponse {
+    Collected { effect: EffectId, collection: ReceiptCollection, result: Result<ReceiptCollectionReply, Failure> },
+    Closed { collection: ClosedReceiptCollection, result: Result<ClosedReceiptReply, Failure> },
 }
 pub enum Response {
     Recovery(Result<RecoveryPage, RecoveryRefused>),
@@ -114,6 +130,11 @@ pub enum Response {
     },
     Stopped,
 }
+pub fn collection_details(collection: ReceiptCollection) -> serde_json::Value {
+    let closure = collection.closure;
+    json!({"incarnation":closure.origin.incarnation.get().to_string(),"epoch":closure.origin.epoch.get().to_string(),"owner":closure.origin.owner.get().to_string(),"through":closure.through.get().to_string(),"publication_through":closure.publication_through.get().to_string(),"payload_through":closure.payload_through.get().to_string(),"limit":collection.limit})
+}
+
 #[derive(Clone, Default)]
 pub struct Hooks {
     pub directory: Option<PathBuf>,
@@ -129,19 +150,13 @@ impl Hooks {
         events: &Events,
         cancel: &AtomicBool,
     ) -> Result<(), Failure> {
-        if !self.pause.iter().any(|p| p == point) {
-            return Ok(());
-        }
-        let dir = self
-            .directory
-            .as_ref()
-            .ok_or_else(|| Failure::plain("hook_directory"))?;
-        events
-            .emit(
-                "barrier_hit",
-                json!({"point":point,"command_kind":kind,"operation":operation(id)}),
-            )
-            .map_err(|_| Failure::plain("events_unavailable"))?;
+        self.barrier_fields(point, json!({"point":point,"command_kind":kind,"operation":operation(id)}), events, cancel)
+    }
+    #[cfg(feature = "test-hooks")]
+    fn barrier_fields(&self, point: &'static str, fields: serde_json::Value, events: &Events, cancel: &AtomicBool) -> Result<(), Failure> {
+        if !self.pause.iter().any(|p| p == point) { return Ok(()); }
+        let dir = self.directory.as_ref().ok_or_else(|| Failure::plain("hook_directory"))?;
+        events.emit("barrier_hit", fields).map_err(|_| Failure::plain("events_unavailable"))?;
         let release = dir.join(format!("release-{point}"));
         let start = Instant::now();
         while !cancel.load(Ordering::Relaxed) {
@@ -161,6 +176,8 @@ impl Hooks {
 pub struct Writer {
     pub sender: SyncSender<Request>,
     pub receiver: Receiver<Response>,
+    pub control_sender: SyncSender<ControlRequest>,
+    pub control_receiver: Receiver<ControlResponse>,
     pub boot: Receiver<Result<Boot, Failure>>,
     handle: Option<JoinHandle<()>>,
 }
@@ -175,14 +192,78 @@ impl Writer {
         let (tx, rx) = mpsc::sync_channel(QUEUE);
         let (rtx, rrx) = mpsc::sync_channel(64);
         let (btx, brx) = mpsc::sync_channel(1);
-        let handle=thread::Builder::new().name("sqlite-writer".into()).spawn(move||{
-            let (mut store,boot)=match bootstrap(&path) {Ok(v)=>v,Err(e)=>{let _=btx.send(Err(e));return;}};
-            if btx.send(Ok(boot)).is_err(){return;}
-            while let Ok(request)=rx.recv(){
-                let response=match request {
-                    Request::Stop=>{drop(store);let _=rtx.send(Response::Stopped);return;}
+        let (ctx, crx) = mpsc::sync_channel(CONTROL_QUEUE);
+        let (cctx, ccrx) = mpsc::sync_channel(CONTROL_QUEUE);
+        let handle = thread::Builder::new().name("sqlite-writer".into()).spawn(move || {
+            let (mut store, boot) = match bootstrap(&path) {
+                Ok(value) => value,
+                Err(error) => { let _ = btx.send(Err(error)); return; }
+            };
+            if btx.send(Ok(boot)).is_err() { return; }
+            let mut pending = None;
+            let mut pending_control = None;
+            let mut stopping = false;
+            loop {
+                if let Some(reply) = pending_control.take() {
+                    match cctx.try_send(reply) {
+                        Ok(()) => {},
+                        Err(TrySendError::Full(reply)) => pending_control = Some(reply),
+                        Err(TrySendError::Disconnected(_)) => return,
+                    }
+                }
+                if let Some(reply) = pending.take() {
+                    if rtx.send(reply).is_err() || stopping { return; }
+                }
+                // Even a completely unread ordinary result lane cannot prevent
+                // a reserved receipt closure from committing and replying.
+                if pending_control.is_none() {
+                    match crx.try_recv() {
+                        Ok(request) => pending_control = Some(control_response(&mut store, request, &events, &hooks, &cancel)),
+                        Err(TryRecvError::Empty) => {},
+                        Err(TryRecvError::Disconnected) => return,
+                    }
+                }
+                if pending.is_none() && !stopping {
+                    match rx.recv_timeout(Duration::from_millis(1)) {
+                        Ok(Request::Stop) => { pending = Some(Response::Stopped); stopping = true; },
+                        Ok(request) => pending = Some(business_response(&mut store, request, &events, &hooks, &cancel)),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {},
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                } else {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }).map_err(|_| Failure::plain("writer_spawn"))?;
+        Ok(Self {
+            sender: tx,
+            receiver: rrx,
+            control_sender: ctx,
+            control_receiver: ccrx,
+            boot: brx,
+            handle: Some(handle),
+        })
+    }
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(|h| h.is_finished())
+    }
+    pub fn join_finished(&mut self) -> Result<(), Failure> {
+        if self.is_finished() {
+            if let Some(h) = self.handle.take() {
+                h.join().map_err(|_| Failure::plain("writer_panicked"))?;
+            }
+            Ok(())
+        } else {
+            Err(Failure::plain("writer_not_finished"))
+        }
+    }
+}
+fn business_response(store: &mut SqliteStore, request: Request, events: &Events, hooks: &Hooks, cancel: &Arc<AtomicBool>) -> Response {
+    let _ = (hooks, cancel);
+                match request {
+                    Request::Stop=>Response::Stopped,
                     Request::Recovery(cursor)=>Response::Recovery(store.recover(cursor,64)),
-                    Request::Session{request,client}=>Response::Session{request,result:session(&mut store,client)},
+                    Request::Session{request,client}=>Response::Session{request,result:session(store,client)},
                     Request::Effect(effect)=>{
                         let (effect,work)=effect.into_parts();
                         match work {
@@ -226,35 +307,54 @@ impl Writer {
                                 Response::Store{effect,operation:id,reply,targets:Vec::new()}
                             }
                             Effect::LoadWork{session,after,limit}=>Response::Work{effect,session,result:store.read_work(session,after,limit as usize)},
-                            _=>{cancel.store(true,Ordering::Relaxed);return;}
+                            _=>{cancel.store(true,Ordering::Relaxed);Response::Stopped}
                         }
                     }
-                };
-                // At most QUEUE + max in-flight results. The receiver outlives orderly drain.
-                if rtx.send(response).is_err(){return;}
+                }
+}
+
+fn control_response(store: &mut SqliteStore, request: ControlRequest, events: &Events, hooks: &Hooks, cancel: &Arc<AtomicBool>) -> ControlResponse {
+    let _ = hooks;
+    match request {
+        ControlRequest::Closed(collection) => ControlResponse::Closed { collection, result: store.collect_closed_receipts(collection).map_err(|e| Failure::read(e, ReadPhase::Maintenance)) },
+        ControlRequest::Collect { effect, collection } => {
+            #[cfg(not(feature="test-hooks"))]
+            let effective = collection;
+            #[cfg(feature="test-hooks")]
+            let effective = ReceiptCollection { limit: if hooks.directory.as_ref().is_some_and(|d| d.join("receipt-collection-limit-one").exists()) {1} else {collection.limit}, ..collection };
+            #[cfg(feature="test-hooks")]
+            {
+                let hc = hooks.clone(); let ev = events.clone(); let stop = cancel.clone();
+                store.set_receipt_hook(Some(Box::new(move |point, current| {
+                    let mut details = collection_details(current);
+                    details["requested_limit"] = json!(collection.limit);
+                    if hc.barrier_fields(point.name(), json!({"point":point.name(),"command_kind":"ReceiptCollection","details":details}), &ev, &stop).is_err() { stop.store(true, Ordering::Relaxed); }
+                })));
             }
-        }).map_err(|_|Failure::plain("writer_spawn"))?;
-        Ok(Self {
-            sender: tx,
-            receiver: rrx,
-            boot: brx,
-            handle: Some(handle),
-        })
-    }
-    pub fn is_finished(&self) -> bool {
-        self.handle.as_ref().is_none_or(|h| h.is_finished())
-    }
-    pub fn join_finished(&mut self) -> Result<(), Failure> {
-        if self.is_finished() {
-            if let Some(h) = self.handle.take() {
-                h.join().map_err(|_| Failure::plain("writer_panicked"))?;
+            let result = store.collect_receipts(effective).map_err(|e| Failure::read(e, ReadPhase::Maintenance));
+            #[cfg(feature="test-hooks")]
+            store.set_receipt_hook(None);
+            let mut details = collection_details(effective);
+            details["requested_limit"] = json!(collection.limit);
+            details["effect"] = json!(format!("{}/{}/{}",effect.epoch.get(),effect.owner.get(),effect.sequence.get()));
+            match result {
+                Ok(ReceiptCollectionReply::Applied { removed, retained, more, .. }) => { details["outcome"] = json!("Applied"); details["removed"] = json!(removed); details["retained"] = json!(retained.to_string()); details["more"] = json!(more); },
+                Ok(ReceiptCollectionReply::PendingOrUnknown) => details["outcome"] = json!("PendingOrUnknown"),
+                Ok(ReceiptCollectionReply::Refused(reason)) => { details["outcome"] = json!("Refused"); details["reason"] = json!(format!("{reason:?}")); },
+                Err(ref failure) => { details["outcome"] = json!("ReadError"); if let Some((cause, _)) = failure.read { details["cause"] = json!(cause.code()); } },
             }
-            Ok(())
-        } else {
-            Err(Failure::plain("writer_not_finished"))
+            if events.emit("receipt_collection_result", json!({"command_kind":"ReceiptCollection","details":details})).is_err() { cancel.store(true,Ordering::Relaxed); }
+            #[cfg(feature="test-hooks")]
+            let result = if matches!(result, Ok(ReceiptCollectionReply::Applied { .. })) && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("drop-next-close-result"))) {
+                let _ = events.emit("receipt_collection_result_dropped", json!({"command_kind":"ReceiptCollection","details":details}));
+                Ok(ReceiptCollectionReply::PendingOrUnknown)
+            } else { result };
+            ControlResponse::Collected { effect, collection, result }
         }
     }
 }
+#[cfg(feature="test-hooks")]
+fn consume_file(path: &Path) -> bool { path.exists() && std::fs::remove_file(path).is_ok() }
 fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
     // Existing files, including empty/truncated files, are never silently initialised.
     let mut store = if path
@@ -336,7 +436,9 @@ fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
     let grant = opening
         .hand_over()
         .map_err(|_| Failure::plain("opening_grant"))?;
-    Ok((store, Boot { grant, sessions }))
+    let collect_closed = state.receipt_frontiers.len() >= 32 || state.accounts.receipt_slots.get() >= 4096;
+    let sqlite = store.effective_settings().clone();
+    Ok((store, Boot { grant, sessions, collect_closed, sqlite }))
 }
 fn session(store: &mut SqliteStore, client: SharedBytes) -> Result<Session, Failure> {
     let state = store
@@ -389,5 +491,55 @@ fn io_cause(kind: std::io::ErrorKind) -> ReadError {
         }
         ErrorKind::OutOfMemory => ReadError::AllocationFailed,
         _ => ReadError::Io,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mqttiumd_contract::ids::{EffectSeq, LogicalOwnerId};
+    use mqttiumd_contract::receipts::{ReceiptClosure, ReceiptOrigin};
+    use std::sync::atomic::AtomicU64;
+    use std::time::Instant;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    #[test]
+    fn reserved_collection_progresses_while_ordinary_replies_are_unread() {
+        let path = std::env::temp_dir().join(format!("mqttiumd-control-lane-{}-{}",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
+        std::fs::create_dir(&path).unwrap();
+        let db = path.join("store.sqlite");
+        let events = Events::open(&path.join("events.jsonl")).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut writer = Writer::spawn(db.clone(),events,Hooks::default(),cancel.clone()).unwrap();
+        let boot = writer.boot.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        let origin = ReceiptOrigin { incarnation:boot.grant.incarnation(), epoch:boot.grant.epoch(), owner:LogicalOwnerId::new(0) };
+        // Exactly 64 ordinary reply slots are left unread. The 65th command
+        // still has a real durable session effect, so an independent snapshot
+        // establishes the worker reached the blocked reply, rather than merely
+        // assuming it did from elapsed time.
+        for request in 1..=65 {
+            writer.sender.send(Request::Session { request, client:SharedBytes::copy_from(format!("lane-{request}").as_bytes(),MAX_CLIENT).unwrap() }).unwrap();
+        }
+        let deadline = Instant::now()+Duration::from_secs(3);
+        while SqliteStore::inspect(&db).unwrap().sessions.len()!=65 && Instant::now()<deadline { thread::sleep(Duration::from_millis(1)); }
+        let established = SqliteStore::inspect(&db).unwrap().sessions.len()==65;
+        let collection = ReceiptCollection { closure:ReceiptClosure::empty(origin), limit:128 };
+        let effect = EffectId { epoch:origin.epoch, owner:origin.owner, sequence:EffectSeq::new(1) };
+        writer.control_sender.send(ControlRequest::Collect { effect, collection }).unwrap();
+        let reply = writer.control_receiver.recv_timeout(Duration::from_secs(2));
+        // Cleanup before asserting: even the original blocked implementation
+        // must release its writer and terminate when the semantic test fails.
+        cancel.store(true,Ordering::Relaxed);
+        while writer.receiver.try_recv().is_ok() {}
+        writer.sender.send(Request::Stop).unwrap();
+        let deadline = Instant::now()+Duration::from_secs(3);
+        while !writer.is_finished() && Instant::now()<deadline {
+            while writer.receiver.try_recv().is_ok() {}
+            while writer.control_receiver.try_recv().is_ok() {}
+            thread::sleep(Duration::from_millis(1));
+        }
+        writer.join_finished().unwrap();
+        let _ = std::fs::remove_dir_all(path);
+        assert!(established,"all65 ordinary commands actually completed while their replies stayed unread");
+        assert!(matches!(reply,Ok(ControlResponse::Collected { effect:e,collection:c,result:Ok(ReceiptCollectionReply::Applied { removed:0,.. }) }) if e==effect && c==collection),"reserved maintenance must reply even when the ordinary result lane is demonstrably full");
     }
 }
