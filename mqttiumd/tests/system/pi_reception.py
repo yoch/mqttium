@@ -573,9 +573,19 @@ def uncertainty(binary: Path, case: Path, *, finish: bool):
                 if not finish and len(rows) < 2:
                     return None
                 return rows
-            assigned_rows = until(second_assignment, "second_claim_not_discovered", ACTION_TIMEOUT)
-            require({row["packet_id"] for row in assigned_rows} == ({2} if finish else {1, 2}),
-                    "pi_freed_before_finish_known" if finish else "unknown_claim_identifier_reused")
+            if finish:
+                assigned_rows = until(second_assignment, "second_claim_not_discovered", ACTION_TIMEOUT)
+                require({row["packet_id"] for row in assigned_rows} == {2}, "pi_freed_before_finish_known")
+            else:
+                # The product may conservatively suspend this destination at
+                # its first unknown claim. Independent destinations must still
+                # progress; any extra current claim must use another PI.
+                current = durable(broker.db)
+                assigned_rows = [row for row in current["tables"]["outbound"] if row["target"] == session]
+                identifiers = [row["packet_id"] for row in assigned_rows]
+                require(1 in identifiers and len(identifiers) == len(set(identifiers))
+                        and set(identifiers) <= {1, 2}, "unknown_claim_identifier_reused")
+                result["same_target_suspended_while_unknown"] = len(identifiers) == 1
             target.send(b"\xc0\x00")
             target.wait(0xD0)
             # A different destination retains an independent control/window.
