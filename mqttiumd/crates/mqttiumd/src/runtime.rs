@@ -123,6 +123,7 @@ struct PendingSession {
     operation: Option<OperationId>,
     zero_end: bool,
 }
+#[derive(Clone)]
 struct AppliedSessionChange {
     operation: OperationId,
     connection: Option<ConnectionGeneration>,
@@ -182,6 +183,10 @@ struct Runtime<'a> {
     copied_outgoing_frame: Option<(EffectId, ConnectionKey, FrameProgress)>,
     #[cfg(feature = "test-hooks")]
     last_finish_result: Option<(EffectId, OperationId, StoreReply)>,
+    #[cfg(feature = "test-hooks")]
+    copied_session_change: Option<AppliedSessionChange>,
+    #[cfg(feature = "test-hooks")]
+    copied_session_close: Option<SessionCloseObservation>,
 }
 impl Runtime<'_> {
     fn queue(&mut self, input: Input) -> Result<(), Failure> {
@@ -248,6 +253,24 @@ impl Runtime<'_> {
     ) -> Result<(), Failure> {
         if let Some(peer) = self.peers.remove(&generation) {
             self.session_cardinality_dirty = true;
+            #[cfg(feature = "test-hooks")]
+            if let Some(session) = peer.session
+                && self
+                    .hooks
+                    .directory
+                    .as_ref()
+                    .is_some_and(|dir| consume_control(&dir.join("capture-next-session-close")))
+            {
+                let observation = SessionCloseObservation {
+                    generation,
+                    session,
+                    opened_by: peer.opened_by,
+                };
+                self.events
+                    .emit("session_close_copied", observation.fields())
+                    .map_err(event_failure)?;
+                self.copied_session_close = Some(observation);
+            }
             // Frame failure can unbind the core before ConnectionClosed is
             // applied. Preserve this transport's confirmed zero-expiry guard
             // independently; neither a cache lookup nor its current binding
@@ -339,6 +362,24 @@ impl Runtime<'_> {
                 self.events.emit("session_change_ignored", json!({"operation":operation(changed_by),"details":{"code":"stale_lifecycle_result"}})).map_err(event_failure)?;
                 return Ok(());
             }
+        }
+        #[cfg(feature = "test-hooks")]
+        if self
+            .hooks
+            .directory
+            .as_ref()
+            .is_some_and(|dir| consume_control(&dir.join("capture-next-session-change")))
+        {
+            let copied = AppliedSessionChange {
+                operation: changed_by,
+                connection,
+                client_id: client_id.clone(),
+                change,
+            };
+            self.events
+                .emit("session_change_copied", copied.fields())
+                .map_err(event_failure)?;
+            self.copied_session_change = Some(copied);
         }
         match change {
             SessionChange::Opened {
@@ -2010,6 +2051,31 @@ impl Runtime<'_> {
             }
         }
         if let Some(dir) = &self.hooks.directory {
+            if consume_control(&dir.join("replay-session-close")) {
+                let copied = self
+                    .copied_session_close
+                    .ok_or_else(|| Failure::plain("no_copied_session_close"))?;
+                self.events
+                    .emit("session_close_replayed", copied.fields())
+                    .map_err(event_failure)?;
+                self.queue(Input::ConnectionClosed {
+                    connection: copied.generation,
+                })?;
+            }
+        }
+        if let Some(dir) = &self.hooks.directory
+            && consume_control(&dir.join("replay-session-change"))
+        {
+            let copied = self
+                .copied_session_change
+                .clone()
+                .ok_or_else(|| Failure::plain("no_copied_session_change"))?;
+            self.events
+                .emit("session_change_replayed", copied.fields())
+                .map_err(event_failure)?;
+            self.session_changed(copied)?;
+        }
+        if let Some(dir) = &self.hooks.directory {
             let replay = dir.join("replay-captured");
             if replay.exists() {
                 std::fs::remove_file(replay).map_err(|_| Failure::plain("hook_release"))?;
@@ -2023,6 +2089,37 @@ impl Runtime<'_> {
             }
         }
         Ok(())
+    }
+}
+#[cfg(feature = "test-hooks")]
+impl AppliedSessionChange {
+    fn fields(&self) -> serde_json::Value {
+        let (action, session) = match self.change {
+            SessionChange::Opened { session, .. } => ("Opened", session),
+            SessionChange::Closed { session, .. } => ("Closed", session),
+        };
+        let mut fields = json!({"operation":operation(self.operation),"details":{"action":action,"session":session.get().to_string()}});
+        if let Some(connection) = self.connection {
+            fields["connection"] = json!(connection.get().to_string());
+        }
+        fields
+    }
+}
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy)]
+struct SessionCloseObservation {
+    generation: ConnectionGeneration,
+    session: SessionId,
+    opened_by: Option<OperationId>,
+}
+#[cfg(feature = "test-hooks")]
+impl SessionCloseObservation {
+    fn fields(self) -> serde_json::Value {
+        let mut fields = json!({"connection":self.generation.get().to_string(),"details":{"session":self.session.get().to_string()}});
+        if let Some(token) = self.opened_by {
+            fields["operation"] = operation(token);
+        }
+        fields
     }
 }
 #[cfg(feature = "test-hooks")]
@@ -3089,6 +3186,10 @@ fn run_inner(
         copied_outgoing_frame: None,
         #[cfg(feature = "test-hooks")]
         last_finish_result: None,
+        #[cfg(feature = "test-hooks")]
+        copied_session_change: None,
+        #[cfg(feature = "test-hooks")]
+        copied_session_close: None,
     };
     let result = (|| {
         let mut cursor = None;

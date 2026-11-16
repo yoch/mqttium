@@ -121,6 +121,10 @@ fn with_runtime(max_exchanges: u32, test: impl FnOnce(&mut Runtime<'_>, &Path)) 
         copied_outgoing_frame: None,
         #[cfg(feature = "test-hooks")]
         last_finish_result: None,
+        #[cfg(feature = "test-hooks")]
+        copied_session_change: None,
+        #[cfg(feature = "test-hooks")]
+        copied_session_close: None,
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut cursor = None;
@@ -2649,5 +2653,78 @@ fn closing_an_ephemeral_transport_keeps_accepted_frame_facts_under_input_pressur
         let durable =
             mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
         assert!(durable.sessions.is_empty() && durable.publications.is_empty());
+    });
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn copied_lifecycle_effect_and_actual_old_close_cannot_rebind_a_replaced_client_id() {
+    with_runtime(128, |runtime, directory| {
+        let hook_dir = directory.join("session-hooks");
+        std::fs::create_dir(&hook_dir).unwrap();
+        runtime.hooks.directory = Some(hook_dir.clone());
+        std::fs::write(hook_dir.join("capture-next-session-change"), []).unwrap();
+        let (old, mut old_client) = peer(runtime);
+        runtime
+            .connect(old, connect_packet(b"copied-lifecycle"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut old_client).0, 0x20);
+        let copied = runtime
+            .copied_session_change
+            .as_ref()
+            .expect("captured from actual SessionChanged sink effect");
+        let old_sid = runtime.peers[&old].session.unwrap();
+        assert_eq!(copied.connection, Some(old));
+        std::fs::write(hook_dir.join("capture-next-session-close"), []).unwrap();
+        runtime.close(old, "test_end_old_transport").unwrap();
+        runtime.drain_inputs().unwrap();
+        let close = runtime
+            .copied_session_close
+            .expect("captured from actual transport close");
+        assert_eq!((close.session, close.generation), (old_sid, old));
+        let (current, mut client) = peer(runtime);
+        let mut connect = connect_packet(b"copied-lifecycle");
+        connect.clean_start = true;
+        runtime.connect(current, connect).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(&read_frame(&mut client).1[..2], &[0, 0]);
+        let current_sid = runtime.peers[&current].session.unwrap();
+        let current_token = runtime.peers[&current].opened_by;
+        assert_ne!(current_sid, old_sid);
+        std::fs::write(hook_dir.join("replay-session-change"), []).unwrap();
+        std::fs::write(hook_dir.join("replay-session-close"), []).unwrap();
+        runtime.controls().unwrap();
+        runtime.drain_inputs().unwrap();
+        assert_eq!(
+            runtime.sessions[b"copied-lifecycle".as_slice()].id,
+            current_sid,
+            "stale_session_change_rebound"
+        );
+        assert_eq!(runtime.peers[&current].session, Some(current_sid));
+        assert_eq!(runtime.peers[&current].opened_by, current_token);
+        assert_eq!(
+            runtime.owner.connection_of(current_sid),
+            Some(current),
+            "old_close_ended_new_incarnation"
+        );
+        runtime.packet(current, 0xc0, vec![]).unwrap();
+        runtime.drain_inputs().unwrap();
+        assert_eq!(read_frame(&mut client).0, 0xd0);
+        let text = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+        for kind in [
+            "session_change_copied",
+            "session_change_replayed",
+            "session_change_ignored",
+            "session_close_copied",
+            "session_close_replayed",
+        ] {
+            assert!(
+                text.lines().any(
+                    |line| serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"] == kind
+                ),
+                "actual hook {kind} reached"
+            );
+        }
     });
 }
