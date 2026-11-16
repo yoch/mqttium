@@ -431,7 +431,7 @@ def crash_delivery(binary: Path, case: Path) -> dict:
             require(delivery_keys(recovered) == delivery_keys(pending)
                     and len(recovered["admissions"]) == 1, "recovery_recreated_obligation")
             new_assignment = assignment(recovered, target)
-            for field in ("packet_id", "generation", "slot_generation", "publication", "idx", "delivery"):
+            for field in ("packet_id", "claim", "generation", "slot_generation", "publication", "idx", "delivery"):
                 if field in old_assignment["row"]:
                     require(old_assignment["row"][field] == new_assignment["row"][field],
                             "outgoing_exchange_identity_not_resumed", field)
