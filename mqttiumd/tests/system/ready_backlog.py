@@ -70,11 +70,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--binary-source-head", help="explicit source revision for a retained comparison binary")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     require(not any(args.out.iterdir()), "output_not_empty")
+    harness_head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     result = {"format": "mqttiumd.ready-backlog-system-witness", "schema_version": 1,
-              "source_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "source_head": args.binary_source_head or harness_head, "harness_source_head": harness_head,
               "binary": {"path": str(args.binary.resolve()),
                          "sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest()},
               "qualification": "system-test-only"}
