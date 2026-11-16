@@ -3,6 +3,7 @@ use crate::{
     codec::{self, Bounds, Packet},
     events::{Events, operation},
     net,
+    receiving::Terminal,
     writer::{Failure, Hooks, Request, Response, Session, Writer},
 };
 use mqttiumd_contract::capacity::{PayloadBytes, WorkUnits};
@@ -69,6 +70,7 @@ struct PendingFrame {
     kind: &'static str,
     packet_id: Option<u16>,
     receive_serial: Option<u64>,
+    terminal: Option<Terminal>,
 }
 struct PendingSession {
     connection: ConnectionGeneration,
@@ -402,9 +404,21 @@ impl Runtime<'_> {
                 let ingress_order = p.ingress;
                 if let InboundPacket::Publish {
                     packet_id: Some(id),
+                    qos,
+                    dup,
                     ..
                 } = &packet
-                    && p.receiving.publish(id.get(), ingress_order).is_err()
+                {
+                    self.events.emit("publish_validated", json!({"connection":generation.get().to_string(),"details":{"packet_id":id.get(),"qos":qos.to_wire(),"dup":dup,"publish_order":ingress_order.to_string()}})).map_err(event_failure)?;
+                }
+                if let InboundPacket::Publish {
+                    packet_id: Some(id),
+                    qos,
+                    ..
+                } = &packet
+                    && p.receiving
+                        .publish_qos(id.get(), ingress_order, *qos)
+                        .is_err()
                 {
                     let bytes = vec![0xe0, 2, 0x93, 0];
                     if bytes.len() <= p.max_packet
@@ -496,11 +510,16 @@ impl Runtime<'_> {
                             if kind != "PINGRESP" {
                                 self.events.emit("frame_written",json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id.unwrap_or(0),"bytes":bytes}})).map_err(event_failure)?;
                             }
-                            if kind == "PUBCOMP"
+                            if let Some(terminal) = pending.terminal
                                 && let Some(p) = self.peers.get_mut(&generation)
                                 && let Some(id) = id
                             {
-                                p.receiving.complete(id, pending.receive_serial);
+                                let released = p.receiving.complete_frame(
+                                    id,
+                                    pending.receive_serial,
+                                    terminal,
+                                );
+                                self.events.emit("receive_credit", json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id,"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
                             }
                             self.queue(Input::FrameResult {
                                 effect,
@@ -688,9 +707,22 @@ impl EffectSink for Sink<'_> {
                 }
             }
             Effect::EmitFrame {
-                connection, frame, ..
+                connection,
+                frame,
+                publish_order,
             } => {
                 let (connection, frame) = (*connection, *frame);
+                let receive_serial = *publish_order;
+                let terminal = match frame {
+                    OutboundFrame::Puback { .. } => Some(Terminal::Puback),
+                    OutboundFrame::Pubcomp { .. } => Some(Terminal::Pubcomp),
+                    OutboundFrame::Pubrec { reason, .. }
+                        if reason != mqttiumd_contract::packet::AckReason::Success =>
+                    {
+                        Some(Terminal::RejectedPubrec)
+                    }
+                    _ => None,
+                };
                 let generation = connection.generation;
                 let (kind, packet_id) = frame_info(frame);
                 if self.inputs.len() >= INPUTS {
@@ -733,7 +765,8 @@ impl EffectSink for Sink<'_> {
                                 connection,
                                 kind,
                                 packet_id,
-                                receive_serial: packet_id.and_then(|id| peer.receiving.serial(id)),
+                                receive_serial,
+                                terminal,
                             },
                         );
                         let _ = effect.into_parts();

@@ -519,15 +519,20 @@ fn a_real_delayed_pubcomp_write_receipt_cannot_release_a_new_packet_identifier_u
 fn a_real_puback_write_receipt_returns_its_receive_credit() {
     with_runtime(8, |runtime, _| {
         let (generation, mut client) = peer(runtime);
-        runtime.connect(generation, connect_packet(b"qos1-credit")).unwrap();
+        runtime
+            .connect(generation, connect_packet(b"qos1-credit"))
+            .unwrap();
         until(runtime, |r| r.session_requests.is_empty());
         assert_eq!(read_frame(&mut client).0, 0x20);
         runtime.packet(generation, 0x32, publish_body(1)).unwrap();
         until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
         assert_eq!(read_frame(&mut client).0, 0x40);
         until(runtime, |r| !r.frames.values().any(|p| p.kind == "PUBACK"));
-        assert_eq!(runtime.peers[&generation].receiving.serial(1), None,
-            "a terminal PUBACK must return the QoS 1 receive credit");
+        assert_eq!(
+            runtime.peers[&generation].receiving.serial(1),
+            None,
+            "a terminal PUBACK must return the QoS 1 receive credit"
+        );
     });
 }
 
