@@ -55,6 +55,32 @@ class ProductRecipes(unittest.TestCase):
             with self.subTest(data=invalid.hex()), self.assertRaises(recipe.RecipeError):
                 recipe.decode(invalid)
 
+    def test_qos_grants_have_a_new_kind_without_reinterpreting_legacy_kind3(self):
+        prefix = b"MQDR\x00\x01\x07" + scoped(24) + be(2) + be(1) + be(3)
+        data = prefix + b"\x03\x01\x00\x01a\x02\x00\x01b\x00\x00\x01c"
+        found = recipe.decode(data)
+        self.assertEqual(found.kind, "UpdateSubscriptions")
+        self.assertEqual([(change.topic, change.granted) for change in found.changes],
+                         [(b"a", 0), (b"b", 1), (b"c", None)])
+        old = recipe.decode(self.canonical("subscription"))
+        self.assertEqual(old.kind, "ChangeSubscriptions")
+        self.assertEqual(old.changes, (recipe.SubscriptionChange(b"p1/example", True),))
+        for invalid in (prefix + b"\x01\x03\x00\x01a", data[:-1], data + b"\x00"):
+            with self.subTest(data=invalid.hex()), self.assertRaises(recipe.RecipeError):
+                recipe.decode(invalid)
+
+    def test_consumption_has_no_packet_identifier_or_claim(self):
+        data = b"MQDR\x00\x01\x06" + scoped(25) + scoped(1) + be(0, 4) + be(2) + be(1)
+        found = recipe.decode(data)
+        self.assertEqual(found.kind, "ConsumeDelivery")
+        self.assertEqual((found.operation, found.publication, found.index, found.target,
+                          found.target_revision), ((1, 1, 0, 25), (1, 1, 0, 1), 0, 2, 1))
+        self.assertFalse(hasattr(found, "packet_id"))
+        self.assertFalse(hasattr(found, "claim"))
+        for invalid in [data[:cut] for cut in range(len(data))] + [data + b"\x00"]:
+            with self.subTest(data=invalid.hex()), self.assertRaises(recipe.RecipeError):
+                recipe.decode(invalid)
+
 
 if __name__ == "__main__":
     unittest.main()
