@@ -54,6 +54,7 @@ pub struct Error {
     pub code: &'static str,
     pub reason: u8,
     peer_maximum: Option<u32>,
+    disconnect_expiry: Option<u32>,
 }
 
 impl Error {
@@ -69,6 +70,16 @@ impl Error {
     /// Peer response limit established by a fully validated CONNECT.
     pub const fn peer_maximum(self) -> Option<u32> {
         self.peer_maximum
+    }
+    /// The packet was structurally validated before profile refusal. MQTT's
+    /// CONNECT0→DISCONNECTnonzero context rule takes precedence over a finite
+    /// interval being outside this implementation's profile.
+    pub fn in_session(self, connect_expiry: SessionExpiry) -> Self {
+        if connect_expiry == SessionExpiry::OnDisconnect
+            && self.disconnect_expiry.is_some_and(|value| value != 0)
+        {
+            protocol("SessionExpiryIncreaseForbidden")
+        } else { self }
     }
 }
 
@@ -86,6 +97,7 @@ const fn malformed(code: &'static str) -> Error {
         code,
         reason: 0x81,
         peer_maximum: None,
+        disconnect_expiry: None,
     }
 }
 
@@ -95,6 +107,7 @@ const fn protocol(code: &'static str) -> Error {
         code,
         reason: 0x82,
         peer_maximum: None,
+        disconnect_expiry: None,
     }
 }
 
@@ -104,6 +117,7 @@ const fn unsupported(code: &'static str) -> Error {
         code,
         reason: 0x83,
         peer_maximum: None,
+        disconnect_expiry: None,
     }
 }
 
@@ -113,6 +127,7 @@ const fn oversized(code: &'static str) -> Error {
         code,
         reason: 0x95,
         peer_maximum: None,
+        disconnect_expiry: None,
     }
 }
 
@@ -603,7 +618,7 @@ fn disconnect(body: &[u8]) -> Result<Packet, Error> {
             .expiry
             .is_some_and(|n| SessionExpiry::from_wire(n).is_none())
     {
-        return Err(unsupported("DisconnectOutsideProfile"));
+        return Err(Error { disconnect_expiry: props.expiry, ..unsupported("DisconnectOutsideProfile") });
     }
     Ok(Packet::Disconnect {
         expiry: props.expiry.and_then(SessionExpiry::from_wire),
@@ -1114,6 +1129,16 @@ mod tests {
         assert!(session_refusal(0).is_err());
         assert!(session_refusal(0x92).is_err());
         assert_eq!(disconnect_reason(0x82), [0xe0, 2, 0x82, 0]);
+    }
+
+    #[test]
+    fn zero_connect_context_rejects_any_nonzero_disconnect_before_profile_refusal() {
+        let error = decode(0xe0, &[0, 5, 0x11, 0, 0, 0, 7], BOUNDS).unwrap_err();
+        assert_eq!(error.in_session(SessionExpiry::OnDisconnect).code(), "SessionExpiryIncreaseForbidden");
+        assert_eq!(error.in_session(SessionExpiry::OnDisconnect).reason_code(), 0x82);
+        assert_eq!(error.in_session(SessionExpiry::Never).kind(), ErrorKind::Unsupported);
+        let malformed = decode(0xe0, &[0, 5, 0x11, 0], BOUNDS).unwrap_err();
+        assert_eq!(malformed.in_session(SessionExpiry::OnDisconnect).kind(), ErrorKind::Malformed);
     }
 
     fn kind(result: Result<Packet, Error>, expected: ErrorKind) {

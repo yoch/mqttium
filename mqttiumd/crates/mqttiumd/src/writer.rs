@@ -11,6 +11,7 @@ use mqttiumd_contract::packet::SharedBytes;
 use mqttiumd_contract::receipts::{
     ClosedReceiptCollection, ClosedReceiptReply, ReceiptCollection, ReceiptCollectionReply,
 };
+use mqttiumd_contract::session::{SessionAction, SessionExpiry};
 use mqttiumd_store_api::{
     AdminCommand, AdminDone, DurableStore, Limits, ReadError, ReadPhase, RecoveryCursor,
     RecoveryPage, RecoveryRefused, SessionState, WorkPage,
@@ -50,6 +51,10 @@ pub fn limits() -> Limits {
 }
 pub fn recipe_kind(recipe: &Recipe) -> &'static str {
     match recipe {
+        Recipe::SessionLifecycle(change) => match change.action {
+            SessionAction::Open { .. } => "SessionOpen",
+            SessionAction::Close { .. } => "SessionClose",
+        },
         Recipe::AdmitPublication(_) => "Admission",
         Recipe::ReleaseInbound(_) => "Release",
         Recipe::ChangeSubscriptions(_) => "Subscriptions",
@@ -89,6 +94,8 @@ pub struct Session {
     pub revision: Revision,
     pub client: SharedBytes,
     pub present: bool,
+    pub expiry: SessionExpiry,
+    pub opened_by: Option<OperationId>,
 }
 pub struct Boot {
     pub grant: EpochGrant,
@@ -104,6 +111,7 @@ pub enum Request {
 }
 /// A reserved lane: maintenance never waits for a network/business slot.
 pub enum ControlRequest {
+    Lifecycle(OwnedEffect),
     Collect {
         effect: EffectId,
         collection: ReceiptCollection,
@@ -112,6 +120,8 @@ pub enum ControlRequest {
 }
 #[derive(Clone)]
 pub enum ControlResponse {
+    Lifecycle { effect: EffectId, operation: OperationId, reply: StoreReply },
+    Failed(Failure),
     Collected {
         effect: EffectId,
         collection: ReceiptCollection,
@@ -278,7 +288,7 @@ impl Writer {
                     if pending_control.is_none() {
                         match crx.try_recv() {
                             Ok(request) => {
-                                let reply = control_response(&mut store, request, &events, &hooks, &cancel);
+                                let reply = control_response(&mut store, request, &events, &hooks, &cancel, &mut state);
                                 #[cfg(feature="test-hooks")]
                                 if let ControlResponse::Collected { collection, result:Ok(ReceiptCollectionReply::Applied { .. }),.. } = &reply
                                     && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("duplicate-close-result"))) {
@@ -337,6 +347,10 @@ impl Writer {
 #[derive(Default)]
 struct BusinessState {
     #[cfg(feature = "test-hooks")]
+    held_session_open: Option<OperationId>,
+    #[cfg(feature = "test-hooks")]
+    held_session_close: Option<OperationId>,
+    #[cfg(feature = "test-hooks")]
     held_admission: Option<OperationId>,
     #[cfg(feature = "test-hooks")]
     held_claim: Option<OperationId>,
@@ -379,6 +393,8 @@ fn business_response(
                         let ev = events.clone();
                         let stop = cancel.clone();
                         let point = match kind {
+                            "SessionOpen" => "session.open.prepared",
+                            "SessionClose" => "session.close.prepared",
                             "Admission" => "admission.prepared",
                             "Release" => "release.prepared",
                             "Subscriptions" => "subscription.prepared",
@@ -415,6 +431,8 @@ fn business_response(
                     {
                         let _ = store.set_kill_hook(None);
                         let point = match kind {
+                            "SessionOpen" => Some("session.open.committed"),
+                            "SessionClose" => Some("session.close.committed"),
                             "Admission" => Some("admission.committed"),
                             "Claim" => Some("claim.committed"),
                             "Finish" => Some("finish.committed"),
@@ -435,11 +453,15 @@ fn business_response(
                     let mut reply = applied.reply;
                     #[cfg(feature = "test-hooks")]
                     if applied.committed_now
-                        && matches!(kind, "Claim" | "Finish" | "Consume")
+                        && matches!(kind, "Claim" | "Finish" | "Consume" | "SessionOpen" | "SessionClose")
                         && let Some(dir) = &hooks.directory
                     {
-                        let file =
-                            dir.join(format!("drop-next-{}-result", kind.to_ascii_lowercase()));
+                        let file_name = match kind {
+                            "SessionOpen" => "drop-next-session-open-result".to_owned(),
+                            "SessionClose" => "drop-next-session-close-result".to_owned(),
+                            _ => format!("drop-next-{}-result", kind.to_ascii_lowercase()),
+                        };
+                        let file = dir.join(file_name);
                         if file.exists() && std::fs::remove_file(file).is_ok() {
                             let _ = events.emit(
                                 "store_result_dropped",
@@ -500,6 +522,8 @@ fn hold_business_reply(
 ) -> StoreReply {
     let reply = hold_admission_reply(state, hooks, id, kind, reply, events);
     for (name, file, held) in [
+        ("SessionOpen", "hold-session-open-result", &mut state.held_session_open),
+        ("SessionClose", "hold-session-close-result", &mut state.held_session_close),
         ("Claim", "hold-claim-result", &mut state.held_claim),
         ("Finish", "hold-finish-result", &mut state.held_finish),
     ] {
@@ -733,9 +757,16 @@ fn control_response(
     events: &Events,
     hooks: &Hooks,
     cancel: &Arc<AtomicBool>,
+    state: &mut BusinessState,
 ) -> ControlResponse {
     let _ = hooks;
     match request {
+        ControlRequest::Lifecycle(effect) => {
+            match business_response(store, Request::Effect(effect), events, hooks, cancel, state) {
+                Response::Store { effect, operation, reply, .. } => ControlResponse::Lifecycle {effect, operation, reply},
+                _ => { cancel.store(true, Ordering::Relaxed); ControlResponse::Failed(Failure::plain("invalid_lifecycle_control")) }
+            }
+        }
         ControlRequest::Closed(collection) => ControlResponse::Closed {
             collection,
             result: store
@@ -885,26 +916,6 @@ fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
     {
         return Err(Failure::plain("durable_profile_mismatch"));
     }
-    let mut sessions = BTreeMap::new();
-    for (id, s) in &state.sessions {
-        if s.state != SessionState::Active {
-            continue;
-        }
-        let client = SharedBytes::copy_from(&s.client_id, MAX_CLIENT)
-            .map_err(|_| Failure::read(ReadError::LimitExceeded, ReadPhase::Snapshot))?;
-        if sessions.len() >= SESSIONS {
-            return Err(Failure::read(ReadError::LimitExceeded, ReadPhase::Snapshot));
-        }
-        sessions.insert(
-            s.client_id.clone(),
-            Session {
-                id: *id,
-                revision: s.revision,
-                client,
-                present: true,
-            },
-        );
-    }
     let ledger = store
         .ledger()
         .map_err(|e| Failure::read(e, ReadPhase::Ledger))?;
@@ -926,6 +937,34 @@ fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
     let grant = opening
         .hand_over()
         .map_err(|_| Failure::plain("opening_grant"))?;
+    // Epoch opening atomically expires previous zero-retention transports.
+    // The first snapshot validated all durable discriminants before cleanup;
+    // only the post-opening state supplies recovery/cache authority.
+    let state = store
+        .snapshot()
+        .map_err(|e| Failure::read(e, ReadPhase::Snapshot))?;
+    let mut sessions = BTreeMap::new();
+    for (id, s) in &state.sessions {
+        if s.state != SessionState::Active {
+            continue;
+        }
+        let client = SharedBytes::copy_from(&s.client_id, MAX_CLIENT)
+            .map_err(|_| Failure::read(ReadError::LimitExceeded, ReadPhase::Snapshot))?;
+        if sessions.len() >= SESSIONS {
+            return Err(Failure::read(ReadError::LimitExceeded, ReadPhase::Snapshot));
+        }
+        sessions.insert(
+            s.client_id.clone(),
+            Session {
+                id: *id,
+                revision: s.revision,
+                client,
+                present: true,
+                expiry: s.expiry,
+                opened_by: s.opened_by,
+            },
+        );
+    }
     let collect_closed =
         state.receipt_frontiers.len() >= 32 || state.accounts.receipt_slots.get() >= 4096;
     let sqlite = store.effective_settings().clone();
@@ -953,6 +992,8 @@ fn session(store: &mut SqliteStore, client: SharedBytes) -> Result<Session, Fail
             revision: s.revision,
             client,
             present: true,
+            expiry: s.expiry,
+            opened_by: s.opened_by,
         });
     }
     match store.admin(AdminCommand::CreateSession {
@@ -963,6 +1004,8 @@ fn session(store: &mut SqliteStore, client: SharedBytes) -> Result<Session, Fail
             revision,
             client,
             present: false,
+            expiry: SessionExpiry::Never,
+            opened_by: None,
         }),
         // WriteFailed has an unknown outcome. No retry and no success acknowledgement.
         Err(mqttiumd_store_api::AdminRefused::WriteFailed) => {
@@ -1146,6 +1189,7 @@ mod tests {
             &events,
             &Hooks::default(),
             &Arc::new(AtomicBool::new(false)),
+            &mut BusinessState::default(),
         );
         assert!(
             matches!(response,ControlResponse::Collected {result:Ok(ReceiptCollectionReply::Applied {closure,..}),..} if closure==closed)

@@ -95,6 +95,12 @@ Physical transport closure/cache installation fences following lifecycle/frame
 dispatch. A known session-quota refusal has its own SessionCapacityExceeded
 cause and a negative CONNACK0x97 without inventing a SessionId.
 
+The new lifecycle transition reserves up to three effects before mutation:
+transport closure, persistence and deadline, or a known change followed by
+ephemeral-session closure and its deadline. Existing two-effect transitions and
+their minimum Outbox configuration retain their previous contract. A lifecycle
+transition that cannot reserve its own three-effect bound refuses before change.
+
 ## Reception and scope
 
 First retain a red test of512 existing-interface create/delete cycles at quota128:
