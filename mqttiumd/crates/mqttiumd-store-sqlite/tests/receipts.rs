@@ -291,3 +291,13 @@ fn real_receipt_barriers_observe_old_then_committed_state_without_command_identi
     );
     sql.store.set_receipt_hook(None);
 }
+#[test]
+fn max_profile_subscription_prefix_memory() {
+    conformance::a_maximum_product_subscription_prefix_fits_the_collection_budget(
+        &MemoryStore::create,
+    );
+}
+#[test]
+fn max_profile_subscription_prefix_sqlite() {
+    conformance::a_maximum_product_subscription_prefix_fits_the_collection_budget(&sqlite);
+}

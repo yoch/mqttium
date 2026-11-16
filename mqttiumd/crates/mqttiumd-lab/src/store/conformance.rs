@@ -3939,3 +3939,104 @@ pub fn collection_at_full_quota_preserves_business_and_startup_collapses_origins
     );
     assert!(world.store.apply(&world.release(1, 8, 2)).committed_now);
 }
+
+/// The largest legal product subscription recipes still fit a full 128-step
+/// collection pass after a held/lost response lets consumed work accumulate.
+pub fn a_maximum_product_subscription_prefix_fits_the_collection_budget<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::command::UpdateSubscriptions;
+    use mqttiumd_contract::pubsub::{GrantedSubscriptionChange, MAX_FILTERS};
+    use mqttiumd_contract::receipts::{
+        ReceiptClosure, ReceiptCollection, ReceiptCollectionReply, ReceiptOrigin,
+    };
+    let limits = Limits {
+        payload_bytes: PayloadBytes::new(4 * 1024 * 1024),
+        references: References::new(128),
+        exchange_slots: ExchangeSlots::new(128),
+        receipt_slots: ReceiptSlots::new(8192),
+        max_targets_per_admission: 16,
+        max_topic_bytes: 1024,
+        max_payload_bytes: 32768,
+        max_sessions: 128,
+        max_route_targets: 16,
+    };
+    let mut world = World::with_limits(make, limits);
+    let empty = ReceiptClosure::empty(ReceiptOrigin::of(operation_id(world.epoch, 1)));
+    assert!(matches!(
+        world.store.collect_receipts(ReceiptCollection {
+            closure: empty,
+            limit: 128
+        }),
+        Ok(ReceiptCollectionReply::Applied { .. })
+    ));
+    let filters: Vec<_> = (0..MAX_FILTERS)
+        .map(|index| {
+            let mut topic = vec![b'a'; 1024];
+            topic[1023] = b'0' + u8::try_from(index).unwrap();
+            GrantedSubscriptionChange {
+                topic: SharedBytes::copy_from(&topic, 1024).unwrap(),
+                granted: Some(Qos::AtLeastOnce),
+            }
+        })
+        .collect();
+    let mut metered_bytes = 0usize;
+    for sequence in 1..=128 {
+        let command = Command {
+            recipe: FrozenRecipe::freeze(Recipe::UpdateSubscriptions(UpdateSubscriptions {
+                operation: operation_id(world.epoch, sequence),
+                session: world.b,
+                session_revision: Revision::new(1),
+                route_revision: world.route_revision,
+                changes: BoundedVec::from_slice(&filters, MAX_FILTERS).unwrap(),
+            }))
+            .unwrap(),
+            payload: None,
+        };
+        let mut canonical = Vec::new();
+        command
+            .recipe
+            .get()
+            .encode_canonical(&mut canonical)
+            .unwrap();
+        metered_bytes = metered_bytes.checked_add(128 + canonical.len()).unwrap();
+        let applied = world.store.apply(&command);
+        let StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SubscriptionsChanged {
+            route_revision,
+            ..
+        })) = applied.reply
+        else {
+            panic!("legal product replacement {sequence} failed: {applied:?}");
+        };
+        assert!(applied.committed_now);
+        world.route_revision = route_revision;
+    }
+    assert!(
+        metered_bytes > ReadBudget::PAGE.max_bytes,
+        "the witness must exceed the ordinary page budget"
+    );
+    let before = world.store.snapshot().unwrap();
+    assert_eq!(before.operations.len(), 128);
+    assert_eq!(before.accounts.receipt_slots.get(), 128);
+    let closure = ReceiptClosure {
+        through: OperationSeq::new(128),
+        ..empty
+    };
+    assert_eq!(
+        world.store.collect_receipts(ReceiptCollection {
+            closure,
+            limit: 128
+        }),
+        Ok(ReceiptCollectionReply::Applied {
+            closure,
+            removed: 128,
+            retained: 0,
+            more: false
+        }),
+        "{metered_bytes} metered bytes are inside the supported product profile"
+    );
+    let after = world.store.snapshot().unwrap();
+    assert_eq!(after.routes, before.routes);
+    assert_eq!(after.route_revision, before.route_revision);
+    assert!(after.operations.is_empty());
+}
