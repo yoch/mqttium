@@ -893,7 +893,8 @@ def historical_ceiling(binary: Path, case: Path, response_timeout: float = 12) -
               "sql_mutations_by_probe": False, "constant_live_filter": True,
               "packet_identifier": 1, "positive_subacks": 0, "samples": [],
               "parameters": {"attempt_budget": HISTORICAL_RECEIPT_LIMIT + 1,
-                             "keep_alive": 0, "response_timeout_s": response_timeout}}
+                             "keep_alive": 0, "response_timeout_s": response_timeout,
+                             "first_phase_deadline_s": 300}}
     started = time.monotonic_ns()
     try:
         ready = broker.ready()
@@ -905,6 +906,7 @@ def historical_ceiling(binary: Path, case: Path, response_timeout: float = 12) -
             result["initial"] = table_counts(broker.db)
             answer = None
             for attempt in range(1, HISTORICAL_RECEIPT_LIMIT + 2):
+                require((time.monotonic_ns() - started) / 1e9 < 300, "ceiling_probe_deadline")
                 answer = replace_one(wire, attempt, response_timeout)
                 if answer.get("codes") != [1]:
                     break

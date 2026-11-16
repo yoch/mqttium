@@ -176,10 +176,27 @@ for name, result in receipts.items():
     binary = result['binary']
     if hashlib.sha256(Path(binary['path']).read_bytes()).hexdigest() != binary['sha256']:
         raise SystemExit('executed and retained binary differ')
+live = receipts['normal-live']['cases'][0]['workload']
+samples = [window['storage'] for window in live['windows']]
+live_summary = {'business_terminal': live['business_terminal'],
+                'business_terminal_total': sum(live['business_terminal'].values()),
+                'pid': samples[0]['pid'], 'file_inode': samples[0]['file_inode'],
+                'client_connections': {'mqttium': live['client_connections'], 'paho': live['paho_connections']},
+                'receipt_limit': 8192,
+                'observed_frontier_advances': live['frontier_advances_observed'],
+                'elapsed_ms': live['elapsed_ms'],
+                'receipt_rows': {'min': min(sample['counts']['operations'] for sample in samples),
+                                 'max': max(sample['counts']['operations'] for sample in samples)},
+                'resident_bytes': {'min': min(sample['resident_bytes'] for sample in samples),
+                                   'max': max(sample['resident_bytes'] for sample in samples)},
+                'last_file_bytes': samples[-1]['file_bytes'],
+                'last_page_count': samples[-1]['sqlite_file']['page_count'],
+                'last_freelist_count': samples[-1]['sqlite_file']['freelist_count']}
 index = {'format': 'mqttiumd.receipt-system-reception-index', 'schema_version': 1,
          'status': 'PASS', 'qualification': 'system-test-only', 'source_head': sys.argv[2],
          'source_archive': {'path': 'source.tar', 'sha256': hashlib.sha256((out / 'source.tar').read_bytes()).hexdigest()},
          'commands': 'commands.jsonl',
+         'normal_live_summary': live_summary,
          'system_witnesses': 'same-run-strace' if int(sys.argv[3]) else 'process-wait-status-only',
          'receipts': {name: {'path': f'{name}/receipt.json', 'status': result['status'],
                              'binary': result['binary'], 'failure': result.get('failure')}
