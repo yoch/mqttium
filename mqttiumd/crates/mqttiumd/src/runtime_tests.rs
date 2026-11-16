@@ -1932,55 +1932,283 @@ fn a_no_target_puback_observed_before_the_first_claim_cannot_bind_to_it_later() 
 
 #[test]
 fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connections() {
-    with_runtime(128,|runtime,_| {
-        let (old_generation,mut old)=peer(runtime);
-        runtime.connect(old_generation,connect_packet(b"takeover-boundary")).unwrap();
-        until(runtime,|r|r.session_requests.is_empty());
-        assert_eq!(read_frame(&mut old).0,0x20);
-        let session=runtime.sessions[b"takeover-boundary".as_slice()].id;
-        let (first,mut first_client)=peer(runtime);
-        runtime.connect(first,connect_packet(b"takeover-pressure-a")).unwrap();
-        until(runtime,|r|r.session_requests.is_empty());
-        assert_eq!(read_frame(&mut first_client).0,0x20);
-        let (second,mut second_client)=peer(runtime);
-        runtime.connect(second,connect_packet(b"takeover-pressure-b")).unwrap();
-        until(runtime,|r|r.session_requests.is_empty());
-        assert_eq!(read_frame(&mut second_client).0,0x20);
-        let (third,mut third_client)=peer(runtime);
-        runtime.connect(third,connect_packet(b"takeover-pressure-c")).unwrap();
-        until(runtime,|r|r.session_requests.is_empty());
-        assert_eq!(read_frame(&mut third_client).0,0x20);
+    with_runtime(128, |runtime, _| {
+        let (old_generation, mut old) = peer(runtime);
+        runtime
+            .connect(old_generation, connect_packet(b"takeover-boundary"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut old).0, 0x20);
+        let session = runtime.sessions[b"takeover-boundary".as_slice()].id;
+        let (first, mut first_client) = peer(runtime);
+        runtime
+            .connect(first, connect_packet(b"takeover-pressure-a"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut first_client).0, 0x20);
+        let (second, mut second_client) = peer(runtime);
+        runtime
+            .connect(second, connect_packet(b"takeover-pressure-b"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut second_client).0, 0x20);
+        let (third, mut third_client) = peer(runtime);
+        runtime
+            .connect(third, connect_packet(b"takeover-pressure-c"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut third_client).0, 0x20);
         for identifier in 1..=8 {
-            runtime.packet(first,0x32,publish_body(identifier)).unwrap();
+            runtime
+                .packet(first, 0x32, publish_body(identifier))
+                .unwrap();
             runtime.drain_inputs().unwrap();
-            runtime.packet(second,0x32,publish_body(identifier)).unwrap();
+            runtime
+                .packet(second, 0x32, publish_body(identifier))
+                .unwrap();
             runtime.drain_inputs().unwrap();
         }
-        assert_eq!(runtime.inflight.len(),IN_FLIGHT,"sixteen actual submissions block the ordinary effect head until their correlated replies are collected");
-        runtime.packet(third,0x32,publish_body(1)).unwrap();
+        assert_eq!(
+            runtime.inflight.len(),
+            IN_FLIGHT,
+            "sixteen actual submissions block the ordinary effect head until their correlated replies are collected"
+        );
+        runtime.packet(third, 0x32, publish_body(1)).unwrap();
         runtime.drain_inputs().unwrap();
         assert!(!runtime.owner.outbox().unwrap().is_empty());
-        let (new_generation,mut new)=peer(runtime);
-        runtime.connect(new_generation,connect_packet(b"takeover-boundary")).unwrap();
+        let (new_generation, mut new) = peer(runtime);
+        runtime
+            .connect(new_generation, connect_packet(b"takeover-boundary"))
+            .unwrap();
         runtime.drain_inputs().unwrap();
-        assert_eq!(runtime.owner.connection_of(session),Some(new_generation));
-        assert!(runtime.peers.contains_key(&old_generation),"the actual old transport survives while CloseConnection waits behind the refused Persist");
-        let observed_before=runtime.puback_observation;
-        old.write_all(&[0x40,2,0,1]).unwrap();
-        let deadline=Instant::now()+Duration::from_secs(2);
-        let mut result=Ok(());
-        while runtime.puback_observation==observed_before && Instant::now()<deadline {
-            result=runtime.connections();
-            if result.is_err() {break;}
+        assert_eq!(runtime.owner.connection_of(session), Some(new_generation));
+        assert!(
+            runtime.peers.contains_key(&old_generation),
+            "the actual old transport survives while CloseConnection waits behind the refused Persist"
+        );
+        let observed_before = runtime.puback_observation;
+        old.write_all(&[0x40, 2, 0, 1]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut result = Ok(());
+        while runtime.puback_observation == observed_before && Instant::now() < deadline {
+            result = runtime.connections();
+            if result.is_err() {
+                break;
+            }
             thread::sleep(Duration::from_millis(1));
         }
-        assert!(result.is_ok(),"stale_puback_stopped_reactor: a live old socket with superseded authority must not cause global failure: {:?}",result.err());
-        assert!(runtime.puback_observation>observed_before,"the real reader must reach the superseded generation's PUBACK");
+        assert!(
+            result.is_ok(),
+            "stale_puback_stopped_reactor: a live old socket with superseded authority must not cause global failure: {:?}",
+            result.err()
+        );
+        assert!(
+            runtime.puback_observation > observed_before,
+            "the real reader must reach the superseded generation's PUBACK"
+        );
         assert!(runtime.inputs.iter().any(|input|matches!(input,Input::ObservedPuback {connection,target:None,..} if connection.session==session && connection.generation==old_generation)),"the observation retains its original durable session/generation and never acquires the replacement connection");
-        until(runtime,|r|r.inflight.is_empty() && r.inputs.is_empty() && !r.peers.contains_key(&old_generation) && r.peers.get(&new_generation).is_some_and(|p|!p.pending));
-        assert_eq!(read_frame(&mut new).0,0x20);
-        runtime.packet(new_generation,0xc0,vec![]).unwrap();
+        until(runtime, |r| {
+            r.inflight.is_empty()
+                && r.inputs.is_empty()
+                && !r.peers.contains_key(&old_generation)
+                && r.peers.get(&new_generation).is_some_and(|p| !p.pending)
+        });
+        assert_eq!(read_frame(&mut new).0, 0x20);
+        runtime.packet(new_generation, 0xc0, vec![]).unwrap();
         runtime.drain_inputs().unwrap();
-        assert_eq!(read_frame(&mut new).0,0xd0,"the replacement and independent control traffic remain usable");
+        assert_eq!(
+            read_frame(&mut new).0,
+            0xd0,
+            "the replacement and independent control traffic remain usable"
+        );
+    });
+}
+
+fn turn_without_socket_receipts(runtime: &mut Runtime<'_>) {
+    runtime.writer_results().unwrap();
+    runtime.drain_inputs().unwrap();
+    runtime.dispatch().unwrap();
+}
+fn until_without_socket_receipts(
+    runtime: &mut Runtime<'_>,
+    condition: impl Fn(&Runtime<'_>) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !condition(runtime) && Instant::now() < deadline {
+        turn_without_socket_receipts(runtime);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        condition(runtime),
+        "the real durable/owner pipeline did not progress while socket receipts were deliberately unread"
+    );
+}
+
+#[test]
+fn observed_puback_copy_and_actual_old_callbacks_cannot_finish_a_reused_identifier() {
+    with_runtime(8, |runtime, path| {
+        let (subscriber, mut receiver) = peer(runtime);
+        runtime
+            .connect(subscriber, connect_packet(b"copy-subscriber"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut receiver).0, 0x20);
+        runtime
+            .packet(subscriber, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
+            .unwrap();
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut receiver).0, 0x90);
+        let session = runtime.sessions[b"copy-subscriber".as_slice()].id;
+        let connection = ConnectionKey {
+            session,
+            generation: subscriber,
+        };
+        let identifier = OutboundPacketId::new(1).unwrap();
+        let (publisher, mut source) = peer(runtime);
+        runtime
+            .connect(publisher, connect_packet(b"copy-publisher"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut source).0, 0x20);
+        // The actual network writer completes A's bytes, then waits before it
+        // can publish either WireProgress or Written. The peer can still ACK.
+        runtime.peers[&subscriber].io.pause_wire_progress(true);
+        runtime.packet(publisher, 0x32, publish_body(1)).unwrap();
+        until_without_socket_receipts(runtime, |r| {
+            r.outgoing_bindings.contains_key(&(connection, identifier))
+        });
+        let first_target = runtime.outgoing_bindings[&(connection, identifier)];
+        let (first, body) = read_frame(&mut receiver);
+        assert_eq!(first, 0x32);
+        assert_eq!(&body[3..5], &[0, 1]);
+        let original = dequeue_puback(runtime, subscriber, &mut receiver, 1);
+        assert!(
+            matches!(&original,Input::ObservedPuback {target:Some(target),..} if *target==first_target)
+        );
+        let old_observation = duplicate_puback_input(&original);
+        runtime.queue(original).unwrap();
+        runtime.drain_inputs().unwrap();
+        let mut old_finish = None;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            runtime.writer_results().unwrap();
+            for input in &runtime.inputs {
+                if let Input::StoreResult {
+                    effect,
+                    operation,
+                    reply:
+                        StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::DeliveryFinished {
+                            delivery,
+                            ..
+                        })),
+                } = input
+                    && *delivery == first_target.delivery
+                {
+                    if let Input::StoreResult { reply, .. } = input {
+                        old_finish = Some((*effect, *operation, *reply));
+                    }
+                }
+            }
+            runtime.drain_inputs().unwrap();
+            runtime.dispatch().unwrap();
+            if runtime.inflight.is_empty() && runtime.inputs.is_empty() && old_finish.is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "A's exact known Finish was not applied"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            runtime.frames.contains_key(&first_target.frame),
+            "legitimate A PUBACK must finish before the local Written callback can even be collected"
+        );
+        assert!(
+            mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite"))
+                .unwrap()
+                .outbound
+                .is_empty()
+        );
+        runtime.packet(publisher, 0x32, publish_body(2)).unwrap();
+        until_without_socket_receipts(runtime, |r| {
+            r.outgoing_bindings
+                .get(&(connection, identifier))
+                .is_some_and(|target| *target != first_target)
+        });
+        let second_target = runtime.outgoing_bindings[&(connection, identifier)];
+        assert_ne!(second_target.delivery, first_target.delivery);
+        assert_ne!(second_target.claim, first_target.claim);
+        assert_ne!(second_target.frame, first_target.frame);
+        runtime.peers[&subscriber].io.pause_wire_progress(false);
+        let (first, body) = read_frame(&mut receiver);
+        assert_eq!(
+            first, 0x32,
+            "B is a fresh occurrence, not a DUP retransmission of A"
+        );
+        assert_eq!(
+            &body[3..5],
+            &[0, 1],
+            "known Finish makes the smallest free identifier reusable"
+        );
+        let before =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap();
+        runtime.queue(old_observation).unwrap();
+        runtime.drain_inputs().unwrap();
+        let (effect, operation, reply) = old_finish.unwrap();
+        runtime
+            .queue(Input::StoreResult {
+                effect,
+                operation,
+                reply,
+            })
+            .unwrap();
+        runtime.drain_inputs().unwrap();
+        until_without_socket_receipts(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        let after =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap();
+        assert_eq!(
+            after.outbound, before.outbound,
+            "stale_puback_observation_rebound: A's already-associated copy must not finish B"
+        );
+        assert_eq!(after.obligations, before.obligations);
+        assert_eq!(
+            runtime.owner.puback_target(connection, identifier),
+            Some(second_target)
+        );
+        // Collect A's real delayed Written callback with B already occupying1.
+        runtime.connections().unwrap();
+        let delayed_b=runtime.inputs.iter().position(|input|matches!(input,Input::FrameResult {effect,..} if *effect==second_target.frame)).map(|index|runtime.inputs.remove(index).unwrap());
+        runtime.drain_inputs().unwrap();
+        assert_eq!(
+            runtime.owner.puback_target(connection, identifier),
+            Some(second_target)
+        );
+        assert_eq!(
+            mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite"))
+                .unwrap()
+                .outbound,
+            before.outbound,
+            "old socket callbacks release no new obligation or identifier"
+        );
+        let own_ack = dequeue_puback(runtime, subscriber, &mut receiver, 1);
+        assert!(
+            matches!(&own_ack,Input::ObservedPuback {target:Some(target),..} if *target==second_target)
+        );
+        runtime.queue(own_ack).unwrap();
+        runtime.drain_inputs().unwrap();
+        until_without_socket_receipts(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        if let Some(callback) = delayed_b {
+            runtime.queue(callback).unwrap();
+            runtime.drain_inputs().unwrap();
+        }
+        let final_state =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap();
+        assert!(
+            final_state.outbound.is_empty()
+                && final_state.obligations.is_empty()
+                && final_state.payloads.is_empty()
+        );
+        assert!(runtime.outgoing_bindings.is_empty());
     });
 }
