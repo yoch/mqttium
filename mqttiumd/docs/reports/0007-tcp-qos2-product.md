@@ -60,6 +60,11 @@ before core delivery, beyond the core's remembered closed window.
 | New PI use arrives before an old PUBCOMP write receipt | Match completion against the latest PUBLISH ingress serial | Red receive-window test lost the new entry; fixed tests include the actual socket/worker receipt race and ninth-PUBLISH refusal |
 | Unsupported CONNECT has a tiny Maximum Packet Size | Preserve only structurally validated limit context; flush a fitting refusal through the bounded writer | Codec red test and actual reactor tests cover both fitting refusal and close without oversized output |
 
+The two historical M1 payload-loss control patches are refreshed for the new
+metadata-cleanup context. Their mutation and expected verdict/assertion/reason
+remain unchanged; the full simulator and SQLite loops must execute them, not
+count a patch/build failure as detection.
+
 No positive ACK is emitted for an unapplied packet refused for volatile
 capacity. Previously accepted commands remain correlated and may commit.
 The runtime does not turn socket closure into certain rejection.

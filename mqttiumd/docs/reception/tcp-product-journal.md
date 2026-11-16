@@ -34,6 +34,31 @@
 - The final wrapper retains four actual executed binaries, a source archive,
   effective feature trees, build/client commands, client/durable/process
   observations, per-run strace, precise mutant failures and SHA256SUMS.
-- Next action: finish the final sequential checks, run the clean-source wrapper
-  and fresh transactional qualification, publish without overwriting concurrent
-  work, then verify the exact remote head/content and every SHA-specific check.
+- Published implementation: `f0cc192f31b440ee64e5132e6b95a83761ff4a2f`.
+  All 53 modified blobs were read back through GitHub and matched. PR #648
+  remains draft. Final local suites: 740 normal / 748 instrumented Rust,
+  142 oracle and 9 independent pilot tests; strict Clippy/formatting,
+  362 corpus and 405 trace files current, 377 schema documents agreeing.
+- Clean-source product receipt of that exact SHA:
+  `/workspace/mqttium-tcp-evidence/f0cc192f/index.json`; archive
+  `f0cc192f.tar.gz`, SHA-256
+  `80bcdaf3928b38d2a51fe5d3e402371480e4e9ce2e89186b79270ddfc0196cf8`.
+  A–H pass; exact `premature_pubrec` and `stale_generation_forwarded`
+  controls fail as required. Actual wait -9 and each run's own strace remain.
+- Its product CI job also passed. Artifact 14191085292 was downloaded;
+  ZIP SHA-256 `18803d2079db81ac3ad5fabcd83fa401c425513ce21cfdead3437a6cd0569ac5`.
+  The source head, all four retained binaries, event schemas/bounds and own-run
+  kill/wait were checked. CI, Formal models and Read the Docs passed; the
+  remaining mqttiumd gates were still running at this checkpoint.
+- A preflight then caught two stale M1 payload-loss mutation contexts after
+  the store cleanup. Only the contexts are refreshed; `expected.json` remains
+  byte-identical (SHA-256
+  `0c270a3626109a31a3e78704d2d9957c54e33452991274fabe899f05647f9bd7`).
+  A patch refusal is not semantic detection. Replay both complete mutant loops
+  and the clean-source product receipt before the final publication/checks.
+- Final SHA-specific CI and fresh K1/K2b/K3 qualification are retained in the
+  updated PR and its workflow artifacts. The final source identity is always
+  `index.json.source_head`; development archives are never relabelled.
+- Next product increment after reception: QoS 1/PUBACK after commit, finite
+  Packet Identifier reuse and MQTT-4.3.2-5 reconnect tests with an independent
+  client and a premature-PUBACK control. No permanent QoS 1 deduplication claim.

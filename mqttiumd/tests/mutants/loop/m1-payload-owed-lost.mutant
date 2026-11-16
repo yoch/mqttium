@@ -1,10 +1,9 @@
 diff --git a/mqttiumd/crates/mqttiumd-lab/src/store/durable.rs b/mqttiumd/crates/mqttiumd-lab/src/store/durable.rs
-index ff11f19..6103013 100644
 --- a/mqttiumd/crates/mqttiumd-lab/src/store/durable.rs
 +++ b/mqttiumd/crates/mqttiumd-lab/src/store/durable.rs
-@@ -663,6 +663,8 @@ impl DurableState {
+@@ -673,6 +673,8 @@
              _ => return Err(failed),
-         }
+         };
          self.inbound.remove(&slot);
 +        // MUTANT M1: the payload still owed by its obligations is lost.
 +        self.payloads.clear();
