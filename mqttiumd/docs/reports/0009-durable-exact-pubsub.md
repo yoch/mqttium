@@ -129,6 +129,13 @@ before close and retaining deferred business order correct these cases.
 Canonical subscription equality also ignores container capacity, as admission
 equality already did; incomplete/trailing encodings remain refused.
 
+The first published integration at `7411400c` passed the product, models and
+proof jobs, but the historical M3 mutation did not compile: its injected
+recipe match omitted kinds 3/4/5. That compiler error is not a semantic
+detection. The patch now explicitly excludes those non-admission recipes;
+its premature PUBREC mutation and required assertion/reason are unchanged.
+The repaired loop must execute on both stores before final CI reception.
+
 ## Contracts and remaining scope
 
 Contract digest changes from

@@ -2,18 +2,21 @@ diff --git a/mqttiumd/crates/mqttiumd-core/src/owner.rs b/mqttiumd/crates/mqttiu
 index 2f882bc..01baba3 100644
 --- a/mqttiumd/crates/mqttiumd-core/src/owner.rs
 +++ b/mqttiumd/crates/mqttiumd-core/src/owner.rs
-@@ -1157,6 +1157,10 @@ impl Owner {
+@@ -1157,6 +1157,13 @@ impl Owner {
          let Verdict::Transition(phase) = CommandPhase::Prepared.on(CommandEvent::Submit) else {
              return Err(IMPOSSIBLE);
          };
 +        let recipe_source = match &recipe {
 +            Recipe::AdmitPublication(admit) => Some((admit.source.session, admit.source.packet_id)),
-+            Recipe::ReleaseInbound(_) => None,
++            Recipe::ReleaseInbound(_)
++            | Recipe::ChangeSubscriptions(_)
++            | Recipe::ClaimDelivery(_)
++            | Recipe::FinishDelivery(_) => None,
 +        };
          let recipe = FrozenRecipe::freeze(recipe).map_err(|error| match error {
              RecipeError::AllocationFailed => Stop::from(AllocationFailed),
              _ => IMPOSSIBLE,
-@@ -1165,10 +1169,27 @@ impl Owner {
+@@ -1165,10 +1172,27 @@ impl Owner {
              command: Command { recipe, payload },
          })?;
          let deadline = draw(&mut draft.counters.deadline, DeadlineToken::checked_next)?;
