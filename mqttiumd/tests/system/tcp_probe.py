@@ -145,6 +145,15 @@ class Observations:
         with self.lock:
             self._record(kind, **fields)
 
+    def record_bytes(self, kind: str, data: bytes, **fields: object) -> None:
+        # Keep complete small frames; larger test writes/reads retain an exact
+        # digest and length rather than exceeding the observer's own budget.
+        if len(data) <= 2048:
+            self.record(kind, bytes=data.hex(), **fields)
+        else:
+            self.record(kind, byte_count=len(data), sha256=hashlib.sha256(data).hexdigest(),
+                        prefix=data[:64].hex(), **fields)
+
     def _record(self, kind: str, **fields: object) -> None:
         value = {"kind": kind, "seq": str(self.sequence), "monotonic_ns": str(time.monotonic_ns()), **fields}
         raw = (json.dumps(value, sort_keys=True) + "\n").encode()
@@ -176,7 +185,7 @@ class Wire:
     def send(self, data: bytes, *, stride: int | None = None, record: bool = True) -> None:
         if record:
             require(len(data) <= 131072, "probe_send_budget")
-            self.observations.record("client_tx", label=self.label, bytes=data.hex())
+            self.observations.record_bytes("client_tx", data, label=self.label)
         try:
             if stride:
                 for index in range(0, len(data), stride):
@@ -204,7 +213,7 @@ class Wire:
                 self.closed = True
                 self.decoder.finish()
                 raise ReceiptFailure("peer_closed")
-            self.observations.record("client_rx", label=self.label, bytes=data.hex())
+            self.observations.record_bytes("client_rx", data, label=self.label)
             self.frames.extend(self.decoder.feed(data))
 
     def expect(self, kind: int, identifier: int | None = None, timeout: float = 5) -> Frame:

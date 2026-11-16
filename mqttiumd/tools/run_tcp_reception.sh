@@ -140,3 +140,6 @@ files = sorted(path for path in out.rglob('*') if path.is_file())
 (out / 'SHA256SUMS').write_text(''.join(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(out)}\n' for path in files))
 print(json.dumps({'status': 'PASS', 'source_head': sys.argv[2], 'receipt': str(out / 'index.json')}))
 PY
+tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+    -czf "$tcp_output.tar.gz" -C "$(dirname -- "$tcp_output")" "$(basename -- "$tcp_output")"
+sha256sum "$tcp_output.tar.gz" >"$tcp_output.tar.gz.sha256"
