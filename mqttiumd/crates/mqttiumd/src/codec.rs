@@ -856,6 +856,10 @@ pub fn refusal(error: Error, before_connack: bool) -> Vec<u8> {
 }
 
 /// Encode the core-authorized non-retained outgoing QoS 1 publication.
+pub fn encode_qos0(_topic: &SharedBytes, _payload: &SharedBytes) -> Result<Vec<u8>, Error> {
+    Err(unsupported("QosZeroOutsideProfile"))
+}
+
 pub fn encode_publish(
     packet_id: OutboundPacketId,
     topic_name: &SharedBytes,
@@ -909,6 +913,13 @@ pub fn encode_publish(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn qos0_has_no_mqtt_identifier_ack_or_duplicate_flag() {
+        use mqttiumd_contract::packet::{InboundPacket,Qos,SharedBytes};
+        assert!(matches!(super::decode(0x30,b"\0\x01t\0p",BOUNDS),Ok(super::Packet::Core(InboundPacket::Publish{qos:Qos::AtMostOnce,packet_id:None,dup:false,..}))));
+        assert_eq!(super::encode_qos0(&SharedBytes::copy_from(b"t",1).unwrap(),&SharedBytes::copy_from(b"p",1).unwrap()).unwrap(),[0x30,5,0,1,b't',0,b'p']);
+        assert!(super::decode(0x38,b"\0\x01t\0p",BOUNDS).is_err());
+    }
     #[test]
     fn pubsub_reasons_frames_and_filter_counts_have_packet_specific_bounds() {
         use mqttiumd_contract::{ids::OutboundPacketId, pubsub::FilterResults};
