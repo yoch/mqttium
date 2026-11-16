@@ -7,6 +7,30 @@ pi_repo=$(git -C "$pi_root" rev-parse --show-toplevel)
 pi_python=${PYTHON:-python3}
 pi_out=$("$pi_python" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve())' "$1")
 case "$pi_out/" in "$pi_repo/"*) echo "output must be outside the checkout" >&2; exit 2;; esac
+# Freeze builder, harness and public client imports together. The caller may
+# advance afterwards; this invocation owns its private detached source tree.
+if [[ -z ${MQTTIUMD_PI_PIN_SOURCE:-} ]]; then
+    [[ -z $(git -C "$pi_repo" status --porcelain --untracked-files=normal) ]] || {
+        echo "reception requires a clean source tree" >&2; exit 2;
+    }
+    pi_pin_sha=$(git -C "$pi_repo" rev-parse HEAD)
+    pi_pin_parent=$(mktemp -d "${TMPDIR:-/tmp}/mqttiumd-pi-source.XXXXXX")
+    pi_pin_cleanup() {
+        git -C "$pi_repo" worktree remove --force -- "$pi_pin_parent/source" >/dev/null 2>&1 || true
+        rm -f -- "$pi_pin_parent/source-pin.log"
+        rmdir -- "$pi_pin_parent" >/dev/null 2>&1 || true
+    }
+    trap pi_pin_cleanup EXIT
+    git -C "$pi_repo" worktree add --detach -- "$pi_pin_parent/source" "$pi_pin_sha" >"$pi_pin_parent/source-pin.log" 2>&1
+    pi_pin_status=0
+    MQTTIUMD_PI_PIN_SOURCE="$pi_pin_parent/source" MQTTIUMD_PI_PIN_SHA="$pi_pin_sha" \
+        MQTTIUMD_PI_CALLER_SOURCE="$pi_repo" \
+        "$pi_pin_parent/source/mqttiumd/tools/run_pi_reception.sh" "$pi_out" || pi_pin_status=$?
+    exit "$pi_pin_status"
+fi
+[[ "$pi_repo" == "$MQTTIUMD_PI_PIN_SOURCE" && $(git -C "$pi_repo" rev-parse HEAD) == "$MQTTIUMD_PI_PIN_SHA" ]] || {
+    echo "invalid PI source pin" >&2; exit 2;
+}
 mkdir -p -- "$pi_out"
 [[ -z $(ls -A -- "$pi_out") ]] || { echo "output must be empty" >&2; exit 2; }
 [[ -z $(git -C "$pi_repo" status --porcelain --untracked-files=normal) ]] || {
@@ -27,6 +51,14 @@ with Path(sys.argv[1]).open('a') as stream:
     stream.write(json.dumps({'kind': sys.argv[2], 'cwd': sys.argv[3], 'command': sys.argv[4:]}) + '\n')
 PY
 }
+pi_record source-pin git -C "$MQTTIUMD_PI_CALLER_SOURCE" worktree add --detach "$pi_repo" "$MQTTIUMD_PI_PIN_SHA"
+"$pi_python" - "$pi_out/source-pin.json" "$MQTTIUMD_PI_CALLER_SOURCE" "$pi_repo" "$pi_sha" <<'PY'
+from pathlib import Path
+import json, sys
+Path(sys.argv[1]).write_text(json.dumps({'caller_source': sys.argv[2], 'captured_caller_head': sys.argv[4],
+    'pinned_source': sys.argv[3], 'pinned_head': sys.argv[4],
+    'assumption': 'this invocation exclusively owns its private detached source tree'}, indent=2) + '\n')
+PY
 "$pi_python" - "$pi_out" <<'PY'
 from pathlib import Path
 from importlib.metadata import version
@@ -96,11 +128,13 @@ index = {'format': 'mqttiumd.pi-system-reception-index', 'schema_version': 1,
          'reception_scope': ['B-normal-long', 'B-normal-reverse'],
          'source_archive': {'path': 'source.tar', 'sha256': hashlib.sha256((out / 'source.tar').read_bytes()).hexdigest()},
          'commands': 'commands.jsonl', 'system_witnesses': 'same-run-strace' if int(sys.argv[3]) else 'process-status-only',
+         'source_pin': json.loads((out / 'source-pin.json').read_text()),
          'normal_summary': {'finished_deliveries': evidence['finished_deliveries'],
              'wire_identifier_reuses': evidence['wire']['identifier_reuses'],
              'unique_wire_identifiers': evidence['wire']['unique_identifiers'],
              'elapsed_ms': evidence['elapsed_ms'], 'publisher_connections': evidence['publisher_connections'],
              'subscriber_connections': evidence['subscriber_connections'], 'proxy_connections': evidence['wire']['connections']},
+         'receipt_collection': long['receipt_collection'],
          'receipts': {name: {'path': f'{name}/receipt.json', 'binary': result['binary'], 'status': result['status']}
                       for name, result in receipts.items()},
          'limitations': ['Finite system evidence does not qualify all MQTT behavior or indefinite service.',
