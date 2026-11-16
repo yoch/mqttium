@@ -38,12 +38,19 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
                         "consume.emission",
                         "receipt.close.prepared",
                         "receipt.close.committed",
+                        "session.open.prepared",
+                        "session.open.committed",
+                        "session.close.prepared",
+                        "session.close.committed",
                     ]
                     .contains(&point)
                     {
                         return Err("unknown test point");
                     }
-                    hooks.pause.push(point.to_owned());
+                    // Only declared unique points enter the bounded control set.
+                    if !hooks.pause.iter().any(|known| known == point) {
+                        hooks.pause.push(point.to_owned());
+                    }
                 }
             }
             _ => return Err("unknown or unavailable option"),
@@ -84,6 +91,39 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lifecycle_points_are_bounded_and_instrumented_only() {
+        let points = [
+            "session.open.prepared",
+            "session.open.committed",
+            "session.close.prepared",
+            "session.close.committed",
+        ];
+        let arguments = |value: String| {
+            [
+                "--db".to_owned(),
+                "unused.sqlite".to_owned(),
+                "--events".to_owned(),
+                "unused.jsonl".to_owned(),
+                "--test-control".to_owned(),
+                std::env::temp_dir().to_string_lossy().into_owned(),
+                "--test-pause".to_owned(),
+                value,
+            ]
+        };
+        let repeated = (0..128).flat_map(|_| points).collect::<Vec<_>>().join(",");
+        let result = parse_arguments(arguments(repeated).into_iter());
+        if cfg!(feature = "test-hooks") {
+            assert_eq!(result.unwrap().hooks.pause, points);
+            assert!(matches!(
+                parse_arguments(arguments("session.open.unknown".to_owned()).into_iter()),
+                Err("unknown test point")
+            ));
+        } else {
+            assert!(matches!(result, Err("unknown or unavailable option")));
+        }
+    }
 
     #[test]
     fn receipt_closure_points_are_available_only_in_the_instrumented_cli() {
