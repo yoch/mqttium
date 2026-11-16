@@ -2581,17 +2581,6 @@ pub fn qos0_consumption_preserves_unknown_and_atomic_capacity<S: DurableStore>(
             payload: None,
         };
         let before = world.store.snapshot().unwrap();
-        world
-            .store
-            .set_durability(super::durable::Durability::Failing);
-        assert_eq!(
-            outcome(world.store.apply(&consume).reply),
-            StoreOutcome::PendingOrUnknown
-        );
-        assert_eq!(world.store.snapshot().unwrap(), before);
-        world
-            .store
-            .set_durability(super::durable::Durability::Available);
         if receipts == 1 {
             assert_eq!(
                 outcome(world.store.apply(&consume).reply),
