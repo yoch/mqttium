@@ -451,9 +451,12 @@ async def cycles(binary, case, count=TARGET_CYCLES):
                 cursor.read()
                 before_close = cursor.last
                 await client.disconnect()
-                final = await gone(broker, cursor, name)
-                assert_drained(final)
                 changed, cardinality = await closed_and_drained(broker, cursor, last_session, before_close)
+                final = session_snapshot(broker)
+                # Atomic physical cleanup is already a known fact here. A
+                # retained Terminal row is a cardinality violation, not a
+                # generic wait-for-absence timeout.
+                assert_drained(final)
                 require(broker.process.pid == pid and final['file_inode'] == inode,
                         'session_process_or_file_changed')
                 require(client.result['connections'] == 1, 'session_unexpected_reconnect')
