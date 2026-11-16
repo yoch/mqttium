@@ -61,3 +61,11 @@
   normal/instrumented target, fmt, strict workspace Clippy and validate11 pass.
   Freeze the integrated source and rerun the entire strict65537 wrapper;
   publish with expected9e653055 ancestry/lease and verify its own CI/artifacts.
+- Correct the remaining obsolete monotonic-PI paragraph in the product profile
+  (6661ef3d, documentation only). A fresh strict run receives/finishes11264,
+  then stops on collector FileNotFoundError during a real log rotation. Keep
+  its original FAIL; add a scan/open rotation regression and preserve cursor
+  state across interrupted scans. Restart the full normal case from zero.
+  Normal Rust log at546a completes53 result groups/882 tests with zero failures;
+  the environment interrupted its orchestration status recording, not cargo's
+  complete log. A filesystem-backed runner records remaining gates/statuses.

@@ -170,6 +170,14 @@ formatting and validation pass. The 57 system pilot tests include the two
 new collector regressions. Final source, run counts and CI remain bound by
 the final receipt/index and PR rather than inherited from this failed attempt.
 
+A subsequent normal attempt at 6661ef3d reached 11,264 received/finished
+deliveries before a different collector race: the event-file path disappeared
+between enumeration and open during rotation (FileNotFoundError). Its original
+FAIL receipt and source/binary identities are also retained. This is an
+incomplete system run, not a broker safety violation or mutation detection.
+The collector must preserve its offsets across an interrupted scan and retry
+within the existing bounded observation deadline before the final fresh run.
+
 ## Remaining bounds and next increment
 
 The existing 128-session persistent/infinite-expiry bound remains; absent
