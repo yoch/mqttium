@@ -77,6 +77,8 @@ pub enum RecoveredFact {
         session: SessionId,
         client_id: SharedBytes,
         revision: Revision,
+        expiry: crate::session::SessionExpiry,
+        opened_by: Option<OperationId>,
     },
     /// An inbound QoS 2 slot linking a client replay to its publication.
     InboundExchange {
@@ -212,6 +214,17 @@ pub enum FrameProgress {
 /// It is moved, never copied: a step either consumes it or hands it back.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Input {
+    OpenSession {
+        connection: ConnectionGeneration,
+        client_id: SharedBytes,
+        clean_start: bool,
+        expiry: crate::session::SessionExpiry,
+    },
+    EndSession {
+        connection: ConnectionKey,
+        opened_by: Option<OperationId>,
+        reason: crate::session::SessionEndReason,
+    },
     /// Enable/pump bounded live receipt collection. Only product adapters that
     /// implement the control invoke it; ordinary S0 fixture runs do not.
     MaintainReceipts,
@@ -313,6 +326,20 @@ pub enum CloseReason {
 /// An effect: a responsibility transferred to an adapter.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Effect {
+    /// A known failed session establishment has no invented SessionId.
+    /// Reason is a valid MQTT 5 CONNACK failure code; transport then closes.
+    SessionRefused {
+        connection: ConnectionGeneration,
+        reason: u8,
+    },
+    /// Install a correlated known lifecycle result in the transport/cache
+    /// adapter before accepting subsequent frames for that binding.
+    SessionChanged {
+        operation: OperationId,
+        connection: Option<ConnectionGeneration>,
+        client_id: SharedBytes,
+        change: crate::session::SessionChange,
+    },
     /// A dedicated control lane; it never consumes a business receipt slot.
     CollectReceipts {
         collection: crate::receipts::ReceiptCollection,
@@ -842,6 +869,65 @@ impl Outbox {
                     SubmitResult::Accepted => {
                         accepted += 1;
                         if is_collection {
+                            waiting = false;
+                        }
+                        None
+                    }
+                    SubmitResult::NotSubmitted { effect, reason } => {
+                        blocked = Some(reason);
+                        Some(effect)
+                    }
+                }
+            } else {
+                Some(effect)
+            };
+            if let Some(effect) = restore {
+                let restored = self.queue.try_push_back(effect);
+                debug_assert!(restored.is_ok(), "the scanned slot was taken");
+            }
+        }
+        DispatchReport { accepted, blocked }
+    }
+
+    /// Bounded session controls can bypass blocked ordinary/network effects.
+    /// Lifecycle cuts are explicitly ordered against old commands by durable
+    /// SessionId/attachment guards, not by the ordinary dispatch lane.
+    /// A blocked control fences later controls in this pass. The adapter also
+    /// fences a pending physical close/cache installation before another send.
+    pub fn dispatch_session_controls(
+        &mut self,
+        sink: &mut dyn EffectSink,
+        flight: Option<(OperationId, DeadlineToken)>,
+    ) -> DispatchReport {
+        let mut waiting = flight.is_some_and(|(operation, _)| self.queue.iter().any(|e| {
+            matches!(e.effect(), Effect::Persist {command} if command.recipe.operation() == operation)
+        }));
+        let mut accepted = 0;
+        let mut blocked = None;
+        let count = self.queue.len();
+        for _ in 0..count {
+            let Some(effect) = self.queue.pop_front() else {
+                break;
+            };
+            let lifecycle_persist = matches!(effect.effect(), Effect::Persist {command} if matches!(command.recipe.get(), crate::command::Recipe::SessionLifecycle(_)));
+            let lifecycle_resolve = !waiting
+                && matches!(effect.effect(), Effect::ResolveAndFence {operation} if flight.is_some_and(|(current,_)| *operation == current));
+            let lifecycle_deadline = !waiting
+                && matches!(effect.effect(), Effect::ArmDeadline {token,..} if flight.is_some_and(|(_,current)| *token == current));
+            let selected = lifecycle_persist
+                || lifecycle_resolve
+                || lifecycle_deadline
+                || matches!(
+                    effect.effect(),
+                    Effect::CloseConnection { .. }
+                        | Effect::SessionChanged { .. }
+                        | Effect::SessionRefused { .. }
+                );
+            let restore = if selected && blocked.is_none() {
+                match sink.try_submit(effect) {
+                    SubmitResult::Accepted => {
+                        accepted += 1;
+                        if lifecycle_persist {
                             waiting = false;
                         }
                         None
@@ -2763,6 +2849,8 @@ mod recovery_order_tests {
                 session: SessionId::new(7),
                 client_id: SharedBytes::copy_from(b"client", 16).expect("short identifier"),
                 revision: Revision::new(1),
+                expiry: crate::session::SessionExpiry::Never,
+                opened_by: None,
             },
             RecoveredFact::InboundExchange {
                 exchange: ExchangeId {

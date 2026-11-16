@@ -15,6 +15,7 @@ use crate::ids::{
 /// The durable facts established by a committed command.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CommitFacts {
+    SessionLifecycle(crate::session::SessionChange),
     DeliveryConsumed {
         delivery: DeliveryId,
         target: SessionId,
@@ -42,7 +43,9 @@ pub enum CommitFacts {
         exchange: ExchangeId,
     },
     /// The inbound QoS 2 exchange was durably terminated after PUBREL.
-    InboundReleased { exchange: ExchangeId },
+    InboundReleased {
+        exchange: ExchangeId,
+    },
 }
 
 /// Why a command was certainly not executed.

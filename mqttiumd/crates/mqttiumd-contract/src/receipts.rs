@@ -10,7 +10,9 @@ use crate::ids::{
 };
 
 pub const RECEIPT_WINDOW: usize = 1024;
-pub const RECEIPT_DATA_WINDOW: usize = 768;
+/// Leaves 384 positions for at most 128 inbound, 128 outgoing and 128
+/// session-termination continuations behind an unresolved business hole.
+pub const RECEIPT_DATA_WINDOW: usize = 640;
 pub const RECEIPT_CONTROL_RESERVE: u64 = 512;
 pub const MAX_RECEIPT_ORIGINS: usize = 64;
 pub const MAX_COLLECTION_ROWS: u16 = 128;
@@ -122,6 +124,10 @@ impl ReceiptClass {
     #[must_use]
     pub const fn of(recipe: &Recipe) -> Self {
         match recipe {
+            Recipe::SessionLifecycle(change) => match change.action {
+                crate::session::SessionAction::Open { .. } => Self::Business,
+                crate::session::SessionAction::Close { .. } => Self::Control,
+            },
             Recipe::AdmitPublication(_)
             | Recipe::ChangeSubscriptions(_)
             | Recipe::UpdateSubscriptions(_) => Self::Business,

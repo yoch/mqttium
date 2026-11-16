@@ -250,6 +250,7 @@ impl Eq for UpdateSubscriptions {}
 /// The closed set of durable recipes of the received perimeter.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Recipe {
+    SessionLifecycle(crate::session::SessionLifecycle),
     AdmitPublication(AdmitPublication),
     ReleaseInbound(ReleaseInbound),
     ChangeSubscriptions(ChangeSubscriptions),
@@ -311,6 +312,7 @@ impl Recipe {
     #[must_use]
     pub fn operation(&self) -> OperationId {
         match self {
+            Self::SessionLifecycle(change) => change.operation,
             Self::AdmitPublication(admit) => admit.operation,
             Self::ReleaseInbound(release) => release.operation,
             Self::ChangeSubscriptions(change) => change.operation,
@@ -324,6 +326,7 @@ impl Recipe {
     /// Checks the internal consistency the canonical layout relies on.
     pub fn check(&self) -> Result<(), RecipeError> {
         match self {
+            Self::SessionLifecycle(change) => change.check(),
             Self::UpdateSubscriptions(change) => {
                 if change.changes.is_empty() || change.changes.len() > MAX_FILTERS {
                     return Err(RecipeError::InvalidField("subscription_count"));
@@ -406,6 +409,10 @@ impl Recipe {
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
         match self {
+            Self::SessionLifecycle(change) => {
+                out.push(8);
+                change.encode(out);
+            }
             Self::ConsumeDelivery(consume) => {
                 out.push(KIND_CONSUME_DELIVERY);
                 out.extend_from_slice(&consume.operation.to_be_bytes());
@@ -528,6 +535,9 @@ impl Recipe {
             return Err(RecipeError::UnknownFormat(format));
         }
         let recipe = match reader.u8()? {
+            8 => {
+                Self::SessionLifecycle(crate::session::SessionLifecycle::decode(&mut reader.bytes)?)
+            }
             KIND_CONSUME_DELIVERY => {
                 let operation = reader.operation()?;
                 let publication = PublicationId::from_be_slice(reader.take(32)?)

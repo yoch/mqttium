@@ -26,4 +26,5 @@ pub mod outcome;
 pub mod packet;
 pub mod pubsub;
 pub mod receipts;
+pub mod session;
 pub mod step;

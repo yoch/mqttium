@@ -77,6 +77,17 @@ identity and byte/row bounds before selection/allocation. Session rows, caches,
 owner metadata, work notifications, emission registries and lifecycle flights
 are bounded by live/configured state, not historical ClientIDs.
 
+The physical receipt quota8192 and control reserve512 remain unchanged. New
+opens are business commands, terminations are controls. The per-origin span
+stays1024; its business threshold becomes640 instead of768, leaving384 sequence
+positions for at most128 inbound,128 outgoing and128 session-termination
+continuations. A known close behind another unknown result still occupies its
+position until the prefix can advance; one simultaneous lifecycle flight alone
+would not justify reserving only one extra position. New opens stop at the
+business threshold, so repeated replacement cannot create unbounded controls
+behind a hole. Same-identity resolution and collection allocate no new command
+identity. Control effects retain their explicit Outbox and writer reserves.
+
 ## Reception and scope
 
 First retain a red test of512 existing-interface create/delete cycles at quota128:

@@ -197,6 +197,8 @@ pub struct SessionRecord {
     pub client_id: Vec<u8>,
     pub revision: Revision,
     pub state: SessionState,
+    pub expiry: mqttiumd_contract::session::SessionExpiry,
+    pub opened_by: Option<OperationId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
