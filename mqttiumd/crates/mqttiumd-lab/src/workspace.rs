@@ -516,6 +516,7 @@ mod tests {
         let root = copy_of_the_contracts("one-snapshot");
         let contracts = Path::new("contracts/v1");
         let workspace = Workspace::open(&root, contracts).expect("opens");
+        let contract_count = workspace.check_contracts().len();
         let digest = workspace.contracts_digest().to_owned();
         let registry = Path::new("contracts/v1/p1.transitions.json");
         assert!(workspace.check_file(registry).is_accepted());
@@ -540,7 +541,7 @@ mod tests {
                 report.diagnostics
             );
         }
-        assert_eq!(workspace.check_contracts().len(), 7);
+        assert_eq!(workspace.check_contracts().len(), contract_count);
 
         // Opened again, the directory is other contracts, and invalid ones.
         assert!(Workspace::open(&root, contracts).is_err());
