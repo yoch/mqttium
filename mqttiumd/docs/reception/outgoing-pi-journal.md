@@ -36,3 +36,14 @@
   b6f5120f/4eef57d1 and fixf100d8ae preserve a durable-confirmed peer SessionId;
   stale facts retain their old generation. Actual Some-copy/early-ACK/Written
   and old-Finish replay test4452186d passes. Root integrated through056a2d8f.
+- Full normal/instrumented Rust suites ran sequentially at4611dad2:882/891
+  PASS, both strict Clippy passes, CLI validate accepted11, digest8884608f...0bb05.
+  Runtime tests also cover ACK received before actual WireProgress/Written.
+- Harness review fixed two evidence gaps test-first: only empty registration
+  is not active collection, and quotas are checked at every/final SQL window;
+  builder/harness/client imports now share an exclusively owned private pinned
+  checkout even if the caller advances. Original red/fix pairs are retained.
+- Nine short real C/D/E diagnostic cases pass. The runtime rebinding mutant
+  compiles and fails exactly observed_puback_rebound; three pure transition
+  mutants retain their separate scope. The final clean wrapper reruns these
+  before strict65537 plus reverse clients; no prior source is relabeled.
