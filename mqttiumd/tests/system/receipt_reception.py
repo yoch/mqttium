@@ -197,11 +197,13 @@ class PahoPeer:
         self.client.max_inflight_messages_set(8)
         self.connected, self.subscribed = threading.Event(), threading.Event()
         self.messages = queue.Queue(maxsize=16)
-        self.failures = []
+        self.failure = None
+        self.connect_count = 0
         self.connect_observation = None
         self.suback = None
 
         def connected(_client, _userdata, flags, reason, _properties):
+            self.connect_count += 1
             self.connect_observation = {"reason": reason.value, "session_present": flags.session_present}
             self.connected.set()
 
@@ -213,19 +215,23 @@ class PahoPeer:
             try:
                 self.messages.put_nowait(publication)
             except queue.Full:
-                self.failures.append("paho_inbound_budget")
+                self.failure = "paho_inbound_budget"
 
         self.client.on_connect, self.client.on_subscribe, self.client.on_message = connected, subscribed, message
         properties = Properties(PacketTypes.CONNECT)
         properties.SessionExpiryInterval = 0xFFFFFFFF
         properties.ReceiveMaximum, properties.MaximumPacketSize = 8, 65536
-        self.client.connect(*address, keepalive=10, clean_start=False, properties=properties)
-        self.client.loop_start()
-        require(self.connected.wait(3), "paho_connack_missing")
-        require(self.connect_observation == {"reason": 0, "session_present": False}, "paho_connack_invalid")
-        code, mid = self.client.subscribe([(topic, 1)])
-        require(code == mqtt.MQTT_ERR_SUCCESS and self.subscribed.wait(12), "paho_suback_missing")
-        require(self.suback == {"packet_id": mid, "reason_codes": [1]}, "paho_suback_invalid")
+        try:
+            self.client.connect(*address, keepalive=10, clean_start=False, properties=properties)
+            self.client.loop_start()
+            require(self.connected.wait(3), "paho_connack_missing")
+            require(self.connect_observation == {"reason": 0, "session_present": False}, "paho_connack_invalid")
+            code, mid = self.client.subscribe([(topic, 1)])
+            require(code == mqtt.MQTT_ERR_SUCCESS and self.subscribed.wait(12), "paho_suback_missing")
+            require(self.suback == {"packet_id": mid, "reason_codes": [1]}, "paho_suback_invalid")
+        except Exception:
+            self.close()
+            raise
 
     def publish(self, topic: str, payload: bytes, qos: int) -> dict:
         receipt = self.client.publish(topic, payload, qos=qos, retain=False)
@@ -238,7 +244,7 @@ class PahoPeer:
             message = self.messages.get(timeout=12)
         except queue.Empty as error:
             raise ReceiptFailure("paho_delivery_missing") from error
-        require(not self.failures and message.topic == topic and bytes(message.payload) == payload
+        require(self.failure is None and message.topic == topic and bytes(message.payload) == payload
                 and int(message.qos) == 1, "paho_delivery_wrong")
         require(self.client.ack(message.mid, message.qos) == 0, "paho_ack_submission")
         return {"packet_id": message.mid, "qos": 1, "payload_sha256": hashlib.sha256(payload).hexdigest()}
@@ -376,7 +382,8 @@ async def live_public_workload(broker: Broker, case: Path, terminal_commands: in
     paho = None
     transcript = BusinessTranscript(case / "public-client-transcript.jsonl")
     tail = EventTail(broker.events_path, broker.process.pid)
-    result = {"clients": {"mqttium": client_identity()}, "windows": [], "mixed_exchanges": [],
+    result = {"clients": {"mqttium": client_identity()}, "client_process_id": os.getpid(),
+              "windows": [], "mixed_exchanges": [],
               "business_terminal": {"subscription_replacements": 0, "mqttium_publications": 0,
                                     "paho_publications": 0},
               "parameters": {"replacement_budget": terminal_commands, "window_commands": WINDOW_COMMANDS,
@@ -458,6 +465,8 @@ async def live_public_workload(broker: Broker, case: Path, terminal_commands: in
         result["client_packet_identifier_range"] = {"first": first_mid, "last": last_mid}
         result["client_connections"] = client.stats().connections
         require(result["client_connections"] == 1, "live_primary_reconnected")
+        result["paho_connections"] = paho.connect_count
+        require(paho.connect_count == 1, "live_second_implementation_reconnected")
         require(result["business_terminal"]["subscription_replacements"] == terminal_commands,
                 "business_terminals_incomplete")
         require(len({window["storage"]["pid"] for window in result["windows"]}) == 1
