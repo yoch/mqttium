@@ -1361,3 +1361,28 @@ fn terminal_admission_results_retire_deadlines_after_the_owner_applies_them() {
         );
     });
 }
+
+#[test]
+fn collection_reply_keeps_reserved_owner_input_capacity_under_business_pressure() {
+    with_runtime(8, |runtime, _| {
+        runtime.queue(Input::MaintainReceipts).unwrap();
+        runtime.drain_inputs().unwrap();
+        assert!(!runtime.owner.collection_ready());
+        // Fill the regular retained-input budget while the actual SQLite
+        // registration is in flight. These bounded no-op work hints are valid
+        // owner inputs, so neither a fault nor a closed transport is involved.
+        for _ in 0..INPUTS {
+            runtime.deferred_inputs.push_back(Input::WorkAvailable { session:SessionId::new(999) });
+        }
+        let deadline=Instant::now()+Duration::from_secs(2);
+        let mut result=Ok(());
+        while !runtime.owner.collection_ready() && Instant::now()<deadline {
+            result=runtime.writer_results();
+            if result.is_err() { break; }
+            runtime.drain_inputs().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(result.is_ok(),"a real reserved collector response must not be rejected by the full regular input budget: {:?}",result.err());
+        assert!(runtime.owner.collection_ready(),"the exact durable registration response must reach and enable the owner under business pressure");
+    });
+}
