@@ -520,6 +520,13 @@ fn publish(first: u8, body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
     if qos != Qos::ExactlyOnce {
         return Err(unsupported("OnlyInboundQos2"));
     }
+    // Check every field before making either application-owned copy.
+    if topic_bytes.len() > bounds.max_topic {
+        return Err(oversized("TopicTooLarge"));
+    }
+    if payload.len() > bounds.max_payload {
+        return Err(oversized("PayloadTooLarge"));
+    }
     let topic = SharedBytes::copy_from(topic_bytes, bounds.max_topic)
         .map_err(|_| oversized("TopicTooLarge"))?;
     let payload = SharedBytes::copy_from(payload, bounds.max_payload)
@@ -558,20 +565,7 @@ fn disconnect(body: &[u8]) -> Result<Packet, Error> {
     let reason = if input.is_empty() { 0 } else { input.byte()? };
     if !matches!(
         reason,
-        0 | 4
-            | 0x80
-            | 0x81
-            | 0x82
-            | 0x83
-            | 0x87
-            | 0x90
-            | 0x93
-            | 0x94
-            | 0x95
-            | 0x96
-            | 0x97
-            | 0x98
-            | 0x99
+        0 | 4 | 0x80 | 0x81 | 0x82 | 0x83 | 0x90 | 0x93 | 0x94 | 0x95 | 0x96 | 0x97 | 0x98 | 0x99
     ) {
         return Err(protocol("InvalidDisconnectReason"));
     }
@@ -733,6 +727,13 @@ pub fn refusal(error: Error, before_connack: bool) -> Vec<u8> {
         };
         vec![0x20, 3, 0, reason, 0]
     } else {
+        // Reasons such as Unsupported Protocol Version belong to CONNACK,
+        // and cannot be reused in a server DISCONNECT.
+        let reason = if matches!(reason,0x80..=0x83|0x87|0x89|0x8b|0x8d..=0x90|0x93..=0xa2) {
+            reason
+        } else {
+            0x83
+        };
         vec![0xe0, 2, reason, 0]
     }
 }
@@ -1073,5 +1074,6 @@ mod tests {
             }
         }
         assert!(attempts < 2048);
+        println!("bounded codec exploration: 256 headers and {attempts} bodies");
     }
 }
