@@ -36,7 +36,7 @@ class Qos0QualificationScope(unittest.TestCase):
     def test_corroborated_queued_qos0_remains_outside_fixture_scope(self):
         publication = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "1"}
         obligation = {"publication_id": publication, "index": 0, "session": "2",
-                      "target_revision": "1", "qos": 0}
+                      "target_revision": "1", "effective_qos": 0}
         snapshot = {"outbound": [], "operations": [],
                     "meta": {"last_opened_epoch": "2"}, "obligations": [obligation]}
         fact = {"kind": "OutboundDelivery", "delivery_id": {
@@ -50,7 +50,7 @@ class Qos0QualificationScope(unittest.TestCase):
     def test_corroborated_queued_qos1_keeps_existing_scope(self):
         publication = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "1"}
         obligation = {"publication_id": publication, "index": 0, "session": "2",
-                      "target_revision": "1", "qos": 1}
+                      "target_revision": "1", "effective_qos": 1}
         snapshot = {"outbound": [], "operations": [],
                     "meta": {"last_opened_epoch": "2"}, "obligations": [obligation]}
         fact = {"kind": "OutboundDelivery", "delivery_id": {
@@ -58,3 +58,22 @@ class Qos0QualificationScope(unittest.TestCase):
         }, "target_session": "2", "target_revision": "1", "qos": 1, "claim": None}
         record = SimpleNamespace(kind="RecoveryPageRead", payload={"run_epoch": "2", "facts": [fact]})
         self.assertEqual(self.unmet(snapshots=[(None, snapshot)], records=[record]), [])
+
+    def test_queued_snapshot_qos0_without_a_recovery_page_is_not_qualified(self):
+        snapshot = {"outbound": [], "operations": [],
+                    "obligations": [{"effective_qos": 0}]}
+        self.assertEqual(self.unmet(snapshots=[(None, snapshot)]), [results.FIXTURE_QOS0_SCOPE])
+
+    def test_recovery_cannot_relabel_a_qos0_obligation_as_qos1(self):
+        publication = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "1"}
+        obligation = {"publication_id": publication, "index": 0, "session": "2",
+                      "target_revision": "1", "effective_qos": 0}
+        snapshot = {"outbound": [], "operations": [],
+                    "meta": {"last_opened_epoch": "2"}, "obligations": [obligation]}
+        fact = {"kind": "OutboundDelivery", "delivery_id": {
+            "publication_id": publication, "index": 0,
+        }, "target_session": "2", "target_revision": "1", "qos": 1, "claim": None}
+        record = SimpleNamespace(kind="RecoveryPageRead", payload={"run_epoch": "2", "facts": [fact]})
+        self.assertEqual(self.unmet(snapshots=[(None, snapshot)], records=[record]), [
+            results.UNCORROBORATED_QUEUED, results.FIXTURE_QOS0_SCOPE,
+        ])
