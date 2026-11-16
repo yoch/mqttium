@@ -3449,6 +3449,12 @@ for kind_name, origin in [
     )
 # Product system evidence is separate from fixture-based qualifying campaigns.
 ok("product-profile.json", json.loads((V1 / "product-profile.json").read_text()))
+product_profile = json.loads((V1 / "product-profile.json").read_text())
+for field, expected in (("closing_input_slots", 32), ("terminal_input_slots", 336),
+                        ("frame_registration_slots", 208), ("pre_connack_packet_slots", 1)):
+    bad(f"product-profile-wrong-{field}.json", "schema-violation", f"/{field}",
+        "The configured bound matches the declared runtime queue rather than historical traffic.",
+        {**product_profile, field: expected + 1})
 product_transitions = json.loads((V1 / "pubsub.transitions.json").read_text())
 ok("product-pubsub-transitions.json", product_transitions)
 receipt_transitions = json.loads((V1 / "receipts.transitions.json").read_text())
@@ -3577,6 +3583,26 @@ for pointer, edit in [
     bad("product-event-overflow-" + pointer.rsplit("/", 1)[1] + ".json", "u64-out-of-range", pointer,
         "Product event identities retain the shared 64-bit range.", edit)
 # Lifecycle observations keep exact identities and bounded resource inventories.
+for observed_kind in ("session_change_copied", "session_change_replayed",
+                      "session_close_copied", "session_close_replayed"):
+    is_change = observed_kind.startswith("session_change_")
+    observed = env("mqttiumd.product-event", seq="10", kind=observed_kind, pid=1,
+        connection="4", operation={**OP, "sequence": "26"},
+        details={"session": "9", **({"action": "Opened"} if is_change else {})})
+    ok("product-" + observed_kind.replace("_", "-") + ".json", observed)
+    required_identity = "operation" if is_change else "connection"
+    bad("product-" + observed_kind.replace("_", "-") + "-missing-identity.json", "schema-violation", "",
+        "An internal copied observation retains its authoritative operation or original transport generation.",
+        edited(observed, lambda v, key=required_identity: v.pop(key)))
+    bad("product-" + observed_kind.replace("_", "-") + "-missing-session.json", "schema-violation", "/details",
+        "The copied fact names its historical durable incarnation without a new ClientID lookup.",
+        edited(observed, lambda v: v["details"].pop("session")))
+    bad("product-" + observed_kind.replace("_", "-") + "-retarget-client.json", "schema-violation", "/details",
+        "Capture/replay evidence does not replace an immutable SessionId with a reusable ClientID.",
+        edited(observed, lambda v: v["details"].update(client_id="reusable-name")))
+    if not is_change:
+        ok("product-" + observed_kind.replace("_", "-") + "-legacy-attachment.json",
+           edited(observed, lambda v: v.pop("operation")))
 session_open_submitted = env("mqttiumd.product-event", seq="10", kind="command_submitted", pid=1,
     operation={**OP, "sequence": "26"}, details={"recipe_kind": "SessionOpen", "action": "Open",
     "clean_start": True, "expiry": "OnDisconnect", "expected_session": None})

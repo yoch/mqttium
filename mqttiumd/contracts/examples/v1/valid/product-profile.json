@@ -70,5 +70,9 @@
     0,
     4294967295
   ],
-  "lifecycle_transition_effect_slots": 3
+  "lifecycle_transition_effect_slots": 3,
+  "closing_input_slots": 32,
+  "terminal_input_slots": 336,
+  "frame_registration_slots": 208,
+  "pre_connack_packet_slots": 1
 }

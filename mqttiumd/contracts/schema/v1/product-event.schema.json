@@ -539,6 +539,83 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "session_change_copied",
+              "session_change_replayed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operation",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "action",
+              "session"
+            ],
+            "properties": {
+              "action": {
+                "enum": [
+                  "Opened",
+                  "Closed"
+                ]
+              },
+              "session": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "session_close_copied",
+              "session_close_replayed"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "connection",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "session"
+            ],
+            "properties": {
+              "session": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
+          }
+        }
+      }
     }
   ],
   "$defs": {

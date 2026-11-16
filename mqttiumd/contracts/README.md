@@ -526,3 +526,45 @@ format is not independent qualification of session lifecycle behavior. Legacy
 Never/null fixture inventories preserve their previous qualification scope.
 Lifecycle transitions requiring takeover/control chaining reserve three effects;
 the historical two-slot constructor minimum remains valid for old inputs only.
+
+### Final lifecycle transport bounds and test controls
+
+The product profile declares 32 `closing_input_slots`, 208
+`frame_registration_slots` and 336 `terminal_input_slots`. Each of the 16
+transports can retain four queued writes, one active write and eight terminal
+write receipts: 16 x (4 + 1 + 8) = 208. The terminal-input lane also reserves
+128 positions for an Outbox-sized set of synchronously refused effects:
+208 + 128 = 336. These finite control/terminal lanes do not borrow the ordinary
+128 input positions. They are bounds on retained work, not historical counters.
+The reactor's pre-CONNACK staging retains at most one bounded packet per
+transport (`pre_connack_packet_slots`); this gate lets the lifecycle input
+progress while preventing later application packets from consuming the ordinary
+owner queue. This is separate from the bounded reader channel and socket bytes
+that the reactor has not yet collected.
+
+The following control-file catalogue is product-system instrumentation behind
+`mqttiumd/test-hooks`, absent from the normal build. It does not add selectors
+to the fixture-based fault catalogue or widen that qualifier. Capture controls
+are consumed once, and each retains at most one copied fact. Replay controls
+submit that exact existing observation to its real guard, not a new lookup by
+ClientID. No captured fact creates an independent permission to emit.
+
+| Control file | Retained or injected fact | Product observation |
+| - | - | - |
+| `capture-next-session-change` | The next applied lifecycle result, with its original OperationId, SessionId and optional transport generation | `session_change_copied` |
+| `replay-session-change` | A retained copy of that same result enters the actual lifecycle result adapter; old results are refused as `stale_lifecycle_result` | `session_change_replayed`, followed by the applicable result or `session_change_ignored` |
+| `capture-next-session-close` | An original transport close, retaining its confirmed SessionId, generation and optional opening token | `session_close_copied` |
+| `replay-session-close` | That original generation's close enters the real closing-input lane | `session_close_replayed` |
+| `hold-session-open-result`, `hold-session-close-result` | A genuinely committed result remains unknown to the owner, including same-operation resolutions, until the file is removed | `store_result_held` |
+| `drop-next-session-open-result`, `drop-next-session-close-result` | One genuinely committed response is replaced with unknown knowledge; resolution retains its OperationId | `store_result_dropped` |
+| `hold-work-pages` | At most 16 correlated successful reads are retained until release; typed read errors are not hidden by a retired destination | `work_page_held`, then its normal application or `work_page_ignored` |
+
+Copied change observations require the original `operation`, `details.action`
+(Opened/Closed) and `details.session`; a connection generation is optional.
+Copied close observations require the original `connection` and
+`details.session`; `operation`, when present, is the original opening token.
+An absent legacy Admin attachment is represented by omission, never a fabricated
+operation. These compact copied/replayed details are closed scalar shapes and
+never contain a ClientID. All their durable/transport identity components retain
+the checked u64 domain. Their format records which fact was injected; system
+assertions separately decide whether the actual stale-event guard held.

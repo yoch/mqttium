@@ -119,6 +119,12 @@
     "contracts/examples/v1/valid/product-maintenance-read-refused.json",
     "contracts/examples/v1/valid/product-ack-receipt.json",
     "contracts/examples/v1/valid/product-puback-credit.json",
+    "contracts/examples/v1/valid/product-session-change-copied.json",
+    "contracts/examples/v1/valid/product-session-change-replayed.json",
+    "contracts/examples/v1/valid/product-session-close-copied.json",
+    "contracts/examples/v1/valid/product-session-close-copied-legacy-attachment.json",
+    "contracts/examples/v1/valid/product-session-close-replayed.json",
+    "contracts/examples/v1/valid/product-session-close-replayed-legacy-attachment.json",
     "contracts/examples/v1/valid/product-session-open-submitted.json",
     "contracts/examples/v1/valid/product-session-opened.json",
     "contracts/examples/v1/valid/product-session-closed.json",
@@ -1939,6 +1945,30 @@
       "why": "A kind of record is stated by its one origin; another may not state it."
     },
     {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-closing_input_slots.json",
+      "code": "schema-violation",
+      "pointer": "/closing_input_slots",
+      "why": "The configured bound matches the declared runtime queue rather than historical traffic."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-terminal_input_slots.json",
+      "code": "schema-violation",
+      "pointer": "/terminal_input_slots",
+      "why": "The configured bound matches the declared runtime queue rather than historical traffic."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-frame_registration_slots.json",
+      "code": "schema-violation",
+      "pointer": "/frame_registration_slots",
+      "why": "The configured bound matches the declared runtime queue rather than historical traffic."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-pre_connack_packet_slots.json",
+      "code": "schema-violation",
+      "pointer": "/pre_connack_packet_slots",
+      "why": "The configured bound matches the declared runtime queue rather than historical traffic."
+    },
+    {
       "file": "contracts/examples/v1/invalid/product-session-transitions-wrong-decision.json",
       "code": "schema-violation",
       "pointer": "/decision",
@@ -2147,6 +2177,78 @@
       "code": "u64-out-of-range",
       "pointer": "/operation/sequence",
       "why": "Product event identities retain the shared 64-bit range."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-change-copied-missing-identity.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "An internal copied observation retains its authoritative operation or original transport generation."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-change-copied-missing-session.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "The copied fact names its historical durable incarnation without a new ClientID lookup."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-change-copied-retarget-client.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "Capture/replay evidence does not replace an immutable SessionId with a reusable ClientID."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-change-replayed-missing-identity.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "An internal copied observation retains its authoritative operation or original transport generation."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-change-replayed-missing-session.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "The copied fact names its historical durable incarnation without a new ClientID lookup."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-change-replayed-retarget-client.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "Capture/replay evidence does not replace an immutable SessionId with a reusable ClientID."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-close-copied-missing-identity.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "An internal copied observation retains its authoritative operation or original transport generation."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-close-copied-missing-session.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "The copied fact names its historical durable incarnation without a new ClientID lookup."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-close-copied-retarget-client.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "Capture/replay evidence does not replace an immutable SessionId with a reusable ClientID."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-close-replayed-missing-identity.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "An internal copied observation retains its authoritative operation or original transport generation."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-close-replayed-missing-session.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "The copied fact names its historical durable incarnation without a new ClientID lookup."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-close-replayed-retarget-client.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "Capture/replay evidence does not replace an immutable SessionId with a reusable ClientID."
     },
     {
       "file": "contracts/examples/v1/invalid/product-session-expected-overflow.json",

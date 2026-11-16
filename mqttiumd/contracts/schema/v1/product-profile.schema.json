@@ -55,7 +55,11 @@
     "outgoing_packet_identifier_probe_limit",
     "session_expiry_default",
     "disconnect_session_expiry_interval",
-    "lifecycle_transition_effect_slots"
+    "lifecycle_transition_effect_slots",
+    "closing_input_slots",
+    "terminal_input_slots",
+    "frame_registration_slots",
+    "pre_connack_packet_slots"
   ],
   "properties": {
     "format": {
@@ -237,6 +241,18 @@
     },
     "lifecycle_transition_effect_slots": {
       "const": 3
+    },
+    "closing_input_slots": {
+      "const": 32
+    },
+    "terminal_input_slots": {
+      "const": 336
+    },
+    "frame_registration_slots": {
+      "const": 208
+    },
+    "pre_connack_packet_slots": {
+      "const": 1
     }
   }
 }
