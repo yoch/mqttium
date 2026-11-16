@@ -110,6 +110,7 @@ pub enum ControlRequest {
     },
     Closed(ClosedReceiptCollection),
 }
+#[derive(Clone)]
 pub enum ControlResponse {
     Collected {
         effect: EffectId,
@@ -238,6 +239,9 @@ impl Writer {
                 let mut pending = None;
                 let mut pending_control = None;
                 let mut stopping = false;
+                let mut state = BusinessState::default();
+                #[cfg(feature="test-hooks")]
+                let mut duplicate_control: Option<ControlResponse> = None;
                 loop {
                     if let Some(reply) = pending_control.take() {
                         match cctx.try_send(reply) {
@@ -256,12 +260,19 @@ impl Writer {
                     }
                     // Even a completely unread ordinary result lane cannot prevent
                     // a reserved receipt closure from committing and replying.
+                    #[cfg(feature="test-hooks")]
+                    if pending_control.is_none() { pending_control = duplicate_control.take(); }
                     if pending_control.is_none() {
                         match crx.try_recv() {
                             Ok(request) => {
-                                pending_control = Some(control_response(
-                                    &mut store, request, &events, &hooks, &cancel,
-                                ))
+                                let reply = control_response(&mut store, request, &events, &hooks, &cancel);
+                                #[cfg(feature="test-hooks")]
+                                if let ControlResponse::Collected { collection, result:Ok(ReceiptCollectionReply::Applied { .. }),.. } = &reply
+                                    && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("duplicate-close-result"))) {
+                                    let _ = events.emit("receipt_collection_result_duplicated",json!({"command_kind":"ReceiptCollection","details":collection_details(*collection)}));
+                                    duplicate_control = Some(reply.clone());
+                                }
+                                pending_control = Some(reply);
                             }
                             Err(TryRecvError::Empty) => {}
                             Err(TryRecvError::Disconnected) => return,
@@ -275,7 +286,7 @@ impl Writer {
                             }
                             Ok(request) => {
                                 pending = Some(business_response(
-                                    &mut store, request, &events, &hooks, &cancel,
+                                    &mut store, request, &events, &hooks, &cancel, &mut state,
                                 ))
                             }
                             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -310,14 +321,22 @@ impl Writer {
         }
     }
 }
+#[derive(Default)]
+struct BusinessState {
+    #[cfg(feature = "test-hooks")]
+    held_admission: Option<OperationId>,
+    #[cfg(feature = "test-hooks")]
+    captured: Option<mqttiumd_contract::command::Command>,
+}
 fn business_response(
     store: &mut SqliteStore,
     request: Request,
     events: &Events,
     hooks: &Hooks,
     cancel: &Arc<AtomicBool>,
+    state: &mut BusinessState,
 ) -> Response {
-    let _ = (hooks, cancel);
+    let _ = (hooks, cancel, &state);
     match request {
         Request::Stop => Response::Stopped,
         Request::Recovery(cursor) => Response::Recovery(store.recover(cursor, 64)),
@@ -362,6 +381,18 @@ fn business_response(
                             cancel.store(true, Ordering::Relaxed);
                         }
                     }
+                    #[cfg(feature = "test-hooks")]
+                    if kind == "Admission"
+                        && hooks
+                            .directory
+                            .as_ref()
+                            .is_some_and(|d| consume_file(&d.join("capture-next-admission")))
+                    {
+                        state.captured = Some(command.clone());
+                        if let Recipe::AdmitPublication(a) = command.recipe.get() {
+                            let _ = events.emit("receipt_replay_captured",json!({"command_kind":"Admission","operation":operation(id),"details":{"publication":identity_text(a.publication.incarnation().get(),a.publication.epoch().get(),a.publication.owner().get(),a.publication.sequence().get()),"payload":identity_text(a.payload.id.incarnation().get(),a.payload.id.epoch().get(),a.payload.id.owner().get(),a.payload.id.sequence().get())}}));
+                        }
+                    }
                     let applied = store.apply(&command);
                     #[cfg(feature = "test-hooks")]
                     {
@@ -402,6 +433,8 @@ fn business_response(
                             );
                         }
                     }
+                    #[cfg(feature = "test-hooks")]
+                    let reply = hold_admission_reply(state, hooks, id, kind, reply, events);
                     Response::Store {
                         effect,
                         operation: id,
@@ -411,6 +444,8 @@ fn business_response(
                 }
                 Effect::ResolveAndFence { operation: id } => {
                     let reply = StoreReply::Outcome(store.resolve_and_fence(id).outcome);
+                    #[cfg(feature = "test-hooks")]
+                    let reply = hold_admission_reply(state, hooks, id, "Resolution", reply, events);
                     if events.emit("store_resolved",json!({"operation":operation(id),"details":{"outcome":outcome_name(reply).to_ascii_lowercase()}})).is_err(){cancel.store(true,Ordering::Relaxed);}
                     Response::Store {
                         effect,
@@ -435,6 +470,44 @@ fn business_response(
             }
         }
     }
+}
+
+#[cfg(feature = "test-hooks")]
+fn hold_admission_reply(
+    state: &mut BusinessState,
+    hooks: &Hooks,
+    id: OperationId,
+    kind: &str,
+    reply: StoreReply,
+    events: &Events,
+) -> StoreReply {
+    let hold = hooks
+        .directory
+        .as_ref()
+        .is_some_and(|d| d.join("hold-admission-result").exists());
+    if !hold {
+        state.held_admission = None;
+        return reply;
+    }
+    if kind == "Admission"
+        && state.held_admission.is_none()
+        && matches!(
+            reply,
+            StoreReply::Outcome(mqttiumd_contract::outcome::StoreOutcome::Committed(_))
+        )
+    {
+        state.held_admission = Some(id);
+    }
+    if state.held_admission == Some(id) {
+        let _ = events.emit("store_result_held",json!({"operation":operation(id),"command_kind":"Admission","details":{"outcome":outcome_name(reply),"source":kind}}));
+        StoreReply::Outcome(mqttiumd_contract::outcome::StoreOutcome::PendingOrUnknown)
+    } else {
+        reply
+    }
+}
+#[cfg(feature = "test-hooks")]
+fn identity_text(incarnation: u64, epoch: u64, owner: u64, sequence: u64) -> String {
+    format!("{incarnation}/{epoch}/{owner}/{sequence}")
 }
 
 fn control_response(
@@ -476,7 +549,7 @@ fn control_response(
                 store.set_receipt_hook(Some(Box::new(move |point, current| {
                     let mut details = collection_details(current);
                     details["requested_limit"] = json!(collection.limit);
-                    if hc.barrier_fields(point.name(), json!({"point":point.name(),"command_kind":"ReceiptCollection","details":details}), &ev, &stop).is_err() { stop.store(true, Ordering::Relaxed); }
+                    if current.closure.through.get()!=0 && hc.barrier_fields(point.name(), json!({"point":point.name(),"command_kind":"ReceiptCollection","details":details}), &ev, &stop).is_err() { stop.store(true, Ordering::Relaxed); }
                 })));
             }
             let result = store
