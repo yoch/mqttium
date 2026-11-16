@@ -5,8 +5,8 @@ use crate::contract::command::{
 };
 use crate::contract::ids::{ContinuationId, OutboundPacketId};
 use crate::contract::pubsub::{
-    DeliveryClaim, FilterResults, GrantedSubscriptionChange, MAX_FILTERS, Qos0DropReason,
-    Qos0Origin, VolatilePublicationId, WORK_PAGE_LIMIT, WorkItem,
+    DeliveryClaim, FilterResults, GrantedSubscriptionChange, MAX_FILTERS, PubackTarget,
+    Qos0DropReason, Qos0Origin, VolatilePublicationId, WORK_PAGE_LIMIT, WorkItem,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -804,6 +804,60 @@ impl Owner {
             | InboundPacket::Pubrel { packet_id: id } => *id == control.packet_id,
             _ => false,
         }
+    }
+
+    /// Correlates an ACK to the current occurrence eligible on this exact
+    /// generation. Local write callbacks are not prerequisites for MQTT ACKs.
+    #[must_use]
+    pub fn puback_target(
+        &self,
+        connection: ConnectionKey,
+        packet_id: OutboundPacketId,
+    ) -> Option<PubackTarget> {
+        if self.connection_of(connection.session) != Some(connection.generation) {
+            return None;
+        }
+        self.pubsub
+            .deliveries
+            .as_slice()
+            .iter()
+            .find_map(|delivery| {
+                let claim = delivery.claim?;
+                let (frame, sent) = delivery.frame?;
+                (delivery.target == connection.session
+                    && delivery.qos == Qos::AtLeastOnce
+                    && delivery.phase == Phase::AwaitPuback
+                    && delivery.window == Some(connection.generation)
+                    && sent == connection
+                    && claim.packet_id == packet_id)
+                    .then_some(PubackTarget {
+                        delivery: delivery.id,
+                        claim: claim.operation,
+                        frame,
+                    })
+            })
+    }
+
+    pub(super) fn plan_observed_puback(
+        &self,
+        connection: ConnectionKey,
+        packet_id: OutboundPacketId,
+        reason: u8,
+        _target: Option<PubackTarget>,
+        draft: &mut Draft,
+    ) -> Result<super::Change, Stop> {
+        let Some(session) = self.sessions.as_slice().iter().position(|session| {
+            session.id == connection.session && session.connection == Some(connection.generation)
+        }) else {
+            return Ok(super::Change::Nothing);
+        };
+        // Baseline behavior: the reusable wire integer is looked up again.
+        self.plan_pubsub_packet(
+            session,
+            connection.generation,
+            &InboundPacket::Puback { packet_id, reason },
+            draft,
+        )
     }
 
     pub(super) fn plan_pubsub_packet(
@@ -2499,5 +2553,88 @@ mod tests {
         };
         assert!(known(&mut owner, finish[0].0, command).is_empty());
         assert_eq!(owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(), 1);
+    }
+
+    #[test]
+    fn an_observed_puback_target_cannot_be_rebound_after_identifier_reuse() {
+        let mut owner = world();
+        queued(&mut owner, 0);
+        let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command } = &claim[0].1 else {
+            panic!("claim A")
+        };
+        let _ = known(&mut owner, claim[0].0, command);
+        let key = ConnectionKey {
+            session: TARGET,
+            generation: CONNECTION,
+        };
+        let packet_id = OutboundPacketId::new(1).unwrap();
+        let target = owner.puback_target(key, packet_id).unwrap();
+        let finish = apply(
+            &mut owner,
+            Input::ObservedPuback {
+                connection: key,
+                packet_id,
+                reason: 0,
+                target: Some(target),
+            },
+        );
+        let Effect::Persist { command } = &finish[0].1 else {
+            panic!("finish A")
+        };
+        assert!(known(&mut owner, finish[0].0, command).is_empty());
+        queued(&mut owner, 1);
+        let claim_b = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command } = &claim_b[0].1 else {
+            panic!("claim B")
+        };
+        let _ = known(&mut owner, claim_b[0].0, command);
+        let new_target = owner.puback_target(key, packet_id).unwrap();
+        assert_ne!(target, new_target);
+        let effects = apply(
+            &mut owner,
+            Input::ObservedPuback {
+                connection: key,
+                packet_id,
+                reason: 0,
+                target: Some(target),
+            },
+        );
+        assert!(
+            effects.is_empty(),
+            "stale_puback_rebound: retained A observation must not finish B: {effects:?}"
+        );
+        assert_eq!(owner.puback_target(key, packet_id), Some(new_target));
+    }
+
+    #[test]
+    fn an_observed_puback_without_a_target_cannot_acquire_a_future_claim() {
+        let mut owner = world();
+        let key = ConnectionKey {
+            session: TARGET,
+            generation: CONNECTION,
+        };
+        let packet_id = OutboundPacketId::new(1).unwrap();
+        let observed = owner.puback_target(key, packet_id);
+        assert_eq!(observed, None);
+        queued(&mut owner, 0);
+        let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command } = &claim[0].1 else {
+            panic!("claim")
+        };
+        let _ = known(&mut owner, claim[0].0, command);
+        let effects = apply(
+            &mut owner,
+            Input::ObservedPuback {
+                connection: key,
+                packet_id,
+                reason: 0,
+                target: observed,
+            },
+        );
+        assert!(
+            effects.is_empty(),
+            "untargeted_puback_rebound: an immutable no-target observation cannot finish a later claim: {effects:?}"
+        );
     }
 }
