@@ -22,7 +22,7 @@ from pubsub_probe import (
     PubsubWire, Publication, decode_filter_ack, durable, puback_packet,
     session_key, subscribe_packet, unsubscribe_packet,
 )
-from tcp_probe import ReceiptFailure, operation_hex, publish_packet, require, write_json
+from tcp_probe import ReceiptFailure, operation_hex, publish_packet, pubrel_packet, require, write_json
 from tcp_reception import Broker, writer_available
 
 
@@ -397,6 +397,75 @@ def finish_barrier(binary: Path, case: Path) -> dict:
         broker.cleanup()
 
 
+def lost_committed_results(binary: Path, case: Path) -> dict:
+    """A lost terminal reply is resolved using the original durable recipe."""
+    broker = Broker(binary, case, test_control=True)
+    topic = "reception/lost-result"
+    try:
+        broker.ready()
+        with PubsubWire(broker.address, broker.observations, "lost-result-subscriber") as subscriber:
+            subscriber.connect("lost-result-subscriber", session_present=False, receive_maximum=1)
+            subscriber.subscribe(1, [(topic, 1)])
+            (broker.control / "drop-next-claim-result").touch(exist_ok=False)
+            first = publisher(broker, case, "lost-result-publisher-a", "mqttium", topic, b"claim-result-lost")
+            claim_dropped = broker.wait_event("store_result_dropped")
+            require(claim_dropped.get("command_kind") == "Claim", "wrong_result_suppressed")
+            claim_state = durable(broker.db)
+            target = session_key(claim_state, "lost-result-subscriber")
+            claim = assignment(claim_state, target)
+            claim_id = operation_hex(claim_dropped["operation"])
+            require(claim["row"]["claim"] == claim_id
+                    and sum(row["id"] == claim_id for row in claim_state["tables"]["operations"]) == 1,
+                    "dropped_claim_not_durably_committed")
+            write_json(case / "claim-committed-result-lost.json", claim_state)
+            subscriber.no_publication(.2, code="unknown_claim_accepted_as_committed")
+            subscriber.send(b"\xc0\x00")
+            subscriber.wait(0xD0)
+            delivered = subscriber.next_publication(timeout=15)
+            message_matches(delivered, topic, b"claim-result-lost")
+            claim_resolved = broker.wait_event("store_resolved", after=int(claim_dropped["seq"]))
+            require(claim_resolved["operation"] == claim_dropped["operation"]
+                    and claim_resolved["details"]["outcome"] == "committed",
+                    "claim_resolution_changed_operation")
+            require(assignment(durable(broker.db), target) == claim, "claim_resolution_recreated_slot")
+            second = publisher(broker, case, "lost-result-publisher-b", "paho", topic,
+                               b"finish-result-lost", 2)
+            subscriber.no_publication(.15, code="destination_receive_maximum_ignored")
+            (broker.control / "drop-next-finish-result").touch(exist_ok=False)
+            subscriber.acknowledge(delivered)
+            finish_dropped = broker.wait_event("store_result_dropped", after=int(claim_dropped["seq"]))
+            require(finish_dropped.get("command_kind") == "Finish", "wrong_result_suppressed")
+            finish_state = durable(broker.db)
+            finish_id = operation_hex(finish_dropped["operation"])
+            require(sum(row["id"] == finish_id for row in finish_state["tables"]["operations"]) == 1
+                    and len(obligations(finish_state)) == 1,
+                    "dropped_finish_not_durably_committed")
+            accounts_consistent(finish_state)
+            write_json(case / "finish-committed-result-lost.json", finish_state)
+            subscriber.no_publication(.2, code="unknown_finish_freed_slot")
+            subscriber.send(b"\xc0\x00")
+            subscriber.wait(0xD0)
+            next_delivery = subscriber.next_publication(timeout=15)
+            message_matches(next_delivery, topic, b"finish-result-lost")
+            finish_resolved = broker.wait_event("store_resolved", after=int(finish_dropped["seq"]))
+            require(finish_resolved["operation"] == finish_dropped["operation"]
+                    and finish_resolved["details"]["outcome"] == "committed",
+                    "finish_resolution_changed_operation")
+            subscriber.acknowledge(next_delivery)
+        final = drained(broker, case, admissions=2)
+        for operation in (claim_id, finish_id):
+            require(sum(row["id"] == operation for row in final["tables"]["operations"]) == 1,
+                    "resolution_reexecuted_under_new_identity")
+        broker.stop()
+        writer_available(broker.db)
+        return {"criterion": "D-resolution", "status": "PASS", "clients": [first, second],
+                "claim_drop": claim_dropped, "claim_resolution": claim_resolved,
+                "finish_drop": finish_dropped, "finish_resolution": finish_resolved,
+                "same_operation_resolved": True, "unknown_did_not_authorize_progress": True}
+    finally:
+        broker.cleanup()
+
+
 def crash_delivery(binary: Path, case: Path) -> dict:
     broker = Broker(binary, case)
     restarted = None
@@ -486,6 +555,28 @@ def identities_and_windows(binary: Path, case: Path) -> dict:
             subscriber.acknowledge(second)
             subscriber.no_publication(.2, code="negative_puback_retransmitted_forever")
         drained(broker, case, admissions=2)
+        # This normal-build sequence uses a new PI after every PUBACK actually
+        # received. It also covers the write-complete/internal-receipt gap;
+        # reusing only the same PI would miss the confirmed window defect.
+        with PubsubWire(broker.address, broker.observations, "receive-credit") as credit:
+            credit.connect("receive-credit", session_present=False)
+            for identifier in range(1, 8):
+                credit.send(publish_packet("reception/no-route", b"held-qos2", identifier, qos=2))
+                require(credit.wait(0x50, identifier).ack() == (identifier, 0), "held_exchange_refused")
+            for identifier in range(8, 40):
+                credit.publish(identifier, "reception/no-route", b"fresh-after-puback", qos=1)
+            for identifier in range(1, 8):
+                credit.send(pubrel_packet(identifier))
+                require(credit.wait(0x70, identifier).ack() == (identifier, 0), "held_exchange_not_completed")
+        # A genuine ninth in-flight exchange is still over the declared limit.
+        with PubsubWire(broker.address, broker.observations, "true-ninth") as ninth:
+            ninth.connect("true-ninth", session_present=False)
+            for identifier in range(1, 9):
+                ninth.send(publish_packet("reception/no-route", b"held-qos2", identifier, qos=2))
+                require(ninth.wait(0x50, identifier).ack() == (identifier, 0), "held_exchange_refused")
+            ninth.send(publish_packet("reception/no-route", b"actual-ninth", 9, qos=1))
+            refusal = ninth.wait(0xE0)
+            require(refusal.body and refusal.body[0] == 0x93, "true_ninth_not_refused")
         with PubsubWire(broker.address, broker.observations, "collision") as collision:
             collision.connect("collision", session_present=False)
             collision.send(publish_packet("reception/no-route", b"held-qos2", 7, qos=2))
@@ -510,7 +601,9 @@ def identities_and_windows(binary: Path, case: Path) -> dict:
         return {"criterion": "F", "status": "PASS", "clients": [seeded],
                 "same_integer_both_directions": initial.packet_id,
                 "receive_maximum": 1, "no_live_periodic_retransmission": True,
-                "negative_puback_terminal": True, "same_sender_collision_refused": True}
+                "negative_puback_terminal": True, "same_sender_collision_refused": True,
+                "receive_window_seven_held_qos2": 7, "fresh_sequential_qos1_after_puback": 32,
+                "genuine_ninth_refused": "0x93"}
     finally:
         broker.cleanup()
 
@@ -812,6 +905,7 @@ def main() -> int:
              ("H-recovery", partial_destination_recovery)]
     if args.mode == "complete" or args.case:
         cases += [("D-claim", claim_barrier), ("D-finish", finish_barrier),
+                  ("D-resolution", lost_committed_results),
                   ("G-order", filter_admission_order),
                   ("H-discovery", discovery_without_notification), ("H-capacity", atomic_capacity_refusal)]
     require(args.case is None or args.case in {name for name, _ in cases}, "unknown_case")
