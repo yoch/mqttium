@@ -1270,7 +1270,7 @@ impl EffectSink for Sink<'_> {
                             },
                         );
                         let _ = effect.into_parts();
-                        if self.events.emit("frame_queued",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","effect":effect_text(id),"delivery":delivery_text(delivery),"target":connection.session.get().to_string(),"packet_id":packet_id.get(),"claim":operation(claim),"dup":dup}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                        if self.events.emit("frame_queued",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","effect":effect_text(id),"delivery":delivery_text(delivery),"target":connection.session.get().to_string(),"packet_id":packet_id.get(),"claim":operation_text(claim),"dup":dup}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         SubmitResult::Accepted
                     }
                     Err(TrySendError::Full(_)) => {
@@ -1313,10 +1313,19 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
             json!({"delivery":delivery_text(c.delivery),"target":c.target.get().to_string(),"packet_id":c.packet_id.get()})
         }
         Recipe::FinishDelivery(c) => {
-            json!({"delivery":delivery_text(c.delivery),"target":c.target.get().to_string(),"packet_id":c.packet_id.get(),"claim":operation(c.claim)})
+            json!({"delivery":delivery_text(c.delivery),"target":c.target.get().to_string(),"packet_id":c.packet_id.get(),"claim":operation_text(c.claim)})
         }
         _ => json!({}),
     }
+}
+fn operation_text(id: OperationId) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        id.incarnation().get(),
+        id.epoch().get(),
+        id.owner().get(),
+        id.sequence().get()
+    )
 }
 fn effect_text(id: EffectId) -> String {
     format!(

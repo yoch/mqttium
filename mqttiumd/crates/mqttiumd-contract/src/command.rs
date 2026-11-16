@@ -164,7 +164,7 @@ pub struct ReleaseInbound {
     pub exchange: ExchangeId,
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Debug)]
 pub struct ChangeSubscriptions {
     pub operation: OperationId,
     pub session: SessionId,
@@ -172,6 +172,23 @@ pub struct ChangeSubscriptions {
     pub route_revision: Revision,
     pub changes: BoundedVec<SubscriptionChange>,
 }
+impl PartialEq for ChangeSubscriptions {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            operation,
+            session,
+            session_revision,
+            route_revision,
+            changes,
+        } = self;
+        *operation == other.operation
+            && *session == other.session
+            && *session_revision == other.session_revision
+            && *route_revision == other.route_revision
+            && changes.as_slice() == other.changes.as_slice()
+    }
+}
+impl Eq for ChangeSubscriptions {}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ClaimDelivery {
