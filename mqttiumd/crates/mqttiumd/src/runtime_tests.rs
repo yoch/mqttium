@@ -1585,85 +1585,184 @@ fn cancellation_during_unacknowledged_registration_never_announces_ready() {
 
 #[test]
 fn four_blocked_ordinary_deadlines_cannot_occupy_the_collectors_reserved_reply_lane() {
-    with_runtime(8, |runtime,path| {
+    with_runtime(8, |runtime, path| {
         runtime.queue(Input::MaintainReceipts).unwrap();
-        until(runtime,|r|r.owner.collection_ready());
-        let (generation,mut client)=peer(runtime);
-        runtime.connect(generation,connect_packet(b"deadline-lane")).unwrap();
-        until(runtime,|r|r.session_requests.is_empty());
-        assert_eq!(read_frame(&mut client).0,0x20);
+        until(runtime, |r| r.owner.collection_ready());
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"deadline-lane"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
         for _ in 0..63 {
-            runtime.packet(generation,0x32,publish_body(1)).unwrap();
-            until(runtime,|r|r.frames.values().any(|f|f.kind=="PUBACK"));
-            assert_eq!(read_frame(&mut client).0,0x40);
-            until(runtime,|r|!r.frames.values().any(|f|f.kind=="PUBACK"));
+            runtime.packet(generation, 0x32, publish_body(1)).unwrap();
+            until(runtime, |r| r.frames.values().any(|f| f.kind == "PUBACK"));
+            assert_eq!(read_frame(&mut client).0, 0x40);
+            until(runtime, |r| !r.frames.values().any(|f| f.kind == "PUBACK"));
         }
-        runtime.packet(generation,0x32,publish_body(1)).unwrap();
-        let deadline=Instant::now()+Duration::from_secs(2);
-        while !runtime.owner.receipt_status().is_some_and(|(_,span,holes)|span==64 && holes==0) && Instant::now()<deadline {
+        runtime.packet(generation, 0x32, publish_body(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !runtime
+            .owner
+            .receipt_status()
+            .is_some_and(|(_, span, holes)| span == 64 && holes == 0)
+            && Instant::now() < deadline
+        {
             event_turn_without_scan(runtime);
             thread::sleep(Duration::from_millis(1));
         }
-        assert!(runtime.owner.receipt_status().is_some_and(|(_,s,h)|s==64 && h==0));
+        assert!(
+            runtime
+                .owner
+                .receipt_status()
+                .is_some_and(|(_, s, h)| s == 64 && h == 0)
+        );
         runtime.drain_inputs().unwrap(); // submit the real closure, leave its reply unread
-        assert_eq!(runtime.timers.len(),1);
-        let collector_token=*runtime.timers.keys().next().unwrap();
-        assert_eq!(read_frame(&mut client).0,0x40);
+        assert_eq!(runtime.timers.len(), 1);
+        let collector_token = *runtime.timers.keys().next().unwrap();
+        assert_eq!(read_frame(&mut client).0, 0x40);
         runtime.connections().unwrap();
         runtime.drain_inputs().unwrap();
         for id in 2..=5 {
-            runtime.packet(generation,0x32,publish_body(id)).unwrap();
+            runtime.packet(generation, 0x32, publish_body(id)).unwrap();
             runtime.drain_inputs().unwrap();
         }
-        let ordinary:Vec<_>=runtime.timers.keys().copied().filter(|t|*t!=collector_token).collect();
-        assert_eq!(ordinary.len(),4,"four actual submitted admissions retain their own unresolved deadlines");
+        let ordinary: Vec<_> = runtime
+            .timers
+            .keys()
+            .copied()
+            .filter(|t| *t != collector_token)
+            .collect();
+        assert_eq!(
+            ordinary.len(),
+            4,
+            "four actual submitted admissions retain their own unresolved deadlines"
+        );
         for order in 0..126 {
-            assert!(matches!(runtime.owner.step(Input::Packet {connection:generation,ingress_order:1000+order,packet:InboundPacket::Pingreq},TurnGrant {work_limit:WorkUnits::new(65536)}),StepOutcome::Applied {..}));
+            assert!(matches!(
+                runtime.owner.step(
+                    Input::Packet {
+                        connection: generation,
+                        ingress_order: 1000 + order,
+                        packet: InboundPacket::Pingreq
+                    },
+                    TurnGrant {
+                        work_limit: WorkUnits::new(65536)
+                    }
+                ),
+                StepOutcome::Applied { .. }
+            ));
         }
-        assert_eq!(runtime.owner.outbox().unwrap().len(),126);
-        assert!(matches!(runtime.owner.step(Input::Deadline {token:ordinary[0],now:LogicalTime::new(10000)},TurnGrant {work_limit:WorkUnits::new(65536)}),StepOutcome::NeedCapacity {need,..} if need.resource==Resource::EffectSlots),"ordinary retries demonstrably need the two business slots reserved for maintenance");
-        for token in ordinary { runtime.timers.insert(token,Instant::now()); }
+        assert_eq!(runtime.owner.outbox().unwrap().len(), 126);
+        assert!(
+            matches!(runtime.owner.step(Input::Deadline {token:ordinary[0],now:LogicalTime::new(10000)},TurnGrant {work_limit:WorkUnits::new(65536)}),StepOutcome::NeedCapacity {need,..} if need.resource==Resource::EffectSlots),
+            "ordinary retries demonstrably need the two business slots reserved for maintenance"
+        );
+        for token in ordinary {
+            runtime.timers.insert(token, Instant::now());
+        }
         runtime.due_deadlines().unwrap();
-        let deadline=Instant::now()+Duration::from_secs(2);
-        let mut result=Ok(());
-        while !runtime.control_inputs.iter().any(|i|matches!(i,Input::ReceiptsCollected {..})) && Instant::now()<deadline {
-            result=runtime.writer_results();
-            if result.is_err() {break;}
+        while runtime.inputs.len()+runtime.deferred_inputs.len()<INPUTS {
+            runtime.inputs.push_back(Input::WorkAvailable {session:SessionId::new(999)});
+        }
+        let committed_by=Instant::now()+Duration::from_secs(2);
+        while !mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap().receipt_frontiers.values().any(|f|f.through.get()==64) && Instant::now()<committed_by {thread::sleep(Duration::from_millis(1));}
+        assert!(mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap().receipt_frontiers.values().any(|f|f.through.get()==64),"the precise closure must really commit before the input-pressure check");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut result = Ok(());
+        while !runtime
+            .control_inputs
+            .iter()
+            .any(|i| matches!(i, Input::ReceiptsCollected { .. }))
+            && Instant::now() < deadline
+        {
+            result = runtime.writer_results();
+            if result.is_err() {
+                break;
+            }
             thread::sleep(Duration::from_millis(1));
         }
         // The independent reader establishes the collection actually committed,
         // so a missing collector reply cannot be attributed to unvisited SQL.
-        let durable=mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap();
-        assert!(durable.receipt_frontiers.values().any(|f|f.through.get()==64));
-        assert!(result.is_ok(),"ordinary command deadlines cannot consume maintenance reply capacity: {:?}",result.err());
-        let reply=runtime.control_inputs.pop_front().expect("actual collector reply kept its reserved input");
-        assert!(matches!(reply,Input::ReceiptsCollected {..}));
-        assert!(matches!(runtime.owner.step(reply,TurnGrant {work_limit:WorkUnits::new(65536)}),StepOutcome::Applied {..}));
-        assert_eq!(runtime.owner.receipt_status().unwrap().0.through.get(),64);
+        let durable =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap();
+        assert!(
+            durable
+                .receipt_frontiers
+                .values()
+                .any(|f| f.through.get() == 64)
+        );
+        assert!(
+            result.is_ok(),
+            "ordinary command deadlines cannot consume maintenance reply capacity: {:?}",
+            result.err()
+        );
+        let reply = runtime
+            .control_inputs
+            .pop_front()
+            .expect("actual collector reply kept its reserved input");
+        assert!(matches!(reply, Input::ReceiptsCollected { .. }));
+        assert!(matches!(
+            runtime.owner.step(
+                reply,
+                TurnGrant {
+                    work_limit: WorkUnits::new(65536)
+                }
+            ),
+            StepOutcome::Applied { .. }
+        ));
+        assert_eq!(runtime.owner.receipt_status().unwrap().0.through.get(), 64);
     });
 }
 
 #[test]
 fn a_full_maintenance_input_lane_leaves_the_real_reply_in_reserved_transport() {
-    with_runtime(8,|runtime,path| {
+    with_runtime(8, |runtime, path| {
         runtime.queue(Input::MaintainReceipts).unwrap();
         runtime.drain_inputs().unwrap();
-        for _ in 0..crate::writer::CONTROL_QUEUE { runtime.queue(Input::MaintainReceipts).unwrap(); }
-        let deadline=Instant::now()+Duration::from_secs(2);
-        while mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap().receipt_frontiers.is_empty() && Instant::now()<deadline {thread::sleep(Duration::from_millis(1));}
-        assert_eq!(mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap().receipt_frontiers.len(),1,"the actual registration committed while its transport reply remains pending");
+        for _ in 0..crate::writer::CONTROL_QUEUE {
+            runtime.queue(Input::MaintainReceipts).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite"))
+            .unwrap()
+            .receipt_frontiers
+            .is_empty()
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite"))
+                .unwrap()
+                .receipt_frontiers
+                .len(),
+            1,
+            "the actual registration committed while its transport reply remains pending"
+        );
         // Two ordinary read markers establish transport order: even when the
         // worker was waiting on its ordinary receiver, it checks the reserved
         // request before processing marker two, and flushes the reserved reply
         // before publishing that marker's ordinary response. No elapsed-time
         // assumption establishes that the collector reached its reply channel.
-        for _ in 0..2 { runtime.writer.sender.send(Request::Recovery(None)).unwrap(); }
-        for _ in 0..2 { assert!(matches!(runtime.writer.receiver.recv_timeout(Duration::from_secs(2)),Ok(Response::Recovery(Ok(_))))); }
-        let result=runtime.writer_results();
-        assert!(result.is_ok(),"a full reserved input lane must backpressure its reply receiver, not consume then lose the reply: {:?}",result.err());
-        assert_eq!(runtime.control_inputs.len(),crate::writer::CONTROL_QUEUE);
+        for _ in 0..2 {
+            runtime.writer.sender.send(Request::Recovery(None)).unwrap();
+        }
+        for _ in 0..2 {
+            assert!(matches!(
+                runtime.writer.receiver.recv_timeout(Duration::from_secs(2)),
+                Ok(Response::Recovery(Ok(_)))
+            ));
+        }
+        let result = runtime.writer_results();
+        assert!(
+            result.is_ok(),
+            "a full reserved input lane must backpressure its reply receiver, not consume then lose the reply: {:?}",
+            result.err()
+        );
+        assert_eq!(runtime.control_inputs.len(), crate::writer::CONTROL_QUEUE);
         assert!(!runtime.owner.collection_ready());
         runtime.drain_inputs().unwrap();
-        until(runtime,|r|r.owner.collection_ready());
+        until(runtime, |r| r.owner.collection_ready());
     });
 }
