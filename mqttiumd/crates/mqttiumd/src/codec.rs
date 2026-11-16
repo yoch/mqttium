@@ -768,7 +768,7 @@ pub fn refusal(error: Error, before_connack: bool) -> Vec<u8> {
 mod tests {
     use super::*;
     use mqttiumd_contract::ids::InboundPacketId;
-    use mqttiumd_contract::packet::{AckReason, Qos};
+    use mqttiumd_contract::packet::{AckReason, PubackReason, Qos};
 
     const BOUNDS: Bounds = Bounds {
         max_packet: 65_536,
@@ -946,6 +946,72 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn qos1_publish_preserves_its_qos_identifier_and_dup_into_the_core() {
+        let body = b"\0\x03a/b\0\x07\0payload";
+        for (first, duplicate) in [(0x32, false), (0x3a, true)] {
+            let decoded = decode(first, body, BOUNDS);
+            assert!(
+                decoded.is_ok(),
+                "QoS 1 is part of the product profile: {decoded:?}"
+            );
+            let Packet::Core(InboundPacket::Publish {
+                topic,
+                qos,
+                retain,
+                dup,
+                packet_id,
+                payload,
+            }) = decoded.unwrap()
+            else {
+                panic!("PUBLISH")
+            };
+            assert_eq!(qos, Qos::AtLeastOnce);
+            assert_eq!(topic.as_slice(), b"a/b");
+            assert_eq!(payload.as_slice(), b"payload");
+            assert_eq!(packet_id.unwrap().get(), 7);
+            assert_eq!(dup, duplicate);
+            assert!(!retain);
+        }
+    }
+
+    #[test]
+    fn puback_encodes_only_reasons_valid_for_its_packet_role() {
+        let packet_id = InboundPacketId::new(7).unwrap();
+        for (reason, expected) in [
+            (PubackReason::Success, vec![0x40, 2, 0, 7]),
+            (PubackReason::QuotaExceeded, vec![0x40, 3, 0, 7, 0x97]),
+            (
+                PubackReason::ImplementationSpecificError,
+                vec![0x40, 3, 0, 7, 0x83],
+            ),
+        ] {
+            assert_eq!(
+                encode(OutboundFrame::Puback { packet_id, reason }).unwrap(),
+                expected
+            );
+        }
+        // PacketIdentifierNotFound cannot be represented by PubackReason.
+        assert_eq!(
+            encode(OutboundFrame::Pubrec {
+                packet_id,
+                reason: AckReason::PacketIdentifierNotFound,
+            })
+            .unwrap_err()
+            .kind(),
+            ErrorKind::Protocol,
+        );
+        assert_eq!(
+            encode(OutboundFrame::Pubcomp {
+                packet_id,
+                reason: AckReason::QuotaExceeded,
+            })
+            .unwrap_err()
+            .kind(),
+            ErrorKind::Protocol,
+        );
     }
 
     #[test]
