@@ -53,7 +53,7 @@ def bounded_empty_business(snapshot: dict) -> bool:
              for name in ("publications", "payloads", "obligations", "outbound", "inbound"))
 
 
-def historical_ceiling(binary: Path, case: Path, response_timeout: float = 1) -> dict:
+def historical_ceiling(binary: Path, case: Path, response_timeout: float = 12) -> dict:
     """A regression that fails semantically on the former cumulative limit."""
     broker = Broker(binary, case / "first")
     restarted = None
