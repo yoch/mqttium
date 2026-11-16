@@ -6512,9 +6512,9 @@ mod tests {
     }
 
     fn product_world() -> World {
-        let mut cfg = config();
-        cfg.max_routes = bound(4);
-        let mut world = World::with(cfg, EPOCH, CAPACITY);
+        let mut product_config = config();
+        product_config.max_routes = bound(4);
+        let mut world = World::with(product_config, EPOCH, CAPACITY);
         world.applied(page(&fixture(EPOCH), true));
         world.applied(connect(CONN, b"p1-producer"));
         assert_eq!(kinds(&world.drain()), ["EmitConnack"]);
@@ -6689,9 +6689,9 @@ mod tests {
 
     #[test]
     fn product_pubsub_recovery_preserves_claim_identity_and_skips_a_new_claim() {
-        let mut cfg = config();
-        cfg.max_routes = bound(4);
-        let mut world = World::with(cfg, EPOCH, CAPACITY);
+        let mut product_config = config();
+        product_config.max_routes = bound(4);
+        let mut world = World::with(product_config, EPOCH, CAPACITY);
         let mut item = work_item(0);
         let claim = crate::contract::pubsub::DeliveryClaim {
             operation: OperationId::new(
