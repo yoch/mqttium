@@ -6561,7 +6561,11 @@ mod tests {
             "an empty known destination is not polled eagerly"
         );
         let first = work_item(0);
-        load_work(&mut world, &[first.clone()], Some(first.delivery));
+        load_work(
+            &mut world,
+            core::slice::from_ref(&first),
+            Some(first.delivery),
+        );
         assert!(
             world.owner.has_ready_work(session),
             "a loaded queued item can be claimed without a tick"

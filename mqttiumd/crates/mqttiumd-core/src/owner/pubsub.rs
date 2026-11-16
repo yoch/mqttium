@@ -307,8 +307,39 @@ impl Owner {
     /// Empty scans are deliberately excluded; external notifications and the
     /// periodic fallback supply the authority to start a new discovery scan.
     #[must_use]
-    pub fn has_ready_work(&self, _session: SessionId) -> bool {
-        false
+    pub fn has_ready_work(&self, session: SessionId) -> bool {
+        if self.recovery.is_some() {
+            return false;
+        }
+        let Some(generation) = self.connection_of(session) else {
+            return false;
+        };
+        let Some(index) = self.pubsub.connection(generation) else {
+            return false;
+        };
+        let settings = self.pubsub.connections.as_slice()[index];
+        let room = self.pubsub.active(generation) < usize::from(settings.receive_maximum);
+        let next = self
+            .pubsub
+            .deliveries
+            .as_slice()
+            .iter()
+            .filter(|d| d.target == session && d.waiting_to_send(generation))
+            .min_by_key(|d| d.id);
+        if let Some(delivery) = next {
+            match delivery.phase {
+                Phase::ClaimPending(_) => return false,
+                Phase::Queued if room && delivery.payload.is_some() => return true,
+                Phase::AwaitPuback
+                    if delivery.payload.is_some()
+                        && (room || delivery.window == Some(generation)) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        room && settings.loading.is_none() && settings.after.is_some()
     }
 
     pub(super) fn plan_settings(
