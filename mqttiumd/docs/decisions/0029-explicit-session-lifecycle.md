@@ -101,6 +101,24 @@ ephemeral-session closure and its deadline. Existing two-effect transitions and
 their minimum Outbox configuration retain their previous contract. A lifecycle
 transition that cannot reserve its own three-effect bound refuses before change.
 
+The reactor retains at most one pre-CONNACK packet per transport and does not
+release pipelined business packets until the ordered CONNACK is accepted by the
+network adapter. An early explicit DISCONNECT-zero hint keeps the original
+opening request correlation until its known result; it cannot become a close
+of whichever incarnation later uses the ClientID. Sixteen configured transports
+have32 reserved end/close inputs. Up to208 accepted frame registrations cover
+four queued writes, one active write and eight terminal receipts per transport;
+336 reserved terminal facts add the128-effect Outbox bound. Ordinary inputs
+remain bounded separately at128, so closure can reconcile accepted frame facts
+without requiring spare business input capacity.
+
+The instrumented writer exposes session.open/close.prepared inside the real
+transaction and session.open/close.committed after COMMIT before result return.
+Normal builds expose neither test controls nor these callbacks. Captured known
+lifecycle effects and transport-close facts retain their original operation,
+SessionId, attachment and generation when replayed by the test adapter. These
+are system controls rather than permission to reinterpret later socket bytes.
+
 ## Reception and scope
 
 First retain a red test of512 existing-interface create/delete cycles at quota128:
