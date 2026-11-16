@@ -2286,6 +2286,7 @@ pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     outgoing_work_is_bounded_and_independent_of_notifications(make);
     outgoing_capacity_and_filter_guards_are_atomic(make);
     deleting_a_claimed_target_releases_only_its_resources(make);
+    outgoing_packet_reuse_preserves_claim_identity(make);
     opening_opens_the_next_epoch_and_closes_the_older_ones(make);
     an_opening_that_expected_another_epoch_opens_nothing(make);
     an_opening_delivered_again_returns_its_commit(make);
@@ -2794,4 +2795,97 @@ pub fn deleting_a_claimed_target_releases_only_its_resources<S: DurableStore>(
         Err(AdminRefused::UnknownSession)
     );
     assert_eq!(world.store.snapshot().unwrap(), after);
+}
+
+/// One target cannot own two live slots with the same directional wire ID.
+/// Once finish is committed that ID can serve another delivery; an obsolete
+/// claim or a replayed old terminal result cannot free the newer occurrence.
+pub fn outgoing_packet_reuse_preserves_claim_identity<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::command::{ClaimDelivery, FinishDelivery};
+    use mqttiumd_contract::ids::OutboundPacketId;
+    let mut world = World::new(make);
+    for sequence in 1..=2 {
+        let admission = altered(
+            &world.admission(sequence, 7, b"same payload", &[world.b]),
+            |admit| {
+                admit.qos = Qos::AtLeastOnce;
+                admit.costs.exchange_slots = ExchangeSlots::ZERO;
+            },
+        );
+        assert!(world.store.apply(&admission).committed_now);
+    }
+    let claim = |seq, published_as| Command {
+        recipe: FrozenRecipe::freeze(Recipe::ClaimDelivery(ClaimDelivery {
+            operation: operation_id(world.epoch, seq),
+            delivery: DeliveryId {
+                publication: publication_id(world.epoch, published_as),
+                index: 0,
+            },
+            target: world.b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(7).unwrap(),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    let finish = |seq, published_as, claimed_as| Command {
+        recipe: FrozenRecipe::freeze(Recipe::FinishDelivery(FinishDelivery {
+            operation: operation_id(world.epoch, seq),
+            delivery: DeliveryId {
+                publication: publication_id(world.epoch, published_as),
+                index: 0,
+            },
+            target: world.b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(7).unwrap(),
+            claim: operation_id(world.epoch, claimed_as),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    assert!(world.store.apply(&claim(3, 1)).committed_now);
+    let collision = claim(4, 2);
+    assert_eq!(
+        outcome(world.store.apply(&collision).reply),
+        StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed)
+    );
+    let first_finish = finish(5, 1, 3);
+    assert!(world.store.apply(&first_finish).committed_now);
+    assert_eq!(
+        outcome(world.store.apply(&collision).reply),
+        StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed),
+        "a certain rejection stays rejected after the slot is freed"
+    );
+    assert!(world.store.apply(&claim(6, 2)).committed_now);
+    let before = world.store.snapshot().unwrap();
+    assert!(!world.store.apply(&first_finish).committed_now);
+    assert_eq!(
+        world.store.snapshot().unwrap(),
+        before,
+        "a replayed old result owns no newer slot"
+    );
+    assert_eq!(
+        outcome(world.store.apply(&finish(7, 2, 3)).reply),
+        StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed)
+    );
+    let refused = world.store.snapshot().unwrap();
+    assert_eq!(refused.outbound, before.outbound);
+    assert_eq!(refused.obligations, before.obligations);
+    assert_eq!(refused.payloads, before.payloads);
+    assert_eq!(
+        refused.accounts.exchange_slots,
+        before.accounts.exchange_slots
+    );
+    assert_eq!(accounts_match_what_is_held(&refused), Ok(()));
+    assert!(world.store.apply(&finish(8, 2, 6)).committed_now);
+    let ended = world.store.snapshot().unwrap();
+    assert!(
+        ended.outbound.is_empty()
+            && ended.obligations.is_empty()
+            && ended.publications.is_empty()
+            && ended.payloads.is_empty()
+    );
+    assert_eq!(accounts_match_what_is_held(&ended), Ok(()));
 }
