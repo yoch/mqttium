@@ -28,9 +28,19 @@
 - Final descriptive registry includes deferred Release; current digest is
   162a9cd3b9e1f5a623ebcba47f75ac852e1c5c02674867dd74496b03a5e6126d.
   Canonical recipe kinds1..7 remain unchanged. SQLite schema4 refuses1/2/3.
-- Next: receive the clean final command tools/run_receipt_reception.sh, normal/
-  instrumented suites sequentially, old product regressions, fresh K1/K2b/K3
-  and exact-head CI; publish with expected remote HEAD3ad41e95 protection.
+- Published checkpoint f17a9f36:864 normal/873 instrumented Rust tests,71
+  product-hook tests,174 oracle tests and all four old product wrappers pass.
+  K1/K2b/K3 qualify/recompute/rebuild on that exact checkpoint; keep their
+  source labels. Its main normal run completed32811 business commands.
+- Final reception under build contention exposed two probe-only bugs: treating
+  0.3s silence as pressure and selecting an interim Unknown resolution. Two
+  committed red/fix pairs now require causal fresh pressure plus same-origin
+  SQL floor/span, and a post-release same-operation terminal result.42 pilots
+  and traced corrected C pass; runtime/contracts/models equal f17a byte-for-byte.
+- Next: receive the fresh clean final tools/run_receipt_reception.sh and fresh
+  K1/K2b/K3/source reconstructions, then exact-head CI. Expected remote f17a9f36
+  supersedes the original3ad41e95 check. Old local wrappers remain f17a evidence;
+  final CI reruns those on the actual publication. Do not relabel prior runs.
   Final SHA, archive hashes and check identities belong in PR648 and indexes,
   without retrospectively relabeling diagnostics. No merge/ADR acceptance.
   Outgoing Packet Identifier recycling remains the next operational increment.
