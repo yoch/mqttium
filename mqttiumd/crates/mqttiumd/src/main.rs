@@ -5,11 +5,13 @@ use mqttiumd::{
 };
 use std::path::PathBuf;
 fn arguments() -> Result<Config, &'static str> {
+    parse_arguments(std::env::args().skip(1))
+}
+fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'static str> {
     let mut db = None;
     let mut listen = "127.0.0.1:1883".parse().map_err(|_| "listen")?;
     let mut events = None;
     let mut hooks = Hooks::default();
-    let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let value = args.next().ok_or("missing argument value")?;
         match arg.as_str() {
@@ -59,6 +61,35 @@ fn arguments() -> Result<Config, &'static str> {
         events: events.ok_or("--events is required")?,
         hooks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receipt_closure_points_are_available_only_in_the_instrumented_cli() {
+        let args = [
+            "--db".to_owned(),
+            "unused.sqlite".to_owned(),
+            "--events".to_owned(),
+            "unused.jsonl".to_owned(),
+            "--test-control".to_owned(),
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            "--test-pause".to_owned(),
+            "receipt.close.prepared,receipt.close.committed".to_owned(),
+        ];
+        let result = parse_arguments(args.into_iter());
+        if cfg!(feature = "test-hooks") {
+            let config = result.unwrap_or_else(|error| panic!("receipt point refused: {error}"));
+            assert_eq!(
+                config.hooks.pause,
+                ["receipt.close.prepared", "receipt.close.committed"]
+            );
+        } else {
+            assert!(matches!(result, Err("unknown or unavailable option")));
+        }
+    }
 }
 fn main() {
     let config = match arguments() {
