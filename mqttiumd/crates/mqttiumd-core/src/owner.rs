@@ -56,6 +56,7 @@ use crate::leases::{LeaseRefused, LeaseTable};
 
 mod pubsub;
 mod receipts;
+mod sessions;
 
 /// The largest reservation of effect slots one transition makes. The
 /// constructor of an owner refuses a box that is smaller (ADR 0006,
@@ -1155,6 +1156,7 @@ impl Owner {
         }
         match input {
             Input::MaintainReceipts => self.plan_receipt_maintenance(draft),
+            Input::OpenSession { .. } | Input::EndSession { .. } => Err(IMPOSSIBLE),
             Input::ReceiptsCollected {
                 effect,
                 collection,
@@ -2586,6 +2588,7 @@ impl Owner {
                 session,
                 client_id,
                 revision,
+                ..
             } => {
                 let session = Session {
                     id: *session,
@@ -2805,6 +2808,8 @@ mod tests {
             session: SessionId::new(session),
             client_id: bytes(client_id),
             revision: Revision::new(session + 10),
+            expiry: crate::contract::session::SessionExpiry::Never,
+            opened_by: None,
         }
     }
 
@@ -2929,6 +2934,8 @@ mod tests {
     fn kind(effect: &Effect) -> &'static str {
         match effect {
             Effect::CollectReceipts { .. } => "CollectReceipts",
+            Effect::SessionChanged { .. } => "SessionChanged",
+            Effect::SessionRefused { .. } => "SessionRefused",
             Effect::Persist { .. } => "Persist",
             Effect::ResolveAndFence { .. } => "ResolveAndFence",
             Effect::LoadWork { .. } => "LoadWork",
@@ -3091,6 +3098,7 @@ mod tests {
                 | Recipe::ConsumeDelivery(_)
                 | Recipe::ClaimDelivery(_)
                 | Recipe::FinishDelivery(_) => panic!("pubsub command needs its own facts"),
+                Recipe::SessionLifecycle(_) => panic!("lifecycle command needs its own facts"),
                 Recipe::AdmitPublication(admit) => {
                     assert!(command.payload.is_some());
                     CommitFacts::PublicationAdmitted {
@@ -3124,6 +3132,7 @@ mod tests {
                 | CommitFacts::SubscriptionsChanged { .. }
                 | CommitFacts::DeliveryClaimed { .. }
                 | CommitFacts::DeliveryFinished { .. } => RejectReason::PreconditionFailed,
+                CommitFacts::SessionLifecycle(_) => RejectReason::PreconditionFailed,
                 CommitFacts::InboundReleased { .. } => RejectReason::Fenced,
                 CommitFacts::PublicationAdmitted { .. } => {
                     RejectReason::CapacityExceeded(Resource::PayloadBytes)

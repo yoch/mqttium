@@ -2161,11 +2161,15 @@ mod tests {
                 session: TARGET,
                 client_id: bytes(b"subscriber"),
                 revision: Revision::new(1),
+                expiry: crate::contract::session::SessionExpiry::Never,
+                opened_by: None,
             },
             RecoveredFact::Session {
                 session: SessionId::new(2),
                 client_id: bytes(b"other"),
                 revision: Revision::new(1),
+                expiry: crate::contract::session::SessionExpiry::Never,
+                opened_by: None,
             },
         ];
         assert!(
