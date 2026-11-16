@@ -3338,7 +3338,10 @@ mod tests {
             }
         );
         assert_eq!(world.owner.sessions.len(), 1);
-        assert_eq!(world.owner.sessions.as_slice()[0].revision, Revision::new(1));
+        assert_eq!(
+            world.owner.sessions.as_slice()[0].revision,
+            Revision::new(1)
+        );
         assert_eq!(
             world.owner.connection_of(SessionId::new(PRODUCER)),
             Some(ConnectionGeneration::new(CONN))
@@ -3391,9 +3394,11 @@ mod tests {
     #[test]
     fn product_late_creation_installs_knowledge_without_binding_or_acknowledging() {
         let mut world = empty_recovered();
-        assert!(world
-            .sent(established(None, PRODUCER, b"new-client", 1, false))
-            .is_empty());
+        assert!(
+            world
+                .sent(established(None, PRODUCER, b"new-client", 1, false))
+                .is_empty()
+        );
         assert_eq!(world.owner.connection_of(SessionId::new(PRODUCER)), None);
         assert_eq!(world.owner.sessions.len(), 1);
         world.applied(connect(11, b"new-client"));
@@ -3407,7 +3412,10 @@ mod tests {
                 }
             )
         );
-        absorbed(&mut world, established(None, PRODUCER, b"new-client", 1, false));
+        absorbed(
+            &mut world,
+            established(None, PRODUCER, b"new-client", 1, false),
+        );
         assert_eq!(
             world.owner.connection_of(SessionId::new(PRODUCER)),
             Some(ConnectionGeneration::new(11))
@@ -3418,9 +3426,11 @@ mod tests {
     fn product_closed_generation_cannot_receive_a_late_creation_acknowledgement() {
         let mut world = empty_recovered();
         assert!(world.sent(transport_closed(CONN)).is_empty());
-        assert!(world
-            .sent(established(Some(CONN), PRODUCER, b"new-client", 1, false))
-            .is_empty());
+        assert!(
+            world
+                .sent(established(Some(CONN), PRODUCER, b"new-client", 1, false))
+                .is_empty()
+        );
         assert_eq!(world.owner.sessions.len(), 1);
         assert_eq!(world.owner.connection_of(SessionId::new(PRODUCER)), None);
         absorbed(&mut world, connect(CONN, b"new-client"));
