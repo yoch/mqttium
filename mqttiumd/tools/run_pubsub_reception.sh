@@ -51,8 +51,10 @@ cargo -V >"$ps_out/cargo.txt"
 "$ps_python" -VV >"$ps_out/python.txt"
 git rev-parse HEAD >"$ps_out/source-head.txt"
 git diff --binary HEAD >"$ps_out/source.modification"
-ps_record source-archive git archive --format=tar "$ps_sha"
-git archive --format=tar "$ps_sha" >"$ps_out/source.tar"
+# Preserve the client checkout as well as the broker: the public mqttium
+# driver imports src/mqttium from this exact repository revision.
+ps_record source-archive git -C "$ps_repo" archive --format=tar "$ps_sha"
+git -C "$ps_repo" archive --format=tar "$ps_sha" >"$ps_out/source.tar"
 for ps_mode in normal hooks; do
     ps_features=()
     if [[ "$ps_mode" == hooks ]]; then ps_features=(--features test-hooks); fi
