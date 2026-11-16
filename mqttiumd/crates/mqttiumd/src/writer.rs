@@ -1072,7 +1072,7 @@ mod tests {
     use std::time::Instant;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     #[test]
-    fn reserved_collection_progresses_while_ordinary_replies_are_unread() {
+    fn reserved_collection_and_lifecycle_progress_while_ordinary_replies_are_unread() {
         let path = std::env::temp_dir().join(format!(
             "mqttiumd-control-lane-{}-{}",
             std::process::id(),
@@ -1130,6 +1130,41 @@ mod tests {
             .send(ControlRequest::Collect { effect, collection })
             .unwrap();
         let reply = writer.control_receiver.recv_timeout(Duration::from_secs(2));
+        let operation = OperationId {
+            incarnation: origin.incarnation,
+            epoch: origin.epoch,
+            owner: origin.owner,
+            sequence: mqttiumd_contract::ids::OperationSeq::new(1),
+        };
+        let lifecycle_effect = EffectId {
+            sequence: EffectSeq::new(2),
+            ..effect
+        };
+        let command = mqttiumd_contract::command::Command {
+            recipe: mqttiumd_contract::command::FrozenRecipe::freeze(Recipe::SessionLifecycle(
+                mqttiumd_contract::session::SessionLifecycle {
+                    operation,
+                    action: SessionAction::Open {
+                        client_id: SharedBytes::copy_from(b"reserved-lifecycle", MAX_CLIENT)
+                            .unwrap(),
+                        expected: None,
+                        clean_start: false,
+                        expiry: SessionExpiry::OnDisconnect,
+                    },
+                },
+            ))
+            .unwrap(),
+            payload: None,
+        };
+        writer
+            .control_sender
+            .send(ControlRequest::Lifecycle(OwnedEffect::new(
+                lifecycle_effect,
+                Effect::Persist { command },
+            )))
+            .unwrap();
+        let lifecycle_reply = writer.control_receiver.recv_timeout(Duration::from_secs(2));
+        let lifecycle_visible = SqliteStore::inspect(&db).unwrap().sessions.len() == 66;
         // Cleanup before asserting: even the original blocked implementation
         // must release its writer and terminate when the semantic test fails.
         cancel.store(true, Ordering::Relaxed);
@@ -1150,6 +1185,20 @@ mod tests {
         assert!(
             matches!(reply,Ok(ControlResponse::Collected { effect:e,collection:c,result:Ok(ReceiptCollectionReply::Applied { removed:0,.. }) }) if e==effect && c==collection),
             "reserved maintenance must reply even when the ordinary result lane is demonstrably full"
+        );
+        assert!(
+            lifecycle_visible,
+            "reserved lifecycle command must actually commit"
+        );
+        assert!(
+            matches!(lifecycle_reply,
+                Ok(ControlResponse::Lifecycle { effect, operation: returned, reply: StoreReply::Outcome(
+                    mqttiumd_contract::outcome::StoreOutcome::Committed(mqttiumd_contract::outcome::CommitFacts::SessionLifecycle(
+                        mqttiumd_contract::session::SessionChange::Opened { expiry: SessionExpiry::OnDisconnect, .. }
+                    ))
+                ) }) if effect == lifecycle_effect && returned == operation
+            ),
+            "reserved lifecycle must correlate its committed result while all ordinary results remain unread"
         );
     }
     #[test]
