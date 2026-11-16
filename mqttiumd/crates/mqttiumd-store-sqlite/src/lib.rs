@@ -46,6 +46,7 @@
 #![forbid(unsafe_code)]
 
 mod codec;
+mod pubsub;
 mod reader;
 mod schema;
 
@@ -66,8 +67,8 @@ use mqttiumd_contract::command::{
 };
 use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
 use mqttiumd_contract::ids::{
-    DeliveryId, InboundPacketId, OperationId, OperationSeq, PayloadId, PublicationId, Revision,
-    RunEpoch, SessionId, StoreIncarnation,
+    DeliveryId, InboundPacketId, OperationId, OperationSeq, OutboundPacketId, PayloadId,
+    PublicationId, Revision, RunEpoch, SessionId, StoreIncarnation,
 };
 use mqttiumd_contract::outcome::{
     CommitFacts, Knowledge, OpeningOutcome, RejectReason, StoreOutcome, StoreReply, StoreViolation,
@@ -76,9 +77,9 @@ use mqttiumd_contract::packet::{Qos, SharedBytes};
 use mqttiumd_store_api::{
     Accounts, AdminCommand, AdminDone, AdminRefused, Applied, Decision, Durability, DurableState,
     DurableStore, InboundRecord, Limits, MAX_CLIENT_ID_BYTES, MAX_RECOVERY_INVENTORY_ROWS,
-    ObligationRecord, OperationRecord, PayloadRecord, PublicationRecord, ReadBudget, ReadError,
-    RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved, RouteTarget, SessionRecord,
-    SessionState,
+    ObligationRecord, OperationRecord, OutboundRecord, PayloadRecord, PublicationRecord,
+    ReadBudget, ReadError, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved, RouteTarget,
+    SessionRecord, SessionState, WorkPage,
 };
 
 use codec::{
@@ -474,6 +475,7 @@ fn decision_of(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Decisi
         exchange: reader::optional_blob(row, first + 2, 16)?,
         reason: row.get(first + 3)?,
         resource: row.get(first + 4)?,
+        facts: reader::optional_blob(row, first + 5, 96)?,
     })
 }
 
@@ -483,6 +485,7 @@ struct DecisionColumns {
     exchange: Option<Vec<u8>>,
     reason: Option<i64>,
     resource: Option<i64>,
+    facts: Option<Vec<u8>>,
 }
 
 const DECISION_ADMITTED: i64 = 1;
@@ -507,6 +510,10 @@ impl DecisionColumns {
                 self.reason.ok_or(Corrupt)?,
                 self.resource,
             )?)),
+            4 | 5 | 6 => Ok(Decision::Committed(pubsub::decode_facts(
+                self.decision,
+                self.facts.as_deref().ok_or(Corrupt)?,
+            )?)),
             _ => Err(Corrupt),
         }
     }
@@ -518,7 +525,7 @@ fn insert_operation(
     recipe: &[u8],
     decision: Decision,
 ) -> Result<(), Fault> {
-    let (code, publication, exchange, reason, resource) = match decision {
+    let (code, publication, exchange, reason, resource, facts) = match decision {
         Decision::Committed(CommitFacts::PublicationAdmitted {
             publication,
             exchange,
@@ -528,6 +535,7 @@ fn insert_operation(
             Some(exchange_blob(exchange).to_vec()),
             None,
             None,
+            None,
         ),
         Decision::Committed(CommitFacts::InboundReleased { exchange }) => (
             DECISION_RELEASED,
@@ -535,25 +543,18 @@ fn insert_operation(
             Some(exchange_blob(exchange).to_vec()),
             None,
             None,
+            None,
         ),
+        Decision::Committed(facts) => {
+            let (code, bytes) = pubsub::facts_blob(facts).ok_or(Fault::Corrupt)?;
+            (code, None, None, None, None, Some(bytes))
+        }
         Decision::Rejected(rejected) => {
             let (reason, resource) = reason_codes(rejected);
-            (DECISION_REJECTED, None, None, Some(reason), resource)
+            (DECISION_REJECTED, None, None, Some(reason), resource, None)
         }
     };
-    conn.prepare_cached(
-        "INSERT INTO operations (id, decision, publication, exchange, reason, resource, recipe)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-    )?
-    .execute(params![
-        operation.to_be_bytes().as_slice(),
-        code,
-        publication,
-        exchange,
-        reason,
-        resource,
-        recipe
-    ])?;
+    conn.prepare_cached("INSERT INTO operations(id,decision,publication,exchange,reason,resource,recipe,facts) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")?.execute(params![operation.to_be_bytes().as_slice(),code,publication,exchange,reason,resource,recipe,facts])?;
     Ok(())
 }
 
@@ -563,7 +564,7 @@ fn read_operation(
 ) -> Result<Option<OperationRecord>, Fault> {
     let row = conn
         .prepare_cached(
-            "SELECT recipe, decision, publication, exchange, reason, resource
+            "SELECT recipe, decision, publication, exchange, reason, resource, facts
                FROM operations WHERE id = ?1",
         )?
         .query_row([operation.to_be_bytes().as_slice()], |row| {
@@ -675,7 +676,7 @@ fn admission_identity_was_used(
         .to_be_bytes()
     };
     let mut statement = conn.prepare_cached(
-        "SELECT id, recipe, decision, publication, exchange, reason, resource
+        "SELECT id, recipe, decision, publication, exchange, reason, resource, facts
            FROM operations WHERE id >= ?1 AND id <= ?2 ORDER BY id",
     )?;
     let mut rows = statement.query(params![bound(0).as_slice(), bound(u64::MAX).as_slice()])?;
@@ -964,6 +965,16 @@ fn end_obligation(
     index: i64,
 ) -> Result<(), Abort<AdminRefused>> {
     let broken = Abort::Refused(AdminRefused::Inconsistent);
+    let removed = conn
+        .prepare_cached("DELETE FROM outbound WHERE publication=?1 AND idx=?2")?
+        .execute(params![publication, index])?;
+    if removed == 1 {
+        meta.accounts.exchange_slots = meta
+            .accounts
+            .exchange_slots
+            .checked_sub(ExchangeSlots::new(1))
+            .ok_or(Abort::Refused(AdminRefused::Inconsistent))?;
+    }
     conn.prepare_cached("DELETE FROM obligations WHERE publication = ?1 AND idx = ?2")?
         .execute(params![publication, index])?;
     meta.accounts.references = meta
@@ -1434,6 +1445,16 @@ impl SqliteStore {
     /// its durable values are decoded.
     pub fn open(path: &Path) -> Result<Self, OpenError> {
         let lock = writer_lock(path)?;
+        {
+            let probe = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            let version: i64 = probe.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if version != SCHEMA_VERSION {
+                return Err(OpenError::SchemaVersion(version));
+            }
+        }
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -1686,7 +1707,14 @@ impl SqliteStore {
         budget: ReadBudget,
     ) -> Result<(Vec<Result<RecoveredFact, RecoveryRefused>>, bool), Fault> {
         let mut total_rows = 3usize;
-        for table in ["routes", "sessions", "inbound", "operations", "fences"] {
+        for table in [
+            "routes",
+            "sessions",
+            "inbound",
+            "obligations",
+            "operations",
+            "fences",
+        ] {
             let count: i64 = conn.query_row(
                 &format!(
                     "SELECT count(*) FROM (SELECT 1 FROM {table} LIMIT {})",
@@ -1701,6 +1729,13 @@ impl SqliteStore {
             if total_rows > MAX_RECOVERY_INVENTORY_ROWS {
                 return Err(Fault::Read(ReadError::LimitExceeded));
             }
+        }
+        let orphan: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outbound c LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx WHERE o.publication IS NULL LIMIT 1)",
+            [], |row| row.get(0),
+        )?;
+        if orphan {
+            return Err(Fault::Corrupt);
         }
         let mut out = Vec::new();
         out.try_reserve_exact(count)
@@ -1877,10 +1912,61 @@ impl SqliteStore {
                 }))
             },
         )?;
+        section(
+            "SELECT o.publication,o.idx,o.target,o.target_revision,c.packet_id,c.claim,c.target,c.target_revision,o.qos,s.revision,s.state FROM obligations o LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE ?1=?1 AND ?2=?2 ORDER BY o.publication,o.idx",
+            &mut out,
+            &mut position,
+            &mut |row| {
+                budget.check_field(32)?;
+                meter.charge(160)?;
+                let delivery = DeliveryId {
+                    publication: PublicationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
+                        .map_err(|_| Fault::Corrupt)?,
+                    index: u32::try_from(row.get::<_, i64>(1)?).map_err(|_| Fault::Corrupt)?,
+                };
+                let target = SessionId::from_be_slice(reader::borrow_blob(row, 2, 8)?)
+                    .map_err(|_| Fault::Corrupt)?;
+                let target_revision = Revision::new(blob_u64(reader::borrow_blob(row, 3, 8)?)?);
+                if code_session_state(row.get(10)?)? != SessionState::Active
+                    || target_revision.get() != blob_u64(reader::borrow_blob(row, 9, 8)?)?
+                {
+                    return Err(Fault::Corrupt);
+                }
+                let qos = code_qos(row.get(8)?)?;
+                let claim = match row.get_ref(4)? {
+                    rusqlite::types::ValueRef::Null => None,
+                    _ => {
+                        let operation =
+                            OperationId::from_be_slice(reader::borrow_blob(row, 5, 32)?)
+                                .map_err(|_| Fault::Corrupt)?;
+                        if operation.incarnation() != incarnation
+                            || qos != Qos::AtLeastOnce
+                            || reader::borrow_blob(row, 6, 8)? != target.to_be_bytes()
+                            || blob_u64(reader::borrow_blob(row, 7, 8)?)? != target_revision.get()
+                        {
+                            return Err(Fault::Corrupt);
+                        }
+                        Some(mqttiumd_contract::pubsub::DeliveryClaim {
+                            operation,
+                            packet_id: u16::try_from(row.get::<_, i64>(4)?)
+                                .ok()
+                                .and_then(OutboundPacketId::new)
+                                .ok_or(Fault::Corrupt)?,
+                        })
+                    }
+                };
+                Ok(Ok(RecoveredFact::OutboundDelivery {
+                    delivery,
+                    target,
+                    target_revision,
+                    claim,
+                }))
+            },
+        )?;
         // What is established about the operations of older epochs: the
         // epoch is bytes 9 to 16 of the identity, compared as bytes.
         section(
-            "SELECT id, decision, publication, exchange, reason, resource FROM operations
+            "SELECT id, decision, publication, exchange, reason, resource, facts FROM operations
               WHERE ?1 = ?1 AND substr(id, 9, 8) != ?2 ORDER BY id",
             &mut out,
             &mut position,
@@ -1975,7 +2061,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
         let mut operations = BTreeMap::new();
         {
             let mut statement = conn.prepare(
-                "SELECT id, recipe, decision, publication, exchange, reason, resource FROM operations",
+                "SELECT id, recipe, decision, publication, exchange, reason, resource, facts FROM operations",
             )?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
@@ -2064,6 +2150,47 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                 );
             }
         }
+        let mut outbound = BTreeMap::new();
+        {
+            let mut statement = conn.prepare(
+                "SELECT publication,idx,target,target_revision,packet_id,claim FROM outbound",
+            )?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let delivery = DeliveryId {
+                    publication: PublicationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
+                        .map_err(|_| Fault::Corrupt)?,
+                    index: u32::try_from(row.get::<_, i64>(1)?).map_err(|_| Fault::Corrupt)?,
+                };
+                let target = SessionId::from_be_slice(reader::borrow_blob(row, 2, 8)?)
+                    .map_err(|_| Fault::Corrupt)?;
+                let target_revision = Revision::new(blob_u64(reader::borrow_blob(row, 3, 8)?)?);
+                let packet_id = u16::try_from(row.get::<_, i64>(4)?)
+                    .ok()
+                    .and_then(OutboundPacketId::new)
+                    .ok_or(Fault::Corrupt)?;
+                let claim = OperationId::from_be_slice(reader::borrow_blob(row, 5, 32)?)
+                    .map_err(|_| Fault::Corrupt)?;
+                let record = OutboundRecord {
+                    target,
+                    target_revision,
+                    packet_id,
+                    claim,
+                };
+                if !obligations
+                    .get(&delivery)
+                    .is_some_and(|obligation: &ObligationRecord| {
+                        obligation.target == target
+                            && obligation.target_revision == target_revision
+                            && obligation.qos == Qos::AtLeastOnce
+                    })
+                    || claim.incarnation() != meta.ledger.incarnation()
+                {
+                    return Err(Fault::Corrupt);
+                }
+                outbound.insert(delivery, record);
+            }
+        }
         let mut inbound = BTreeMap::new();
         {
             let mut statement = conn
@@ -2105,6 +2232,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
             payloads,
             obligations,
             inbound,
+            outbound,
         })
     }
 }
@@ -2203,6 +2331,9 @@ impl DurableStore for SqliteStore {
             let facts = match recipe {
                 Recipe::AdmitPublication(admit) => stage_admission(conn, meta, admit, payload)?,
                 Recipe::ReleaseInbound(release) => stage_release(conn, meta, release)?,
+                Recipe::ChangeSubscriptions(command) => pubsub::subscriptions(conn, meta, command)?,
+                Recipe::ClaimDelivery(command) => pubsub::claim(conn, meta, command)?,
+                Recipe::FinishDelivery(command) => pubsub::finish(conn, meta, command)?,
             };
             insert_operation(conn, operation, &canonical, Decision::Committed(facts))?;
             Ok(facts)
@@ -2313,6 +2444,16 @@ impl DurableStore for SqliteStore {
         read.commit()
             .map_err(|error| refused(reader::sql_error(&error)))?;
         Ok(RecoveryPage { facts, next })
+    }
+
+    fn read_work_with_budget(
+        &self,
+        session: SessionId,
+        after: Option<DeliveryId>,
+        limit: usize,
+        budget: ReadBudget,
+    ) -> Result<WorkPage, ReadError> {
+        pubsub::work(&self.conn, session, after, limit, budget).map_err(|fault| fault.read_error())
     }
 
     fn snapshot_with_budget(&self, budget: ReadBudget) -> Result<DurableState, ReadError> {

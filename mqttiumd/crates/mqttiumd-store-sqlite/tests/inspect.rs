@@ -143,7 +143,11 @@ fn an_inspection_refuses_what_is_not_this_store() {
     );
     rusqlite::Connection::open(&path)
         .expect("raw")
-        .pragma_update(None, "user_version", 2)
+        .pragma_update(
+            None,
+            "user_version",
+            mqttiumd_store_sqlite::SCHEMA_VERSION + 1,
+        )
         .expect("set");
     assert!(matches!(
         SqliteStore::inspect(&path),

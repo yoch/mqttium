@@ -1,11 +1,11 @@
-//! The schema of version 1. Every table is `STRICT`; identities and 64-bit
+//! The schema of version 2. Every table is `STRICT`; identities and 64-bit
 //! values are 8-byte big-endian BLOBs (32 bytes for an operation-scoped
 //! identity, 16 for an exchange, 24 for an opening attempt); large BLOBs
 //! come last in their row.
 
 /// `PRAGMA user_version` of the schema below. Any other version is
 /// refused before anything is written.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// The format named in `meta`.
 pub const FORMAT: &str = "mqttiumd-store-sqlite";
@@ -58,7 +58,8 @@ CREATE TABLE operations (
     exchange BLOB CHECK (exchange IS NULL OR length(exchange) = 16),
     reason INTEGER,
     resource INTEGER,
-    recipe BLOB NOT NULL
+    recipe BLOB NOT NULL,
+    facts BLOB CHECK (facts IS NULL OR length(facts) <= 96)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE fences (
@@ -95,7 +96,18 @@ CREATE TABLE obligations (
     PRIMARY KEY (publication, idx)
 ) STRICT, WITHOUT ROWID;
 
-CREATE INDEX obligations_by_target ON obligations (target);
+CREATE INDEX obligations_by_target ON obligations (target, qos, publication, idx);
+
+CREATE TABLE outbound (
+    publication BLOB NOT NULL CHECK(length(publication)=32),
+    idx INTEGER NOT NULL CHECK(idx>=0 AND idx<=4294967295),
+    target BLOB NOT NULL CHECK(length(target)=8),
+    target_revision BLOB NOT NULL CHECK(length(target_revision)=8),
+    packet_id INTEGER NOT NULL CHECK(packet_id>=1 AND packet_id<=65535),
+    claim BLOB NOT NULL CHECK(length(claim)=32),
+    PRIMARY KEY(publication,idx),
+    UNIQUE(target,packet_id)
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE inbound (
     session BLOB NOT NULL CHECK (length(session) = 8),

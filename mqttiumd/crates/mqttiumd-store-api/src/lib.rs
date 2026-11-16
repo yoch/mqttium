@@ -18,13 +18,14 @@ use mqttiumd_contract::capacity::{
 use mqttiumd_contract::command::{Command, DeliveryCause, EpochLedger, OpenEpoch};
 use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
 use mqttiumd_contract::ids::{
-    DeliveryId, ExchangeId, InboundPacketId, OperationId, PayloadId, PublicationId, Revision,
-    RunEpoch, SessionId,
+    DeliveryId, ExchangeId, InboundPacketId, OperationId, OutboundPacketId, PayloadId,
+    PublicationId, Revision, RunEpoch, SessionId,
 };
 use mqttiumd_contract::outcome::{
     CommitFacts, OpeningOutcome, RejectReason, StoreOutcome, StoreReply,
 };
 use mqttiumd_contract::packet::Qos;
+use mqttiumd_contract::pubsub::WorkItem;
 
 /// The longest ClientID MQTT can carry: a UTF-8 string with a two-byte
 /// length. A session never holds a longer one, and a recovered session
@@ -70,6 +71,7 @@ pub enum ReadPhase {
     Snapshot,
     Inspect,
     Recovery,
+    Work,
 }
 
 impl ReadPhase {
@@ -83,6 +85,7 @@ impl ReadPhase {
             Self::Snapshot => "Snapshot",
             Self::Inspect => "Inspect",
             Self::Recovery => "Recovery",
+            Self::Work => "Work",
         }
     }
 }
@@ -245,6 +248,22 @@ pub struct InboundRecord {
     pub phase: InboundPhase,
 }
 
+/// A durable outgoing QoS 1 intent. Its claim operation also guards slot reuse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct OutboundRecord {
+    pub target: SessionId,
+    pub target_revision: Revision,
+    pub packet_id: OutboundPacketId,
+    pub claim: OperationId,
+}
+
+/// One coherent live key page, ordered by DeliveryId. A new scan starts at None.
+#[derive(PartialEq, Eq, Debug)]
+pub struct WorkPage {
+    pub items: BoundedVec<WorkItem>,
+    pub next: Option<DeliveryId>,
+}
+
 /// Everything that survives a crash. It is also the snapshot of a store:
 /// two stores in the same durable state compare equal, and every
 /// collection is ordered by its key.
@@ -272,6 +291,7 @@ pub struct DurableState {
     pub payloads: BTreeMap<PayloadId, PayloadRecord>,
     pub obligations: BTreeMap<DeliveryId, ObligationRecord>,
     pub inbound: BTreeMap<(SessionId, InboundPacketId), InboundRecord>,
+    pub outbound: BTreeMap<DeliveryId, OutboundRecord>,
 }
 
 /// Commands that prepare or administer a data set. A fixture is set up
@@ -456,6 +476,28 @@ pub trait DurableStore {
         limit: usize,
         budget: ReadBudget,
     ) -> Result<RecoveryPage, RecoveryRefused>;
+
+    /// Read only QoS 1 obligations for a target, in DeliveryId order. This is
+    /// a live key cursor, not a claim or a proof of global absence. Each page
+    /// is coherent and copied only within its field/aggregate byte budgets.
+    fn read_work(
+        &self,
+        session: SessionId,
+        after: Option<DeliveryId>,
+        limit: usize,
+    ) -> Result<WorkPage, ReadError> {
+        self.read_work_with_budget(session, after, limit, ReadBudget::PAGE)
+    }
+
+    fn read_work_with_budget(
+        &self,
+        _session: SessionId,
+        _after: Option<DeliveryId>,
+        _limit: usize,
+        _budget: ReadBudget,
+    ) -> Result<WorkPage, ReadError> {
+        Err(ReadError::Unavailable)
+    }
 
     /// The durable state, for inspection.
     fn snapshot(&self) -> Result<DurableState, ReadError> {

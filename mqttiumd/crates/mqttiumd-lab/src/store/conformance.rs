@@ -1035,7 +1035,7 @@ pub fn a_release_ends_the_inbound_exchange<S: DurableStore>(
 }
 
 /// Every account equals what the state holds: a receipt slot per receipt
-/// and per fence, an exchange slot per inbound marker, a reference per
+/// and per fence, an exchange slot per inbound marker or outgoing claim, a reference per
 /// obligation, the bytes of the payloads kept. Returns the first account
 /// that differs.
 pub fn accounts_match_what_is_held(state: &DurableState) -> Result<(), &'static str> {
@@ -1049,7 +1049,7 @@ pub fn accounts_match_what_is_held(state: &DurableState) -> Result<(), &'static 
                 .sum(),
         ),
         references: References::new(count(state.obligations.len())),
-        exchange_slots: ExchangeSlots::new(count(state.inbound.len())),
+        exchange_slots: ExchangeSlots::new(count(state.inbound.len() + state.outbound.len())),
         receipt_slots: ReceiptSlots::new(count(state.operations.len() + state.fences.len())),
     };
     let accounts = state.accounts;
@@ -1416,9 +1416,44 @@ pub fn recovery_reads_bounded_pages_of_durable_facts<S: DurableStore>(
             (fenced, Knowledge::RejectedCertain(RejectReason::Fenced)),
         ]
     );
-    // The epoch, the limits, the route table and its two targets, three
-    // sessions, one inbound exchange, three operations.
-    assert_eq!(facts.len(), 1 + 1 + 1 + 2 + 3 + 1 + 3);
+    let outbound: Vec<_> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            RecoveredFact::OutboundDelivery {
+                delivery,
+                target,
+                target_revision,
+                claim,
+            } => Some((*delivery, *target, *target_revision, *claim)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        outbound,
+        [
+            (
+                DeliveryId {
+                    publication: publication_id(old_epoch, 1),
+                    index: 0
+                },
+                world.b,
+                Revision::new(1),
+                None
+            ),
+            (
+                DeliveryId {
+                    publication: publication_id(old_epoch, 1),
+                    index: 1
+                },
+                world.c,
+                Revision::new(1),
+                None
+            ),
+        ]
+    );
+    // The epoch, limits, route table and two targets, three sessions,
+    // one inbound exchange, two queued deliveries and three operations.
+    assert_eq!(facts.len(), 1 + 1 + 1 + 2 + 3 + 1 + 2 + 3);
 
     // The same inventory in pages of every size, never above the limit.
     for limit in 1..=facts.len() + 1 {
@@ -1909,7 +1944,7 @@ pub fn every_receipt_and_fence_holds_a_receipt_slot<S: DurableStore>(
 /// The inventory is in the order of record 0014: the epoch, the limits,
 /// the route table, the routes sorted by the bytes of their topic with
 /// the targets of one topic in the order they were added, the sessions,
-/// the inbound exchanges, the operations. `RecoveryOrder::admit` takes
+/// the inbound exchanges, the outgoing deliveries, the operations. `RecoveryOrder::admit` takes
 /// every fact, page by page from a fresh rule, and over the whole
 /// inventory with the rule carried from page to page.
 pub fn recovered_facts_follow_the_order_of_an_inventory<S: DurableStore>(
@@ -2246,6 +2281,8 @@ pub fn recovery_field_limits_include_fixed_identities<S: DurableStore>(
 
 /// Every check of this module, in order.
 pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
+    subscriptions_replace_and_remove_without_duplicate_or_hole(make);
+    qos1_claim_and_finish_are_conditional_and_idempotent(make);
     opening_opens_the_next_epoch_and_closes_the_older_ones(make);
     an_opening_that_expected_another_epoch_opens_nothing(make);
     an_opening_delivered_again_returns_its_commit(make);

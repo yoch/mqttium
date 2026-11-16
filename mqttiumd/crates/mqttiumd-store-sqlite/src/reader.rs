@@ -201,7 +201,7 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
         budget.check_field(24)?;
     }
     meter.charge(256)?;
-    let tables: [(&str, &[(usize, usize)]); 8] = [
+    let tables: [(&str, &[(usize, usize)]); 9] = [
         (
             "SELECT id, client_id, revision, state FROM sessions",
             &[(0, 8), (1, MAX_CLIENT_ID_BYTES), (2, 8)],
@@ -211,8 +211,14 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
             &[(0, meta.limits.max_topic_bytes), (1, 8)],
         ),
         (
-            "SELECT id, recipe, decision, publication, exchange, reason, resource FROM operations",
-            &[(0, 32), (1, budget.max_field_bytes), (3, 32), (4, 16)],
+            "SELECT id, recipe, decision, publication, exchange, reason, resource, facts FROM operations",
+            &[
+                (0, 32),
+                (1, budget.max_field_bytes),
+                (3, 32),
+                (4, 16),
+                (7, 96),
+            ],
         ),
         ("SELECT id FROM fences", &[(0, 32)]),
         (
@@ -232,6 +238,10 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
         (
             "SELECT publication, idx, target, target_revision, qos, cause, phase FROM obligations",
             &[(0, 32), (2, 8), (3, 8)],
+        ),
+        (
+            "SELECT publication,idx,target,target_revision,packet_id,claim FROM outbound",
+            &[(0, 32), (2, 8), (3, 8), (5, 32)],
         ),
         (
             "SELECT session, packet_id, exchange, publication, phase FROM inbound",

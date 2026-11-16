@@ -17,8 +17,8 @@ use mqttiumd_contract::capacity::{
     BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References, Resource,
 };
 use mqttiumd_contract::command::{
-    AdmitPublication, Command, EpochLedger, EpochPhase, LedgerOpening, OpenEpoch, Recipe,
-    RecipeError, ReleaseInbound,
+    AdmitPublication, ChangeSubscriptions, ClaimDelivery, Command, EpochLedger, EpochPhase,
+    FinishDelivery, LedgerOpening, OpenEpoch, Recipe, RecipeError, ReleaseInbound,
 };
 use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
 use mqttiumd_contract::ids::{
@@ -29,6 +29,7 @@ use mqttiumd_contract::outcome::{
     CommitFacts, Knowledge, OpeningOutcome, RejectReason, StoreOutcome, StoreReply, StoreViolation,
 };
 use mqttiumd_contract::packet::{Qos, SharedBytes};
+use mqttiumd_contract::pubsub::{DeliveryClaim, MAX_SUBSCRIPTIONS, WORK_PAGE_LIMIT, WorkItem};
 
 pub use mqttiumd_store_api::*;
 
@@ -64,6 +65,7 @@ impl MemoryStore {
                 payloads: BTreeMap::new(),
                 obligations: BTreeMap::new(),
                 inbound: BTreeMap::new(),
+                outbound: BTreeMap::new(),
             },
             durability: Durability::Available,
         }
@@ -202,6 +204,7 @@ enum FactRef<'a> {
     Inbound(mqttiumd_contract::ids::InboundPacketId, &'a InboundRecord),
     Operation(OperationId, &'a OperationRecord),
     Fence(OperationId),
+    Outbound(DeliveryId, &'a ObligationRecord),
 }
 
 struct ReadMeter {
@@ -307,6 +310,16 @@ impl FactRef<'_> {
                     },
                 }
             }
+            Self::Outbound(delivery, record) => {
+                meter.field(32, 32)?;
+                let claim = delivery_claim(state, delivery, record)?;
+                RecoveredFact::OutboundDelivery {
+                    delivery,
+                    target: record.target,
+                    target_revision: record.target_revision,
+                    claim,
+                }
+            }
             Self::Fence(operation) => {
                 meter.field(32, 32)?;
                 RecoveredFact::Operation {
@@ -318,12 +331,41 @@ impl FactRef<'_> {
     }
 }
 
+/// Validate the relationships before exposing an outgoing intent as recoverable.
+fn delivery_claim(
+    state: &DurableState,
+    delivery: DeliveryId,
+    record: &ObligationRecord,
+) -> Result<Option<DeliveryClaim>, ReadError> {
+    if !state.sessions.get(&record.target).is_some_and(|session| {
+        session.state == SessionState::Active && session.revision == record.target_revision
+    }) {
+        return Err(ReadError::InvalidData);
+    }
+    let Some(claim) = state.outbound.get(&delivery) else {
+        return Ok(None);
+    };
+    if claim.target != record.target
+        || claim.target_revision != record.target_revision
+        || record.qos != Qos::AtLeastOnce
+        || claim.claim.incarnation() != state.ledger.incarnation()
+    {
+        return Err(ReadError::InvalidData);
+    }
+    Ok(Some(DeliveryClaim {
+        operation: claim.claim,
+        packet_id: claim.packet_id,
+    }))
+}
+
 fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
     let mut rows = 3usize;
     for size in [
         state.routes.len(),
         state.sessions.len(),
         state.inbound.len(),
+        state.obligations.len(),
+        state.outbound.len(),
         state.operations.len(),
         state.fences.len(),
     ] {
@@ -334,6 +376,7 @@ fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
     for size in [
         state.sessions.len(),
         state.inbound.len(),
+        state.obligations.len(),
         state.operations.len(),
         state.fences.len(),
     ] {
@@ -348,10 +391,16 @@ fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
         }
     }
     if rows > MAX_RECOVERY_INVENTORY_ROWS {
-        Err(ReadError::LimitExceeded)
-    } else {
-        Ok(())
+        return Err(ReadError::LimitExceeded);
     }
+    for delivery in state.outbound.keys() {
+        let record = state
+            .obligations
+            .get(delivery)
+            .ok_or(ReadError::InvalidData)?;
+        delivery_claim(state, *delivery, record)?;
+    }
+    Ok(())
 }
 
 fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadError> {
@@ -422,6 +471,15 @@ fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadEr
         meter.field(32, 32)?;
         meter.charge(208)?;
     }
+    for delivery in state.outbound.keys() {
+        meter.field(32, 32)?;
+        meter.charge(232)?;
+        let record = state
+            .obligations
+            .get(delivery)
+            .ok_or(ReadError::InvalidData)?;
+        delivery_claim(state, *delivery, record)?;
+    }
     for _ in state.inbound.values() {
         meter.field(32, 32)?;
         meter.charge(200)?;
@@ -441,6 +499,9 @@ trait Staging {
         payload: Option<&SharedBytes>,
     ) -> Guard<CommitFacts>;
     fn stage_release(&mut self, release: &ReleaseInbound) -> Guard<CommitFacts>;
+    fn stage_subscriptions(&mut self, command: &ChangeSubscriptions) -> Guard<CommitFacts>;
+    fn stage_claim(&mut self, command: &ClaimDelivery) -> Guard<CommitFacts>;
+    fn stage_finish(&mut self, command: &FinishDelivery) -> Guard<CommitFacts>;
     fn discard_completed_publication(&mut self, publication: PublicationId);
     fn end_obligation(&mut self, delivery: DeliveryId) -> Result<(), AdminRefused>;
     fn stage_admin(&mut self, command: AdminCommand) -> Result<AdminDone, AdminRefused>;
@@ -661,6 +722,119 @@ impl Staging for DurableState {
         })
     }
 
+    fn stage_subscriptions(&mut self, command: &ChangeSubscriptions) -> Guard<CommitFacts> {
+        let failed = RejectReason::PreconditionFailed;
+        self.active_session(command.session, command.session_revision)?;
+        if command.route_revision != self.route_revision {
+            return Err(failed);
+        }
+        for change in command.changes.as_slice() {
+            if change.topic.len() > self.limits.max_topic_bytes {
+                return Err(failed);
+            }
+            if change.subscribe {
+                let targets = self
+                    .routes
+                    .entry(change.topic.as_slice().to_vec())
+                    .or_default();
+                if let Some(target) = targets
+                    .iter_mut()
+                    .find(|target| target.session == command.session)
+                {
+                    target.qos = Qos::AtLeastOnce;
+                } else {
+                    if targets.len() >= self.limits.max_route_targets
+                        || targets.len() >= self.limits.max_targets_per_admission
+                    {
+                        return Err(RejectReason::CapacityExceeded(Resource::References));
+                    }
+                    targets.push(RouteTarget {
+                        session: command.session,
+                        qos: Qos::AtLeastOnce,
+                    });
+                }
+            } else if let Some(targets) = self.routes.get_mut(change.topic.as_slice()) {
+                targets.retain(|target| target.session != command.session);
+                if targets.is_empty() {
+                    self.routes.remove(change.topic.as_slice());
+                }
+            }
+        }
+        let total = self
+            .routes
+            .values()
+            .try_fold(0usize, |n, t| n.checked_add(t.len()))
+            .ok_or(failed)?;
+        if total > MAX_SUBSCRIPTIONS {
+            return Err(RejectReason::CapacityExceeded(Resource::References));
+        }
+        self.route_revision = self.route_revision.checked_next().map_err(|_| failed)?;
+        self.charge(Accounts::RECEIPT)?;
+        Ok(CommitFacts::SubscriptionsChanged {
+            session: command.session,
+            route_revision: self.route_revision,
+        })
+    }
+
+    fn stage_claim(&mut self, command: &ClaimDelivery) -> Guard<CommitFacts> {
+        let failed = RejectReason::PreconditionFailed;
+        self.active_session(command.target, command.target_revision)?;
+        let record = self.obligations.get(&command.delivery).ok_or(failed)?;
+        if record.target != command.target
+            || record.target_revision != command.target_revision
+            || record.qos != Qos::AtLeastOnce
+            || self.outbound.contains_key(&command.delivery)
+            || self
+                .outbound
+                .values()
+                .any(|slot| slot.target == command.target && slot.packet_id == command.packet_id)
+        {
+            return Err(failed);
+        }
+        self.charge(Accounts {
+            exchange_slots: ExchangeSlots::new(1),
+            receipt_slots: ReceiptSlots::new(1),
+            ..Accounts::default()
+        })?;
+        self.outbound.insert(
+            command.delivery,
+            OutboundRecord {
+                target: command.target,
+                target_revision: command.target_revision,
+                packet_id: command.packet_id,
+                claim: command.operation,
+            },
+        );
+        Ok(CommitFacts::DeliveryClaimed {
+            delivery: command.delivery,
+            target: command.target,
+            packet_id: command.packet_id,
+            claim: command.operation,
+        })
+    }
+
+    fn stage_finish(&mut self, command: &FinishDelivery) -> Guard<CommitFacts> {
+        let failed = RejectReason::PreconditionFailed;
+        self.active_session(command.target, command.target_revision)?;
+        let expected = OutboundRecord {
+            target: command.target,
+            target_revision: command.target_revision,
+            packet_id: command.packet_id,
+            claim: command.claim,
+        };
+        if self.outbound.get(&command.delivery) != Some(&expected) {
+            return Err(failed);
+        }
+        self.end_obligation(command.delivery).map_err(|_| failed)?;
+        self.charge(Accounts::RECEIPT)?;
+        Ok(CommitFacts::DeliveryFinished {
+            delivery: command.delivery,
+            target: command.target,
+            packet_id: command.packet_id,
+            claim: command.claim,
+        })
+    }
+
     fn stage_release(&mut self, release: &ReleaseInbound) -> Guard<CommitFacts> {
         let failed = RejectReason::PreconditionFailed;
         let slot = (release.source_session, release.packet_id);
@@ -707,6 +881,13 @@ impl Staging for DurableState {
     fn end_obligation(&mut self, delivery: DeliveryId) -> Result<(), AdminRefused> {
         let broken = AdminRefused::Inconsistent;
         self.obligations.remove(&delivery).ok_or(broken)?;
+        if self.outbound.remove(&delivery).is_some() {
+            self.accounts.exchange_slots = self
+                .accounts
+                .exchange_slots
+                .checked_sub(ExchangeSlots::new(1))
+                .ok_or(broken)?;
+        }
         self.accounts.references = self
             .accounts
             .references
@@ -922,6 +1103,11 @@ impl Staging for DurableState {
             .chain(routes)
             .chain(sessions)
             .chain(inbound)
+            .chain(
+                self.obligations
+                    .iter()
+                    .map(|(id, record)| FactRef::Outbound(*id, record)),
+            )
             .chain(operations)
             .chain(fences)
     }
@@ -1022,7 +1208,9 @@ impl DurableStore for MemoryStore {
                 staged.stage_admission(admit, command.payload.as_ref())
             }
             Recipe::ReleaseInbound(release) => staged.stage_release(release),
-            _ => Err(RejectReason::PreconditionFailed),
+            Recipe::ChangeSubscriptions(command) => staged.stage_subscriptions(command),
+            Recipe::ClaimDelivery(command) => staged.stage_claim(command),
+            Recipe::FinishDelivery(command) => staged.stage_finish(command),
         };
         match facts {
             Ok(facts) => {
@@ -1151,6 +1339,71 @@ impl DurableStore for MemoryStore {
             .is_some()
             .then_some(RecoveryCursor::new(revision, position));
         Ok(RecoveryPage { facts, next })
+    }
+
+    fn read_work_with_budget(
+        &self,
+        session: SessionId,
+        after: Option<DeliveryId>,
+        limit: usize,
+        budget: ReadBudget,
+    ) -> Result<WorkPage, ReadError> {
+        if limit == 0 || limit > WORK_PAGE_LIMIT as usize {
+            return Err(ReadError::LimitExceeded);
+        }
+        let state = &self.committed;
+        check_inventory_bound(state)?;
+        let mut meter = ReadMeter::new(budget);
+        let mut items =
+            BoundedVec::with_capacity(limit).map_err(|_| ReadError::AllocationFailed)?;
+        let mut more = false;
+        for (delivery, record) in &state.obligations {
+            if after.is_some_and(|after| *delivery <= after)
+                || record.target != session
+                || record.qos != Qos::AtLeastOnce
+            {
+                continue;
+            }
+            if items.len() == limit {
+                more = true;
+                break;
+            }
+            let publication = state
+                .publications
+                .get(&delivery.publication)
+                .ok_or(ReadError::InvalidData)?;
+            let payload = state
+                .payloads
+                .get(&publication.payload)
+                .ok_or(ReadError::InvalidData)?;
+            meter.field(publication.topic.len(), state.limits.max_topic_bytes)?;
+            meter.field(payload.bytes.len(), state.limits.max_payload_bytes)?;
+            meter.charge(
+                256usize
+                    .checked_add(publication.topic.len())
+                    .and_then(|n| n.checked_add(payload.bytes.len()))
+                    .ok_or(ReadError::LimitExceeded)?,
+            )?;
+            let claim = delivery_claim(state, *delivery, record)?;
+            items
+                .try_push(WorkItem {
+                    delivery: *delivery,
+                    target: record.target,
+                    target_revision: record.target_revision,
+                    topic: SharedBytes::copy_from(&publication.topic, state.limits.max_topic_bytes)
+                        .map_err(|_| ReadError::LimitExceeded)?,
+                    payload: SharedBytes::copy_from(&payload.bytes, state.limits.max_payload_bytes)
+                        .map_err(|_| ReadError::LimitExceeded)?,
+                    claim,
+                })
+                .map_err(|_| ReadError::LimitExceeded)?;
+        }
+        let next = if more {
+            items.as_slice().last().map(|item| item.delivery)
+        } else {
+            None
+        };
+        Ok(WorkPage { items, next })
     }
 
     fn snapshot_with_budget(&self, budget: ReadBudget) -> Result<DurableState, ReadError> {
