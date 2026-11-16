@@ -283,6 +283,37 @@ jobs:
             ${{ runner.temp }}/receipt-product.tar.gz.sha256
           if-no-files-found: error
 
+  sessions-product:
+    name: product explicit bounded session lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+      - name: Install the independent external MQTT client
+        run: python -m pip install --disable-pip-version-check -r tests/system/requirements.txt
+      - name: Session matrix, 512 cycles, full capacity and guarded recovery
+        run: tools/run_session_reception.sh "$RUNNER_TEMP/sessions-product"
+      - name: Keep each session run's own evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-sessions-product-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/sessions-product
+            ${{ runner.temp }}/sessions-product.tar.gz
+            ${{ runner.temp }}/sessions-product.tar.gz.sha256
+          if-no-files-found: error
+
   outgoing-pi-product:
     name: product outgoing QoS 1 identifier reuse
     runs-on: ubuntu-24.04
