@@ -2889,3 +2889,106 @@ fn accepted_frames_reserve_their_terminal_fact_before_reactor_backpressure() {
         drop(clients);
     });
 }
+
+#[test]
+fn graceful_shutdown_finishes_zero_sessions_and_preserves_persistent_state() {
+    with_runtime(128, |runtime, directory| {
+        let (zero, mut ephemeral) = peer(runtime);
+        let mut connect = connect_packet(b"shutdown-zero");
+        connect.expiry = SessionExpiry::OnDisconnect;
+        runtime.connect(zero, connect).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut ephemeral).0, 0x20);
+        let (persistent, mut kept) = peer(runtime);
+        runtime
+            .connect(persistent, connect_packet(b"shutdown-persistent"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut kept).0, 0x20);
+        runtime
+            .packet(persistent, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
+            .unwrap();
+        until(runtime, |r| r.inputs.is_empty() && r.inflight.is_empty());
+        assert_eq!(read_frame(&mut kept).0, 0x90);
+        let persistent_sid = runtime.peers[&persistent].session.unwrap();
+        runtime.shutdown_sessions(Duration::from_secs(2)).unwrap();
+        let durable =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert_eq!(
+            durable.sessions.len(),
+            1,
+            "normal_stop_must_finish_zero_session_before_writer_release"
+        );
+        assert!(durable.sessions.contains_key(&persistent_sid));
+        assert_eq!(
+            durable.routes.len(),
+            1,
+            "persistent responsibilities survive graceful shutdown"
+        );
+        assert!(runtime.peers.is_empty());
+        assert_eq!(runtime.owner.session_status().bindings, 0);
+        assert_eq!(runtime.sessions.len(), 1);
+        let mut byte = [0];
+        assert_eq!(ephemeral.read(&mut byte).unwrap(), 0);
+        assert_eq!(kept.read(&mut byte).unwrap(), 0);
+    });
+}
+
+#[test]
+fn bounded_shutdown_reports_an_authentic_unknown_open_without_fabricating_rejection() {
+    with_runtime(128, |runtime, directory| {
+        let (generation, _client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"shutdown-unknown"))
+            .unwrap();
+        runtime.drain_inputs().unwrap();
+        let actual = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let ControlResponse::Lifecycle {
+            operation,
+            reply:
+                StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                    SessionChange::Opened { session, .. },
+                ))),
+            ..
+        } = actual.clone()
+        else {
+            panic!("actual committed Open result");
+        };
+        let start = Instant::now();
+        let stopped = runtime.shutdown_sessions(Duration::from_millis(30));
+        assert!(matches!(stopped,Err(ref failure) if failure.code=="shutdown_incomplete"));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "shutdown must retain a finite budget"
+        );
+        assert_eq!(
+            runtime.owner.lifecycle_dispatch().map(|(op, _)| op),
+            Some(operation),
+            "unknown lifecycle keeps its exact operation identity"
+        );
+        assert!(
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite"))
+                .unwrap()
+                .sessions
+                .contains_key(&session),
+            "unknown result is not proof the committed session is absent"
+        );
+        let text = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+        assert!(text.lines().any(|line| {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            event["kind"] == "shutdown_incomplete"
+                && event["details"]["code"] == "pending_or_unknown"
+        }));
+        relay_control_reply(runtime, actual);
+        runtime.drain_inputs().unwrap();
+        assert_eq!(
+            runtime.owner.session_status().bindings,
+            0,
+            "late result may establish durability, never a ghost transport"
+        );
+    });
+}

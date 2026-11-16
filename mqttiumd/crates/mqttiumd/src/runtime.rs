@@ -392,6 +392,63 @@ impl Runtime<'_> {
         Ok(())
     }
 
+    /// Orderly process shutdown closes transports first, then gives exact
+    /// zero-session ends and already accepted commands a bounded final turn.
+    /// An unresolved command remains uncertain; startup has its durable policy.
+    fn shutdown_sessions(&mut self, budget: Duration) -> Result<(), Failure> {
+        if self.owner.is_recovering() {
+            return Ok(());
+        }
+        let deadline = Instant::now()
+            .checked_add(budget)
+            .ok_or_else(|| Failure::plain("shutdown_deadline_overflow"))?;
+        let generations: Vec<_> = self.peers.keys().copied().collect();
+        for generation in generations {
+            self.close(generation, "shutdown")?;
+        }
+        loop {
+            self.writer_results()?;
+            self.connections()?;
+            self.due_deadlines()?;
+            self.drain_inputs()?;
+            self.dispatch()?;
+            let status = self.owner.session_status();
+            let complete = !status.lifecycle_pending
+                && status.retired_flights == 0
+                && self
+                    .sessions
+                    .values()
+                    .all(|session| session.expiry == SessionExpiry::Never)
+                && self.inputs.is_empty()
+                && self.deferred_inputs.is_empty()
+                && self.control_inputs.is_empty()
+                && self.closing_inputs.is_empty()
+                && self.terminal_inputs.is_empty()
+                && self.session_requests.is_empty()
+                && self.lifecycle_inflight.is_empty()
+                && self.inflight.is_empty()
+                && self.work_reads.is_empty()
+                && self.frames.is_empty()
+                && self.timers.is_empty()
+                && self.owner.outbox().unwrap().is_empty();
+            if complete {
+                self.events.emit("session_shutdown_completed", json!({"details":{"persistent_sessions":self.sessions.len(),"owner_bindings":status.bindings}})).map_err(event_failure)?;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let mut fields = json!({"details":{"code":"pending_or_unknown","phase":"Shutdown","lifecycle_pending":status.lifecycle_pending,"retired_flights":status.retired_flights,"in_flight":self.inflight.len()+self.lifecycle_inflight.len(),"closing_inputs":self.closing_inputs.len()}});
+                if let Some((pending, _)) = self.owner.lifecycle_dispatch() {
+                    fields["operation"] = operation(pending);
+                }
+                self.events
+                    .emit("shutdown_incomplete", fields)
+                    .map_err(event_failure)?;
+                return Err(Failure::plain("shutdown_incomplete"));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Apply the adapter responsibility before any following network effect
     /// can leave the outbox. The pure owner has already applied this exact
     /// known result; its non-reused operation also fences copied old effects.
@@ -3432,6 +3489,13 @@ fn run_inner(
         Ok(())
     })();
     cancel.store(true, Ordering::Relaxed);
+    // A typed startup/read failure remains authoritative and performs no
+    // further durable writes. A normal stop finishes safe zero-expiry ends.
+    let session_result = if result.is_ok() {
+        runtime.shutdown_sessions(Duration::from_secs(2))
+    } else {
+        Ok(())
+    };
     for (_, p) in std::mem::take(&mut runtime.peers) {
         p.io.close();
         runtime.retiring.push(p.io);
@@ -3446,7 +3510,7 @@ fn run_inner(
             socket_result = Err(Failure::plain("socket_shutdown_deadline"));
         }
     }
-    result.and(socket_result)
+    result.and(session_result).and(socket_result)
 }
 
 #[cfg(test)]
