@@ -42,7 +42,7 @@ class Client:
     def __init__(self, broker: Broker, case: Path, name: str, implementation: str,
                  action: str, *, filters: tuple[str, ...] = (), count: int = 1,
                  topic: str = "reception/pubsub", payload: bytes = b"pubsub", qos: int = 1,
-                 present: bool | None = None, resume: bool = False,
+                 present: bool | None = None, resume: bool = False, client_id: str | None = None,
                  hold: bool = False, release: Path | None = None):
         self.broker = broker
         self.events = case / f"{name}.client.jsonl"
@@ -52,7 +52,7 @@ class Client:
         self.stderr = self.stderr_path.open("wb")
         self.command = [sys.executable, str(Path(__file__).with_name("external_pubsub.py")),
                         "--host", broker.address[0], "--port", str(broker.address[1]),
-                        "--client-id", name, "--client", implementation, "--action", action,
+                        "--client-id", client_id or name, "--client", implementation, "--action", action,
                         "--qos", str(qos), "--count", str(count), "--events", str(self.events),
                         "--wait-timeout", "12"]
         for value in filters:
@@ -249,8 +249,8 @@ def persistent_subscription(binary: Path, case: Path) -> dict:
         restarted = Broker(binary, case, db=broker.db, label="restarted")
         restarted.ready()
         require(restarted.db.stat().st_ino == inode, "restart_replaced_database")
-        client = Client(restarted, case, "persistent-subscriber", "mqttium", "receive", count=1,
-                        resume=True, present=True)
+        client = Client(restarted, case, "persistent-resumed", "mqttium", "receive", count=1,
+                        client_id="persistent-subscriber", resume=True, present=True)
         received = client.collect()
         require(not received["result"]["subscriptions"] and len(received["result"]["messages"]) == 1,
                 "resume_resubscribed_or_message_missing")
