@@ -2298,6 +2298,8 @@ pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     outgoing_capacity_and_filter_guards_are_atomic(make);
     deleting_a_claimed_target_releases_only_its_resources(make);
     outgoing_packet_reuse_preserves_claim_identity(make);
+    recycled_packet_ids_preserve_occurrences_after_receipt_collection(make);
+    lost_claim_results_preserve_packet_reservations_until_guarded_finish(make);
     opening_opens_the_next_epoch_and_closes_the_older_ones(make);
     an_opening_that_expected_another_epoch_opens_nothing(make);
     an_opening_delivered_again_returns_its_commit(make);
@@ -4039,4 +4041,235 @@ pub fn a_maximum_product_subscription_prefix_fits_the_collection_budget<S: Durab
     assert_eq!(after.routes, before.routes);
     assert_eq!(after.route_revision, before.route_revision);
     assert!(after.operations.is_empty());
+}
+
+/// Recycled wire IDs do not recycle a delivery/claim identity, even after
+/// terminal receipts have been collected. This uses only the durable contract.
+pub fn recycled_packet_ids_preserve_occurrences_after_receipt_collection<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::command::{ClaimDelivery, FinishDelivery};
+    use mqttiumd_contract::ids::OutboundPacketId;
+    use mqttiumd_contract::receipts::{
+        ReceiptClosure, ReceiptCollection, ReceiptCollectionReply, ReceiptOrigin,
+    };
+    let mut limits = fixture_limits();
+    limits.receipt_slots = ReceiptSlots::new(8192);
+    let mut world = World::with_limits(make, limits);
+    let empty = ReceiptClosure::empty(ReceiptOrigin::of(operation_id(world.epoch, 1)));
+    assert!(matches!(
+        world.store.collect_receipts(ReceiptCollection {
+            closure: empty,
+            limit: 128
+        }),
+        Ok(ReceiptCollectionReply::Applied { .. })
+    ));
+    let delivery = |published_as| DeliveryId {
+        publication: publication_id(world.epoch, published_as),
+        index: 0,
+    };
+    let claim = |sequence, published_as| Command {
+        recipe: FrozenRecipe::freeze(Recipe::ClaimDelivery(ClaimDelivery {
+            operation: operation_id(world.epoch, sequence),
+            delivery: delivery(published_as),
+            target: world.b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(1).unwrap(),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    let finish = |sequence, published_as, claimed_as| Command {
+        recipe: FrozenRecipe::freeze(Recipe::FinishDelivery(FinishDelivery {
+            operation: operation_id(world.epoch, sequence),
+            delivery: delivery(published_as),
+            target: world.b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(1).unwrap(),
+            claim: operation_id(world.epoch, claimed_as),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    let (epoch, route_revision, producer, target) =
+        (world.epoch, world.route_revision, world.producer, world.b);
+    let admit = |published_as| {
+        altered(
+            &admission_in(
+                epoch,
+                route_revision,
+                producer,
+                published_as,
+                1,
+                b"same bytes",
+                &[target],
+            ),
+            |admit| {
+                admit.qos = Qos::AtLeastOnce;
+                admit.costs.exchange_slots = ExchangeSlots::ZERO;
+            },
+        )
+    };
+    let a = admit(1);
+    let a_claim = claim(2, 1);
+    let a_finish = finish(3, 1, 2);
+    for command in [&a, &a_claim, &a_finish] {
+        assert!(world.store.apply(command).committed_now);
+    }
+    let closure = ReceiptClosure {
+        through: OperationSeq::new(3),
+        publication_through: PublicationSeq::new(1),
+        payload_through: PayloadSeq::new(1),
+        ..empty
+    };
+    assert!(matches!(
+        world.store.collect_receipts(ReceiptCollection {
+            closure,
+            limit: 128
+        }),
+        Ok(ReceiptCollectionReply::Applied {
+            removed: 3,
+            retained: 0,
+            ..
+        })
+    ));
+    assert!(world.store.snapshot().unwrap().operations.is_empty());
+    assert!(world.store.apply(&admit(4)).committed_now);
+    assert!(world.store.apply(&claim(5, 4)).committed_now);
+    let b = world.store.snapshot().unwrap();
+    assert_eq!(b.outbound[&delivery(4)].packet_id.get(), 1);
+    assert_eq!(b.outbound[&delivery(4)].claim, operation_id(world.epoch, 5));
+    for obsolete in [&a_finish, &finish(3, 4, 5)] {
+        assert_eq!(
+            outcome(world.store.apply(obsolete).reply),
+            StoreOutcome::RetiredOutcomeUnavailable
+        );
+        assert_eq!(
+            world.store.snapshot().unwrap(),
+            b,
+            "a retired operation cannot own the recycled PI"
+        );
+    }
+    for forged in [finish(6, 1, 2), finish(7, 4, 2)] {
+        assert_eq!(
+            outcome(world.store.apply(&forged).reply),
+            StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed)
+        );
+        let guarded = world.store.snapshot().unwrap();
+        assert_eq!(guarded.outbound, b.outbound);
+        assert_eq!(guarded.obligations, b.obligations);
+        assert_eq!(guarded.payloads, b.payloads);
+        assert_eq!(guarded.accounts.exchange_slots, b.accounts.exchange_slots);
+        assert_eq!(guarded.accounts.references, b.accounts.references);
+        assert_eq!(guarded.accounts.payload_bytes, b.accounts.payload_bytes);
+    }
+    let b_finish = finish(8, 4, 5);
+    assert!(world.store.apply(&b_finish).committed_now);
+    let terminal = world.store.snapshot().unwrap();
+    assert!(
+        terminal.outbound.is_empty()
+            && terminal.obligations.is_empty()
+            && terminal.payloads.is_empty()
+            && terminal.publications.is_empty()
+    );
+    assert_eq!(terminal.accounts.exchange_slots, ExchangeSlots::ZERO);
+    assert_eq!(accounts_match_what_is_held(&terminal), Ok(()));
+    assert!(!world.store.apply(&b_finish).committed_now);
+    assert_eq!(
+        world.store.snapshot().unwrap(),
+        terminal,
+        "a duplicate Finish never returns credit twice"
+    );
+}
+
+/// A committed Claim with a lost result still owns the directional wire ID.
+/// Resolution uses the same OperationId; a separate fresh claim can reuse only
+/// after the old obligation's Finish is durably established.
+pub fn lost_claim_results_preserve_packet_reservations_until_guarded_finish<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::command::{ClaimDelivery, FinishDelivery};
+    use mqttiumd_contract::ids::OutboundPacketId;
+    let mut limits = fixture_limits();
+    limits.receipt_slots = ReceiptSlots::new(8192);
+    let mut world = World::with_limits(make, limits);
+    let delivery = |published_as| DeliveryId {
+        publication: publication_id(world.epoch, published_as),
+        index: 0,
+    };
+    let claim = |sequence, published_as| Command {
+        recipe: FrozenRecipe::freeze(Recipe::ClaimDelivery(ClaimDelivery {
+            operation: operation_id(world.epoch, sequence),
+            delivery: delivery(published_as),
+            target: world.b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(1).unwrap(),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    for seq in 1..=2 {
+        let admission = altered(&world.admission(seq, 1, b"pending", &[world.b]), |admit| {
+            admit.qos = Qos::AtLeastOnce;
+            admit.costs.exchange_slots = ExchangeSlots::ZERO;
+        });
+        assert!(world.store.apply(&admission).committed_now);
+    }
+    let a_claim = claim(3, 1);
+    let _lost_claim_reply = world.store.apply(&a_claim);
+    let reserved = world.store.snapshot().unwrap();
+    assert_eq!(
+        reserved.outbound[&delivery(1)].claim,
+        a_claim.recipe.operation()
+    );
+    assert_eq!(
+        outcome(world.store.apply(&claim(4, 2)).reply),
+        StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed)
+    );
+    assert_eq!(world.store.snapshot().unwrap().outbound, reserved.outbound);
+    let resolved_claim = world.store.resolve_and_fence(a_claim.recipe.operation());
+    assert_eq!(
+        resolved_claim.outcome,
+        StoreOutcome::Committed(CommitFacts::DeliveryClaimed {
+            delivery: delivery(1),
+            target: world.b,
+            packet_id: OutboundPacketId::new(1).unwrap(),
+            claim: operation_id(world.epoch, 3)
+        })
+    );
+    assert!(!resolved_claim.fenced_now);
+    let a_finish = Command {
+        recipe: FrozenRecipe::freeze(Recipe::FinishDelivery(FinishDelivery {
+            operation: operation_id(world.epoch, 5),
+            delivery: delivery(1),
+            target: world.b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(1).unwrap(),
+            claim: operation_id(world.epoch, 3),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    // The store can establish durability, not whether an owner applied a reply.
+    // The consumer holds its volatile reservation until this same-op lookup.
+    let _lost_finish_reply = world.store.apply(&a_finish);
+    let after_finish = world.store.snapshot().unwrap();
+    let resolved = world.store.resolve_and_fence(a_finish.recipe.operation());
+    assert!(
+        matches!(resolved.outcome,StoreOutcome::Committed(CommitFacts::DeliveryFinished {claim,..}) if claim==operation_id(world.epoch,3))
+    );
+    assert!(!resolved.fenced_now);
+    assert_eq!(
+        world.store.snapshot().unwrap(),
+        after_finish,
+        "resolution adds no recursive receipt/fence"
+    );
+    assert!(world.store.apply(&claim(6, 2)).committed_now);
+    let reused = world.store.snapshot().unwrap();
+    assert!(!world.store.apply(&a_finish).committed_now);
+    assert_eq!(world.store.snapshot().unwrap(), reused);
+    assert_eq!(
+        reused.outbound[&delivery(2)].claim,
+        operation_id(world.epoch, 6)
+    );
 }
