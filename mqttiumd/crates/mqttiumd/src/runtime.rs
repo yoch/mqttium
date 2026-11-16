@@ -46,6 +46,10 @@ const BOUNDS: Bounds = Bounds {
 const MUTANT_EARLY_ACK: bool = false;
 #[cfg(feature = "test-hooks")]
 const MUTANT_ALLOW_STALE: bool = false;
+#[cfg(feature = "test-hooks")]
+const MUTANT_EARLY_PUBACK: bool = false;
+#[cfg(feature = "test-hooks")]
+const MUTANT_STALE_RECEIPT: bool = false;
 
 pub struct Config {
     pub db: PathBuf,
@@ -95,6 +99,10 @@ struct Runtime<'a> {
     captured: Option<(ConnectionGeneration, codec::Connect)>,
     #[cfg(feature = "test-hooks")]
     hooks: Hooks,
+    #[cfg(feature = "test-hooks")]
+    deferred_ack: Option<(EffectId, ConnectionKey, usize, Instant)>,
+    #[cfg(feature = "test-hooks")]
+    deferred_ack_used: bool,
     frames: BTreeMap<EffectId, PendingFrame>,
 }
 impl Runtime<'_> {
@@ -502,33 +510,19 @@ impl Runtime<'_> {
                 match written {
                     Ok(net::Written::Complete { correlation, bytes }) => {
                         if let Some((effect, connection)) = correlation {
-                            let pending = self
-                                .frames
-                                .remove(&effect)
-                                .ok_or_else(|| Failure::plain("uncorrelated_frame_result"))?;
-                            let (kind, id) = (pending.kind, pending.packet_id);
-                            if kind != "PINGRESP" {
-                                self.events.emit("frame_written",json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id.unwrap_or(0),"bytes":bytes}})).map_err(event_failure)?;
-                            }
-                            if let Some(terminal) = pending.terminal
-                                && let Some(p) = self.peers.get_mut(&generation)
-                                && let Some(id) = id
+                            #[cfg(feature = "test-hooks")]
+                            if !self.deferred_ack_used
+                                && self.hooks.pause.iter().any(|p| p == "ack.receipt")
+                                && let Some(pending) = self.frames.get(&effect)
+                                && pending.kind == "PUBACK"
                             {
-                                let released = p.receiving.complete_frame(
-                                    id,
-                                    pending.receive_serial,
-                                    terminal,
-                                );
-                                self.events.emit("receive_credit", json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id,"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
+                                self.events.emit("barrier_hit", json!({"point":"ack.receipt","connection":generation.get().to_string(),"details":{"effect":effect_text(effect),"packet_id":pending.packet_id.unwrap_or(0),"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes,"socket_write_complete":true}})).map_err(event_failure)?;
+                                self.deferred_ack_used = true;
+                                self.deferred_ack =
+                                    Some((effect, connection, bytes, Instant::now()));
+                                continue;
                             }
-                            self.queue(Input::FrameResult {
-                                effect,
-                                connection,
-                                progress: FrameProgress::Written {
-                                    confirmed: bytes as u64,
-                                    total: bytes as u64,
-                                },
-                            })?;
+                            self.written_complete(effect, connection, bytes)?;
                         } else if let Some((code, _)) =
                             self.peers.get(&generation).and_then(|p| p.closing)
                         {
@@ -601,8 +595,69 @@ impl Runtime<'_> {
         }
         Ok(())
     }
+    /// A socket write receipt is local progress, not evidence of peer receipt.
+    fn written_complete(
+        &mut self,
+        effect: EffectId,
+        connection: ConnectionKey,
+        bytes: usize,
+    ) -> Result<(), Failure> {
+        let pending = self
+            .frames
+            .remove(&effect)
+            .ok_or_else(|| Failure::plain("uncorrelated_frame_result"))?;
+        if pending.connection != connection {
+            return Err(Failure::plain("frame_connection_mismatch"));
+        }
+        let generation = connection.generation;
+        let (kind, id) = (pending.kind, pending.packet_id);
+        if kind != "PINGRESP" {
+            self.events.emit("frame_written",json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id.unwrap_or(0),"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes}})).map_err(event_failure)?;
+        }
+        if let Some(terminal) = pending.terminal
+            && let Some(p) = self.peers.get_mut(&generation)
+            && let Some(id) = id
+        {
+            let released = p
+                .receiving
+                .complete_frame(id, pending.receive_serial, terminal);
+            #[cfg(feature = "test-hooks")]
+            let released = if MUTANT_STALE_RECEIPT && !released {
+                p.receiving.complete_current(id)
+            } else {
+                released
+            };
+            self.events.emit("receive_credit", json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id,"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
+        }
+        self.queue(Input::FrameResult {
+            effect,
+            connection,
+            progress: FrameProgress::Written {
+                confirmed: bytes as u64,
+                total: bytes as u64,
+            },
+        })
+    }
     #[cfg(feature = "test-hooks")]
     fn controls(&mut self) -> Result<(), Failure> {
+        if let Some((effect, connection, bytes, since)) = self.deferred_ack {
+            if !self.frames.contains_key(&effect) {
+                self.deferred_ack = None;
+            } else if since.elapsed() > Duration::from_secs(30) {
+                return Err(Failure::plain("ack_receipt_deadline"));
+            } else if let Some(dir) = &self.hooks.directory {
+                let release = dir.join("release-ack.receipt");
+                if release
+                    .try_exists()
+                    .map_err(|_| Failure::plain("hook_release"))?
+                {
+                    std::fs::remove_file(release).map_err(|_| Failure::plain("hook_release"))?;
+                    self.deferred_ack = None;
+                    self.written_complete(effect, connection, bytes)?;
+                    self.events.emit("barrier_released", json!({"point":"ack.receipt","connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect)}})).map_err(event_failure)?;
+                }
+            }
+        }
         if let Some(dir) = &self.hooks.directory {
             let replay = dir.join("replay-captured");
             if replay.exists() {
@@ -647,6 +702,7 @@ impl EffectSink for Sink<'_> {
                 if MUTANT_EARLY_ACK
                     && let mqttiumd_contract::command::Recipe::AdmitPublication(admission) =
                         command.recipe.get()
+                    && admission.qos == mqttiumd_contract::packet::Qos::ExactlyOnce
                     && let Some(p) = self.peers.values().find(|p| {
                         p.receiving
                             .serial(admission.source.packet_id.get())
@@ -658,6 +714,26 @@ impl EffectSink for Sink<'_> {
                         bytes: codec::encode(OutboundFrame::Pubrec {
                             packet_id: admission.source.packet_id,
                             reason: mqttiumd_contract::packet::AckReason::Success,
+                        })
+                        .unwrap_or_default(),
+                    });
+                }
+                #[cfg(feature = "test-hooks")]
+                if MUTANT_EARLY_PUBACK
+                    && let mqttiumd_contract::command::Recipe::AdmitPublication(admission) =
+                        command.recipe.get()
+                    && admission.qos == mqttiumd_contract::packet::Qos::AtLeastOnce
+                    && let Some(p) = self.peers.values().find(|p| {
+                        p.receiving
+                            .serial(admission.source.packet_id.get())
+                            .is_some()
+                    })
+                {
+                    let _ = p.io.outgoing.try_send(net::Write {
+                        correlation: None,
+                        bytes: codec::encode(OutboundFrame::Puback {
+                            packet_id: admission.source.packet_id,
+                            reason: mqttiumd_contract::packet::PubackReason::Success,
                         })
                         .unwrap_or_default(),
                     });
@@ -952,6 +1028,10 @@ fn run_inner(
         captured: None,
         #[cfg(feature = "test-hooks")]
         hooks,
+        #[cfg(feature = "test-hooks")]
+        deferred_ack: None,
+        #[cfg(feature = "test-hooks")]
+        deferred_ack_used: false,
         frames: BTreeMap::new(),
     };
     let result = (|| {

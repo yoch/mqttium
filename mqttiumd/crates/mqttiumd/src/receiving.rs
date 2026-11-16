@@ -36,6 +36,12 @@ pub struct Window {
 }
 
 impl Window {
+    /// Isolated test mutation: deliberately discard the occurrence and QoS
+    /// guards. This entry point is absent from a normal product build.
+    #[cfg(feature = "test-hooks")]
+    pub fn complete_current(&mut self, id: u16) -> bool {
+        self.receiving.remove(&id).is_some()
+    }
     /// Refreshing a reusable identifier does not consume another receive
     /// slot. Older accepted frames retain their own frozen occurrence serial.
     pub fn publish_qos(&mut self, id: u16, serial: u64, qos: Qos) -> Result<(), ()> {

@@ -87,6 +87,10 @@ fn with_runtime(max_exchanges: u32, test: impl FnOnce(&mut Runtime<'_>, &Path)) 
         captured: None,
         #[cfg(feature = "test-hooks")]
         hooks: Hooks::default(),
+        #[cfg(feature = "test-hooks")]
+        deferred_ack: None,
+        #[cfg(feature = "test-hooks")]
+        deferred_ack_used: false,
         frames: BTreeMap::new(),
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
