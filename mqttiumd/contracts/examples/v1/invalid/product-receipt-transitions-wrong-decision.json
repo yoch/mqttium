@@ -64,6 +64,28 @@
       ]
     },
     {
+      "id": "receipt.window.release_retry",
+      "machine": "ReceiptMaintenance",
+      "state_class": "ControlWindowFull",
+      "event_class": "FencedReleaseResultApplied",
+      "guard": "A correlated certainly fenced Release result is consumed without allocating another operation at the full window. Retain its exchange, lease and known terminal identity. Only after durable closure creates room does one counted continuation prepare the retry. An unknown operation is never retried under a new identity.",
+      "next_state_class": "ReleaseRetryDeferred",
+      "required_actions": [
+        "MarkResultConsumed",
+        "RetainReleaseIntent",
+        "ContinueAfterKnownClosure"
+      ],
+      "forbidden_actions": [
+        "IssuePastWindow",
+        "DropLease",
+        "RetryUnknownUnderNewIdentity"
+      ],
+      "reception_groups": [
+        "C",
+        "H"
+      ]
+    },
+    {
       "id": "receipt.collection.submit",
       "machine": "ReceiptMaintenance",
       "state_class": "WindowOpen",
@@ -107,7 +129,7 @@
       "machine": "ReceiptMaintenance",
       "state_class": "CollectionPending",
       "event_class": "UnknownCollectionResult",
-      "guard": "Commit knowledge is unavailable. Keep the same closure and correlation, read or repeat that control within the finite attempt budget; no absence or timeout proves rejection.",
+      "guard": "Commit knowledge is unavailable. Keep the same closure and correlation, with bounded active attempt history and externally scheduled deadlines; no absence or timeout proves rejection. Startup has its own finite deadline.",
       "next_state_class": "CollectionPending",
       "required_actions": [
         "ReconcileSameClosure"
@@ -125,7 +147,7 @@
       "machine": "ReceiptMaintenance",
       "state_class": "FrontierKnown",
       "event_class": "RetiredOperationOrIdentity",
-      "guard": "Exact origin and requested operation at or below through, or publication/payload identity at or below its own durable boundary. Retained physical rows may still exist below the frontier.",
+      "guard": "An exact-origin operation at or below through is retired without execution or a claim of certain rejection. A fresh operation carrying an old publication/payload identity needs its own durable rejection/fence. Retained physical rows may still exist below the frontier.",
       "next_state_class": "FrontierKnown",
       "required_actions": [
         "ReportRetiredKnowledge",

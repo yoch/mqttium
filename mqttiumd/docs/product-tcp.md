@@ -145,7 +145,10 @@ Limits are 16 connections, 128 sessions, 128 exact subscriptions, eight filters
 per request and 16 targets per publication/topic. Packets are at most 65,536
 bytes, ClientID/topic/filter 1,024 bytes and payload 32,768 bytes. Per-connection
 input/output queues hold four items; writer queue 32, commands in flight 16,
-timers 512 and receipts 8,192. The core remembers eight closed generations.
+timers 512 and physical receipts 8,192. Maintenance has separate four-slot
+writer request/reply lanes and four owner control inputs. The core remembers
+eight closed generations. Known terminal operation timers are removed only
+after their corresponding owner transition applies.
 
 There are 128 volatile incoming entries and a separate 128-entry outgoing
 metadata table with 4 MiB of loaded payload. Initially QoS 0 fanout has a separate
@@ -231,7 +234,7 @@ a second permission. A historical consumption receipt is command-replay
 evidence, not startup emission work. A lawful new incoming QoS 1 admission can
 create another obligation with identical bytes; that is a different identity.
 Consumption releases its resources once and collects payload after the final
-reference, without general receipt/epoch collection.
+reference, independently of command-result receipt retirement.
 
 ## Incoming and outgoing QoS 1/2 guarantees
 
@@ -297,7 +300,7 @@ their bytes and meanings; kind 3 remains implicit QoS 1 rather than silently
 being reinterpreted. Proposed [ADR 0026](decisions/0026-qos0-volatile-and-consumed.md)
 specifies the layouts and separate volatile/consumed cycles.
 
-SQLite schema **3** stores the new bounded facts. Schemas 1/2 and other
+SQLite schema **4** stores compact receipt guards. Schemas 1/2/3 and other
 incompatible versions are refused with typed InvalidData before write-affecting
 pragmas. There is no implicit migration, checkpoint, reset or empty replacement.
 Use a new file for this increment; older files remain historical inputs until
@@ -305,14 +308,60 @@ a separate migration is supplied. Invalid/over-budget current files also refuse
 readiness without resetting partial recovery.
 
 Publication metadata is collected after its final marker/obligation reference;
-a zero-target admission does not archive payload. Durable receipts keep identity
-and replay evidence. Receipt/epoch/session collection remains a finite service
-limit, not an indefinite-operation or throughput promise.
+a zero-target admission does not archive payload. Live command-result retirement
+removes the cumulative receipt ceiling described below. Session capacity,
+outgoing Packet Identifiers and checked identity counters remain finite.
 
 SIGINT/SIGTERM closes sockets and drains accepted writer work before releasing
 the writer. Accepted commands are not called certainly rejected. Shutdown has
 a finite deadline; a stuck storage operation reports incomplete shutdown with
 unknown outcome. SIGKILL has no graceful drain and depends on SQLite recovery.
+
+## Live receipt retirement
+
+Proposed [ADR 0027](decisions/0027-live-receipt-retirement.md) separates result
+consumption from completion of the responsibility a command created. Only an
+applied, correlated terminal store result whose consequences are retained by
+the pure owner can close its sequence position. Unknown outcomes, disconnection,
+timeouts and history eviction cannot. An offline obligation, an active claim
+or an incoming QoS 2 marker can outlast the full admission/claim receipt.
+
+Each origin has at most 1024 issued but not durably confirmed positions. New
+business stops at span 768, leaving 256 positions for continuations. Ordinary
+business cannot spend the final 512 of the unchanged 8192 physical receipt
+slots. Resolution uses its original operation identity. Maintenance itself
+creates neither an OperationId nor another receipt. Its reserved paths can
+progress when ordinary result/input queues or network output are blocked.
+
+The owner closes only a contiguous consumed prefix, with the PublicationSeq
+and PayloadSeq issuance boundaries at that exact position. At most 128 new
+positions and 128 physical rows are handled per pass. A known absolute closure
+returns issuance capacity once; repeated/lost replies never grant credits twice.
+The usual trigger is 64 consumed results. Hole-blocked or empty producers do
+not spin. A deferred fenced Release can consume its terminal result at a full
+window and prepare its new attempt only after collection makes room.
+
+SQLite atomically installs all three monotone guards, deletes bounded receipt/
+fence rows and updates actual receipt accounting. Old OperationIds return
+RetiredOutcomeUnavailable, including with different recipe bytes: their detail
+may be unavailable, but they cannot execute again. Retained nonretired receipts
+still compare canonical bytes. New operations cannot reuse old publication or
+payload identities after the business rows and original receipt have vanished.
+Live business rows keep their own identities/guards and are not deleted by GC.
+
+There are at most 64 compact origin rows. On startup, after complete validated
+recovery, 32 retained origins or 4096 receipts trigger bounded sweeping of closed
+epochs before readiness. This does not rotate an active owner's epoch. Initial
+opt-in compatibility uses the existing snapshot read budget; normal product
+origins register empty before accepting business. Legacy epoch-zero fixtures
+remain outside this live-origin protocol. No incompatible database is reset.
+
+The optional product event log retains at most a 16 MiB active segment and one
+16 MiB `.previous` segment, with continuous sequence numbers and explicit
+rotation. A receiver requiring a complete long-run history must drain it during
+the run; bounded retention is not a permanent archive. Actual writer SQLite
+settings and receipt policy are emitted before readiness. WAL measurements in
+the receipt reception use the normal build and its normal autocheckpoint.
 
 ## System reception
 
@@ -321,6 +370,7 @@ tools/run_tcp_reception.sh /tmp/mqttiumd-tcp-reception
 tools/run_qos1_reception.sh /tmp/mqttiumd-qos1-reception
 tools/run_pubsub_reception.sh /tmp/mqttiumd-pubsub-reception
 tools/run_qos0_reception.sh /tmp/mqttiumd-qos0-reception
+tools/run_receipt_reception.sh /tmp/mqttiumd-receipt-reception
 ```
 
 mqttium 1.3.0 is primary through public APIs; Paho 2.1.0 is a second
@@ -350,8 +400,13 @@ are labeled rather than presented as ordinary product configuration changes.
 
 These are finite system tests. Existing K1/K2b/K3 qualifications and proof/model
 limits stay separate; no new path automatically qualifies all P1/P2. ADRs
-0024/0025/0026 retain Proposed status and guard partitions stay incomplete.
-General receipt/epoch collection, indefinite operation, outgoing QoS 2,
+0024/0025/0026/0027 retain Proposed status and guard partitions stay incomplete.
+Legacy epoch-zero/session collection, indefinite operation, outgoing QoS 2,
 wildcard/shared/retained delivery, Will/authentication, finite expiry, deployment
 security and performance remain separate. Process SIGKILL is not a power-loss
 or universal storage guarantee.
+
+Outgoing QoS 1 Packet Identifier recycling is the next operational increment.
+The current connection still exhausts its 1..65535 space instead of reusing
+completed identifiers indefinitely; reconnect remains necessary. Live receipt
+retirement does not remove that limit or the 128-session lifetime bound.

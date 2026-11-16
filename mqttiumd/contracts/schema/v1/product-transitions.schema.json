@@ -92,7 +92,9 @@
               "GapBlocked",
               "CollectionPending",
               "FrontierKnown",
-              "ClosedEpochPending"
+              "ClosedEpochPending",
+              "ControlWindowFull",
+              "ReleaseRetryDeferred"
             ]
           },
           "event_class": {
@@ -120,7 +122,9 @@
               "GapBlocked",
               "CollectionPending",
               "FrontierKnown",
-              "ClosedEpochPending"
+              "ClosedEpochPending",
+              "ControlWindowFull",
+              "ReleaseRetryDeferred"
             ]
           },
           "required_actions": {

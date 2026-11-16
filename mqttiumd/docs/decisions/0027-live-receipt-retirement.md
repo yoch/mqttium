@@ -65,6 +65,10 @@ at 32 retained origins or 4096 physical receipts it sweeps closed scopes before
 readiness, leaving headroom under the 64-origin and 8192-receipt bounds.
 SQLite schema 4 refuses older formats before write-affecting pragmas; no implicit
 migration/reset. Readers preserve typed failures and bounded rows/bytes.
+One-time opt-in compatibility may inspect retained legacy-origin admission
+receipts under the snapshot budget (65536 rows/32 MiB) to reject historical
+zero identities. Normal product origins register fresh and empty; ordinary
+collection validation and sweeps retain the smaller per-pass bounds.
 
 The receipt budget ceases to be a cumulative live-process traffic ceiling.
 Outgoing QoS 1 Packet Identifiers, finite session/epoch identities, storage

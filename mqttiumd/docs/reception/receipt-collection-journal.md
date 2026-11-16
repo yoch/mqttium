@@ -12,10 +12,25 @@
   closure; no maintenance OperationId/receipt; bounded controls, holes and
   physical sweeps. Contract unit suite and store API check passed. Previous
   digest6d1a0045...a6c3042c7; derived formats/new digest follow the consumer lot.
-- Implementation lots own separate worktrees/targets: core, stores, runtime,
-  formats, focused model and reception. Root owns contracts/integration/CI.
-- Next: integrate red/fix lots, execute first live collection, then normal
-  >32768 business completions with identical process/file/main connections,
-  saturation/identity/crash controls and all exact-head gates. Final published
-  SHA, archive hashes and CI status belong in the PR receipt and run indexes.
-  No main merge or ADR acceptance. Outgoing PI recycling is the next increment.
+- Separate core/store/runtime/format/model/reception lots are integrated.
+  Code checkpoint e4edacf0 includes exact collector timer classification,
+  reserved input backpressure/fairness, startup cancellation, the full-window
+  fenced Release retry, partial-sweep recovery and all namespace guards.
+- Complete diagnostic at1e785746: normal A+B/D/G plus six hook runs and five
+  compiled mutants PASS as expected; archive3858f77f...75e8c071b. Same-run
+  strace, actual barriers, source/binary/client identities and SQL snapshots.
+  B:32769 replacements+42 publications=32811 business completions, same process/
+  file/main connections, receipts4..64/8192, RSS9.21..9.26MB, DB20pages, WAL4.14MB.
+  Historical red archive580317a0...776cccae remains separate and unchanged.
+- Independent review confirmed/fixed full-window Release deadlock, absolute
+  guard observation and ordinary deadlines occupying the maintenance reserve.
+  Model-only b16c0eb9 has ten exact TLC outcomes, archivecca014ee...8dd401.
+- Final descriptive registry includes deferred Release; current digest is
+  92d4192f1f701224395818686f52caaff59ff6859569c62f8570650bddec5cf9.
+  Canonical recipe kinds1..7 remain unchanged. SQLite schema4 refuses1/2/3.
+- Next: receive the clean final command tools/run_receipt_reception.sh, normal/
+  instrumented suites sequentially, old product regressions, fresh K1/K2b/K3
+  and exact-head CI; publish with expected remote HEAD3ad41e95 protection.
+  Final SHA, archive hashes and check identities belong in PR648 and indexes,
+  without retrospectively relabeling diagnostics. No merge/ADR acceptance.
+  Outgoing Packet Identifier recycling remains the next operational increment.
