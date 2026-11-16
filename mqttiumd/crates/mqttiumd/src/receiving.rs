@@ -63,19 +63,8 @@ impl Window {
         false
     }
 
-    /// A repeated identifier refreshes its serial without consuming another
-    /// slot. The runtime supplies a checked, monotonically increasing serial.
-    pub fn publish(&mut self, id: u16, serial: u64) -> Result<(), ()> {
-        self.publish_qos(id, serial, Qos::ExactlyOnce)
-    }
-
     pub fn serial(&self, id: u16) -> Option<u64> {
         self.receiving.get(&id).map(|occurrence| occurrence.serial)
-    }
-
-    /// The runtime captures the serial when it accepts a PUBCOMP frame.
-    pub fn complete(&mut self, id: u16, serial: Option<u64>) {
-        self.complete_frame(id, serial, Terminal::Pubcomp);
     }
 }
 
@@ -147,28 +136,31 @@ mod tests {
     #[test]
     fn an_old_pubcomp_receipt_cannot_free_a_reused_identifier() {
         let mut window = Window::default();
-        assert_eq!(window.publish(1, 1), Ok(()));
+        assert_eq!(window.publish_qos(1, 1, Qos::ExactlyOnce), Ok(()));
         let old_completion = window.serial(1);
-        assert_eq!(window.publish(1, 2), Ok(()));
-        window.complete(1, old_completion);
+        assert_eq!(window.publish_qos(1, 2, Qos::ExactlyOnce), Ok(()));
+        window.complete_frame(1, old_completion, Terminal::Pubcomp);
         assert_eq!(
             window.serial(1),
             Some(2),
             "the new exchange still holds its slot"
         );
         for id in 2..=8 {
-            assert_eq!(window.publish(id, u64::from(id) + 1), Ok(()));
+            assert_eq!(
+                window.publish_qos(id, u64::from(id) + 1, Qos::ExactlyOnce),
+                Ok(())
+            );
         }
         assert_eq!(
-            window.publish(9, 10),
+            window.publish_qos(9, 10, Qos::ExactlyOnce),
             Err(()),
             "the ninth distinct exchange is refused"
         );
         assert_eq!(window.serial(9), None);
-        window.complete(1, Some(2));
+        window.complete_frame(1, Some(2), Terminal::Pubcomp);
         assert_eq!(window.serial(1), None);
         assert_eq!(
-            window.publish(9, 10),
+            window.publish_qos(9, 10, Qos::ExactlyOnce),
             Ok(()),
             "a matching receipt frees its slot"
         );
@@ -177,14 +169,14 @@ mod tests {
     #[test]
     fn only_a_matching_present_serial_can_complete_an_exchange() {
         let mut window = Window::default();
-        assert_eq!(window.publish(7, 1), Ok(()));
-        window.complete(7, None);
+        assert_eq!(window.publish_qos(7, 1, Qos::ExactlyOnce), Ok(()));
+        window.complete_frame(7, None, Terminal::Pubcomp);
         assert_eq!(window.serial(7), Some(1));
-        window.complete(7, Some(2));
+        window.complete_frame(7, Some(2), Terminal::Pubcomp);
         assert_eq!(window.serial(7), Some(1));
-        window.complete(8, Some(1));
+        window.complete_frame(8, Some(1), Terminal::Pubcomp);
         assert_eq!(window.serial(7), Some(1));
-        window.complete(7, Some(1));
+        window.complete_frame(7, Some(1), Terminal::Pubcomp);
         assert_eq!(window.serial(7), None);
     }
 
@@ -192,15 +184,18 @@ mod tests {
     fn duplicate_refreshes_remain_bounded_and_need_their_latest_serial() {
         let mut window = Window::default();
         for id in 1..=8 {
-            assert_eq!(window.publish(id, u64::from(id)), Ok(()));
+            assert_eq!(
+                window.publish_qos(id, u64::from(id), Qos::ExactlyOnce),
+                Ok(())
+            );
         }
         for serial in 9..=1024 {
-            assert_eq!(window.publish(1, serial), Ok(()));
+            assert_eq!(window.publish_qos(1, serial, Qos::ExactlyOnce), Ok(()));
         }
-        assert_eq!(window.publish(9, 1025), Err(()));
-        window.complete(1, Some(1));
+        assert_eq!(window.publish_qos(9, 1025, Qos::ExactlyOnce), Err(()));
+        window.complete_frame(1, Some(1), Terminal::Pubcomp);
         assert_eq!(window.serial(1), Some(1024));
-        window.complete(1, Some(1024));
-        assert_eq!(window.publish(9, 1025), Ok(()));
+        window.complete_frame(1, Some(1024), Terminal::Pubcomp);
+        assert_eq!(window.publish_qos(9, 1025, Qos::ExactlyOnce), Ok(()));
     }
 }
