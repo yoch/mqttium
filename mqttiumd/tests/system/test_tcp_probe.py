@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 from tcp_probe import (
     Frame, FrameDecoder, Observations, ReceiptFailure, Wire, assert_no_positive_ack,
-    assert_stale_filtered, connect_packet, publish_packet, variable_integer,
+    assert_stale_filtered, connect_packet, publish_packet, read_events, variable_integer,
 )
 
 
@@ -103,6 +103,36 @@ class ProbeTests(unittest.TestCase):
             wire.send = lambda *args, **kwargs: None
             wire.exchange(7, concat=True)
             self.assertEqual(wire.frames, [])
+
+    def read_product_event(self, kind, details):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "product.jsonl"
+            event = {"format": "mqttiumd.product-event", "schema_version": 1,
+                     "seq": "0", "kind": kind, "pid": 1, "details": details}
+            path.write_text(json.dumps(event) + "\n")
+            return read_events(path)
+
+    def test_lifecycle_optional_identity_nulls_keep_their_exact_context(self):
+        for kind, details in (
+                ("command_submitted", {"recipe_kind": "SessionOpen", "action": "Open",
+                                       "expected_session": None}),
+                ("session_changed", {"action": "Opened", "session": "1", "retired_session": None})):
+            with self.subTest(kind=kind):
+                events = self.read_product_event(kind, details)
+                self.assertEqual(events[0]["details"], details)
+
+    def test_null_or_object_details_outside_typed_identity_slots_stay_invalid(self):
+        for kind, details in (
+                ("command_submitted", {"unexpected": None}),
+                ("command_submitted", {"retired_session": None}),
+                ("session_changed", {"expected_session": None}),
+                ("runtime_refused", {"expected_session": None}),
+                ("runtime_refused", {"retired_session": None}),
+                ("command_submitted", {"expected_session": {"session": "1"}}),
+                ("session_changed", {"retired_session": []})):
+            with self.subTest(kind=kind, details=details), self.assertRaises(ReceiptFailure) as failure:
+                self.read_product_event(kind, details)
+            self.assertEqual(failure.exception.code, "product_event_details")
 
     def test_nonreader_receive_buffer_is_configured_before_tcp_connect(self):
         # A post-connect RCVBUF does not constrain the window advertised in SYN.
