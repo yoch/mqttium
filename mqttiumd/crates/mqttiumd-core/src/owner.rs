@@ -47,7 +47,9 @@ use crate::contract::ids::{
 use crate::contract::outcome::{
     CommitFacts, RejectReason, StoreOutcome, StoreReply, StoreViolation,
 };
-use crate::contract::packet::{AckReason, InboundPacket, OutboundFrame, Qos, SharedBytes};
+use crate::contract::packet::{
+    AckReason, InboundPacket, OutboundFrame, PubackReason, Qos, SharedBytes,
+};
 use crate::contract::step::{CoreFault, Exhaustion, PlanStamp, Progress, StepOutcome, TurnGrant};
 use crate::credits::{Credits, ReleaseOutcome};
 use crate::leases::{LeaseRefused, LeaseTable};
@@ -80,7 +82,8 @@ pub struct OwnerConfig {
     pub max_sessions: NonZeroU32,
     /// Route targets the owner can hold.
     pub max_routes: NonZeroU32,
-    /// Inbound QoS 2 exchanges the owner can hold at a time.
+    /// Inbound admissions/exchanges and outstanding QoS 1 acknowledgements
+    /// the owner can hold at a time, across both QoS levels.
     pub max_exchanges: NonZeroU32,
     /// The account charged for the exchanges this owner holds.
     pub account: AccountId,
@@ -342,15 +345,26 @@ enum SlotState {
     AdmissionPending(InFlight),
     AwaitPubrel,
     ReleasePending(InFlight),
+    /// The admission ended, but its own PUBACK frame is still outstanding.
+    /// A later PUBLISH may reuse the Packet Identifier before this frame's
+    /// write receipt is processed. Only effect + generation identifies it.
+    AckPending {
+        effect: EffectId,
+        connection: ConnectionKey,
+    },
 }
 
-/// One inbound QoS 2 exchange.
+/// One bounded inbound occurrence, using the shared admission path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Slot {
     session: SessionId,
     packet_id: InboundPacketId,
     exchange: ExchangeId,
     publication: PublicationId,
+    qos: Qos,
+    /// The latest PUBLISH of this active occurrence. Recovery supplies no
+    /// invented network ingress order.
+    publish_origin: Option<(ConnectionGeneration, u64)>,
     /// The lease of the exchange in the account of the owner, held until
     /// the exchange ends.
     lease: LeaseKey,
@@ -369,7 +383,7 @@ impl Slot {
             SlotState::AdmissionPending(in_flight) | SlotState::ReleasePending(in_flight) => {
                 Some(in_flight)
             }
-            SlotState::AwaitPubrel => None,
+            SlotState::AwaitPubrel | SlotState::AckPending { .. } => None,
         }
     }
 }
@@ -428,11 +442,25 @@ enum Change {
         packet_id: InboundPacketId,
         exchange: ExchangeId,
         publication: PublicationId,
+        qos: Qos,
+        publish_origin: (ConnectionGeneration, u64),
         cost: Credits,
         in_flight: InFlight,
     },
     /// The admission of the exchange is known committed.
     Committed { slot: usize, admission: Finished },
+    /// A repeated active PUBLISH keeps the same operation and refreshes
+    /// only the network occurrence to which its future ACK is correlated.
+    Replay {
+        slot: usize,
+        publish_origin: (ConnectionGeneration, u64),
+    },
+    AckReady {
+        slot: usize,
+        admission: Finished,
+        effect: EffectId,
+        connection: ConnectionKey,
+    },
     /// The exchange ends with the operation it waited for, and gives its
     /// lease back.
     End { slot: usize, finished: Finished },
@@ -516,6 +544,21 @@ impl Draft {
             publish_order: None,
         })
         .map(|_| ())
+    }
+
+    /// Captures correlation while planning, before an Outbox refusal or
+    /// a later reuse can change the meaning of the Packet Identifier.
+    fn publish_frame(
+        &mut self,
+        connection: ConnectionKey,
+        frame: OutboundFrame,
+        publish_order: Option<u64>,
+    ) -> Result<EffectId, Stop> {
+        self.emit(Effect::EmitFrame {
+            connection,
+            frame,
+            publish_order,
+        })
     }
 
     fn close(&mut self, connection: ConnectionGeneration, reason: CloseReason) -> Result<(), Stop> {
@@ -832,6 +875,7 @@ impl Owner {
             SlotState::AdmissionPending(_) => ExchangePhase::AdmissionPending,
             SlotState::AwaitPubrel => ExchangePhase::AwaitPubrel,
             SlotState::ReleasePending(_) => ExchangePhase::ReleasePending,
+            SlotState::AckPending { .. } => return None,
         };
         Some((slot.exchange, phase))
     }
@@ -996,8 +1040,10 @@ impl Owner {
             // work behind one.
             Input::WorkAvailable { .. } => Ok(Change::Nothing),
             Input::Packet {
-                connection, packet, ..
-            } => self.plan_packet(*connection, packet, draft),
+                connection,
+                ingress_order,
+                packet,
+            } => self.plan_packet(*connection, *ingress_order, packet, draft),
             Input::StoreResult {
                 effect,
                 operation,
@@ -1005,10 +1051,10 @@ impl Owner {
             } => self.plan_result(*effect, *operation, reply, draft),
             Input::Deadline { token, .. } => self.plan_deadline(*token, draft),
             Input::FrameResult {
+                effect,
                 connection,
                 progress,
-                ..
-            } => self.plan_frame_result(*connection, *progress, draft),
+            } => self.plan_frame_result(*effect, *connection, *progress, draft),
         }
     }
 
@@ -1020,10 +1066,11 @@ impl Owner {
     }
 
     fn slot_of(&self, session: SessionId, packet_id: InboundPacketId) -> Option<usize> {
-        self.slots
-            .as_slice()
-            .iter()
-            .position(|slot| slot.session == session && slot.packet_id == packet_id)
+        self.slots.as_slice().iter().position(|slot| {
+            slot.session == session
+                && slot.packet_id == packet_id
+                && !matches!(slot.state, SlotState::AckPending { .. })
+        })
     }
 
     /// Installs only an exclusive writer's confirmed fact. The adapter
@@ -1148,6 +1195,7 @@ impl Owner {
     fn plan_packet(
         &self,
         connection: ConnectionGeneration,
+        ingress_order: u64,
         packet: &InboundPacket,
         draft: &mut Draft,
     ) -> Result<Change, Stop> {
@@ -1210,37 +1258,46 @@ impl Owner {
                 Ok(Change::Nothing)
             }
             InboundPacket::Publish {
-                topic,
                 qos,
                 retain,
                 packet_id,
-                payload,
                 ..
             } => {
-                if *qos != Qos::ExactlyOnce || *retain {
+                if *qos == Qos::AtMostOnce || *retain {
                     return protocol_error(draft);
                 }
                 let Some(packet_id) = *packet_id else {
                     return Err(IMPOSSIBLE);
                 };
                 let Some(slot) = self.slot_of(session.id, packet_id) else {
-                    return self
-                        .plan_admission(index, connection, packet_id, topic, payload, draft);
+                    return self.plan_admission(index, (connection, ingress_order), packet, draft);
                 };
-                match self.slots.as_slice()[slot].state {
+                let held = self.slots.as_slice()[slot];
+                if held.qos != *qos {
+                    return protocol_error(draft);
+                }
+                let publish_origin = (connection, ingress_order);
+                match held.state {
                     // The exchange owns its admission: the replay creates
                     // no command and no acknowledgement (ADR 0001).
-                    SlotState::AdmissionPending(_) => Ok(Change::Nothing),
+                    SlotState::AdmissionPending(_) => Ok(Change::Replay {
+                        slot,
+                        publish_origin,
+                    }),
                     SlotState::AwaitPubrel => {
                         let frame = OutboundFrame::Pubrec {
                             packet_id,
                             reason: AckReason::Success,
                         };
-                        draft.frame(key, frame)?;
-                        Ok(Change::Nothing)
+                        draft.publish_frame(key, frame, Some(ingress_order))?;
+                        Ok(Change::Replay {
+                            slot,
+                            publish_origin,
+                        })
                     }
                     // After its PUBREL a client may only resend PUBREL.
                     SlotState::ReleasePending(_) => protocol_error(draft),
+                    SlotState::AckPending { .. } => Err(IMPOSSIBLE),
                 }
             }
             InboundPacket::Pubrel { packet_id } => {
@@ -1252,12 +1309,17 @@ impl Owner {
                     draft.frame(key, frame)?;
                     return Ok(Change::Nothing);
                 };
-                match self.slots.as_slice()[slot].state {
+                let held = self.slots.as_slice()[slot];
+                if held.qos != Qos::ExactlyOnce {
+                    return protocol_error(draft);
+                }
+                match held.state {
                     // No PUBREC of this exchange was ever made eligible.
                     SlotState::AdmissionPending(_) => protocol_error(draft),
                     SlotState::AwaitPubrel => self.plan_release(slot, None, draft),
                     // No second release, and no PUBCOMP before the commit.
                     SlotState::ReleasePending(_) => Ok(Change::Nothing),
+                    SlotState::AckPending { .. } => Err(IMPOSSIBLE),
                 }
             }
         }
@@ -1311,12 +1373,22 @@ impl Owner {
     fn plan_admission(
         &self,
         session: usize,
-        connection: ConnectionGeneration,
-        packet_id: InboundPacketId,
-        topic: &SharedBytes,
-        payload: &SharedBytes,
+        publish_origin: (ConnectionGeneration, u64),
+        packet: &InboundPacket,
         draft: &mut Draft,
     ) -> Result<Change, Stop> {
+        let InboundPacket::Publish {
+            qos,
+            topic,
+            packet_id: Some(packet_id),
+            payload,
+            ..
+        } = packet
+        else {
+            return Err(IMPOSSIBLE);
+        };
+        let (qos, packet_id) = (*qos, *packet_id);
+        let (connection, _) = publish_origin;
         let (Some(limits), Some(route_revision)) = (self.limits, self.route_revision) else {
             return Err(IMPOSSIBLE);
         };
@@ -1405,7 +1477,7 @@ impl Owner {
                     publication,
                     index: u32::try_from(index).map_err(|_| IMPOSSIBLE)?,
                 },
-                effective_qos: route.max_qos.min(Qos::ExactlyOnce),
+                effective_qos: route.max_qos.min(qos),
                 cause: DeliveryCause::LiveExact,
             };
             list.try_push(target).map_err(|_| IMPOSSIBLE)?;
@@ -1421,7 +1493,7 @@ impl Owner {
                 exchange,
             },
             route_revision,
-            qos: Qos::ExactlyOnce,
+            qos,
             retain: false,
             topic: topic.clone(),
             payload: PayloadRef {
@@ -1431,7 +1503,7 @@ impl Owner {
             costs: Costs {
                 payload_bytes: PayloadBytes::new(length),
                 references: References::new(references),
-                exchange_slots: ExchangeSlots::new(1),
+                exchange_slots: ExchangeSlots::new(u64::from(qos == Qos::ExactlyOnce)),
                 receipt_slots: ReceiptSlots::new(1),
             },
             targets: list,
@@ -1442,6 +1514,8 @@ impl Owner {
             packet_id,
             exchange,
             publication,
+            qos,
+            publish_origin,
             cost,
             in_flight,
         })
@@ -1480,15 +1554,53 @@ impl Owner {
         frame: OutboundFrame,
         draft: &mut Draft,
     ) -> Result<(), Stop> {
-        match self.connection_of(slot.session) {
-            None => Ok(()),
-            Some(generation) => draft.frame(
-                ConnectionKey {
-                    session: slot.session,
-                    generation,
-                },
-                frame,
-            ),
+        self.plan_answer_frame(slot, frame, draft).map(|_| ())
+    }
+
+    fn plan_answer_frame(
+        &self,
+        slot: &Slot,
+        frame: OutboundFrame,
+        draft: &mut Draft,
+    ) -> Result<Option<(EffectId, ConnectionKey)>, Stop> {
+        let Some(generation) = self.connection_of(slot.session) else {
+            return Ok(None);
+        };
+        let connection = ConnectionKey {
+            session: slot.session,
+            generation,
+        };
+        let publish_order = slot
+            .publish_origin
+            .filter(|(origin, _)| *origin == generation)
+            .map(|(_, order)| order);
+        let effect = draft.publish_frame(connection, frame, publish_order)?;
+        Ok(Some((effect, connection)))
+    }
+
+    fn plan_puback(
+        &self,
+        index: usize,
+        finished: Finished,
+        reason: PubackReason,
+        draft: &mut Draft,
+    ) -> Result<Change, Stop> {
+        let slot = &self.slots.as_slice()[index];
+        let frame = OutboundFrame::Puback {
+            packet_id: slot.packet_id,
+            reason,
+        };
+        match self.plan_answer_frame(slot, frame, draft)? {
+            Some((effect, connection)) => Ok(Change::AckReady {
+                slot: index,
+                admission: finished,
+                effect,
+                connection,
+            }),
+            None => Ok(Change::End {
+                slot: index,
+                finished,
+            }),
         }
     }
 
@@ -1562,6 +1674,9 @@ impl Owner {
                 // transition: the command is consumed.
                 let finished = finished(CommandPhase::Consumed, Some(facts));
                 if admission {
+                    if slot.qos == Qos::AtLeastOnce {
+                        return self.plan_puback(index, finished, PubackReason::Success, draft);
+                    }
                     // PUBREC becomes eligible here and nowhere earlier.
                     self.plan_answer(slot, OutboundFrame::Pubrec { packet_id, reason }, draft)?;
                     Ok(Change::Committed {
@@ -1582,6 +1697,14 @@ impl Owner {
             ) => {
                 let finished = finished(CommandPhase::RejectedCertain, None);
                 if admission {
+                    if slot.qos == Qos::AtLeastOnce {
+                        return self.plan_puback(
+                            index,
+                            finished,
+                            PubackReason::refusing(rejection),
+                            draft,
+                        );
+                    }
                     // Nothing was admitted: the exchange ends and the
                     // client is told, as the protocol says.
                     let frame = OutboundFrame::Pubrec {
@@ -1703,11 +1826,39 @@ impl Owner {
 
     fn plan_frame_result(
         &self,
+        effect: EffectId,
         connection: ConnectionKey,
         progress: FrameProgress,
         draft: &mut Draft,
     ) -> Result<Change, Stop> {
         let failed = matches!(progress, FrameProgress::Failed);
+        let completed = matches!(
+            progress,
+            FrameProgress::Written { confirmed, total } if total > 0 && confirmed == total
+        );
+        let ended = self
+            .slots
+            .as_slice()
+            .iter()
+            .enumerate()
+            .find_map(|(index, slot)| {
+                let SlotState::AckPending {
+                    effect: held,
+                    connection: destination,
+                } = slot.state
+                else {
+                    return None;
+                };
+                (held == effect && destination == connection).then_some((index, slot.admission))
+            });
+        if (failed || completed)
+            && let Some((slot, Some(finished))) = ended
+        {
+            if failed && self.connection_of(connection.session) == Some(connection.generation) {
+                draft.end(connection.generation)?;
+            }
+            return Ok(Change::End { slot, finished });
+        }
         match self.session_of(connection.generation) {
             Some(session)
                 if failed && self.sessions.as_slice()[session].id == connection.session =>
@@ -1881,6 +2032,13 @@ impl Owner {
 
         self.apply_change(change, input)?;
         if let Some(connection) = closed {
+            // Closing a generation is terminal for its queued/emitting
+            // ACKs, even if the adapter never accepted their Outbox effect.
+            // Uncertain admissions are deliberately kept for reconciliation.
+            self.finish_closed_acks(connection)?;
+            if let Some(session) = self.session_of(connection) {
+                self.sessions.as_mut_slice()[session].connection = None;
+            }
             remember(&mut self.closed, connection)?;
         }
         self.counters = counters;
@@ -1930,6 +2088,8 @@ impl Owner {
                 packet_id,
                 exchange,
                 publication,
+                qos,
+                publish_origin,
                 cost,
                 in_flight,
             } => {
@@ -1940,6 +2100,8 @@ impl Owner {
                     packet_id,
                     exchange,
                     publication,
+                    qos,
+                    publish_origin: Some(publish_origin),
                     lease,
                     admission: None,
                     release_preparations: 0,
@@ -1955,6 +2117,28 @@ impl Owner {
                 held.admission = Some(admission);
                 held.state = SlotState::AwaitPubrel;
             }
+            Change::Replay {
+                slot,
+                publish_origin,
+            } => {
+                let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
+                held.publish_origin = Some(publish_origin);
+            }
+            Change::AckReady {
+                slot,
+                admission,
+                effect,
+                connection,
+            } => {
+                let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
+                if !matches!(held.state, SlotState::AdmissionPending(_))
+                    || held.qos != Qos::AtLeastOnce
+                {
+                    return Err(STALE);
+                }
+                held.admission = Some(admission);
+                held.state = SlotState::AckPending { effect, connection };
+            }
             Change::End { slot, finished } => {
                 let slots = self.slots.as_mut_slice();
                 let last = slots.len().checked_sub(1).ok_or(STALE)?;
@@ -1966,7 +2150,9 @@ impl Owner {
                 let _ = self.slots.pop();
                 // The operations of the exchange stay visible, the latest
                 // last.
-                if let Some(admission) = held.admission {
+                if let Some(admission) = held.admission
+                    && admission.operation != finished.operation
+                {
                     remember(&mut self.finished, admission)?;
                 }
                 remember(&mut self.finished, finished)?;
@@ -1999,6 +2185,31 @@ impl Owner {
                 if let Some(refused) = refused {
                     remember(&mut self.finished, refused)?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_closed_acks(&mut self, connection: ConnectionGeneration) -> Result<(), CoreFault> {
+        let mut index = 0;
+        while index < self.slots.len() {
+            let held = self.slots.as_slice()[index];
+            if matches!(held.state, SlotState::AckPending { connection: key, .. } if key.generation == connection)
+            {
+                let finished = held.admission.ok_or(CoreFault::StalePlan)?;
+                if self.leases.release(held.lease) != Ok(ReleaseOutcome::Released) {
+                    return Err(CoreFault::StalePlan);
+                }
+                let last = self
+                    .slots
+                    .len()
+                    .checked_sub(1)
+                    .ok_or(CoreFault::StalePlan)?;
+                self.slots.as_mut_slice().swap(index, last);
+                let _ = self.slots.pop();
+                remember(&mut self.finished, finished)?;
+            } else {
+                index += 1;
             }
         }
         Ok(())
@@ -2072,6 +2283,8 @@ impl Owner {
                     packet_id: *packet_id,
                     exchange: *exchange,
                     publication: *publication,
+                    qos: Qos::ExactlyOnce,
+                    publish_origin: None,
                     lease,
                     admission: None,
                     release_preparations: 0,
@@ -3346,7 +3559,7 @@ mod tests {
             assert_eq!(world.drain()[0].1, close(connection));
         }
         assert_eq!(world.owner.connection_of(SessionId::new(PRODUCER)), None);
-        // A second CONNECT, a QoS below 2, a retained message: the session
+        // A second CONNECT, QoS 0, a retained message: the session
         // loses its connection and keeps everything else.
         let retained = || Input::Packet {
             connection: ConnectionGeneration::new(CONN),
@@ -3363,7 +3576,6 @@ mod tests {
         for input in [
             connect(CONN, b"p1-producer"),
             connect(CONN, b"p1-b"),
-            publish_with(CONN, 7, Qos::AtLeastOnce, b"payload"),
             publish_with(CONN, 7, Qos::AtMostOnce, b"payload"),
             retained(),
         ] {
@@ -3772,13 +3984,17 @@ mod tests {
     }
 
     fn frame_to(connection: u64, frame: OutboundFrame) -> Effect {
+        let publish_order = match frame {
+            OutboundFrame::Pubrec { .. } | OutboundFrame::Pubcomp { .. } => Some(0),
+            _ => None,
+        };
         Effect::EmitFrame {
             connection: ConnectionKey {
                 session: SessionId::new(PRODUCER),
                 generation: ConnectionGeneration::new(connection),
             },
             frame,
-            publish_order: None,
+            publish_order,
         }
     }
 
@@ -3864,9 +4080,15 @@ mod tests {
             world.sent(connect(11, b"p1-producer")),
             ["CloseConnection", "EmitConnack"]
         );
-        absorbed(
-            &mut world,
-            publish_with(11, 7, Qos::ExactlyOnce, b"payload"),
+        let mut before = world.snapshot();
+        world.applied(publish_with(11, 7, Qos::ExactlyOnce, b"payload"));
+        assert!(world.drain().is_empty());
+        before.revision = before.revision.checked_next().expect("not exhausted");
+        before.slots[0].publish_origin = Some((ConnectionGeneration::new(11), 0));
+        assert_eq!(
+            world.snapshot(),
+            before,
+            "only the PUBLISH correlation changed"
         );
         assert_eq!(world.flights.len(), 1);
         // PUBREC goes to the connection that is current at the commit.
