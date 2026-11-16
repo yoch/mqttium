@@ -833,7 +833,8 @@ impl Owner {
         Some(&self.outbox)
     }
 
-    /// Hands the effects of the box to `sink`, in order.
+    /// Hands effects to `sink` in order. The live collector and its own
+    /// deadline alone can bypass blocked ordinary effects.
     pub fn dispatch(&mut self, sink: &mut dyn EffectSink) -> DispatchReport {
         let priority = self.receipts.priority().map(|(effect, deadline)| {
             self.outbox
@@ -861,10 +862,11 @@ impl Owner {
         if authority.incarnation() != self.incarnation || authority.epoch() != self.epoch {
             return Err(RenewRefused::ForeignAuthority);
         }
-        if capacity.get() < MAX_TRANSITION_SLOTS {
+        let needed = MAX_TRANSITION_SLOTS + if self.receipts.enabled { 2 } else { 0 };
+        if capacity.get() < needed {
             return Err(RenewRefused::BoxTooSmall {
                 capacity: capacity.get(),
-                needed: MAX_TRANSITION_SLOTS,
+                needed,
             });
         }
         authority
@@ -8503,14 +8505,25 @@ mod tests {
 
     #[test]
     fn receipt_collection_box_renewal_preserves_reserved_control_capacity() {
-        let mut world=World::connected();
+        let mut world = World::connected();
         gc_register(&mut world);
-        let before=world.snapshot();
-        assert_eq!(world.owner.renew_box(&mut world.authority,nonzero(2),bound(ENTRIES)),
-            Err(RenewRefused::BoxTooSmall {capacity:2,needed:4}));
-        assert_eq!(world.snapshot(),before);
-        assert_eq!(world.owner.renew_box(&mut world.authority,nonzero(4),bound(ENTRIES)),Ok(()));
+        let before = world.snapshot();
+        assert_eq!(
+            world
+                .owner
+                .renew_box(&mut world.authority, nonzero(2), bound(ENTRIES)),
+            Err(RenewRefused::BoxTooSmall {
+                capacity: 2,
+                needed: 4
+            })
+        );
+        assert_eq!(world.snapshot(), before);
+        assert_eq!(
+            world
+                .owner
+                .renew_box(&mut world.authority, nonzero(4), bound(ENTRIES)),
+            Ok(())
+        );
         assert!(world.owner.collection_ready());
     }
-
 }
