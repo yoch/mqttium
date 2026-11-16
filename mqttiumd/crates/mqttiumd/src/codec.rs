@@ -3,6 +3,7 @@
 use mqttiumd_contract::ids::{InboundPacketId, OutboundPacketId};
 use mqttiumd_contract::packet::{AckReason, InboundPacket, OutboundFrame, Qos, SharedBytes};
 use mqttiumd_contract::pubsub::{FilterList, MAX_FILTERS, SubscriptionFilter};
+use mqttiumd_contract::session::SessionExpiry;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bounds {
@@ -23,6 +24,8 @@ pub struct Header {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Connect {
     pub client_id: SharedBytes,
+    pub clean_start: bool,
+    pub expiry: SessionExpiry,
     pub keep_alive: u16,
     pub max_packet_size: u32,
     pub receive_maximum: u16,
@@ -34,7 +37,7 @@ pub struct Connect {
 pub enum Packet {
     Connect(Connect),
     Core(InboundPacket),
-    Disconnect,
+    Disconnect { expiry: Option<SessionExpiry> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -491,7 +494,8 @@ fn client_connect(body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
             ..unsupported("ExplicitClientIdRequired")
         });
     }
-    if flags != 0 || props.expiry != Some(u32::MAX) || props.unsupported {
+    let expiry = SessionExpiry::from_wire(props.expiry.unwrap_or(0));
+    if flags & !2 != 0 || expiry.is_none() || props.unsupported {
         return Err(Error {
             peer_maximum,
             ..unsupported("ConnectOutsideProfile")
@@ -503,6 +507,8 @@ fn client_connect(body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
     })?;
     Ok(Packet::Connect(Connect {
         client_id,
+        clean_start: flags & 2 != 0,
+        expiry: expiry.ok_or_else(|| unsupported("SessionExpiryOutsideProfile"))?,
         keep_alive,
         max_packet_size: props.max_packet.unwrap_or(u32::MAX),
         receive_maximum: props.receive_maximum.unwrap_or(u16::MAX),
@@ -591,10 +597,30 @@ fn disconnect(body: &[u8]) -> Result<Packet, Error> {
         properties(&mut input, Context::Disconnect)?
     };
     input.end()?;
-    if reason != 0 || props.unsupported || props.expiry.is_some_and(|n| n != u32::MAX) {
+    if reason != 0
+        || props.unsupported
+        || props
+            .expiry
+            .is_some_and(|n| SessionExpiry::from_wire(n).is_none())
+    {
         return Err(unsupported("DisconnectOutsideProfile"));
     }
-    Ok(Packet::Disconnect)
+    Ok(Packet::Disconnect {
+        expiry: props.expiry.and_then(SessionExpiry::from_wire),
+    })
+}
+
+/// A refused establishment has no session key and never advertises SP1.
+pub fn session_refusal(reason: u8) -> Result<Vec<u8>, Error> {
+    if !matches!(reason, 0x80 | 0x82 | 0x83 | 0x89 | 0x97) {
+        return Err(protocol("InvalidConnackRefusal"));
+    }
+    Ok(vec![0x20, 3, 0, reason, 0])
+}
+
+/// The lifecycle runtime uses this bounded control frame before physical close.
+pub fn disconnect_reason(reason: u8) -> Vec<u8> {
+    vec![0xe0, 2, reason, 0]
 }
 
 fn subscribe(body: &[u8], unsubscribe: bool, bounds: Bounds) -> Result<Packet, Error> {
@@ -1027,6 +1053,69 @@ mod tests {
 
     const EXPIRY: &[u8] = &[0x11, 0xff, 0xff, 0xff, 0xff];
 
+    #[test]
+    fn session_connect_matrix_keeps_absent_zero_infinite_and_clean_start_explicit() {
+        for clean_start in [false, true] {
+            for (properties, expected) in [
+                (&[][..], SessionExpiry::OnDisconnect),
+                (&[0x11, 0, 0, 0, 0][..], SessionExpiry::OnDisconnect),
+                (EXPIRY, SessionExpiry::Never),
+            ] {
+                let mut body = connect(properties, b"lifecycle-client");
+                body[7] = if clean_start { 2 } else { 0 };
+                let Packet::Connect(value) = decode(0x10, &body, BOUNDS).unwrap() else {
+                    panic!("CONNECT");
+                };
+                assert_eq!(value.clean_start, clean_start);
+                assert_eq!(value.expiry, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn disconnect_retains_override_and_checks_its_domain_before_runtime_policy() {
+        assert_eq!(
+            decode(0xe0, &[], BOUNDS).unwrap(),
+            Packet::Disconnect { expiry: None }
+        );
+        assert_eq!(
+            decode(0xe0, &[0, 5, 0x11, 0, 0, 0, 0], BOUNDS).unwrap(),
+            Packet::Disconnect {
+                expiry: Some(SessionExpiry::OnDisconnect)
+            }
+        );
+        assert_eq!(
+            decode(0xe0, &[0, 5, 0x11, 255, 255, 255, 255], BOUNDS).unwrap(),
+            Packet::Disconnect {
+                expiry: Some(SessionExpiry::Never)
+            }
+        );
+        assert_eq!(
+            decode(0xe0, &[0, 5, 0x11, 0, 0, 0, 7], BOUNDS)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            decode(0xe0, &[0, 10, 0x11, 0, 0, 0, 0, 0x11, 0, 0, 0, 0], BOUNDS)
+                .unwrap_err()
+                .code(),
+            "DuplicateProperty"
+        );
+        assert_eq!(
+            decode(0xe0, &[0, 5, 0x11, 0], BOUNDS).unwrap_err().kind(),
+            ErrorKind::Malformed
+        );
+    }
+
+    #[test]
+    fn session_refusal_never_invents_a_session_or_a_success_reason() {
+        assert_eq!(session_refusal(0x97).unwrap(), [0x20, 3, 0, 0x97, 0]);
+        assert!(session_refusal(0).is_err());
+        assert!(session_refusal(0x92).is_err());
+        assert_eq!(disconnect_reason(0x82), [0xe0, 2, 0x82, 0]);
+    }
+
     fn kind(result: Result<Packet, Error>, expected: ErrorKind) {
         assert_eq!(result.expect_err("must refuse").kind, expected);
     }
@@ -1089,17 +1178,22 @@ mod tests {
 
     #[test]
     fn an_unsupported_connect_retains_its_validated_response_limit() {
-        let mut props = EXPIRY.to_vec();
+        let mut props = vec![0x11, 0, 0, 0, 7];
         props.extend_from_slice(&[0x27, 0, 0, 0, 3]);
         let mut clean = connect(&props, b"small-refusal");
-        clean[7] = 2; // Clean Start is valid MQTT 5, outside this profile.
+        clean[7] = 2; // Clean Start is supported; a finite interval is not.
         let error = decode(0x10, &clean, BOUNDS).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
         assert_eq!(error.peer_maximum(), Some(3));
         assert!(refusal(error, true).len() > error.peer_maximum().unwrap() as usize);
 
-        let absent = decode(0x10, &connect(&[], b"unsupported-expiry"), BOUNDS).unwrap_err();
-        assert_eq!(absent.peer_maximum(), Some(u32::MAX));
+        let finite = decode(
+            0x10,
+            &connect(&[0x11, 0, 0, 0, 7], b"unsupported-expiry"),
+            BOUNDS,
+        )
+        .unwrap_err();
+        assert_eq!(finite.peer_maximum(), Some(u32::MAX));
         clean.pop();
         assert_eq!(
             decode(0x10, &clean, BOUNDS).unwrap_err().peer_maximum(),
@@ -1118,7 +1212,7 @@ mod tests {
     #[test]
     fn profile_refusals_differ_from_malformed_or_contradictory_properties() {
         kind(
-            decode(0x10, &connect(&[], b"client"), BOUNDS),
+            decode(0x10, &connect(&[0x11, 0, 0, 0, 7], b"client"), BOUNDS),
             ErrorKind::Unsupported,
         );
         let mut duplicate = EXPIRY.to_vec();
@@ -1285,7 +1379,10 @@ mod tests {
             decode(0xc0, &[], BOUNDS).unwrap(),
             Packet::Core(InboundPacket::Pingreq)
         );
-        assert_eq!(decode(0xe0, &[], BOUNDS).unwrap(), Packet::Disconnect);
+        assert_eq!(
+            decode(0xe0, &[], BOUNDS).unwrap(),
+            Packet::Disconnect { expiry: None }
+        );
         kind(decode(0xc0, &[0], BOUNDS), ErrorKind::Malformed);
         kind(decode(0x60, &[0, 7], BOUNDS), ErrorKind::Malformed);
     }
