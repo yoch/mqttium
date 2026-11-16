@@ -265,6 +265,28 @@ pub(super) fn work(
     }
     let read = conn.unchecked_transaction()?;
     let meta = read_meta(&read)?;
+    // Check the target's finite metadata domain before either the QoS or
+    // cursor selection can turn an invalid obligation into apparent absence.
+    // SQL inspects scalars only; no offending value or payload is copied.
+    let obligations: i64 = read.query_row(
+        "SELECT count(*) FROM (SELECT 1 FROM obligations WHERE target=?1 LIMIT ?2)",
+        params![
+            session.to_be_bytes().as_slice(),
+            i64::try_from(MAX_RECOVERY_INVENTORY_ROWS + 1).map_err(|_| Fault::Corrupt)?
+        ],
+        |row| row.get(0),
+    )?;
+    if usize::try_from(obligations).map_err(|_| Fault::Corrupt)? > MAX_RECOVERY_INVENTORY_ROWS {
+        return Err(Fault::Read(ReadError::LimitExceeded));
+    }
+    let invalid: bool = read.query_row(
+        "SELECT EXISTS(SELECT 1 FROM obligations WHERE target=?1 AND (typeof(qos)!='integer' OR qos NOT IN (0,1,2) OR typeof(cause)!='integer' OR cause!=1 OR typeof(phase)!='integer' OR phase!=1) LIMIT 1)",
+        [session.to_be_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    if invalid {
+        return Err(Fault::Corrupt);
+    }
     // A missing obligation must not turn an already claimed delivery into a
     // successful empty scan. Bound the target's claim set before checking it.
     let claims: i64 = read.query_row(
