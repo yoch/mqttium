@@ -22,11 +22,12 @@ import threading
 import time
 
 from external_mqttium import client_identity
-from pubsub_probe import decode_publish, durable
-from pubsub_reception import accounts_consistent, drained
+from pubsub_probe import PubsubWire, decode_publish, durable, puback_packet, session_key
+from pubsub_reception import accounts_consistent, assignment, drained, until
 from pubsub_reception import Client, publisher
 from receipt_reception import PahoPeer, storage_sample
-from tcp_probe import Frame, FrameDecoder, ReceiptFailure, packet, require, write_json
+from tcp_probe import (Frame, FrameDecoder, ReceiptFailure, operation_hex, packet,
+                       publish_packet, pubrel_packet, require, write_json)
 from tcp_reception import Broker, writer_available
 
 
@@ -498,12 +499,227 @@ def reverse_clients(binary: Path, case: Path):
         broker.cleanup()
 
 
+def latest_sequence(broker):
+    return max(int(event["seq"]) for event in broker.events())
+
+
+def queued_publication(broker, *, after=-1, delivery=None):
+    def find():
+        for event in broker.events():
+            if (int(event["seq"]) > after and event["kind"] == "frame_queued"
+                    and event.get("details", {}).get("packet_kind") == "PUBLISH"
+                    and (delivery is None or event["details"].get("delivery") == delivery)):
+                return event
+    return until(find, "outgoing_frame_fact_missing", ACTION_TIMEOUT)
+
+
+def known_finish(broker, delivery, *, after=-1):
+    def find():
+        for event in broker.events():
+            if (int(event["seq"]) > after and event["kind"] == "core_finish_observed"
+                    and event["details"]["delivery"] == delivery):
+                return event
+    return until(find, "known_finish_missing", ACTION_TIMEOUT)
+
+
+def require_live_assignment(broker, target, expected, case, code):
+    state = durable(broker.db)
+    write_json(case / f"{code}-state.json", state)
+    candidates = [row for row in state["tables"]["outbound"] if row["target"] == target]
+    require(candidates == [expected], code, "current outgoing assignment changed")
+    accounts_consistent(state)
+    return state
+
+
+def copied_ack(binary: Path, case: Path, *, no_target=False, takeover=False):
+    """Replay a real already-associated copy; the original is never withheld."""
+    broker = Broker(binary, case, test_control=True)
+    result = {"criterion": "D-none" if no_target else "D-takeover" if takeover else "D-copy",
+              "status": "PASS", "parameters": {"receipt_aging_commands": 128,
+                                                    "takeovers": 10 if takeover else 0}}
+    target = source = None
+    try:
+        result["ready"] = broker.ready()
+        target = PubsubWire(broker.address, broker.observations, "copy-target")
+        target.connect("pi-copy-target", session_present=False, receive_maximum=2, keep_alive=0)
+        target.subscribe(1, [("reception/pi-copy", 1)])
+        source = PubsubWire(broker.address, broker.observations, "copy-source")
+        source.connect("pi-copy-source", session_present=False, keep_alive=0)
+        (broker.control / "copy-next-puback-observation").touch(exist_ok=False)
+        if no_target:
+            target.send(puback_packet(1))
+            copied = broker.wait_event("puback_observation_copied")
+            require(copied["puback"]["target"] is None, "no_target_observation_not_reached")
+        else:
+            (broker.control / "hold-next-outgoing-written").touch(exist_ok=False)
+            source.publish(1, "reception/pi-copy", b"occurrence-A", qos=1)
+            first = target.next_publication()
+            first_fact = queued_publication(broker)
+            held = broker.wait_event("outgoing_written_held")
+            require(held["details"]["effect"] == first_fact["details"]["effect"],
+                    "wrong_written_callback_held")
+            target.acknowledge(first)
+            copied = broker.wait_event("puback_observation_copied")
+            require(copied["puback"]["target"] is not None
+                    and copied["puback"]["packet_id"] == first.packet_id,
+                    "associated_ack_copy_not_reached")
+            finished = known_finish(broker, first_fact["details"]["delivery"])
+            until(lambda: durable(broker.db)["counts"]["outbound"] == 0, "first_finish_not_durable")
+            # Age its authentic receipt out while its immutable saved facts
+            # remain in the bounded test hook. No result is held unknown.
+            for identifier in range(1, 129):
+                source.subscribe(identifier, [("reception/pi-aging", identifier % 2)])
+            aged = durable(broker.db)
+            old_claim = ''.join(int(value).to_bytes(8, 'big').hex()
+                                for value in first_fact["details"]["claim"].split('/'))
+            require(not any(row["id"] == old_claim for row in aged["tables"]["operations"]),
+                    "old_claim_receipt_not_collected")
+            result.update(first_publish=first.observation(), first_fact=first_fact,
+                          first_finish=finished, written_held=held, old_claim_receipt_collected=True)
+        result["copied"] = copied
+        if takeover:
+            for _ in range(10):
+                target.close()
+                target = PubsubWire(broker.address, broker.observations, "takeover-target")
+                target.connect("pi-copy-target", session_present=True, receive_maximum=2, keep_alive=0)
+        before = latest_sequence(broker)
+        source.publish(2, "reception/pi-copy", b"occurrence-B", qos=1)
+        second = target.next_publication()
+        second_fact = queued_publication(broker, after=before)
+        require(second.packet_id == 1 and not second.dup and second.payload == b"occurrence-B",
+                "finished_identifier_not_reused_as_new_claim")
+        if not no_target:
+            require(second_fact["details"]["claim"] != first_fact["details"]["claim"]
+                    and second_fact["details"]["delivery"] != first_fact["details"]["delivery"],
+                    "reused_identifier_kept_old_occurrence")
+        state = durable(broker.db)
+        session = session_key(state, "pi-copy-target")
+        expected = assignment(state, session)["row"]
+        (broker.control / "replay-copied-puback-observation").touch(exist_ok=False)
+        replayed = broker.wait_event("puback_observation_replayed", after=before)
+        require(replayed["puback"] == copied["puback"], "copied_observation_was_reassociated")
+        def replay_outcome():
+            for event in broker.events():
+                if int(event["seq"]) <= int(replayed["seq"]):
+                    continue
+                if (event["kind"] == "command_submitted" and event.get("command_kind") == "Finish"
+                        and event.get("details", {}).get("delivery") == second_fact["details"]["delivery"]):
+                    write_json(case / "rebound-finish.json", event)
+                    raise ReceiptFailure("observed_puback_rebound", "old copied observation submitted a Finish for B")
+                if event["kind"] == "puback_ignored":
+                    return event
+        result["replay_ignored"] = until(replay_outcome, "replayed_puback_not_processed", ACTION_TIMEOUT)
+        require_live_assignment(broker, session, expected, case, "observed_puback_rebound")
+        if not no_target and not takeover:
+            (broker.control / "release-outgoing-written").touch(exist_ok=False)
+            released = broker.wait_event("outgoing_written_released", after=int(replayed["seq"]))
+            require(released["details"]["effect"] == held["details"]["effect"], "wrong_written_released")
+            (broker.control / "replay-last-outgoing-frame-result").touch(exist_ok=False)
+            callback = broker.wait_event("outgoing_frame_result_replayed", after=int(released["seq"]))
+            require(callback["details"]["effect"] == held["details"]["effect"], "old_callback_not_reached")
+            (broker.control / "replay-last-finish-result").touch(exist_ok=False)
+            old_result = broker.wait_event("finish_result_replayed", after=int(callback["seq"]))
+            require(old_result["operation"] == finished["operation"], "old_finish_result_not_reached")
+            target.send(b"\xc0\x00")
+            target.wait(0xD0)
+            require_live_assignment(broker, session, expected, case, "old_callback_released_new_occupant")
+            result.update(written_released=released, old_callback=callback, old_finish_result=old_result)
+        target.acknowledge(second)
+        result["second_finish"] = known_finish(broker, second_fact["details"]["delivery"], after=before)
+        result["second_fact"] = second_fact
+        result["second_publish"] = second.observation()
+        drained(broker, case / "final")
+        target.close(); source.close()
+        result["stop_status"] = broker.stop()
+        writer_available(broker.db)
+        write_json(case / "observation.json", result)
+        return result
+    finally:
+        if target: target.close()
+        if source: source.close()
+        broker.cleanup()
+
+
+def crash_delivery(binary: Path, case: Path, mode: str):
+    point = {"claim": "claim.committed", "finish": "finish.committed"}.get(mode)
+    broker = Broker(binary, case, pauses=(point,) if point else ())
+    restarted = None
+    target = source = None
+    result = {"criterion": f"E-{mode}", "status": "PASS", "point": point}
+    try:
+        result["ready"] = broker.ready()
+        target = PubsubWire(broker.address, broker.observations, "crash-target")
+        target.connect("pi-crash-target", session_present=False, receive_maximum=1, keep_alive=0)
+        target.subscribe(1, [("reception/pi-crash", 1)])
+        source = PubsubWire(broker.address, broker.observations, "crash-source")
+        source.connect("pi-crash-source", session_present=False, keep_alive=0)
+        source.send(publish_packet("reception/pi-crash", b"crash-occurrence-A", 1, qos=2))
+        if mode == "claim":
+            result["hit"] = broker.wait_event("barrier_hit", point=point)
+            target.no_publication(.05, code="publish_before_claim_known")
+        else:
+            first = target.next_publication()
+            require(first.packet_id == 1 and not first.dup, "first_crash_exchange_invalid")
+            result["first_publish"] = first.observation()
+            if mode == "finish":
+                target.acknowledge(first)
+                result["hit"] = broker.wait_event("barrier_hit", point=point)
+        before = durable(broker.db)
+        session = session_key(before, "pi-crash-target")
+        if mode != "finish":
+            saved = assignment(before, session)
+            result["saved_assignment"] = saved
+        else:
+            require(before["counts"]["outbound"] == before["counts"]["obligations"] == 0,
+                    "finish_barrier_did_not_commit")
+        write_json(case / "before-crash.json", before)
+        inode = broker.db.stat().st_ino
+        result["kill_status"] = broker.stop(killed=True)
+        target.close(); source.close()
+        writer_available(broker.db)
+        restarted = Broker(binary, case / "restart", db=broker.db, label="restarted")
+        result["restart_ready"] = restarted.ready()
+        require(restarted.db.stat().st_ino == inode, "crash_replaced_database")
+        target = PubsubWire(restarted.address, restarted.observations, "recovered-target")
+        target.connect("pi-crash-target", session_present=True, receive_maximum=1, keep_alive=0)
+        if mode == "finish":
+            target.no_publication(.1, code="finished_delivery_resurrected")
+        else:
+            replay = target.next_publication()
+            after = durable(restarted.db)
+            require(assignment(after, session) == saved and replay.packet_id == 1 and replay.dup
+                    and replay.payload == b"crash-occurrence-A", "recovered_claim_or_identifier_changed")
+            target.acknowledge(replay)
+            result["retransmission"] = replay.observation()
+        source = PubsubWire(restarted.address, restarted.observations, "recovered-source")
+        source.connect("pi-crash-source", session_present=True, keep_alive=0)
+        source.publish(1, "reception/pi-crash", b"crash-occurrence-A", qos=2, dup=True)
+        until(lambda: durable(restarted.db)["counts"]["outbound"] == 0, "recovered_finish_missing")
+        source.publish(2, "reception/pi-crash", b"new-occurrence-B", qos=2)
+        newer = target.next_publication()
+        require(newer.packet_id == 1 and not newer.dup and newer.payload == b"new-occurrence-B",
+                "new_occurrence_not_fresh_after_restart")
+        target.acknowledge(newer)
+        drained(restarted, case / "final")
+        result["new_occurrence"] = newer.observation()
+        result["restart_stop_status"] = restarted.stop()
+        writer_available(broker.db)
+        write_json(case / "observation.json", result)
+        return result
+    finally:
+        if target: target.close()
+        if source: source.close()
+        broker.cleanup()
+        if restarted: restarted.cleanup()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--binary-source-head")
-    parser.add_argument("--case", choices=("B", "reverse", "smoke"), default="B")
+    parser.add_argument("--case", choices=("B", "reverse", "smoke", "D-copy", "D-none", "D-takeover",
+                                          "E-claim", "E-observed", "E-finish"), default="B")
     parser.add_argument("--count", type=int)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -516,7 +732,12 @@ def main():
                          "sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest()}, "cases": []}
     try:
         count = args.count if args.count is not None else 128 if args.case == "smoke" else TARGET_DELIVERIES
-        if args.case == "reverse":
+        if args.case.startswith("D-"):
+            case = copied_ack(args.binary.resolve(), args.out / args.case,
+                              no_target=args.case == "D-none", takeover=args.case == "D-takeover")
+        elif args.case.startswith("E-"):
+            case = crash_delivery(args.binary.resolve(), args.out / args.case, args.case[2:])
+        elif args.case == "reverse":
             case = reverse_clients(args.binary.resolve(), args.out / args.case)
         else:
             require((args.case == "B" and count >= TARGET_DELIVERIES)
