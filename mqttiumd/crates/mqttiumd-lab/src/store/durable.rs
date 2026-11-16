@@ -17,8 +17,9 @@ use mqttiumd_contract::capacity::{
     BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References, Resource,
 };
 use mqttiumd_contract::command::{
-    AdmitPublication, ChangeSubscriptions, ClaimDelivery, Command, EpochLedger, EpochPhase,
-    FinishDelivery, LedgerOpening, OpenEpoch, Recipe, RecipeError, ReleaseInbound,
+    AdmitPublication, ChangeSubscriptions, ClaimDelivery, Command, ConsumeDelivery, EpochLedger,
+    EpochPhase, FinishDelivery, LedgerOpening, OpenEpoch, Recipe, RecipeError, ReleaseInbound,
+    UpdateSubscriptions,
 };
 use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
 use mqttiumd_contract::ids::{
@@ -501,8 +502,17 @@ trait Staging {
     ) -> Guard<CommitFacts>;
     fn stage_release(&mut self, release: &ReleaseInbound) -> Guard<CommitFacts>;
     fn stage_subscriptions(&mut self, command: &ChangeSubscriptions) -> Guard<CommitFacts>;
+    fn stage_updates(&mut self, command: &UpdateSubscriptions) -> Guard<CommitFacts>;
+    fn stage_route_updates<'a>(
+        &mut self,
+        session: SessionId,
+        revision: Revision,
+        route_revision: Revision,
+        changes: impl Iterator<Item = (&'a SharedBytes, Option<Qos>)>,
+    ) -> Guard<CommitFacts>;
     fn stage_claim(&mut self, command: &ClaimDelivery) -> Guard<CommitFacts>;
     fn stage_finish(&mut self, command: &FinishDelivery) -> Guard<CommitFacts>;
+    fn stage_consume(&mut self, command: &ConsumeDelivery) -> Guard<CommitFacts>;
     fn discard_completed_publication(&mut self, publication: PublicationId);
     fn end_obligation(&mut self, delivery: DeliveryId) -> Result<(), AdminRefused>;
     fn stage_admin(&mut self, command: AdminCommand) -> Result<AdminDone, AdminRefused>;
@@ -724,40 +734,64 @@ impl Staging for DurableState {
     }
 
     fn stage_subscriptions(&mut self, command: &ChangeSubscriptions) -> Guard<CommitFacts> {
+        self.stage_route_updates(
+            command.session,
+            command.session_revision,
+            command.route_revision,
+            command
+                .changes
+                .as_slice()
+                .iter()
+                .map(|c| (&c.topic, c.subscribe.then_some(Qos::AtLeastOnce))),
+        )
+    }
+    fn stage_updates(&mut self, command: &UpdateSubscriptions) -> Guard<CommitFacts> {
+        self.stage_route_updates(
+            command.session,
+            command.session_revision,
+            command.route_revision,
+            command
+                .changes
+                .as_slice()
+                .iter()
+                .map(|c| (&c.topic, c.granted)),
+        )
+    }
+    fn stage_route_updates<'a>(
+        &mut self,
+        session: SessionId,
+        revision: Revision,
+        route_revision: Revision,
+        changes: impl Iterator<Item = (&'a SharedBytes, Option<Qos>)>,
+    ) -> Guard<CommitFacts> {
         let failed = RejectReason::PreconditionFailed;
-        self.active_session(command.session, command.session_revision)?;
-        if command.route_revision != self.route_revision {
+        self.active_session(session, revision)?;
+        if route_revision != self.route_revision {
             return Err(failed);
         }
-        for change in command.changes.as_slice() {
-            if change.topic.len() > self.limits.max_topic_bytes {
+        for (topic, granted) in changes {
+            if topic.len() > self.limits.max_topic_bytes {
                 return Err(failed);
             }
-            if change.subscribe {
-                let targets = self
-                    .routes
-                    .entry(change.topic.as_slice().to_vec())
-                    .or_default();
-                if let Some(target) = targets
-                    .iter_mut()
-                    .find(|target| target.session == command.session)
-                {
-                    target.qos = Qos::AtLeastOnce;
+            if let Some(qos) = granted {
+                if !matches!(qos, Qos::AtMostOnce | Qos::AtLeastOnce) {
+                    return Err(failed);
+                }
+                let targets = self.routes.entry(topic.as_slice().to_vec()).or_default();
+                if let Some(target) = targets.iter_mut().find(|target| target.session == session) {
+                    target.qos = qos;
                 } else {
                     if targets.len() >= self.limits.max_route_targets
                         || targets.len() >= self.limits.max_targets_per_admission
                     {
                         return Err(RejectReason::CapacityExceeded(Resource::References));
                     }
-                    targets.push(RouteTarget {
-                        session: command.session,
-                        qos: Qos::AtLeastOnce,
-                    });
+                    targets.push(RouteTarget { session, qos });
                 }
-            } else if let Some(targets) = self.routes.get_mut(change.topic.as_slice()) {
-                targets.retain(|target| target.session != command.session);
+            } else if let Some(targets) = self.routes.get_mut(topic.as_slice()) {
+                targets.retain(|target| target.session != session);
                 if targets.is_empty() {
-                    self.routes.remove(change.topic.as_slice());
+                    self.routes.remove(topic.as_slice());
                 }
             }
         }
@@ -772,7 +806,7 @@ impl Staging for DurableState {
         self.route_revision = self.route_revision.checked_next().map_err(|_| failed)?;
         self.charge(Accounts::RECEIPT)?;
         Ok(CommitFacts::SubscriptionsChanged {
-            session: command.session,
+            session,
             route_revision: self.route_revision,
         })
     }
@@ -833,6 +867,25 @@ impl Staging for DurableState {
             target: command.target,
             packet_id: command.packet_id,
             claim: command.claim,
+        })
+    }
+
+    fn stage_consume(&mut self, command: &ConsumeDelivery) -> Guard<CommitFacts> {
+        let failed = RejectReason::PreconditionFailed;
+        self.active_session(command.target, command.target_revision)?;
+        let record = self.obligations.get(&command.delivery).ok_or(failed)?;
+        if record.target != command.target
+            || record.target_revision != command.target_revision
+            || record.qos != Qos::AtMostOnce
+            || self.outbound.contains_key(&command.delivery)
+        {
+            return Err(failed);
+        }
+        self.end_obligation(command.delivery).map_err(|_| failed)?;
+        self.charge(Accounts::RECEIPT)?;
+        Ok(CommitFacts::DeliveryConsumed {
+            delivery: command.delivery,
+            target: command.target,
         })
     }
 
@@ -1212,9 +1265,8 @@ impl DurableStore for MemoryStore {
             Recipe::ChangeSubscriptions(command) => staged.stage_subscriptions(command),
             Recipe::ClaimDelivery(command) => staged.stage_claim(command),
             Recipe::FinishDelivery(command) => staged.stage_finish(command),
-            Recipe::ConsumeDelivery(_) | Recipe::UpdateSubscriptions(_) => {
-                Err(RejectReason::PreconditionFailed)
-            }
+            Recipe::ConsumeDelivery(command) => staged.stage_consume(command),
+            Recipe::UpdateSubscriptions(command) => staged.stage_updates(command),
         };
         match facts {
             Ok(facts) => {
@@ -1364,7 +1416,7 @@ impl DurableStore for MemoryStore {
         for (delivery, record) in &state.obligations {
             if after.is_some_and(|after| *delivery <= after)
                 || record.target != session
-                || record.qos != Qos::AtLeastOnce
+                || !matches!(record.qos, Qos::AtMostOnce | Qos::AtLeastOnce)
             {
                 continue;
             }

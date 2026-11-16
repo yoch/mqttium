@@ -510,7 +510,7 @@ impl DecisionColumns {
                 self.reason.ok_or(Corrupt)?,
                 self.resource,
             )?)),
-            4..=6 => Ok(Decision::Committed(pubsub::decode_facts(
+            4..=7 => Ok(Decision::Committed(pubsub::decode_facts(
                 self.decision,
                 self.facts.as_deref().ok_or(Corrupt)?,
             )?)),
@@ -2343,9 +2343,8 @@ impl DurableStore for SqliteStore {
                 Recipe::ChangeSubscriptions(command) => pubsub::subscriptions(conn, meta, command)?,
                 Recipe::ClaimDelivery(command) => pubsub::claim(conn, meta, command)?,
                 Recipe::FinishDelivery(command) => pubsub::finish(conn, meta, command)?,
-                Recipe::ConsumeDelivery(_) | Recipe::UpdateSubscriptions(_) => {
-                    return Err(Abort::Refused(RejectReason::PreconditionFailed));
-                }
+                Recipe::ConsumeDelivery(command) => pubsub::consume(conn, meta, command)?,
+                Recipe::UpdateSubscriptions(command) => pubsub::updates(conn, meta, command)?,
             };
             insert_operation(conn, operation, &canonical, Decision::Committed(facts))?;
             Ok(facts)

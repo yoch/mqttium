@@ -1,6 +1,8 @@
-//! Schema-2 subscription and outgoing delivery transactions and bounded reads.
+//! Schema-3 subscription and outgoing delivery transactions and bounded reads.
 use super::*;
-use mqttiumd_contract::command::{ChangeSubscriptions, ClaimDelivery, FinishDelivery};
+use mqttiumd_contract::command::{
+    ChangeSubscriptions, ClaimDelivery, ConsumeDelivery, FinishDelivery, UpdateSubscriptions,
+};
 use mqttiumd_contract::ids::OutboundPacketId;
 use mqttiumd_contract::pubsub::{DeliveryClaim, MAX_SUBSCRIPTIONS, WORK_PAGE_LIMIT, WorkItem};
 
@@ -9,26 +11,68 @@ pub(super) fn subscriptions(
     meta: &mut Meta,
     command: &ChangeSubscriptions,
 ) -> Guard<CommitFacts> {
+    route_updates(
+        conn,
+        meta,
+        command.session,
+        command.session_revision,
+        command.route_revision,
+        command
+            .changes
+            .as_slice()
+            .iter()
+            .map(|c| (&c.topic, c.subscribe.then_some(Qos::AtLeastOnce))),
+    )
+}
+pub(super) fn updates(
+    conn: &Connection,
+    meta: &mut Meta,
+    command: &UpdateSubscriptions,
+) -> Guard<CommitFacts> {
+    route_updates(
+        conn,
+        meta,
+        command.session,
+        command.session_revision,
+        command.route_revision,
+        command
+            .changes
+            .as_slice()
+            .iter()
+            .map(|c| (&c.topic, c.granted)),
+    )
+}
+fn route_updates<'a>(
+    conn: &Connection,
+    meta: &mut Meta,
+    session: SessionId,
+    session_revision: Revision,
+    route_revision: Revision,
+    changes: impl Iterator<Item = (&'a SharedBytes, Option<Qos>)>,
+) -> Guard<CommitFacts> {
     let failed = RejectReason::PreconditionFailed;
-    active_session(conn, command.session, command.session_revision)?;
-    if meta.route_revision != command.route_revision {
+    active_session(conn, session, session_revision)?;
+    if meta.route_revision != route_revision {
         return refused(failed);
     }
-    for change in command.changes.as_slice() {
-        if change.topic.len() > meta.limits.max_topic_bytes {
+    for (topic, granted) in changes {
+        if topic.len() > meta.limits.max_topic_bytes {
             return refused(failed);
         }
-        let topic = change.topic.as_slice();
-        let target = command.session.to_be_bytes();
-        if change.subscribe {
+        let topic = topic.as_slice();
+        let target = session.to_be_bytes();
+        if let Some(qos) = granted {
+            if !matches!(qos, Qos::AtMostOnce | Qos::AtLeastOnce) {
+                return refused(failed);
+            }
             let present: bool = conn
                 .prepare_cached("SELECT 1 FROM routes WHERE topic=?1 AND session=?2 LIMIT 1")?
                 .query_row(params![topic, target.as_slice()], |_| Ok(()))
                 .optional()?
                 .is_some();
             if present {
-                conn.prepare_cached("UPDATE routes SET qos=1 WHERE topic=?1 AND session=?2")?
-                    .execute(params![topic, target.as_slice()])?;
+                conn.prepare_cached("UPDATE routes SET qos=?3 WHERE topic=?1 AND session=?2")?
+                    .execute(params![topic, target.as_slice(), qos_code(qos)])?;
             } else {
                 let count: i64 = conn
                     .prepare_cached(
@@ -61,12 +105,13 @@ pub(super) fn subscriptions(
                     None => 0,
                 };
                 conn.prepare_cached(
-                    "INSERT INTO routes(topic,position,session,qos) VALUES(?1,?2,?3,1)",
+                    "INSERT INTO routes(topic,position,session,qos) VALUES(?1,?2,?3,?4)",
                 )?
                 .execute(params![
                     topic,
                     u64_blob(position).as_slice(),
-                    target.as_slice()
+                    target.as_slice(),
+                    qos_code(qos)
                 ])?;
             }
         } else {
@@ -89,7 +134,7 @@ pub(super) fn subscriptions(
         .map_err(|_| Abort::Refused(failed))?;
     charge(meta, Accounts::RECEIPT)?;
     Ok(CommitFacts::SubscriptionsChanged {
-        session: command.session,
+        session,
         route_revision: meta.route_revision,
     })
 }
@@ -175,11 +220,66 @@ pub(super) fn finish(
     })
 }
 
+pub(super) fn consume(
+    conn: &Connection,
+    meta: &mut Meta,
+    command: &ConsumeDelivery,
+) -> Guard<CommitFacts> {
+    let failed = RejectReason::PreconditionFailed;
+    active_session(conn, command.target, command.target_revision)?;
+    let publication = command.delivery.publication.to_be_bytes();
+    let index = i64::from(command.delivery.index);
+    let row = conn
+        .prepare_cached(
+            "SELECT target,target_revision,qos FROM obligations WHERE publication=?1 AND idx=?2",
+        )?
+        .query_row(params![publication.as_slice(), index], |row| {
+            Ok((
+                reader::copy_blob(row, 0, 8)?,
+                reader::copy_blob(row, 1, 8)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .optional()?;
+    let Some((target, revision, qos)) = row else {
+        return refused(failed);
+    };
+    if target != command.target.to_be_bytes()
+        || blob_u64(&revision)? != command.target_revision.get()
+        || qos != 0
+    {
+        return refused(failed);
+    }
+    if conn
+        .prepare_cached("SELECT 1 FROM outbound WHERE publication=?1 AND idx=?2 LIMIT 1")?
+        .query_row(params![publication.as_slice(), index], |_| Ok(()))
+        .optional()?
+        .is_some()
+    {
+        return refused(failed);
+    }
+    end_obligation(conn, meta, &publication, index).map_err(|error| match error {
+        Abort::Fault => Abort::Fault,
+        Abort::Refused(_) => Abort::Refused(failed),
+    })?;
+    charge(meta, Accounts::RECEIPT)?;
+    Ok(CommitFacts::DeliveryConsumed {
+        delivery: command.delivery,
+        target: command.target,
+    })
+}
+
 /// Decision4: session8 + routeRevision8. Decisions5/6: publication32 +
 /// index4 + target8 + packet2 + claim32. Every integer is big-endian.
 pub(super) fn facts_blob(facts: CommitFacts) -> Option<(i64, Vec<u8>)> {
     let mut bytes = Vec::new();
     let code = match facts {
+        CommitFacts::DeliveryConsumed { delivery, target } => {
+            bytes.extend_from_slice(&delivery.publication.to_be_bytes());
+            bytes.extend_from_slice(&delivery.index.to_be_bytes());
+            bytes.extend_from_slice(&target.to_be_bytes());
+            7
+        }
         CommitFacts::SubscriptionsChanged {
             session,
             route_revision,
@@ -217,6 +317,15 @@ pub(super) fn facts_blob(facts: CommitFacts) -> Option<(i64, Vec<u8>)> {
 }
 
 pub(super) fn decode_facts(code: i64, bytes: &[u8]) -> Result<CommitFacts, Corrupt> {
+    if code == 7 && bytes.len() == 44 {
+        return Ok(CommitFacts::DeliveryConsumed {
+            delivery: DeliveryId {
+                publication: PublicationId::from_be_slice(&bytes[..32]).map_err(|_| Corrupt)?,
+                index: u32::from_be_bytes(bytes[32..36].try_into().map_err(|_| Corrupt)?),
+            },
+            target: SessionId::from_be_slice(&bytes[36..44]).map_err(|_| Corrupt)?,
+        });
+    }
     if code == 4 && bytes.len() == 16 {
         return Ok(CommitFacts::SubscriptionsChanged {
             session: SessionId::from_be_slice(&bytes[..8]).map_err(|_| Corrupt)?,
@@ -307,7 +416,7 @@ pub(super) fn work(
     if broken {
         return Err(Fault::Corrupt);
     }
-    let sql = "SELECT o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN payloads y ON y.id=p.payload LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.target=?1 AND o.qos=1 AND (?2 IS NULL OR o.publication>?2 OR (o.publication=?2 AND o.idx>?3)) ORDER BY o.publication,o.idx LIMIT ?4";
+    let sql = "SELECT o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state,o.qos FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN payloads y ON y.id=p.payload LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.target=?1 AND o.qos IN (0,1) AND (?2 IS NULL OR o.publication>?2 OR (o.publication=?2 AND o.idx>?3)) ORDER BY o.publication,o.idx LIMIT ?4";
     let mut items = BoundedVec::with_capacity(limit).map_err(|_| ReadError::AllocationFailed)?;
     let mut meter = reader::Meter::new(budget);
     let mut more = false;
@@ -377,7 +486,7 @@ pub(super) fn work(
                     delivery,
                     target: session,
                     target_revision: revision,
-                    qos: Qos::AtLeastOnce,
+                    qos: code_qos(row.get(11)?)?,
                     topic: SharedBytes::copy_from(topic, meta.limits.max_topic_bytes)
                         .map_err(|_| ReadError::LimitExceeded)?,
                     payload: SharedBytes::copy_from(payload, meta.limits.max_payload_bytes)

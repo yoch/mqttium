@@ -225,8 +225,8 @@ pub struct PayloadRecord {
     pub references: u64,
 }
 
-/// Phase of an obligation. S0 excludes emission towards recipients, so
-/// an obligation stays pending until its destination is deleted.
+/// Durable phase of an obligation. A QoS 0 consumption or guarded QoS 1
+/// finish removes it atomically; local network progress alone never does.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ObligationPhase {
     Pending,
@@ -257,7 +257,9 @@ pub struct OutboundRecord {
     pub claim: OperationId,
 }
 
-/// One coherent live key page, ordered by DeliveryId. A new scan starts at None.
+/// One coherent live key page, ordered by DeliveryId, with the admitted QoS
+/// preserved independently of later subscription changes. A new scan starts
+/// at None. Current work paths select QoS 0/1; valid QoS 2 remains distinct.
 #[derive(PartialEq, Eq, Debug)]
 pub struct WorkPage {
     pub items: BoundedVec<WorkItem>,
