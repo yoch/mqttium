@@ -22,10 +22,11 @@ if [[ -z ${MQTTIUMD_PI_PIN_SOURCE:-} ]]; then
     }
     trap pi_pin_cleanup EXIT
     git -C "$pi_repo" worktree add --detach -- "$pi_pin_parent/source" "$pi_pin_sha" >"$pi_pin_parent/source-pin.log" 2>&1
+    pi_pin_source=$(git -C "$pi_pin_parent/source" rev-parse --show-toplevel)
     pi_pin_status=0
-    MQTTIUMD_PI_PIN_SOURCE="$pi_pin_parent/source" MQTTIUMD_PI_PIN_SHA="$pi_pin_sha" \
+    MQTTIUMD_PI_PIN_SOURCE="$pi_pin_source" MQTTIUMD_PI_PIN_SHA="$pi_pin_sha" \
         MQTTIUMD_PI_CALLER_SOURCE="$pi_repo" \
-        "$pi_pin_parent/source/mqttiumd/tools/run_pi_reception.sh" "$pi_out" || pi_pin_status=$?
+        "$pi_pin_source/mqttiumd/tools/run_pi_reception.sh" "$pi_out" || pi_pin_status=$?
     exit "$pi_pin_status"
 fi
 [[ "$pi_repo" == "$MQTTIUMD_PI_PIN_SOURCE" && $(git -C "$pi_repo" rev-parse HEAD) == "$MQTTIUMD_PI_PIN_SHA" ]] || {
@@ -83,6 +84,10 @@ cargo tree -p mqttiumd --no-default-features --locked --format '{p} features={f}
 pi_record normal-build cargo build -p mqttiumd --no-default-features --locked --target-dir "$pi_targets/normal"
 cargo build -p mqttiumd --no-default-features --locked --target-dir "$pi_targets/normal" >"$pi_out/normal-build.log" 2>&1
 cp -- "$pi_targets/normal/debug/mqttiumd" "$pi_out/binaries/mqttiumd-normal"
+cargo tree -p mqttiumd --no-default-features --features test-hooks --locked --format '{p} features={f}' >"$pi_out/hooks-features.txt"
+pi_record hooks-build cargo build -p mqttiumd --no-default-features --features test-hooks --locked --target-dir "$pi_targets/hooks"
+cargo build -p mqttiumd --no-default-features --features test-hooks --locked --target-dir "$pi_targets/hooks" >"$pi_out/hooks-build.log" 2>&1
+cp -- "$pi_targets/hooks/debug/mqttiumd" "$pi_out/binaries/mqttiumd-hooks"
 "$pi_python" - "$pi_out/normal-features.txt" <<'PY'
 from pathlib import Path
 import sys
@@ -95,8 +100,8 @@ if command -v strace >/dev/null 2>&1; then
     pi_trace=(strace -f -qq -s 256 -e trace=process,signal,network,flock -o)
 fi
 pi_run() {
-    local pi_name=$1 pi_case=$2
-    local pi_command=("$pi_python" "$pi_root/tests/system/pi_reception.py" --binary "$pi_out/binaries/mqttiumd-normal" --out "$pi_out/$pi_name" --binary-source-head "$pi_sha" --case "$pi_case")
+    local pi_name=$1 pi_case=$2 pi_binary=${3:-$pi_out/binaries/mqttiumd-normal}
+    local pi_command=("$pi_python" "$pi_root/tests/system/pi_reception.py" --binary "$pi_binary" --out "$pi_out/$pi_name" --binary-source-head "$pi_sha" --case "$pi_case")
     pi_record "$pi_name-reception" "${pi_command[@]}"
     if [[ ${#pi_trace[@]} != 0 ]]; then
         "${pi_trace[@]}" "$pi_out/$pi_name.strace" "${pi_command[@]}" >"$pi_out/$pi_name.log" 2>&1
@@ -104,20 +109,62 @@ pi_run() {
         "${pi_command[@]}" >"$pi_out/$pi_name.log" 2>&1
     fi
 }
+# Receive short fault/correlation cases before starting the one long normal
+# stream. A missing hook or wrong mutant reason cannot waste/qualify that run.
+for pi_case in C-claim C-finish D-copy D-none D-takeover E-claim E-observed E-finish E-reuse; do
+    pi_run "hooks-$pi_case" "$pi_case" "$pi_out/binaries/mqttiumd-hooks"
+done
+pi_record core-transition-mutants "$pi_python" "$pi_root/tools/run_pi_core_mutants.py" "$pi_out/core-mutants" --target-dir "$pi_targets/core-mutants"
+"$pi_python" "$pi_root/tools/run_pi_core_mutants.py" "$pi_out/core-mutants" --target-dir "$pi_targets/core-mutants" >"$pi_out/core-mutants.log" 2>&1
+pi_mutant_source="$pi_out/runtime-mutant-worktree"
+pi_mutant_cleanup() {
+    if [[ -n "$pi_mutant_source" ]]; then
+        git -C "$pi_repo" worktree remove --force -- "$pi_mutant_source" >/dev/null 2>&1 || true
+    fi
+}
+trap pi_mutant_cleanup EXIT
+git -C "$pi_repo" worktree add --detach -- "$pi_mutant_source" "$pi_sha" >"$pi_out/runtime-mutant-worktree.log" 2>&1
+"$pi_python" - "$pi_mutant_source/mqttiumd/crates/mqttiumd/src/runtime.rs" <<'PY'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]); old = 'const MUTANT_REBIND_OBSERVED_PUBACK: bool = false;'
+text = source.read_text()
+if text.count(old) != 1: raise SystemExit('exactly one runtime mutation site required')
+source.write_text(text.replace(old, 'const MUTANT_REBIND_OBSERVED_PUBACK: bool = true;'))
+PY
+git -C "$pi_mutant_source" diff --binary >"$pi_out/runtime-rebind.mutant"
+pi_record runtime-mutant-build cargo build --manifest-path "$pi_mutant_source/mqttiumd/Cargo.toml" -p mqttiumd --no-default-features --features test-hooks --locked --target-dir "$pi_targets/runtime-mutant"
+cargo build --manifest-path "$pi_mutant_source/mqttiumd/Cargo.toml" -p mqttiumd --no-default-features --features test-hooks --locked --target-dir "$pi_targets/runtime-mutant" >"$pi_out/runtime-mutant-build.log" 2>&1
+cp -- "$pi_targets/runtime-mutant/debug/mqttiumd" "$pi_out/binaries/mqttiumd-runtime-rebind"
+pi_mutant_status=0
+pi_run runtime-rebind D-copy "$pi_out/binaries/mqttiumd-runtime-rebind" || pi_mutant_status=$?
+"$pi_python" - "$pi_out/runtime-rebind/receipt.json" "$pi_mutant_status" <<'PY'
+from pathlib import Path
+import json, sys
+result = json.loads(Path(sys.argv[1]).read_text())
+if int(sys.argv[2]) != 1 or result['status'] != 'FAIL' or result.get('failure', {}).get('code') != 'observed_puback_rebound':
+    raise SystemExit(f"runtime mutation not detected for its exact reason: {result.get('failure')}")
+PY
+pi_mutant_cleanup
+pi_mutant_source=
 pi_run normal-long B
 pi_run normal-reverse reverse
 "$pi_python" - "$pi_out" "$pi_sha" "${#pi_trace[@]}" <<'PY'
 from pathlib import Path
 import hashlib, json, sys
-out = Path(sys.argv[1]); names = ('normal-long', 'normal-reverse')
+out = Path(sys.argv[1]); names = ('normal-long', 'normal-reverse', 'hooks-C-claim', 'hooks-C-finish',
+    'hooks-D-copy', 'hooks-D-none', 'hooks-D-takeover', 'hooks-E-claim', 'hooks-E-observed', 'hooks-E-finish', 'hooks-E-reuse', 'runtime-rebind')
 receipts = {name: json.loads((out / name / 'receipt.json').read_text()) for name in names}
 for name, result in receipts.items():
-    if result['status'] != 'PASS' or result['source_head'] != sys.argv[2]:
+    if result['status'] != ('FAIL' if name == 'runtime-rebind' else 'PASS') or result['source_head'] != sys.argv[2]:
         raise SystemExit('source or verdict does not match')
     binary = result['binary']
     if hashlib.sha256(Path(binary['path']).read_bytes()).hexdigest() != binary['sha256']:
         raise SystemExit('retained and executed binaries differ')
 long = receipts['normal-long']['cases'][0]; evidence = long['deliveries']
+core = json.loads((out / 'core-mutants/result.json').read_text())
+if not core['passed'] or core['source_revision'] != sys.argv[2] or len(core['mutants']) != 3:
+    raise SystemExit('three pure-transition mutants not received at the pinned source')
 if evidence['finished_deliveries'] < 65537 or not long['long_requirement_met']:
     raise SystemExit('actual numbered and durably finished delivery quota not reached')
 for ledger in (evidence['ledger'], evidence['wire']['ledger']):
@@ -125,7 +172,7 @@ for ledger in (evidence['ledger'], evidence['wire']['ledger']):
         raise SystemExit('streamed ledger identity differs')
 index = {'format': 'mqttiumd.pi-system-reception-index', 'schema_version': 1,
          'status': 'PASS', 'qualification': 'system-test-only', 'source_head': sys.argv[2],
-         'reception_scope': ['B-normal-long', 'B-normal-reverse'],
+         'reception_scope': ['B-normal-long', 'B-normal-reverse', 'C-real-uncertainty', 'D-runtime-association', 'E-real-crashes', 'F-protected-resource'],
          'source_archive': {'path': 'source.tar', 'sha256': hashlib.sha256((out / 'source.tar').read_bytes()).hexdigest()},
          'commands': 'commands.jsonl', 'system_witnesses': 'same-run-strace' if int(sys.argv[3]) else 'process-status-only',
          'source_pin': json.loads((out / 'source-pin.json').read_text()),
@@ -135,7 +182,12 @@ index = {'format': 'mqttiumd.pi-system-reception-index', 'schema_version': 1,
              'elapsed_ms': evidence['elapsed_ms'], 'publisher_connections': evidence['publisher_connections'],
              'subscriber_connections': evidence['subscriber_connections'], 'proxy_connections': evidence['wire']['connections']},
          'receipt_collection': long['receipt_collection'],
-         'receipts': {name: {'path': f'{name}/receipt.json', 'binary': result['binary'], 'status': result['status']}
+         'mutations': {'pure_transition': {'path': 'core-mutants/result.json', 'cases': [
+             {'flag': item['flag'], 'reason': item['expected_reason'], 'scope': 'pure Owner transition'} for item in core['mutants']]},
+             'runtime_queue': {'path': 'runtime-rebind/receipt.json', 'reason': 'observed_puback_rebound',
+                 'scope': 'actual associated PUBACK copy through runtime input queue'}},
+         'receipts': {name: {'path': f'{name}/receipt.json', 'binary': result['binary'], 'status': result['status'],
+                             'failure': result.get('failure')}
                       for name, result in receipts.items()},
          'limitations': ['Finite system evidence does not qualify all MQTT behavior or indefinite service.',
              'A Packet Identifier is a recyclable wire resource, not a causal identity.',
