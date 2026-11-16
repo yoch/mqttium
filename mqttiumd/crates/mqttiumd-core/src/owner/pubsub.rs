@@ -21,7 +21,6 @@ pub(super) struct Connection {
     generation: ConnectionGeneration,
     receive_maximum: u16,
     maximum_packet_size: u32,
-    next_packet: u32,
     after: Option<DeliveryId>,
     loading: Option<Read>,
     rescan_needed: bool,
@@ -192,7 +191,6 @@ pub(super) enum Change {
         claim: DeliveryClaim,
         in_flight: InFlight,
         connection: usize,
-        next_packet: u32,
     },
     Claimed {
         slot: usize,
@@ -228,6 +226,33 @@ pub(super) enum Change {
 }
 
 impl State {
+    /// Packet Identifiers are recyclable target-local resources. Every
+    /// retained claim reserves its number, including unknown submissions,
+    /// unconfirmed finishes and recovered metadata without loaded bytes.
+    /// Among N live claims, a free value is found in the first N+1 values
+    /// or the finite domain is genuinely full. No traffic-history scan.
+    fn free_packet_id(&self, session: SessionId, maximum: u16) -> Option<OutboundPacketId> {
+        let occupied = self
+            .deliveries
+            .as_slice()
+            .iter()
+            .filter(|delivery| delivery.target == session && delivery.claim.is_some())
+            .count();
+        let candidates = occupied.saturating_add(1).min(usize::from(maximum));
+        for raw in 1..=candidates {
+            let packet_id = u16::try_from(raw).ok().and_then(OutboundPacketId::new)?;
+            if !self.deliveries.as_slice().iter().any(|delivery| {
+                delivery.target == session
+                    && delivery
+                        .claim
+                        .is_some_and(|claim| claim.packet_id == packet_id)
+            }) {
+                return Some(packet_id);
+            }
+        }
+        None
+    }
+
     pub(super) fn work_bound(&self, input: &Input, routes: usize) -> u64 {
         let new = matches!(
             input,
@@ -743,7 +768,6 @@ impl Owner {
             generation: connection,
             receive_maximum: receive_maximum.min(8),
             maximum_packet_size,
-            next_packet: 1,
             after: None,
             loading: None,
             rescan_needed: false,
@@ -1121,16 +1145,7 @@ impl Owner {
             && d.phase == Phase::Queued
             && d.payload.is_some()
         {
-            let mut raw = settings.next_packet;
-            while raw <= u32::from(u16::MAX)
-                && self.pubsub.deliveries.as_slice().iter().any(|d| {
-                    d.target == session
-                        && d.claim.is_some_and(|c| u32::from(c.packet_id.get()) == raw)
-                })
-            {
-                raw += 1;
-            }
-            let Some(packet_id) = u16::try_from(raw).ok().and_then(OutboundPacketId::new) else {
+            let Some(packet_id) = self.pubsub.free_packet_id(session, u16::MAX) else {
                 draft.close(generation, CloseReason::CapacityExceeded)?;
                 return Ok(super::Change::Nothing);
             };
@@ -1152,7 +1167,6 @@ impl Owner {
                 claim,
                 in_flight,
                 connection,
-                next_packet: raw + 1,
             }));
         }
         if room && settings.loading.is_none() {
@@ -1851,7 +1865,6 @@ impl Owner {
                 claim,
                 in_flight,
                 connection,
-                next_packet,
             } => {
                 let generation = self
                     .pubsub
@@ -1860,7 +1873,6 @@ impl Owner {
                     .get(connection)
                     .ok_or(stale)?
                     .generation;
-                self.pubsub.connections.as_mut_slice()[connection].next_packet = next_packet;
                 let d = self
                     .pubsub
                     .deliveries
@@ -2003,91 +2015,223 @@ impl Owner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
+    use crate::contract::command::StartupNonce;
     use crate::contract::effects::{EffectSink, SubmitResult};
     use crate::contract::outcome::{EpochOpened, EpochOpening, OpeningOutcome, OpeningReply};
-    use crate::contract::command::StartupNonce;
+    use alloc::vec::Vec;
 
     const TARGET: SessionId = SessionId::new(1);
     const CONNECTION: ConnectionGeneration = ConnectionGeneration::new(10);
-    const TURN: TurnGrant = TurnGrant { work_limit: WorkUnits::new(100_000) };
+    const TURN: TurnGrant = TurnGrant {
+        work_limit: WorkUnits::new(100_000),
+    };
 
     struct Taking(Vec<OwnedEffect>);
     impl EffectSink for Taking {
-        fn try_submit(&mut self,effect:OwnedEffect)->SubmitResult {
-            self.0.push(effect); SubmitResult::Accepted
+        fn try_submit(&mut self, effect: OwnedEffect) -> SubmitResult {
+            self.0.push(effect);
+            SubmitResult::Accepted
         }
     }
 
-    fn bytes(value:&[u8])->SharedBytes {SharedBytes::copy_from(value,128).unwrap()}
-    fn nonzero(value:u32)->NonZeroU32 {NonZeroU32::new(value).unwrap()}
-    fn drain(owner:&mut Owner)->Vec<(EffectId,Effect)> {
-        let mut sink=Taking(Vec::new());
-        let _=owner.dispatch(&mut sink);
+    fn bytes(value: &[u8]) -> SharedBytes {
+        SharedBytes::copy_from(value, 128).unwrap()
+    }
+    fn nonzero(value: u32) -> NonZeroU32 {
+        NonZeroU32::new(value).unwrap()
+    }
+    fn drain(owner: &mut Owner) -> Vec<(EffectId, Effect)> {
+        let mut sink = Taking(Vec::new());
+        let _ = owner.dispatch(&mut sink);
         sink.0.into_iter().map(OwnedEffect::into_parts).collect()
     }
-    fn apply(owner:&mut Owner,input:Input)->Vec<(EffectId,Effect)> {
-        let result=owner.step(input,TURN);
-        assert!(matches!(result,StepOutcome::Applied {..}),"{result:?}");
+    fn apply(owner: &mut Owner, input: Input) -> Vec<(EffectId, Effect)> {
+        let result = owner.step(input, TURN);
+        assert!(matches!(result, StepOutcome::Applied { .. }), "{result:?}");
         drain(owner)
     }
-    fn world()->Owner {
-        let incarnation=StoreIncarnation::new(1);
-        let epoch=RunEpoch::new(2);
-        let mut opening=EpochOpening::new(incarnation,StartupNonce::new([7;16]));
-        let command=opening.submit(RunEpoch::new(1)).unwrap();
-        let _=opening.observe(OpeningReply {command,outcome:OpeningOutcome::Committed(EpochOpened {incarnation,epoch})}).unwrap();
-        let mut authority=OwnerAuthority::from_grant(opening.hand_over().unwrap(),nonzero(1)).unwrap();
-        let outbox=authority.create_outbox(LogicalOwnerId::new(4),NonZeroUsize::new(32).unwrap(),nonzero(8)).unwrap();
-        let config=OwnerConfig {max_sessions:nonzero(2),max_routes:nonzero(2),max_exchanges:nonzero(8),
-            account:AccountId::new(1),payload_bytes:PayloadBytes::new(1024),resolution_delay:LogicalDuration::new(1),
-            retained_operations:nonzero(16),remembered_connections:nonzero(4)};
-        let mut owner=Owner::new(config,outbox).unwrap();
-        let facts=[RecoveredFact::Epoch {incarnation,epoch},
-            RecoveredFact::Limits {max_targets_per_admission:2,max_topic_bytes:128,max_payload_bytes:PayloadBytes::new(128)},
-            RecoveredFact::RouteTable {revision:Revision::new(0)},
-            RecoveredFact::Session {session:TARGET,client_id:bytes(b"subscriber"),revision:Revision::new(1)},
-            RecoveredFact::Session {session:SessionId::new(2),client_id:bytes(b"other"),revision:Revision::new(1)}];
-        assert!(apply(&mut owner,Input::Recovery {facts:BoundedVec::from_slice(&facts,facts.len()).unwrap(),last:true}).is_empty());
-        let _=apply(&mut owner,Input::Packet {connection:CONNECTION,ingress_order:0,
-            packet:InboundPacket::ConnectResume {client_id:bytes(b"subscriber")}});
-        assert!(apply(&mut owner,Input::ConnectionSettings {connection:CONNECTION,receive_maximum:8,maximum_packet_size:65536}).is_empty());
+    fn world() -> Owner {
+        let incarnation = StoreIncarnation::new(1);
+        let epoch = RunEpoch::new(2);
+        let mut opening = EpochOpening::new(incarnation, StartupNonce::new([7; 16]));
+        let command = opening.submit(RunEpoch::new(1)).unwrap();
+        let _ = opening
+            .observe(OpeningReply {
+                command,
+                outcome: OpeningOutcome::Committed(EpochOpened { incarnation, epoch }),
+            })
+            .unwrap();
+        let mut authority =
+            OwnerAuthority::from_grant(opening.hand_over().unwrap(), nonzero(1)).unwrap();
+        let outbox = authority
+            .create_outbox(
+                LogicalOwnerId::new(4),
+                NonZeroUsize::new(32).unwrap(),
+                nonzero(8),
+            )
+            .unwrap();
+        let config = OwnerConfig {
+            max_sessions: nonzero(2),
+            max_routes: nonzero(2),
+            max_exchanges: nonzero(8),
+            account: AccountId::new(1),
+            payload_bytes: PayloadBytes::new(1024),
+            resolution_delay: LogicalDuration::new(1),
+            retained_operations: nonzero(16),
+            remembered_connections: nonzero(4),
+        };
+        let mut owner = Owner::new(config, outbox).unwrap();
+        let facts = [
+            RecoveredFact::Epoch { incarnation, epoch },
+            RecoveredFact::Limits {
+                max_targets_per_admission: 2,
+                max_topic_bytes: 128,
+                max_payload_bytes: PayloadBytes::new(128),
+            },
+            RecoveredFact::RouteTable {
+                revision: Revision::new(0),
+            },
+            RecoveredFact::Session {
+                session: TARGET,
+                client_id: bytes(b"subscriber"),
+                revision: Revision::new(1),
+            },
+            RecoveredFact::Session {
+                session: SessionId::new(2),
+                client_id: bytes(b"other"),
+                revision: Revision::new(1),
+            },
+        ];
+        assert!(
+            apply(
+                &mut owner,
+                Input::Recovery {
+                    facts: BoundedVec::from_slice(&facts, facts.len()).unwrap(),
+                    last: true
+                }
+            )
+            .is_empty()
+        );
+        let _ = apply(
+            &mut owner,
+            Input::Packet {
+                connection: CONNECTION,
+                ingress_order: 0,
+                packet: InboundPacket::ConnectResume {
+                    client_id: bytes(b"subscriber"),
+                },
+            },
+        );
+        assert!(
+            apply(
+                &mut owner,
+                Input::ConnectionSettings {
+                    connection: CONNECTION,
+                    receive_maximum: 8,
+                    maximum_packet_size: 65536
+                }
+            )
+            .is_empty()
+        );
         owner
     }
-    fn delivery(index:u32)->DeliveryId {
-        DeliveryId {publication:PublicationId::new(StoreIncarnation::new(1),RunEpoch::new(1),LogicalOwnerId::new(4),PublicationSeq::new(1)),index}
+    fn delivery(index: u32) -> DeliveryId {
+        DeliveryId {
+            publication: PublicationId::new(
+                StoreIncarnation::new(1),
+                RunEpoch::new(1),
+                LogicalOwnerId::new(4),
+                PublicationSeq::new(1),
+            ),
+            index,
+        }
     }
-    fn queued(owner:&mut Owner,index:u32) {
-        let mut item=Delivery::metadata(delivery(index),TARGET,Revision::new(1),Qos::AtLeastOnce,None);
-        item.topic=Some(bytes(b"topic"));item.payload=Some(bytes(b"payload"));
+    fn queued(owner: &mut Owner, index: u32) {
+        let mut item = Delivery::metadata(
+            delivery(index),
+            TARGET,
+            Revision::new(1),
+            Qos::AtLeastOnce,
+            None,
+        );
+        item.topic = Some(bytes(b"topic"));
+        item.payload = Some(bytes(b"payload"));
         owner.pubsub.deliveries.try_push(item).unwrap();
     }
-    fn known(owner:&mut Owner,effect:EffectId,command:&Command)->Vec<(EffectId,Effect)> {
-        let facts=match command.recipe.get() {
-            Recipe::ClaimDelivery(c)=>CommitFacts::DeliveryClaimed {delivery:c.delivery,target:c.target,packet_id:c.packet_id,claim:c.operation},
-            Recipe::FinishDelivery(c)=>CommitFacts::DeliveryFinished {delivery:c.delivery,target:c.target,packet_id:c.packet_id,claim:c.claim},
-            _=>panic!("delivery command"),
+    fn known(owner: &mut Owner, effect: EffectId, command: &Command) -> Vec<(EffectId, Effect)> {
+        let facts = match command.recipe.get() {
+            Recipe::ClaimDelivery(c) => CommitFacts::DeliveryClaimed {
+                delivery: c.delivery,
+                target: c.target,
+                packet_id: c.packet_id,
+                claim: c.operation,
+            },
+            Recipe::FinishDelivery(c) => CommitFacts::DeliveryFinished {
+                delivery: c.delivery,
+                target: c.target,
+                packet_id: c.packet_id,
+                claim: c.claim,
+            },
+            _ => panic!("delivery command"),
         };
-        apply(owner,Input::StoreResult {effect,operation:command.recipe.operation(),reply:StoreReply::Outcome(StoreOutcome::Committed(facts))})
+        apply(
+            owner,
+            Input::StoreResult {
+                effect,
+                operation: command.recipe.operation(),
+                reply: StoreReply::Outcome(StoreOutcome::Committed(facts)),
+            },
+        )
     }
 
     #[test]
     fn an_applied_finish_reuses_a_free_identifier_after_the_historical_ceiling() {
-        let mut owner=world();
-        owner.pubsub.connections.as_mut_slice()[0].next_packet=u32::from(u16::MAX);
-        queued(&mut owner,0);
-        let claim=apply(&mut owner,Input::WorkAvailable {session:TARGET});
-        let Effect::Persist {command}=&claim[0].1 else {panic!("initial claim")};
-        let packet_id=match command.recipe.get() {Recipe::ClaimDelivery(c)=>c.packet_id,_=>panic!("claim")};
-        let emitted=known(&mut owner,claim[0].0,command);
-        assert!(matches!(emitted[0].1,Effect::EmitPublish {..}));
-        let finish=apply(&mut owner,Input::Packet {connection:CONNECTION,ingress_order:1,
-            packet:InboundPacket::Puback {packet_id,reason:0}});
-        let Effect::Persist {command}=&finish[0].1 else {panic!("finish")};
-        assert!(known(&mut owner,finish[0].0,command).is_empty());
-        queued(&mut owner,1);
-        let next=apply(&mut owner,Input::WorkAvailable {session:TARGET});
-        assert!(matches!(next.first(),Some((_,Effect::Persist {command})) if matches!(command.recipe.get(),Recipe::ClaimDelivery(_))),
-            "outgoing_pi_historical_exhaustion: a free identifier must permit the next delivery on the same connection: {next:?}");
+        let mut owner = world();
+        // The committed red fixture positioned the old cursor at 65535.
+        // There is now no historical allocation cursor to position; both
+        // completed cycles below still require a new claim on this socket.
+        queued(&mut owner, 0);
+        let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command } = &claim[0].1 else {
+            panic!("initial claim")
+        };
+        let packet_id = match command.recipe.get() {
+            Recipe::ClaimDelivery(c) => c.packet_id,
+            _ => panic!("claim"),
+        };
+        let emitted = known(&mut owner, claim[0].0, command);
+        assert!(matches!(emitted[0].1, Effect::EmitPublish { .. }));
+        let finish = apply(
+            &mut owner,
+            Input::Packet {
+                connection: CONNECTION,
+                ingress_order: 1,
+                packet: InboundPacket::Puback {
+                    packet_id,
+                    reason: 0,
+                },
+            },
+        );
+        let Effect::Persist { command } = &finish[0].1 else {
+            panic!("finish")
+        };
+        assert!(known(&mut owner, finish[0].0, command).is_empty());
+        queued(&mut owner, 1);
+        let next = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        assert!(
+            matches!(next.first(),Some((_,Effect::Persist {command})) if matches!(command.recipe.get(),Recipe::ClaimDelivery(_))),
+            "outgoing_pi_historical_exhaustion: a free identifier must permit the next delivery on the same connection: {next:?}"
+        );
+        let Effect::Persist { command } = &next[0].1 else {
+            panic!("new claim")
+        };
+        let Recipe::ClaimDelivery(claim) = command.recipe.get() else {
+            panic!("claim")
+        };
+        assert_eq!(
+            claim.packet_id.get(),
+            1,
+            "the allocator prefers the smallest free number"
+        );
     }
 }
