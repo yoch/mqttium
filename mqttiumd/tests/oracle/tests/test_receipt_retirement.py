@@ -111,3 +111,21 @@ class HistoricalRecipe(unittest.TestCase):
         run = self.run_of()
         self.assertNotIn(tuple(int(corpus.OP_ADMIT[name]) for name in (
             "incarnation", "epoch", "owner", "sequence")), judge._closures(run))
+
+
+class ReturnedClosureObservation(unittest.TestCase):
+    def test_returned_absolute_guard_components_are_checked_as_u64(self):
+        contracts = Contracts.open(ROOT)
+        event = json.loads((ROOT / "contracts/examples/v1/valid/product-receipt-collection.json").read_text())
+        event["details"].update(returned_incarnation="1", returned_epoch="1", returned_owner="0",
+                                returned_through="64", returned_publication_through="32",
+                                returned_payload_through="32")
+        self.assertEqual(contracts.check_bytes(json.dumps(event).encode()), [])
+        for member in ("incarnation", "epoch", "owner", "through", "publication_through", "payload_through"):
+            with self.subTest(member=member):
+                invalid = copy.deepcopy(event)
+                invalid["details"]["returned_" + member] = "18446744073709551616"
+                diagnostics = contracts.check_bytes(json.dumps(invalid).encode())
+                self.assertEqual([(d.code, d.pointer) for d in diagnostics], [
+                    ("u64-out-of-range", "/details/returned_" + member),
+                ])
