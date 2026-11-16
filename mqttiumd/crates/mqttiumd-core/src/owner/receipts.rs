@@ -373,17 +373,8 @@ impl Owner {
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
+mod test_support {
     use super::*;
-    #[derive(PartialEq, Eq, Debug)]
-    pub(crate) struct Snapshot {
-        enabled: bool,
-        registered: bool,
-        acknowledged: ReceiptClosure,
-        entries: alloc::vec::Vec<Entry>,
-        pending: Option<Flight>,
-        sweep: bool,
-    }
     impl State {
         pub(crate) fn test_fill_consumed_window(&mut self) {
             let first = self.entries.as_slice()[0].boundary;
@@ -405,8 +396,8 @@ pub(crate) mod test_support {
             self.sweep = true;
         }
 
-        pub(crate) fn snapshot(&self) -> Snapshot {
-            Snapshot {
+        pub(crate) fn snapshot(&self) -> super::super::tests::ReceiptSnapshot {
+            super::super::tests::ReceiptSnapshot {
                 enabled: self.enabled,
                 registered: self.registered,
                 acknowledged: self.acknowledged,

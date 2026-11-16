@@ -2679,6 +2679,16 @@ mod tests {
 
     /// Everything a refusal must leave unchanged: the state, the identity
     /// counters, the account and its leases, and the content of the box.
+    #[derive(PartialEq, Eq, Debug)]
+    pub(super) struct ReceiptSnapshot {
+        pub(super) enabled: bool,
+        pub(super) registered: bool,
+        pub(super) acknowledged: crate::contract::receipts::ReceiptClosure,
+        pub(super) entries: Vec<receipts::Entry>,
+        pub(super) pending: Option<receipts::Flight>,
+        pub(super) sweep: bool,
+    }
+
     #[derive(PartialEq, Debug)]
     struct Snapshot {
         revision: Revision,
@@ -2696,7 +2706,7 @@ mod tests {
         continuation: (Option<crate::contract::ids::ContinuationId>, bool),
         subscription: Option<ControlSnapshot>,
         leases: (Credits, Vec<crate::leases::LeaseSlotView>),
-        receipts: receipts::test_support::Snapshot,
+        receipts: ReceiptSnapshot,
         release_continuation: (Option<ContinuationId>, bool),
         finished: Vec<Finished>,
         closed: Vec<ConnectionGeneration>,
