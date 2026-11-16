@@ -67,6 +67,16 @@ target (delivery, claim operation, frame effect), or explicit None. Exact
 occurrence/generation guards prevent a copy or delayed callback affecting a
 new occupant. A no-target observation never gains a target retroactively.
 
+A targeted integration review also found and reproduced a takeover race. If
+an older Persist blocks FIFO Outbox dispatch, the owner's new session binding
+can apply before the old socket's Close effect. The former adapter tried to
+derive its PUBACK connection key from the current owner binding and stopped
+the entire reactor (puback_connection_unbound). Red b6f5120f/4eef57d1 preserves
+that real queued/wire schedule. Fix f100d8ae retains each peer's original,
+writer-confirmed SessionId with its non-reused generation; the old observation
+stays targetless/stale while the replacement connection and PING progress.
+This is distinct from releasing the old delivery's resource number.
+
 The earlier reader queue/socket still contains unassociated bytes. Two
 indistinguishable arbitrary wire ACKs first observed after reuse cannot be
 assigned an invented historical claim. The scope is protection of facts

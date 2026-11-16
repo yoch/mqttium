@@ -31,3 +31,8 @@
   PR/indexes record exact final SHA, artifacts, hashes and CI; never relabel
   diagnostic runs. Expected remote remains66d2 until protected publication.
   No main merge, implicit migration/session eviction or ADR acceptance.
+- Targeted takeover review reproduced global puback_connection_unbound when
+  an older Persist blocks the old peer's Close after Owner rebind. Red
+  b6f5120f/4eef57d1 and fixf100d8ae preserve a durable-confirmed peer SessionId;
+  stale facts retain their old generation. Actual Some-copy/early-ACK/Written
+  and old-Finish replay test4452186d passes. Root integrated through056a2d8f.
