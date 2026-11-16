@@ -119,6 +119,15 @@ impl ReadBudget {
         max_field_bytes: 1024 * 1024,
     };
 
+    /// A closure can validate 128 canonical subscription recipes, each with
+    /// eight legal 1024-byte filters. Their aggregate exceeds a work page.
+    /// Keep a separate finite budget rather than widening every page reader.
+    pub const COLLECTION: Self = Self {
+        max_rows: mqttiumd_contract::receipts::MAX_COLLECTION_ROWS as usize,
+        max_bytes: 2 * 1024 * 1024,
+        max_field_bytes: 1024 * 1024,
+    };
+
     pub fn check_field(self, bytes: usize) -> Result<(), ReadError> {
         if bytes > self.max_field_bytes || bytes > self.max_bytes {
             Err(ReadError::LimitExceeded)
