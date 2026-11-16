@@ -412,6 +412,9 @@ enum Change {
     Nothing,
     /// The facts of the recovery page in the input join the state.
     Recover,
+    /// The exclusive writer confirmed this durable session after the
+    /// recovery inventory closed. Its table place was checked by the plan.
+    Establish { session: Session },
     /// The connection becomes the current one of the session.
     Bind {
         session: usize,
@@ -967,8 +970,23 @@ impl Owner {
             };
         }
         match input {
-            // Product lifecycle inputs are implemented by the TCP core lot.
-            Input::SessionEstablished { .. } | Input::ConnectionClosed { .. } => Err(IMPOSSIBLE),
+            Input::SessionEstablished {
+                connection,
+                session,
+                client_id,
+                revision,
+                session_present,
+            } => self.plan_established(
+                *connection,
+                *session,
+                client_id,
+                *revision,
+                *session_present,
+                draft,
+            ),
+            Input::ConnectionClosed { connection } => {
+                self.plan_connection_closed(*connection, draft)
+            }
             Input::Recovery { .. } | Input::Continue { .. } => Err(IMPOSSIBLE),
             // A wake-up carries no authority, and this perimeter keeps no
             // work behind one.
@@ -1002,6 +1020,112 @@ impl Owner {
             .as_slice()
             .iter()
             .position(|slot| slot.session == session && slot.packet_id == packet_id)
+    }
+
+    /// Installs only an exclusive writer's confirmed fact. The adapter
+    /// correlates it with its session request before producing this input;
+    /// no network request alone establishes a durable session.
+    fn plan_established(
+        &self,
+        connection: Option<ConnectionGeneration>,
+        session: SessionId,
+        client_id: &SharedBytes,
+        revision: Revision,
+        session_present: bool,
+        draft: &mut Draft,
+    ) -> Result<Change, Stop> {
+        let known = self
+            .sessions
+            .as_slice()
+            .iter()
+            .position(|held| held.id == session || held.client_id == *client_id);
+        if let Some(index) = known {
+            let held = &self.sessions.as_slice()[index];
+            if held.id != session || held.client_id != *client_id || held.revision != revision {
+                return Err(IMPOSSIBLE);
+            }
+        }
+        if let Some(connection) = connection
+            && self
+                .session_of(connection)
+                .is_some_and(|index| Some(index) != known)
+        {
+            // One transport generation cannot denote two sessions.
+            return Err(IMPOSSIBLE);
+        }
+        let connection =
+            connection.filter(|connection| !self.closed.iter().any(|closed| closed == connection));
+        if let Some(index) = known {
+            let held = &self.sessions.as_slice()[index];
+            let Some(connection) = connection else {
+                // A completed creation on a closed transport still joins
+                // durable knowledge, but never unbinds a newer connection.
+                return Ok(Change::Nothing);
+            };
+            if held.connection == Some(connection) {
+                // Replaying the same confirmation cannot emit a second
+                // CONNACK, including the result of a fresh creation.
+                return Ok(Change::Nothing);
+            }
+            if !session_present {
+                return Err(IMPOSSIBLE);
+            }
+            if let Some(previous) = held.connection {
+                draft.close(previous, CloseReason::SessionTakenOver)?;
+            }
+            draft.frame(
+                ConnectionKey {
+                    session,
+                    generation: connection,
+                },
+                OutboundFrame::Connack {
+                    session_present: true,
+                },
+            )?;
+            return Ok(Change::Bind {
+                session: index,
+                connection,
+            });
+        }
+        // Product startup must keep the writer's session bound coherent
+        // with this table. Sessions do not leave it in this perimeter, so
+        // no resource-release event can make an excess fact admissible.
+        if self.sessions.len() == self.sessions.capacity() {
+            return Err(IMPOSSIBLE);
+        }
+        if let Some(generation) = connection {
+            draft.frame(
+                ConnectionKey {
+                    session,
+                    generation,
+                },
+                OutboundFrame::Connack { session_present },
+            )?;
+        }
+        Ok(Change::Establish {
+            session: Session {
+                id: session,
+                client_id: client_id.clone(),
+                revision,
+                connection,
+            },
+        })
+    }
+
+    /// The transport already closed: remember it without requesting a
+    /// second close or discarding an operation the store may still commit.
+    fn plan_connection_closed(
+        &self,
+        connection: ConnectionGeneration,
+        draft: &mut Draft,
+    ) -> Result<Change, Stop> {
+        if self.closed.iter().any(|closed| *closed == connection) {
+            return Ok(Change::Nothing);
+        }
+        draft.end(connection)?;
+        Ok(self
+            .session_of(connection)
+            .map_or(Change::Nothing, |session| Change::Unbind { session }))
     }
 
     /// Closes the connection of a packet the subset does not accept. The
@@ -1043,7 +1167,8 @@ impl Owner {
                 .iter()
                 .position(|session| session.client_id == *client_id);
             let Some(index) = known else {
-                // The subset resumes the sessions of the fixture only.
+                // New durable sessions enter through SessionEstablished;
+                // this packet alone can resume only a session already held.
                 return protocol_error(draft);
             };
             let session = &self.sessions.as_slice()[index];
@@ -1075,7 +1200,11 @@ impl Owner {
             generation: connection,
         };
         match packet {
-            InboundPacket::ConnectResume { .. } | InboundPacket::Pingreq => Err(IMPOSSIBLE),
+            InboundPacket::ConnectResume { .. } => Err(IMPOSSIBLE),
+            InboundPacket::Pingreq => {
+                draft.frame(key, OutboundFrame::Pingresp)?;
+                Ok(Change::Nothing)
+            }
             InboundPacket::Publish {
                 topic,
                 qos,
@@ -1777,6 +1906,9 @@ impl Owner {
                 if last {
                     self.recovery = None;
                 }
+            }
+            Change::Establish { session } => {
+                self.sessions.try_push(session).map_err(|_| STALE)?;
             }
             Change::Bind {
                 session,
