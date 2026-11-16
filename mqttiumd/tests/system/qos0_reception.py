@@ -505,10 +505,11 @@ def replacements(binary: Path, case: Path) -> dict:
             old_rows = obligations(before, target)
             require(len(old_rows) == 1 and old_rows[0]["qos"] == old, "old_subscription_work_missing")
             hold = broker.control / "hold-work-pages"
+            mark = sequence(broker)
             hold.touch(exist_ok=False)
             with PubsubWire(broker.address, broker.observations, f"{name}-resumed") as subscriber:
                 subscriber.connect(name, session_present=True)
-                broker.wait_event("work_page_held")
+                broker.wait_event("work_page_held", after=mark)
                 subscriber.subscribe(2, [(topic, new)], expected=(new,))
                 changed = durable(broker.db)
                 require(obligations(changed, target) == old_rows, "subscription_retroactively_changed_delivery_qos")
@@ -531,6 +532,108 @@ def replacements(binary: Path, case: Path) -> dict:
         broker.stop()
         return {"criterion": "G", "status": "PASS", "replacements": outcomes,
                 "admitted_delivery_qos_immutable": True}
+    finally:
+        broker.cleanup()
+
+
+def subscription_recovery(binary: Path, case: Path) -> dict:
+    broker = Broker(binary, case)
+    processes = [broker]
+    topic = "reception/qos0/grant-recovery"
+    try:
+        broker.ready()
+        with PubsubWire(broker.address, broker.observations, "grant-created") as subscriber:
+            subscriber.connect("grant-recovery", session_present=False)
+            subscriber.subscribe(1, [(topic, 0)], expected=(0,))
+            subscriber.subscribe(2, [(topic, 1)], expected=(1,))
+        broker.stop()
+        results = []
+        for iteration, grant in enumerate((1, 0)):
+            resumed = Broker(binary, case, db=broker.db, label=f"resumed-{iteration}")
+            processes.append(resumed)
+            resumed.ready()
+            with PubsubWire(resumed.address, resumed.observations, f"grant-resumed-{iteration}") as subscriber:
+                subscriber.connect("grant-recovery", session_present=True)
+                state = durable(resumed.db)
+                target = session_key(state, "grant-recovery")
+                rows = [row for row in state["tables"]["routes"] if row["session"] == target]
+                require(len(rows) == 1 and rows[0]["qos"] == grant, "recovered_grant_changed")
+                sent = publish(resumed, case, f"grant-publisher-{iteration}", "mqttium" if grant else "paho",
+                               topic, f"restored-grant-{grant}".encode(), 2)
+                message = subscriber.next_publication()
+                message_is(message, topic, f"restored-grant-{grant}".encode(), grant)
+                acknowledge_if_needed(subscriber, message)
+                if grant == 1:
+                    subscriber.subscribe(3, [(topic, 0)], expected=(0,))
+                results.append({"restored_grant": grant, "public_client": sent,
+                                "no_subscribe_before_delivery": True, "message": message.observation()})
+            drained(resumed, case, admissions=iteration + 1)
+            resumed.stop()
+        writer_available(broker.db)
+        return {"criterion": "G-recovery", "status": "PASS", "restarts": results,
+                "replacements_persist_both_directions": True}
+    finally:
+        for process in processes:
+            process.cleanup()
+
+
+def routing_cut(binary: Path, case: Path) -> dict:
+    broker = Broker(binary, case, pauses=("subscription.prepared",))
+    topic, payload = "reception/qos0/routing-cut", b"volatile-publication-after-subscribe-cut"
+    try:
+        broker.ready()
+        with PubsubWire(broker.address, broker.observations, "cut-sub") as subscriber, \
+                PubsubWire(broker.address, broker.observations, "cut-source") as source:
+            subscriber.connect("cut-sub", session_present=False)
+            source.connect("cut-source", session_present=False)
+            from pubsub_probe import subscribe_packet
+            subscriber.send(subscribe_packet(1, [(topic, 0)]))
+            hit = broker.wait_event("barrier_hit", point="subscription.prepared")
+            mark = sequence(broker)
+            before = durable(broker.db)
+            require(not before["tables"]["routes"], "subscription_visible_before_commit")
+            source.publish_qos0(topic, payload)
+            subscriber.no_publication(.15, code="volatile_publication_bypassed_route_cut")
+            ping(source)
+            require(not any(e["kind"] == "qos0_dropped" for e in new_events(broker, mark)),
+                    "volatile_publication_used_pre_cut_absence")
+            broker.release("subscription.prepared")
+            subscriber.wait(0x90, 1)
+            message = subscriber.next_publication()
+            message_is(message, topic, payload, 0)
+            after = durable(broker.db)
+            require(not after["admissions"] and not obligations(after), "routing_cut_forced_qos0_admission")
+        broker.stop()
+        return {"criterion": "G-order", "status": "PASS", "point": hit,
+                "controls_progress_while_cut_pending": True, "message": message.observation()}
+    finally:
+        broker.cleanup()
+
+
+def consumed_takeover(binary: Path, case: Path) -> dict:
+    broker = Broker(binary, case, pauses=("consume.emission",))
+    topic, payload = "reception/qos0/takeover", b"permission-bound-to-original-connection"
+    try:
+        broker.ready()
+        with PubsubWire(broker.address, broker.observations, "takeover-old") as old, \
+                PubsubWire(broker.address, broker.observations, "takeover-source") as source:
+            old.connect("takeover-target", session_present=False)
+            old.subscribe(1, [(topic, 0)], expected=(0,))
+            source.connect("takeover-source", session_present=False)
+            source.publish(7, topic, payload, qos=2)
+            hit = broker.wait_event("barrier_hit", point="consume.emission")
+            require(not obligations(durable(broker.db)), "emission_barrier_before_consumption")
+            old.no_publication(.1, code="consume_emission_barrier_not_holding")
+            with PubsubWire(broker.address, broker.observations, "takeover-new") as current:
+                current.connect("takeover-target", session_present=True)
+                broker.release("consume.emission")
+                current.no_publication(.2, code="consumed_qos0_retargeted_after_takeover")
+                ping(current)
+            ping(source)
+        drained(broker, case, admissions=1)
+        broker.stop()
+        return {"criterion": "E-takeover", "status": "PASS", "point": hit,
+                "old_permission_not_moved_to_new_connection": True}
     finally:
         broker.cleanup()
 
@@ -651,12 +754,13 @@ def main() -> int:
     require(not any(args.out.iterdir()), "output_not_empty")
     cases = [("A", matrix), ("B", pure_no_commit), ("C", bounds_and_abandon),
              ("E-after", lambda b, p: crash(b, p, "after")), ("F-capacity", atomic_capacity),
-             ("H", credits), ("R-read-domain", corrupt_live_work)]
+             ("G-recovery", subscription_recovery), ("H", credits), ("R-read-domain", corrupt_live_work)]
     if args.mode == "complete" or args.case:
         cases += [("D-consume", consumption_barrier), ("D-resolution", consumption_resolution),
                   ("E-before", lambda b, p: crash(b, p, "before")),
                   ("E-between", lambda b, p: crash(b, p, "between")),
-                  ("F", mixed_fanout), ("G", replacements)]
+                  ("E-takeover", consumed_takeover), ("F", mixed_fanout),
+                  ("G", replacements), ("G-order", routing_cut)]
     require(args.case is None or args.case in {name for name, _ in cases}, "unknown_case")
     result = {"format": "mqttiumd.qos0-system-reception", "schema_version": 1,
               "qualification": "system-test-only", "mode": args.mode,
