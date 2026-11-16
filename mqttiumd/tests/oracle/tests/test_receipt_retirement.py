@@ -53,6 +53,13 @@ class ReceiptScope(unittest.TestCase):
                 snapshot = {"outbound": [], "operations": [], "receipt_frontiers": rows}
                 self.assertEqual(self.unmet(snapshots=[(None, snapshot)]), [])
 
+    def test_positive_identity_boundary_is_not_an_empty_registration(self):
+        # A descriptive snapshot can contain inconsistent business data.
+        # through=0 must not hide newly introduced identity-retirement facts.
+        row = {**frontier("0"), "publication_through": "1"}
+        snapshot = {"outbound": [], "operations": [], "receipt_frontiers": [row]}
+        self.assertEqual(self.unmet(snapshots=[(None, snapshot)]), [SCOPE])
+
 
 class HistoricalRecipe(unittest.TestCase):
     @classmethod
