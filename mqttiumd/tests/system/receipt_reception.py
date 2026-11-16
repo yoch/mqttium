@@ -310,7 +310,15 @@ class HeldBusiness:
                 "consumed_qos0_observed": consumed.observation()}
 
     def after_cycles(self) -> dict:
-        state = durable(self.broker.db)
+        expected_deliveries = delivery_keys(self.seed)
+        def settled():
+            candidate = durable(self.broker.db)
+            actual = delivery_keys(candidate)
+            require(expected_deliveries <= actual, "live_obligation_lost_during_collection")
+            # Public ACK calls establish submission, not durable Finish. Let
+            # the last mixed exchange settle before isolating the old work.
+            return candidate if actual == expected_deliveries else None
+        state = until(settled, "last_live_delivery_not_finished")
         accounts_consistent(state)
         require(delivery_keys(state) == delivery_keys(self.seed), "live_obligation_lost_during_collection")
         require(assignment(state, self.claim_key) == self.claim,
@@ -824,7 +832,7 @@ def close_result_replay(binary: Path, case: Path) -> dict:
                 (broker.control / file).touch(exist_ok=False)
                 for identifier in range(1, 257):
                     control.subscribe(identifier, [("reception/receipt-close-results", identifier % 2)])
-                observed = broker.wait_event(event_name, after=last)
+                observed = broker.wait_event(event_name, after=last, timeout=15)
                 control_progress(control)
                 result["passes"].append({"control": file, "injection": observed,
                                           "storage": storage_sample(broker)})
