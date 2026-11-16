@@ -26,6 +26,8 @@ MAX_REFERENCE_DEPTH = 4
 DIALECT = "https://json-schema.org/draft/2020-12/schema"
 
 FORMATS = {
+    "mqttiumd.product-event": "product-event.schema.json",
+    "mqttiumd.product-profile": "product-profile.schema.json",
     "mqttiumd.scenario": "scenario.schema.json",
     "mqttiumd.fixture": "fixture.schema.json",
     "mqttiumd.trace-record": "trace-record.schema.json",

@@ -3222,6 +3222,17 @@ for kind_name, origin in [
         "A kind of record is stated by its one origin; another may not state it.",
         setter(["origin_component"], origin),
     )
+# Product system evidence is separate from fixture-based qualifying campaigns.
+ok("product-profile.json", json.loads((V1 / "product-profile.json").read_text()))
+product_event = env("mqttiumd.product-event", seq="1", kind="startup_refused", pid=1,
+                    cause="InvalidData", phase="Snapshot", details={"code": "durable_read"})
+ok("product-event.json", product_event)
+bad("product-event-untyped-cause.json", "schema-violation", "/cause",
+    "A durable cause is a stable code, never an SQL message.",
+    {**product_event, "cause": "qos 99"})
+bad("product-event-unbounded-detail.json", "schema-violation", "/details/code",
+    "Product diagnostics never copy unbounded values.",
+    {**product_event, "details": {"code": "x" * 257}})
 dump(EX / "index.json", env("mqttiumd.example-index", valid=valid, invalid=invalid))
 
 

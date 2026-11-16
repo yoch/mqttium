@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "schema_version",
+    "seq",
+    "kind",
+    "pid"
+  ],
+  "properties": {
+    "format": {
+      "const": "mqttiumd.product-event"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "seq": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
+    },
+    "kind": {
+      "type": "string",
+      "pattern": "^[a-z][a-z_]{0,47}$"
+    },
+    "pid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "connection": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch",
+        "owner",
+        "sequence"
+      ],
+      "properties": {
+        "incarnation": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$"
+        },
+        "epoch": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$"
+        },
+        "owner": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$"
+        },
+        "sequence": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,19})$"
+        }
+      }
+    },
+    "point": {
+      "enum": [
+        "admission.prepared",
+        "release.prepared",
+        "admission.committed"
+      ]
+    },
+    "command_kind": {
+      "enum": [
+        "Admission",
+        "Release"
+      ]
+    },
+    "cause": {
+      "enum": [
+        "InvalidData",
+        "LimitExceeded",
+        "Unavailable",
+        "Io",
+        "AllocationFailed"
+      ]
+    },
+    "phase": {
+      "enum": [
+        "Open",
+        "Ledger",
+        "Opening",
+        "Lookup",
+        "Snapshot",
+        "Inspect",
+        "Recovery"
+      ]
+    },
+    "details": {
+      "type": "object",
+      "maxProperties": 32,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z_]{0,47}$"
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "string",
+            "maxLength": 256
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          }
+        ]
+      }
+    }
+  }
+}

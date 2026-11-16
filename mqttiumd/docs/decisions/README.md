@@ -37,5 +37,7 @@ its source; a test fails when the register and the records drift apart.
 | [0020](0020-kill-inside-a-transaction.md) | Proposed | Deterministic transaction points, acknowledged in-flight barriers and identity-based recovery evidence | L3, L4, L7 |
 | [0021](0021-typed-bounded-durable-reads.md) | Proposed | Typed bounded durable reads, lifecycle evidence and action termination through the surviving supervisor | L3, L4, L7 |
 
+| [0022](0022-product-tcp-qos2.md) | Proposed | Product TCP incoming QoS 2, durable session facts, bounded transport and system evidence | Product |
+
 What each record leaves open is tracked in
 [`../reception/open-conditions.md`](../reception/open-conditions.md).

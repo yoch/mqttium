@@ -84,7 +84,9 @@
     "contracts/examples/v1/valid/toy.catalog.json",
     "contracts/examples/v1/valid/toy.transitions.complete.json",
     "contracts/examples/v1/valid/toy.transitions.seed-with-hole.json",
-    "contracts/examples/v1/valid/wide.catalog.json"
+    "contracts/examples/v1/valid/wide.catalog.json",
+    "contracts/examples/v1/valid/product-profile.json",
+    "contracts/examples/v1/valid/product-event.json"
   ],
   "invalid": [
     {
@@ -1778,6 +1780,18 @@
       "code": "schema-violation",
       "pointer": "/origin_component",
       "why": "A kind of record is stated by its one origin; another may not state it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-event-untyped-cause.json",
+      "code": "schema-violation",
+      "pointer": "/cause",
+      "why": "A durable cause is a stable code, never an SQL message."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-event-unbounded-detail.json",
+      "code": "schema-violation",
+      "pointer": "/details/code",
+      "why": "Product diagnostics never copy unbounded values."
     }
   ]
 }

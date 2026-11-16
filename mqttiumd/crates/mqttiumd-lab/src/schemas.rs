@@ -28,6 +28,8 @@ pub const SCHEMA_VERSION: u64 = 1;
 
 /// The closed map from document format to the schema file that defines it.
 pub const FORMATS: &[(&str, &str)] = &[
+    ("mqttiumd.product-event", "product-event.schema.json"),
+    ("mqttiumd.product-profile", "product-profile.schema.json"),
     ("mqttiumd.scenario", "scenario.schema.json"),
     ("mqttiumd.fixture", "fixture.schema.json"),
     ("mqttiumd.trace-record", "trace-record.schema.json"),

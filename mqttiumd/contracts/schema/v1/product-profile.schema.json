@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "schema_version",
+    "id",
+    "mqtt_version",
+    "client_id",
+    "clean_start",
+    "session_expiry_interval",
+    "incoming_qos",
+    "retain",
+    "will",
+    "authentication",
+    "subscriptions",
+    "outgoing_delivery",
+    "mqtt_conformant",
+    "max_connections",
+    "max_sessions",
+    "max_packet_bytes",
+    "max_client_id_bytes",
+    "max_topic_bytes",
+    "max_payload_bytes",
+    "per_connection_input_slots",
+    "per_connection_output_slots",
+    "writer_queue_slots",
+    "max_commands_in_flight",
+    "max_timers",
+    "receipt_slots",
+    "partial_packet_timeout_ms",
+    "connect_timeout_ms",
+    "write_timeout_ms",
+    "receive_maximum",
+    "remembered_connections"
+  ],
+  "properties": {
+    "format": {
+      "const": "mqttiumd.product-profile"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "id": {
+      "const": "tcp-inbound-qos2-v1"
+    },
+    "mqtt_version": {
+      "const": 5
+    },
+    "client_id": {
+      "const": "explicit"
+    },
+    "clean_start": {
+      "const": false
+    },
+    "session_expiry_interval": {
+      "const": 4294967295
+    },
+    "incoming_qos": {
+      "const": [
+        2
+      ]
+    },
+    "retain": {
+      "const": false
+    },
+    "will": {
+      "const": false
+    },
+    "authentication": {
+      "const": false
+    },
+    "subscriptions": {
+      "const": false
+    },
+    "outgoing_delivery": {
+      "const": false
+    },
+    "mqtt_conformant": {
+      "const": false
+    },
+    "max_connections": {
+      "const": 16
+    },
+    "max_sessions": {
+      "const": 128
+    },
+    "max_packet_bytes": {
+      "const": 65536
+    },
+    "max_client_id_bytes": {
+      "const": 1024
+    },
+    "max_topic_bytes": {
+      "const": 1024
+    },
+    "max_payload_bytes": {
+      "const": 32768
+    },
+    "per_connection_input_slots": {
+      "const": 4
+    },
+    "per_connection_output_slots": {
+      "const": 4
+    },
+    "writer_queue_slots": {
+      "const": 32
+    },
+    "max_commands_in_flight": {
+      "const": 16
+    },
+    "max_timers": {
+      "const": 512
+    },
+    "receipt_slots": {
+      "const": 8192
+    },
+    "partial_packet_timeout_ms": {
+      "const": 5000
+    },
+    "connect_timeout_ms": {
+      "const": 3000
+    },
+    "write_timeout_ms": {
+      "const": 250
+    },
+    "receive_maximum": {
+      "const": 8
+    },
+    "remembered_connections": {
+      "const": 8
+    }
+  }
+}
