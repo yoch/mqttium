@@ -540,7 +540,7 @@ mod tests {
                 report.diagnostics
             );
         }
-        assert_eq!(workspace.check_contracts().len(), 6);
+        assert_eq!(workspace.check_contracts().len(), 7);
 
         // Opened again, the directory is other contracts, and invalid ones.
         assert!(Workspace::open(&root, contracts).is_err());
