@@ -1,4 +1,4 @@
-//! The bounded MQTT 5 codec of the experimental incoming QoS 2 profile.
+//! The bounded MQTT 5 codec of the experimental incoming QoS 1/2 profile.
 
 use mqttiumd_contract::ids::InboundPacketId;
 use mqttiumd_contract::packet::{AckReason, InboundPacket, OutboundFrame, Qos, SharedBytes};
@@ -535,8 +535,8 @@ fn publish(first: u8, body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
             ..unsupported("RetainNotSupported")
         });
     }
-    if qos != Qos::ExactlyOnce {
-        return Err(unsupported("OnlyInboundQos2"));
+    if qos == Qos::AtMostOnce {
+        return Err(unsupported("QosZeroOutsideProfile"));
     }
     // Check every field before making either application-owned copy.
     if topic_bytes.len() > bounds.max_topic {
@@ -1017,7 +1017,7 @@ mod tests {
     #[test]
     fn publish_restrictions_do_not_hide_invalid_fields() {
         kind(
-            decode(0x32, b"\0\x03a/b\0\x07\0payload", BOUNDS),
+            decode(0x30, b"\0\x03a/b\0payload", BOUNDS),
             ErrorKind::Unsupported,
         );
         kind(
