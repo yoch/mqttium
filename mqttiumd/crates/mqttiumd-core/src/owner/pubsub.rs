@@ -427,9 +427,6 @@ impl Owner {
         }
         if let Some(control) = &self.pubsub.control {
             if control.connection == key && control.packet_id == packet_id {
-                if control.packet == *packet {
-                    return Ok(super::Change::Nothing);
-                }
                 return Self::plan_close(
                     connection,
                     Some(session_index),
