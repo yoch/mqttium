@@ -172,6 +172,7 @@ struct Counters {
     effect: Option<EffectSeq>,
     deadline: Option<DeadlineToken>,
     generation: Option<ExchangeGeneration>,
+    continuation: Option<crate::contract::ids::ContinuationId>,
 }
 
 impl Counters {
@@ -186,6 +187,7 @@ impl Counters {
             effect: Some(EffectSeq::new(1)),
             deadline: Some(DeadlineToken::new(1)),
             generation,
+            continuation: Some(crate::contract::ids::ContinuationId::new(1)),
         }
     }
 }
@@ -1075,7 +1077,11 @@ impl Owner {
             };
         }
         match input {
-            Input::Qos0EmitRefused { .. } => Ok(Change::Nothing),
+            Input::Qos0EmitRefused {
+                effect,
+                connection,
+                reason,
+            } => self.plan_qos0_refusal(*effect, *connection, *reason, draft),
             Input::ConnectionSettings {
                 connection,
                 receive_maximum,
@@ -1104,7 +1110,8 @@ impl Owner {
             Input::ConnectionClosed { connection } => {
                 self.plan_connection_closed(*connection, draft)
             }
-            Input::Recovery { .. } | Input::Continue { .. } => Err(IMPOSSIBLE),
+            Input::Continue { continuation, .. } => self.plan_qos0_continue(*continuation, draft),
+            Input::Recovery { .. } => Err(IMPOSSIBLE),
             // A wake-up carries no authority, and this perimeter keeps no
             // work behind one.
             Input::WorkAvailable { session } => self.plan_work(*session, draft),
@@ -1347,8 +1354,16 @@ impl Owner {
                 packet_id,
                 ..
             } => {
-                if *qos == Qos::AtMostOnce || *retain {
+                if *retain {
                     return protocol_error(draft);
+                }
+                if *qos == Qos::AtMostOnce {
+                    return self.plan_qos0_packet(
+                        index,
+                        (connection, ingress_order),
+                        packet,
+                        draft,
+                    );
                 }
                 let Some(packet_id) = *packet_id else {
                     return Err(IMPOSSIBLE);
@@ -1922,6 +1937,9 @@ impl Owner {
         progress: FrameProgress,
         draft: &mut Draft,
     ) -> Result<Change, Stop> {
+        if let Some(change) = self.plan_qos0_frame(effect, connection, progress, draft)? {
+            return Ok(change);
+        }
         if let Some(change) = self.plan_pubsub_frame(effect, connection, progress) {
             return Ok(change);
         }
@@ -1999,13 +2017,13 @@ impl Owner {
                     delivery,
                     target,
                     target_revision,
+                    qos,
                     claim,
-                    ..
                 } => self.valid_outbound_fact(
                     *delivery,
                     *target,
                     *target_revision,
-                    *claim,
+                    (*qos, *claim),
                     same,
                     run(facts, &starts, FactRank::Session, position),
                 ),
@@ -2336,9 +2354,9 @@ impl Owner {
                 delivery,
                 target,
                 target_revision,
+                qos,
                 claim,
-                ..
-            } => self.add_outbound_fact(*delivery, *target, *target_revision, *claim)?,
+            } => self.add_outbound_fact(*delivery, *target, *target_revision, *qos, *claim)?,
             RecoveredFact::Epoch { .. } => self.epoch_recovered = true,
             RecoveredFact::Limits {
                 max_targets_per_admission,
@@ -7600,7 +7618,7 @@ mod tests {
         let (effect, Effect::Persist { command }) = &effects[0] else {
             panic!("subscription recipe")
         };
-        let Recipe::ChangeSubscriptions(change) = command.recipe.get() else {
+        let Recipe::UpdateSubscriptions(change) = command.recipe.get() else {
             panic!("same durable operation path")
         };
         assert_eq!(change.session, SessionId::new(PRODUCER));

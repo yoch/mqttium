@@ -1,9 +1,12 @@
 //! Exact subscriptions and outgoing QoS 1 under the same owner authority.
 use super::*;
-use crate::contract::command::{ChangeSubscriptions, ClaimDelivery, FinishDelivery};
-use crate::contract::ids::OutboundPacketId;
+use crate::contract::command::{
+    ClaimDelivery, ConsumeDelivery, FinishDelivery, UpdateSubscriptions,
+};
+use crate::contract::ids::{ContinuationId, OutboundPacketId};
 use crate::contract::pubsub::{
-    DeliveryClaim, FilterResults, MAX_FILTERS, SubscriptionChange, WORK_PAGE_LIMIT, WorkItem,
+    DeliveryClaim, FilterResults, GrantedSubscriptionChange, MAX_FILTERS, Qos0DropReason,
+    Qos0Origin, VolatilePublicationId, WORK_PAGE_LIMIT, WorkItem,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -22,6 +25,7 @@ pub(super) struct Connection {
     after: Option<DeliveryId>,
     loading: Option<Read>,
     rescan_needed: bool,
+    last_qos0_ingress: u64,
 }
 
 #[derive(Debug)]
@@ -41,6 +45,8 @@ enum Phase {
     ClaimPending(InFlight),
     AwaitPuback,
     FinishPending(InFlight),
+    ConsumePending(InFlight, ConnectionKey),
+    Qos0Writing(Finished),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -48,6 +54,7 @@ pub(super) struct Delivery {
     id: DeliveryId,
     target: SessionId,
     revision: Revision,
+    qos: Qos,
     claim: Option<DeliveryClaim>,
     topic: Option<SharedBytes>,
     payload: Option<SharedBytes>,
@@ -62,19 +69,21 @@ pub(super) struct Delivery {
 impl Delivery {
     fn waiting_to_send(&self, generation: ConnectionGeneration) -> bool {
         match self.phase {
-            Phase::FinishPending(_) => false,
+            Phase::FinishPending(_) | Phase::Qos0Writing(_) => false,
             Phase::AwaitPuback => {
                 self.window != Some(generation)
                     || self
                         .frame
                         .is_none_or(|(_, key)| key.generation != generation)
             }
-            Phase::Queued | Phase::ClaimPending(_) => true,
+            Phase::Queued | Phase::ClaimPending(_) | Phase::ConsumePending(_, _) => true,
         }
     }
     fn in_flight(&self) -> Option<InFlight> {
         match self.phase {
-            Phase::ClaimPending(f) | Phase::FinishPending(f) => Some(f),
+            Phase::ClaimPending(f) | Phase::FinishPending(f) | Phase::ConsumePending(f, _) => {
+                Some(f)
+            }
             _ => None,
         }
     }
@@ -82,12 +91,14 @@ impl Delivery {
         id: DeliveryId,
         target: SessionId,
         revision: Revision,
+        qos: Qos,
         claim: Option<DeliveryClaim>,
     ) -> Self {
         Self {
             id,
             target,
             revision,
+            qos,
             claim,
             topic: None,
             payload: None,
@@ -105,16 +116,59 @@ impl Delivery {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(super) struct Volatile {
+    origin: Qos0Origin,
+    target: SessionId,
+    connection: Option<ConnectionKey>,
+    topic: SharedBytes,
+    payload: SharedBytes,
+    frame: Option<EffectId>,
+}
+
 #[derive(Debug)]
 pub(super) struct State {
     pub(super) connections: BoundedVec<Connection>,
     pub(super) deliveries: BoundedVec<Delivery>,
     pub(super) control: Option<Control>,
     payload_limit: PayloadBytes,
+    pub(super) volatile: BoundedVec<Volatile>,
+    continuation: Option<ContinuationId>,
+    continuations_started: bool,
 }
 
 #[derive(Debug)]
 pub(super) enum Change {
+    Qos0Admit {
+        connection: usize,
+        ingress_order: u64,
+        records: BoundedVec<Volatile>,
+        continuation: Option<ContinuationId>,
+    },
+    Qos0Send {
+        slot: usize,
+        effect: EffectId,
+        continuation: Option<ContinuationId>,
+    },
+    Qos0Drop {
+        slot: usize,
+        continuation: Option<ContinuationId>,
+    },
+    Qos0Done {
+        slot: usize,
+    },
+    Qos0Idle,
+    Consume {
+        slot: usize,
+        in_flight: InFlight,
+        connection: ConnectionKey,
+    },
+    Consumed {
+        slot: usize,
+        finished: Finished,
+        emission: Option<(EffectId, ConnectionKey)>,
+    },
+
     Settings {
         index: Option<usize>,
         value: Connection,
@@ -221,6 +275,9 @@ impl State {
             deliveries: table(config.max_exchanges)?,
             control: None,
             payload_limit: config.payload_bytes,
+            volatile: table(config.max_exchanges)?,
+            continuation: None,
+            continuations_started: false,
         })
     }
     fn connection(&self, generation: ConnectionGeneration) -> Option<usize> {
@@ -329,8 +386,12 @@ impl Owner {
             .min_by_key(|d| d.id);
         if let Some(delivery) = next {
             match delivery.phase {
-                Phase::ClaimPending(_) => return false,
-                Phase::Queued if room && delivery.payload.is_some() => return true,
+                Phase::ClaimPending(_) | Phase::ConsumePending(_, _) => return false,
+                Phase::Queued
+                    if (room || delivery.qos == Qos::AtMostOnce) && delivery.payload.is_some() =>
+                {
+                    return true;
+                }
                 Phase::AwaitPuback
                     if delivery.payload.is_some()
                         && (room || delivery.window == Some(generation)) =>
@@ -341,6 +402,310 @@ impl Owner {
             }
         }
         room && settings.loading.is_none() && (settings.after.is_some() || settings.rescan_needed)
+    }
+
+    fn qos0_continuation(&self, draft: &mut Draft) -> Result<ContinuationId, Stop> {
+        let continuation = draw(
+            &mut draft.counters.continuation,
+            ContinuationId::checked_next,
+        )?;
+        draft.emit(Effect::Continue { continuation })?;
+        Ok(continuation)
+    }
+
+    pub(super) fn plan_qos0_packet(
+        &self,
+        session: usize,
+        origin: (ConnectionGeneration, u64),
+        packet: &InboundPacket,
+        draft: &mut Draft,
+    ) -> Result<super::Change, Stop> {
+        let (generation, ingress_order) = origin;
+        let Some(connection) = self.pubsub.connection(generation) else {
+            return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
+        };
+        let InboundPacket::Publish {
+            qos: Qos::AtMostOnce,
+            dup: false,
+            retain: false,
+            packet_id: None,
+            topic,
+            payload,
+        } = packet
+        else {
+            return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
+        };
+        if ingress_order <= self.pubsub.connections.as_slice()[connection].last_qos0_ingress {
+            return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
+        }
+        let limits = self.limits.ok_or(IMPOSSIBLE)?;
+        if topic.len() as u64 > u64::from(limits.max_topic_bytes)
+            || payload.len() as u64 > limits.max_payload_bytes.get()
+        {
+            return Self::plan_close(
+                generation,
+                Some(session),
+                CloseReason::CapacityExceeded,
+                draft,
+            );
+        }
+        let publication = VolatilePublicationId {
+            source: ConnectionKey {
+                session: self.sessions.as_slice()[session].id,
+                generation,
+            },
+            ingress_order,
+        };
+        let origin = Qos0Origin::Volatile { publication };
+        let count = self
+            .routes
+            .as_slice()
+            .iter()
+            .filter(|r| r.topic == *topic)
+            .count();
+        let used = self
+            .pubsub
+            .volatile
+            .as_slice()
+            .iter()
+            .try_fold(0u64, |sum, v| sum.checked_add(v.payload.len() as u64))
+            .ok_or(IMPOSSIBLE)?;
+        let fits = count <= self.pubsub.volatile.capacity() - self.pubsub.volatile.len()
+            && (payload.len() as u64)
+                .checked_mul(count as u64)
+                .and_then(|n| n.checked_add(used))
+                .is_some_and(|n| n <= self.pubsub.payload_limit.get());
+        if count == 0 || !fits {
+            draft.emit(Effect::Qos0Dropped {
+                origin,
+                target: None,
+                reason: if count == 0 {
+                    Qos0DropReason::NoSubscribers
+                } else {
+                    Qos0DropReason::CapacityExceeded
+                },
+            })?;
+            return Ok(changed(Change::Qos0Admit {
+                connection,
+                ingress_order,
+                records: BoundedVec::with_capacity(0)?,
+                continuation: None,
+            }));
+        }
+        let mut records = BoundedVec::with_capacity(count)?;
+        for route in self.routes.as_slice().iter().filter(|r| r.topic == *topic) {
+            let connection = self
+                .connection_of(route.target)
+                .map(|generation| ConnectionKey {
+                    session: route.target,
+                    generation,
+                });
+            records
+                .try_push(Volatile {
+                    origin,
+                    target: route.target,
+                    connection,
+                    topic: topic.clone(),
+                    payload: payload.clone(),
+                    frame: None,
+                })
+                .map_err(|_| IMPOSSIBLE)?;
+        }
+        let continuation = if self.pubsub.continuation.is_none() {
+            Some(self.qos0_continuation(draft)?)
+        } else {
+            None
+        };
+        Ok(changed(Change::Qos0Admit {
+            connection,
+            ingress_order,
+            records,
+            continuation,
+        }))
+    }
+
+    fn qos0_fits(
+        &self,
+        connection: ConnectionKey,
+        topic: &SharedBytes,
+        payload: &SharedBytes,
+    ) -> bool {
+        let Some(settings) = self
+            .pubsub
+            .connection(connection.generation)
+            .map(|i| self.pubsub.connections.as_slice()[i])
+        else {
+            return false;
+        };
+        let Some(body) = topic
+            .len()
+            .checked_add(payload.len())
+            .and_then(|n| n.checked_add(3))
+        else {
+            return false;
+        };
+        let remaining = if body < 128 {
+            1
+        } else if body < 16384 {
+            2
+        } else if body < 2097152 {
+            3
+        } else {
+            4
+        };
+        body.checked_add(remaining + 1)
+            .is_some_and(|n| n <= settings.maximum_packet_size as usize)
+    }
+
+    pub(super) fn plan_qos0_continue(
+        &self,
+        continuation: ContinuationId,
+        draft: &mut Draft,
+    ) -> Result<super::Change, Stop> {
+        if self.pubsub.continuation != Some(continuation) {
+            return if self.pubsub.continuations_started {
+                Ok(super::Change::Nothing)
+            } else {
+                Err(IMPOSSIBLE)
+            };
+        }
+        let Some((slot, v)) = self
+            .pubsub
+            .volatile
+            .as_slice()
+            .iter()
+            .enumerate()
+            .find(|(_, v)| v.frame.is_none())
+        else {
+            return Ok(changed(Change::Qos0Idle));
+        };
+        let next = if self.pubsub.volatile.as_slice()[slot + 1..]
+            .iter()
+            .any(|v| v.frame.is_none())
+        {
+            Some(self.qos0_continuation(draft)?)
+        } else {
+            None
+        };
+        let reason = match v.connection {
+            None => Some(Qos0DropReason::DestinationAbsent),
+            Some(key) if self.connection_of(v.target) != Some(key.generation) => {
+                Some(Qos0DropReason::ConnectionClosed)
+            }
+            Some(key) if !self.qos0_fits(key, &v.topic, &v.payload) => {
+                Some(Qos0DropReason::PacketTooLarge)
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            draft.emit(Effect::Qos0Dropped {
+                origin: v.origin,
+                target: Some(v.target),
+                reason,
+            })?;
+            return Ok(changed(Change::Qos0Drop {
+                slot,
+                continuation: next,
+            }));
+        }
+        let connection = v.connection.ok_or(IMPOSSIBLE)?;
+        let effect = draft.emit(Effect::EmitQos0 {
+            connection,
+            origin: v.origin,
+            topic: v.topic.clone(),
+            payload: v.payload.clone(),
+        })?;
+        Ok(changed(Change::Qos0Send {
+            slot,
+            effect,
+            continuation: next,
+        }))
+    }
+
+    fn plan_qos0_terminal(
+        &self,
+        effect: EffectId,
+        connection: ConnectionKey,
+        reason: Option<Qos0DropReason>,
+        draft: &mut Draft,
+    ) -> Result<Option<super::Change>, Stop> {
+        if let Some((slot, v)) = self
+            .pubsub
+            .volatile
+            .as_slice()
+            .iter()
+            .enumerate()
+            .find(|(_, v)| v.frame == Some(effect) && v.connection == Some(connection))
+        {
+            if let Some(reason) = reason {
+                draft.emit(Effect::Qos0Dropped {
+                    origin: v.origin,
+                    target: Some(v.target),
+                    reason,
+                })?;
+            }
+            return Ok(Some(changed(Change::Qos0Done { slot })));
+        }
+        if let Some((slot, d)) =
+            self.pubsub
+                .deliveries
+                .as_slice()
+                .iter()
+                .enumerate()
+                .find(|(_, d)| {
+                    matches!(d.phase, Phase::Qos0Writing(_))
+                        && d.frame == Some((effect, connection))
+                })
+        {
+            let Phase::Qos0Writing(finished) = d.phase else {
+                return Err(IMPOSSIBLE);
+            };
+            if let Some(reason) = reason {
+                draft.emit(Effect::Qos0Dropped {
+                    origin: Qos0Origin::Consumed {
+                        delivery: d.id,
+                        operation: finished.operation,
+                    },
+                    target: Some(d.target),
+                    reason,
+                })?;
+            }
+            return Ok(Some(changed(Change::Finished { slot, finished })));
+        }
+        Ok(None)
+    }
+
+    pub(super) fn plan_qos0_refusal(
+        &self,
+        effect: EffectId,
+        connection: ConnectionKey,
+        reason: Qos0DropReason,
+        draft: &mut Draft,
+    ) -> Result<super::Change, Stop> {
+        Ok(self
+            .plan_qos0_terminal(effect, connection, Some(reason), draft)?
+            .unwrap_or(super::Change::Nothing))
+    }
+
+    pub(super) fn plan_qos0_frame(
+        &self,
+        effect: EffectId,
+        connection: ConnectionKey,
+        progress: FrameProgress,
+        draft: &mut Draft,
+    ) -> Result<Option<super::Change>, Stop> {
+        match progress {
+            FrameProgress::Failed => self.plan_qos0_terminal(
+                effect,
+                connection,
+                Some(Qos0DropReason::WriteFailed),
+                draft,
+            ),
+            FrameProgress::Written { confirmed, total } if total > 0 && confirmed == total => {
+                self.plan_qos0_terminal(effect, connection, None, draft)
+            }
+            _ => Ok(None),
+        }
     }
 
     pub(super) fn plan_settings(
@@ -369,6 +734,7 @@ impl Owner {
             after: None,
             loading: None,
             rescan_needed: false,
+            last_qos0_ingress: 0,
         };
         if let Some(index) = index {
             let current = self.pubsub.connections.as_slice()[index];
@@ -528,7 +894,7 @@ impl Owner {
             Err(error) => return Err(error),
         };
         let operation = self.operation(draft)?;
-        let recipe = Recipe::ChangeSubscriptions(ChangeSubscriptions {
+        let recipe = Recipe::UpdateSubscriptions(UpdateSubscriptions {
             operation,
             session: session.id,
             session_revision: session.revision,
@@ -551,16 +917,16 @@ impl Owner {
         &self,
         session: SessionId,
         packet: &InboundPacket,
-    ) -> Result<(BoundedVec<SubscriptionChange>, FilterResults), Stop> {
+    ) -> Result<(BoundedVec<GrantedSubscriptionChange>, FilterResults), Stop> {
         let mut changes = BoundedVec::with_capacity(MAX_FILTERS)?;
         let mut codes = [0u8; MAX_FILTERS];
         let mut len = 0usize;
         match packet {
             InboundPacket::Subscribe { filters, .. } => {
                 for item in filters.as_slice() {
-                    let allowed = exact(&item.filter) && item.qos != Qos::AtMostOnce;
+                    let allowed = exact(&item.filter);
                     codes[len] = if allowed {
-                        1
+                        item.qos.min(Qos::AtLeastOnce).to_wire()
                     } else if item.filter.as_slice().starts_with(b"$share/") {
                         0x9e
                     } else if !exact(&item.filter) {
@@ -571,9 +937,9 @@ impl Owner {
                     len += 1;
                     if allowed {
                         changes
-                            .try_push(SubscriptionChange {
+                            .try_push(GrantedSubscriptionChange {
                                 topic: item.filter.clone(),
-                                subscribe: true,
+                                granted: Some(item.qos.min(Qos::AtLeastOnce)),
                             })
                             .map_err(|_| IMPOSSIBLE)?;
                     }
@@ -585,7 +951,7 @@ impl Owner {
                     let removed_before = changes
                         .as_slice()
                         .iter()
-                        .any(|c| c.topic == *topic && !c.subscribe);
+                        .any(|c| c.topic == *topic && c.granted.is_none());
                     let present = !removed_before
                         && self
                             .routes
@@ -602,9 +968,9 @@ impl Owner {
                     len += 1;
                     if allowed {
                         changes
-                            .try_push(SubscriptionChange {
+                            .try_push(GrantedSubscriptionChange {
                                 topic: topic.clone(),
-                                subscribe: false,
+                                granted: None,
                             })
                             .map_err(|_| IMPOSSIBLE)?;
                     }
@@ -633,7 +999,7 @@ impl Owner {
         &self,
         session: SessionId,
         revision: Revision,
-        changes: &[SubscriptionChange],
+        changes: &[GrantedSubscriptionChange],
     ) -> Result<BoundedVec<Route>, Stop> {
         let mut routes = BoundedVec::with_capacity(self.routes.capacity())?;
         for route in self.routes.as_slice() {
@@ -642,7 +1008,7 @@ impl Owner {
             }
         }
         for (i, change) in changes.iter().enumerate() {
-            if !change.subscribe
+            if change.granted.is_none()
                 || changes[i + 1..]
                     .iter()
                     .any(|later| later.topic == change.topic)
@@ -654,7 +1020,7 @@ impl Owner {
                     topic: change.topic.clone(),
                     target: session,
                     target_revision: revision,
-                    max_qos: Qos::AtLeastOnce,
+                    max_qos: change.granted.ok_or(IMPOSSIBLE)?,
                 })
                 .map_err(|_| {
                     Stop::Need(CapacityNeed {
@@ -689,7 +1055,10 @@ impl Owner {
             .filter(|(_, d)| d.target == session && d.waiting_to_send(generation))
             .min_by_key(|(_, d)| d.id);
         if let Some((_, d)) = next
-            && matches!(d.phase, Phase::ClaimPending(_))
+            && matches!(
+                d.phase,
+                Phase::ClaimPending(_) | Phase::ConsumePending(_, _)
+            )
         {
             // A lost claim result must be reconciled before a later
             // publication can become eligible on this destination.
@@ -711,6 +1080,28 @@ impl Owner {
             if draft.closed.is_some() {
                 return Ok(super::Change::Nothing);
             }
+        }
+        if let Some((slot, d)) = next
+            && d.phase == Phase::Queued
+            && d.qos == Qos::AtMostOnce
+            && d.payload.is_some()
+        {
+            let operation = self.operation(draft)?;
+            let recipe = Recipe::ConsumeDelivery(ConsumeDelivery {
+                operation,
+                delivery: d.id,
+                target: d.target,
+                target_revision: d.revision,
+            });
+            let in_flight = self.plan_submission(operation, recipe, None, draft)?;
+            return Ok(changed(Change::Consume {
+                slot,
+                in_flight,
+                connection: ConnectionKey {
+                    session,
+                    generation,
+                },
+            }));
         }
         if room
             && let Some((slot, d)) = next
@@ -814,6 +1205,8 @@ impl Owner {
                 || item.target_revision != target.revision
                 || item.topic.len() as u64 > u64::from(limits.max_topic_bytes)
                 || item.payload.len() as u64 > limits.max_payload_bytes.get()
+                || item.qos == Qos::ExactlyOnce
+                || (item.claim.is_some() && item.qos != Qos::AtLeastOnce)
             {
                 return Err(IMPOSSIBLE);
             }
@@ -843,6 +1236,7 @@ impl Owner {
             if let Some(known) = known {
                 if known.target != item.target
                     || known.revision != item.target_revision
+                    || known.qos != item.qos
                     || known
                         .topic
                         .as_ref()
@@ -1021,6 +1415,53 @@ impl Owner {
                     })));
                 }
                 let (slot, d) = delivery.ok_or(IMPOSSIBLE)?;
+                if let Phase::ConsumePending(_, connection) = d.phase {
+                    if facts
+                        != (CommitFacts::DeliveryConsumed {
+                            delivery: d.id,
+                            target: d.target,
+                        })
+                    {
+                        return Err(Stop::Fatal(CoreFault::ContradictoryOutcome { operation }));
+                    }
+                    let (Some(topic), Some(payload)) = (&d.topic, &d.payload) else {
+                        return Err(IMPOSSIBLE);
+                    };
+                    let origin = Qos0Origin::Consumed {
+                        delivery: d.id,
+                        operation,
+                    };
+                    let reason = if self.connection_of(d.target) != Some(connection.generation) {
+                        Some(Qos0DropReason::ConnectionClosed)
+                    } else if !self.qos0_fits(connection, topic, payload) {
+                        Some(Qos0DropReason::PacketTooLarge)
+                    } else {
+                        None
+                    };
+                    let emission = if let Some(reason) = reason {
+                        draft.emit(Effect::Qos0Dropped {
+                            origin,
+                            target: Some(d.target),
+                            reason,
+                        })?;
+                        None
+                    } else {
+                        Some((
+                            draft.emit(Effect::EmitQos0 {
+                                connection,
+                                origin,
+                                topic: topic.clone(),
+                                payload: payload.clone(),
+                            })?,
+                            connection,
+                        ))
+                    };
+                    return Ok(Some(changed(Change::Consumed {
+                        slot,
+                        finished: done,
+                        emission,
+                    })));
+                }
                 let claim = d.claim.ok_or(IMPOSSIBLE)?;
                 if matches!(d.phase, Phase::ClaimPending(_)) {
                     if facts
@@ -1087,7 +1528,10 @@ impl Owner {
                 Ok(Some(changed(Change::Refused {
                     slot,
                     finished: done,
-                    claiming: matches!(d.phase, Phase::ClaimPending(_)),
+                    claiming: matches!(
+                        d.phase,
+                        Phase::ClaimPending(_) | Phase::ConsumePending(_, _)
+                    ),
                 })))
             }
             (Verdict::Transition(CommandPhase::Indeterminate), _) => {
@@ -1187,10 +1631,11 @@ impl Owner {
         delivery: DeliveryId,
         target: SessionId,
         revision: Revision,
-        claim: Option<DeliveryClaim>,
+        kind: (Qos, Option<DeliveryClaim>),
         same: &[RecoveredFact],
         sessions: &[RecoveredFact],
     ) -> bool {
+        let (qos, claim) = kind;
         let session_ok=self.sessions.as_slice().iter().any(|s|s.id==target&&s.revision==revision)||sessions.iter().any(|f|matches!(f,RecoveredFact::Session{session,revision:rev,..}if *session==target&&*rev==revision));
         let conflict = |id: DeliveryId, to: SessionId, other: Option<DeliveryClaim>| {
             id == delivery
@@ -1200,7 +1645,7 @@ impl Owner {
                 || claim.is_some()
                     && other.is_some_and(|c| Some(c.operation) == claim.map(|c| c.operation))
         };
-        session_ok&&self.pubsub.deliveries.len()+same.len()<self.pubsub.deliveries.capacity()
+        (claim.is_none()||qos==Qos::AtLeastOnce)&&session_ok&&self.pubsub.deliveries.len()+same.len()<self.pubsub.deliveries.capacity()
             &&claim.is_none_or(|c|c.operation.incarnation()==self.incarnation&&c.operation.epoch()<self.epoch)
             &&!self.pubsub.deliveries.as_slice().iter().any(|d|conflict(d.id,d.target,d.claim))
             &&!same.iter().any(|f|matches!(f,RecoveredFact::OutboundDelivery{delivery:id,target:to,claim:other,..}if conflict(*id,*to,*other)))
@@ -1211,17 +1656,109 @@ impl Owner {
         id: DeliveryId,
         target: SessionId,
         revision: Revision,
+        qos: Qos,
         claim: Option<DeliveryClaim>,
     ) -> Result<(), CoreFault> {
         self.pubsub
             .deliveries
-            .try_push(Delivery::metadata(id, target, revision, claim))
+            .try_push(Delivery::metadata(id, target, revision, qos, claim))
             .map_err(|_| CoreFault::StalePlan)
     }
 
     pub(super) fn apply_pubsub(&mut self, change: Change, input: Input) -> Result<(), CoreFault> {
         let stale = CoreFault::StalePlan;
         match change {
+            Change::Qos0Admit {
+                connection,
+                ingress_order,
+                records,
+                continuation,
+            } => {
+                self.pubsub
+                    .connections
+                    .as_mut_slice()
+                    .get_mut(connection)
+                    .ok_or(stale)?
+                    .last_qos0_ingress = ingress_order;
+                for record in records.as_slice() {
+                    self.pubsub
+                        .volatile
+                        .try_push(record.clone())
+                        .map_err(|_| stale)?;
+                }
+                if let Some(c) = continuation {
+                    self.pubsub.continuation = Some(c);
+                    self.pubsub.continuations_started = true;
+                }
+            }
+            Change::Qos0Send {
+                slot,
+                effect,
+                continuation,
+            } => {
+                self.pubsub
+                    .volatile
+                    .as_mut_slice()
+                    .get_mut(slot)
+                    .ok_or(stale)?
+                    .frame = Some(effect);
+                self.pubsub.continuation = continuation;
+            }
+            Change::Qos0Drop { slot, continuation } => {
+                self.pubsub
+                    .volatile
+                    .as_mut_slice()
+                    .get_mut(slot..)
+                    .ok_or(stale)?
+                    .rotate_left(1);
+                let _ = self.pubsub.volatile.pop();
+                self.pubsub.continuation = continuation;
+            }
+            Change::Qos0Done { slot } => {
+                self.pubsub
+                    .volatile
+                    .as_mut_slice()
+                    .get_mut(slot..)
+                    .ok_or(stale)?
+                    .rotate_left(1);
+                let _ = self.pubsub.volatile.pop();
+            }
+            Change::Qos0Idle => self.pubsub.continuation = None,
+            Change::Consume {
+                slot,
+                in_flight,
+                connection,
+            } => {
+                self.pubsub
+                    .deliveries
+                    .as_mut_slice()
+                    .get_mut(slot)
+                    .ok_or(stale)?
+                    .phase = Phase::ConsumePending(in_flight, connection);
+            }
+            Change::Consumed {
+                slot,
+                finished,
+                emission,
+            } => {
+                let d = self
+                    .pubsub
+                    .deliveries
+                    .as_mut_slice()
+                    .get_mut(slot)
+                    .ok_or(stale)?;
+                d.phase = Phase::Qos0Writing(finished);
+                d.claim_result = Some(finished);
+                d.frame = emission;
+                let target = d.target;
+                self.pubsub.invalidate_reads(target);
+                if emission.is_none() {
+                    remember(&mut self.finished, finished)?;
+                    let last = self.pubsub.deliveries.len() - 1;
+                    self.pubsub.deliveries.as_mut_slice().swap(slot, last);
+                    let _ = self.pubsub.deliveries.pop();
+                }
+            }
             Change::Settings { index, value } => match index {
                 Some(i) => {
                     *self
@@ -1282,6 +1819,7 @@ impl Owner {
                                 item.delivery,
                                 item.target,
                                 item.target_revision,
+                                item.qos,
                                 item.claim,
                             );
                             d.topic = Some(item.topic.clone());
@@ -1418,7 +1956,9 @@ impl Owner {
                         .find(|d| d.in_flight().is_some_and(|f| f.operation == operation))
                         .ok_or(stale)?;
                     match &mut d.phase {
-                        Phase::ClaimPending(f) | Phase::FinishPending(f) => f,
+                        Phase::ClaimPending(f)
+                        | Phase::FinishPending(f)
+                        | Phase::ConsumePending(f, _) => f,
                         _ => return Err(stale),
                     }
                 };
