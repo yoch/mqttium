@@ -586,10 +586,59 @@ def operation_floor(state: dict, operation: dict) -> int:
 def wait_control_or_pressure(broker, control, *, after: int, pressure_ready,
                              timeout: float = 12, clock=None):
     """Wait for a business response or its explicit causal pressure witness."""
-    frame = control.poll(.3)
-    if frame is None or (frame.kind == 0x90 and any(code >= 128 for code in decode_filter_ack(frame)[1])):
-        return frame, broker.wait_event("receipt_window_pressure", after=after, timeout=2)
-    return frame, None
+    clock = clock or time.monotonic
+    deadline = clock() + timeout
+    negative = None
+    while clock() < deadline:
+        frame = control.poll(min(.05, deadline - clock()))
+        if frame is not None:
+            if frame.kind != 0x90 or all(code < 128 for code in decode_filter_ack(frame)[1]):
+                return frame, None
+            negative = frame
+        for event in broker.events():
+            if (event["kind"] == "receipt_window_pressure" and int(event["seq"]) > after
+                    and pressure_ready(event)):
+                broker.observations.record("event_retained", event=event)
+                return negative, event
+        require(broker.process.poll() is None, "broker_exited_before_control_response")
+    raise ReceiptFailure("control_response_deadline", "no response or stable causal pressure within action budget")
+
+
+def origin_pressure_state(path: Path, operation: dict) -> dict:
+    """Bounded indexed facts, excluding canonical bodies and unrelated origins."""
+    prefix = bytes.fromhex(operation_hex(operation))[:24]
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        incarnation = connection.execute("SELECT incarnation FROM meta").fetchone()[0]
+        require(incarnation == int(operation["incarnation"]).to_bytes(8, "big"), "pressure_scope_mismatch")
+        row = connection.execute(
+            "SELECT consumed_through FROM receipt_origins WHERE epoch=? AND owner=?",
+            (int(operation["epoch"]).to_bytes(8, "big"), int(operation["owner"]).to_bytes(8, "big"))).fetchone()
+        floor = int.from_bytes(row[0], "big") if row else 0
+        largest = []
+        for table in ("operations", "fences"):
+            value = connection.execute(f"SELECT MAX(id) FROM {table} WHERE id>=? AND id<=?",
+                                       (prefix + bytes(8), prefix + b"\xff" * 8)).fetchone()[0]
+            if value is not None:
+                require(len(value) == 32, "pressure_operation_identity_invalid")
+                largest.append(int.from_bytes(value[24:], "big"))
+        unknown = connection.execute("SELECT 1 FROM operations WHERE id=?",
+                                     (bytes.fromhex(operation_hex(operation)),)).fetchone() is not None
+        maximum = max(largest, default=0)
+        return {"durable_floor": floor, "maximum_retained_sequence": maximum,
+                "retained_span": max(0, maximum - floor), "unknown_receipt_present": unknown}
+    finally:
+        connection.close()
+
+
+def stable_receipt_pressure(event: dict, state: dict, unknown_sequence: int) -> bool:
+    require(state["durable_floor"] < unknown_sequence, "closure_crossed_unknown")
+    require(state["unknown_receipt_present"], "unknown_receipt_deleted")
+    return (state["durable_floor"] == unknown_sequence - 1 and state["retained_span"] >= 768
+            and int(event["details"].get("span", 0)) >= 768
+            and int(event["details"].get("unconsumed_holes", 0)) >= 1)
 
 
 def unknown_hole(binary: Path, case: Path) -> dict:
@@ -597,7 +646,8 @@ def unknown_hole(binary: Path, case: Path) -> dict:
     held = HeldBusiness(broker, case)
     result = {"criterion": "C-pressure", "status": "PASS", "samples": [],
               "parameters": {"business_window": 768, "total_window": 1024,
-                             "attempt_budget": 1025, "result_release_timeout_s": 15}}
+                             "attempt_budget": 1025, "result_release_timeout_s": 15,
+                             "control_response_timeout_s": 12}}
     try:
         result["ready"] = broker.ready()
         result["held_continuations"] = held.prepare()
@@ -621,10 +671,20 @@ def unknown_hole(binary: Path, case: Path) -> dict:
             write_json(case / "hole-before-pressure.json", before)
             positives = 0
             pressure = None
+            pressure_measurements = []
+            def pressure_ready(event):
+                measured = origin_pressure_state(broker.db, operation)
+                stable = stable_receipt_pressure(event, measured, int(operation["sequence"]))
+                pressure_measurements.append({"event_sequence": event["seq"], "stable": stable, **measured})
+                require(len(pressure_measurements) <= 1024, "pressure_measurement_budget")
+                return stable
             for attempt in range(1, 1026):
+                # An older transient pressure report must not stand in for
+                # this request's response after an intervening prefix commit.
+                latest = max(int(event["seq"]) for event in broker.events())
                 control.send(subscribe_packet(1, [("reception/receipt-pressure", attempt % 2)]))
                 frame, pressure = wait_control_or_pressure(
-                    broker, control, after=int(hit["seq"]), pressure_ready=lambda event: True)
+                    broker, control, after=latest, pressure_ready=pressure_ready)
                 if pressure is not None:
                     require(pressure["details"]["code"] in
                             ("receipt_window_business_full", "receipt_window_total_full"),
@@ -645,6 +705,7 @@ def unknown_hole(binary: Path, case: Path) -> dict:
                                               "storage": storage_sample(broker)})
             require(pressure is not None and positives <= 768, "planned_window_pressure_not_reached")
             result["positive_commands_while_hole_open"], result["pressure"] = positives, pressure
+            result["pressure_measurements"] = pressure_measurements
             blocked = durable(broker.db)
             require(operation_floor(blocked, operation) < int(operation["sequence"]), "closure_crossed_unknown")
             require(any(row["id"] == key for row in blocked["tables"]["operations"]), "unknown_receipt_deleted")

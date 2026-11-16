@@ -2,7 +2,7 @@
 from types import SimpleNamespace
 import unittest
 
-from receipt_reception import wait_control_or_pressure
+from receipt_reception import stable_receipt_pressure, wait_control_or_pressure
 from tcp_probe import Frame, ReceiptFailure
 
 
@@ -72,6 +72,22 @@ class ReceiptControlWaitTests(unittest.TestCase):
             pressure_ready=lambda event: False, clock=clock)
         self.assertIs(response, ACK)
         self.assertIsNone(pressure)
+
+    def test_durable_prefix_advance_can_make_pressure_transient(self):
+        before = {"durable_floor": 0, "maximum_retained_sequence": 768,
+                  "retained_span": 768, "unknown_receipt_present": True}
+        after = {**before, "durable_floor": 12, "retained_span": 756}
+        full = {**after, "maximum_retained_sequence": 780, "retained_span": 768}
+        self.assertFalse(stable_receipt_pressure(PRESSURE, before, 13))
+        self.assertFalse(stable_receipt_pressure(PRESSURE, after, 13))
+        self.assertTrue(stable_receipt_pressure(PRESSURE, full, 13))
+
+    def test_silence_without_any_witness_is_an_explicit_deadline(self):
+        clock = Clock()
+        with self.assertRaises(ReceiptFailure) as raised:
+            wait_control_or_pressure(Broker([]), Wire(clock, []), after=1,
+                                     pressure_ready=lambda event: True, clock=clock, timeout=.5)
+        self.assertEqual(raised.exception.code, "control_response_deadline")
 
 
 if __name__ == "__main__":
