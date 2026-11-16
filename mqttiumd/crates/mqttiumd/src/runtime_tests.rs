@@ -82,6 +82,7 @@ fn with_runtime(max_exchanges: u32, test: impl FnOnce(&mut Runtime<'_>, &Path)) 
         inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),
+        terminal_inputs: VecDeque::new(),
         deferred_inputs: VecDeque::new(),
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
@@ -240,7 +241,17 @@ fn until(runtime: &mut Runtime<'_>, condition: impl Fn(&Runtime<'_>) -> bool) {
     }
     assert!(
         condition(runtime),
-        "runtime failed to make bounded progress"
+        "runtime failed to make bounded progress: inputs={:?} control={:?} closing={:?} terminal={:?} sessions={} requests={} lifecycle={:?} frames={} timers={} status={:?}",
+        runtime.inputs,
+        runtime.control_inputs,
+        runtime.closing_inputs,
+        runtime.terminal_inputs,
+        runtime.sessions.len(),
+        runtime.session_requests.len(),
+        runtime.lifecycle_inflight,
+        runtime.frames.len(),
+        runtime.timers.len(),
+        runtime.owner.session_status()
     );
 }
 
@@ -302,7 +313,7 @@ fn closing_qos0_without_collecting_written_retires_the_exact_attempt() {
             !runtime.frames.contains_key(&effect),
             "closed transport must not retain a write receipt forever"
         );
-        assert!(runtime.inputs.iter().any(|i|matches!(i,Input::Qos0EmitRefused{effect:e,connection,reason:Qos0DropReason::ConnectionClosed} if *e==effect && connection.generation==generation)),"the owner must receive exact terminal loss, not lose an accepted effect silently");
+        assert!(runtime.terminal_inputs.iter().any(|i|matches!(i,Input::Qos0EmitRefused{effect:e,connection,reason:Qos0DropReason::ConnectionClosed} if *e==effect && connection.generation==generation)),"the owner must receive exact terminal loss, not lose an accepted effect silently");
         runtime.drain_inputs().unwrap();
     });
 }

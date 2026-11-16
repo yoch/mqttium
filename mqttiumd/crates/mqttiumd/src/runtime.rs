@@ -48,6 +48,11 @@ const INPUTS: usize = 128;
 const OUTGOING_BINDINGS: usize = 128;
 const LIFECYCLE_IN_FLIGHT: usize = 1;
 const CLOSING_INPUTS: usize = 2 * CONNECTIONS;
+// Per transport: four queued frames, one active and eight terminal receipts.
+const FRAMES: usize = CONNECTIONS * (net::OUTPUT_SLOTS + 9);
+// A close can retire every accepted frame while an outbox-sized set of
+// synchronously refused volatile effects also awaits its exact owner fact.
+const TERMINAL_INPUTS: usize = FRAMES + 128;
 const BOUNDS: Bounds = Bounds {
     max_packet: 65536,
     max_client_id: 1024,
@@ -138,6 +143,7 @@ struct Runtime<'a> {
     inputs: VecDeque<Input>,
     control_inputs: VecDeque<Input>,
     closing_inputs: VecDeque<Input>,
+    terminal_inputs: VecDeque<Input>,
     deferred_inputs: VecDeque<Input>,
     timers: BTreeMap<DeadlineToken, Instant>,
     inflight: BTreeMap<EffectId, OperationId>,
@@ -179,6 +185,17 @@ struct Runtime<'a> {
 }
 impl Runtime<'_> {
     fn queue(&mut self, input: Input) -> Result<(), Failure> {
+        if Self::terminal_input(&input) {
+            if self.terminal_inputs.iter().any(|queued| queued == &input) {
+                return Ok(());
+            }
+            if self.terminal_inputs.len() >= TERMINAL_INPUTS {
+                return Err(Failure::plain("terminal_input_budget"));
+            }
+            self.terminal_inputs.push_back(input);
+            self.session_cardinality_dirty = true;
+            return Ok(());
+        }
         if Self::closing_input(&input) {
             // At most one close and one explicit end per configured transport.
             // Retried facts remain here while another lifecycle command runs.
@@ -205,6 +222,12 @@ impl Runtime<'_> {
         self.inputs.push_back(input);
         Ok(())
     }
+    fn terminal_input(input: &Input) -> bool {
+        matches!(
+            input,
+            Input::FrameResult { .. } | Input::Qos0EmitRefused { .. }
+        )
+    }
     fn closing_input(input: &Input) -> bool {
         matches!(
             input,
@@ -215,7 +238,8 @@ impl Runtime<'_> {
         matches!(
             input,
             Input::ReceiptsCollected { .. } | Input::MaintainReceipts
-        ) || matches!(input,Input::Deadline {token,..} if self.owner.collection_deadline_is_live(*token))
+        ) || matches!(input, Input::StoreResult { operation, .. } if self.owner.lifecycle_operation_is_live(*operation))
+            || matches!(input,Input::Deadline {token,..} if self.owner.collection_deadline_is_live(*token) || self.owner.lifecycle_dispatch().is_some_and(|(_,deadline)| deadline == *token))
     }
     fn close(
         &mut self,
@@ -224,6 +248,26 @@ impl Runtime<'_> {
     ) -> Result<(), Failure> {
         if let Some(peer) = self.peers.remove(&generation) {
             self.session_cardinality_dirty = true;
+            // Frame failure can unbind the core before ConnectionClosed is
+            // applied. Preserve this transport's confirmed zero-expiry guard
+            // independently; neither a cache lookup nor its current binding
+            // can recover that authority afterwards.
+            if peer.connect_expiry == SessionExpiry::OnDisconnect
+                && let Some(session) = peer.session
+            {
+                self.queue(Input::EndSession {
+                    connection: ConnectionKey {
+                        session,
+                        generation,
+                    },
+                    opened_by: peer.opened_by,
+                    reason: if code == "client_disconnect" {
+                        SessionEndReason::Disconnect
+                    } else {
+                        SessionEndReason::TransportLost
+                    },
+                })?;
+            }
             self.session_requests.retain(|_, pending| {
                 pending.connection != generation || pending.operation.is_some()
             });
@@ -352,7 +396,11 @@ impl Runtime<'_> {
                                 generation,
                             },
                             opened_by: Some(changed_by),
-                            reason: SessionEndReason::TransportLost,
+                            reason: if zero_end {
+                                SessionEndReason::Disconnect
+                            } else {
+                                SessionEndReason::TransportLost
+                            },
                         })?;
                     } else {
                         self.queue(Input::ConnectionClosed {
@@ -502,7 +550,11 @@ impl Runtime<'_> {
     fn drain_inputs(&mut self) -> Result<(), Failure> {
         let mut control_budget = crate::writer::CONTROL_QUEUE;
         let mut closing_budget = self.closing_inputs.len().min(CONNECTIONS);
-        for _ in 0..(self.inputs.len() + self.control_inputs.len() + closing_budget).min(64) {
+        let mut terminal_budget = self.terminal_inputs.len().min(CONNECTIONS);
+        for _ in
+            0..(self.inputs.len() + self.control_inputs.len() + closing_budget + terminal_budget)
+                .min(64)
+        {
             let control = if control_budget > 0 {
                 self.control_inputs.pop_front()
             } else {
@@ -514,6 +566,14 @@ impl Runtime<'_> {
                     if closing_budget > 0 {
                         closing_budget -= 1;
                         self.pop_closing_input()
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    if terminal_budget > 0 {
+                        terminal_budget -= 1;
+                        self.terminal_inputs.pop_front()
                     } else {
                         None
                     }
@@ -750,6 +810,9 @@ impl Runtime<'_> {
                             self.events.emit("input_capacity_refused",json!({"connection":connection.get().to_string(),"details":{"accepted_command_rejected":false}})).map_err(event_failure)?;
                             self.close(connection, "input_capacity")?;
                         }
+                        other if Self::terminal_input(&other) => {
+                            self.terminal_inputs.push_back(other)
+                        }
                         other if Self::closing_input(&other) => {
                             self.closing_inputs.push_back(other)
                         }
@@ -823,8 +886,12 @@ impl Runtime<'_> {
             .map(|(token, _)| *token)
             .collect();
         for token in due {
-            let collector = self.owner.collection_deadline_is_live(token);
-            let room = if collector {
+            let reserved = self.owner.collection_deadline_is_live(token)
+                || self
+                    .owner
+                    .lifecycle_dispatch()
+                    .is_some_and(|(_, deadline)| deadline == token);
+            let room = if reserved {
                 self.control_inputs.len() < crate::writer::CONTROL_QUEUE
             } else {
                 self.inputs.len() + self.deferred_inputs.len() < INPUTS
@@ -871,6 +938,7 @@ impl Runtime<'_> {
             releasing_qos0: false,
             timers: &mut self.timers,
             inputs: &mut self.inputs,
+            terminal_inputs: &mut self.terminal_inputs,
             deferred_count: self.deferred_inputs.len(),
             frames: &mut self.frames,
             outgoing_bindings: &mut self.outgoing_bindings,
@@ -2016,6 +2084,7 @@ struct Sink<'a> {
     releasing_qos0: bool,
     timers: &'a mut BTreeMap<DeadlineToken, Instant>,
     inputs: &'a mut VecDeque<Input>,
+    terminal_inputs: &'a mut VecDeque<Input>,
     deferred_count: usize,
     frames: &'a mut BTreeMap<EffectId, PendingFrame>,
     outgoing_bindings: &'a mut BTreeMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
@@ -2187,7 +2256,7 @@ impl EffectSink for Sink<'_> {
                 payload,
             } => {
                 let (connection, origin) = (*connection, *origin);
-                if self.inputs.len() + self.deferred_count >= INPUTS {
+                if self.terminal_inputs.len() >= TERMINAL_INPUTS || self.frames.len() >= FRAMES {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
                 #[cfg(feature = "test-hooks")]
@@ -2264,7 +2333,7 @@ impl EffectSink for Sink<'_> {
                         );
                         if self.events.emit("frame_queued",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","qos":0,"origin":qos0_origin(origin),"effect":effect_text(id)}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                     }
-                    Err(reason) => self.inputs.push_back(Input::Qos0EmitRefused {
+                    Err(reason) => self.terminal_inputs.push_back(Input::Qos0EmitRefused {
                         effect: id,
                         connection,
                         reason,
@@ -2455,7 +2524,10 @@ impl EffectSink for Sink<'_> {
                 };
                 let generation = connection.generation;
                 let (kind, packet_id) = frame_info(frame);
-                if self.inputs.len() + self.deferred_count >= INPUTS {
+                if self.terminal_inputs.len() >= TERMINAL_INPUTS
+                    || self.frames.len() >= FRAMES
+                    || (kind == "CONNACK" && self.inputs.len() + self.deferred_count >= INPUTS)
+                {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
                 let Some(peer) = self.peers.get_mut(&generation).filter(|peer| {
@@ -2464,7 +2536,7 @@ impl EffectSink for Sink<'_> {
                 }) else {
                     let _ = effect.into_parts();
                     if self.events.emit("frame_failed",json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(id),"packet_kind":kind,"code":"unusable_generation"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
-                    self.inputs.push_back(Input::FrameResult {
+                    self.terminal_inputs.push_back(Input::FrameResult {
                         effect: id,
                         connection,
                         progress: FrameProgress::Failed,
@@ -2644,7 +2716,7 @@ impl EffectSink for Sink<'_> {
             } => {
                 let (connection, delivery, packet_id, claim, dup) =
                     (*connection, *delivery, *packet_id, *claim, *dup);
-                if self.inputs.len() + self.deferred_count >= INPUTS {
+                if self.terminal_inputs.len() >= TERMINAL_INPUTS || self.frames.len() >= FRAMES {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
                 let generation = connection.generation;
@@ -2653,7 +2725,7 @@ impl EffectSink for Sink<'_> {
                         && self.bindings.get(&connection.session) == Some(&generation)
                 }) else {
                     let _ = effect.into_parts();
-                    self.inputs.push_back(Input::FrameResult {
+                    self.terminal_inputs.push_back(Input::FrameResult {
                         effect: id,
                         connection,
                         progress: FrameProgress::Failed,
@@ -2786,7 +2858,7 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
                 json!({"action":"Open","clean_start":clean_start,"expiry":format!("{expiry:?}"),"expected_session":expected.map(|g|g.session.get().to_string())})
             }
             SessionAction::Close { guard, reason } => {
-                json!({"action":"Close","session":guard.session.get().to_string(),"opened_by":guard.opened_by.map(operation),"reason":format!("{reason:?}")})
+                json!({"action":"Close","session":guard.session.get().to_string(),"opened_by":guard.opened_by.map(operation_text).unwrap_or_default(),"reason":format!("{reason:?}")})
             }
         },
         Recipe::ConsumeDelivery(c) => {
@@ -2978,6 +3050,7 @@ fn run_inner(
         inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
         closing_inputs: VecDeque::new(),
+        terminal_inputs: VecDeque::new(),
         deferred_inputs: VecDeque::new(),
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
