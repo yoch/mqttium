@@ -47,3 +47,17 @@
   compiles and fails exactly observed_puback_rebound; three pure transition
   mutants retain their separate scope. The final clean wrapper reruns these
   before strict65537 plus reverse clients; no prior source is relabeled.
+- First publication9e653055 remains draft/unmerged. Local exact9e pub/sub,
+  QoS0 and receipt-GC receptions pass; their own archives retain that source.
+  Its PI normal run stops at7746 wire receptions after the collector misses
+  an inode-reused log generation; actual Finish seq117302 exists in that run.
+  Retain the original FAIL and incomplete-run analysis, never count it as a
+  mutation detection. Collector red9e19f6b7/fix83188305 (root796d8319/dfe5cbcb)
+  adds two real-file generation regressions; all57 system pilots pass.
+- Takeover CI's generic aggregate wait has no recoverable original phase.
+  Real-response relay red2ce97b95/fixaea65c4e (rootb65cb718/59b0d12a) separately
+  proves controls progress with16 correlated replies held, then drains each
+  exact effect within the unchanged one-second bound. Only test code changes;
+  normal/instrumented target, fmt, strict workspace Clippy and validate11 pass.
+  Freeze the integrated source and rerun the entire strict65537 wrapper;
+  publish with expected9e653055 ancestry/lease and verify its own CI/artifacts.

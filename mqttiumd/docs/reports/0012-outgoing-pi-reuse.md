@@ -144,6 +144,32 @@ existing receipt/pubsub/QoS 0/1/2, models/proof and K1/K2b/K3 gates keep their
 separate results, exact identities and limits. Final counts/check identities
 are recorded by the final receipt/index rather than inherited from 66d2.
 
+## Reception follow-ups after the first publication
+
+The first complete-launch attempt at 9e653055 stopped in the normal long case
+after 7,746 wire receptions/PUBACKs. The original FAIL receipt is retained:
+the collector reported durable_finish_not_observed, while the same run's SQL
+state and rotated event log establish Finish application at sequence 117302.
+An inode reused on the second log rotation made the collector reuse an old
+offset. Red 9e19f6b7 exercises two real-file rotations with inode reuse; fix
+83188305 keys the bounded cursor by inode and the file's first event sequence.
+Both short-timeout and larger-replacement variants discriminate the defect.
+The full 65,537 case must start afresh; this incomplete run is neither a
+successful reception nor an invariant mutation detection.
+
+The same publication's CI exposed the takeover regression's aggregate
+quiescence wait. Its original scheduling phase is not recoverable from that
+log. A controlled real-response relay (red 2ce97b95) establishes the narrower
+test defect: old-peer Close and replacement CONNACK have progressed while
+sixteen genuine correlated store replies are intentionally held. Fix aea65c4e
+checks replacement and independent-peer PINGRESP before releasing those
+replies, then requires each exact effect to progress under the unchanged
+one-second bound. It does not change production code or claim to establish a
+production stall. Normal/instrumented targeted tests, strict workspace Clippy,
+formatting and validation pass. The 57 system pilot tests include the two
+new collector regressions. Final source, run counts and CI remain bound by
+the final receipt/index and PR rather than inherited from this failed attempt.
+
 ## Remaining bounds and next increment
 
 The existing 128-session persistent/infinite-expiry bound remains; absent
