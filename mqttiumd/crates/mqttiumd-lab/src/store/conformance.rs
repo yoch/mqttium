@@ -3324,80 +3324,179 @@ pub fn outgoing_packet_reuse_preserves_claim_identity<S: DurableStore>(
 pub fn live_receipt_collection_is_bounded_and_never_reexecutes<S: DurableStore>(
     make: &dyn Fn(StoreIncarnation, Limits) -> S,
 ) {
-    use mqttiumd_contract::receipts::{ReceiptClosure, ReceiptCollection, ReceiptCollectionReply, ReceiptOrigin};
+    use mqttiumd_contract::receipts::{
+        ReceiptClosure, ReceiptCollection, ReceiptCollectionReply, ReceiptOrigin,
+    };
     let mut limits = fixture_limits();
     limits.receipt_slots = ReceiptSlots::new(2048);
     let mut world = World::with_limits(make, limits);
     let origin = ReceiptOrigin::of(operation_id(world.epoch, 1));
     let empty = ReceiptClosure::empty(origin);
     let collect = |closure, limit| ReceiptCollection { closure, limit };
-    assert_eq!(world.store.collect_receipts(collect(empty, 1)), Ok(ReceiptCollectionReply::Applied {
-        closure: empty, removed: 0, retained: 0, more: false,
-    }));
-    let admission = |world: &World<S>, seq| altered(&world.admission(seq, 7, b"same", &[]), |admit| {
-        admit.qos = Qos::AtLeastOnce;
-        admit.costs.exchange_slots = ExchangeSlots::ZERO;
-    });
+    assert_eq!(
+        world.store.collect_receipts(collect(empty, 1)),
+        Ok(ReceiptCollectionReply::Applied {
+            closure: empty,
+            removed: 0,
+            retained: 0,
+            more: false,
+        })
+    );
+    let admission = |world: &World<S>, seq| {
+        altered(&world.admission(seq, 7, b"same", &[]), |admit| {
+            admit.qos = Qos::AtLeastOnce;
+            admit.costs.exchange_slots = ExchangeSlots::ZERO;
+        })
+    };
     let first = admission(&world, 1);
     assert!(world.store.apply(&first).committed_now);
-    assert!(world.store.resolve_and_fence(operation_id(world.epoch, 2)).fenced_now);
-    for seq in 3..=4 { assert!(world.store.apply(&admission(&world, seq)).committed_now); }
+    assert!(
+        world
+            .store
+            .resolve_and_fence(operation_id(world.epoch, 2))
+            .fenced_now
+    );
+    for seq in 3..=4 {
+        assert!(world.store.apply(&admission(&world, seq)).committed_now);
+    }
     let closure = ReceiptClosure {
-        through: OperationSeq::new(4), publication_through: PublicationSeq::new(4),
-        payload_through: PayloadSeq::new(4), ..empty
+        through: OperationSeq::new(4),
+        publication_through: PublicationSeq::new(4),
+        payload_through: PayloadSeq::new(4),
+        ..empty
     };
     for remaining in (0..=3).rev() {
-        assert_eq!(world.store.collect_receipts(collect(closure, 1)), Ok(ReceiptCollectionReply::Applied {
-            closure, removed: 1, retained: remaining, more: remaining != 0,
-        }));
+        assert_eq!(
+            world.store.collect_receipts(collect(closure, 1)),
+            Ok(ReceiptCollectionReply::Applied {
+                closure,
+                removed: 1,
+                retained: remaining,
+                more: remaining != 0,
+            })
+        );
         assert_eq!(world.store.receipt_frontier(origin), Ok(Some(closure)));
-        assert_eq!(world.store.established(first.recipe.operation()), Ok(Some(StoreOutcome::RetiredOutcomeUnavailable)));
-        assert_eq!(outcome(world.store.apply(&first).reply), StoreOutcome::RetiredOutcomeUnavailable);
+        assert_eq!(
+            world.store.established(first.recipe.operation()),
+            Ok(Some(StoreOutcome::RetiredOutcomeUnavailable))
+        );
+        assert_eq!(
+            outcome(world.store.apply(&first).reply),
+            StoreOutcome::RetiredOutcomeUnavailable
+        );
         let different = altered(&first, |admit| admit.retain = true);
-        assert_eq!(outcome(world.store.apply(&different).reply), StoreOutcome::RetiredOutcomeUnavailable);
-        assert_eq!(world.store.snapshot().unwrap().accounts.receipt_slots.get(), remaining);
+        assert_eq!(
+            outcome(world.store.apply(&different).reply),
+            StoreOutcome::RetiredOutcomeUnavailable
+        );
+        assert_eq!(
+            world.store.snapshot().unwrap().accounts.receipt_slots.get(),
+            remaining
+        );
     }
     let before = world.store.snapshot().unwrap();
-    assert_eq!(world.store.collect_receipts(collect(closure, 1)), Ok(ReceiptCollectionReply::Applied {
-        closure, removed: 0, retained: 0, more: false,
-    }));
+    assert_eq!(
+        world.store.collect_receipts(collect(closure, 1)),
+        Ok(ReceiptCollectionReply::Applied {
+            closure,
+            removed: 0,
+            retained: 0,
+            more: false,
+        })
+    );
     assert_eq!(world.store.snapshot().unwrap().accounts, before.accounts);
-    assert!(world.store.apply(&admission(&world, 5)).committed_now, "the epoch stays live");
+    assert!(
+        world.store.apply(&admission(&world, 5)).committed_now,
+        "the epoch stays live"
+    );
 }
 
 /// No absent sequence can be closed on the strength of a later receipt.
 pub fn live_receipt_collection_refuses_holes_and_preserves_identity_guards<S: DurableStore>(
     make: &dyn Fn(StoreIncarnation, Limits) -> S,
 ) {
-    use mqttiumd_contract::receipts::{ReceiptClosure, ReceiptCollection, ReceiptCollectionRefusal, ReceiptCollectionReply, ReceiptOrigin};
+    use mqttiumd_contract::receipts::{
+        ReceiptClosure, ReceiptCollection, ReceiptCollectionRefusal, ReceiptCollectionReply,
+        ReceiptOrigin,
+    };
     let mut limits = fixture_limits();
     limits.receipt_slots = ReceiptSlots::new(2048);
     let mut world = World::with_limits(make, limits);
     let empty = ReceiptClosure::empty(ReceiptOrigin::of(operation_id(world.epoch, 1)));
-    let request = |closure| ReceiptCollection { closure, limit: 128 };
-    assert!(matches!(world.store.collect_receipts(request(empty)), Ok(ReceiptCollectionReply::Applied { .. })));
-    let admission = |world: &World<S>, seq| altered(&world.admission(seq, 7, b"payload", &[]), |admit| {
-        admit.qos = Qos::AtLeastOnce; admit.costs.exchange_slots = ExchangeSlots::ZERO;
-    });
-    for seq in [3, 1] { assert!(world.store.apply(&admission(&world, seq)).committed_now); }
-    let closure = ReceiptClosure { through: OperationSeq::new(3), publication_through: PublicationSeq::new(3), payload_through: PayloadSeq::new(3), ..empty };
+    let request = |closure| ReceiptCollection {
+        closure,
+        limit: 128,
+    };
+    assert!(matches!(
+        world.store.collect_receipts(request(empty)),
+        Ok(ReceiptCollectionReply::Applied { .. })
+    ));
+    let admission = |world: &World<S>, seq| {
+        altered(&world.admission(seq, 7, b"payload", &[]), |admit| {
+            admit.qos = Qos::AtLeastOnce;
+            admit.costs.exchange_slots = ExchangeSlots::ZERO;
+        })
+    };
+    for seq in [3, 1] {
+        assert!(world.store.apply(&admission(&world, seq)).committed_now);
+    }
+    let closure = ReceiptClosure {
+        through: OperationSeq::new(3),
+        publication_through: PublicationSeq::new(3),
+        payload_through: PayloadSeq::new(3),
+        ..empty
+    };
     let before = world.store.snapshot().unwrap();
-    assert_eq!(world.store.collect_receipts(request(closure)), Ok(ReceiptCollectionReply::Refused(ReceiptCollectionRefusal::Gap)));
+    assert_eq!(
+        world.store.collect_receipts(request(closure)),
+        Ok(ReceiptCollectionReply::Refused(
+            ReceiptCollectionRefusal::Gap
+        ))
+    );
     assert_eq!(world.store.snapshot().unwrap(), before);
-    assert!(world.store.resolve_and_fence(operation_id(world.epoch, 2)).fenced_now);
-    assert!(matches!(world.store.collect_receipts(request(closure)), Ok(ReceiptCollectionReply::Applied { removed: 3, .. })));
+    assert!(
+        world
+            .store
+            .resolve_and_fence(operation_id(world.epoch, 2))
+            .fenced_now
+    );
+    assert!(matches!(
+        world.store.collect_receipts(request(closure)),
+        Ok(ReceiptCollectionReply::Applied { removed: 3, .. })
+    ));
     for payload in [false, true] {
         let sequence = if payload { 5 } else { 4 };
         let alias = altered(&admission(&world, sequence), |admit| {
-            if payload { admit.payload.id = PayloadId::new(INCARNATION, world.epoch, OWNER, PayloadSeq::new(1)); }
-            else { admit.publication = publication_id(world.epoch, 1); }
+            if payload {
+                admit.payload.id =
+                    PayloadId::new(INCARNATION, world.epoch, OWNER, PayloadSeq::new(1));
+            } else {
+                admit.publication = publication_id(world.epoch, 1);
+            }
         });
-        assert_eq!(outcome(world.store.apply(&alias).reply), StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed));
-        assert!(world.store.snapshot().unwrap().operations.contains_key(&alias.recipe.operation()), "an alias refusal itself closes its new operation durably");
-        assert_eq!(world.store.apply(&admission(&world, sequence)).reply, StoreReply::Violation(StoreViolation::RecipeMismatch));
+        assert_eq!(
+            outcome(world.store.apply(&alias).reply),
+            StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed)
+        );
+        assert!(
+            world
+                .store
+                .snapshot()
+                .unwrap()
+                .operations
+                .contains_key(&alias.recipe.operation()),
+            "an alias refusal itself closes its new operation durably"
+        );
+        assert_eq!(
+            world.store.apply(&admission(&world, sequence)).reply,
+            StoreReply::Violation(StoreViolation::RecipeMismatch)
+        );
     }
     assert!(world.store.apply(&admission(&world, 6)).committed_now);
-    assert_eq!(accounts_match_what_is_held(&world.store.snapshot().unwrap()), Ok(()));
+    assert_eq!(
+        accounts_match_what_is_held(&world.store.snapshot().unwrap()),
+        Ok(())
+    );
 }
 
 /// Full business capacity cannot consume the room required to fence a hole;
@@ -3405,21 +3504,62 @@ pub fn live_receipt_collection_refuses_holes_and_preserves_identity_guards<S: Du
 pub fn live_receipt_collection_has_a_control_reserve<S: DurableStore>(
     make: &dyn Fn(StoreIncarnation, Limits) -> S,
 ) {
-    use mqttiumd_contract::receipts::{ReceiptClosure, ReceiptCollection, ReceiptCollectionReply, ReceiptOrigin, RECEIPT_CONTROL_RESERVE};
+    use mqttiumd_contract::receipts::{
+        RECEIPT_CONTROL_RESERVE, ReceiptClosure, ReceiptCollection, ReceiptCollectionReply,
+        ReceiptOrigin,
+    };
     let mut limits = fixture_limits();
     limits.receipt_slots = ReceiptSlots::new(RECEIPT_CONTROL_RESERVE + 2);
     let mut world = World::with_limits(make, limits);
     let empty = ReceiptClosure::empty(ReceiptOrigin::of(operation_id(world.epoch, 1)));
-    assert!(matches!(world.store.collect_receipts(ReceiptCollection { closure: empty, limit: 128 }), Ok(ReceiptCollectionReply::Applied { .. })));
-    let admission = |world: &World<S>, seq| altered(&world.admission(seq, 7, b"p", &[]), |admit| {
-        admit.qos = Qos::AtLeastOnce; admit.costs.exchange_slots = ExchangeSlots::ZERO;
-    });
-    for seq in 1..=2 { assert!(world.store.apply(&admission(&world, seq)).committed_now); }
-    assert_eq!(outcome(world.store.apply(&admission(&world, 3)).reply), StoreOutcome::PendingOrUnknown);
-    assert_eq!(world.store.snapshot().unwrap().accounts.receipt_slots.get(), 2);
-    assert!(world.store.resolve_and_fence(operation_id(world.epoch, 3)).fenced_now);
-    let closure = ReceiptClosure { through: OperationSeq::new(3), publication_through: PublicationSeq::new(3), payload_through: PayloadSeq::new(3), ..empty };
-    assert_eq!(world.store.collect_receipts(ReceiptCollection { closure, limit: 128 }), Ok(ReceiptCollectionReply::Applied { closure, removed: 3, retained: 0, more: false }));
+    assert!(matches!(
+        world.store.collect_receipts(ReceiptCollection {
+            closure: empty,
+            limit: 128
+        }),
+        Ok(ReceiptCollectionReply::Applied { .. })
+    ));
+    let admission = |world: &World<S>, seq| {
+        altered(&world.admission(seq, 7, b"p", &[]), |admit| {
+            admit.qos = Qos::AtLeastOnce;
+            admit.costs.exchange_slots = ExchangeSlots::ZERO;
+        })
+    };
+    for seq in 1..=2 {
+        assert!(world.store.apply(&admission(&world, seq)).committed_now);
+    }
+    assert_eq!(
+        outcome(world.store.apply(&admission(&world, 3)).reply),
+        StoreOutcome::PendingOrUnknown
+    );
+    assert_eq!(
+        world.store.snapshot().unwrap().accounts.receipt_slots.get(),
+        2
+    );
+    assert!(
+        world
+            .store
+            .resolve_and_fence(operation_id(world.epoch, 3))
+            .fenced_now
+    );
+    let closure = ReceiptClosure {
+        through: OperationSeq::new(3),
+        publication_through: PublicationSeq::new(3),
+        payload_through: PayloadSeq::new(3),
+        ..empty
+    };
+    assert_eq!(
+        world.store.collect_receipts(ReceiptCollection {
+            closure,
+            limit: 128
+        }),
+        Ok(ReceiptCollectionReply::Applied {
+            closure,
+            removed: 3,
+            retained: 0,
+            more: false
+        })
+    );
     assert!(world.store.apply(&admission(&world, 4)).committed_now);
 }
 
@@ -3427,16 +3567,31 @@ pub fn live_receipt_collection_has_a_control_reserve<S: DurableStore>(
 pub fn live_receipt_registration_preserves_legacy_zero<S: DurableStore>(
     make: &dyn Fn(StoreIncarnation, Limits) -> S,
 ) {
-    use mqttiumd_contract::receipts::{ReceiptClosure, ReceiptCollection, ReceiptCollectionRefusal, ReceiptCollectionReply, ReceiptOrigin};
+    use mqttiumd_contract::receipts::{
+        ReceiptClosure, ReceiptCollection, ReceiptCollectionRefusal, ReceiptCollectionReply,
+        ReceiptOrigin,
+    };
     let mut world = World::new(make);
     let zero = altered(&world.admission(0, 7, b"gone", &[]), |admit| {
-        admit.qos = Qos::AtLeastOnce; admit.costs.exchange_slots = ExchangeSlots::ZERO;
+        admit.qos = Qos::AtLeastOnce;
+        admit.costs.exchange_slots = ExchangeSlots::ZERO;
     });
     assert!(world.store.apply(&zero).committed_now);
     let before = world.store.snapshot().unwrap();
     assert!(before.publications.is_empty() && before.payloads.is_empty());
     let closure = ReceiptClosure::empty(ReceiptOrigin::of(zero.recipe.operation()));
-    assert_eq!(world.store.collect_receipts(ReceiptCollection { closure, limit: 128 }), Ok(ReceiptCollectionReply::Refused(ReceiptCollectionRefusal::InvalidFrontier)));
+    assert_eq!(
+        world.store.collect_receipts(ReceiptCollection {
+            closure,
+            limit: 128
+        }),
+        Ok(ReceiptCollectionReply::Refused(
+            ReceiptCollectionRefusal::InvalidFrontier
+        ))
+    );
     assert_eq!(world.store.snapshot().unwrap(), before);
-    assert!(matches!(outcome(world.store.apply(&zero).reply), StoreOutcome::Committed(_)));
+    assert!(matches!(
+        outcome(world.store.apply(&zero).reply),
+        StoreOutcome::Committed(_)
+    ));
 }

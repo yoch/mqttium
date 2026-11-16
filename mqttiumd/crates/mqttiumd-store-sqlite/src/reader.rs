@@ -201,7 +201,7 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
         budget.check_field(24)?;
     }
     meter.charge(256)?;
-    let tables: [(&str, &[(usize, usize)]); 9] = [
+    let tables: [(&str, &[(usize, usize)]); 10] = [
         (
             "SELECT id, client_id, revision, state FROM sessions",
             &[(0, 8), (1, MAX_CLIENT_ID_BYTES), (2, 8)],
@@ -221,6 +221,10 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
             ],
         ),
         ("SELECT id FROM fences", &[(0, 32)]),
+        (
+            "SELECT epoch,owner,consumed_through,publication_through,payload_through FROM receipt_origins",
+            &[(0, 8), (1, 8), (2, 8), (3, 8), (4, 8)],
+        ),
         (
             "SELECT id, operation, source, topic, qos, retain, payload FROM publications",
             &[

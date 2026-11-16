@@ -1,11 +1,11 @@
-//! The schema of version 3. Every table is `STRICT`; identities and 64-bit
+//! The schema of version 4. Every table is `STRICT`; identities and 64-bit
 //! values are 8-byte big-endian BLOBs (32 bytes for an operation-scoped
 //! identity, 16 for an exchange, 24 for an opening attempt); large BLOBs
 //! come last in their row.
 
 /// `PRAGMA user_version` of the schema below. Any other version is
 /// refused before anything is written.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// The format named in `meta`.
 pub const FORMAT: &str = "mqttiumd-store-sqlite";
@@ -64,6 +64,15 @@ CREATE TABLE operations (
 
 CREATE TABLE fences (
     id BLOB PRIMARY KEY CHECK (length(id) = 32)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE receipt_origins (
+    epoch BLOB NOT NULL CHECK (length(epoch) = 8),
+    owner BLOB NOT NULL CHECK (length(owner) = 8),
+    consumed_through BLOB NOT NULL CHECK (length(consumed_through) = 8),
+    publication_through BLOB NOT NULL CHECK (length(publication_through) = 8),
+    payload_through BLOB NOT NULL CHECK (length(payload_through) = 8),
+    PRIMARY KEY (epoch, owner)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE publications (

@@ -48,6 +48,7 @@
 mod codec;
 mod pubsub;
 mod reader;
+mod receipts;
 mod schema;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -80,6 +81,11 @@ use mqttiumd_store_api::{
     ObligationRecord, OperationRecord, OutboundRecord, PayloadRecord, PublicationRecord,
     ReadBudget, ReadError, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved, RouteTarget,
     SessionRecord, SessionState, WorkPage,
+};
+
+use mqttiumd_contract::receipts::{
+    ClosedReceiptCollection, ClosedReceiptReply, ReceiptClass, ReceiptClosure, ReceiptCollection,
+    ReceiptCollectionReply, ReceiptOrigin,
 };
 
 use codec::{
@@ -130,6 +136,38 @@ pub mod kill_points {
             && let Some(hook) = hook.as_mut()
         {
             hook(point);
+        }
+    }
+}
+
+/// Test-only receipt-control barriers, distinct from command kill points.
+#[cfg(feature = "kill-points")]
+pub mod receipt_points {
+    use mqttiumd_contract::receipts::ReceiptCollection;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum ReceiptPoint {
+        ClosePrepared,
+        CloseCommitted,
+    }
+
+    impl ReceiptPoint {
+        #[must_use]
+        pub const fn name(self) -> &'static str {
+            match self {
+                Self::ClosePrepared => "receipt.close.prepared",
+                Self::CloseCommitted => "receipt.close.committed",
+            }
+        }
+    }
+
+    pub type Hook = Box<dyn FnMut(ReceiptPoint, ReceiptCollection) + Send>;
+    pub(crate) type Shared = std::sync::Arc<std::sync::Mutex<Option<Hook>>>;
+    pub(crate) fn pass(shared: &Shared, point: ReceiptPoint, collection: ReceiptCollection) {
+        if let Ok(mut hook) = shared.lock()
+            && let Some(hook) = hook.as_mut()
+        {
+            hook(point, collection);
         }
     }
 }
@@ -603,6 +641,13 @@ fn established(
             StoreOutcome::RetiredOutcomeUnavailable,
         ));
     }
+    if receipts::frontier(conn, meta, ReceiptOrigin::of(operation))?
+        .is_some_and(|closure| operation.sequence() <= closure.through)
+    {
+        return Ok(Established::Outcome(
+            StoreOutcome::RetiredOutcomeUnavailable,
+        ));
+    }
     if let Some(record) = read_operation(conn, operation)? {
         return Ok(Established::Outcome(match record.decision {
             Decision::Committed(facts) => StoreOutcome::Committed(facts),
@@ -666,6 +711,14 @@ fn admission_identity_was_used(
     admit: &AdmitPublication,
 ) -> Result<bool, Fault> {
     let operation = admit.operation;
+    if let Some(closure) = receipts::frontier(conn, meta, ReceiptOrigin::of(operation))?
+        && ((!receipts::MUTANT_ALLOW_OLD_PUBLICATION
+            && admit.publication.sequence() <= closure.publication_through)
+            || (!receipts::MUTANT_ALLOW_OLD_PAYLOAD
+                && admit.payload.id.sequence() <= closure.payload_through))
+    {
+        return Ok(true);
+    }
     let bound = |sequence| {
         OperationId::new(
             operation.incarnation(),
@@ -1383,6 +1436,8 @@ pub struct SqliteStore {
     #[cfg(feature = "kill-points")]
     kill_hook: kill_points::Shared,
     #[cfg(feature = "kill-points")]
+    receipt_hook: receipt_points::Shared,
+    #[cfg(feature = "kill-points")]
     autocheckpoint_before_hook: Option<i64>,
     _writer_lock: WriterLease,
 }
@@ -1525,6 +1580,8 @@ impl SqliteStore {
             #[cfg(feature = "kill-points")]
             kill_hook: kill_points::Shared::default(),
             #[cfg(feature = "kill-points")]
+            receipt_hook: receipt_points::Shared::default(),
+            #[cfg(feature = "kill-points")]
             autocheckpoint_before_hook: None,
             _writer_lock: lock,
         })
@@ -1595,6 +1652,85 @@ impl SqliteStore {
             self.settings.checkpoint_policy = "sqlite-autocheckpoint";
         }
         Ok(())
+    }
+
+    /// Installs barriers carrying the real control, never a fabricated command.
+    #[cfg(feature = "kill-points")]
+    pub fn set_receipt_hook(&mut self, hook: Option<receipt_points::Hook>) {
+        if let Ok(mut installed) = self.receipt_hook.lock() {
+            *installed = hook;
+        }
+    }
+
+    fn collect_receipts_transaction(
+        &mut self,
+        collection: ReceiptCollection,
+    ) -> Result<ReceiptCollectionReply, ReadError> {
+        let failing = self.durability == Durability::Failing;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| reader::sql_error(&error))?;
+        let mut meta = read_meta(&tx).map_err(|fault| fault.read_error())?;
+        let (reply, changed) =
+            receipts::prepare(&tx, &mut meta, collection).map_err(|fault| fault.read_error())?;
+        if !changed {
+            return Ok(reply);
+        }
+        let Some(revision) = meta.revision.checked_add(1) else {
+            return Ok(ReceiptCollectionReply::Refused(
+                mqttiumd_contract::receipts::ReceiptCollectionRefusal::Exhausted,
+            ));
+        };
+        meta.revision = revision;
+        write_meta(&tx, &meta).map_err(|fault| fault.read_error())?;
+        #[cfg(feature = "kill-points")]
+        receipt_points::pass(
+            &self.receipt_hook,
+            receipt_points::ReceiptPoint::ClosePrepared,
+            collection,
+        );
+        if failing {
+            return Ok(ReceiptCollectionReply::PendingOrUnknown);
+        }
+        if tx.commit().is_err() {
+            return Ok(ReceiptCollectionReply::PendingOrUnknown);
+        }
+        #[cfg(feature = "kill-points")]
+        receipt_points::pass(
+            &self.receipt_hook,
+            receipt_points::ReceiptPoint::CloseCommitted,
+            collection,
+        );
+        Ok(reply)
+    }
+
+    fn collect_closed_receipts_transaction(
+        &mut self,
+        collection: ClosedReceiptCollection,
+    ) -> Result<ClosedReceiptReply, ReadError> {
+        let failing = self.durability == Durability::Failing;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| reader::sql_error(&error))?;
+        let mut meta = read_meta(&tx).map_err(|fault| fault.read_error())?;
+        let (reply, changed) = receipts::prepare_closed(&tx, &mut meta, collection)
+            .map_err(|fault| fault.read_error())?;
+        if !changed {
+            return Ok(reply);
+        }
+        let Some(revision) = meta.revision.checked_add(1) else {
+            return Ok(ClosedReceiptReply::Refused(
+                mqttiumd_contract::receipts::ReceiptCollectionRefusal::Exhausted,
+            ));
+        };
+        meta.revision = revision;
+        write_meta(&tx, &meta).map_err(|fault| fault.read_error())?;
+        if failing || tx.commit().is_err() {
+            return Ok(ClosedReceiptReply::PendingOrUnknown);
+        }
+        Ok(reply)
     }
 
     /// The engine and the settings in force, read back at opening.
@@ -1714,6 +1850,7 @@ impl SqliteStore {
             "obligations",
             "operations",
             "fences",
+            "receipt_origins",
         ] {
             let count: i64 = conn.query_row(
                 &format!(
@@ -1970,6 +2107,18 @@ impl SqliteStore {
                     qos,
                     claim,
                 }))
+            },
+        )?;
+        section(
+            "SELECT epoch,owner,consumed_through,publication_through,payload_through FROM receipt_origins WHERE ?1=?1 AND ?2=?2 ORDER BY epoch,owner",
+            &mut out,
+            &mut position,
+            &mut |row| {
+                budget.check_field(8)?;
+                meter.charge(128)?;
+                Ok(Ok(RecoveredFact::ReceiptFrontier(
+                    receipts::decode_frontier(row, meta)?,
+                )))
             },
         )?;
         // What is established about the operations of older epochs: the
@@ -2237,7 +2386,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
             routes,
             operations,
             fences,
-            receipt_frontiers: BTreeMap::new(),
+            receipt_frontiers: receipts::all_frontiers(conn, &meta, budget)?,
             publications,
             payloads,
             obligations,
@@ -2248,6 +2397,25 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
 }
 
 impl DurableStore for SqliteStore {
+    fn collect_receipts(
+        &mut self,
+        collection: ReceiptCollection,
+    ) -> Result<ReceiptCollectionReply, ReadError> {
+        self.collect_receipts_transaction(collection)
+    }
+
+    fn receipt_frontier(&self, origin: ReceiptOrigin) -> Result<Option<ReceiptClosure>, ReadError> {
+        let meta = read_meta(&self.conn).map_err(|fault| fault.read_error())?;
+        receipts::frontier(&self.conn, &meta, origin).map_err(|fault| fault.read_error())
+    }
+
+    fn collect_closed_receipts(
+        &mut self,
+        collection: ClosedReceiptCollection,
+    ) -> Result<ClosedReceiptReply, ReadError> {
+        self.collect_closed_receipts_transaction(collection)
+    }
+
     fn ledger(&self) -> Result<EpochLedger, ReadError> {
         self.read_ledger()
     }
@@ -2290,6 +2458,14 @@ impl DurableStore for SqliteStore {
             return unknown;
         };
 
+        // Logical retirement wins even while a bounded sweep leaves physical rows.
+        match established(&self.conn, &meta, operation) {
+            Ok(Established::Outcome(StoreOutcome::RetiredOutcomeUnavailable)) => {
+                return settled(StoreOutcome::RetiredOutcomeUnavailable);
+            }
+            Err(_) => return unknown,
+            _ => {}
+        }
         // 1. Recognise an operation that was already decided.
         let Ok(record) = read_operation(&self.conn, operation) else {
             return unknown;
@@ -2327,6 +2503,12 @@ impl DurableStore for SqliteStore {
             Ok(Established::Absent(phase)) => phase,
             Err(_) => return unknown,
         };
+        if !matches!(
+            receipts::capacity(&self.conn, &meta, operation, Some(ReceiptClass::of(recipe))),
+            Ok(true)
+        ) {
+            return unknown;
+        }
         if phase != EpochPhase::Open {
             return rejected(self.commit_rejection(
                 operation,
@@ -2380,6 +2562,9 @@ impl DurableStore for SqliteStore {
             match established(conn, meta, operation)? {
                 Established::Outcome(outcome) => return Err(Abort::Refused(Some(outcome))),
                 Established::Absent(_) => {}
+            }
+            if !receipts::capacity(conn, meta, operation, None)? {
+                return Err(Abort::Refused(None));
             }
             // A fence holds a receipt slot. Without one no fence is
             // written, and absence proves nothing: unknown.

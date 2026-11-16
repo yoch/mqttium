@@ -23,14 +23,19 @@ use mqttiumd_contract::command::{
 };
 use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
 use mqttiumd_contract::ids::{
-    DeliveryId, OperationId, OperationSeq, PublicationId, Revision, RunEpoch, SessionId,
-    StoreIncarnation,
+    DeliveryId, LogicalOwnerId, OperationId, OperationSeq, PayloadId, PayloadSeq, PublicationId,
+    PublicationSeq, Revision, RunEpoch, SessionId, StoreIncarnation,
 };
 use mqttiumd_contract::outcome::{
     CommitFacts, Knowledge, OpeningOutcome, RejectReason, StoreOutcome, StoreReply, StoreViolation,
 };
 use mqttiumd_contract::packet::{Qos, SharedBytes};
 use mqttiumd_contract::pubsub::{DeliveryClaim, MAX_SUBSCRIPTIONS, WORK_PAGE_LIMIT, WorkItem};
+use mqttiumd_contract::receipts::{
+    ClosedReceiptCollection, ClosedReceiptReply, MAX_COLLECTION_ROWS, MAX_RECEIPT_ORIGINS,
+    RECEIPT_CONTROL_RESERVE, RECEIPT_DATA_WINDOW, RECEIPT_WINDOW, ReceiptClass, ReceiptClosure,
+    ReceiptCollection, ReceiptCollectionRefusal, ReceiptCollectionReply, ReceiptOrigin,
+};
 
 pub use mqttiumd_store_api::*;
 
@@ -93,6 +98,17 @@ impl MemoryStore {
     /// Check the whole relevant scope before treating an identity as unused.
     fn admission_identity_was_used(&self, admit: &AdmitPublication) -> Result<bool, ReadError> {
         let operation = admit.operation;
+        if self
+            .committed
+            .receipt_frontiers
+            .get(&ReceiptOrigin::of(operation))
+            .is_some_and(|closure| {
+                admit.publication.sequence() <= closure.publication_through
+                    || admit.payload.id.sequence() <= closure.payload_through
+            })
+        {
+            return Ok(true);
+        }
         let bound = |sequence| {
             OperationId::new(
                 operation.incarnation(),
@@ -207,6 +223,7 @@ enum FactRef<'a> {
     Operation(OperationId, &'a OperationRecord),
     Fence(OperationId),
     Outbound(DeliveryId, &'a ObligationRecord),
+    ReceiptFrontier(ReceiptClosure),
 }
 
 struct ReadMeter {
@@ -255,6 +272,7 @@ impl FactRef<'_> {
                 .ok_or(ReadError::LimitExceeded)?,
         )?;
         Ok(match self {
+            Self::ReceiptFrontier(closure) => RecoveredFact::ReceiptFrontier(closure),
             Self::Epoch(incarnation, epoch) => RecoveredFact::Epoch { incarnation, epoch },
             Self::Limits => RecoveredFact::Limits {
                 max_targets_per_admission: u32::try_from(state.limits.max_targets_per_admission)
@@ -371,6 +389,7 @@ fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
         state.outbound.len(),
         state.operations.len(),
         state.fences.len(),
+        state.receipt_frontiers.len(),
     ] {
         if size > MAX_RECOVERY_INVENTORY_ROWS {
             return Err(ReadError::LimitExceeded);
@@ -382,6 +401,7 @@ fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
         state.obligations.len(),
         state.operations.len(),
         state.fences.len(),
+        state.receipt_frontiers.len(),
     ] {
         rows = rows.checked_add(size).ok_or(ReadError::LimitExceeded)?;
     }
@@ -451,6 +471,20 @@ fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadEr
     for _ in &state.fences {
         meter.field(32, 32)?;
         meter.charge(160)?;
+    }
+    if state.receipt_frontiers.len() > MAX_RECEIPT_ORIGINS {
+        return Err(ReadError::LimitExceeded);
+    }
+    for (origin, closure) in &state.receipt_frontiers {
+        meter.field(8, 8)?;
+        meter.charge(168)?;
+        if *origin != closure.origin
+            || origin.incarnation != state.ledger.incarnation()
+            || origin.epoch.get() == 0
+            || origin.epoch > state.ledger.last_opened()
+        {
+            return Err(ReadError::InvalidData);
+        }
     }
     for record in state.publications.values() {
         meter.field(32, 32)?;
@@ -529,6 +563,13 @@ impl Staging for DurableState {
             ));
         }
         if operation.epoch() <= self.collected_through && operation.epoch().get() != 0 {
+            return Established::Outcome(StoreOutcome::RetiredOutcomeUnavailable);
+        }
+        if self
+            .receipt_frontiers
+            .get(&ReceiptOrigin::of(operation))
+            .is_some_and(|closure| operation.sequence() <= closure.through)
+        {
             return Established::Outcome(StoreOutcome::RetiredOutcomeUnavailable);
         }
         if let Some(record) = self.operations.get(&operation) {
@@ -1163,12 +1204,39 @@ impl Staging for DurableState {
                     .iter()
                     .map(|(id, record)| FactRef::Outbound(*id, record)),
             )
+            .chain(
+                self.receipt_frontiers
+                    .values()
+                    .copied()
+                    .map(FactRef::ReceiptFrontier),
+            )
             .chain(operations)
             .chain(fences)
     }
 }
 
 impl DurableStore for MemoryStore {
+    fn collect_receipts(
+        &mut self,
+        collection: ReceiptCollection,
+    ) -> Result<ReceiptCollectionReply, ReadError> {
+        self.collect_receipts_inner(collection)
+    }
+
+    fn receipt_frontier(&self, origin: ReceiptOrigin) -> Result<Option<ReceiptClosure>, ReadError> {
+        if origin.incarnation != self.committed.ledger.incarnation() {
+            return Err(ReadError::InvalidData);
+        }
+        Ok(self.committed.receipt_frontiers.get(&origin).copied())
+    }
+
+    fn collect_closed_receipts(
+        &mut self,
+        collection: ClosedReceiptCollection,
+    ) -> Result<ClosedReceiptReply, ReadError> {
+        self.collect_closed_receipts_inner(collection)
+    }
+
     fn ledger(&self) -> Result<EpochLedger, ReadError> {
         Ok(self.committed.ledger)
     }
@@ -1202,6 +1270,12 @@ impl DurableStore for MemoryStore {
         };
         let recipe = command.recipe.get();
         let operation = recipe.operation();
+        if matches!(
+            self.committed.established(operation),
+            Established::Outcome(StoreOutcome::RetiredOutcomeUnavailable)
+        ) {
+            return settled(StoreOutcome::RetiredOutcomeUnavailable);
+        }
         let mut canonical = Vec::new();
         if recipe.encode_canonical(&mut canonical).is_err() {
             // A frozen recipe is well formed; one that is not never ran.
@@ -1232,6 +1306,9 @@ impl DurableStore for MemoryStore {
             Established::Outcome(outcome) => return settled(outcome),
             Established::Absent(phase) => phase,
         };
+        if !self.receipt_capacity(operation, Some(ReceiptClass::of(recipe))) {
+            return settled(StoreOutcome::PendingOrUnknown);
+        }
         if phase != EpochPhase::Open {
             // Its epoch is not open yet. It must not become executable
             // when that epoch opens: the rejection is recorded.
@@ -1309,6 +1386,9 @@ impl DurableStore for MemoryStore {
         match self.committed.established(operation) {
             Established::Outcome(outcome) => settled(outcome),
             Established::Absent(_) => {
+                if !self.receipt_capacity(operation, None) {
+                    return settled(StoreOutcome::PendingOrUnknown);
+                }
                 let mut staged = self.committed.clone();
                 // A fence holds a receipt slot. Without one no fence is
                 // written, and absence proves nothing: unknown.
@@ -1467,5 +1547,408 @@ impl DurableStore for MemoryStore {
     fn snapshot_with_budget(&self, budget: ReadBudget) -> Result<DurableState, ReadError> {
         check_snapshot(&self.committed, budget)?;
         Ok(self.committed.clone())
+    }
+}
+
+impl MemoryStore {
+    fn receipt_capacity(&self, operation: OperationId, class: Option<ReceiptClass>) -> bool {
+        let state = &self.committed;
+        if let Some(closure) = state.receipt_frontiers.get(&ReceiptOrigin::of(operation)) {
+            let span = operation
+                .sequence()
+                .get()
+                .checked_sub(closure.through.get());
+            let window = if class == Some(ReceiptClass::Business) {
+                RECEIPT_DATA_WINDOW
+            } else {
+                RECEIPT_WINDOW
+            };
+            if span.is_none_or(|span| span > window as u64) {
+                return false;
+            }
+        }
+        class != Some(ReceiptClass::Business)
+            || state.receipt_frontiers.is_empty()
+            || state.accounts.receipt_slots.get()
+                < state
+                    .limits
+                    .receipt_slots
+                    .get()
+                    .saturating_sub(RECEIPT_CONTROL_RESERVE)
+    }
+
+    fn initial_receipt_origin_is_compatible(
+        &self,
+        origin: ReceiptOrigin,
+    ) -> Result<bool, ReadError> {
+        let id = |seq| {
+            OperationId::new(
+                origin.incarnation,
+                origin.epoch,
+                origin.owner,
+                OperationSeq::new(seq),
+            )
+        };
+        let zero_pub = PublicationId::new(
+            origin.incarnation,
+            origin.epoch,
+            origin.owner,
+            PublicationSeq::new(0),
+        );
+        let zero_payload = PayloadId::new(
+            origin.incarnation,
+            origin.epoch,
+            origin.owner,
+            PayloadSeq::new(0),
+        );
+        if self.committed.operations.contains_key(&id(0))
+            || self.committed.fences.contains(&id(0))
+            || self.committed.publications.contains_key(&zero_pub)
+            || self.committed.payloads.contains_key(&zero_payload)
+        {
+            return Ok(false);
+        }
+        let mut meter = ReadMeter::new(ReadBudget::SNAPSHOT);
+        for (operation, record) in self.committed.operations.range(id(0)..=id(u64::MAX)) {
+            meter.field(record.recipe.len(), ReadBudget::SNAPSHOT.max_field_bytes)?;
+            meter.charge(
+                128usize
+                    .checked_add(record.recipe.len())
+                    .ok_or(ReadError::LimitExceeded)?,
+            )?;
+            if let Some(admit) = self.admission_receipt(*operation, record)?
+                && (admit.publication.sequence().get() == 0
+                    || admit.payload.id.sequence().get() == 0)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn admission_receipt(
+        &self,
+        operation: OperationId,
+        record: &OperationRecord,
+    ) -> Result<Option<AdmitPublication>, ReadError> {
+        let Decision::Committed(CommitFacts::PublicationAdmitted {
+            publication,
+            exchange,
+        }) = record.decision
+        else {
+            return Ok(None);
+        };
+        let recipe = Recipe::decode_canonical(
+            &record.recipe,
+            self.committed.limits.max_targets_per_admission,
+            self.committed.limits.max_topic_bytes,
+        )
+        .map_err(|error| match error {
+            RecipeError::AllocationFailed => ReadError::AllocationFailed,
+            RecipeError::TooManyTargets { .. } | RecipeError::TopicTooLong(_) => {
+                ReadError::LimitExceeded
+            }
+            _ => ReadError::InvalidData,
+        })?;
+        let Recipe::AdmitPublication(admit) = recipe else {
+            return Err(ReadError::InvalidData);
+        };
+        if admit.operation != operation
+            || admit.publication != publication
+            || admit.source.exchange != exchange
+            || ReceiptOrigin::of(operation)
+                != (ReceiptOrigin {
+                    incarnation: admit.publication.incarnation(),
+                    epoch: admit.publication.epoch(),
+                    owner: admit.publication.owner(),
+                })
+            || ReceiptOrigin::of(operation)
+                != (ReceiptOrigin {
+                    incarnation: admit.payload.id.incarnation(),
+                    epoch: admit.payload.id.epoch(),
+                    owner: admit.payload.id.owner(),
+                })
+        {
+            return Err(ReadError::InvalidData);
+        }
+        Ok(Some(admit))
+    }
+
+    fn collect_receipts_inner(
+        &mut self,
+        collection: ReceiptCollection,
+    ) -> Result<ReceiptCollectionReply, ReadError> {
+        let refused = |why| Ok(ReceiptCollectionReply::Refused(why));
+        let request = collection.closure;
+        let origin = request.origin;
+        if collection.limit == 0 || collection.limit > MAX_COLLECTION_ROWS {
+            return refused(ReceiptCollectionRefusal::LimitExceeded);
+        }
+        if origin.incarnation != self.committed.ledger.incarnation() {
+            return refused(ReceiptCollectionRefusal::OriginMismatch);
+        }
+        if origin.epoch > self.committed.ledger.last_opened() {
+            return refused(ReceiptCollectionRefusal::FutureEpoch);
+        }
+        if origin.epoch.get() == 0 || origin.epoch <= self.committed.collected_through {
+            return refused(ReceiptCollectionRefusal::InvalidFrontier);
+        }
+        let stored = self.committed.receipt_frontiers.get(&origin).copied();
+        if stored.is_none() {
+            if self.committed.receipt_frontiers.len() >= MAX_RECEIPT_ORIGINS {
+                return refused(ReceiptCollectionRefusal::OriginCapacity);
+            }
+            if !self.initial_receipt_origin_is_compatible(origin)? {
+                return refused(ReceiptCollectionRefusal::InvalidFrontier);
+            }
+        }
+        let prior = stored.unwrap_or(ReceiptClosure::empty(origin));
+        let closure = if request.through <= prior.through {
+            if request.publication_through > prior.publication_through
+                || request.payload_through > prior.payload_through
+            {
+                return refused(ReceiptCollectionRefusal::InvalidFrontier);
+            }
+            prior
+        } else {
+            let span = request
+                .through
+                .get()
+                .checked_sub(prior.through.get())
+                .ok_or(ReadError::InvalidData)?;
+            if span > u64::from(MAX_COLLECTION_ROWS) {
+                return refused(ReceiptCollectionRefusal::LimitExceeded);
+            }
+            if request.publication_through < prior.publication_through
+                || request.payload_through < prior.payload_through
+            {
+                return refused(ReceiptCollectionRefusal::InvalidFrontier);
+            }
+            let mut meter = ReadMeter::new(ReadBudget::PAGE);
+            for seq in prior.through.get() + 1..=request.through.get() {
+                let operation = OperationId::new(
+                    origin.incarnation,
+                    origin.epoch,
+                    origin.owner,
+                    OperationSeq::new(seq),
+                );
+                let record = self.committed.operations.get(&operation);
+                let fence = self.committed.fences.contains(&operation);
+                if record.is_some() && fence {
+                    return Err(ReadError::InvalidData);
+                }
+                let Some(record) = record else {
+                    if !fence {
+                        return refused(ReceiptCollectionRefusal::Gap);
+                    }
+                    meter.charge(32)?;
+                    continue;
+                };
+                meter.field(record.recipe.len(), ReadBudget::PAGE.max_field_bytes)?;
+                meter.charge(
+                    128usize
+                        .checked_add(record.recipe.len())
+                        .ok_or(ReadError::LimitExceeded)?,
+                )?;
+                if let Some(admit) = self.admission_receipt(operation, record)?
+                    && (admit.publication.sequence() > request.publication_through
+                        || admit.payload.id.sequence() > request.payload_through)
+                {
+                    return refused(ReceiptCollectionRefusal::InvalidFrontier);
+                }
+            }
+            request
+        };
+        let first = OperationId::new(
+            origin.incarnation,
+            origin.epoch,
+            origin.owner,
+            OperationSeq::new(0),
+        );
+        let last = OperationId::new(
+            origin.incarnation,
+            origin.epoch,
+            origin.owner,
+            closure.through,
+        );
+        let mut keys = Vec::new();
+        let ceiling = usize::from(collection.limit) + 1;
+        keys.try_reserve_exact(ceiling * 2)
+            .map_err(|_| ReadError::AllocationFailed)?;
+        keys.extend(
+            self.committed
+                .operations
+                .range(first..=last)
+                .take(ceiling)
+                .map(|(id, _)| (*id, false)),
+        );
+        keys.extend(
+            self.committed
+                .fences
+                .range(first..=last)
+                .take(ceiling)
+                .map(|id| (*id, true)),
+        );
+        keys.sort_unstable();
+        if keys.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(ReadError::InvalidData);
+        }
+        let more = keys.len() > usize::from(collection.limit);
+        keys.truncate(usize::from(collection.limit));
+        let removed = u16::try_from(keys.len()).map_err(|_| ReadError::LimitExceeded)?;
+        let retained = self
+            .committed
+            .accounts
+            .receipt_slots
+            .get()
+            .checked_sub(u64::from(removed))
+            .ok_or(ReadError::InvalidData)?;
+        if stored == Some(closure) && removed == 0 {
+            return Ok(ReceiptCollectionReply::Applied {
+                closure,
+                removed,
+                retained,
+                more,
+            });
+        }
+        let mut staged = self.committed.clone();
+        staged.receipt_frontiers.insert(origin, closure);
+        for (operation, fence) in keys {
+            if fence {
+                staged.fences.remove(&operation);
+            } else {
+                staged.operations.remove(&operation);
+            }
+        }
+        staged.accounts.receipt_slots = ReceiptSlots::new(retained);
+        if self.commit(staged) {
+            Ok(ReceiptCollectionReply::Applied {
+                closure,
+                removed,
+                retained,
+                more,
+            })
+        } else {
+            Ok(ReceiptCollectionReply::PendingOrUnknown)
+        }
+    }
+
+    fn collect_closed_receipts_inner(
+        &mut self,
+        collection: ClosedReceiptCollection,
+    ) -> Result<ClosedReceiptReply, ReadError> {
+        let refused = |why| Ok(ClosedReceiptReply::Refused(why));
+        if collection.limit == 0 || collection.limit > MAX_COLLECTION_ROWS {
+            return refused(ReceiptCollectionRefusal::LimitExceeded);
+        }
+        if self.committed.ledger.phase_of(collection.through) != EpochPhase::Closed {
+            return refused(ReceiptCollectionRefusal::FutureEpoch);
+        }
+        let through = collection.through.max(self.committed.collected_through);
+        let incarnation = self.committed.ledger.incarnation();
+        let start = OperationId::new(
+            incarnation,
+            RunEpoch::new(1),
+            LogicalOwnerId::new(0),
+            OperationSeq::new(0),
+        );
+        let end = OperationId::new(
+            incarnation,
+            through,
+            LogicalOwnerId::new(u64::MAX),
+            OperationSeq::new(u64::MAX),
+        );
+        let mut keys = Vec::new();
+        let ceiling = usize::from(collection.limit) + 1;
+        keys.try_reserve_exact(ceiling * 2)
+            .map_err(|_| ReadError::AllocationFailed)?;
+        keys.extend(
+            self.committed
+                .operations
+                .range(start..=end)
+                .take(ceiling)
+                .map(|(id, _)| (*id, false)),
+        );
+        keys.extend(
+            self.committed
+                .fences
+                .range(start..=end)
+                .take(ceiling)
+                .map(|id| (*id, true)),
+        );
+        keys.sort_unstable();
+        if keys.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(ReadError::InvalidData);
+        }
+        let origin_start = ReceiptOrigin {
+            incarnation,
+            epoch: RunEpoch::new(1),
+            owner: LogicalOwnerId::new(0),
+        };
+        let origin_end = ReceiptOrigin {
+            incarnation,
+            epoch: through,
+            owner: LogicalOwnerId::new(u64::MAX),
+        };
+        let mut origins = Vec::new();
+        origins
+            .try_reserve_exact(ceiling)
+            .map_err(|_| ReadError::AllocationFailed)?;
+        origins.extend(
+            self.committed
+                .receipt_frontiers
+                .range(origin_start..=origin_end)
+                .take(ceiling)
+                .map(|(origin, _)| *origin),
+        );
+        let more = keys
+            .len()
+            .checked_add(origins.len())
+            .ok_or(ReadError::LimitExceeded)?
+            > usize::from(collection.limit);
+        keys.truncate(usize::from(collection.limit));
+        origins.truncate(usize::from(collection.limit) - keys.len());
+        let removed = u16::try_from(keys.len()).map_err(|_| ReadError::LimitExceeded)?;
+        let removed_origins = u16::try_from(origins.len()).map_err(|_| ReadError::LimitExceeded)?;
+        let retained = self
+            .committed
+            .accounts
+            .receipt_slots
+            .get()
+            .checked_sub(u64::from(removed))
+            .ok_or(ReadError::InvalidData)?;
+        if through == self.committed.collected_through && removed == 0 && removed_origins == 0 {
+            return Ok(ClosedReceiptReply::Applied {
+                through,
+                removed,
+                removed_origins,
+                retained,
+                more,
+            });
+        }
+        let mut staged = self.committed.clone();
+        staged.collected_through = through;
+        for (id, fence) in keys {
+            if fence {
+                staged.fences.remove(&id);
+            } else {
+                staged.operations.remove(&id);
+            }
+        }
+        for origin in origins {
+            staged.receipt_frontiers.remove(&origin);
+        }
+        staged.accounts.receipt_slots = ReceiptSlots::new(retained);
+        if self.commit(staged) {
+            Ok(ClosedReceiptReply::Applied {
+                through,
+                removed,
+                removed_origins,
+                retained,
+                more,
+            })
+        } else {
+            Ok(ClosedReceiptReply::PendingOrUnknown)
+        }
     }
 }
