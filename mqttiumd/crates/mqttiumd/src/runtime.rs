@@ -191,8 +191,15 @@ struct Runtime<'a> {
 impl Runtime<'_> {
     fn accept(&mut self, stream: std::net::TcpStream) -> Result<bool, Failure> {
         // Retiring threads count against the same hard connection budget.
+        let close_reserved = self
+            .peers
+            .len()
+            .checked_add(1)
+            .and_then(|peers| peers.checked_mul(2))
+            .and_then(|future| future.checked_add(self.closing_inputs.len()))
+            .is_some_and(|required| required <= CLOSING_INPUTS);
         if self.peers.len() + self.retiring.len() >= CONNECTIONS
-            || self.closing_inputs.len() >= CONNECTIONS
+            || !close_reserved
             || self.session_requests.len() >= CONNECTIONS
         {
             let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -2397,7 +2404,13 @@ impl EffectSink for Sink<'_> {
                 payload,
             } => {
                 let (connection, origin) = (*connection, *origin);
-                if self.terminal_inputs.len() >= TERMINAL_INPUTS || self.frames.len() >= FRAMES {
+                if self
+                    .terminal_inputs
+                    .len()
+                    .checked_add(self.frames.len())
+                    .is_none_or(|used| used >= TERMINAL_INPUTS)
+                    || self.frames.len() >= FRAMES
+                {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
                 #[cfg(feature = "test-hooks")]
@@ -2665,7 +2678,11 @@ impl EffectSink for Sink<'_> {
                 };
                 let generation = connection.generation;
                 let (kind, packet_id) = frame_info(frame);
-                if self.terminal_inputs.len() >= TERMINAL_INPUTS
+                if self
+                    .terminal_inputs
+                    .len()
+                    .checked_add(self.frames.len())
+                    .is_none_or(|used| used >= TERMINAL_INPUTS)
                     || self.frames.len() >= FRAMES
                     || (kind == "CONNACK" && self.inputs.len() + self.deferred_count >= INPUTS)
                 {
@@ -2857,7 +2874,13 @@ impl EffectSink for Sink<'_> {
             } => {
                 let (connection, delivery, packet_id, claim, dup) =
                     (*connection, *delivery, *packet_id, *claim, *dup);
-                if self.terminal_inputs.len() >= TERMINAL_INPUTS || self.frames.len() >= FRAMES {
+                if self
+                    .terminal_inputs
+                    .len()
+                    .checked_add(self.frames.len())
+                    .is_none_or(|used| used >= TERMINAL_INPUTS)
+                    || self.frames.len() >= FRAMES
+                {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
                 let generation = connection.generation;
