@@ -1557,6 +1557,20 @@ PAGE = {
 }
 PAGE_READ = record(14, "store-adapter", 2, "RecoveryPageRead", PAGE)
 ok("trace-record-recovery-page-read.json", PAGE_READ)
+policy_page = copy.deepcopy(PAGE)
+policy_page["facts"][1].update(expiry="OnDisconnect", opened_by=OP)
+ok("trace-record-recovery-page-session-policy.json", record(14, "store-adapter", 2, "RecoveryPageRead", policy_page))
+bad_policy_page = copy.deepcopy(policy_page)
+bad_policy_page["facts"][1].update(expiry="Sometimes")
+bad("trace-record-recovery-session-policy-invalid.json", "schema-violation", "/payload/facts/1/expiry",
+    "A runtime recovery inventory validates policy before the core consumes it.",
+    record(14, "store-adapter", 2, "RecoveryPageRead", bad_policy_page))
+bad_attachment_page = copy.deepcopy(policy_page)
+bad_attachment_page["facts"][1]["opened_by"].update(sequence="18446744073709551616")
+bad("trace-record-recovery-session-attachment-overflow.json", "u64-out-of-range", "/payload/facts/1/opened_by/sequence",
+    "The opening attachment is a complete checked OperationId in recovery too.",
+    record(14, "store-adapter", 2, "RecoveryPageRead", bad_attachment_page))
+
 RECEIPT_FRONTIER = {
     "origin": {"incarnation": "1", "epoch": "1", "owner": "0"},
     "through": "1", "publication_through": "1", "payload_through": "1",
@@ -2428,6 +2442,52 @@ consumed_snapshot["obligations"].pop(0)
 consumed_snapshot["payloads"][0]["references"] = "1"
 consumed_snapshot["account"]["used"].update(references="1", receipt_slots="2")
 ok("store-snapshot-delivery-consume-receipt.json", consumed_snapshot)
+# Lifecycle kind8 preserves kinds1--7 and does not enlarge fixture qualification.
+# JSON-only historical fixture fields may be omitted: Never/None is explicit.
+lifecycle_open = copy.deepcopy(snapshot)
+open_operation = {**OP, "sequence": "26"}
+new_session = {"session": "4", "client_id_hex": b"new-client".hex(), "revision": "1",
+               "state": "Active", "expiry": "OnDisconnect", "opened_by": open_operation}
+lifecycle_open["sessions"].append(new_session)
+lifecycle_open["meta"]["next_session"] = "5"
+lifecycle_open["operations"].append(product_operation(
+    26, 8, be(0, 1) + be(1, 1) + be(0, 1) + be(0, 1) + be(10, 2) + b"new-client".hex(),
+    {"kind": "SessionLifecycle", "change": {
+        "kind": "Opened", "session": "4", "revision": "1", "session_present": False,
+        "expiry": "OnDisconnect", "retired": None, "route_revision": "2",
+        "cancelled": {"inbound": 0, "deliveries": 0, "routes": 0},
+    }},
+))
+lifecycle_open["account"]["used"]["receipt_slots"] = "2"
+ok("store-snapshot-session-open-receipt.json", lifecycle_open)
+# An old producer's identity remains historical after target-only cleanup.
+# Its other destinations and immutable shared payload remain owed.
+lifecycle_close = copy.deepcopy(snapshot)
+lifecycle_close["sessions"].pop(0)
+lifecycle_close["inbound_exchanges"] = []
+lifecycle_close["operations"].append(product_operation(
+    27, 8, be(1, 1) + be(1) + be(0, 1) + be(0, 1),
+    {"kind": "SessionLifecycle", "change": {
+        "kind": "Closed", "session": "1", "route_revision": "2",
+        "cancelled": {"inbound": 1, "deliveries": 0, "routes": 0},
+    }},
+))
+lifecycle_close["account"]["used"].update(exchange_slots="0", receipt_slots="2")
+ok("store-snapshot-session-close-receipt.json", lifecycle_close)
+bad("store-snapshot-session-policy-invalid.json", "schema-violation", "/sessions/3/expiry",
+    "Persisted policy is a closed discriminant; intermediate expiry values are outside this format.",
+    edited(lifecycle_open, lambda v: v["sessions"][3].update(expiry="Sometimes")))
+bad("store-snapshot-session-attachment-overflow.json", "u64-out-of-range", "/sessions/3/opened_by/sequence",
+    "An attachment is the original complete OperationId, not a reusable ClientID.",
+    edited(lifecycle_open, lambda v: v["sessions"][3]["opened_by"].update(sequence=OVER)))
+bad("store-snapshot-session-cancel-count-overflow.json", "schema-violation", "/operations/1/decision/facts/change",
+    "Cancellation counts remain bounded u32 numbers, not success delivery counts.",
+    edited(lifecycle_close, lambda v: v["operations"][1]["decision"]["facts"]["change"]["cancelled"].update(inbound=4294967296)))
+bad("store-snapshot-session-retired-overflow.json", "u64-out-of-range", "/operations/1/decision/facts/change/retired",
+    "Even a no-longer-retained SessionId remains an unsigned checked causal identity.",
+    edited(lifecycle_open, lambda v: v["operations"][1]["decision"]["facts"]["change"].update(retired=OVER)))
+ok("store-snapshot-explicit-legacy-session-policy.json", edited(snapshot, lambda v:
+    [row.update(expiry="Never", opened_by=None) for row in v["sessions"]]))
 retained_frontier_snapshot = copy.deepcopy(snapshot)
 retained_frontier_snapshot["receipt_frontiers"] = [copy.deepcopy(RECEIPT_FRONTIER)]
 ok("store-snapshot-receipt-frontier-retained-rows.json", retained_frontier_snapshot)
@@ -3388,6 +3448,11 @@ receipt_transitions = json.loads((V1 / "receipts.transitions.json").read_text())
 ok("product-receipt-transitions.json", receipt_transitions)
 pi_transitions = json.loads((V1 / "pi.transitions.json").read_text())
 ok("product-pi-transitions.json", pi_transitions)
+session_transitions = json.loads((V1 / "sessions.transitions.json").read_text())
+ok("product-session-transitions.json", session_transitions)
+bad("product-session-transitions-wrong-decision.json", "schema-violation", "/decision",
+    "Lifecycle transitions name Proposed0029 and retain system-test scope.",
+    {**session_transitions, "decision": "0028"})
 bad("product-pi-transitions-wrong-decision.json", "schema-violation", "/decision",
     "The recyclable identifier subset refers to Proposed 0028 without relabeling earlier subsets.",
     {**pi_transitions, "decision": "0027"})
@@ -3504,6 +3569,37 @@ for pointer, edit in [
 ]:
     bad("product-event-overflow-" + pointer.rsplit("/", 1)[1] + ".json", "u64-out-of-range", pointer,
         "Product event identities retain the shared 64-bit range.", edit)
+# Lifecycle observations keep exact identities and bounded resource inventories.
+session_changed = env("mqttiumd.product-event", seq="11", kind="session_changed", pid=1,
+    operation=open_operation, connection="1", details={
+    "action": "Opened", "session": "4", "route_revision": "2", "revision": "1",
+    "session_present": False, "expiry": "OnDisconnect", "retired_session": None,
+    "cancelled_inbound": 0, "cancelled_deliveries": 0, "cancelled_routes": 0})
+ok("product-session-opened.json", session_changed)
+session_closed = env("mqttiumd.product-event", seq="12", kind="session_changed", pid=1,
+    operation={**OP, "sequence": "27"}, details={"action": "Closed", "session": "1",
+    "route_revision": "2", "cancelled_inbound": 1, "cancelled_deliveries": 0, "cancelled_routes": 0})
+ok("product-session-closed.json", session_closed)
+ok("product-session-refused.json", env("mqttiumd.product-event", seq="13", kind="session_refused", pid=1,
+    connection="2", details={"reason_code": 151}))
+cardinalities = {name: 0 for name in ("session_cache", "owner_sessions", "owner_bindings", "work_requests",
+    "work_ready", "emit_registrations", "lifecycle_requests", "closed_generations", "retired_flights",
+    "owner_inbound", "owner_outgoing", "frames", "timers")}
+ok("product-session-cardinality.json", env("mqttiumd.product-event", seq="14", kind="session_cardinality", pid=1,
+    details={**cardinalities, "closed_generations": 8}))
+for member in ("session", "route_revision", "revision", "retired_session"):
+    bad(f"product-session-{member}-overflow.json", "u64-out-of-range", f"/details/{member}",
+        "Lifecycle observations use checked identities even for retired historical incarnations.",
+        edited(session_changed, lambda v, member=member: v["details"].update({member: OVER})))
+bad("product-session-missing-operation.json", "schema-violation", "",
+    "An applied lifecycle result is correlated by its original OperationId.",
+    edited(session_changed, lambda v: v.pop("operation")))
+bad("product-session-missing-policy.json", "schema-violation", "/details",
+    "An open observation must identify the established durable retention policy.",
+    edited(session_changed, lambda v: v["details"].pop("expiry")))
+bad("product-session-refused-success.json", "schema-violation", "/details/reason_code",
+    "A refusal must not describe a success CONNACK or fabricate a session identity.",
+    env("mqttiumd.product-event", seq="13", kind="session_refused", pid=1, connection="2", details={"reason_code": 0}))
 dump(EX / "index.json", env("mqttiumd.example-index", valid=valid, invalid=invalid))
 
 

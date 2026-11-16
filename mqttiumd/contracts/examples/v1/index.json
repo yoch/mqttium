@@ -50,6 +50,7 @@
     "contracts/examples/v1/valid/trace-record-deadline-armed.json",
     "contracts/examples/v1/valid/trace-record-deadline-delivered.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-read.json",
+    "contracts/examples/v1/valid/trace-record-recovery-page-session-policy.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-receipt-frontier.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-outbound-queued.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-outbound-claimed.json",
@@ -75,6 +76,9 @@
     "contracts/examples/v1/valid/store-snapshot-delivery-finish-receipt.json",
     "contracts/examples/v1/valid/store-snapshot-subscription-qos0-receipt.json",
     "contracts/examples/v1/valid/store-snapshot-delivery-consume-receipt.json",
+    "contracts/examples/v1/valid/store-snapshot-session-open-receipt.json",
+    "contracts/examples/v1/valid/store-snapshot-session-close-receipt.json",
+    "contracts/examples/v1/valid/store-snapshot-explicit-legacy-session-policy.json",
     "contracts/examples/v1/valid/store-snapshot-receipt-frontier-retained-rows.json",
     "contracts/examples/v1/valid/store-snapshot-receipt-frontier-collected.json",
     "contracts/examples/v1/valid/store-snapshot-empty.json",
@@ -101,6 +105,7 @@
     "contracts/examples/v1/valid/product-pubsub-transitions.json",
     "contracts/examples/v1/valid/product-receipt-transitions.json",
     "contracts/examples/v1/valid/product-pi-transitions.json",
+    "contracts/examples/v1/valid/product-session-transitions.json",
     "contracts/examples/v1/valid/product-event.json",
     "contracts/examples/v1/valid/product-puback-observed.json",
     "contracts/examples/v1/valid/product-puback-no-target.json",
@@ -112,7 +117,11 @@
     "contracts/examples/v1/valid/product-receipt-prepared.json",
     "contracts/examples/v1/valid/product-maintenance-read-refused.json",
     "contracts/examples/v1/valid/product-ack-receipt.json",
-    "contracts/examples/v1/valid/product-puback-credit.json"
+    "contracts/examples/v1/valid/product-puback-credit.json",
+    "contracts/examples/v1/valid/product-session-opened.json",
+    "contracts/examples/v1/valid/product-session-closed.json",
+    "contracts/examples/v1/valid/product-session-refused.json",
+    "contracts/examples/v1/valid/product-session-cardinality.json"
   ],
   "invalid": [
     {
@@ -794,6 +803,18 @@
       "why": "S0 fixtures hold persistent sessions only."
     },
     {
+      "file": "contracts/examples/v1/invalid/trace-record-recovery-session-policy-invalid.json",
+      "code": "schema-violation",
+      "pointer": "/payload/facts/1/expiry",
+      "why": "A runtime recovery inventory validates policy before the core consumes it."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-recovery-session-attachment-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/payload/facts/1/opened_by/sequence",
+      "why": "The opening attachment is a complete checked OperationId in recovery too."
+    },
+    {
       "file": "contracts/examples/v1/invalid/trace-record-recovery-page-late-frontier.json",
       "code": "rows-out-of-order",
       "pointer": "/payload/facts/4/kind",
@@ -1218,6 +1239,30 @@
       "code": "u64-out-of-range",
       "pointer": "/outbound/0/claim_operation_id/sequence",
       "why": "Outgoing claim rows retain bounded identities, unique DeliveryIds and valid packet identifiers."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-session-policy-invalid.json",
+      "code": "schema-violation",
+      "pointer": "/sessions/3/expiry",
+      "why": "Persisted policy is a closed discriminant; intermediate expiry values are outside this format."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-session-attachment-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/sessions/3/opened_by/sequence",
+      "why": "An attachment is the original complete OperationId, not a reusable ClientID."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-session-cancel-count-overflow.json",
+      "code": "schema-violation",
+      "pointer": "/operations/1/decision/facts/change",
+      "why": "Cancellation counts remain bounded u32 numbers, not success delivery counts."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-session-retired-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/operations/1/decision/facts/change/retired",
+      "why": "Even a no-longer-retained SessionId remains an unsigned checked causal identity."
     },
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-receipt-frontier-missing-bound.json",
@@ -1892,6 +1937,12 @@
       "why": "A kind of record is stated by its one origin; another may not state it."
     },
     {
+      "file": "contracts/examples/v1/invalid/product-session-transitions-wrong-decision.json",
+      "code": "schema-violation",
+      "pointer": "/decision",
+      "why": "Lifecycle transitions name Proposed0029 and retain system-test scope."
+    },
+    {
       "file": "contracts/examples/v1/invalid/product-pi-transitions-wrong-decision.json",
       "code": "schema-violation",
       "pointer": "/decision",
@@ -2094,6 +2145,48 @@
       "code": "u64-out-of-range",
       "pointer": "/operation/sequence",
       "why": "Product event identities retain the shared 64-bit range."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-session-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/details/session",
+      "why": "Lifecycle observations use checked identities even for retired historical incarnations."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-route_revision-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/details/route_revision",
+      "why": "Lifecycle observations use checked identities even for retired historical incarnations."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-revision-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/details/revision",
+      "why": "Lifecycle observations use checked identities even for retired historical incarnations."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-retired_session-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/details/retired_session",
+      "why": "Lifecycle observations use checked identities even for retired historical incarnations."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-missing-operation.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "An applied lifecycle result is correlated by its original OperationId."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-missing-policy.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "An open observation must identify the established durable retention policy."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-session-refused-success.json",
+      "code": "schema-violation",
+      "pointer": "/details/reason_code",
+      "why": "A refusal must not describe a success CONNACK or fabricate a session identity."
     }
   ]
 }

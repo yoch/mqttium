@@ -1,0 +1,22 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "14",
+  "kind": "session_cardinality",
+  "pid": 1,
+  "details": {
+    "session_cache": 0,
+    "owner_sessions": 0,
+    "owner_bindings": 0,
+    "work_requests": 0,
+    "work_ready": 0,
+    "emit_registrations": 0,
+    "lifecycle_requests": 0,
+    "closed_generations": 8,
+    "retired_flights": 0,
+    "owner_inbound": 0,
+    "owner_outgoing": 0,
+    "frames": 0,
+    "timers": 0
+  }
+}

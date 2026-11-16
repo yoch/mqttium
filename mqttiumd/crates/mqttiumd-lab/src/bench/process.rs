@@ -615,7 +615,9 @@ impl<S: DurableStore> EffectSink for Sink<'_, S> {
                 SubmitResult::Accepted
             }
             // No adapter of S0 takes these: the box keeps them.
-            Effect::CollectReceipts { .. }
+            Effect::SessionChanged { .. }
+            | Effect::SessionRefused { .. }
+            | Effect::CollectReceipts { .. }
             | Effect::LoadWork { .. }
             | Effect::EmitPublish { .. }
             | Effect::EmitQos0 { .. }

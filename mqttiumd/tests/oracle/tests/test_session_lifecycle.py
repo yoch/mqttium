@@ -138,3 +138,45 @@ class SessionQualificationScope(unittest.TestCase):
             snapshot = self.snapshot()
             snapshot["sessions"] = [session]
             self.assertEqual(self.unmet(snapshots=[snapshot]), [])
+
+
+class SessionCorpus(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.contracts = Contracts.open(ROOT)
+
+    def example(self, name):
+        return json.loads((ROOT / f"contracts/examples/v1/valid/{name}.json").read_text())
+
+    def test_generated_open_and_close_use_the_same_descriptive_kind8_layout(self):
+        opened_snapshot = self.example("store-snapshot-session-open-receipt")
+        close_snapshot = self.example("store-snapshot-session-close-receipt")
+        decoded = [recipe.decode(bytes.fromhex(value["operations"][-1]["recipe_hex"]))
+                   for value in (opened_snapshot, close_snapshot)]
+        self.assertEqual(decoded[0].client_id, b"new-client")
+        self.assertEqual((decoded[0].clean_start, decoded[0].expiry, decoded[0].expected),
+                         (True, "OnDisconnect", None))
+        self.assertEqual((decoded[1].guard, decoded[1].reason), ((1, None), "Disconnect"))
+
+    def test_historical_producer_identity_can_outlive_its_row_for_other_destinations(self):
+        value = self.example("store-snapshot-session-close-receipt")
+        self.assertEqual(self.contracts.check_value(value), [])
+        self.assertNotIn("1", [row["session"] for row in value["sessions"]])
+        self.assertEqual(value["publications"][0]["source_session"], "1")
+        self.assertLess(int(value["publications"][0]["source_session"]), int(value["meta"]["next_session"]))
+        self.assertEqual([row["session"] for row in value["obligations"]], ["2", "3"])
+        self.assertEqual(value["payloads"][0]["references"], "2")
+
+    def test_session_refusal_cannot_fabricate_a_durable_identity(self):
+        value = self.example("product-session-refused")
+        value["details"]["session"] = "1"
+        self.assertTrue(self.contracts.check_value(value))
+
+    def test_session_cardinality_requires_complete_bounded_counts(self):
+        value = self.example("product-session-cardinality")
+        self.assertEqual(self.contracts.check_value(value), [])
+        for edit in (lambda v: v["details"].pop("retired_flights"),
+                     lambda v: v["details"].update(owner_sessions=4294967296)):
+            invalid = copy.deepcopy(value)
+            edit(invalid)
+            self.assertTrue(self.contracts.check_value(invalid))

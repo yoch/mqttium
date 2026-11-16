@@ -101,7 +101,7 @@
       }
     },
     "sessions": {
-      "description": "Sessions, by SessionId.",
+      "description": "Retained session rows ordered by non-reused SessionId. Omitted legacy policy/attachment mean Never/None; newly emitted snapshots carry both. Physical cleanup does not reset next_session.",
       "type": "array",
       "items": {
         "type": "object",
@@ -123,11 +123,17 @@
             "$ref": "primitives.schema.json#/$defs/u64"
           },
           "state": {
-            "description": "A deleted session stays, terminal: its identity is never reused.",
+            "description": "Active product sessions are physically removed after known atomic termination. Terminal is readable legacy descriptive evidence, never a reusable identity.",
             "enum": [
               "Active",
               "Terminal"
             ]
+          },
+          "expiry": {
+            "$ref": "primitives.schema.json#/$defs/session_expiry"
+          },
+          "opened_by": {
+            "$ref": "primitives.schema.json#/$defs/session_opening"
           }
         }
       },
@@ -254,7 +260,8 @@
                             "SubscriptionsChanged",
                             "DeliveryClaimed",
                             "DeliveryFinished",
-                            "DeliveryConsumed"
+                            "DeliveryConsumed",
+                            "SessionLifecycle"
                           ]
                         }
                       },
@@ -462,6 +469,34 @@
                               }
                             }
                           }
+                        },
+                        {
+                          "if": {
+                            "required": [
+                              "kind"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "SessionLifecycle"
+                              }
+                            }
+                          },
+                          "then": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "kind",
+                              "change"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "SessionLifecycle"
+                              },
+                              "change": {
+                                "$ref": "primitives.schema.json#/$defs/session_change"
+                              }
+                            }
+                          }
                         }
                       ]
                     }
@@ -495,7 +530,8 @@
                         "PreconditionFailed",
                         "CapacityExceeded",
                         "Fenced",
-                        "EpochClosed"
+                        "EpochClosed",
+                        "SessionCapacityExceeded"
                       ]
                     },
                     "resource": {

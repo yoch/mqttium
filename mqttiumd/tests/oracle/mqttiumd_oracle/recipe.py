@@ -19,6 +19,8 @@ CLAIM_DELIVERY = 4
 FINISH_DELIVERY = 5
 CONSUME_DELIVERY = 6
 UPDATE_SUBSCRIPTIONS = 7
+SESSION_LIFECYCLE = 8
+MAX_SESSION_CLIENT_BYTES = 1024
 
 
 class RecipeError(ValueError):
@@ -123,6 +125,28 @@ class UpdateSubscriptions(Subscriptions):
     kind = "UpdateSubscriptions"
 
 
+@dataclass(frozen=True)
+class SessionOpen:
+    operation: tuple
+    clean_start: bool
+    expiry: str
+    expected: tuple | None
+    client_id: bytes
+
+    kind = "SessionLifecycle"
+    action = "Open"
+
+
+@dataclass(frozen=True)
+class SessionClose:
+    operation: tuple
+    guard: tuple
+    reason: str
+
+    kind = "SessionLifecycle"
+    action = "Close"
+
+
 class _Reader:
     def __init__(self, data: bytes) -> None:
         self.data = data
@@ -140,6 +164,16 @@ class _Reader:
 
     def scoped(self) -> tuple:
         return tuple(self.number(8) for _ in range(4))
+
+    def boolean(self) -> bool:
+        value = self.number(1)
+        if value not in (0, 1):
+            raise RecipeError("invalid boolean")
+        return bool(value)
+
+    def session_guard(self) -> tuple:
+        session = self.number(8)
+        return session, self.scoped() if self.boolean() else None
 
 
 def decode(data: bytes):
@@ -222,6 +256,35 @@ def decode(data: bytes):
     elif kind == CONSUME_DELIVERY:
         recipe = Consume(reader.scoped(), reader.scoped(), reader.number(4),
                          reader.number(8), reader.number(8))
+    elif kind == SESSION_LIFECYCLE:
+        operation, action = reader.scoped(), reader.number(1)
+        if action == 0:
+            clean_start = reader.boolean()
+            expiry = reader.number(1)
+            if expiry not in (0, 1):
+                raise RecipeError("invalid session expiry")
+            expected = reader.session_guard() if reader.boolean() else None
+            length = reader.number(2)
+            if not 1 <= length <= MAX_SESSION_CLIENT_BYTES:
+                raise RecipeError("invalid ClientID length")
+            client = reader.take(length)
+            try:
+                client.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as error:
+                raise RecipeError("invalid ClientID") from error
+            if b"\x00" in client:
+                raise RecipeError("invalid ClientID")
+            recipe = SessionOpen(operation, clean_start, ("OnDisconnect", "Never")[expiry],
+                                 expected, client)
+        elif action == 1:
+            guard = reader.session_guard()
+            reason = reader.number(1)
+            if reason > 3:
+                raise RecipeError("invalid session end reason")
+            recipe = SessionClose(operation, guard,
+                                  ("Disconnect", "TransportLost", "Replaced", "Startup")[reason])
+        else:
+            raise RecipeError("invalid session action")
     else:
         raise RecipeError("unknown kind")
     if reader.at != len(data):

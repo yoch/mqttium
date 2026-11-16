@@ -166,6 +166,14 @@ FIXTURE_QOS0_SCOPE = (
     "the fixture-based qualifier does not cover volatile or consumed QoS 0 delivery"
 )
 FIXTURE_RECEIPT_SCOPE = "the fixture-based qualifier does not cover live receipt retirement"
+FIXTURE_SESSION_SCOPE = "the fixture-based qualifier does not cover product session lifecycle"
+
+
+def _product_session(row):
+    # Missing fields in historical fixture snapshots/recovery mean Never/None.
+    # Describing new policy or attachment facts cannot enlarge qualification.
+    return row.get("expiry", "Never") != "Never" or row.get("opened_by") is not None
+
 UNCORROBORATED_QUEUED = (
     "queued recovery delivery metadata is not corroborated by a durable snapshot"
 )
@@ -192,7 +200,9 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         return []
     unsupported, non_qos2, uncorroborated, qos0_delivery = False, False, False, False
     receipt_retirement = False
+    session_lifecycle = False
     for _, snapshot in run.snapshots.values():
+        session_lifecycle |= any(_product_session(row) for row in snapshot.get("sessions", ()))
         # A zero producer registration does not establish collection. A
         # positive compact boundary belongs to a new, unexamined state machine.
         receipt_retirement |= any(_positive_receipt_frontier(row)
@@ -205,6 +215,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
             if recipe[:6] == b"MQDR\x00\x01" and len(recipe) >= 7:
                 unsupported |= recipe[6] in (3, 4, 5, 7)
                 qos0_delivery |= recipe[6] == 6
+                session_lifecycle |= recipe[6] == 8
             try:
                 decoded = recipes.decode(recipe)
             except recipes.RecipeError:
@@ -216,12 +227,14 @@ def _scope_unmet(contracts, scenario_path, trace_path):
                 "SubscriptionsChanged", "DeliveryClaimed", "DeliveryFinished"
             }
             qos0_delivery |= facts.get("kind") == "DeliveryConsumed"
+            session_lifecycle |= facts.get("kind") == "SessionLifecycle"
     for record in run.trace.records:
         payload = record.payload
         unsupported |= payload.get("command_kind") in {
             "ChangeSubscriptions", "UpdateSubscriptions", "ClaimDelivery", "FinishDelivery"
         }
         qos0_delivery |= payload.get("command_kind") == "ConsumeDelivery"
+        session_lifecycle |= payload.get("command_kind") == "SessionLifecycle"
         non_qos2 |= (record.kind == "ClientBytesReceived"
                      and payload.get("packet_kind") == "PUBLISH"
                      and payload.get("qos", 2) != 2)
@@ -232,6 +245,8 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         if record.kind not in {"RecoveryPageRead", "RecoveryPageDelivered"}:
             continue
         for fact in payload["facts"]:
+            if fact["kind"] == "Session":
+                session_lifecycle |= _product_session(fact)
             if fact["kind"] == "ReceiptFrontier":
                 receipt_retirement |= _positive_receipt_frontier(fact)
                 continue
@@ -259,7 +274,9 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         ["the fixture-based qualifier covers incoming QoS 2 only"] if non_qos2 else []
     ) + ([UNCORROBORATED_QUEUED] if uncorroborated else []) + (
         [FIXTURE_QOS0_SCOPE] if qos0_delivery else []
-    ) + ([FIXTURE_RECEIPT_SCOPE] if receipt_retirement else [])
+    ) + ([FIXTURE_RECEIPT_SCOPE] if receipt_retirement else []) + (
+        [FIXTURE_SESSION_SCOPE] if session_lifecycle else []
+    )
 
 
 def _broker_unmet(contracts, manifest, trace_path):

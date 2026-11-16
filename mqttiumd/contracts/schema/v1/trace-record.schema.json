@@ -1910,6 +1910,12 @@
               },
               "revision": {
                 "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "expiry": {
+                "$ref": "primitives.schema.json#/$defs/session_expiry"
+              },
+              "opened_by": {
+                "$ref": "primitives.schema.json#/$defs/session_opening"
               }
             }
           }

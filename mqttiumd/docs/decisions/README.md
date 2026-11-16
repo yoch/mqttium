@@ -39,5 +39,7 @@ its source; a test fails when the register and the records drift apart.
 
 | [0022](0022-product-tcp-qos2.md) | Proposed | Product TCP incoming QoS 2, durable session facts, bounded transport and system evidence | Product |
 
+| [0029](0029-explicit-session-lifecycle.md) | Proposed | Explicit bounded zero/infinite session lifecycle, receipted attachments, target-only cancellation and physical cleanup | Product |
+
 What each record leaves open is tracked in
 [`../reception/open-conditions.md`](../reception/open-conditions.md).

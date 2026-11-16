@@ -18,7 +18,8 @@ it. The examples illustrate the contract and are not part of the digest.
 | `schema/v1/store-snapshot.schema.json` | The durable state of a store at one checkpoint, as `InspectDurableState` writes it |
 | `v1/fault-points.json` | Contractual injection points, what each carries (a command or a result) and the actions it offers |
 | `v1/profiles.json` | Profiles and their perimeter |
-| `v1/product-profile.json` | Fixed bounds and MQTT feature restrictions of the experimental TCP receiver |
+| `v1/product-profile.json` | Fixed bounds and MQTT feature restrictions of the experimental TCP broker |
+| `v1/sessions.transitions.json` | Partial lifecycle transitions under Proposed0029, with product-system-test scope |
 | `schema/v1/product-event.schema.json` | Bounded product observations; separate from fixture-based qualifying campaign traces |
 | `v1/assertions.json` | Assertion names, their meaning and the requirements they serve |
 | `v1/requirements.json` | Every identifier the specification defines, each with its source: a chapter or an accepted decision record |
@@ -321,7 +322,7 @@ oracle and never an input of the broker.
 | Table | Rows, in the order of their key |
 | - | - |
 | `meta` | Store incarnation; the last opened epoch (every earlier one is closed) and the attempt that opened it; the revision frontier; the next session |
-| `sessions` | SessionId, ClientID bytes, revision, state. A deleted session stays, terminal |
+| `sessions` | Retained SessionId, ClientID bytes, revision, state, expiry policy and opening attachment OperationId. Current termination physically removes its row; `next_session` preserves non-reuse |
 | `route_table` | Its revision, and each exact topic with its target sessions and their QoS |
 | `receipt_frontiers` | At most 64 committed producer-origin guards, ordered by incarnation, epoch, owner; explicit operation/publication/payload boundaries, distinct from rejection receipts |
 | `operations` | Receipts: OperationId, the exact canonical bytes of the recipe, the terminal decision with its content (commit facts, or the reason of a certain rejection) |
@@ -471,3 +472,52 @@ and repeats no semantic rule. A second reader of the semantic rules is an
 open condition. Its strict parsing matches the Rust reader on the cases the
 corpus holds, including `NaN`, a lone surrogate escape, an integer beyond
 64 bits and the lexeme `-0`.
+
+### Explicit bounded session lifecycle (Proposed0029)
+
+ClientID is a reusable name; SessionId, opening OperationId and transport
+generation retain separate identities. JSON snapshot/recovery fields `expiry`
+and `opened_by` are optional only for historical fixture compatibility: omitted
+means `Never` and null respectively. New emitters always carry both. SQLite
+schema5 always persists and validates both; formats1--4 are refused before
+write-affecting pragmas. `Terminal` session rows remain readable historical
+format evidence, but current atomic cleanup removes them and never resets the
+monotone `next_session` counter. A publication's historical producer SessionId
+may outlive its row while obligations toward other destinations remain due.
+
+Canonical format1 adds kind8 `SessionLifecycle`, leaving kind1--7 bytes
+unchanged. Its OperationId precedes action0(Open) or1(Close). Open holds a strict
+boolean Clean Start, policy0(OnDisconnect)/1(Never), an optional expected guard,
+and a u16-length UTF-8 ClientID of1--1024 bytes without NUL. An optional
+expected guard starts with a presence bit. Its contents are SessionId followed
+by a strict opening-token presence bit and optional opening OperationId.
+Close holds that exact guard and reason0(Disconnect),1(TransportLost),2(Replaced)
+or3(Startup). No result loss authorizes a new request identity. Close is a
+control; Open consumes the business window. The window remains1024; its
+business threshold640 reserves384 positions for bounded continuation needs.
+Physical receipt quota8192/control reserve512 are unchanged.
+
+Committed facts are `{kind: "SessionLifecycle", change: ...}`. Opened identifies
+the durable session/revision, Session Present, policy, optional retired identity,
+route revision and bounded cancelled inbound/delivery/route counts. Closed
+identifies the cancelled session, route revision and cancellation counts.
+Cancellations are not successful deliveries. Product `session_changed` carries
+the original OperationId and the applied facts; an Open's attachment is this
+OperationId. `session_refused` carries a negative CONNACK reason and no invented
+SessionId. `session_cardinality` records bounded live/cleanup inventories without
+historical ClientIDs.
+
+Absent CONNECT expiry means0. Clean Start0 may resume a persistent incarnation
+and set policy0, retaining its business state until later closure. Clean Start1
+creates a new incarnation. DISCONNECT may retain policy, set0, or request the
+supported infinity value; CONNECT0 to nonzero DISCONNECT is Protocol Error0x82.
+Finite intermediate intervals remain explicitly unsupported. Ephemeral sessions
+from a previous process are atomically terminated on actual epoch opening before
+readiness. Duplicate opening replay does not repeat startup expiry.
+
+The partial lifecycle registry describes product-system tests only. The fixture
+qualifier refuses lifecycle receipts, new policies or attachments; decoding their
+format is not independent qualification of session lifecycle behavior. Legacy
+Never/null fixture inventories preserve their previous qualification scope.
+Lifecycle transitions requiring takeover/control chaining reserve three effects;
+the historical two-slot constructor minimum remains valid for old inputs only.

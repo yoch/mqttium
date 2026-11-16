@@ -76,7 +76,11 @@
         "consume.committed",
         "consume.emission",
         "receipt.close.prepared",
-        "receipt.close.committed"
+        "receipt.close.committed",
+        "session.open.prepared",
+        "session.close.prepared",
+        "session.open.committed",
+        "session.close.committed"
       ]
     },
     "command_kind": {
@@ -87,7 +91,9 @@
         "Claim",
         "Finish",
         "Consume",
-        "ReceiptCollection"
+        "ReceiptCollection",
+        "SessionOpen",
+        "SessionClose"
       ]
     },
     "cause": {
@@ -152,6 +158,25 @@
         },
         "returned_payload_through": {
           "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "session": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "route_revision": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "revision": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        },
+        "retired_session": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            }
+          ]
         }
       }
     },
@@ -206,6 +231,247 @@
             "properties": {
               "authority": {
                 "const": "reader_dequeue"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "session_changed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operation",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "required": [
+              "action",
+              "session",
+              "route_revision",
+              "cancelled_inbound",
+              "cancelled_deliveries",
+              "cancelled_routes"
+            ],
+            "properties": {
+              "action": {
+                "enum": [
+                  "Opened",
+                  "Closed"
+                ]
+              },
+              "cancelled_inbound": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 128
+              },
+              "cancelled_deliveries": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "cancelled_routes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 128
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "action": {
+                      "const": "Opened"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "revision",
+                    "session_present",
+                    "expiry",
+                    "retired_session"
+                  ],
+                  "properties": {
+                    "expiry": {
+                      "$ref": "primitives.schema.json#/$defs/session_expiry"
+                    },
+                    "session_present": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "session_refused"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "connection",
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "required": [
+              "reason_code"
+            ],
+            "properties": {
+              "reason_code": {
+                "enum": [
+                  128,
+                  129,
+                  130,
+                  131,
+                  132,
+                  133,
+                  134,
+                  135,
+                  136,
+                  137,
+                  138,
+                  140,
+                  144,
+                  149,
+                  151,
+                  153,
+                  154,
+                  155,
+                  156,
+                  157,
+                  159
+                ]
+              }
+            },
+            "not": {
+              "required": [
+                "session"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "session_cardinality"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "required": [
+              "session_cache",
+              "owner_sessions",
+              "owner_bindings",
+              "work_requests",
+              "work_ready",
+              "emit_registrations",
+              "lifecycle_requests",
+              "closed_generations",
+              "retired_flights",
+              "owner_inbound",
+              "owner_outgoing",
+              "frames",
+              "timers"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "session_cache": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "owner_sessions": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "owner_bindings": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "work_requests": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "work_ready": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "emit_registrations": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "lifecycle_requests": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "closed_generations": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "retired_flights": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "owner_inbound": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "owner_outgoing": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "frames": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
+              },
+              "timers": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4096
               }
             }
           }

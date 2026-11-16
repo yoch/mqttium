@@ -12,7 +12,7 @@
       "machine": "ReceiptMaintenance",
       "state_class": "WindowOpen",
       "event_class": "CommandPrepared",
-      "guard": "Checked never-reused sequence and recipe identity boundaries. Issued span is at most 1024; new business is limited to 768, leaving continuation capacity. Register issuance before exposing the command.",
+      "guard": "Checked never-reused sequence and recipe identity boundaries. Issued span is at most 1024; new business is limited to 640, leaving 384 positions for bounded inbound, outgoing and lifecycle continuations. Register issuance before exposing the command.",
       "next_state_class": "WindowOpen",
       "required_actions": [
         "RegisterIssuance"

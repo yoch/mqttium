@@ -4,8 +4,14 @@
   "id": "tcp-qos0-exact-pubsub-v1",
   "mqtt_version": 5,
   "client_id": "explicit",
-  "clean_start": false,
-  "session_expiry_interval": 4294967295,
+  "clean_start": [
+    false,
+    true
+  ],
+  "session_expiry_interval": [
+    0,
+    4294967295
+  ],
   "incoming_qos": [
     0,
     1,
@@ -51,12 +57,18 @@
   "volatile_payload_reference_bytes": 4194304,
   "outbox_slots": 128,
   "receipt_window": 1024,
-  "receipt_data_window": 768,
+  "receipt_data_window": 640,
   "receipt_control_reserve": 512,
   "receipt_collection_rows": 128,
   "receipt_collection_trigger": 64,
   "max_receipt_origins": 64,
   "receipt_collection_bytes": 2097152,
   "outgoing_packet_identifier_max": 65535,
-  "outgoing_packet_identifier_probe_limit": 129
+  "outgoing_packet_identifier_probe_limit": 129,
+  "session_expiry_default": 0,
+  "disconnect_session_expiry_interval": [
+    0,
+    4294967295
+  ],
+  "lifecycle_transition_effect_slots": 3
 }

@@ -180,6 +180,14 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
                     u64_at(document, &pointer, &mut report.diagnostics);
                 }
             }
+            if text(document, "kind") == "session_changed" {
+                for member in ["session", "route_revision", "revision", "retired_session"] {
+                    let pointer = format!("/details/{member}");
+                    if document.pointer(&pointer).is_some_and(Value::is_string) {
+                        u64_at(document, &pointer, &mut report.diagnostics);
+                    }
+                }
+            }
             if matches!(
                 text(document, "kind"),
                 "receipt_collection_submitted"
@@ -1598,6 +1606,8 @@ pub fn representative_fact(kind: &str, topic_hex: &str) -> Option<RecoveredFact>
             session: SessionId::new(0),
             client_id: SharedBytes::copy_from(&[], 0).ok()?,
             revision: Revision::new(0),
+            expiry: mqttiumd_contract::session::SessionExpiry::Never,
+            opened_by: None,
         },
         "InboundExchange" => RecoveredFact::InboundExchange {
             exchange: ExchangeId {
@@ -1824,7 +1834,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
 /// Names of the members that hold a 64-bit decimal string, in a trace
 /// payload or a snapshot. A test walks the schemas and fails when one of
 /// their 64-bit members is missing here.
-const COMPONENTS: [&str; 47] = [
+const COMPONENTS: [&str; 48] = [
     "source_observation_sequence",
     "through",
     "publication_through",
@@ -1869,6 +1879,7 @@ const COMPONENTS: [&str; 47] = [
     "target_revision",
     "target_session",
     "route_revision",
+    "retired",
     "max_payload_bytes",
     "max_sessions",
     "max_route_targets",

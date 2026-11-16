@@ -25,14 +25,16 @@
       "enum": [
         "tcp-qos0-exact-pubsub-v1",
         "tcp-receipt-maintenance-v1",
-        "tcp-outgoing-pi-reuse-v1"
+        "tcp-outgoing-pi-reuse-v1",
+        "tcp-session-lifecycle-v1"
       ]
     },
     "decision": {
       "enum": [
         "0026",
         "0027",
-        "0028"
+        "0028",
+        "0029"
       ]
     },
     "scope": {
@@ -75,7 +77,8 @@
               "VolatileQos0",
               "ConsumedQos0",
               "ReceiptMaintenance",
-              "OutgoingPacketIdentifier"
+              "OutgoingPacketIdentifier",
+              "SessionLifecycle"
             ]
           },
           "state_class": {
@@ -102,7 +105,13 @@
               "Reserved",
               "Observed",
               "NoTarget",
-              "Ignored"
+              "Ignored",
+              "ActivePersistent",
+              "ActiveEphemeral",
+              "OpenPending",
+              "ClosePending",
+              "RetiredDetached",
+              "Absent"
             ]
           },
           "event_class": {
@@ -137,7 +146,13 @@
               "Reserved",
               "Observed",
               "NoTarget",
-              "Ignored"
+              "Ignored",
+              "ActivePersistent",
+              "ActiveEphemeral",
+              "OpenPending",
+              "ClosePending",
+              "RetiredDetached",
+              "Absent"
             ]
           },
           "required_actions": {
@@ -232,6 +247,25 @@
         "properties": {
           "decision": {
             "const": "0028"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "const": "tcp-session-lifecycle-v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "const": "0029"
           }
         }
       }

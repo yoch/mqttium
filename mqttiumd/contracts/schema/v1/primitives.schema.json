@@ -290,7 +290,8 @@
         "PreconditionFailed",
         "CapacityExceeded",
         "Fenced",
-        "EpochClosed"
+        "EpochClosed",
+        "SessionCapacityExceeded"
       ]
     },
     "durableReadCode": {
@@ -404,6 +405,126 @@
           "$ref": "#/$defs/u64"
         }
       }
+    },
+    "session_expiry": {
+      "description": "Never for an omitted legacy fixture field; current schema5 SQLite always persists and validates it.",
+      "enum": [
+        "OnDisconnect",
+        "Never"
+      ]
+    },
+    "session_opening": {
+      "description": "OperationId of the durable open attachment, or null for a legacy Admin fixture. Omitted legacy JSON means null.",
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        }
+      ]
+    },
+    "session_cancellations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inbound",
+        "deliveries",
+        "routes"
+      ],
+      "properties": {
+        "inbound": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "deliveries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "routes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "session_change": {
+      "description": "Known committed lifecycle business facts; cancellation is distinct from successful delivery. The attachment of an Open is its enclosing OperationId.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "session",
+            "route_revision",
+            "cancelled",
+            "revision",
+            "session_present",
+            "expiry",
+            "retired"
+          ],
+          "properties": {
+            "kind": {
+              "const": "Opened"
+            },
+            "session": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "route_revision": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "cancelled": {
+              "$ref": "primitives.schema.json#/$defs/session_cancellations"
+            },
+            "revision": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "session_present": {
+              "type": "boolean"
+            },
+            "expiry": {
+              "$ref": "primitives.schema.json#/$defs/session_expiry"
+            },
+            "retired": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "primitives.schema.json#/$defs/u64"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "session",
+            "route_revision",
+            "cancelled"
+          ],
+          "properties": {
+            "kind": {
+              "const": "Closed"
+            },
+            "session": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "route_revision": {
+              "$ref": "primitives.schema.json#/$defs/u64"
+            },
+            "cancelled": {
+              "$ref": "primitives.schema.json#/$defs/session_cancellations"
+            }
+          }
+        }
+      ]
     }
   }
 }
