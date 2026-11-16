@@ -215,6 +215,8 @@ impl Runtime<'_> {
                 _ => None,
             };
             let wakes_business = matches!(input, Input::StoreResult { .. });
+            let ready_work = self.work_progress_hint(&input);
+            let mut applied = false;
             match self.owner.step(
                 input,
                 TurnGrant {
@@ -222,6 +224,7 @@ impl Runtime<'_> {
                 },
             ) {
                 StepOutcome::Applied { .. } => {
+                    applied = true;
                     if let Some((id, delivery)) = finish {
                         self.events.emit("core_finish_observed",json!({"operation":operation(id),"details":{"delivery":delivery_text(delivery)}})).map_err(event_failure)?;
                     }
@@ -262,6 +265,9 @@ impl Runtime<'_> {
                 }
             }
             self.dispatch()?;
+            if applied && let Some((session, initial)) = ready_work {
+                self.rearm_ready_work(session, initial);
+            }
         }
         Ok(())
     }
@@ -426,6 +432,67 @@ impl Runtime<'_> {
         }
         self.queue_work(session);
         Ok(())
+    }
+    /// A hint follows only a relevant input actually applied by the owner.
+    /// Eligibility remains a pure-core decision; an applied no-op is not
+    /// authority to poll a blocked destination or repeatedly read an empty page.
+    fn work_progress_hint(&self, input: &Input) -> Option<(SessionId, bool)> {
+        match input {
+            Input::WorkPage { session, .. } | Input::WorkAvailable { session } => {
+                Some((*session, false))
+            }
+            Input::SessionEstablished {
+                session,
+                connection: Some(_),
+                ..
+            } => Some((*session, true)),
+            Input::StoreResult {
+                reply:
+                    StoreReply::Outcome(StoreOutcome::Committed(
+                        CommitFacts::DeliveryClaimed { target, .. }
+                        | CommitFacts::DeliveryFinished { target, .. },
+                    )),
+                ..
+            } => Some((*target, false)),
+            Input::StoreResult {
+                reply:
+                    StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SubscriptionsChanged {
+                        session,
+                        ..
+                    })),
+                ..
+            } => Some((*session, false)),
+            Input::FrameResult { connection, .. } => Some((connection.session, false)),
+            Input::Packet {
+                packet: InboundPacket::ConnectResume { client_id },
+                ..
+            } => self
+                .sessions
+                .get(client_id.as_slice())
+                .map(|s| (s.id, true)),
+            Input::Packet {
+                connection,
+                packet: InboundPacket::Puback { .. },
+                ..
+            } => self
+                .sessions
+                .values()
+                .find(|s| self.owner.connection_of(s.id) == Some(*connection))
+                .map(|s| (s.id, false)),
+            _ => None,
+        }
+    }
+    fn rearm_ready_work(&mut self, session: SessionId, initial: bool) {
+        let usable = self.owner.connection_of(session).is_some_and(|generation| {
+            self.peers
+                .get(&generation)
+                .is_some_and(|p| p.connected && !p.pending && p.closing.is_none())
+        });
+        if usable && (initial || self.owner.has_ready_work(session)) {
+            // queue_work is FIFO, bounded by the existing input budget, and
+            // deduplicated by destination. Each turn retains its 64-input cap.
+            self.queue_work(session);
+        }
     }
     fn queue_work(&mut self, session: SessionId) {
         if self.inputs.len() + self.deferred_inputs.len() < INPUTS
