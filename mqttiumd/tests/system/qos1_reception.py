@@ -559,6 +559,8 @@ def quota_refusal(binary: Path, case: Path) -> dict:
         refusals = []
         with Wire(broker.address, broker.observations, "certain-refusals") as wire:
             wire.connect("qos1-refusal", session_present=False)
+            established = database(broker.db)
+            established_receipts = {row['id'] for row in established['tables']['operations']}
             for identifier in range(1, 10):
                 wire.send(publish_packet("reception/refusal", b"rejected", identifier, qos=1))
                 frame = wire.expect(0x40)
@@ -571,7 +573,10 @@ def quota_refusal(binary: Path, case: Path) -> dict:
                 refusals.append({"qos": 2, "packet_id": identifier, "reason": 0x97})
             rejected = database(broker.db)
             write_json(case / "rejected-durable.json", rejected)
-            require(not rejected["admissions"] and rejected["counts"]["operations"] == 18,
+            refused_operations = [row for row in rejected['tables']['operations']
+                                  if row['id'] not in established_receipts]
+            require(not rejected["admissions"] and len(refused_operations) == 18
+                    and all(row['decision'] == 3 for row in refused_operations),
                     "certain_refusal_not_durable")
             command = [sys.executable, str(Path(__file__).with_name("external_mqttium.py")),
                        "--host", broker.address[0], "--port", str(broker.address[1]),
@@ -592,6 +597,7 @@ def quota_refusal(binary: Path, case: Path) -> dict:
         finished_state(broker, case, admissions=2, releases=1)
         broker.stop()
         return {"criterion": "E-refusal", "status": "PASS", "refusals": refusals,
+                "durable_refusal_operations": [row['id'] for row in refused_operations],
                 "credit_reused": True, "mqttium": {"command": command, "result": client},
                 "intervention": "Isolated post-readiness payload quota guard; restored before restart"}
     finally:
@@ -608,18 +614,24 @@ def unknown_outcome(binary: Path, case: Path) -> dict:
         broker.ready()
         with Wire(broker.address, broker.observations, "unknown") as wire:
             wire.connect("qos1-unknown", session_present=False)
+            established = database(broker.db)
+            after_connect = max(int(event['seq']) for event in broker.events())
             with sqlite3.connect(broker.db, timeout=.25) as connection:
                 original = connection.execute("SELECT limit_receipt_slots FROM meta").fetchone()[0]
                 connection.execute("UPDATE meta SET limit_receipt_slots = ?", ((0).to_bytes(8, "big"),))
             broker.observations.record("quota_intervention", field="limit_receipt_slots", value="0",
                                        scope="isolated unknown-outcome guard; restored before resolution")
             wire.send(publish_packet("reception/unknown", b"uncertain", 7, qos=1))
-            hit = broker.wait_event("store_result")
-            require(hit["details"]["outcome"] == "PendingOrUnknown", "unknown_not_reached")
+            hit = broker.wait_event("store_result", after=after_connect)
+            require(hit.get('command_kind') == 'Admission'
+                    and hit["details"]["outcome"] == "PendingOrUnknown", "unknown_not_reached")
             frame = wire.poll(.2)
             require(frame is None, "unknown_outcome_acknowledged")
             before = database(broker.db)
-            require(not before["admissions"] and not before["tables"]["operations"],
+            require(not before["admissions"]
+                    and before['tables']['operations'] == established['tables']['operations']
+                    and not any(row['id'] == operation_hex(hit['operation'])
+                                for row in before['tables']['operations']),
                     "unknown_operation_unexpectedly_decided")
             write_json(case / "unknown-durable.json", before)
             with sqlite3.connect(broker.db, timeout=.25) as connection:
@@ -647,28 +659,43 @@ def unknown_outcome(binary: Path, case: Path) -> dict:
 
 
 def takeover_late_commit(binary: Path, case: Path) -> dict:
-    broker = Broker(binary, case, pauses=("admission.committed",))
+    broker = Broker(binary, case, test_control=True)
     first = None
     second = None
     try:
         broker.ready()
         first = Wire(broker.address, broker.observations, "closed-generation")
         first.connect("qos1-takeover", session_present=False)
-        first.send(publish_packet("reception/takeover", b"first", 7, qos=1))
-        hit = broker.wait_event("barrier_hit", point="admission.committed")
         first_generation = next(event["connection"] for event in broker.events()
                                 if event["kind"] == "session_established")
+        before = max(int(event["seq"]) for event in broker.events())
+        # Hold the authentic result, not the SQLite writer. Reconnection now
+        # requires its own known lifecycle commit and cannot bypass that writer.
+        hold = broker.control / 'hold-admission-result'
+        hold.touch(exist_ok=False)
+        first.send(publish_packet("reception/takeover", b"first", 7, qos=1))
+        hit = broker.wait_event("store_result_held", after=before)
+        require(hit.get('command_kind') == 'Admission'
+                and hit['details']['outcome'] == 'Committed', 'late_commit_not_reached')
+        committed = database(broker.db)
+        require(any(row['id'] == operation_hex(hit['operation']) for row in committed['admissions']),
+                'late_commit_not_durable')
+        require(first.poll(.1) is None, 'unknown_outcome_acknowledged')
         first.close()
-        # Existing sessions reconnect from the confirmed runtime cache while
-        # the writer still holds the committed command's result.
         second = Wire(broker.address, broker.observations, "new-generation")
         second.connect("qos1-takeover", session_present=True)
-        before = max(int(event["seq"]) for event in broker.events())
-        broker.release("admission.committed")
-        result = broker.wait_event("store_result", after=before)
-        require(result["operation"] == hit["operation"], "late_result_changed_operation")
-        # A pending operation can answer the currently owning connection; its
-        # old socket must not receive a newly emitted business acknowledgement.
+        second.send(b'\xc0\x00')
+        second.expect(0xD0)
+        after_reconnect = max(int(event["seq"]) for event in broker.events())
+        hold.unlink()
+        broker.observations.record('admission_result_released', operation=hit['operation'])
+        # Existing operation resolution runs on the unchanged ten-second
+        # deadline, using the same twelve-second bound as E-unknown.
+        result = broker.wait_event("store_resolved", after=after_reconnect, timeout=12)
+        require(result["operation"] == hit["operation"]
+                and result['details']['outcome'] == 'committed', 'late_result_changed_operation')
+        # The old transport cannot receive an acknowledgement. A pending
+        # exchange may finish on the currently owning transport after knowledge.
         deadline = time.monotonic() + .25
         while time.monotonic() < deadline:
             frame = second.poll(max(0, deadline - time.monotonic()))
@@ -681,15 +708,18 @@ def takeover_late_commit(binary: Path, case: Path) -> dict:
         require(not frames, "ack_on_closed_generation")
         state = database(broker.db)
         require(len(state["admissions"]) == 1, "late_commit_readmitted")
+        before_next = max(int(event["seq"]) for event in broker.events())
         second.send(publish_packet("reception/takeover", b"second", 7, qos=1))
-        next_hit = broker.wait_event("barrier_hit", point="admission.committed", after=int(hit["seq"]))
-        require(next_hit["operation"] != hit["operation"], "new_occurrence_reused_operation")
-        broker.release("admission.committed")
         second.expect(0x40, 7)
+        next_result = broker.wait_event("store_result", after=before_next)
+        require(next_result.get('command_kind') == 'Admission'
+                and next_result['details']['outcome'] == 'Committed'
+                and next_result['operation'] != hit['operation'], 'new_occurrence_reused_operation')
         finished_state(broker, case, admissions=2, releases=0)
         broker.stop()
         return {"criterion": "E-takeover", "status": "PASS", "first_operation": hit["operation"],
-                "next_operation": next_hit["operation"], "closed_generation": first_generation,
+                "next_operation": next_result["operation"], "closed_generation": first_generation,
+                "held_committed_result": hit, "same_operation_resolution": result,
                 "no_ack_on_closed_generation": True}
     finally:
         if first:
