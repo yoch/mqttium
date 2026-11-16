@@ -60,3 +60,54 @@ impl Events {
 pub fn operation(id: OperationId) -> Value {
     json!({"incarnation":id.incarnation().get().to_string(),"epoch":id.epoch().get().to_string(),"owner":id.owner().get().to_string(),"sequence":id.sequence().get().to_string()})
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64,Ordering};
+    static NEXT:AtomicU64=AtomicU64::new(0);
+    struct Directory(std::path::PathBuf);
+    impl Directory {
+        fn new()->Self {
+            let path=std::env::temp_dir().join(format!("mqttiumd-log-test-{}-{}",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
+            std::fs::create_dir(&path).unwrap();Self(path)
+        }
+    }
+    impl Drop for Directory {fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
+    fn read(path:&Path)->Vec<Value> {
+        std::fs::read_to_string(path).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect()
+    }
+    fn sequence(value:&Value)->u64 {value["seq"].as_str().unwrap().parse().unwrap()}
+
+    #[test]
+    fn observations_rotate_bounded_files_without_stopping_a_long_lived_product() {
+        let directory=Directory::new();let path=directory.0.join("events.jsonl");
+        let events=Events::open(&path).unwrap();let text="x".repeat(240);
+        for index in 0..34_000 {
+            events.emit("frame_queued",json!({"details":{"packet_kind":"PUBLISH","effect":index.to_string(),"a":text,"b":text,"c":text,"d":text}})).expect("bounded observations rotate instead of exhausting the product log budget");
+        }
+        let previous=directory.0.join("events.jsonl.previous");
+        assert!(previous.is_file(),"a previous bounded file preserves rotation evidence");
+        assert!(std::fs::metadata(&path).unwrap().len()<=MAX_LOG as u64);
+        assert!(std::fs::metadata(&previous).unwrap().len()<=MAX_LOG as u64);
+        assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(),2);
+        let before=read(&previous);let current=read(&path);
+        assert_eq!(current[0]["kind"],"log_rotated");
+        assert_eq!(current[0]["details"]["retained_from"],sequence(&before[0]).to_string());
+        assert_eq!(current[0]["details"]["previous_last_seq"],sequence(before.last().unwrap()).to_string());
+        assert_eq!(current[0]["details"]["discarded_through"],(sequence(&before[0])-1).to_string());
+        let all:Vec<_>=before.iter().chain(current.iter()).collect();
+        assert!(all.windows(2).all(|pair|sequence(pair[1])==sequence(pair[0])+1));
+        assert!(sequence(before.first().unwrap())>1,"this witness crosses more than one real 16MiB boundary");
+    }
+
+    #[test]
+    fn an_oversized_record_neither_rotates_nor_advances_the_event_sequence() {
+        let directory=Directory::new();let path=directory.0.join("events.jsonl");let events=Events::open(&path).unwrap();
+        events.emit("starting",json!({})).unwrap();
+        assert!(events.emit("starting",json!({"details":{"oversized":"x".repeat(MAX_RECORD)}})).is_err());
+        events.emit("stopped",json!({})).unwrap();
+        assert!(!directory.0.join("events.jsonl.previous").exists());
+        assert_eq!(read(&path).iter().map(sequence).collect::<Vec<_>>(),[1,2]);
+    }
+}
