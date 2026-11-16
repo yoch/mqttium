@@ -258,7 +258,7 @@ class FinishCursor:
     def __init__(self, broker: Broker):
         self.broker = broker
         self.offsets = {}
-        self.last_sequence = -1
+        self.last_sequence = 0
         self.counts = Counter()
         self.active = {}
         self.by_identifier = {}
