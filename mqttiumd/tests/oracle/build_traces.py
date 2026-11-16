@@ -291,6 +291,7 @@ def snapshot(run, checkpoint, admissions, releases=(), open_exchange=True, epoch
         ]
         if open_exchange
         else [],
+        "outbound": [],
         "account": {
             "used": {
                 "payload_bytes": str(len(PAYLOAD) * len(admissions)),

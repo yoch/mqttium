@@ -187,7 +187,10 @@ fn opening_reply_json(reply: &OpeningReply) -> Value {
 fn ack_reason(frame: OutboundFrame) -> Option<&'static str> {
     use mqttiumd_contract::packet::AckReason;
     let reason = match frame {
-        OutboundFrame::Connack { .. } | OutboundFrame::Pingresp => return None,
+        OutboundFrame::Connack { .. }
+        | OutboundFrame::Pingresp
+        | OutboundFrame::Suback { .. }
+        | OutboundFrame::Unsuback { .. } => return None,
         OutboundFrame::Puback { reason, .. } => {
             return Some(match reason {
                 mqttiumd_contract::packet::PubackReason::Success => "Success",
@@ -612,10 +615,12 @@ impl<S: DurableStore> EffectSink for Sink<'_, S> {
                 SubmitResult::Accepted
             }
             // No adapter of S0 takes these: the box keeps them.
-            Effect::LoadWork { .. } | Effect::Continue { .. } => SubmitResult::NotSubmitted {
-                effect,
-                reason: SubmitBlock::Closed,
-            },
+            Effect::LoadWork { .. } | Effect::EmitPublish { .. } | Effect::Continue { .. } => {
+                SubmitResult::NotSubmitted {
+                    effect,
+                    reason: SubmitBlock::Closed,
+                }
+            }
         }
     }
 }

@@ -18,7 +18,7 @@ use mqttiumd_contract::capacity::Resource;
 use mqttiumd_contract::command::{DeliveryCause, OpeningAttempt};
 use mqttiumd_contract::effects::{InboundPhase, RecoveredFact};
 use mqttiumd_contract::ids::{
-    EffectId, ExchangeId, OperationId, PayloadId, PublicationId, SessionId,
+    DeliveryId, EffectId, ExchangeId, OperationId, PayloadId, PublicationId, SessionId,
 };
 use mqttiumd_contract::outcome::{
     CommitFacts, Knowledge, RejectReason, StoreOutcome, StoreReply, StoreViolation,
@@ -69,6 +69,13 @@ fn payload_id(payload: PayloadId) -> Value {
         "epoch": decimal(payload.epoch().get()),
         "owner": decimal(payload.owner().get()),
         "sequence": decimal(payload.sequence().get()),
+    })
+}
+
+fn delivery_id(delivery: DeliveryId) -> Value {
+    json!({
+        "publication_id": publication_id(delivery.publication),
+        "index": delivery.index,
     })
 }
 
@@ -127,6 +134,36 @@ fn facts(facts: CommitFacts) -> Value {
         CommitFacts::InboundReleased { exchange } => json!({
             "kind": "InboundReleased",
             "exchange": exchange_id(exchange),
+        }),
+        CommitFacts::SubscriptionsChanged {
+            session: id,
+            route_revision,
+        } => json!({
+            "kind": "SubscriptionsChanged",
+            "session": session(id),
+            "route_revision": decimal(route_revision.get()),
+        }),
+        CommitFacts::DeliveryClaimed {
+            delivery,
+            target,
+            packet_id,
+            claim,
+        }
+        | CommitFacts::DeliveryFinished {
+            delivery,
+            target,
+            packet_id,
+            claim,
+        } => json!({
+            "kind": if matches!(facts, CommitFacts::DeliveryClaimed { .. }) {
+                "DeliveryClaimed"
+            } else {
+                "DeliveryFinished"
+            },
+            "delivery_id": delivery_id(delivery),
+            "target_session": session(target),
+            "packet_id": packet_id.get(),
+            "claim_operation_id": operation_id(claim),
         }),
     }
 }
@@ -280,6 +317,21 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
             })
         })
         .collect();
+    let outbound: Vec<Value> = state
+        .outbound
+        .iter()
+        .map(|(delivery, record)| {
+            json!({
+                "delivery_id": delivery_id(*delivery),
+                "target_session": session(record.target),
+                "target_revision": decimal(record.target_revision.get()),
+                "packet_id": record.packet_id.get(),
+                "claim_operation_id": operation_id(record.claim),
+                "phase": "AwaitPuback",
+                "emission": "MayHaveStarted",
+            })
+        })
+        .collect();
     let limits = state.limits;
     let used = state.accounts;
     json!({
@@ -307,6 +359,7 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
         "publications": publications,
         "obligations": obligations,
         "inbound_exchanges": inbound,
+        "outbound": outbound,
         "account": {
             "used": {
                 "payload_bytes": decimal(used.payload_bytes.get()),
@@ -389,6 +442,21 @@ pub fn recovered_fact(fact: &RecoveredFact) -> Value {
             "phase": match phase {
                 InboundPhase::AwaitPubrel => "AwaitPubrel",
             },
+        }),
+        RecoveredFact::OutboundDelivery {
+            delivery,
+            target,
+            target_revision,
+            claim,
+        } => json!({
+            "kind": "OutboundDelivery",
+            "delivery_id": delivery_id(*delivery),
+            "target_session": session(*target),
+            "target_revision": decimal(target_revision.get()),
+            "claim": claim.map(|claim| json!({
+                "operation_id": operation_id(claim.operation),
+                "packet_id": claim.packet_id.get(),
+            })),
         }),
         RecoveredFact::Operation {
             operation,
@@ -695,7 +763,11 @@ impl<'a> TraceWriter<'a> {
                             "operation_id": operation_id(*operation),
                         }),
                     ),
-                    WorkKind::AdmitPublication | WorkKind::ReleaseInbound => self.record(
+                    WorkKind::AdmitPublication
+                    | WorkKind::ReleaseInbound
+                    | WorkKind::ChangeSubscriptions
+                    | WorkKind::ClaimDelivery
+                    | WorkKind::FinishDelivery => self.record(
                         "store-adapter",
                         "CommandSubmitted",
                         &[],

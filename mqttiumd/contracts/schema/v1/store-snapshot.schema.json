@@ -19,6 +19,7 @@
     "publications",
     "obligations",
     "inbound_exchanges",
+    "outbound",
     "account"
   ],
   "properties": {
@@ -248,7 +249,10 @@
                         "kind": {
                           "enum": [
                             "PublicationAdmitted",
-                            "InboundReleased"
+                            "InboundReleased",
+                            "SubscriptionsChanged",
+                            "DeliveryClaimed",
+                            "DeliveryFinished"
                           ]
                         }
                       },
@@ -309,6 +313,118 @@
                               },
                               "exchange": {
                                 "$ref": "primitives.schema.json#/$defs/exchange_id"
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "if": {
+                            "required": [
+                              "kind"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "SubscriptionsChanged"
+                              }
+                            }
+                          },
+                          "then": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "kind",
+                              "session",
+                              "route_revision"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "SubscriptionsChanged"
+                              },
+                              "session": {
+                                "$ref": "primitives.schema.json#/$defs/u64"
+                              },
+                              "route_revision": {
+                                "$ref": "primitives.schema.json#/$defs/u64"
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "if": {
+                            "required": [
+                              "kind"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "DeliveryClaimed"
+                              }
+                            }
+                          },
+                          "then": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "kind",
+                              "delivery_id",
+                              "target_session",
+                              "packet_id",
+                              "claim_operation_id"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "DeliveryClaimed"
+                              },
+                              "delivery_id": {
+                                "$ref": "primitives.schema.json#/$defs/delivery_id"
+                              },
+                              "target_session": {
+                                "$ref": "primitives.schema.json#/$defs/u64"
+                              },
+                              "packet_id": {
+                                "$ref": "primitives.schema.json#/$defs/packet_id"
+                              },
+                              "claim_operation_id": {
+                                "$ref": "primitives.schema.json#/$defs/operation_id"
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "if": {
+                            "required": [
+                              "kind"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "DeliveryFinished"
+                              }
+                            }
+                          },
+                          "then": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "kind",
+                              "delivery_id",
+                              "target_session",
+                              "packet_id",
+                              "claim_operation_id"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "DeliveryFinished"
+                              },
+                              "delivery_id": {
+                                "$ref": "primitives.schema.json#/$defs/delivery_id"
+                              },
+                              "target_session": {
+                                "$ref": "primitives.schema.json#/$defs/u64"
+                              },
+                              "packet_id": {
+                                "$ref": "primitives.schema.json#/$defs/packet_id"
+                              },
+                              "claim_operation_id": {
+                                "$ref": "primitives.schema.json#/$defs/operation_id"
                               }
                             }
                           }
@@ -626,6 +742,47 @@
             "max_route_targets": {
               "$ref": "primitives.schema.json#/$defs/u64"
             }
+          }
+        }
+      }
+    },
+    "outbound": {
+      "description": "Durable outgoing QoS 1 claims, by DeliveryId. MayHaveStarted is a conservative durable emission intent, not proof that bytes reached a client.",
+      "type": "array",
+      "maxItems": 65536,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "delivery_id",
+          "target_session",
+          "target_revision",
+          "packet_id",
+          "claim_operation_id",
+          "phase",
+          "emission"
+        ],
+        "properties": {
+          "delivery_id": {
+            "$ref": "primitives.schema.json#/$defs/delivery_id"
+          },
+          "target_session": {
+            "$ref": "primitives.schema.json#/$defs/u64"
+          },
+          "target_revision": {
+            "$ref": "primitives.schema.json#/$defs/u64"
+          },
+          "packet_id": {
+            "$ref": "primitives.schema.json#/$defs/packet_id"
+          },
+          "claim_operation_id": {
+            "$ref": "primitives.schema.json#/$defs/operation_id"
+          },
+          "phase": {
+            "const": "AwaitPuback"
+          },
+          "emission": {
+            "const": "MayHaveStarted"
           }
         }
       }

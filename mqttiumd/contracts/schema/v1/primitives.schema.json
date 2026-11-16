@@ -312,7 +312,8 @@
         "Lookup",
         "Snapshot",
         "Inspect",
-        "Recovery"
+        "Recovery",
+        "Work"
       ]
     },
     "processControlCode": {
@@ -339,6 +340,24 @@
         "KillDrain",
         "Stop"
       ]
+    },
+    "delivery_id": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "publication_id",
+        "index"
+      ],
+      "properties": {
+        "publication_id": {
+          "$ref": "primitives.schema.json#/$defs/publication_id"
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
     }
   }
 }

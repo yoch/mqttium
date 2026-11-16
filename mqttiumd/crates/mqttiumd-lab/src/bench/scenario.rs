@@ -186,6 +186,9 @@ fn work_kind(name: &str) -> Result<WorkKind, String> {
     [
         WorkKind::AdmitPublication,
         WorkKind::ReleaseInbound,
+        WorkKind::ChangeSubscriptions,
+        WorkKind::ClaimDelivery,
+        WorkKind::FinishDelivery,
         WorkKind::ResolveAndFence,
         WorkKind::OpenEpoch,
     ]

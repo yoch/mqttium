@@ -33,7 +33,12 @@
     "connect_timeout_ms",
     "write_timeout_ms",
     "receive_maximum",
-    "remembered_connections"
+    "remembered_connections",
+    "max_filters_per_packet",
+    "max_subscriptions",
+    "max_outgoing_per_connection",
+    "work_page_items",
+    "max_targets_per_admission"
   ],
   "properties": {
     "format": {
@@ -43,7 +48,7 @@
       "const": 1
     },
     "id": {
-      "const": "tcp-inbound-qos1-qos2-v1"
+      "const": "tcp-exact-pubsub-v1"
     },
     "mqtt_version": {
       "const": 5
@@ -73,10 +78,10 @@
       "const": false
     },
     "subscriptions": {
-      "const": false
+      "const": true
     },
     "outgoing_delivery": {
-      "const": false
+      "const": true
     },
     "mqtt_conformant": {
       "const": false
@@ -131,6 +136,21 @@
     },
     "remembered_connections": {
       "const": 8
+    },
+    "max_filters_per_packet": {
+      "const": 8
+    },
+    "max_subscriptions": {
+      "const": 128
+    },
+    "max_outgoing_per_connection": {
+      "const": 8
+    },
+    "work_page_items": {
+      "const": 8
+    },
+    "max_targets_per_admission": {
+      "const": 16
     }
   }
 }

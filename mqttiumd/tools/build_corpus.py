@@ -1557,6 +1557,22 @@ PAGE = {
 }
 PAGE_READ = record(14, "store-adapter", 2, "RecoveryPageRead", PAGE)
 ok("trace-record-recovery-page-read.json", PAGE_READ)
+OUTBOUND_QUEUED = {
+    "kind": "OutboundDelivery",
+    "delivery_id": {"publication_id": PUBLICATION, "index": 0},
+    "target_session": "2",
+    "target_revision": "1",
+    "claim": None,
+}
+OUTBOUND_CLAIMED = {
+    **OUTBOUND_QUEUED,
+    "claim": {"operation_id": OP, "packet_id": 1},
+}
+for name, fact in [("queued", OUTBOUND_QUEUED), ("claimed", OUTBOUND_CLAIMED)]:
+    page = copy.deepcopy(PAGE)
+    page["facts"].insert(-1, fact)
+    ok(f"trace-record-recovery-page-outbound-{name}.json",
+       record(14, "store-adapter", 2, "RecoveryPageRead", page))
 ok(
     "trace-record-recovery-page-delivered.json",
     record(15, "broker-core", 3, "RecoveryPageDelivered", PAGE, [("store-adapter", 2)]),
@@ -2291,6 +2307,7 @@ snapshot = env(
             "phase": "AwaitPubrel",
         }
     ],
+    outbound=[],
     account={
         "used": {
             "payload_bytes": "7",
@@ -2302,6 +2319,29 @@ snapshot = env(
     },
 )
 ok("store-snapshot-after-commit.json", snapshot)
+OUTBOUND_SLOT = {
+    "delivery_id": {"publication_id": PUBLICATION, "index": 0},
+    "target_session": "2",
+    "target_revision": "1",
+    "packet_id": 1,
+    "claim_operation_id": OP,
+    "phase": "AwaitPuback",
+    "emission": "MayHaveStarted",
+}
+ok("store-snapshot-outbound-claim.json",
+   edited(snapshot, lambda v: v.update(outbound=[OUTBOUND_SLOT])))
+for suffix, code, pointer, rows in [
+    ("duplicate", "duplicate-name", "/outbound/1/delivery_id", [OUTBOUND_SLOT, OUTBOUND_SLOT]),
+    ("packet-id-zero", "schema-violation", "/outbound/0/packet_id",
+     [{**OUTBOUND_SLOT, "packet_id": 0}]),
+    ("target-overflow", "u64-out-of-range", "/outbound/0/target_session",
+     [{**OUTBOUND_SLOT, "target_session": "18446744073709551616"}]),
+    ("claim-overflow", "u64-out-of-range", "/outbound/0/claim_operation_id/sequence",
+     [{**OUTBOUND_SLOT, "claim_operation_id": {**OP, "sequence": "18446744073709551616"}}]),
+]:
+    bad(f"store-snapshot-outbound-{suffix}.json", code, pointer,
+        "Outgoing claim rows retain bounded identities, unique DeliveryIds and valid packet identifiers.",
+        edited(snapshot, lambda v, rows=rows: v.update(outbound=rows)))
 ok(
     "store-snapshot-empty.json",
     env(
@@ -2325,6 +2365,7 @@ ok(
         publications=[],
         obligations=[],
         inbound_exchanges=[],
+        outbound=[],
         account={"used": dict.fromkeys(SIZES, "0"), "limits": LIMITS},
     ),
 )

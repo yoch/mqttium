@@ -23,6 +23,7 @@
   "publications": [],
   "obligations": [],
   "inbound_exchanges": [],
+  "outbound": [],
   "account": {
     "used": {
       "payload_bytes": "0",

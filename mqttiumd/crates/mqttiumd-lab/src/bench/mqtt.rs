@@ -17,6 +17,8 @@ pub enum Kind {
     Pubrec,
     Pubrel,
     Pubcomp,
+    Suback,
+    Unsuback,
     Pingresp,
 }
 
@@ -32,6 +34,8 @@ impl Kind {
             Self::Pubrec => "PUBREC",
             Self::Pubrel => "PUBREL",
             Self::Pubcomp => "PUBCOMP",
+            Self::Suback => "SUBACK",
+            Self::Unsuback => "UNSUBACK",
             Self::Pingresp => "PINGRESP",
         }
     }
@@ -47,6 +51,8 @@ impl Kind {
             Self::Pubrec,
             Self::Pubrel,
             Self::Pubcomp,
+            Self::Suback,
+            Self::Unsuback,
             Self::Pingresp,
         ]
         .into_iter()
@@ -347,6 +353,9 @@ pub mod transport {
     /// The bytes of a frame: the short form when the reason is Success.
     pub fn encode(frame: OutboundFrame) -> Result<Vec<u8>, &'static str> {
         match frame {
+            OutboundFrame::Suback { .. } | OutboundFrame::Unsuback { .. } => {
+                Err("subscription acknowledgements outside the fixture profile")
+            }
             OutboundFrame::Puback { packet_id, reason } => {
                 let mut body = packet_id.get().to_be_bytes().to_vec();
                 if reason.to_wire() != 0 {
@@ -379,6 +388,8 @@ pub mod transport {
     #[must_use]
     pub fn describe(frame: OutboundFrame) -> (Kind, Option<u16>) {
         match frame {
+            OutboundFrame::Suback { packet_id, .. } => (Kind::Suback, Some(packet_id.get())),
+            OutboundFrame::Unsuback { packet_id, .. } => (Kind::Unsuback, Some(packet_id.get())),
             OutboundFrame::Puback { packet_id, .. } => (Kind::Puback, Some(packet_id.get())),
             OutboundFrame::Pingresp => (Kind::Pingresp, None),
             OutboundFrame::Connack { .. } => (Kind::Connack, None),

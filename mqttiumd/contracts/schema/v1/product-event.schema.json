@@ -66,13 +66,21 @@
         "admission.prepared",
         "release.prepared",
         "admission.committed",
-        "ack.receipt"
+        "ack.receipt",
+        "subscription.prepared",
+        "claim.prepared",
+        "finish.prepared",
+        "claim.committed",
+        "finish.committed"
       ]
     },
     "command_kind": {
       "enum": [
         "Admission",
-        "Release"
+        "Release",
+        "Subscriptions",
+        "Claim",
+        "Finish"
       ]
     },
     "cause": {
@@ -92,7 +100,8 @@
         "Lookup",
         "Snapshot",
         "Inspect",
-        "Recovery"
+        "Recovery",
+        "Work"
       ]
     },
     "details": {

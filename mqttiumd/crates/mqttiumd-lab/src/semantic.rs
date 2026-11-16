@@ -1542,6 +1542,15 @@ pub fn representative_fact(kind: &str, topic_hex: &str) -> Option<RecoveredFact>
             publication,
             phase: InboundPhase::AwaitPubrel,
         },
+        "OutboundDelivery" => RecoveredFact::OutboundDelivery {
+            delivery: mqttiumd_contract::ids::DeliveryId {
+                publication,
+                index: 0,
+            },
+            target: SessionId::new(0),
+            target_revision: Revision::new(0),
+            claim: None,
+        },
         "Operation" => RecoveredFact::Operation {
             operation: zero,
             knowledge: Knowledge::Unknown,
@@ -1644,7 +1653,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
         &'static [(&'static str, KeyKind)],
         &'static str,
     );
-    const TABLES: [Table; 8] = [
+    const TABLES: [Table; 9] = [
         ("/sessions", &[("/session", KeyKind::Decimal)], "/session"),
         (
             "/route_table/routes",
@@ -1686,6 +1695,14 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
                 ("/packet_id", KeyKind::Integer),
             ],
             "",
+        ),
+        (
+            "/outbound",
+            &[
+                ("/delivery_id/publication_id", KeyKind::Scoped),
+                ("/delivery_id/index", KeyKind::Integer),
+            ],
+            "/delivery_id",
         ),
     ];
     decimal_strings(Some(document), "", out);
@@ -1731,7 +1748,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
 /// Names of the members that hold a 64-bit decimal string, in a trace
 /// payload or a snapshot. A test walks the schemas and fails when one of
 /// their 64-bit members is missing here.
-const COMPONENTS: [&str; 41] = [
+const COMPONENTS: [&str; 43] = [
     "incarnation",
     "process_incarnation",
     "epoch",
@@ -1770,6 +1787,8 @@ const COMPONENTS: [&str; 41] = [
     "next_session",
     "source_session",
     "target_revision",
+    "target_session",
+    "route_revision",
     "max_payload_bytes",
     "max_sessions",
     "max_route_targets",

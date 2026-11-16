@@ -137,6 +137,9 @@ impl FaultAction {
 pub enum WorkKind {
     AdmitPublication,
     ReleaseInbound,
+    ChangeSubscriptions,
+    ClaimDelivery,
+    FinishDelivery,
     ResolveAndFence,
     OpenEpoch,
 }
@@ -148,6 +151,9 @@ impl WorkKind {
         match self {
             Self::AdmitPublication => "AdmitPublication",
             Self::ReleaseInbound => "ReleaseInbound",
+            Self::ChangeSubscriptions => "ChangeSubscriptions",
+            Self::ClaimDelivery => "ClaimDelivery",
+            Self::FinishDelivery => "FinishDelivery",
             Self::ResolveAndFence => "ResolveAndFence",
             Self::OpenEpoch => "OpenEpoch",
         }
@@ -460,6 +466,13 @@ fn describe(work: &Work) -> (WorkKind, Option<OperationId>, Source) {
                 Some(release.operation),
                 Some((release.source_session, release.packet_id)),
             ),
+            Recipe::ChangeSubscriptions(change) => {
+                (WorkKind::ChangeSubscriptions, Some(change.operation), None)
+            }
+            Recipe::ClaimDelivery(claim) => (WorkKind::ClaimDelivery, Some(claim.operation), None),
+            Recipe::FinishDelivery(finish) => {
+                (WorkKind::FinishDelivery, Some(finish.operation), None)
+            }
         },
         Work::Resolve(operation) => (WorkKind::ResolveAndFence, Some(*operation), None),
         Work::Open(_) => (WorkKind::OpenEpoch, None, None),

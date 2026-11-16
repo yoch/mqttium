@@ -1718,7 +1718,7 @@
       }
     },
     "recovered_fact": {
-      "description": "One fact of a recovery page, as the store adapter reads it from the store the broker opened. The semantic pass enforces the order of the facts of a page: Epoch, Limits, RouteTable, Route, Session, InboundExchange, Operation.",
+      "description": "One fact of a recovery page, as the store adapter reads it from the store the broker opened. The semantic pass enforces the order of the facts of a page: Epoch, Limits, RouteTable, Route, Session, InboundExchange, OutboundDelivery, Operation.",
       "type": "object",
       "required": [
         "kind"
@@ -1732,6 +1732,7 @@
             "Route",
             "Session",
             "InboundExchange",
+            "OutboundDelivery",
             "Operation"
           ]
         }
@@ -1949,6 +1950,66 @@
               "phase": {
                 "enum": [
                   "AwaitPubrel"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "OutboundDelivery"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "delivery_id",
+              "target_session",
+              "target_revision",
+              "claim"
+            ],
+            "properties": {
+              "kind": {
+                "const": "OutboundDelivery"
+              },
+              "delivery_id": {
+                "$ref": "primitives.schema.json#/$defs/delivery_id"
+              },
+              "target_session": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "target_revision": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "claim": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "operation_id",
+                      "packet_id"
+                    ],
+                    "properties": {
+                      "operation_id": {
+                        "$ref": "primitives.schema.json#/$defs/operation_id"
+                      },
+                      "packet_id": {
+                        "$ref": "primitives.schema.json#/$defs/packet_id"
+                      }
+                    }
+                  }
                 ]
               }
             }

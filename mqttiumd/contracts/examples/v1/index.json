@@ -50,6 +50,8 @@
     "contracts/examples/v1/valid/trace-record-deadline-armed.json",
     "contracts/examples/v1/valid/trace-record-deadline-delivered.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-read.json",
+    "contracts/examples/v1/valid/trace-record-recovery-page-outbound-queued.json",
+    "contracts/examples/v1/valid/trace-record-recovery-page-outbound-claimed.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-delivered.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-with-routes-and-limits.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-of-routes-only.json",
@@ -65,6 +67,7 @@
     "contracts/examples/v1/valid/trace-record-durable-lookup-failed.json",
     "contracts/examples/v1/valid/trace-record-header-core-without-bytes.json",
     "contracts/examples/v1/valid/store-snapshot-after-commit.json",
+    "contracts/examples/v1/valid/store-snapshot-outbound-claim.json",
     "contracts/examples/v1/valid/store-snapshot-empty.json",
     "contracts/examples/v1/valid/store-snapshot-orphan-obligation.json",
     "contracts/examples/v1/valid/store-snapshot-refused-and-fenced.json",
@@ -1158,6 +1161,30 @@
       "code": "u64-out-of-range",
       "pointer": "/payload/operation_id/sequence",
       "why": "Identity components are 64-bit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-outbound-duplicate.json",
+      "code": "duplicate-name",
+      "pointer": "/outbound/1/delivery_id",
+      "why": "Outgoing claim rows retain bounded identities, unique DeliveryIds and valid packet identifiers."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-outbound-packet-id-zero.json",
+      "code": "schema-violation",
+      "pointer": "/outbound/0/packet_id",
+      "why": "Outgoing claim rows retain bounded identities, unique DeliveryIds and valid packet identifiers."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-outbound-target-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/outbound/0/target_session",
+      "why": "Outgoing claim rows retain bounded identities, unique DeliveryIds and valid packet identifiers."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-outbound-claim-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/outbound/0/claim_operation_id/sequence",
+      "why": "Outgoing claim rows retain bounded identities, unique DeliveryIds and valid packet identifiers."
     },
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-target-limit-over-32-bits.json",

@@ -932,7 +932,10 @@ def _by_schema(contracts, document, out):
 
 # The place of a kind of fact in the inventory of a recovery, first to last
 # (record 0014), and the kinds an inventory holds at most once.
-FACT_RANKS = ("Epoch", "Limits", "RouteTable", "Route", "Session", "InboundExchange", "Operation")
+FACT_RANKS = (
+    "Epoch", "Limits", "RouteTable", "Route", "Session", "InboundExchange",
+    "OutboundDelivery", "Operation",
+)
 FACTS_ONCE = ("Epoch", "Limits", "RouteTable")
 
 
@@ -1011,6 +1014,11 @@ _SNAPSHOT_KEYS = [
         "/inbound_exchanges",
         [("/exchange/session", "decimal"), ("/packet_id", "integer")],
         "",
+    ),
+    (
+        "/outbound",
+        [("/delivery_id/publication_id", "scoped"), ("/delivery_id/index", "integer")],
+        "/delivery_id",
     ),
 ]
 _SCOPED = ("incarnation", "epoch", "owner", "sequence")

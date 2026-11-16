@@ -188,5 +188,6 @@
       "max_sessions": "8",
       "max_route_targets": "8"
     }
-  }
+  },
+  "outbound": []
 }

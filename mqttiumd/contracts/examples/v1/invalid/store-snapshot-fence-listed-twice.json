@@ -183,6 +183,7 @@
       "phase": "AwaitPubrel"
     }
   ],
+  "outbound": [],
   "account": {
     "used": {
       "payload_bytes": "7",
