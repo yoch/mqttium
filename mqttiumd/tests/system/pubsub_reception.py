@@ -381,6 +381,11 @@ def finish_barrier(binary: Path, case: Path) -> dict:
                             and (event.get("command_kind") == "Claim"
                                  or event.get("details", {}).get("command_kind") == "Claim")]
             require(not early_claims, "premature_delivery_release", "another claim submitted before finish confirmation")
+            early_finish = [event for event in broker.events() if int(event["seq"]) > before_sequence
+                            and event["kind"] == "core_finish_observed"
+                            and event["operation"] == hit["operation"]]
+            require(not early_finish, "premature_delivery_release",
+                    "the core observed a committed Finish while that transaction was still held before commit")
             broker.release("finish.prepared")
             next_delivery = subscriber.next_publication()
             message_matches(next_delivery, topic, b"second")
