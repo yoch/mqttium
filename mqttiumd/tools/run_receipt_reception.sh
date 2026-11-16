@@ -19,6 +19,15 @@ if [[ -n $(git -C "$receipt_repo" status --porcelain --untracked-files=normal) ]
 fi
 receipt_sha=$(git -C "$receipt_repo" rev-parse HEAD)
 receipt_targets=${MQTTIUMD_RECEIPT_TARGET_ROOT:-${TMPDIR:-/tmp}/mqttiumd-receipt-$receipt_sha}
+receipt_scratch=$(mktemp -d "${TMPDIR:-/tmp}/mqttiumd-receipt-mutants.XXXXXX")
+receipt_worktree=
+receipt_cleanup() {
+    if [[ -n "$receipt_worktree" ]]; then
+        git -C "$receipt_repo" worktree remove --force -- "$receipt_worktree" >/dev/null 2>&1 || true
+    fi
+    rmdir -- "$receipt_scratch" >/dev/null 2>&1 || true
+}
+trap receipt_cleanup EXIT
 mkdir -p -- "$receipt_targets" "$receipt_out/binaries"
 cd -- "$receipt_root"
 receipt_record() {
@@ -78,6 +87,53 @@ receipt_run() {
 }
 receipt_run normal-ceiling "$receipt_out/binaries/mqttiumd-normal" --case A-ceiling
 receipt_run normal-live "$receipt_out/binaries/mqttiumd-normal" --case B-live
+for receipt_case in C-pressure E-replay F-before F-after F-credit F-results; do
+    receipt_run "hooks-$receipt_case" "$receipt_out/binaries/mqttiumd-hooks" --build-mode test-hooks --case "$receipt_case"
+done
+
+# The two identity mutations are separate builds in the same risk group. Each
+# changes one existing boolean site and must fail for the intended invariant.
+for receipt_mutation in unknown-hole no-closure old-publication old-payload double-credit; do
+    receipt_worktree="$receipt_scratch/$receipt_mutation"
+    git -C "$receipt_repo" worktree add --detach -- "$receipt_worktree" "$receipt_sha" >"$receipt_out/$receipt_mutation-worktree.log" 2>&1
+    "$receipt_python" - "$receipt_worktree/mqttiumd/crates" "$receipt_mutation" <<'PY'
+from pathlib import Path
+import sys
+name = {'unknown-hole': 'MUTANT_CONFIRM_UNKNOWN',
+        'no-closure': 'MUTANT_DELETE_WITHOUT_CLOSURE',
+        'old-publication': 'MUTANT_ALLOW_OLD_PUBLICATION',
+        'old-payload': 'MUTANT_ALLOW_OLD_PAYLOAD',
+        'double-credit': 'MUTANT_DOUBLE_RECEIPT_CREDIT'}[sys.argv[2]]
+old = f'const {name}: bool = false;'
+sites = [(path, path.read_text()) for path in Path(sys.argv[1]).rglob('*.rs') if old in path.read_text()]
+if len(sites) != 1 or sites[0][1].count(old) != 1:
+    raise SystemExit(f'exactly one mutation site required: {name}')
+path, text = sites[0]
+path.write_text(text.replace(old, f'const {name}: bool = true;'))
+PY
+    git -C "$receipt_worktree" diff --binary >"$receipt_out/$receipt_mutation.mutant"
+    receipt_record "$receipt_mutation-build" cargo build --manifest-path "$receipt_worktree/mqttiumd/Cargo.toml" -p mqttiumd --no-default-features --features test-hooks --locked --target-dir "$receipt_targets/$receipt_mutation"
+    cargo build --manifest-path "$receipt_worktree/mqttiumd/Cargo.toml" -p mqttiumd --no-default-features --features test-hooks --locked --target-dir "$receipt_targets/$receipt_mutation" >"$receipt_out/$receipt_mutation-build.log" 2>&1
+    cp -- "$receipt_targets/$receipt_mutation/debug/mqttiumd" "$receipt_out/binaries/mqttiumd-$receipt_mutation"
+    case "$receipt_mutation" in
+        unknown-hole) receipt_case=C-pressure; receipt_expected=closure_crossed_unknown;;
+        no-closure) receipt_case=F-after; receipt_expected=receipt_deleted_without_closure;;
+        old-publication) receipt_case=E-replay; receipt_expected=retired_publication_reused;;
+        old-payload) receipt_case=E-replay; receipt_expected=retired_payload_reused;;
+        double-credit) receipt_case=F-credit; receipt_expected=receipt_credit_double_returned;;
+    esac
+    receipt_status=0
+    receipt_run "$receipt_mutation" "$receipt_out/binaries/mqttiumd-$receipt_mutation" --build-mode test-hooks --case "$receipt_case" || receipt_status=$?
+    "$receipt_python" - "$receipt_out/$receipt_mutation/receipt.json" "$receipt_expected" "$receipt_status" <<'PY'
+from pathlib import Path
+import json, sys
+result = json.loads(Path(sys.argv[1]).read_text())
+if int(sys.argv[3]) != 1 or result['status'] != 'FAIL' or result.get('failure', {}).get('code') != sys.argv[2]:
+    raise SystemExit(f"mutation not caught for its precise reason: {result.get('failure')}")
+PY
+    git -C "$receipt_repo" worktree remove --force -- "$receipt_worktree"
+    receipt_worktree=
+done
 
 # Historical evidence has its own source and executable. Never label an old
 # executable with this checkout's identity. Supplying it is optional because
@@ -103,11 +159,20 @@ fi
 from pathlib import Path
 import hashlib, json, sys
 out = Path(sys.argv[1])
-names = ('normal-ceiling', 'normal-live')
+names = ('normal-ceiling', 'normal-live', 'hooks-C-pressure', 'hooks-E-replay',
+         'hooks-F-before', 'hooks-F-after', 'hooks-F-credit', 'hooks-F-results',
+         'unknown-hole', 'no-closure', 'old-publication', 'old-payload', 'double-credit')
 receipts = {name: json.loads((out / name / 'receipt.json').read_text()) for name in names}
-for result in receipts.values():
-    if result['status'] != 'PASS' or result['source_head'] != sys.argv[2]:
+expected_failures = {'unknown-hole': 'closure_crossed_unknown',
+                     'no-closure': 'receipt_deleted_without_closure',
+                     'old-publication': 'retired_publication_reused',
+                     'old-payload': 'retired_payload_reused',
+                     'double-credit': 'receipt_credit_double_returned'}
+for name, result in receipts.items():
+    if result['status'] != ('FAIL' if name in expected_failures else 'PASS') or result['source_head'] != sys.argv[2]:
         raise SystemExit('receipt or source did not match the tested source')
+    if name in expected_failures and result.get('failure', {}).get('code') != expected_failures[name]:
+        raise SystemExit('mutation reason changed')
     binary = result['binary']
     if hashlib.sha256(Path(binary['path']).read_bytes()).hexdigest() != binary['sha256']:
         raise SystemExit('executed and retained binary differ')
