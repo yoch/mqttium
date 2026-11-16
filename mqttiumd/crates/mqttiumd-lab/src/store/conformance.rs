@@ -2380,3 +2380,117 @@ pub fn subscriptions_replace_and_remove_without_duplicate_or_hole<S: DurableStor
         "unsubscribe must retain both already admitted obligations"
     );
 }
+
+/// Claims reserve a directional wire identifier until guarded durable finish;
+/// neither a repeat nor an obsolete claim can decrement resources twice.
+pub fn qos1_claim_and_finish_are_conditional_and_idempotent<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::command::{ClaimDelivery, FinishDelivery};
+    use mqttiumd_contract::ids::OutboundPacketId;
+    let mut world = World::new(make);
+    let admission = world.admission(1, 7, b"payload", &[world.b, world.c]);
+    assert!(matches!(
+        world.store.apply(&admission).reply,
+        StoreReply::Outcome(StoreOutcome::Committed(_))
+    ));
+    let delivery = |index| DeliveryId {
+        publication: publication_id(world.epoch, 1),
+        index,
+    };
+    let claim = |seq, target, index| Command {
+        recipe: FrozenRecipe::freeze(Recipe::ClaimDelivery(ClaimDelivery {
+            operation: operation_id(world.epoch, seq),
+            delivery: delivery(index),
+            target,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(7).unwrap(),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    let first = claim(2, world.b, 0);
+    assert_eq!(
+        world.store.apply(&first).reply,
+        StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::DeliveryClaimed {
+            delivery: delivery(0),
+            target: world.b,
+            packet_id: OutboundPacketId::new(7).unwrap(),
+            claim: operation_id(world.epoch, 2),
+        })),
+        "claim must durably reserve its own operation and packet identifier"
+    );
+    let before = world.store.snapshot().unwrap();
+    assert_eq!(
+        before.accounts.exchange_slots.get(),
+        2,
+        "one incoming and one outgoing slot coexist"
+    );
+    assert!(!world.store.apply(&first).committed_now);
+    assert_eq!(
+        world.store.snapshot().unwrap(),
+        before,
+        "claim replay changes nothing"
+    );
+    assert!(matches!(
+        world.store.apply(&claim(3, world.c, 1)).reply,
+        StoreReply::Outcome(StoreOutcome::Committed(_))
+    ));
+    let finish = |seq, target, index, claimed_as| Command {
+        recipe: FrozenRecipe::freeze(Recipe::FinishDelivery(FinishDelivery {
+            operation: operation_id(world.epoch, seq),
+            delivery: delivery(index),
+            target,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(7).unwrap(),
+            claim: operation_id(world.epoch, claimed_as),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    assert_eq!(
+        world.store.apply(&finish(4, world.b, 0, 99)).reply,
+        StoreReply::Outcome(StoreOutcome::RejectedCertain(
+            RejectReason::PreconditionFailed
+        ))
+    );
+    let correct = finish(5, world.b, 0, 2);
+    assert!(matches!(
+        world.store.apply(&correct).reply,
+        StoreReply::Outcome(StoreOutcome::Committed(_))
+    ));
+    let one = world.store.snapshot().unwrap();
+    assert_eq!(one.obligations.len(), 1);
+    assert_eq!(one.payloads.len(), 1);
+    assert_eq!(one.accounts.references.get(), 1);
+    assert_eq!(one.accounts.exchange_slots.get(), 2);
+    assert!(!world.store.apply(&correct).committed_now);
+    assert_eq!(world.store.snapshot().unwrap(), one);
+    let release = world.release(6, 7, 1);
+    assert!(matches!(
+        world.store.apply(&release).reply,
+        StoreReply::Outcome(StoreOutcome::Committed(_))
+    ));
+    assert!(matches!(
+        world.store.apply(&finish(7, world.c, 1, 3)).reply,
+        StoreReply::Outcome(StoreOutcome::Committed(_))
+    ));
+    let ended = world.store.snapshot().unwrap();
+    assert!(
+        ended.obligations.is_empty() && ended.payloads.is_empty() && ended.publications.is_empty()
+    );
+    assert_eq!(
+        (
+            ended.accounts.references.get(),
+            ended.accounts.payload_bytes.get(),
+            ended.accounts.exchange_slots.get()
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        world.store.apply(&finish(8, world.b, 0, 2)).reply,
+        StoreReply::Outcome(StoreOutcome::RejectedCertain(
+            RejectReason::PreconditionFailed
+        ))
+    );
+}
