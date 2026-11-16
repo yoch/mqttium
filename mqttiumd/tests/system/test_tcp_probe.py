@@ -5,6 +5,7 @@ from pathlib import Path
 import socket
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 from tcp_probe import (
     Frame, FrameDecoder, Observations, ReceiptFailure, Wire, assert_no_positive_ack,
@@ -97,6 +98,19 @@ class ProbeTests(unittest.TestCase):
             wire.send = lambda *args, **kwargs: None
             wire.exchange(7, concat=True)
             self.assertEqual(wire.frames, [])
+
+    def test_nonreader_receive_buffer_is_configured_before_tcp_connect(self):
+        # A post-connect RCVBUF does not constrain the window advertised in SYN.
+        # Exercise the real constructor, intercepting only the OS socket calls.
+        with tempfile.TemporaryDirectory() as directory:
+            peer = Mock()
+            peer.getsockopt.return_value = 2304
+            with patch("tcp_probe.socket.socket", return_value=peer):
+                wire = Wire(("127.0.0.1", 1883), Observations(Path(directory) / "observer.jsonl"),
+                            "nonreader", receive_buffer=1024)
+                wire.close()
+            calls = [call[0] for call in peer.method_calls]
+            self.assertLess(calls.index("setsockopt"), calls.index("connect"))
 
 
 if __name__ == "__main__":
