@@ -18,6 +18,9 @@ and resolve/fence path. The owner holds dependent publication admissions while
 the route mutation is unresolved, then installs its projection/revision before
 SUBACK/UNSUBACK and further admissions. Prior FIFO submissions remain ordered
 before the cut. Unknown results never authorize a positive acknowledgement.
+The runtime retains deferred business packets in their connection order within
+its existing 128-input budget and wakes them after store-result application.
+PUBACK, PUBREL, PING and closure can progress while a route mutation is pending.
 
 Canonical format 1 gains kinds 3/4/5, preserving kinds 1/2 byte for byte.
 Kind 3 holds operation32, session8, session_revision8, route_revision8, count1,
@@ -35,6 +38,8 @@ The claim row means AwaitPuback with an intent that may have started; it is
 not proof of socket or peer receipt. Fresh known claims emit DUP 0; recovered
 claims retain their identifier/generation and conservatively replay DUP 1.
 There is no periodic retransmission on a live MQTT 5 connection.
+An unresolved earlier claim prevents a later delivery to the same destination
+from becoming eligible first. Other destinations remain independent.
 
 PUBACK, including a valid negative reason, submits FinishDelivery guarded by
 DeliveryId, target/revision, outgoing identifier and original claim identity.
