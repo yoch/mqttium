@@ -23,7 +23,7 @@ use crate::ids::{
 };
 use crate::outcome::{EpochGrant, Knowledge, StoreReply};
 use crate::packet::{InboundPacket, OutboundFrame, Qos, SharedBytes};
-use crate::pubsub::{DeliveryClaim, WorkItem};
+use crate::pubsub::{DeliveryClaim, Qos0DropReason, Qos0Origin, WorkItem};
 
 /// Durable phase of an inbound QoS 2 exchange.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,6 +43,7 @@ pub enum RecoveredFact {
         delivery: DeliveryId,
         target: SessionId,
         target_revision: Revision,
+        qos: Qos,
         claim: Option<DeliveryClaim>,
     },
     /// The data set and the run epoch opened for this run.
@@ -207,6 +208,12 @@ pub enum FrameProgress {
 /// It is moved, never copied: a step either consumes it or hands it back.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Input {
+    /// Adapter refused or failed this exact volatile attempt. The owner decides its loss.
+    Qos0EmitRefused {
+        effect: EffectId,
+        connection: ConnectionKey,
+        reason: Qos0DropReason,
+    },
     ConnectionSettings {
         connection: ConnectionGeneration,
         receive_maximum: u16,
@@ -283,6 +290,19 @@ pub enum CloseReason {
 /// An effect: a responsibility transferred to an adapter.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Effect {
+    /// One volatile attempt. No Packet Identifier, durable claim, or retry permission.
+    EmitQos0 {
+        connection: ConnectionKey,
+        origin: Qos0Origin,
+        topic: SharedBytes,
+        payload: SharedBytes,
+    },
+    /// An explicit bounded owner decision, including drops before any adapter transfer.
+    Qos0Dropped {
+        origin: Qos0Origin,
+        target: Option<SessionId>,
+        reason: Qos0DropReason,
+    },
     /// Propose a frozen command.
     Persist { command: Command },
     /// Reconcile an operation and, if possible, establish a safe fence. It

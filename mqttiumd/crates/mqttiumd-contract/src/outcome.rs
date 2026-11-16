@@ -15,6 +15,10 @@ use crate::ids::{
 /// The durable facts established by a committed command.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CommitFacts {
+    DeliveryConsumed {
+        delivery: DeliveryId,
+        target: SessionId,
+    },
     SubscriptionsChanged {
         session: SessionId,
         route_revision: Revision,

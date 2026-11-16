@@ -44,7 +44,7 @@ use crate::ids::{
     PayloadId, PublicationId, RequestId, Revision, SessionId,
 };
 use crate::packet::{Qos, SharedBytes};
-use crate::pubsub::{MAX_FILTERS, SubscriptionChange};
+use crate::pubsub::{GrantedSubscriptionChange, MAX_FILTERS, SubscriptionChange};
 
 const MAGIC: &[u8; 4] = b"MQDR";
 
@@ -56,6 +56,8 @@ const KIND_RELEASE_INBOUND: u8 = 2;
 const KIND_CHANGE_SUBSCRIPTIONS: u8 = 3;
 const KIND_CLAIM_DELIVERY: u8 = 4;
 const KIND_FINISH_DELIVERY: u8 = 5;
+const KIND_CONSUME_DELIVERY: u8 = 6;
+const KIND_UPDATE_SUBSCRIPTIONS: u8 = 7;
 
 /// Why an obligation exists. The cause stays inspectable by the oracle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -208,6 +210,38 @@ pub struct FinishDelivery {
     pub packet_id: OutboundPacketId,
     pub claim: OperationId,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ConsumeDelivery {
+    pub operation: OperationId,
+    pub delivery: DeliveryId,
+    pub target: SessionId,
+    pub target_revision: Revision,
+}
+#[derive(Debug)]
+pub struct UpdateSubscriptions {
+    pub operation: OperationId,
+    pub session: SessionId,
+    pub session_revision: Revision,
+    pub route_revision: Revision,
+    pub changes: BoundedVec<GrantedSubscriptionChange>,
+}
+impl PartialEq for UpdateSubscriptions {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            operation,
+            session,
+            session_revision,
+            route_revision,
+            changes,
+        } = self;
+        *operation == other.operation
+            && *session == other.session
+            && *session_revision == other.session_revision
+            && *route_revision == other.route_revision
+            && changes.as_slice() == other.changes.as_slice()
+    }
+}
+impl Eq for UpdateSubscriptions {}
 
 /// The closed set of durable recipes of the received perimeter.
 #[derive(PartialEq, Eq, Debug)]
@@ -217,6 +251,8 @@ pub enum Recipe {
     ChangeSubscriptions(ChangeSubscriptions),
     ClaimDelivery(ClaimDelivery),
     FinishDelivery(FinishDelivery),
+    ConsumeDelivery(ConsumeDelivery),
+    UpdateSubscriptions(UpdateSubscriptions),
 }
 
 /// A recipe is not well formed, or cannot be decoded.
@@ -276,12 +312,36 @@ impl Recipe {
             Self::ChangeSubscriptions(change) => change.operation,
             Self::ClaimDelivery(claim) => claim.operation,
             Self::FinishDelivery(finish) => finish.operation,
+            Self::ConsumeDelivery(consume) => consume.operation,
+            Self::UpdateSubscriptions(change) => change.operation,
         }
     }
 
     /// Checks the internal consistency the canonical layout relies on.
     pub fn check(&self) -> Result<(), RecipeError> {
         match self {
+            Self::UpdateSubscriptions(change) => {
+                if change.changes.is_empty() || change.changes.len() > MAX_FILTERS {
+                    return Err(RecipeError::InvalidField("subscription_count"));
+                }
+                for entry in change.changes.as_slice() {
+                    if entry.granted == Some(Qos::ExactlyOnce) {
+                        return Err(RecipeError::InvalidField("granted_qos"));
+                    }
+                    if entry.topic.is_empty()
+                        || entry.topic.len() > usize::from(u16::MAX)
+                        || entry
+                            .topic
+                            .as_slice()
+                            .iter()
+                            .any(|b| matches!(*b, 0 | b'+' | b'#'))
+                        || core::str::from_utf8(entry.topic.as_slice()).is_err()
+                    {
+                        return Err(RecipeError::InvalidField("exact_filter"));
+                    }
+                }
+                Ok(())
+            }
             Self::ChangeSubscriptions(change) => {
                 if change.changes.is_empty() || change.changes.len() > MAX_FILTERS {
                     return Err(RecipeError::InvalidField("subscription_count"));
@@ -301,7 +361,7 @@ impl Recipe {
                 }
                 Ok(())
             }
-            Self::ClaimDelivery(_) | Self::FinishDelivery(_) => Ok(()),
+            Self::ClaimDelivery(_) | Self::FinishDelivery(_) | Self::ConsumeDelivery(_) => Ok(()),
             Self::AdmitPublication(admit) => {
                 if admit.source.exchange.session != admit.source.session {
                     return Err(RecipeError::ForeignExchange);
@@ -342,6 +402,34 @@ impl Recipe {
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
         match self {
+            Self::ConsumeDelivery(consume) => {
+                out.push(KIND_CONSUME_DELIVERY);
+                out.extend_from_slice(&consume.operation.to_be_bytes());
+                out.extend_from_slice(&consume.delivery.publication.to_be_bytes());
+                out.extend_from_slice(&consume.delivery.index.to_be_bytes());
+                out.extend_from_slice(&consume.target.to_be_bytes());
+                out.extend_from_slice(&consume.target_revision.to_be_bytes());
+            }
+            Self::UpdateSubscriptions(change) => {
+                out.push(KIND_UPDATE_SUBSCRIPTIONS);
+                out.extend_from_slice(&change.operation.to_be_bytes());
+                out.extend_from_slice(&change.session.to_be_bytes());
+                out.extend_from_slice(&change.session_revision.to_be_bytes());
+                out.extend_from_slice(&change.route_revision.to_be_bytes());
+                out.push(change.changes.len() as u8);
+                for entry in change.changes.as_slice() {
+                    out.push(match entry.granted {
+                        None => 0,
+                        Some(Qos::AtMostOnce) => 1,
+                        Some(Qos::AtLeastOnce) => 2,
+                        Some(Qos::ExactlyOnce) => {
+                            return Err(RecipeError::InvalidField("granted_qos"));
+                        }
+                    });
+                    out.extend_from_slice(&(entry.topic.len() as u16).to_be_bytes());
+                    out.extend_from_slice(entry.topic.as_slice());
+                }
+            }
             Self::ChangeSubscriptions(change) => {
                 out.push(KIND_CHANGE_SUBSCRIPTIONS);
                 out.extend_from_slice(&change.operation.to_be_bytes());
@@ -436,6 +524,59 @@ impl Recipe {
             return Err(RecipeError::UnknownFormat(format));
         }
         let recipe = match reader.u8()? {
+            KIND_CONSUME_DELIVERY => {
+                let operation = reader.operation()?;
+                let publication = PublicationId::from_be_slice(reader.take(32)?)
+                    .map_err(|_| RecipeError::Truncated)?;
+                let delivery = DeliveryId {
+                    publication,
+                    index: reader.u32()?,
+                };
+                let target = SessionId::new(reader.u64()?);
+                let target_revision = Revision::new(reader.u64()?);
+                Self::ConsumeDelivery(ConsumeDelivery {
+                    operation,
+                    delivery,
+                    target,
+                    target_revision,
+                })
+            }
+            KIND_UPDATE_SUBSCRIPTIONS => {
+                let operation = reader.operation()?;
+                let session = SessionId::new(reader.u64()?);
+                let session_revision = Revision::new(reader.u64()?);
+                let route_revision = Revision::new(reader.u64()?);
+                let count = usize::from(reader.u8()?);
+                if count == 0 || count > MAX_FILTERS {
+                    return Err(RecipeError::InvalidField("subscription_count"));
+                }
+                let mut changes =
+                    BoundedVec::with_capacity(count).map_err(|_| RecipeError::AllocationFailed)?;
+                for _ in 0..count {
+                    let granted = match reader.u8()? {
+                        0 => None,
+                        1 => Some(Qos::AtMostOnce),
+                        2 => Some(Qos::AtLeastOnce),
+                        _ => return Err(RecipeError::InvalidField("granted_qos")),
+                    };
+                    let len = usize::from(reader.u16()?);
+                    if len > max_topic_len {
+                        return Err(RecipeError::TopicTooLong(len));
+                    }
+                    let topic = SharedBytes::copy_from(reader.take(len)?, max_topic_len)
+                        .map_err(|_| RecipeError::TopicTooLong(len))?;
+                    changes
+                        .try_push(GrantedSubscriptionChange { topic, granted })
+                        .map_err(|_| RecipeError::AllocationFailed)?;
+                }
+                Self::UpdateSubscriptions(UpdateSubscriptions {
+                    operation,
+                    session,
+                    session_revision,
+                    route_revision,
+                    changes,
+                })
+            }
             KIND_CHANGE_SUBSCRIPTIONS => {
                 let operation = reader.operation()?;
                 let session = SessionId::new(reader.u64()?);

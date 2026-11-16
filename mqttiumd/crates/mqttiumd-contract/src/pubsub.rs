@@ -1,5 +1,5 @@
 //! Bounded exact-subscription and outgoing QoS 1 data (ADR 0025).
-use crate::ids::{DeliveryId, OperationId, OutboundPacketId, Revision, SessionId};
+use crate::ids::{ConnectionKey, DeliveryId, OperationId, OutboundPacketId, Revision, SessionId};
 use crate::packet::{Qos, SharedBytes, TooLarge};
 use alloc::sync::Arc;
 
@@ -79,6 +79,51 @@ pub struct SubscriptionChange {
     pub topic: SharedBytes,
     pub subscribe: bool,
 }
+/// New subscription semantics; legacy kind 3 retains its implicit QoS 1.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct GrantedSubscriptionChange {
+    pub topic: SharedBytes,
+    pub granted: Option<Qos>,
+}
+/// A publication occurrence in one live connection, with no MQTT identifier.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VolatilePublicationId {
+    pub source: ConnectionKey,
+    pub ingress_order: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Qos0Origin {
+    Volatile {
+        publication: VolatilePublicationId,
+    },
+    Consumed {
+        delivery: DeliveryId,
+        operation: OperationId,
+    },
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Qos0DropReason {
+    NoSubscribers,
+    DestinationAbsent,
+    CapacityExceeded,
+    PacketTooLarge,
+    ConnectionClosed,
+    OutputSaturated,
+    WriteFailed,
+}
+impl Qos0DropReason {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::NoSubscribers => "no_subscribers",
+            Self::DestinationAbsent => "destination_absent",
+            Self::CapacityExceeded => "capacity_exceeded",
+            Self::PacketTooLarge => "packet_too_large",
+            Self::ConnectionClosed => "connection_closed",
+            Self::OutputSaturated => "output_saturated",
+            Self::WriteFailed => "write_failed",
+        }
+    }
+}
 
 /// Durable intent that a QoS 1 delivery may have begun. It is not proof of
 /// socket write or peer receipt. Its operation is also its slot generation.
@@ -95,6 +140,7 @@ pub struct WorkItem {
     pub delivery: DeliveryId,
     pub target: SessionId,
     pub target_revision: Revision,
+    pub qos: Qos,
     pub topic: SharedBytes,
     pub payload: SharedBytes,
     pub claim: Option<DeliveryClaim>,
