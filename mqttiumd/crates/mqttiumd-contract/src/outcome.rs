@@ -51,6 +51,9 @@ pub enum CommitFacts {
 /// Why a command was certainly not executed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RejectReason {
+    /// The active-session quota has no free slot. Replacement may reuse its
+    /// own slot atomically; this is not an exhaustion of SessionId identity.
+    SessionCapacityExceeded,
     /// A guard on identities or revisions failed; nothing was admitted.
     PreconditionFailed,
     /// A durable capacity was insufficient; nothing was admitted.

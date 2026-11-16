@@ -87,6 +87,13 @@ would not justify reserving only one extra position. New opens stop at the
 business threshold, so repeated replacement cannot create unbounded controls
 behind a hole. Same-identity resolution and collection allocate no new command
 identity. Control effects retain their explicit Outbox and writer reserves.
+Lifecycle Persist/Resolve replies use a separately bounded control lane and
+Outbox selection, so sixteen retained ordinary replies cannot consume their
+only progress resource. Durable guards establish the cut when this lane passes
+an older uncommitted command; retained receipts still resolve older commits.
+Physical transport closure/cache installation fences following lifecycle/frame
+dispatch. A known session-quota refusal has its own SessionCapacityExceeded
+cause and a negative CONNACK0x97 without inventing a SessionId.
 
 ## Reception and scope
 
