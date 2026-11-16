@@ -218,6 +218,86 @@ print('mqttiumd features=' if sys.argv[1]=='tree' else 'cargo-test-stub')
     def test_product_cursor_observes_larger_generation_on_recycled_inode(self):
         self.read_reused_event_inode(replacement_larger=True)
 
+    def disappearing_product_event_path(self, *, after_another_file):
+        def encoded(*rows):
+            return ''.join(json.dumps(row) + '\n' for row in rows).encode()
+
+        starting = {"seq": "1", "pid": 7, "kind": "starting"}
+        queued = {"seq": "2", "pid": 7, "kind": "frame_queued", "connection": "1",
+                  "details": {"packet_kind": "PUBLISH", "packet_id": 1, "dup": False,
+                              "claim": "1/1/0/2", "delivery": "1/1/0/1/0", "effect": "1/0/3"}}
+        finished = {"seq": "3", "pid": 7, "kind": "core_finish_observed",
+                    "operation": {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "4"},
+                    "details": {"delivery": "1/1/0/1/0"}}
+        rotated = {"seq": "4", "pid": 7, "kind": "log_rotated",
+                   "details": {"retained_from": "1", "previous_last_seq": "3", "discarded_through": "0"}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / 'broker.events.jsonl'
+            previous = root / 'broker.events.jsonl.previous'
+            retired = root / 'retired-log'
+            path.write_bytes(encoded(starting))
+            # The second case exercises scan rollback after another file's
+            # new records have already been buffered. This additional real
+            # file is a controlled collection schedule, not a broker run.
+            if after_another_file:
+                previous.write_bytes(encoded(starting))
+            cursor = FinishCursor(SimpleNamespace(events_path=path,
+                                  process=SimpleNamespace(pid=7, poll=lambda: None)))
+            cursor.read()
+            offsets = dict(cursor.offsets)
+            with path.open('ab') as stream:
+                stream.write(encoded(queued, finished))
+            real_open = Path.open
+            reached = False
+
+            def open_during_rotation(candidate, *args, **kwargs):
+                nonlocal reached
+                selected = previous if after_another_file else path
+                if candidate == selected and not reached:
+                    reached = True
+                    # Perform the rename after is_file() but before open().
+                    # The first case is the product's actual rotation gap:
+                    # rename current→previous precedes creating new current.
+                    selected.rename(retired if after_another_file else previous)
+                return real_open(candidate, *args, **kwargs)
+
+            with patch.object(Path, 'open', open_during_rotation):
+                try:
+                    cursor.read()
+                except FileNotFoundError as error:
+                    self.fail('temporary_product_log_rotation_gap: ' + str(error))
+            self.assertTrue(reached, 'the scan/open injection must be reached')
+            self.assertEqual(cursor.offsets, offsets, 'an interrupted scan cannot advance offsets')
+            self.assertEqual(cursor.last_sequence, 1)
+            self.assertEqual(cursor.finishes, 0)
+            self.assertFalse(cursor.active)
+            if after_another_file:
+                retired.rename(previous)
+            else:
+                path.write_bytes(encoded(rotated))
+            entry = cursor.take(1, timeout=.1)
+            self.assertEqual(entry['finish']['event_sequence'], '3')
+            self.assertEqual(cursor.last_sequence, 3 if after_another_file else 4)
+            self.assertEqual(cursor.finishes, 1)
+            self.assertFalse(cursor.active)
+            self.assertFalse(cursor.by_identifier)
+            cursor.read()
+            self.assertEqual(cursor.finishes, 1)
+            self.assertEqual(cursor.duplicate_finishes, 0)
+            self.assertLessEqual(len(cursor.offsets), 4)
+            with path.open('ab') as stream:
+                stream.write(encoded({"seq": str(cursor.last_sequence + 2), "pid": 7, "kind": "stopped"}))
+            with self.assertRaises(ReceiptFailure) as raised:
+                cursor.read()
+            self.assertEqual(raised.exception.code, 'product_event_observation_gap')
+
+    def test_product_cursor_retries_current_path_renamed_between_scan_and_open(self):
+        self.disappearing_product_event_path(after_another_file=False)
+
+    def test_interrupted_scan_does_not_consume_another_files_buffered_finish(self):
+        self.disappearing_product_event_path(after_another_file=True)
+
     def test_finish_duplicates_do_not_inflate_distinct_delivery_count(self):
         operation = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "4"}
         queued = {"seq": "1", "pid": 7, "kind": "frame_queued", "connection": "1",
