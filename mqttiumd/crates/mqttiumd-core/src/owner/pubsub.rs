@@ -9,6 +9,9 @@ use crate::contract::pubsub::{
     Qos0DropReason, Qos0Origin, VolatilePublicationId, WORK_PAGE_LIMIT, WorkItem,
 };
 
+// Isolated transition mutants. Production builds retain these false values.
+const MUTANT_EARLY_PI_RELEASE: bool = false;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Read {
     effect: EffectId,
@@ -226,6 +229,12 @@ pub(super) enum Change {
 }
 
 impl State {
+    fn reserves_packet_id(delivery: &Delivery, session: SessionId) -> bool {
+        delivery.target == session
+            && delivery.claim.is_some()
+            && !(MUTANT_EARLY_PI_RELEASE && matches!(delivery.phase, Phase::FinishPending(_)))
+    }
+
     /// Packet Identifiers are recyclable target-local resources. Every
     /// retained claim reserves its number, including unknown submissions,
     /// unconfirmed finishes and recovered metadata without loaded bytes.
@@ -236,13 +245,13 @@ impl State {
             .deliveries
             .as_slice()
             .iter()
-            .filter(|delivery| delivery.target == session && delivery.claim.is_some())
+            .filter(|delivery| Self::reserves_packet_id(delivery, session))
             .count();
         let candidates = occupied.saturating_add(1).min(usize::from(maximum));
         for raw in 1..=candidates {
             let packet_id = u16::try_from(raw).ok().and_then(OutboundPacketId::new)?;
             if !self.deliveries.as_slice().iter().any(|delivery| {
-                delivery.target == session
+                Self::reserves_packet_id(delivery, session)
                     && delivery
                         .claim
                         .is_some_and(|claim| claim.packet_id == packet_id)
