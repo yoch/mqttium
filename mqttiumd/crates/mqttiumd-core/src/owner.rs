@@ -8500,4 +8500,17 @@ mod tests {
         assert_eq!(flight.operation.sequence().get(), 1);
         assert_eq!(world.owner.receipt_status().unwrap().1, 1);
     }
+
+    #[test]
+    fn receipt_collection_box_renewal_preserves_reserved_control_capacity() {
+        let mut world=World::connected();
+        gc_register(&mut world);
+        let before=world.snapshot();
+        assert_eq!(world.owner.renew_box(&mut world.authority,nonzero(2),bound(ENTRIES)),
+            Err(RenewRefused::BoxTooSmall {capacity:2,needed:4}));
+        assert_eq!(world.snapshot(),before);
+        assert_eq!(world.owner.renew_box(&mut world.authority,nonzero(4),bound(ENTRIES)),Ok(()));
+        assert!(world.owner.collection_ready());
+    }
+
 }
