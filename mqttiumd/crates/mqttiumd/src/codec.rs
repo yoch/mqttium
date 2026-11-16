@@ -1,7 +1,8 @@
 //! The bounded MQTT 5 codec of the experimental incoming QoS 1/2 profile.
 
-use mqttiumd_contract::ids::InboundPacketId;
+use mqttiumd_contract::ids::{InboundPacketId, OutboundPacketId};
 use mqttiumd_contract::packet::{AckReason, InboundPacket, OutboundFrame, Qos, SharedBytes};
+use mqttiumd_contract::pubsub::{FilterList, MAX_FILTERS, SubscriptionFilter};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bounds {
@@ -599,10 +600,10 @@ fn disconnect(body: &[u8]) -> Result<Packet, Error> {
     Ok(Packet::Disconnect)
 }
 
-fn subscribe(body: &[u8], unsubscribe: bool) -> Result<Packet, Error> {
+fn subscribe(body: &[u8], unsubscribe: bool, bounds: Bounds) -> Result<Packet, Error> {
     let mut input = Cursor::new(body);
-    identifier(&mut input)?;
-    properties(
+    let packet_id = identifier(&mut input)?;
+    let props = properties(
         &mut input,
         if unsubscribe {
             Context::Unsubscribe
@@ -613,8 +614,18 @@ fn subscribe(body: &[u8], unsubscribe: bool) -> Result<Packet, Error> {
     if input.is_empty() {
         return Err(protocol("EmptySubscriptionList"));
     }
+    let mut parsed = Vec::with_capacity(MAX_FILTERS);
+    let mut outside = props.unsupported;
     while !input.is_empty() {
-        let shared = filter(input.string()?)?;
+        if parsed.len() == MAX_FILTERS {
+            return Err(oversized("TooManyFilters"));
+        }
+        let text = input.string()?;
+        let shared = filter(text)?;
+        if text.len() > bounds.max_topic {
+            return Err(oversized("FilterTooLarge"));
+        }
+        let mut qos = Qos::AtLeastOnce;
         if !unsubscribe {
             let options = input.byte()?;
             if options & 0xc0 != 0
@@ -624,9 +635,58 @@ fn subscribe(body: &[u8], unsubscribe: bool) -> Result<Packet, Error> {
             {
                 return Err(protocol("InvalidSubscriptionOptions"));
             }
+            qos = Qos::from_wire(options & 3).ok_or_else(|| protocol("InvalidSubscriptionQos"))?;
+            outside |= options & 0x0c != 0;
         }
+        parsed.push((text, qos));
     }
-    Err(unsupported("SubscriptionsOutsideProfile"))
+    if outside {
+        return Err(unsupported("SubscriptionOptionsOutsideProfile"));
+    }
+    if unsubscribe {
+        let mut filters = Vec::with_capacity(parsed.len());
+        for (text, _) in parsed {
+            filters.push(
+                SharedBytes::copy_from(text, bounds.max_topic)
+                    .map_err(|_| oversized("FilterTooLarge"))?,
+            );
+        }
+        Ok(Packet::Core(InboundPacket::Unsubscribe {
+            packet_id,
+            filters: FilterList::copy_from(&filters).map_err(|_| oversized("TooManyFilters"))?,
+        }))
+    } else {
+        let mut filters = Vec::with_capacity(parsed.len());
+        for (text, qos) in parsed {
+            filters.push(SubscriptionFilter {
+                filter: SharedBytes::copy_from(text, bounds.max_topic)
+                    .map_err(|_| oversized("FilterTooLarge"))?,
+                qos,
+            });
+        }
+        Ok(Packet::Core(InboundPacket::Subscribe {
+            packet_id,
+            filters: FilterList::copy_from(&filters).map_err(|_| oversized("TooManyFilters"))?,
+        }))
+    }
+}
+
+fn puback(body: &[u8]) -> Result<Packet, Error> {
+    let mut input = Cursor::new(body);
+    let packet_id =
+        OutboundPacketId::new(input.u16()?).ok_or_else(|| protocol("ZeroPacketIdentifier"))?;
+    let reason = if input.is_empty() { 0 } else { input.byte()? };
+    if !matches!(
+        reason,
+        0 | 0x10 | 0x80 | 0x83 | 0x87 | 0x90 | 0x91 | 0x97 | 0x99
+    ) {
+        return Err(protocol("InvalidPubackReason"));
+    }
+    if !input.is_empty() {
+        properties(&mut input, Context::Acknowledge)?;
+    }
+    input.end()?;
+    Ok(Packet::Core(InboundPacket::Puback { packet_id, reason }))
 }
 
 /// Decode a complete packet body. No application-owned bytes are copied
@@ -655,9 +715,10 @@ pub fn decode(first: u8, body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
     match first >> 4 {
         1 => client_connect(body, bounds),
         3 => publish(first, body, bounds),
+        4 => puback(body),
         6 => pubrel(body),
-        8 => subscribe(body, false),
-        10 => subscribe(body, true),
+        8 => subscribe(body, false, bounds),
+        10 => subscribe(body, true, bounds),
         12 if body.is_empty() => Ok(Packet::Core(InboundPacket::Pingreq)),
         12 => Err(malformed("PingreqPayload")),
         14 => disconnect(body),
@@ -698,7 +759,36 @@ pub fn encode(frame: OutboundFrame) -> Result<Vec<u8>, Error> {
         })
     };
     match frame {
-        OutboundFrame::Suback { .. } | OutboundFrame::Unsuback { .. } => Err(unsupported("PubsubNotEnabled")),
+        OutboundFrame::Suback { packet_id, results }
+        | OutboundFrame::Unsuback { packet_id, results } => {
+            let codes = results
+                .as_slice()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| protocol("InvalidFilterResults"))?;
+            let sub = matches!(frame, OutboundFrame::Suback { .. });
+            if codes.iter().any(|code| {
+                if sub {
+                    !matches!(
+                        code,
+                        0 | 1 | 2 | 0x80 | 0x83 | 0x87 | 0x8f | 0x91 | 0x97 | 0x9e | 0xa1 | 0xa2
+                    )
+                } else {
+                    !matches!(code, 0 | 0x11 | 0x80 | 0x83 | 0x87 | 0x8f | 0x91)
+                }
+            }) {
+                return Err(protocol("InvalidFilterReason"));
+            }
+            let [high, low] = packet_id.get().to_be_bytes();
+            let mut bytes = vec![
+                if sub { 0x90 } else { 0xb0 },
+                (3 + codes.len()) as u8,
+                high,
+                low,
+                0,
+            ];
+            bytes.extend_from_slice(codes);
+            Ok(bytes)
+        }
         OutboundFrame::Puback { packet_id, reason } => {
             let [high, low] = packet_id.get().to_be_bytes();
             if reason.to_wire() == 0 {
@@ -765,17 +855,117 @@ pub fn refusal(error: Error, before_connack: bool) -> Vec<u8> {
     }
 }
 
+/// Encode the core-authorized non-retained outgoing QoS 1 publication.
+pub fn encode_publish(
+    packet_id: OutboundPacketId,
+    topic_name: &SharedBytes,
+    payload: &SharedBytes,
+    dup: bool,
+) -> Result<Vec<u8>, Error> {
+    topic(topic_name.as_slice())?;
+    if topic_name.len() > 1024 || payload.len() > 32768 {
+        return Err(oversized("OutgoingFieldTooLarge"));
+    }
+    let body = topic_name
+        .len()
+        .checked_add(payload.len())
+        .and_then(|n| n.checked_add(5))
+        .ok_or_else(|| oversized("PacketTooLarge"))?;
+    let length_bytes = if body < 128 {
+        1
+    } else if body < 16384 {
+        2
+    } else {
+        3
+    };
+    let total = body
+        .checked_add(1 + length_bytes)
+        .filter(|n| *n <= 65536)
+        .ok_or_else(|| oversized("PacketTooLarge"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(total)
+        .map_err(|_| protocol("OutgoingAllocationFailed"))?;
+    bytes.push(0x32 | if dup { 8 } else { 0 });
+    let mut left = body;
+    for _ in 0..4 {
+        let mut part = (left % 128) as u8;
+        left /= 128;
+        if left > 0 {
+            part |= 128;
+        }
+        bytes.push(part);
+        if left == 0 {
+            break;
+        }
+    }
+    bytes.extend_from_slice(&(topic_name.len() as u16).to_be_bytes());
+    bytes.extend_from_slice(topic_name.as_slice());
+    bytes.extend_from_slice(&packet_id.get().to_be_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(payload.as_slice());
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
+    fn pubsub_reasons_frames_and_filter_counts_have_packet_specific_bounds() {
+        use mqttiumd_contract::{ids::OutboundPacketId, pubsub::FilterResults};
+        assert_eq!(
+            super::encode(OutboundFrame::Suback {
+                packet_id: InboundPacketId::new(7).unwrap(),
+                results: FilterResults::new(&[1, 0x83, 0xa2]).unwrap()
+            })
+            .unwrap(),
+            [0x90, 6, 0, 7, 0, 1, 0x83, 0xa2]
+        );
+        assert!(
+            super::encode(OutboundFrame::Unsuback {
+                packet_id: InboundPacketId::new(7).unwrap(),
+                results: FilterResults::new(&[1]).unwrap()
+            })
+            .is_err()
+        );
+        for reason in [0, 0x10, 0x80, 0x83, 0x87, 0x90, 0x91, 0x97, 0x99] {
+            assert!(super::decode(0x40, &[0, 1, reason, 0], BOUNDS).is_ok());
+        }
+        assert!(super::decode(0x40, &[0, 1, 0x92], BOUNDS).is_err());
+        let mut too_many = vec![0, 1, 0];
+        for _ in 0..9 {
+            too_many.extend_from_slice(&[0, 1, b't', 1]);
+        }
+        assert_eq!(
+            super::decode(0x82, &too_many, BOUNDS).unwrap_err().code(),
+            "TooManyFilters"
+        );
+        let bytes = super::encode_publish(
+            OutboundPacketId::new(4).unwrap(),
+            &SharedBytes::copy_from(b"t", 1).unwrap(),
+            &SharedBytes::copy_from(b"p", 1).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(bytes, [0x3a, 7, 0, 1, b't', 0, 4, 0, b'p']);
+    }
+    #[test]
     fn exact_subscriptions_and_recipient_puback_enter_the_pure_core() {
         use mqttiumd_contract::packet::InboundPacket;
-        assert!(matches!(super::decode(0x82, &[0,7,0,0,1,b't',1], BOUNDS),
-            Ok(super::Packet::Core(InboundPacket::Subscribe { .. }))));
-        assert!(matches!(super::decode(0xa2, &[0,8,0,0,1,b't'], BOUNDS),
-            Ok(super::Packet::Core(InboundPacket::Unsubscribe { .. }))));
-        assert!(matches!(super::decode(0x40, &[0,1,0x97], BOUNDS),
-            Ok(super::Packet::Core(InboundPacket::Puback { reason:0x97, .. }))));
+        assert!(matches!(
+            super::decode(0x82, &[0, 7, 0, 0, 1, b't', 1], BOUNDS),
+            Ok(super::Packet::Core(InboundPacket::Subscribe { .. }))
+        ));
+        assert!(matches!(
+            super::decode(0xa2, &[0, 8, 0, 0, 1, b't'], BOUNDS),
+            Ok(super::Packet::Core(InboundPacket::Unsubscribe { .. }))
+        ));
+        assert!(matches!(
+            super::decode(0x40, &[0, 1, 0x97], BOUNDS),
+            Ok(super::Packet::Core(InboundPacket::Puback {
+                reason: 0x97,
+                ..
+            }))
+        ));
     }
     use super::*;
     use mqttiumd_contract::ids::InboundPacketId;
@@ -1067,9 +1257,9 @@ mod tests {
     }
 
     #[test]
-    fn valid_subscribe_is_unsupported_but_a_truncated_one_is_malformed() {
+    fn no_local_subscribe_is_unsupported_but_a_truncated_one_is_malformed() {
         kind(
-            decode(0x82, b"\0\x01\0\0\x03a/#\x02", BOUNDS),
+            decode(0x82, b"\0\x01\0\0\x03a/#\x06", BOUNDS),
             ErrorKind::Unsupported,
         );
         kind(
