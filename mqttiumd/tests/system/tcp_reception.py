@@ -185,6 +185,15 @@ def expect_rejection(wire: Wire, *, before_connect: bool = False, timeout: float
                 "invalid_input_succeeded", hex(frame.header))
 
 
+def committed_admission_ids(events: list[dict]) -> frozenset[str]:
+    """Known commit identities survive retirement of their detailed SQL rows."""
+    return frozenset(operation_hex(event["operation"]) for event in events
+                     if event.get("kind") == "store_result"
+                     and event.get("command_kind") == "Admission"
+                     and event.get("details", {}).get("committed_now") is True
+                     and event["details"].get("outcome") == "Committed")
+
+
 def framing(binary: Path, case: Path) -> dict:
     broker = Broker(binary, case)
     try:
@@ -207,24 +216,28 @@ def framing(binary: Path, case: Path) -> dict:
         # A valid MQTT feature outside the narrow profile must not be confused
         # with a syntactically malformed fixed header.
         start = len(broker.events())
-        with Wire(broker.address, broker.observations, "unsupported-clean-start") as wire:
-            wire.send(connect_packet("unsupported", flags=2))
+        with Wire(broker.address, broker.observations, "unsupported-finite-expiry") as wire:
+            wire.send(connect_packet("unsupported", properties=b"\x11\x00\x00\x00\x01"))
             expect_rejection(wire, before_connect=True)
         unsupported = broker.wait_event("packet_refused", after=start - 1)
+        require(unsupported["details"]["code"] == "ConnectOutsideProfile",
+                "unsupported_connect_wrong_cause")
         start = len(broker.events())
         with Wire(broker.address, broker.observations, "malformed-connect") as wire:
             wire.send(connect_packet("malformed", flags=1))
             expect_rejection(wire, before_connect=True)
         malformed = broker.wait_event("packet_refused", after=start - 1)
+        require(malformed["details"]["code"] == "ReservedConnectFlag",
+                "malformed_connect_wrong_cause")
         require(unsupported["details"]["code"] != malformed["details"]["code"],
                 "unsupported_not_distinguished_from_malformed")
         # A declared excessive size is refused without waiting for the body.
         with Wire(broker.address, broker.observations, "oversized") as wire:
             wire.connect("invalid-client", session_present=False)
-            before = len(database(broker.db)["admissions"])
+            before = committed_admission_ids(broker.events())
             wire.send(b"\x34" + variable_integer(65537))
             expect_rejection(wire, timeout=1)
-            require(len(database(broker.db)["admissions"]) == before, "oversized_admitted")
+            require(committed_admission_ids(broker.events()) == before, "oversized_admitted")
         # Clean EOF after a partial body is a truncated packet, not clean EOF.
         after = max(int(event["seq"]) for event in broker.events())
         with Wire(broker.address, broker.observations, "truncated") as wire:
