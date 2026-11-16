@@ -143,6 +143,24 @@ Actual broker-epoch opening ends previous zero-retention sessions before owner
 recovery/readiness. Persistent sessions remain until explicitly ended; there is
 no automatic eviction and the active quota remains 128.
 
+For a short lifecycle demonstration against the running broker:
+
+```bash
+python tests/system/external_sessions.py --client mqttium --port 1883 \
+  --client-id demo-ephemeral --clean-start 1 --expiry 0 \
+  --topic demo/lifecycle --qos 1 --expected-session-present 0
+python tests/system/external_sessions.py --client paho --port 1883 \
+  --client-id demo-persistent --clean-start 0 --expiry infinite \
+  --expected-session-present 0
+python tests/system/external_sessions.py --client paho --port 1883 \
+  --client-id demo-persistent --clean-start 0 --expiry infinite \
+  --disconnect-expiry 0 --expected-session-present 1
+```
+
+These helpers use the public APIs. The reception command
+`tools/run_session_reception.sh /tmp/mqttiumd-session-reception` additionally
+waits for the broker's known lifecycle result and independent durable cleanup.
+
 The profile accepts non-retained QoS 0/1/2 PUBLISH, PUBREL, exact SUBSCRIBE and
 UNSUBSCRIBE, recipient PUBACK, PINGREQ and ordinary DISCONNECT. Completed valid
 packets reset the 1.5-times-Keep-Alive deadline; fragments do not. Keep Alive 0
@@ -355,6 +373,9 @@ SIGINT/SIGTERM closes sockets and drains accepted writer work before releasing
 the writer. Accepted commands are not called certainly rejected. Shutdown has
 a finite deadline; a stuck storage operation reports incomplete shutdown with
 unknown outcome. SIGKILL has no graceful drain and depends on SQLite recovery.
+Normal shutdown gives zero-policy session ends two seconds to complete while
+preserving persistent state. An unresolved end is reported as incomplete;
+the next actual epoch opening still finalizes previous zero-policy sessions.
 
 ## Live receipt retirement
 

@@ -110,8 +110,8 @@ product F's own process witnesses.
 
 The focused finite model adds8 expected outcomes to the unchanged74 previous
 outcomes. It separates payload references from inbound/claim exchange slots and
-maps actual Rust counterexample replays. This is a specification model with
-explicit assumptions, not a universal Rust/network/storage proof. The pilot
+maps the related focused Rust regressions. This is a specification model with
+explicit assumptions, not a Rust refinement or universal network/storage proof. The pilot
 proof's protected files and French archive remain unchanged.
 
 ## Reproduction and remaining limits

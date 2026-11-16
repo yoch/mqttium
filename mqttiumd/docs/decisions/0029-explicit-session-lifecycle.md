@@ -111,6 +111,14 @@ four queued writes, one active write and eight terminal receipts per transport;
 336 reserved terminal facts add the128-effect Outbox bound. Ordinary inputs
 remain bounded separately at128, so closure can reconcile accepted frame facts
 without requiring spare business input capacity.
+Each accepted transport reserves both of its possible future closing facts
+against the same32 slots already queued. Each accepted frame likewise reserves
+its future terminal fact against the combined frame/fact budget; independent
+per-container limits alone would overcommit under repeated healthy traffic.
+Orderly shutdown closes transports and gives accepted work and zero-policy
+ends at most two seconds. Unresolved outcomes report incomplete shutdown;
+they are not converted into certain rejection. Typed startup/read failure
+retains its original cause and does not start additional cleanup writes.
 
 The instrumented writer exposes session.open/close.prepared inside the real
 transaction and session.open/close.committed after COMMIT before result return.
