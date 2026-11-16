@@ -249,6 +249,88 @@ fn corrupt(path: &Path, sql: &str) {
 }
 
 #[test]
+fn work_validates_unclaimed_discriminants_before_selecting_qos_or_cursor() {
+    for mutation in [
+        "UPDATE obligations SET qos=99",
+        "UPDATE obligations SET qos=1.5",
+        "UPDATE obligations SET qos=0,cause=99",
+        "UPDATE obligations SET qos=2,phase=99",
+    ] {
+        let path = fresh_path("invalid-unclaimed-work");
+        let mut world = World::new(&|incarnation, limits| {
+            SqliteStore::create(&path, incarnation, limits).unwrap()
+        });
+        assert!(
+            world
+                .store
+                .apply(&world.admission(1, 7, b"payload", &[world.b]))
+                .committed_now
+        );
+        let before = world.store.snapshot().unwrap();
+        assert!(before.outbound.is_empty());
+        let delivery = *before.obligations.keys().next().unwrap();
+        assert_eq!(
+            world.store.read_work(world.b, None, 8).unwrap().items.len(),
+            1
+        );
+        // Deliberate corruption of a disposable live store, not a product API.
+        // The writer remains open: startup validation cannot detect this for it.
+        corrupt(&path, mutation);
+        assert_eq!(
+            world.store.read_work(world.b, None, 8),
+            Err(ReadError::InvalidData),
+            "{mutation}"
+        );
+        assert_eq!(
+            world.store.read_work(world.b, Some(delivery), 8),
+            Err(ReadError::InvalidData),
+            "a cursor must not hide {mutation}"
+        );
+        assert!(
+            world
+                .store
+                .read_work(world.c, None, 8)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert_eq!(world.store.snapshot(), Err(ReadError::InvalidData));
+        drop(world.store);
+        assert_eq!(
+            SqliteStore::open(&path).unwrap().snapshot(),
+            Err(ReadError::InvalidData),
+            "startup still refuses {mutation}"
+        );
+    }
+}
+
+#[test]
+fn work_distinguishes_valid_other_qos_from_an_invalid_discriminant() {
+    for qos in [0, 2] {
+        let path = fresh_path("other-valid-work");
+        let mut world = World::new(&|incarnation, limits| {
+            SqliteStore::create(&path, incarnation, limits).unwrap()
+        });
+        assert!(
+            world
+                .store
+                .apply(&world.admission(1, 7, b"payload", &[world.b]))
+                .committed_now
+        );
+        corrupt(&path, &format!("UPDATE obligations SET qos={qos}"));
+        assert!(
+            world
+                .store
+                .read_work(world.b, None, 8)
+                .unwrap()
+                .items
+                .is_empty(),
+            "valid QoS {qos} belongs to another work path in this profile"
+        );
+    }
+}
+
+#[test]
 fn malformed_claim_metadata_stays_typed_through_all_outgoing_readers() {
     for mutation in [
         "UPDATE outbound SET target_revision=x'0000000000000063'",
