@@ -87,6 +87,17 @@ class ProbeTests(unittest.TestCase):
             finally:
                 left.close();right.close()
 
+    def test_concat_accepts_ping_responses_while_release_commit_is_pending(self):
+        for completion in (
+                [Frame(0x70, b"\x00\x07"), Frame(0xD0, b""), Frame(0xD0, b"")],
+                [Frame(0xD0, b""), Frame(0x70, b"\x00\x07"), Frame(0xD0, b"")],
+                [Frame(0xD0, b""), Frame(0xD0, b""), Frame(0x70, b"\x00\x07")]):
+            wire = Wire.__new__(Wire)
+            wire.frames = [Frame(0x50, b"\x00\x07")] + completion
+            wire.send = lambda *args, **kwargs: None
+            wire.exchange(7, concat=True)
+            self.assertEqual(wire.frames, [])
+
 
 if __name__ == "__main__":
     unittest.main()
