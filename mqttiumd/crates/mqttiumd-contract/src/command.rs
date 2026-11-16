@@ -26,6 +26,13 @@
 //!     session:8 session_revision:8 delivery_index:u32 qos:u8 cause:u8
 //! kind 2, ReleaseInbound:
 //!   operation:32 session:8 packet_id:2 exchange_generation:8
+//! kind 3, ChangeSubscriptions:
+//!   operation:32 session:8 session_revision:8 route_revision:8 count:u8
+//!   per change: subscribe:u8 topic_len:u16 topic
+//! kind 4, ClaimDelivery:
+//!   operation:32 publication:32 delivery_index:u32 target:8 target_revision:8 packet_id:2
+//! kind 5, FinishDelivery:
+//!   the kind-4 fields, then claim_operation:32
 //! ```
 
 use alloc::sync::Arc;
@@ -767,6 +774,63 @@ mod tests {
         let mut bytes = Vec::new();
         recipe.encode_canonical(&mut bytes).expect("well formed");
         bytes
+    }
+
+    #[test]
+    fn pubsub_recipes_round_trip_and_reject_every_incomplete_encoding() {
+        let (incarnation, epoch, owner) = scope();
+        let operation = OperationId::new(incarnation, epoch, owner, OperationSeq::new(7));
+        let claim = OperationId::new(incarnation, epoch, owner, OperationSeq::new(8));
+        let delivery = target(11, 0).delivery;
+        let packet_id = OutboundPacketId::new(12).unwrap();
+        let changes = BoundedVec::from_slice(
+            &[SubscriptionChange {
+                topic: SharedBytes::copy_from(b"exact/topic", 64).unwrap(),
+                subscribe: true,
+            }],
+            MAX_FILTERS,
+        )
+        .unwrap();
+        let recipes = [
+            Recipe::ChangeSubscriptions(ChangeSubscriptions {
+                operation,
+                session: SessionId::new(11),
+                session_revision: Revision::new(1),
+                route_revision: Revision::new(2),
+                changes,
+            }),
+            Recipe::ClaimDelivery(ClaimDelivery {
+                operation,
+                delivery,
+                target: SessionId::new(11),
+                target_revision: Revision::new(1),
+                packet_id,
+            }),
+            Recipe::FinishDelivery(FinishDelivery {
+                operation,
+                delivery,
+                target: SessionId::new(11),
+                target_revision: Revision::new(1),
+                packet_id,
+                claim,
+            }),
+        ];
+        for recipe in recipes {
+            let bytes = encode(&recipe);
+            assert_eq!(Recipe::decode_canonical(&bytes, 16, 64).unwrap(), recipe);
+            for cut in 0..bytes.len() {
+                assert!(
+                    Recipe::decode_canonical(&bytes[..cut], 16, 64).is_err(),
+                    "accepted cut {cut}"
+                );
+            }
+            let mut trailing = bytes;
+            trailing.push(0);
+            assert_eq!(
+                Recipe::decode_canonical(&trailing, 16, 64),
+                Err(RecipeError::TrailingBytes)
+            );
+        }
     }
 
     #[test]
