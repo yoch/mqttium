@@ -6911,6 +6911,53 @@ mod tests {
     }
 
     #[test]
+    fn product_pubsub_unknown_earlier_claim_cannot_be_overtaken_by_a_new_claim() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 2));
+        load_work(&mut world, &[work_item(0), work_item(1)], None);
+        let first = pubsub_flight(&mut world, work_available());
+        world.applied(unknown(&first));
+        assert!(
+            world.sent(work_available()).is_empty(),
+            "later claim must wait for earlier claim eligibility, even when a peer slot is free"
+        );
+        world.applied(committed(&first));
+        assert_eq!(kinds(&world.drain()), ["EmitPublish"]);
+        let second = pubsub_flight(&mut world, work_available());
+        assert!(
+            matches!(second.facts,CommitFacts::DeliveryClaimed {delivery,..}if delivery==work_item(1).delivery)
+        );
+    }
+
+    #[test]
+    fn product_pubsub_late_claim_result_does_not_overtake_earlier_replay_after_takeover() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 2));
+        load_work(&mut world, &[work_item(0), work_item(1)], None);
+        let first = pubsub_flight(&mut world, work_available());
+        world.applied(committed(&first));
+        world.drain();
+        let second = pubsub_flight(&mut world, work_available());
+        world.applied(product_settings(CONN + 1, 2));
+        world.sent(connect(CONN + 1, b"p1-producer"));
+        world.applied(committed(&second));
+        assert!(
+            world.drain().is_empty(),
+            "later known claim cannot bypass an earlier exchange that must be replayed"
+        );
+        world.applied(work_available());
+        let first_replay = world.drain();
+        assert!(
+            matches!(&first_replay[0].1,Effect::EmitPublish {delivery,dup:true,..}if *delivery==work_item(0).delivery)
+        );
+        world.applied(work_available());
+        let second_emit = world.drain();
+        assert!(
+            matches!(&second_emit[0].1,Effect::EmitPublish {delivery,dup:false,..}if *delivery==work_item(1).delivery)
+        );
+    }
+
+    #[test]
     fn product_pubsub_claim_and_finish_each_require_their_own_commit() {
         let mut world = product_world();
         world.applied(product_settings(CONN, 1));
