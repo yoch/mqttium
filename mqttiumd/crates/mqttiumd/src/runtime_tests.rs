@@ -319,6 +319,111 @@ fn concatenated_fresh_connect_and_publish_wait_for_confirmed_session_creation() 
     });
 }
 
+#[test]
+fn closing_transport_reconciles_late_commit_without_acknowledging_after_disconnect() {
+    with_runtime(1, |runtime, directory| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"closing-client"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        let session = runtime.sessions[b"closing-client".as_slice()].id;
+        let packet_id = InboundPacketId::new(7).unwrap();
+        runtime.packet(generation, 0x34, publish_body(7)).unwrap();
+        runtime.drain_inputs().unwrap();
+        assert_eq!(
+            runtime.inflight.len(),
+            1,
+            "admission reached the real writer"
+        );
+        assert!(
+            runtime
+                .owner
+                .exchange(session, packet_id)
+                .is_some_and(|(_, phase)| phase == ExchangePhase::AdmissionPending)
+        );
+
+        // A valid SUBSCRIBE is outside this product profile. It queues a
+        // DISCONNECT while the admitted command's response is still withheld.
+        let subscription = vec![0, 9, 0, 0, 1, b't', 2];
+        assert_eq!(
+            codec::decode(0x82, &subscription, BOUNDS)
+                .unwrap_err()
+                .kind(),
+            codec::ErrorKind::Unsupported
+        );
+        runtime.packet(generation, 0x82, subscription).unwrap();
+        assert!(runtime.peers[&generation].closing.is_some());
+        assert_eq!(read_frame(&mut client), (0xe0, vec![0x83, 0]));
+
+        // Reconcile the actual commit without collecting the refusal's socket
+        // receipt: this establishes the precise closing-but-not-removed phase.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !runtime.inflight.is_empty() && Instant::now() < deadline {
+            runtime.writer_results().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            runtime.inflight.is_empty(),
+            "correlated writer result arrived"
+        );
+        runtime.drain_inputs().unwrap();
+        assert!(runtime.peers[&generation].closing.is_some());
+        assert!(
+            runtime
+                .owner
+                .exchange(session, packet_id)
+                .is_some_and(|(_, phase)| phase == ExchangePhase::AwaitPubrel)
+        );
+        let state =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert_eq!(state.inbound.len(), 1, "the late admission remains durable");
+
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut byte = [0];
+        match client.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            result => panic!(
+                "a closing transport emitted MQTT output after DISCONNECT: {result:?}, first byte={:#04x}",
+                byte[0]
+            ),
+        }
+
+        // Suppressing the old socket's frame must not suppress reconciliation.
+        // A fresh generation resumes the committed exchange without Persist.
+        runtime.connections().unwrap();
+        runtime.drain_inputs().unwrap();
+        let (resumed, mut resumed_client) = peer(runtime);
+        runtime
+            .connect(resumed, connect_packet(b"closing-client"))
+            .unwrap();
+        runtime.drain_inputs().unwrap();
+        let (first, body) = read_frame(&mut resumed_client);
+        assert_eq!(first, 0x20);
+        assert_eq!(body[0], 1, "the durable session is resumed");
+        runtime.packet(resumed, 0x3c, publish_body(7)).unwrap();
+        runtime.drain_inputs().unwrap();
+        assert!(
+            runtime.inflight.is_empty(),
+            "DUP does not submit a second admission"
+        );
+        assert_eq!(read_frame(&mut resumed_client).0, 0x50);
+        let after =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert_eq!(after.inbound, state.inbound);
+        assert_eq!(after.publications, state.publications);
+        assert_eq!(after.operations, state.operations);
+    });
+}
+
 fn unsupported_connect_with_cap(cap: u32) -> Vec<u8> {
     let mut body = vec![
         0, 4, b'M', b'Q', b'T', b'T', 5, 2, 0, 10, 10, 0x11, 255, 255, 255, 255, 0x27,
