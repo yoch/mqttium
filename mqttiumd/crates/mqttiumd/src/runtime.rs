@@ -147,10 +147,7 @@ struct Runtime<'a> {
 }
 impl Runtime<'_> {
     fn queue(&mut self, input: Input) -> Result<(), Failure> {
-        if matches!(
-            input,
-            Input::ReceiptsCollected { .. } | Input::MaintainReceipts | Input::Deadline { .. }
-        ) {
+        if self.maintenance_input(&input) {
             if self.control_inputs.len() >= crate::writer::CONTROL_QUEUE {
                 return Err(Failure::plain("core_control_input_budget"));
             }
@@ -162,6 +159,12 @@ impl Runtime<'_> {
         }
         self.inputs.push_back(input);
         Ok(())
+    }
+    fn maintenance_input(&self, input: &Input) -> bool {
+        matches!(
+            input,
+            Input::ReceiptsCollected { .. } | Input::MaintainReceipts
+        ) || matches!(input,Input::Deadline {token,..} if self.owner.collection_deadline_is_live(*token))
     }
     fn close(
         &mut self,
@@ -215,10 +218,15 @@ impl Runtime<'_> {
         Ok(())
     }
     fn drain_inputs(&mut self) -> Result<(), Failure> {
+        let mut control_budget = crate::writer::CONTROL_QUEUE;
         for _ in 0..(self.inputs.len() + self.control_inputs.len()).min(64) {
-            let Some(input) = self
-                .control_inputs
-                .pop_front()
+            let control = if control_budget > 0 {
+                self.control_inputs.pop_front()
+            } else {
+                None
+            };
+            let Some(input) = control
+                .inspect(|_| control_budget -= 1)
                 .or_else(|| self.inputs.pop_front())
             else {
                 break;
@@ -355,9 +363,9 @@ impl Runtime<'_> {
                             self.events.emit("input_capacity_refused",json!({"connection":connection.get().to_string(),"details":{"accepted_command_rejected":false}})).map_err(event_failure)?;
                             self.close(connection, "input_capacity")?;
                         }
-                        other @ (Input::ReceiptsCollected { .. }
-                        | Input::MaintainReceipts
-                        | Input::Deadline { .. }) => self.control_inputs.push_back(other),
+                        other if self.maintenance_input(&other) => {
+                            self.control_inputs.push_back(other)
+                        }
                         other => self.inputs.push_back(other),
                     }
                 }
@@ -406,10 +414,17 @@ impl Runtime<'_> {
             .iter()
             .filter(|(_, due)| **due <= now)
             .map(|(token, _)| *token)
-            .take(crate::writer::CONTROL_QUEUE.saturating_sub(self.control_inputs.len()))
             .collect();
         for token in due {
-            self.timers.remove(&token);
+            let collector = self.owner.collection_deadline_is_live(token);
+            let room = if collector {
+                self.control_inputs.len() < crate::writer::CONTROL_QUEUE
+            } else {
+                self.inputs.len() + self.deferred_inputs.len() < INPUTS
+            };
+            if !room {
+                continue;
+            } // The exact token remains in the bounded timer map.
             self.queue(Input::Deadline {
                 token,
                 now: LogicalTime::new(
@@ -420,6 +435,7 @@ impl Runtime<'_> {
                         .map_err(|_| Failure::plain("clock_exhausted"))?,
                 ),
             })?;
+            self.timers.remove(&token);
         }
         Ok(())
     }
@@ -470,7 +486,7 @@ impl Runtime<'_> {
     fn writer_results(&mut self) -> Result<(), Failure> {
         // Replies have their own reserved capacity. The owner retains bounded
         // attempt correlation; no adapter history or second retry loop exists.
-        for _ in 0..crate::writer::CONTROL_QUEUE {
+        for _ in 0..crate::writer::CONTROL_QUEUE.saturating_sub(self.control_inputs.len()) {
             let response = match self.writer.control_receiver.try_recv() {
                 Ok(reply) => reply,
                 Err(TryRecvError::Empty) => break,
@@ -501,6 +517,9 @@ impl Runtime<'_> {
             }
         }
         for _ in 0..64 {
+            if self.inputs.len() + self.deferred_inputs.len() >= INPUTS {
+                break;
+            }
             let response = match self.writer.receiver.try_recv() {
                 Ok(r) => r,
                 Err(TryRecvError::Empty) => break,

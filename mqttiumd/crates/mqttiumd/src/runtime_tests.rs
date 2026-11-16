@@ -1662,12 +1662,29 @@ fn four_blocked_ordinary_deadlines_cannot_occupy_the_collectors_reserved_reply_l
             runtime.timers.insert(token, Instant::now());
         }
         runtime.due_deadlines().unwrap();
-        while runtime.inputs.len()+runtime.deferred_inputs.len()<INPUTS {
-            runtime.inputs.push_back(Input::WorkAvailable {session:SessionId::new(999)});
+        while runtime.inputs.len() + runtime.deferred_inputs.len() < INPUTS {
+            runtime.inputs.push_back(Input::WorkAvailable {
+                session: SessionId::new(999),
+            });
         }
-        let committed_by=Instant::now()+Duration::from_secs(2);
-        while !mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap().receipt_frontiers.values().any(|f|f.through.get()==64) && Instant::now()<committed_by {thread::sleep(Duration::from_millis(1));}
-        assert!(mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite")).unwrap().receipt_frontiers.values().any(|f|f.through.get()==64),"the precise closure must really commit before the input-pressure check");
+        let committed_by = Instant::now() + Duration::from_secs(2);
+        while !mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite"))
+            .unwrap()
+            .receipt_frontiers
+            .values()
+            .any(|f| f.through.get() == 64)
+            && Instant::now() < committed_by
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            mqttiumd_store_sqlite::SqliteStore::inspect(&path.join("store.sqlite"))
+                .unwrap()
+                .receipt_frontiers
+                .values()
+                .any(|f| f.through.get() == 64),
+            "the precise closure must really commit before the input-pressure check"
+        );
         let deadline = Instant::now() + Duration::from_secs(2);
         let mut result = Ok(());
         while !runtime
