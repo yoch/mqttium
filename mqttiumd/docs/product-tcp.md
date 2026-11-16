@@ -274,9 +274,11 @@ leaves ACK, PING, closure and results runnable. Each destination owns its window
 
 Incoming and outgoing PI spaces are independent. The client's active PUBLISH,
 SUBSCRIBE and UNSUBSCRIBE share its sender space; active collisions are errors.
-Server PIs are monotonic without reuse on one live connection; exhaustion closes
-rather than wraps. A reconnect restores outstanding claims, skips their PIs for
-new allocations and fences old generation callbacks/bytes.
+Server PIs are recyclable resources: all live claims reserve their number,
+including unknown Claim/Finish outcomes and recovered claims before payload
+loading. Known durable Finish application makes the number available to a new
+claim. A reconnect restores outstanding claims with their original PIs and
+fences old generation callbacks/observations. Causal identities never wrap.
 
 ## Recovery, discovery and formats
 
