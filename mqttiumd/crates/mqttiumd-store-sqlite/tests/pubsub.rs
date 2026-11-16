@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use mqttiumd_contract::capacity::{BoundedVec, ExchangeSlots};
 use mqttiumd_contract::command::{
-    ChangeSubscriptions, ClaimDelivery, Command, FinishDelivery, FrozenRecipe, Recipe,
+    ChangeSubscriptions, ClaimDelivery, Command, ConsumeDelivery, FinishDelivery, FrozenRecipe,
+    Recipe,
 };
 use mqttiumd_contract::effects::RecoveredFact;
 use mqttiumd_contract::ids::{DeliveryId, OutboundPacketId, Revision};
@@ -318,15 +319,17 @@ fn work_distinguishes_valid_other_qos_from_an_invalid_discriminant() {
                 .committed_now
         );
         corrupt(&path, &format!("UPDATE obligations SET qos={qos}"));
-        assert!(
-            world
-                .store
-                .read_work(world.b, None, 8)
-                .unwrap()
-                .items
-                .is_empty(),
-            "valid QoS {qos} belongs to another work path in this profile"
-        );
+        let page = world.store.read_work(world.b, None, 8).unwrap();
+        if qos == 0 {
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(page.items.as_slice()[0].qos, Qos::AtMostOnce);
+            assert!(page.items.as_slice()[0].claim.is_none());
+        } else {
+            assert!(
+                page.items.is_empty(),
+                "valid QoS2 belongs to another work path in this profile"
+            );
+        }
     }
 }
 
@@ -379,23 +382,136 @@ fn malformed_claim_metadata_stays_typed_through_all_outgoing_readers() {
 }
 
 #[test]
-fn schema_one_refusal_preserves_main_and_uncheckpointed_wal_bytes() {
-    let path = fresh_path("schema1");
-    let raw = rusqlite::Connection::open(&path).unwrap();
-    raw.execute_batch("PRAGMA journal_mode=WAL;PRAGMA wal_autocheckpoint=0;PRAGMA user_version=1;CREATE TABLE old_store(one INTEGER PRIMARY KEY, contents BLOB);INSERT INTO old_store VALUES(1,x'01020304');").unwrap();
-    let wal = PathBuf::from(format!("{}-wal", path.display()));
-    let main_before = std::fs::read(&path).unwrap();
-    let wal_before = std::fs::read(&wal).unwrap();
-    assert!(!wal_before.is_empty());
-    for _ in 0..2 {
-        assert!(matches!(
-            SqliteStore::open(&path),
-            Err(OpenError::SchemaVersion(1))
-        ));
-        assert_eq!(std::fs::read(&path).unwrap(), main_before);
-        assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+fn schema_one_and_two_refusal_preserves_main_and_uncheckpointed_wal_bytes() {
+    for version in [1, 2] {
+        let path = fresh_path("schema1");
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute_batch(&format!("PRAGMA journal_mode=WAL;PRAGMA wal_autocheckpoint=0;PRAGMA user_version={version};CREATE TABLE old_store(one INTEGER PRIMARY KEY, contents BLOB);INSERT INTO old_store VALUES(1,x'01020304');")).unwrap();
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let main_before = std::fs::read(&path).unwrap();
+        let wal_before = std::fs::read(&wal).unwrap();
+        assert!(!wal_before.is_empty());
+        for _ in 0..2 {
+            assert!(
+                matches!(SqliteStore::open(&path),Err(OpenError::SchemaVersion(found)) if found==version)
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), main_before);
+            assert_eq!(std::fs::read(&wal).unwrap(), wal_before);
+        }
+        drop(raw);
     }
+}
+
+#[test]
+fn consuming_a_qos0_obligation_has_no_claim_and_survives_lost_results_and_restart() {
+    let path = fresh_path("consume-qos0");
+    let mut sqlite =
+        World::new(&|incarnation, limits| SqliteStore::create(&path, incarnation, limits).unwrap());
+    let mut memory = World::new(&MemoryStore::create);
+    let admission = altered(&memory.admission(1, 7, b"payload", &[memory.b]), |a| {
+        a.targets.as_mut_slice()[0].effective_qos = Qos::AtMostOnce
+    });
+    for command in [admission, memory.release(2, 7, 1)] {
+        assert_eq!(sqlite.store.apply(&command), memory.store.apply(&command));
+    }
+    let delivery = DeliveryId {
+        publication: publication_id(memory.epoch, 1),
+        index: 0,
+    };
+    let consume = command(Recipe::ConsumeDelivery(ConsumeDelivery {
+        operation: operation_id(memory.epoch, 3),
+        delivery,
+        target: memory.b,
+        target_revision: Revision::new(1),
+    }));
+    let before = memory.store.snapshot().unwrap();
+    assert!(before.outbound.is_empty());
+    assert_eq!(before.accounts.exchange_slots, ExchangeSlots::ZERO);
+    sqlite.store.set_durability(Durability::Failing);
+    memory.store.set_durability(Durability::Failing);
+    assert_eq!(sqlite.store.apply(&consume), memory.store.apply(&consume));
+    assert_eq!(
+        sqlite.store.apply(&consume).reply,
+        StoreReply::Outcome(StoreOutcome::PendingOrUnknown)
+    );
+    assert_eq!(sqlite.store.snapshot().unwrap(), before);
+    assert_eq!(memory.store.snapshot().unwrap(), before);
+    assert_eq!(
+        sqlite.store.resolve_and_fence(consume.recipe.operation()),
+        memory.store.resolve_and_fence(consume.recipe.operation())
+    );
+    assert_eq!(sqlite.store.snapshot().unwrap(), before);
+    sqlite.store.set_durability(Durability::Available);
+    memory.store.set_durability(Durability::Available);
+    // The application may lose this committed result; resolution uses its
+    // original operation, never a newly invented delivery or packet id.
+    assert_eq!(sqlite.store.apply(&consume), memory.store.apply(&consume));
+    let established = StoreOutcome::Committed(CommitFacts::DeliveryConsumed {
+        delivery,
+        target: memory.b,
+    });
+    assert_eq!(
+        sqlite
+            .store
+            .resolve_and_fence(consume.recipe.operation())
+            .outcome,
+        established
+    );
+    assert_eq!(
+        memory
+            .store
+            .resolve_and_fence(consume.recipe.operation())
+            .outcome,
+        established
+    );
+    let after = memory.store.snapshot().unwrap();
+    assert_eq!(sqlite.store.snapshot().unwrap(), after);
+    assert!(
+        after.obligations.is_empty()
+            && after.outbound.is_empty()
+            && after.publications.is_empty()
+            && after.payloads.is_empty()
+    );
+    assert_eq!(accounts_match_what_is_held(&after), Ok(()));
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        raw.query_row(
+            "SELECT length(facts) FROM operations WHERE decision=7",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        44
+    );
     drop(raw);
+    drop(sqlite.store);
+    let mut reopened = SqliteStore::open(&path).unwrap();
+    assert_eq!(reopened.snapshot().unwrap(), after);
+    assert_eq!(
+        reopened.established(consume.recipe.operation()),
+        Ok(Some(established))
+    );
+    assert!(!reopened.apply(&consume).committed_now);
+    assert_eq!(reopened.snapshot().unwrap(), after);
+    assert!(
+        reopened
+            .read_work(memory.b, None, 8)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    assert_eq!(open(&mut reopened), open(&mut memory.store));
+    let inventory = reopened.recover(None, 64).unwrap();
+    assert_eq!(inventory, memory.store.recover(None, 64).unwrap());
+    assert!(
+        !inventory
+            .facts
+            .as_slice()
+            .iter()
+            .any(|f| matches!(f, RecoveredFact::OutboundDelivery { .. })),
+        "a consumption receipt never reconstructs outgoing work"
+    );
+    assert!(inventory.facts.as_slice().iter().any(|f|matches!(f,RecoveredFact::Operation{knowledge:mqttiumd_contract::outcome::Knowledge::Committed(CommitFacts::DeliveryConsumed{delivery:found,..}),..} if *found==delivery)));
 }
 
 #[test]
