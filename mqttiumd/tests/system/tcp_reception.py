@@ -20,7 +20,7 @@ from tcp_probe import Observations, ReceiptFailure, Wire, database, read_events,
 
 class Broker:
     def __init__(self, binary: Path, case: Path, *, db: Path | None = None,
-                 label: str = "broker", pauses: tuple[str, ...] = ()):
+                 label: str = "broker", pauses: tuple[str, ...] = (), test_control: bool = False):
         case.mkdir(parents=True, exist_ok=True)
         self.binary = binary.resolve()
         self.case = case
@@ -30,7 +30,9 @@ class Broker:
         self.control.mkdir()
         self.observations = Observations(case / f"{label}.observer.jsonl")
         command = [str(self.binary), "--db", str(self.db), "--listen", "127.0.0.1:0",
-                   "--events", str(self.events_path), "--test-control", str(self.control)]
+                   "--events", str(self.events_path)]
+        if pauses or test_control:
+            command += ["--test-control", str(self.control)]
         if pauses:
             command += ["--test-pause", ",".join(pauses)]
         self.stdout_path = case / f"{label}.stdout"
