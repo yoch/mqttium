@@ -6648,6 +6648,266 @@ mod tests {
     }
 
     #[test]
+    fn product_pubsub_unknown_claim_and_finish_resolve_the_original_operation() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 1));
+        load_work(&mut world, &[work_item(0)], None);
+        let claim = pubsub_flight(&mut world, work_available());
+        world.applied(unknown(&claim));
+        assert!(
+            world.drain().is_empty(),
+            "unknown claim never authorizes PUBLISH"
+        );
+        world.applied(deadline(claim.deadline));
+        let resolve = world.drain();
+        assert_eq!(kinds(&resolve), ["ResolveAndFence", "ArmDeadline"]);
+        let (effect, Effect::ResolveAndFence { operation }) = resolve[0] else {
+            panic!("resolve")
+        };
+        assert_eq!(operation, claim.operation);
+        world.applied(Input::StoreResult {
+            effect,
+            operation,
+            reply: StoreReply::Outcome(StoreOutcome::Committed(claim.facts)),
+        });
+        assert_eq!(kinds(&world.drain()), ["EmitPublish"]);
+        let finish = pubsub_flight(&mut world, outgoing_puback(CONN, 1, 0x80));
+        world.applied(unknown(&finish));
+        assert!(
+            world.sent(work_available()).is_empty(),
+            "negative PUBACK also holds its slot until finish commit"
+        );
+        world.applied(deadline(finish.deadline));
+        let resolve = world.drain();
+        let (effect, Effect::ResolveAndFence { operation }) = resolve[0] else {
+            panic!("resolve")
+        };
+        assert_eq!(operation, finish.operation);
+        world.applied(Input::StoreResult {
+            effect,
+            operation,
+            reply: StoreReply::Outcome(StoreOutcome::Committed(finish.facts)),
+        });
+        assert!(world.drain().is_empty());
+        assert_eq!(world.sent(work_available()), ["LoadWork"]);
+    }
+
+    #[test]
+    fn product_pubsub_reconnect_replays_same_claims_under_smaller_peer_window() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 2));
+        load_work(&mut world, &[work_item(0), work_item(1)], None);
+        for raw in 1..=2 {
+            let claim = pubsub_flight(&mut world, work_available());
+            world.applied(committed(&claim));
+            let effects = world.drain();
+            assert!(
+                matches!(&effects[0].1,Effect::EmitPublish {packet_id,dup:false,..} if packet_id.get()==raw)
+            );
+        }
+        assert!(
+            world.sent(work_available()).is_empty(),
+            "no periodic live retransmission"
+        );
+        world.applied(Input::ConnectionClosed {
+            connection: ConnectionGeneration::new(CONN),
+        });
+        assert!(world.drain().is_empty());
+        world.applied(product_settings(CONN + 1, 1));
+        assert_eq!(
+            world.sent(connect(CONN + 1, b"p1-producer")),
+            ["EmitConnack"]
+        );
+        world.applied(work_available());
+        let replay = world.drain();
+        assert!(
+            matches!(&replay[0].1,Effect::EmitPublish {packet_id,dup:true,..} if packet_id.get()==1)
+        );
+        assert!(
+            world.sent(work_available()).is_empty(),
+            "durable claims not yet replayed do not overrun the new Receive Maximum"
+        );
+        assert!(
+            world.sent(outgoing_puback(CONN, 1, 0)).is_empty(),
+            "old-generation PUBACK cannot finish a replay"
+        );
+        let finish = pubsub_flight(&mut world, outgoing_puback(CONN + 1, 1, 0));
+        world.applied(committed(&finish));
+        world.applied(work_available());
+        let replay = world.drain();
+        assert!(
+            matches!(&replay[0].1,Effect::EmitPublish {packet_id,dup:true,..} if packet_id.get()==2)
+        );
+    }
+
+    #[test]
+    fn product_pubsub_late_work_page_cannot_resurrect_a_finished_obligation() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 2));
+        load_work(&mut world, &[work_item(0)], None);
+        let claim = pubsub_flight(&mut world, work_available());
+        world.applied(committed(&claim));
+        world.drain();
+        world.applied(work_available());
+        let load = world.drain();
+        assert_eq!(kinds(&load), ["LoadWork"]);
+        let mut old_item = work_item(0);
+        let CommitFacts::DeliveryClaimed {
+            packet_id, claim, ..
+        } = claim.facts
+        else {
+            panic!("claim")
+        };
+        old_item.claim = Some(crate::contract::pubsub::DeliveryClaim {
+            operation: claim,
+            packet_id,
+        });
+        let finish = pubsub_flight(&mut world, outgoing_puback(CONN, 1, 0));
+        world.applied(committed(&finish));
+        world.applied(Input::WorkPage {
+            effect: load[0].0,
+            session: SessionId::new(PRODUCER),
+            items: BoundedVec::from_slice(&[old_item], 8).unwrap(),
+            next: None,
+        });
+        assert!(world.drain().is_empty());
+        assert_eq!(
+            world.sent(work_available()),
+            ["LoadWork"],
+            "discard stale read and rediscover, rather than recreating the removed slot"
+        );
+    }
+
+    #[test]
+    fn product_pubsub_late_control_commit_updates_projection_without_reply_to_takeover() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 1));
+        let control = pubsub_flight(&mut world, subscribe(CONN, 9, b"fresh"));
+        world.applied(product_settings(CONN + 1, 1));
+        assert_eq!(
+            world.sent(connect(CONN + 1, b"p1-producer")),
+            ["CloseConnection", "EmitConnack"]
+        );
+        world.applied(committed(&control));
+        assert!(
+            world.drain().is_empty(),
+            "SUBACK belongs to the original connection generation"
+        );
+        assert!(
+            world
+                .owner
+                .routes
+                .as_slice()
+                .iter()
+                .any(|r| r.target == SessionId::new(PRODUCER) && r.topic == bytes(b"fresh"))
+        );
+    }
+
+    #[test]
+    fn product_pubsub_pending_route_change_hands_back_publication_and_preserves_control_progress() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 1));
+        let control = pubsub_flight(&mut world, subscribe(CONN, 9, b"fresh"));
+        let input = publish_with(CONN, 10, Qos::AtLeastOnce, b"x");
+        let StepOutcome::NeedCapacity { input, need, .. } = world.step(input) else {
+            panic!("route change must preserve publication for retry")
+        };
+        assert_eq!(input, publish_with(CONN, 10, Qos::AtLeastOnce, b"x"));
+        assert_eq!(
+            need,
+            CapacityNeed {
+                resource: Resource::ResultSlots,
+                amount: 1,
+                wake: WakeCondition::ResultDelivered
+            }
+        );
+        assert_eq!(
+            world.sent(Input::Packet {
+                connection: ConnectionGeneration::new(CONN),
+                ingress_order: 2,
+                packet: InboundPacket::Pingreq
+            }),
+            ["EmitPingresp"]
+        );
+        world.applied(committed(&control));
+        assert_eq!(kinds(&world.drain()), ["EmitSuback"]);
+        world.applied(publish_with(CONN, 10, Qos::AtLeastOnce, b"x"));
+        assert_eq!(kinds(&world.drain()), ["Persist", "ArmDeadline"]);
+    }
+
+    #[test]
+    fn product_pubsub_work_page_rejects_two_claims_using_the_same_network_identifier() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 2));
+        world.applied(work_available());
+        let load = world.drain();
+        let mut a = work_item(0);
+        let mut b = work_item(1);
+        let claim = crate::contract::pubsub::DeliveryClaim {
+            operation: OperationId::new(
+                StoreIncarnation::new(INCARNATION),
+                RunEpoch::new(EPOCH - 1),
+                LogicalOwnerId::new(4),
+                OperationSeq::new(1),
+            ),
+            packet_id: crate::contract::ids::OutboundPacketId::new(7).unwrap(),
+        };
+        a.claim = Some(claim);
+        b.claim = Some(crate::contract::pubsub::DeliveryClaim {
+            operation: OperationId::new(
+                StoreIncarnation::new(INCARNATION),
+                RunEpoch::new(EPOCH - 1),
+                LogicalOwnerId::new(4),
+                OperationSeq::new(2),
+            ),
+            ..claim
+        });
+        assert!(
+            matches!(
+                world.step(Input::WorkPage {
+                    effect: load[0].0,
+                    session: SessionId::new(PRODUCER),
+                    items: BoundedVec::from_slice(&[a, b], 8).unwrap(),
+                    next: None
+                }),
+                StepOutcome::Fatal(CoreFault::ImpossibleInput)
+            ),
+            "ambiguous PUBACK correlation must be refused before mutation"
+        );
+    }
+
+    #[test]
+    fn product_pubsub_work_page_must_advance_the_requested_delivery_cursor() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 1));
+        load_work(&mut world, &[work_item(0)], Some(work_item(0).delivery));
+        let claim = pubsub_flight(&mut world, work_available());
+        world.applied(committed(&claim));
+        world.drain();
+        let finish = pubsub_flight(&mut world, outgoing_puback(CONN, 1, 0));
+        world.applied(committed(&finish));
+        // Finish invalidates outstanding reads but does not erase the
+        // successful pagination cursor when no read is in flight.
+        world.applied(work_available());
+        let load = world.drain();
+        assert!(
+            matches!(&load[0].1,Effect::LoadWork{after:Some(id),..}if *id==work_item(0).delivery)
+        );
+        assert!(
+            matches!(
+                world.step(Input::WorkPage {
+                    effect: load[0].0,
+                    session: SessionId::new(PRODUCER),
+                    items: BoundedVec::from_slice(&[work_item(0)], 8).unwrap(),
+                    next: Some(work_item(0).delivery)
+                }),
+                StepOutcome::Fatal(CoreFault::ImpossibleInput)
+            ),
+            "nonadvancing cursor must not recreate finished work"
+        );
+    }
+
+    #[test]
     fn product_pubsub_settings_enable_bounded_durable_work_discovery() {
         let mut world = product_world();
         world.applied(product_settings(CONN, 1));
