@@ -636,7 +636,9 @@ mod tests {
     use crate::contract::opening::{
         EpochOpened, EpochOpening, OpeningOutcome, OpeningReply, StartupNonce,
     };
-    use crate::contract::session::{SessionCancellations, SessionChange, SessionExpiry};
+    use crate::contract::session::{
+        SessionAction, SessionCancellations, SessionChange, SessionExpiry, SessionLifecycle,
+    };
     use alloc::vec::Vec;
 
     const TURN: TurnGrant = TurnGrant {
@@ -691,7 +693,7 @@ mod tests {
         let mut owner = Owner::new(
             OwnerConfig {
                 max_sessions: bound(1),
-                max_routes: bound(2),
+                max_routes: bound(4),
                 max_exchanges: bound(8),
                 account: AccountId::new(1),
                 payload_bytes: PayloadBytes::new(1024),
@@ -751,6 +753,99 @@ mod tests {
                 },
             ),
         )
+    }
+    fn opened(session: u64, expiry: SessionExpiry) -> SessionChange {
+        SessionChange::Opened {
+            session: SessionId::new(session),
+            revision: Revision::new(1),
+            session_present: false,
+            expiry,
+            retired: None,
+            route_revision: Revision::new(0),
+            cancelled: SessionCancellations::default(),
+        }
+    }
+    fn submit(
+        owner: &mut Owner,
+        connection: u64,
+        client_id: &[u8],
+        expiry: SessionExpiry,
+    ) -> Vec<(EffectId, Effect)> {
+        apply(
+            owner,
+            Input::OpenSession {
+                connection: ConnectionGeneration::new(connection),
+                client_id: bytes(client_id),
+                clean_start: false,
+                expiry,
+            },
+        )
+    }
+    #[test]
+    fn refused_takeover_still_closes_the_disconnected_ephemeral_incarnation() {
+        let mut owner = world();
+        let first = submit(&mut owner, 1, b"ephemeral", SessionExpiry::OnDisconnect);
+        let (opened_by, _) = known(&mut owner, &first, opened(1, SessionExpiry::OnDisconnect));
+        let takeover = submit(&mut owner, 2, b"ephemeral", SessionExpiry::Never);
+        assert!(takeover.iter().any(|(_, e)| matches!(e, Effect::CloseConnection { connection, .. } if *connection == ConnectionGeneration::new(1))));
+        let flight = owner.lifecycle.clone().unwrap();
+        let effects = apply(
+            &mut owner,
+            Input::StoreResult {
+                effect: flight.in_flight.answers.persist,
+                operation: flight.command.operation,
+                reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(RejectReason::Fenced)),
+            },
+        );
+        assert!(effects.iter().any(|(_, e)| matches!(e, Effect::SessionRefused { connection, .. } if *connection == ConnectionGeneration::new(2))));
+        assert!(effects.iter().any(|(_, e)| matches!(e, Effect::Persist { command } if matches!(command.recipe.get(), Recipe::SessionLifecycle(SessionLifecycle { action: SessionAction::Close { guard, .. }, .. }) if guard.session == SessionId::new(1) && guard.opened_by == Some(opened_by)))), "disconnected_ephemeral_takeover_refusal_leaks_capacity");
+    }
+    #[test]
+    fn impossible_committed_creation_at_full_capacity_is_refused_before_mutation() {
+        let mut owner = world();
+        let first = submit(&mut owner, 1, b"persistent", SessionExpiry::Never);
+        known(&mut owner, &first, opened(1, SessionExpiry::Never));
+        submit(&mut owner, 2, b"other", SessionExpiry::Never);
+        let flight = owner.lifecycle.clone().unwrap();
+        let previous = owner.sessions.as_slice().to_vec();
+        let input = Input::StoreResult {
+            effect: flight.in_flight.answers.persist,
+            operation: flight.command.operation,
+            reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                opened(2, SessionExpiry::Never),
+            ))),
+        };
+        assert!(
+            matches!(
+                owner.step(input, TURN),
+                StepOutcome::Fatal(CoreFault::ContradictoryOutcome { .. })
+            ),
+            "committed_creation_exceeds_owner_capacity"
+        );
+        assert_eq!(owner.sessions.as_slice(), previous.as_slice());
+        assert_eq!(owner.lifecycle, Some(flight));
+        assert!(drain(&mut owner).is_empty());
+    }
+    #[test]
+    fn retiring_a_session_preserves_the_order_of_other_targets_routes() {
+        let mut owner = world();
+        for (topic, target) in [
+            (b"a".as_slice(), 1),
+            (b"b".as_slice(), 2),
+            (b"c".as_slice(), 3),
+        ] {
+            owner
+                .routes
+                .try_push(Route {
+                    topic: bytes(topic),
+                    target: SessionId::new(target),
+                    target_revision: Revision::new(1),
+                    max_qos: Qos::AtLeastOnce,
+                })
+                .unwrap();
+        }
+        owner.retire_session(SessionId::new(1)).unwrap();
+        assert_eq!(owner.routes.as_slice()[0].topic, bytes(b"b"));
     }
     #[test]
     fn a_new_ephemeral_session_ends_and_releases_the_owner_slot() {
