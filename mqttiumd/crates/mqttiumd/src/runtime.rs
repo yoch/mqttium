@@ -2487,6 +2487,13 @@ impl EffectSink for Sink<'_> {
                             // Pipeline processing starts only after the core's
                             // CONNACK occupies the ordered socket output queue.
                             peer.pending = false;
+                            // Readiness is effective only after the ordered
+                            // CONNACK enters the bounded writer queue. The
+                            // earlier cache-install fence deliberately kept
+                            // this destination ineligible for discovery.
+                            if !self.inputs.iter().any(|input| matches!(input, Input::WorkAvailable { session } if *session == connection.session)) {
+                                self.inputs.push_back(Input::WorkAvailable { session: connection.session });
+                            }
                         }
                         self.frames.insert(
                             id,

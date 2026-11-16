@@ -783,7 +783,7 @@ fn closing_transport_reconciles_late_commit_without_acknowledging_after_disconne
         runtime
             .connect(resumed, connect_packet(b"closing-client"))
             .unwrap();
-        runtime.drain_inputs().unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
         let (first, body) = read_frame(&mut resumed_client);
         assert_eq!(first, 0x20);
         assert_eq!(body[0], 1, "the durable session is resumed");
@@ -798,13 +798,24 @@ fn closing_transport_reconciles_late_commit_without_acknowledging_after_disconne
             mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
         assert_eq!(after.inbound, state.inbound);
         assert_eq!(after.publications, state.publications);
-        assert_eq!(after.operations, state.operations);
+        assert_eq!(
+            after.operations.len(),
+            state.operations.len() + 1,
+            "only the confirmed resume lifecycle adds a receipt"
+        );
+        for (id, record) in &state.operations {
+            assert_eq!(
+                after.operations.get(id),
+                Some(record),
+                "DUP preserves the original exact admission receipt"
+            );
+        }
     });
 }
 
 fn unsupported_connect_with_cap(cap: u32) -> Vec<u8> {
     let mut body = vec![
-        0, 4, b'M', b'Q', b'T', b'T', 5, 2, 0, 10, 10, 0x11, 255, 255, 255, 255, 0x27,
+        0, 4, b'M', b'Q', b'T', b'T', 5, 2, 0, 10, 10, 0x11, 0, 0, 0, 1, 0x27,
     ];
     body.extend_from_slice(&cap.to_be_bytes());
     body.extend_from_slice(&[0, 4, b't', b'i', b'n', b'y']);
@@ -1237,8 +1248,8 @@ fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_fail
             mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
         assert_eq!(
             state.operations.len(),
-            1,
-            "transport failure does not cancel the admission"
+            2,
+            "the durable Open and accepted admission both survive transport failure"
         );
         assert!(state.inbound.is_empty() && state.publications.is_empty());
         drop((original, receiver));
@@ -1276,48 +1287,18 @@ fn concatenated_subscription_waits_for_connack(known: bool) {
             .write_all(&connect_then_subscribe(client_id))
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
-        if known {
-            // The cached path must also defer the second TCP packet while
-            // ConnectResume remains queued and unapplied.
-            while !runtime.inputs.iter().any(|input| {
-                matches!(input, Input::Packet { connection, packet: InboundPacket::ConnectResume { .. }, .. }
-                    if *connection == generation)
-            }) && Instant::now() < deadline
-            {
-                runtime.connections().unwrap();
-                thread::sleep(Duration::from_millis(1));
-            }
-            assert!(runtime.inputs.iter().any(|input| {
-                matches!(input, Input::Packet { connection, packet: InboundPacket::ConnectResume { .. }, .. }
-                    if *connection == generation)
-            }), "known CONNECT reached the owner input queue");
-        } else {
-            while runtime.session_requests.is_empty() && Instant::now() < deadline {
-                runtime.connections().unwrap();
-                thread::sleep(Duration::from_millis(1));
-            }
-            assert!(
-                !runtime.session_requests.is_empty(),
-                "fresh CONNECT reached writer"
-            );
-            while !runtime.session_requests.is_empty() && Instant::now() < deadline {
-                runtime.writer_results().unwrap();
-                thread::sleep(Duration::from_millis(1));
-            }
-            assert!(
-                runtime.session_requests.is_empty(),
-                "session result is correlated"
-            );
-            assert!(
-                runtime.inputs.iter().any(|input| {
-                    matches!(input, Input::SessionEstablished { connection: Some(found), .. }
-                    if *found == generation)
-                }),
-                "confirmed creation remains queued before owner application"
-            );
+        while !runtime.inputs.iter().any(|input| matches!(input, Input::OpenSession { connection, .. } if *connection == generation))
+            && Instant::now() < deadline
+        {
+            runtime.connections().unwrap();
+            thread::sleep(Duration::from_millis(1));
         }
-        let session = runtime.sessions[client_id.as_slice()].id;
-        assert_eq!(runtime.owner.connection_of(session), None);
+        assert!(runtime.inputs.iter().any(|input| matches!(input, Input::OpenSession { connection, .. } if *connection == generation)), "every fresh or known CONNECT reaches the correlated owner lifecycle path");
+        assert!(runtime.peers[&generation].pending);
+        assert!(
+            !runtime.peers[&generation].connected,
+            "neither a cached name nor submitted Open proves readiness"
+        );
         // Hold owner input application while polling the actual transport.
         // A ready SQLite result alone must not permit a DISCONNECT to overtake
         // the core-authorized CONNACK in this connection's write FIFO.
@@ -1615,7 +1596,12 @@ fn four_blocked_ordinary_deadlines_cannot_occupy_the_collectors_reserved_reply_l
             .unwrap();
         until(runtime, |r| r.session_requests.is_empty());
         assert_eq!(read_frame(&mut client).0, 0x20);
-        for _ in 0..63 {
+        let known_open_span = runtime.owner.receipt_status().unwrap().1;
+        assert_eq!(
+            known_open_span, 1,
+            "the confirmed Open owns one consumed receipt before publications"
+        );
+        for _ in known_open_span..63 {
             runtime.packet(generation, 0x32, publish_body(1)).unwrap();
             until(runtime, |r| r.frames.values().any(|f| f.kind == "PUBACK"));
             assert_eq!(read_frame(&mut client).0, 0x40);
@@ -2050,54 +2036,116 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
             runtime.owner.outbox().unwrap().pending().next().unwrap().effect(),
             Effect::Persist { command } if matches!(command.recipe.get(), Recipe::AdmitPublication(admission) if admission.source.session == runtime.sessions[b"takeover-pressure-c".as_slice()].id)
         ));
+        // Observe a real old-generation PUBACK before the takeover cut, then
+        // keep a copy of the already correlated fact for a later replay.
+        let observed_before = runtime.puback_observation;
+        old.write_all(&[0x40, 2, 0, 1]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.puback_observation == observed_before && Instant::now() < deadline {
+            runtime.connections().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            runtime.puback_observation > observed_before,
+            "real reader reached old-generation PUBACK"
+        );
+        let stale = runtime
+            .inputs
+            .iter()
+            .find_map(|input| match input {
+                Input::ObservedPuback {
+                    connection,
+                    packet_id,
+                    reason,
+                    target,
+                } if connection.generation == old_generation => {
+                    Some((*connection, *packet_id, *reason, *target))
+                }
+                _ => None,
+            })
+            .expect("old observation is correlated before either owner input queue");
+        assert_eq!(stale.0.session, session);
+        assert_eq!(stale.3, None);
         let (new_generation, mut new) = peer(runtime);
         runtime
             .connect(new_generation, connect_packet(b"takeover-boundary"))
             .unwrap();
         runtime.drain_inputs().unwrap();
-        assert_eq!(runtime.owner.connection_of(session), Some(new_generation));
-        assert!(
-            runtime.peers.contains_key(&old_generation),
-            "the actual old transport survives while CloseConnection waits behind the refused Persist"
+        assert_ne!(
+            runtime.owner.connection_of(session),
+            Some(new_generation),
+            "new authority waits for the durable Open"
         );
-        let pending = runtime
-            .owner
-            .outbox()
-            .unwrap()
-            .pending()
-            .collect::<Vec<_>>();
-        assert_eq!(pending[0].id(), blocked_persist);
-        assert!(pending.iter().skip(1).any(|effect| matches!(
-            effect.effect(),
-            Effect::CloseConnection { connection, reason: CloseReason::SessionTakenOver } if *connection == old_generation
-        )), "takeover Close must really wait behind the same refused Persist");
-        let observed_before = runtime.puback_observation;
-        old.write_all(&[0x40, 2, 0, 1]).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut result = Ok(());
-        while runtime.puback_observation == observed_before && Instant::now() < deadline {
-            result = runtime.connections();
-            if result.is_err() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert!(
-            result.is_ok(),
-            "stale_puback_stopped_reactor: a live old socket with superseded authority must not cause global failure: {:?}",
-            result.err()
+        assert_eq!(
+            runtime.peers[&old_generation].session,
+            Some(session),
+            "Peer keeps its original confirmed durable identity"
         );
         assert!(
-            runtime.puback_observation > observed_before,
-            "the real reader must reach the superseded generation's PUBACK"
+            runtime.peers[&old_generation].closing.is_some(),
+            "reserved Close reaches the old socket even behind sixteen held ordinary operations"
         );
-        assert!(runtime.inputs.iter().any(|input|matches!(input,Input::ObservedPuback {connection,target:None,..} if connection.session==session && connection.generation==old_generation)),"the observation retains its original durable session/generation and never acquires the replacement connection");
+        assert_eq!(
+            read_frame(&mut old),
+            (0xe0, vec![0x8e, 0]),
+            "takeover control is actually written before new Open can commit"
+        );
+        assert!(
+            runtime.lifecycle_inflight.is_empty(),
+            "Open Persist is fenced until the actual old transport shutdown, not merely a queued close intent"
+        );
         // Relay one actual admission reply, retaining the real worker's other
         // replies. This distinguishes takeover/control progress from global
         // quiescence while preserving the adapter's original correlations.
         let (released, receiver) = std::sync::mpsc::sync_channel(IN_FLIGHT * 2);
         let worker_receiver = std::mem::replace(&mut runtime.writer.receiver, receiver);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            until_phase(
+                runtime,
+                path,
+                "reserved Open after actual takeover shutdown",
+                |r| {
+                    !r.peers.contains_key(&old_generation)
+                        && r.owner.connection_of(session) == Some(new_generation)
+                        && r.session_requests.is_empty()
+                },
+            );
+            assert_eq!(
+                runtime.inflight.len(),
+                IN_FLIGHT,
+                "session lifecycle did not consume an ordinary writer slot"
+            );
+            assert_eq!(
+                runtime
+                    .owner
+                    .outbox()
+                    .unwrap()
+                    .pending()
+                    .next()
+                    .unwrap()
+                    .id(),
+                blocked_persist,
+                "the same ordinary effect remains retained with its original identity"
+            );
+            assert!(
+                runtime.peers[&new_generation].pending,
+                "CONNACK remains behind the older ordinary Persist until that exact operation can be submitted"
+            );
+            runtime
+                .queue(Input::ObservedPuback {
+                    connection: stale.0,
+                    packet_id: stale.1,
+                    reason: stale.2,
+                    target: stale.3,
+                })
+                .unwrap();
+            runtime.drain_inputs().unwrap();
+            assert_eq!(
+                runtime.owner.connection_of(session),
+                Some(new_generation),
+                "old observed fact cannot stop or rebind the replacement"
+            );
+
             let mut admission_released = false;
             for _ in 0..=IN_FLIGHT {
                 let response = worker_receiver
@@ -2132,7 +2180,7 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
             until_phase(
                 runtime,
                 path,
-                "first reply releases Close and CONNACK",
+                "one ordinary reply releases only the retained Persist and CONNACK",
                 |r| {
                     !r.peers.contains_key(&old_generation)
                         && r.peers.get(&new_generation).is_some_and(|p| !p.pending)
