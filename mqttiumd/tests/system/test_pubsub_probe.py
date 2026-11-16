@@ -25,6 +25,16 @@ class PubsubProbeTests(unittest.TestCase):
         self.assertEqual((message.topic, message.payload, message.packet_id, message.qos,
                           message.dup, message.retain), ("a/b", b"payload", 9, 1, True, False))
 
+    def test_qos0_has_no_packet_identifier_or_duplicate_flag(self):
+        message = decode_publish(Frame(0x30, bytes.fromhex("0003612f6200") + b"payload"))
+        self.assertEqual((message.topic, message.payload, message.packet_id, message.qos,
+                          message.dup, message.retain), ("a/b", b"payload", None, 0, False, False))
+        self.assertIsNone(message.observation()['packet_id'])
+        for frame in [Frame(0x38, b"\x00\x01a\x00data"),
+                      Frame(0x30, b"\x00\x01a\x80\x00data")]:
+            with self.assertRaises(ReceiptFailure):
+                decode_publish(frame)
+
     def test_invalid_or_unbounded_outgoing_packets_are_refused(self):
         for frame in [Frame(0x34, b"\x00\x01a\x00\x01\x00"),
                       Frame(0x32, b"\x00\x01a\x00\x00\x00"),

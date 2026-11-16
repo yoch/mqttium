@@ -25,6 +25,11 @@ def server_publish(topic, payload, mid=7, dup=False):
                   len(name).to_bytes(2, 'big') + name + mid.to_bytes(2, 'big') + b'\0' + payload)
 
 
+def server_publish_qos0(topic, payload):
+    name = topic.encode()
+    return packet(0x30, len(name).to_bytes(2, 'big') + name + b'\0' + payload)
+
+
 def filters(body, options):
     if body[2] != 0:
         raise AssertionError('test client sent unrequested subscription properties')
@@ -49,6 +54,55 @@ async def call(kind, action, host, port, client_id, **options):
 
 
 class ExternalPubsubTests(unittest.IsolatedAsyncioTestCase):
+    async def test_qos0_publish_receipt_is_local_and_never_waits_for_a_broker_ack(self):
+        for kind in ('mqttium', 'paho'):
+            with self.subTest(client=kind):
+                async def script(reader, writer, _connection):
+                    await connack(reader, writer)
+                    first, body = await read_packet(reader)
+                    self.assertEqual(first, 0x30)
+                    self.assertEqual(body, b'\x00\x0freception/exact\x00data')
+                    # The independent peer sends no ACK. Client completion is
+                    # deliberately weaker than broker admission or delivery.
+                    self.assertEqual(await read_packet(reader), (0xE0, b''))
+
+                async with ScriptedBroker(script) as broker:
+                    result = await call(kind, 'publish', '127.0.0.1', broker.port, f'{kind}-qos0-publisher',
+                                        topic='reception/exact', payload=b'data', qos=0)
+                self.assertEqual(result['status'], 'success', result)
+                row = result['publications'][0]
+                self.assertEqual(row['completion_scope'], 'local-write-only')
+                self.assertIsNone(row['packet_id'], 'an API receipt token is not a QoS 0 wire identifier')
+                self.assertIn('client_receipt_id', row)
+
+    async def test_qos0_receive_never_submits_manual_ack_and_checks_granted_qos(self):
+        for kind in ('mqttium', 'paho'):
+            with self.subTest(client=kind):
+                async def script(reader, writer, _connection):
+                    await connack(reader, writer)
+                    first, body = await read_packet(reader)
+                    self.assertEqual(first, 0x82)
+                    self.assertEqual(filters(body, True), [('reception/exact', 0)])
+                    writer.write(packet(0x90, body[:2] + b'\0\0'))
+                    writer.write(server_publish_qos0('reception/exact', b'volatile'))
+                    await writer.drain()
+                    self.assertEqual(await read_packet(reader), (0xE0, b''),
+                                     'QoS 0 must never issue PUBACK even in manual-ACK mode')
+
+                async with ScriptedBroker(script) as broker:
+                    result = await call(kind, 'receive', '127.0.0.1', broker.port, f'{kind}-qos0-receiver',
+                                        filters=('reception/exact',), qos=0,
+                                        expected_granted_qos=0, expected_delivery_qos=0,
+                                        ack_policy='hold')
+                self.assertEqual(result['status'], 'success', result)
+                self.assertEqual(result['subscriptions'][0]['reason_codes'], [0])
+                message = result['messages'][0]
+                self.assertEqual(message['qos'], 0)
+                self.assertIsNone(message['packet_id'])
+                kinds = [event['kind'] for event in result['events']]
+                self.assertNotIn('manual_ack_submitted', kinds)
+                self.assertNotIn('ack_held', kinds)
+
     async def test_both_public_clients_wait_for_suback_and_receive_qos1(self):
         for kind in ('mqttium', 'paho'):
             with self.subTest(client=kind):
