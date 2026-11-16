@@ -82,6 +82,20 @@
   core-authorised CONNACK. Pending ingress now lasts through CONNACK acceptance
   by the ordered output queue (and keeps the CONNECT deadline). Both cases
   require CONNACK first, then the refusal, with correct Session Present.
+- The 28174af5 product CI passed all A–H and precise mutants; its downloaded
+  ZIP 14192826735 has SHA-256
+  `c706ca9443c92e85c18f930ff5ce307dbb58dabf9ff1b3ba485e7599e8f6d57e`.
+  The ordinary CI, models, proof and documentation also passed. The contracts
+  job failed one normal bench parity run with Open/Unavailable at simulated
+  crash; the original low-level cause was not preserved, so it is not claimed.
+- A deterministic descriptor-duplication regression independently established
+  `WriterAlive` after the logical store had dropped. A private WriterLease now
+  explicitly unlocks after SQLite closes, including verification error paths.
+  A live owner still excludes others immediately; there is no retry/fallback.
+  The regression failed first, then normal/instrumented lease tests, all seven
+  real crash tests and the original bench group passed. A bounded pre-fix
+  stress (40 groups / 120 tests) did not reproduce the CI occurrence; that
+  limitation is retained. Fresh final-source receipts and CI follow this fix.
 - Final SHA-specific CI and fresh K1/K2b/K3 qualification are retained in the
   updated PR and its workflow artifacts. The final source identity is always
   `index.json.source_head`; development archives are never relabelled.

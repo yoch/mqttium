@@ -53,6 +53,7 @@ before core delivery, beyond the core's remembered closed window.
 
 | Trigger | Correction | Executed detection |
 | - | - | - |
+| A duplicated/inherited file descriptor outlives the logical SQLite owner | Explicit private lease unlock after connection closure, also on verification error paths; immediate live-writer refusal remains | A deterministic red test reopened with WriterAlive after Drop; fixed lease, normal/instrumented crash tests and bench parity pass. The separate CI Open/Unavailable occurrence was not uniquely attributed by its kept diagnostics |
 | Confirmed new session, close or PING reaches the old owner | Prepared/applied session facts, close input and PING frames | Ten lifecycle tests failed with `ImpossibleInput` before the fix; the full core suite passes afterwards |
 | Complete an unrouted publication | Collect metadata only after the last inbound marker and obligation, preserving receipt identity guards | Both stores retained publication metadata in the red tests; unreadable witnesses wrongly admitted a fresh operation; fixed tests compare complete states including reopening |
 | Full exchange table precedes another client's release/result | Close only the unaccepted packet's transport; bounded fair retry of nonpacket inputs | Real socket/SQLite reactor regression failed on the starved release, then passed |
