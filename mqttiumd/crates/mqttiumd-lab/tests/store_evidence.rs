@@ -371,7 +371,7 @@ fn qos0_consumption_snapshot_has_no_claim_and_matches_the_canonical_example() {
 }
 
 /// Every kind of row: a commit, a capacity rejection with its resource,
-/// a fence, a terminal session, a release; and the empty store.
+/// a fence, a physically erased session, a release; and the empty store.
 #[test]
 fn every_snapshot_of_the_store_is_accepted() {
     let workspace = workspace();
@@ -406,6 +406,20 @@ fn every_snapshot_of_the_store_is_accepted() {
     );
     let state = world.store.snapshot().expect("healthy durable snapshot");
     assert!(!state.fences.is_empty());
+    assert!(
+        !state.sessions.contains_key(&world.c),
+        "terminated session metadata is physically reclaimed"
+    );
+    assert_eq!(state.sessions.len(), 2);
+    assert!(state.sessions.contains_key(&world.producer) && state.sessions.contains_key(&world.b));
+    assert_eq!(state.obligations.len(), 1);
+    assert_eq!(state.obligations.values().next().unwrap().target, world.b);
+    assert_eq!(state.accounts.references.get(), 1);
+    assert_eq!(state.accounts.exchange_slots.get(), 0);
+    assert_eq!(
+        mqttiumd_lab::store::conformance::accounts_match_what_is_held(&state),
+        Ok(())
+    );
     let written = snapshot(&state, CONTEXT);
     accepted(&workspace, &written);
     let decisions: Vec<&Value> = written["operations"]
@@ -424,7 +438,7 @@ fn every_snapshot_of_the_store_is_accepted() {
             .as_array()
             .expect("rows")
             .iter()
-            .any(|row| row["state"] == "Terminal")
+            .all(|row| row["state"] == "Active")
     );
 }
 

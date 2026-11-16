@@ -36,6 +36,7 @@ def checked(command: list[str], cwd: Path) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--target-dir", type=Path, help="optional persistent Cargo cache outside the source checkout")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -66,7 +67,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="mqttiumd-session-store-controls-") as directory:
         temporary = Path(directory)
         tree = temporary / "worktree"
-        target = temporary / "target"
+        target = args.target_dir.resolve() if args.target_dir else temporary / "target"
         checked(["git", "worktree", "add", "--detach", str(tree), source_sha], repository)
         try:
             baseline_command = [
@@ -125,9 +126,15 @@ def main() -> None:
             summary = {
                 "scope": "compiled-store-negative-controls", "source_sha": source_sha,
                 "baseline": baseline,
-                "controls": results, "original_checkout_unchanged": not checked(["git", "status", "--porcelain"], repository),
+                "controls": results,
+                "original_checkout_unchanged": (
+                    checked(["git", "rev-parse", "HEAD"], repository) == source_sha
+                    and not checked(["git", "status", "--porcelain"], repository)
+                ),
             }
             (output / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
+    if not summary["original_checkout_unchanged"]:
+        raise RuntimeError("source checkout changed concurrently; receive the controls again from a stable checkout")
     print(json.dumps(summary, indent=2))
 
 
