@@ -66,10 +66,14 @@ def connect_packet(client_id: str, keep_alive: int = 30, *, properties: bytes | 
     return packet(0x10, body + variable_integer(len(properties)) + properties + utf8(client_id))
 
 
-def publish_packet(topic: str, payload: bytes, identifier: int, *, dup: bool = False) -> bytes:
+def publish_packet(topic: str, payload: bytes, identifier: int, *, dup: bool = False,
+                   qos: int = 2) -> bytes:
     if not 1 <= identifier <= 65535:
         raise ValueError("zero or excessive Packet Identifier")
-    return packet(0x3C if dup else 0x34, utf8(topic) + identifier.to_bytes(2, "big") + b"\x00" + payload)
+    if qos not in (1, 2):
+        raise ValueError("probe supports incoming QoS 1 and 2 only")
+    return packet(0x30 | qos << 1 | int(dup) << 3,
+                  utf8(topic) + identifier.to_bytes(2, "big") + b"\x00" + payload)
 
 
 def pubrel_packet(identifier: int) -> bytes:
@@ -86,7 +90,7 @@ class Frame:
         return self.header & 0xF0
 
     def ack(self) -> tuple[int, int]:
-        require(self.kind in (0x50, 0x70) and self.header & 15 == 0,
+        require(self.kind in (0x40, 0x50, 0x70) and self.header & 15 == 0,
                 "unexpected_ack", hex(self.header))
         require(len(self.body) >= 2, "probe_malformed_ack")
         identifier = int.from_bytes(self.body[:2], "big")
@@ -251,7 +255,7 @@ class Wire:
             frame = self.poll(max(0, deadline - time.monotonic()))
             require(frame is not None, "missing_frame", repr(pending))
             identifier = None
-            if frame.kind in (0x50, 0x70):
+            if frame.kind in (0x40, 0x50, 0x70):
                 identifier, reason = frame.ack()
                 require(reason == 0, "negative_business_ack", str(reason))
             actual = (frame.kind, identifier)
@@ -271,8 +275,12 @@ class Wire:
         return present
 
     def exchange(self, identifier: int, payload: bytes = b"durable", *, topic: str = "reception/qos2",
-                 stride: int | None = None, concat: bool = False) -> None:
-        self.send(publish_packet(topic, payload, identifier), stride=stride)
+                 stride: int | None = None, concat: bool = False, qos: int = 2,
+                 dup: bool = False) -> None:
+        self.send(publish_packet(topic, payload, identifier, qos=qos, dup=dup), stride=stride)
+        if qos == 1:
+            self.expect(0x40, identifier)
+            return
         self.expect(0x50, identifier)
         self.send(pubrel_packet(identifier) + (b"\xc0\x00\xc0\x00" if concat else b""), stride=stride)
         self.expect_batch([(0x70, identifier)] + ([(0xD0, None)] * 2 if concat else []))
@@ -293,7 +301,8 @@ def assert_no_positive_ack(frames: list[Frame], header: int, identifier: int) ->
         if frame.kind == header:
             actual, reason = frame.ack()
             if actual == identifier and reason < 128:
-                raise ReceiptFailure("premature_pubrec" if header == 0x50 else "premature_pubcomp",
+                code = {0x40: "premature_puback", 0x50: "premature_pubrec", 0x70: "premature_pubcomp"}[header]
+                raise ReceiptFailure(code,
                                      f"positive acknowledgement for Packet Identifier {identifier} before commit")
 
 
