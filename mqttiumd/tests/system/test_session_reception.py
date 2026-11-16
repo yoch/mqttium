@@ -6,7 +6,9 @@ import tempfile
 import unittest
 
 from external_sessions import INFINITE, MqttiumSession, PahoSession, exchange, options
+from session_reception import CARDINALITY_ZERO, assert_drained, cardinality_drained
 from test_external_clients import ScriptedBroker, read_packet
+from tcp_probe import ReceiptFailure
 
 
 def connect_fields(header, body):
@@ -119,3 +121,25 @@ class SessionEvidenceTests(unittest.TestCase):
                 options(False, value)
         with self.assertRaises(ValueError):
             options(1, 0)
+
+    def test_terminal_rows_are_detected_even_if_active_capacity_is_returned(self):
+        state = {'terminal_sessions': 1, 'active_sessions': 0, 'counts': {'sessions': 1}}
+        with self.assertRaises(ReceiptFailure) as raised:
+            assert_drained(state)
+        self.assertEqual(raised.exception.code, 'terminal_session_rows_retained')
+
+    def test_absent_cardinality_cannot_be_presented_as_drained(self):
+        with self.assertRaises(ReceiptFailure) as raised:
+            cardinality_drained({'details': {}})
+        self.assertEqual(raised.exception.code, 'session_cardinality_fields_missing')
+
+    def test_owner_and_runtime_must_both_drain_with_bounded_closed_memory(self):
+        row = {name: 0 for name in CARDINALITY_ZERO}
+        row['closed_generations'] = 8
+        self.assertTrue(cardinality_drained({'details': row}))
+        for name in CARDINALITY_ZERO:
+            with self.subTest(name=name):
+                self.assertFalse(cardinality_drained({'details': dict(row, **{name: 1})}))
+        with self.assertRaises(ReceiptFailure) as raised:
+            cardinality_drained({'details': dict(row, closed_generations=9)})
+        self.assertEqual(raised.exception.code, 'session_closed_generation_memory_grew')
