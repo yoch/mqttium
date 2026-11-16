@@ -33,6 +33,10 @@
 //!   operation:32 publication:32 delivery_index:u32 target:8 target_revision:8 packet_id:2
 //! kind 5, FinishDelivery:
 //!   the kind-4 fields, then claim_operation:32
+//! kind 6, ConsumeDelivery:
+//!   operation:32 publication:32 delivery_index:u32 target:8 target_revision:8
+//! kind 7, UpdateSubscriptions:
+//!   kind-3 header; each action is 0(remove), 1(grant0), 2(grant1), then topic
 //! ```
 
 use alloc::sync::Arc;
@@ -1003,6 +1007,47 @@ mod tests {
         };
         assert_eq!(admit.targets.as_slice(), &[target(11, 0), target(12, 1)]);
         assert_eq!(admit.topic.as_slice(), b"p1/example");
+    }
+    #[test]
+    fn qos0_canonical_consumption_has_no_identifier_and_grants_are_distinct() {
+        let (incarnation, epoch, owner) = scope();
+        let operation = OperationId::new(incarnation, epoch, owner, OperationSeq::new(3));
+        let consume = Recipe::ConsumeDelivery(ConsumeDelivery {
+            operation,
+            delivery: target(11, 0).delivery,
+            target: SessionId::new(11),
+            target_revision: Revision::new(1),
+        });
+        let bytes = encode(&consume);
+        assert_eq!(bytes.len(), 91);
+        assert_eq!(bytes[6], 6);
+        assert_eq!(Recipe::decode_canonical(&bytes, 16, 64).unwrap(), consume);
+        for len in 0..bytes.len() {
+            assert!(Recipe::decode_canonical(&bytes[..len], 16, 64).is_err());
+        }
+        let mut encodings = Vec::new();
+        for granted in [None, Some(Qos::AtMostOnce), Some(Qos::AtLeastOnce)] {
+            let recipe = Recipe::UpdateSubscriptions(UpdateSubscriptions {
+                operation,
+                session: SessionId::new(11),
+                session_revision: Revision::new(1),
+                route_revision: Revision::new(1),
+                changes: BoundedVec::from_slice(
+                    &[GrantedSubscriptionChange {
+                        topic: SharedBytes::copy_from(b"t", 64).unwrap(),
+                        granted,
+                    }],
+                    8,
+                )
+                .unwrap(),
+            });
+            let bytes = encode(&recipe);
+            assert_eq!(bytes[6], 7);
+            assert_eq!(Recipe::decode_canonical(&bytes, 16, 64).unwrap(), recipe);
+            encodings.push(bytes);
+        }
+        assert_ne!(encodings[0], encodings[1]);
+        assert_ne!(encodings[1], encodings[2]);
     }
 
     #[test]
