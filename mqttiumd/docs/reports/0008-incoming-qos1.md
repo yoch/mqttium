@@ -25,6 +25,16 @@ Final publication/check identities are kept in the PR description and CI
 artifacts' `source_head`, rather than relabeling an older run with a new SHA.
 The PR stays draft and unmerged. Proposed decisions stay proposed.
 
+The full CI at `9f997cda` received both product suites, models and proof, but
+stopped the contracts job because historical mutant M3 omitted the new
+EmitFrame.publish_order field and did not compile. Static patch applicability
+was insufficient. Its initializer is refreshed with `publish_order: None`;
+the premature-PUBREC mutation and expected assertion/reason are unchanged.
+The complete simulator and SQLite mutation loops were executed: all 5 and 11
+applicable mutants were rejected for their expected reasons. M3 now compiles
+and fails no_positive_ack_before_confirmed_commit for its premature PUBREC.
+The earlier compiler error is not a semantic detection.
+
 ## Lifecycle and contracts
 
 [Proposed ADR 0023](../decisions/0023-incoming-qos1.md) defines the occurrence,

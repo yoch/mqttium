@@ -62,12 +62,25 @@ retains its own strace; all 461 local retained files match SHA256SUMS.
 
 ## Publication and next action
 
-The final documentation/test-assertion integration must be published with
-expected-head protection against the already confirmed 530c5adf. Read back
-HEAD/diff/blobs and receive that SHA's CI, including fresh K1/K2b/K3, typed
-reads, K2a/WAL, models and proof; correct actionable failures before finishing.
+9f997cda881f3efa9375c3f731207f7e15786bae was published after expected-head
+checks against 530c5adf; all 34 changed blobs matched connector readback.
+Fresh local QoS 1/2 wrappers and the CI product job pass at that SHA. Models,
+proof, client CI/formal models and docs also pass. The contracts job stopped
+at historical mutant M3: its added EmitFrame initializer omitted publish_order.
+That compiler error is not a detection. Only the initializer/hunk count was
+refreshed, keeping mutation, verdict/assertion/reason unchanged. Both complete
+loops passed locally: all 5 simulator / 11 SQLite controls were rejected for
+their expected reasons, including M3's premature PUBREC before known commit.
+The product event artifacts were downloaded, ZIP hashes checked, all 1,133
+archived mqttiumd source blobs matched Git, and client source identity matched
+its 62 Python files. Broker and independent-client event streams have separate
+formats. Normal effective features and each run's own signal/wait witness pass.
+
+For the corrected publication, read back HEAD/diff/blobs and receive its CI,
+including fresh K1/K2b/K3, typed reads, K2a/WAL, models and proof; correct
+actionable failures before finishing. Do not report a skipped gate as passed.
 The PR description and CI artifacts record the immutable final head/checks.
-Do not transfer 530c5adf's local archive identity to a later run.
+Do not transfer an earlier archive identity to a later run.
 
 QoS 1 is a finite system reception, not newly qualified by the fixture oracle.
 See open-conditions and product-tcp for retained operational limits. Next:
