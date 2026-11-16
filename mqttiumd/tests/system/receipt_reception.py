@@ -516,6 +516,14 @@ def live_receipts(binary: Path, case: Path, terminal_commands: int = BUSINESS_CO
         require(ready["details"]["receipt_slots"] == HISTORICAL_RECEIPT_LIMIT, "receipt_budget_changed")
         result = {"criterion": "B-live", "status": "PASS", "ready": ready,
                   "normal_build_required": True, "qualification": "system-test-only"}
+        startup = broker.events()
+        result["startup_observations"] = [event for event in startup
+                                           if event["kind"] in ("sqlite_configuration", "receipt_policy", "ready")]
+        configurations = [event for event in startup if event["kind"] == "sqlite_configuration"]
+        require(len(configurations) == 1, "effective_sqlite_configuration_missing")
+        result["sqlite_configuration"] = configurations[0]
+        require(configurations[0]["details"]["kill_points"] is False,
+                "normal_measurement_contains_kill_instrumentation")
         result["held_before_cycles"] = held.prepare()
         async def bounded():
             async with asyncio.timeout(900):
