@@ -15,6 +15,9 @@ use crate::codec::{self, ErrorKind};
 pub const INPUT_SLOTS: usize = 4;
 pub const OUTPUT_SLOTS: usize = 4;
 pub const MAX_PACKET_BYTES: usize = 65_536;
+// Four queued writes, one active write and eight terminal receipts. Wire
+// progress is an independent bounded lane, not the core's receipt lane.
+const WIRE_PROGRESS_SLOTS: usize = OUTPUT_SLOTS + 1 + 8;
 const POLL: Duration = Duration::from_millis(20);
 const INPUT_WAIT: Duration = Duration::from_millis(100);
 const RESULT_WAIT: Duration = Duration::from_millis(100);
@@ -45,10 +48,20 @@ pub enum Written {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct WireProgress {
+    pub effect: EffectId,
+    pub connection: ConnectionKey,
+}
+
 #[derive(Clone)]
 struct Control {
     cancelled: Arc<AtomicBool>,
     terminal: Arc<Mutex<Option<&'static str>>>,
+    #[cfg(test)]
+    pause_progress: Arc<AtomicBool>,
+    #[cfg(test)]
+    progress_waiting: Arc<AtomicBool>,
 }
 
 impl Control {
@@ -76,6 +89,7 @@ pub struct Connection {
     pub incoming: Receiver<Incoming>,
     pub outgoing: SyncSender<Write>,
     pub written: Receiver<Written>,
+    pub wire_progress: Receiver<WireProgress>,
     stream: TcpStream,
     control: Control,
     reader: Option<JoinHandle<()>>,
@@ -95,9 +109,14 @@ pub fn spawn(stream: TcpStream) -> io::Result<Connection> {
     let (outgoing, output_rx) = mpsc::sync_channel(OUTPUT_SLOTS);
     // Four queued writes, one active write, and their terminal receipts fit.
     let (written_tx, written) = mpsc::sync_channel(8);
+    let (progress_tx, wire_progress) = mpsc::sync_channel(WIRE_PROGRESS_SLOTS);
     let control = Control {
         cancelled: Arc::new(AtomicBool::new(false)),
         terminal: Arc::new(Mutex::new(None)),
+        #[cfg(test)]
+        pause_progress: Arc::new(AtomicBool::new(false)),
+        #[cfg(test)]
+        progress_waiting: Arc::new(AtomicBool::new(false)),
     };
     let reader_control = control.clone();
     let reader = thread::Builder::new()
@@ -109,7 +128,13 @@ pub fn spawn(stream: TcpStream) -> io::Result<Connection> {
     let writer = match thread::Builder::new()
         .name("mqttiumd-socket-writer".into())
         .spawn(move || {
-            write_frames(output_stream, output_rx, written_tx, writer_control);
+            write_frames(
+                output_stream,
+                output_rx,
+                written_tx,
+                progress_tx,
+                writer_control,
+            );
         }) {
         Ok(writer) => writer,
         Err(error) => {
@@ -122,6 +147,7 @@ pub fn spawn(stream: TcpStream) -> io::Result<Connection> {
         incoming,
         outgoing,
         written,
+        wire_progress,
         stream,
         control,
         reader: Some(reader),
@@ -131,6 +157,15 @@ pub fn spawn(stream: TcpStream) -> io::Result<Connection> {
 }
 
 impl Connection {
+    #[cfg(test)]
+    pub fn pause_wire_progress(&self, pause: bool) {
+        self.control.pause_progress.store(pause, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn wire_progress_is_waiting(&self) -> bool {
+        self.control.progress_waiting.load(Ordering::Acquire)
+    }
     pub fn close(&self) {
         self.control.stop(&self.stream, "cancelled");
     }
@@ -337,6 +372,7 @@ fn write_frames(
     mut stream: TcpStream,
     receiver: Receiver<Write>,
     sender: SyncSender<Written>,
+    progress: SyncSender<WireProgress>,
     control: Control,
 ) {
     let code = loop {
@@ -364,6 +400,41 @@ fn write_frames(
                 break code;
             }
         };
+        if let Some((effect, connection)) = frame.correlation {
+            // This publication is deliberately separate from Written: the
+            // reactor may retain a core receipt while MQTT receive credit has
+            // already been returned on the wire. A preempted writer between
+            // write_one and this point is handled by bounded ingress deferral.
+            #[cfg(test)]
+            {
+                let start = Instant::now();
+                while control.pause_progress.load(Ordering::Acquire) && !control.is_cancelled() {
+                    control.progress_waiting.store(true, Ordering::Release);
+                    if start.elapsed() > Duration::from_secs(2) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                control.progress_waiting.store(false, Ordering::Release);
+            }
+            let deadline = Instant::now() + RESULT_WAIT;
+            let mut value = WireProgress { effect, connection };
+            loop {
+                match progress.try_send(value) {
+                    Ok(()) => break,
+                    Err(TrySendError::Full(returned))
+                        if Instant::now() < deadline && !control.is_cancelled() =>
+                    {
+                        value = returned;
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => {
+                        control.stop(&stream, "wire_progress_unavailable");
+                        return;
+                    }
+                }
+            }
+        }
         if !report(&sender, result) {
             break "write_result_queue_full";
         }

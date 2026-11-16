@@ -58,15 +58,23 @@ impl Window {
     /// releases its credit. The caller supplies a core-frozen serial, never
     /// one inferred later from the current use of the Packet Identifier.
     pub fn complete_frame(&mut self, id: u16, serial: Option<u64>, terminal: Terminal) -> bool {
-        if let Some(serial) = serial
-            && self.receiving.get(&id).is_some_and(|occurrence| {
-                occurrence.serial == serial && occurrence.qos == terminal.qos()
-            })
-        {
+        if self.can_complete_frame(id, serial, terminal) {
             self.receiving.remove(&id);
             return true;
         }
         false
+    }
+
+    pub fn can_complete_frame(&self, id: u16, serial: Option<u64>, terminal: Terminal) -> bool {
+        serial.is_some_and(|serial| {
+            self.receiving.get(&id).is_some_and(|occurrence| {
+                occurrence.serial == serial && occurrence.qos == terminal.qos()
+            })
+        })
+    }
+
+    pub fn contains(&self, id: u16) -> bool {
+        self.receiving.contains_key(&id)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

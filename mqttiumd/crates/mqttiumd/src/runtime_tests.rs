@@ -173,6 +173,7 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             ingress: 0,
             receiving: crate::receiving::Window::default(),
             closing: None,
+            deferred_publish: None,
         },
     );
     (generation, client)
@@ -594,6 +595,88 @@ fn a_new_identifier_after_received_puback_does_not_exceed_receive_maximum() {
                 .any(|p| p.kind == "PUBACK" && p.packet_id == Some(9))
         });
         assert_eq!(read_frame(&mut client), (0x40, vec![0, 9]));
+    });
+}
+
+#[test]
+fn a_received_puback_can_precede_publication_of_its_network_progress() {
+    with_runtime(128, |runtime, _| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"flow-new-id"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        seven_qos2(runtime, generation, &mut client);
+        // Pause only the private test seam between write_one success and the
+        // progress lane publication. The real socket write still completes.
+        until(runtime, |r| r.frames.is_empty());
+        runtime.peers[&generation].io.pause_wire_progress(true);
+        runtime.packet(generation, 0x32, publish_body(8)).unwrap();
+        until(runtime, |r| r.frames.values().any(|p| p.kind == "PUBACK"));
+        assert_eq!(read_frame(&mut client), (0x40, vec![0, 8]));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !runtime.peers[&generation].io.wire_progress_is_waiting() && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(runtime.peers[&generation].io.wire_progress_is_waiting());
+        let mut bytes = vec![0x32, 7];
+        bytes.extend_from_slice(&publish_body(9));
+        client.write_all(&bytes).unwrap();
+        let net::Incoming::Packet { first, body } = runtime.peers[&generation]
+            .io
+            .incoming
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+        else {
+            panic!("network PUBLISH");
+        };
+        runtime.packet(generation, first, body).unwrap();
+        assert!(
+            runtime.peers[&generation].closing.is_none(),
+            "a preempted completion publisher is not a Receive Maximum violation"
+        );
+        assert!(
+            runtime.peers[&generation].deferred_publish.is_some(),
+            "the input remains bounded and unapplied until progress arrives"
+        );
+        runtime.peers[&generation].io.pause_wire_progress(false);
+        until(runtime, |r| {
+            r.frames
+                .values()
+                .any(|p| p.kind == "PUBACK" && p.packet_id == Some(9))
+        });
+        assert_eq!(read_frame(&mut client), (0x40, vec![0, 9]));
+        assert!(runtime.peers[&generation].deferred_publish.is_none());
+    });
+}
+
+#[test]
+fn eight_live_qos2_exchanges_still_refuse_a_genuine_ninth_identifier() {
+    with_runtime(128, |runtime, _| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"flow-new-id"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        seven_qos2(runtime, generation, &mut client);
+        let session = runtime.sessions[b"flow-new-id".as_slice()].id;
+        runtime.packet(generation, 0x34, publish_body(8)).unwrap();
+        until(runtime, |r| {
+            r.owner
+                .exchange(session, InboundPacketId::new(8).unwrap())
+                .is_some_and(|(_, phase)| phase == ExchangePhase::AwaitPubrel)
+        });
+        assert_eq!(read_frame(&mut client), (0x50, vec![0, 8]));
+        runtime.packet(generation, 0x32, publish_body(9)).unwrap();
+        assert_eq!(
+            runtime.peers[&generation].closing.map(|v| v.0),
+            Some("receive_maximum")
+        );
+        assert!(runtime.peers[&generation].deferred_publish.is_none());
+        assert_eq!(read_frame(&mut client), (0xe0, vec![0x93, 0]));
     });
 }
 

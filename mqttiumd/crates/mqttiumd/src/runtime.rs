@@ -68,6 +68,12 @@ struct Peer {
     ingress: u64,
     receiving: crate::receiving::Window,
     closing: Option<(&'static str, Instant)>,
+    deferred_publish: Option<DeferredPublish>,
+}
+struct DeferredPublish {
+    packet: InboundPacket,
+    ingress_order: u64,
+    since: Instant,
 }
 struct PendingFrame {
     connection: ConnectionKey,
@@ -75,6 +81,7 @@ struct PendingFrame {
     packet_id: Option<u16>,
     receive_serial: Option<u64>,
     terminal: Option<Terminal>,
+    wire_released: bool,
 }
 struct PendingSession {
     connection: ConnectionGeneration,
@@ -363,6 +370,7 @@ impl Runtime<'_> {
         if !self.admit_generation(generation)? {
             return Ok(());
         }
+        self.wire_progress(generation)?;
         let decoded = match codec::decode(first, &body, BOUNDS) {
             Ok(v) => v,
             Err(error) => {
@@ -428,6 +436,35 @@ impl Runtime<'_> {
                         .publish_qos(id.get(), ingress_order, *qos)
                         .is_err()
                 {
+                    let pending_terminal = self.frames.values().any(|frame| {
+                        frame.connection.generation == generation
+                            && frame
+                                .packet_id
+                                .zip(frame.terminal)
+                                .is_some_and(|(id, terminal)| {
+                                    p.receiving.can_complete_frame(
+                                        id,
+                                        frame.receive_serial,
+                                        terminal,
+                                    )
+                                })
+                    });
+                    if pending_terminal {
+                        if p.deferred_publish.is_some() {
+                            return Err(Failure::plain("deferred_publish_overlap"));
+                        }
+                        // A successful write can become visible to the client
+                        // just before the network thread publishes its progress.
+                        // Keep this one bounded input instead of declaring a
+                        // Receive Maximum violation from a stale window.
+                        p.deferred_publish = Some(DeferredPublish {
+                            packet,
+                            ingress_order,
+                            since: Instant::now(),
+                        });
+                        self.events.emit("publish_waiting_wire",json!({"connection":generation.get().to_string(),"details":{"publish_order":ingress_order.to_string()}})).map_err(event_failure)?;
+                        return Ok(());
+                    }
                     let bytes = vec![0xe0, 2, 0x93, 0];
                     if bytes.len() <= p.max_packet
                         && p.io
@@ -476,9 +513,13 @@ impl Runtime<'_> {
     fn connections(&mut self) -> Result<(), Failure> {
         let keys: Vec<_> = self.peers.keys().copied().collect();
         for generation in keys {
+            self.wire_progress(generation)?;
+            self.retry_deferred_publish(generation)?;
             for _ in 0..4 {
                 let incoming = match self.peers.get(&generation) {
-                    Some(p) if p.pending || p.closing.is_some() => break,
+                    Some(p) if p.pending || p.closing.is_some() || p.deferred_publish.is_some() => {
+                        break;
+                    }
                     Some(p) => p.io.incoming.try_recv(),
                     None => break,
                 };
@@ -595,6 +636,73 @@ impl Runtime<'_> {
         }
         Ok(())
     }
+    /// Network completion and core receipt consumption have separate lanes.
+    /// No lock is held across I/O. Scope/occurrence/QoS are checked for every
+    /// early receive-credit release; stale progress is never inferred by PI.
+    fn wire_progress(&mut self, generation: ConnectionGeneration) -> Result<(), Failure> {
+        let Some(peer) = self.peers.get_mut(&generation) else {
+            return Ok(());
+        };
+        for _ in 0..net::OUTPUT_SLOTS + 1 + 8 {
+            let progress = match peer.io.wire_progress.try_recv() {
+                Ok(progress) => progress,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            // Written may already have consumed a completion between two
+            // polls of these independent lanes. Its late copy is harmless.
+            let Some(frame) = self.frames.get_mut(&progress.effect) else {
+                continue;
+            };
+            if frame.connection != progress.connection
+                || progress.connection.generation != generation
+            {
+                return Err(Failure::plain("wire_progress_connection_mismatch"));
+            }
+            if let Some((id, terminal)) = frame.packet_id.zip(frame.terminal) {
+                let released = peer
+                    .receiving
+                    .complete_frame(id, frame.receive_serial, terminal);
+                frame.wire_released |= released;
+                self.events.emit("wire_receive_credit",json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(progress.effect),"packet_kind":frame.kind,"packet_id":id,"publish_order":frame.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn retry_deferred_publish(&mut self, generation: ConnectionGeneration) -> Result<(), Failure> {
+        let Some(peer) = self.peers.get_mut(&generation) else {
+            return Ok(());
+        };
+        let Some(deferred) = peer.deferred_publish.as_ref() else {
+            return Ok(());
+        };
+        let InboundPacket::Publish {
+            packet_id: Some(id),
+            qos,
+            ..
+        } = &deferred.packet
+        else {
+            return Err(Failure::plain("deferred_publish_kind"));
+        };
+        if peer
+            .receiving
+            .publish_qos(id.get(), deferred.ingress_order, *qos)
+            .is_ok()
+        {
+            let deferred = peer
+                .deferred_publish
+                .take()
+                .ok_or_else(|| Failure::plain("deferred_publish_missing"))?;
+            self.queue(Input::Packet {
+                connection: generation,
+                ingress_order: deferred.ingress_order,
+                packet: deferred.packet,
+            })?;
+        } else if deferred.since.elapsed() > Duration::from_millis(500) {
+            self.close(generation, "wire_progress_deadline")?;
+        }
+        Ok(())
+    }
     /// A socket write receipt is local progress, not evidence of peer receipt.
     fn written_complete(
         &mut self,
@@ -618,9 +726,13 @@ impl Runtime<'_> {
             && let Some(p) = self.peers.get_mut(&generation)
             && let Some(id) = id
         {
-            let released = p
+            let released_now = p
                 .receiving
                 .complete_frame(id, pending.receive_serial, terminal);
+            // If no newer occurrence occupies the identifier, this receipt
+            // confirms its own already published wire completion. A newer
+            // occurrence still meets the exact guards and is left untouched.
+            let released = released_now || (pending.wire_released && !p.receiving.contains(id));
             #[cfg(feature = "test-hooks")]
             let released = if MUTANT_STALE_RECEIPT && !released {
                 p.receiving.complete_current(id)
@@ -843,6 +955,7 @@ impl EffectSink for Sink<'_> {
                                 packet_id,
                                 receive_serial,
                                 terminal,
+                                wire_released: false,
                             },
                         );
                         let _ = effect.into_parts();
@@ -1135,6 +1248,7 @@ fn run_inner(
                                 ingress: 0,
                                 receiving: crate::receiving::Window::default(),
                                 closing: None,
+                                deferred_publish: None,
                             },
                         );
                         events.emit("connection_opened",json!({"connection":runtime.generation.get().to_string(),"details":{"send_buffer_bytes":sendbuf}})).map_err(event_failure)?;
