@@ -1522,7 +1522,9 @@ impl Owner {
                     })));
                 }
                 let (slot, d) = delivery.ok_or(IMPOSSIBLE)?;
-                if let Some(connection) = self.connection_of(d.target) {
+                if let Some(connection) = self.connection_of(d.target)
+                    && !matches!(d.phase,Phase::ConsumePending(_,key) if key.generation!=connection)
+                {
                     draft.close(connection, CloseReason::CapacityExceeded)?;
                 }
                 Ok(Some(changed(Change::Refused {
@@ -1906,7 +1908,9 @@ impl Owner {
                     .get(slot)
                     .ok_or(stale)?
                     .clone();
-                if let Some(known) = d.claim_result {
+                if let Some(known) = d.claim_result
+                    && known.operation != finished.operation
+                {
                     remember(&mut self.finished, known)?;
                 }
                 remember(&mut self.finished, finished)?;
