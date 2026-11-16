@@ -238,6 +238,100 @@ fn publish_body(packet_id: u16) -> Vec<u8> {
     vec![0, 1, b't', high, low, 0, b'v']
 }
 
+fn event_turn_without_scan(runtime: &mut Runtime<'_>) {
+    runtime.writer_results().unwrap();
+    runtime.connections().unwrap();
+    runtime.drain_inputs().unwrap();
+    runtime.dispatch().unwrap();
+}
+
+fn until_without_scan(runtime: &mut Runtime<'_>, condition: impl Fn(&Runtime<'_>) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !condition(runtime) && Instant::now() < deadline {
+        event_turn_without_scan(runtime);
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(condition(runtime), "ready backlog made no autonomous progress with periodic discovery disabled");
+}
+
+fn queued_publications(directory: &Path, generation: ConnectionGeneration) -> usize {
+    std::fs::read_to_string(directory.join("events.jsonl")).unwrap().lines().filter(|line| {
+        let event:serde_json::Value=serde_json::from_str(line).unwrap();
+        event["kind"]=="frame_queued" && event["connection"]==generation.get().to_string() && event["details"]["packet_kind"]=="PUBLISH"
+    }).count()
+}
+
+#[test]
+fn twelve_offline_deliveries_drain_without_a_discovery_tick_per_message_or_page() {
+    with_runtime(128, |runtime,directory| {
+        let (first,mut old)=peer(runtime);
+        runtime.connect(first,connect_packet(b"ready-backlog")).unwrap();
+        until(runtime,|r|r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut old).0,0x20);
+        runtime.packet(first,0x82,vec![0,1,0,0,1,b't',1]).unwrap();
+        until(runtime,|r|r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut old).0,0x90);
+        runtime.close(first,"test_offline").unwrap();
+        runtime.drain_inputs().unwrap();
+        let (source,mut publisher)=peer(runtime);
+        runtime.connect(source,connect_packet(b"ready-source")).unwrap();
+        until(runtime,|r|r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut publisher).0,0x20);
+        for id in 1..=12 {
+            runtime.packet(source,0x32,publish_body(id)).unwrap();
+            until(runtime,|r|r.inputs.is_empty() && r.inflight.is_empty());
+            assert_eq!(read_frame(&mut publisher).0,0x40);
+        }
+        let before=mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert_eq!(before.obligations.len(),12);
+        assert_eq!(before.outbound.len(),0);
+        let (target,mut subscriber)=peer(runtime);
+        runtime.connect(target,connect_packet(b"ready-backlog")).unwrap();
+        // No discover_work or synthetic clock input below: only real store,
+        // socket and bounded owner turns may rearm useful work.
+        until_without_scan(runtime,|_|queued_publications(directory,target)==8);
+        assert_eq!(read_frame(&mut subscriber).0,0x20);
+        let mut acknowledged=Vec::new();
+        for _ in 0..8 {
+            let (first,body)=read_frame(&mut subscriber);assert_eq!(first,0x32);
+            acknowledged.extend_from_slice(&[0x40,2,body[3],body[4]]);
+        }
+        until_without_scan(runtime,|r|r.inputs.is_empty() && r.inflight.is_empty() && r.frames.is_empty());
+        let revision=runtime.owner.revision();
+        for _ in 0..256 {event_turn_without_scan(runtime);}
+        assert_eq!(runtime.owner.revision(),revision,"a full outgoing window must not rearm a busy loop");
+        runtime.packet(source,0xc0,vec![]).unwrap();
+        event_turn_without_scan(runtime);
+        assert_eq!(read_frame(&mut publisher).0,0xd0,"controls progress beside the full destination");
+        subscriber.write_all(&acknowledged).unwrap();
+        until_without_scan(runtime,|_|queued_publications(directory,target)==12);
+        for _ in 0..4 {
+            let (first,body)=read_frame(&mut subscriber);assert_eq!(first,0x32);
+            subscriber.write_all(&[0x40,2,body[3],body[4]]).unwrap();
+        }
+        until_without_scan(runtime,|r|r.inputs.is_empty() && r.inflight.is_empty() && r.work_reads.is_empty() && mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap().obligations.is_empty());
+        let after=mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert_eq!(after.operations.values().filter(|op|matches!(op.decision,mqttiumd_store_api::Decision::Committed(CommitFacts::PublicationAdmitted{..}))).count(),12,"draining introduces no new admission");
+    });
+}
+
+#[test]
+fn empty_ready_work_settles_and_wakes_are_deduplicated() {
+    with_runtime(128,|runtime,_| {
+        let (generation,mut client)=peer(runtime);
+        runtime.connect(generation,connect_packet(b"empty-ready")).unwrap();
+        until_without_scan(runtime,|r|r.session_requests.is_empty() && r.inputs.is_empty() && r.work_reads.is_empty() && r.frames.is_empty());
+        assert_eq!(read_frame(&mut client).0,0x20);
+        let session=runtime.sessions[b"empty-ready".as_slice()].id;
+        for _ in 0..1024 {runtime.queue_work(session);}
+        assert_eq!(runtime.inputs.iter().filter(|i|matches!(i,Input::WorkAvailable{session:s} if *s==session)).count(),1);
+        until_without_scan(runtime,|r|r.inputs.is_empty() && r.work_reads.is_empty());
+        let revision=runtime.owner.revision();
+        for _ in 0..256 {event_turn_without_scan(runtime);}
+        assert_eq!(runtime.owner.revision(),revision,"an empty page must not rearm a busy loop");
+    });
+}
+
 #[test]
 fn recipient_puback_preceding_disconnect_is_applied_before_generation_closes() {
     with_runtime(128, |runtime, directory| {
