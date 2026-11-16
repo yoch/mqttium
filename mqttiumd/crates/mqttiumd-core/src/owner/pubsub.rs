@@ -59,6 +59,18 @@ pub(super) struct Delivery {
 }
 
 impl Delivery {
+    fn waiting_to_send(&self, generation: ConnectionGeneration) -> bool {
+        match self.phase {
+            Phase::FinishPending(_) => false,
+            Phase::AwaitPuback => {
+                self.window != Some(generation)
+                    || self
+                        .frame
+                        .is_none_or(|(_, key)| key.generation != generation)
+            }
+            Phase::Queued | Phase::ClaimPending(_) => true,
+        }
+    }
     fn in_flight(&self) -> Option<InFlight> {
         match self.phase {
             Phase::ClaimPending(f) | Phase::FinishPending(f) => Some(f),
@@ -630,20 +642,26 @@ impl Owner {
         };
         let settings = self.pubsub.connections.as_slice()[connection];
         let room = self.pubsub.active(generation) < usize::from(settings.receive_maximum);
-        let ready = self
+        let next = self
             .pubsub
             .deliveries
             .as_slice()
             .iter()
             .enumerate()
-            .filter(|(_, d)| {
-                d.target == session
-                    && d.phase == Phase::AwaitPuback
-                    && d.payload.is_some()
-                    && d.window != Some(generation)
-            })
+            .filter(|(_, d)| d.target == session && d.waiting_to_send(generation))
             .min_by_key(|(_, d)| d.id);
-        if room && let Some((slot, d)) = ready {
+        if let Some((_, d)) = next
+            && matches!(d.phase, Phase::ClaimPending(_))
+        {
+            // A lost claim result must be reconciled before a later
+            // publication can become eligible on this destination.
+            return Ok(super::Change::Nothing);
+        }
+        if let Some((slot, d)) = next
+            && d.phase == Phase::AwaitPuback
+            && d.payload.is_some()
+            && (room || d.window == Some(generation))
+        {
             let emission = self.plan_delivery_emit(d, draft)?;
             if let Some((effect, connection)) = emission {
                 return Ok(changed(Change::Emit {
@@ -656,15 +674,11 @@ impl Owner {
                 return Ok(super::Change::Nothing);
             }
         }
-        let queued = self
-            .pubsub
-            .deliveries
-            .as_slice()
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| d.target == session && d.phase == Phase::Queued && d.payload.is_some())
-            .min_by_key(|(_, d)| d.id);
-        if room && let Some((slot, d)) = queued {
+        if room
+            && let Some((slot, d)) = next
+            && d.phase == Phase::Queued
+            && d.payload.is_some()
+        {
             let mut raw = settings.next_packet;
             while raw <= u32::from(u16::MAX)
                 && self.pubsub.deliveries.as_slice().iter().any(|d| {
@@ -848,6 +862,15 @@ impl Owner {
         if delivery.window != Some(generation)
             && self.pubsub.active(generation) >= usize::from(settings.receive_maximum)
         {
+            return Ok(None);
+        }
+        if self.pubsub.deliveries.as_slice().iter().any(|earlier| {
+            earlier.target == delivery.target
+                && earlier.id < delivery.id
+                && earlier.waiting_to_send(generation)
+        }) {
+            // This also protects a claim result delivered after takeover:
+            // restored earlier exchanges are replayed before newer ones.
             return Ok(None);
         }
         let (Some(topic), Some(payload), Some(claim)) =

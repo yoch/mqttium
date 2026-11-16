@@ -85,12 +85,14 @@ pub struct OwnerConfig {
     /// Route targets the owner can hold.
     pub max_routes: NonZeroU32,
     /// Inbound admissions/exchanges and outstanding QoS 1 acknowledgements
-    /// the owner can hold at a time, across both QoS levels.
+    /// the owner can hold at a time, across both QoS levels. The product
+    /// outgoing-delivery table has this same bound independently.
     pub max_exchanges: NonZeroU32,
     /// The account charged for the exchanges this owner holds.
     pub account: AccountId,
     /// Payload bytes the exchanges of this owner may have brought in and
-    /// not yet finished with.
+    /// not yet finished with. Loaded outgoing payloads have this same
+    /// bound independently of the incoming leases.
     pub payload_bytes: PayloadBytes,
     /// The delay after which an unanswered operation is resolved (ADR
     /// 0001). The timer adapter counts it from its acceptance of the
@@ -949,7 +951,8 @@ impl Owner {
         }
     }
 
-    /// The work an input costs: one unit, and for a recovery page a bound
+    /// The work an input costs: one unit, plus bounded pub/sub table work
+    /// when the product profile is enabled. For a recovery page, a bound
     /// of the comparisons its checks make. A fact is compared with the
     /// table it joins: a route with the routes, a session with the
     /// sessions, an exchange with the sessions and the exchanges. The page
