@@ -49,6 +49,7 @@ pub struct Error {
     pub kind: ErrorKind,
     pub code: &'static str,
     pub reason: u8,
+    peer_maximum: Option<u32>,
 }
 
 impl Error {
@@ -63,7 +64,7 @@ impl Error {
     }
     /// Peer response limit established by a fully validated CONNECT.
     pub const fn peer_maximum(self) -> Option<u32> {
-        None
+        self.peer_maximum
     }
 }
 
@@ -80,6 +81,7 @@ const fn malformed(code: &'static str) -> Error {
         kind: ErrorKind::Malformed,
         code,
         reason: 0x81,
+        peer_maximum: None,
     }
 }
 
@@ -88,6 +90,7 @@ const fn protocol(code: &'static str) -> Error {
         kind: ErrorKind::Protocol,
         code,
         reason: 0x82,
+        peer_maximum: None,
     }
 }
 
@@ -96,6 +99,7 @@ const fn unsupported(code: &'static str) -> Error {
         kind: ErrorKind::Unsupported,
         code,
         reason: 0x83,
+        peer_maximum: None,
     }
 }
 
@@ -104,6 +108,7 @@ const fn oversized(code: &'static str) -> Error {
         kind: ErrorKind::Oversized,
         code,
         reason: 0x95,
+        peer_maximum: None,
     }
 }
 
@@ -475,17 +480,26 @@ fn client_connect(body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
         input.binary()?;
     }
     input.end()?;
+    // These response limits are trusted only after every field has been
+    // validated. A malformed or truncated CONNECT supplies no such context.
+    let peer_maximum = Some(props.max_packet.unwrap_or(u32::MAX));
     if client_id.is_empty() {
         return Err(Error {
             reason: 0x85,
+            peer_maximum,
             ..unsupported("ExplicitClientIdRequired")
         });
     }
     if flags != 0 || props.expiry != Some(u32::MAX) || props.unsupported {
-        return Err(unsupported("ConnectOutsideProfile"));
+        return Err(Error {
+            peer_maximum,
+            ..unsupported("ConnectOutsideProfile")
+        });
     }
-    let client_id = SharedBytes::copy_from(client_id, bounds.max_client_id)
-        .map_err(|_| oversized("ClientIdTooLarge"))?;
+    let client_id = SharedBytes::copy_from(client_id, bounds.max_client_id).map_err(|_| Error {
+        peer_maximum,
+        ..oversized("ClientIdTooLarge")
+    })?;
     Ok(Packet::Connect(Connect {
         client_id,
         keep_alive,
@@ -1014,6 +1028,7 @@ mod tests {
             kind: ErrorKind::Unsupported,
             code: "UnsupportedProtocolVersion",
             reason: 0x84,
+            peer_maximum: None,
         };
         assert_eq!(refusal(version, true), [0x20, 3, 0, 0x84, 0]);
         assert_eq!(refusal(version, false), [0xe0, 2, 0x83, 0]);
