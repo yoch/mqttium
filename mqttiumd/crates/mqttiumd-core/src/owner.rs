@@ -495,7 +495,10 @@ struct Effects {
 #[derive(Debug)]
 struct Plan {
     stamp: PlanStamp,
+    /// The whole transition budget, including a bounded apply-time scan.
     work: WorkUnits,
+    /// Work already spent if the final Outbox reservation refuses the plan.
+    planned_work: WorkUnits,
     /// The counters after the identities of the plan were drawn.
     counters: Counters,
     change: Change,
@@ -909,13 +912,16 @@ impl Owner {
             }
         };
         let work_used = plan.work;
+        let planned_work = plan.planned_work;
         // The last acquisition, and the only one a plan cannot check: one
         // reservation for all the slots of the plan.
         let reservation = match NonZeroUsize::new(plan.effects.count) {
             None => None,
             Some(slots) => match self.outbox.reserve(slots) {
                 Ok(key) => Some(key),
-                Err(refusal) => return StepOutcome::reservation_refused(input, refusal, work_used),
+                Err(refusal) => {
+                    return StepOutcome::reservation_refused(input, refusal, planned_work);
+                }
             },
         };
         match self.apply(plan, input, reservation) {
@@ -991,18 +997,45 @@ impl Owner {
                 self.plan_change(input, &mut draft)
             });
         match planned {
-            Ok(change) => Ok(Plan {
-                stamp: PlanStamp {
-                    owner: self.id,
-                    state_revision: self.revision,
-                },
-                work,
-                counters: draft.counters,
-                change,
-                effects: draft.effects,
-                progress: draft.progress,
-                closed: draft.closed,
-            }),
+            Ok(change) => {
+                // Once the plan identifies a closed generation, its
+                // bounded ACK cleanup is charged before any mutation or
+                // effect reservation. One inspection and two constant-time
+                // removals per possible slot, plus the binding search.
+                let cleanup = if draft.closed.is_some() {
+                    capacity_of(self.slots.capacity())
+                        .saturating_mul(3)
+                        .saturating_add(capacity_of(self.sessions.capacity()))
+                } else {
+                    0
+                };
+                let total = WorkUnits::new(work.get().saturating_add(cleanup));
+                if let Some(missing) = total.checked_sub(grant.work_limit)
+                    && missing > WorkUnits::ZERO
+                {
+                    return Err(Refusal {
+                        stop: Stop::Need(CapacityNeed {
+                            resource: Resource::Work,
+                            amount: missing.get(),
+                            wake: WakeCondition::TurnGranted,
+                        }),
+                        work_used: work,
+                    });
+                }
+                Ok(Plan {
+                    stamp: PlanStamp {
+                        owner: self.id,
+                        state_revision: self.revision,
+                    },
+                    work: total,
+                    planned_work: work,
+                    counters: draft.counters,
+                    change,
+                    effects: draft.effects,
+                    progress: draft.progress,
+                    closed: draft.closed,
+                })
+            }
             Err(stop) => Err(Refusal {
                 stop,
                 work_used: work,
@@ -3970,6 +4003,449 @@ mod tests {
             1,
             "a replay cannot get a new identity to erase uncertainty"
         );
+    }
+
+    fn qos1_publish(raw: u16, order: u64, dup: bool) -> Input {
+        let Input::Packet {
+            connection,
+            mut packet,
+            ..
+        } = publish_with(CONN, raw, Qos::AtLeastOnce, b"same")
+        else {
+            panic!("a packet")
+        };
+        let InboundPacket::Publish { dup: value, .. } = &mut packet else {
+            panic!("a PUBLISH")
+        };
+        *value = dup;
+        Input::Packet {
+            connection,
+            ingress_order: order,
+            packet,
+        }
+    }
+
+    fn frame_progress(frame: &(EffectId, Effect), progress: FrameProgress) -> Input {
+        let Effect::EmitFrame { connection, .. } = frame.1 else {
+            panic!("a frame")
+        };
+        Input::FrameResult {
+            effect: frame.0,
+            connection,
+            progress,
+        }
+    }
+
+    fn written(frame: &(EffectId, Effect)) -> Input {
+        frame_progress(
+            frame,
+            FrameProgress::Written {
+                confirmed: 4,
+                total: 4,
+            },
+        )
+    }
+
+    fn qos1_commit(world: &mut World, flight: &Flight, order: u64) -> (EffectId, Effect) {
+        world.applied(committed(flight));
+        let mut effects = world.drain();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            effects[0].1,
+            Effect::EmitFrame {
+                connection: ConnectionKey {
+                    session: SessionId::new(PRODUCER),
+                    generation: ConnectionGeneration::new(CONN),
+                },
+                frame: OutboundFrame::Puback {
+                    packet_id: packet_id(7),
+                    reason: PubackReason::Success
+                },
+                publish_order: Some(order),
+            }
+        );
+        effects.remove(0)
+    }
+
+    #[test]
+    fn qos1_reused_identifier_precedes_the_old_puback_write_receipt() {
+        let mut world = World::connected();
+        let first = world.submit(qos1_publish(7, 11, false));
+        let old_ack = qos1_commit(&mut world, &first, 11);
+        assert_eq!(used(&world), (4, 1));
+        assert_eq!(
+            world.phase(7),
+            None,
+            "an ACK-pending record no longer excludes reuse"
+        );
+
+        // The client has received the first PUBACK; the adapter's write
+        // receipt is deliberately withheld while the new PUBLISH arrives.
+        let second = world.submit(qos1_publish(7, 12, true));
+        assert_ne!(first.operation, second.operation);
+        assert_ne!(
+            first.facts, second.facts,
+            "equal bytes and DUP still form a new publication"
+        );
+        assert_eq!(used(&world), (8, 2));
+        world.applied(written(&old_ack));
+        assert_eq!(
+            used(&world),
+            (4, 1),
+            "only the old occurrence released its lease"
+        );
+        assert_eq!(world.in_flight(7).operation, second.operation);
+        absorbed(&mut world, written(&old_ack));
+        let new_ack = qos1_commit(&mut world, &second, 12);
+        assert_ne!(old_ack.0, new_ack.0);
+        absorbed(&mut world, written(&old_ack));
+        assert_eq!(used(&world), (4, 1));
+        world.applied(written(&new_ack));
+        assert_eq!(used(&world), (0, 0));
+        assert!(world.owner.slots.is_empty());
+    }
+
+    #[test]
+    fn qos1_complete_write_releases_once_partial_or_wrong_receipt_never_does() {
+        let mut world = World::connected();
+        let admission = world.submit(qos1_publish(7, 1, false));
+        let ack = qos1_commit(&mut world, &admission, 1);
+        absorbed(
+            &mut world,
+            frame_progress(
+                &ack,
+                FrameProgress::Written {
+                    confirmed: 1,
+                    total: 4,
+                },
+            ),
+        );
+        let mut wrong = written(&ack);
+        if let Input::FrameResult { effect, .. } = &mut wrong {
+            *effect = admission.effect; // An issued Persist is not this frame.
+        }
+        absorbed(&mut world, wrong);
+        let mut wrong = written(&ack);
+        if let Input::FrameResult { connection, .. } = &mut wrong {
+            connection.generation = ConnectionGeneration::new(11);
+        }
+        absorbed(&mut world, wrong);
+        assert_eq!(used(&world), (4, 1));
+        world.applied(written(&ack));
+        assert_eq!(used(&world), (0, 0));
+        absorbed(&mut world, written(&ack));
+        every_result_is_absorbed(&mut world, &admission, true);
+        faulted(
+            &mut world,
+            rejected(&admission),
+            CoreFault::ContradictoryOutcome {
+                operation: admission.operation,
+            },
+        );
+    }
+
+    #[test]
+    fn qos1_refusal_uses_a_puback_reason_and_retains_its_credit_until_terminal() {
+        for (rejection, reason) in [
+            (
+                RejectReason::CapacityExceeded(Resource::ReceiptSlots),
+                PubackReason::QuotaExceeded,
+            ),
+            (
+                RejectReason::Fenced,
+                PubackReason::ImplementationSpecificError,
+            ),
+        ] {
+            let mut world = World::connected();
+            let admission = world.submit(qos1_publish(7, 1, false));
+            world.applied(result(&admission, StoreOutcome::RejectedCertain(rejection)));
+            let effects = world.drain();
+            assert_eq!(effects.len(), 1);
+            assert_eq!(
+                effects[0].1,
+                Effect::EmitFrame {
+                    connection: ConnectionKey {
+                        session: SessionId::new(PRODUCER),
+                        generation: ConnectionGeneration::new(CONN)
+                    },
+                    frame: OutboundFrame::Puback {
+                        packet_id: packet_id(7),
+                        reason
+                    },
+                    publish_order: Some(1),
+                }
+            );
+            assert_eq!(used(&world), (4, 1));
+            world.applied(written(&effects[0]));
+            assert_eq!(used(&world), (0, 0));
+            let next = world.submit(qos1_publish(7, 2, true));
+            assert_ne!(admission.operation, next.operation);
+        }
+    }
+
+    #[test]
+    fn qos1_ack_slots_are_bounded_and_a_matching_receipt_reclaims_exactly_one() {
+        let mut world = World::connected();
+        let first = world.submit(qos1_publish(7, 1, false));
+        let first_ack = qos1_commit(&mut world, &first, 1);
+        let second = world.submit(qos1_publish(7, 2, false));
+        let second_ack = qos1_commit(&mut world, &second, 2);
+        let before = world.snapshot();
+        assert!(matches!(
+            world.step(qos1_publish(7, 3, false)),
+            StepOutcome::NeedCapacity { .. }
+        ));
+        assert_eq!(world.snapshot(), before);
+        world.applied(written(&first_ack));
+        assert_eq!(used(&world), (4, 1));
+        let third = world.submit(qos1_publish(7, 3, false));
+        assert_ne!(second.operation, third.operation);
+        absorbed(&mut world, written(&first_ack));
+        assert_eq!(used(&world), (8, 2));
+        world.applied(written(&second_ack));
+        assert_eq!(used(&world), (4, 1));
+        assert_eq!(world.in_flight(7).operation, third.operation);
+    }
+
+    #[test]
+    fn qos1_closed_generation_finishes_unaccepted_ack_but_keeps_unknown_admission() {
+        let mut world = World::connected();
+        let first = world.submit(qos1_publish(7, 1, false));
+        world.applied(committed(&first)); // Leave PUBACK retained in Outbox.
+        let retained: Vec<_> = world.held().pending().map(OwnedEffect::id).collect();
+        world.applied(Input::ConnectionClosed {
+            connection: ConnectionGeneration::new(CONN),
+        });
+        assert_eq!(used(&world), (0, 0));
+        assert!(world.owner.slots.is_empty());
+        assert_eq!(
+            world
+                .held()
+                .pending()
+                .map(OwnedEffect::id)
+                .collect::<Vec<_>>(),
+            retained,
+            "closure does not discard Outbox effects"
+        );
+        let old = world.drain().remove(0);
+        absorbed(&mut world, written(&old));
+        every_result_is_absorbed(&mut world, &first, true);
+
+        let mut world = World::connected();
+        let unknown_admission = world.submit(qos1_publish(7, 1, false));
+        world.applied(Input::ConnectionClosed {
+            connection: ConnectionGeneration::new(CONN),
+        });
+        assert_eq!(used(&world), (4, 1));
+        assert_eq!(world.in_flight(7).operation, unknown_admission.operation);
+        assert!(world.sent(committed(&unknown_admission)).is_empty());
+        assert_eq!(
+            used(&world),
+            (0, 0),
+            "late commit reconciled without emitting on a closed generation"
+        );
+        every_result_is_absorbed(&mut world, &unknown_admission, true);
+    }
+
+    #[test]
+    fn qos1_takeover_releases_old_ack_but_not_a_new_generation_occurrence() {
+        let mut world = World::connected();
+        let first = world.submit(qos1_publish(7, 1, false));
+        let old_ack = qos1_commit(&mut world, &first, 1);
+        assert_eq!(
+            world.sent(connect(11, b"p1-producer")),
+            ["CloseConnection", "EmitConnack"]
+        );
+        assert_eq!(used(&world), (0, 0));
+        let second = world.submit(publish_with(11, 7, Qos::AtLeastOnce, b"same"));
+        assert_ne!(first.operation, second.operation);
+        absorbed(&mut world, written(&old_ack));
+        assert_eq!(world.in_flight(7).operation, second.operation);
+        assert_eq!(used(&world), (4, 1));
+    }
+
+    #[test]
+    fn qos1_pending_admission_follows_a_replayed_publish_on_the_new_generation() {
+        let mut world = World::connected();
+        let first = world.submit(qos1_publish(7, 1, false));
+        assert_eq!(
+            world.sent(connect(11, b"p1-producer")),
+            ["CloseConnection", "EmitConnack"]
+        );
+        assert!(
+            world
+                .sent(publish_with(11, 7, Qos::AtLeastOnce, b"same"))
+                .is_empty()
+        );
+        assert_eq!(world.in_flight(7).operation, first.operation);
+        world.applied(committed(&first));
+        let ack = world.drain().remove(0);
+        assert_eq!(
+            ack.1,
+            Effect::EmitFrame {
+                connection: ConnectionKey {
+                    session: SessionId::new(PRODUCER),
+                    generation: ConnectionGeneration::new(11)
+                },
+                frame: OutboundFrame::Puback {
+                    packet_id: packet_id(7),
+                    reason: PubackReason::Success
+                },
+                publish_order: Some(0),
+            }
+        );
+        world.applied(written(&ack));
+        assert_eq!(used(&world), (0, 0));
+    }
+
+    #[test]
+    fn qos1_and_qos2_share_active_packet_identifiers_but_not_old_frame_receipts() {
+        let mut world = World::connected();
+        let first = world.submit(qos1_publish(7, 1, false));
+        let old_ack = qos1_commit(&mut world, &first, 1);
+        let second = world.submit(publish(7));
+        world.applied(written(&old_ack));
+        assert_eq!(world.in_flight(7).operation, second.operation);
+        assert_eq!(used(&world), (7, 1));
+        assert_eq!(world.sent(committed(&second)), ["EmitPubrec"]);
+        absorbed(&mut world, written(&old_ack));
+        assert_eq!(world.phase(7), AWAIT);
+        assert_eq!(used(&world), (7, 1));
+
+        let mut world = World::release_pending();
+        let release = world.flights[1];
+        world.applied(committed(&release));
+        let old_comp = world.drain().remove(0);
+        let qos1 = world.submit(qos1_publish(7, 20, false));
+        let new_ack = qos1_commit(&mut world, &qos1, 20);
+        absorbed(&mut world, written(&old_comp));
+        assert_eq!(used(&world), (4, 1));
+        world.applied(written(&new_ack));
+        assert_eq!(used(&world), (0, 0));
+    }
+
+    #[test]
+    fn qos1_cannot_change_the_qos_of_an_active_identifier_or_accept_pubrel() {
+        for (first, second) in [
+            (Qos::AtLeastOnce, Qos::ExactlyOnce),
+            (Qos::ExactlyOnce, Qos::AtLeastOnce),
+        ] {
+            let mut world = World::connected();
+            let admission = world.submit(publish_with(CONN, 7, first, b"same"));
+            assert_eq!(
+                world.sent(publish_with(CONN, 7, second, b"same")),
+                ["CloseConnection"]
+            );
+            assert_eq!(world.in_flight(7).operation, admission.operation);
+            assert_eq!(
+                used(&world),
+                (4, 1),
+                "uncertain work survives transport rejection"
+            );
+        }
+        let mut world = World::connected();
+        let admission = world.submit(qos1_publish(7, 1, false));
+        assert_eq!(world.sent(pubrel(7)), ["CloseConnection"]);
+        assert_eq!(world.in_flight(7).operation, admission.operation);
+    }
+
+    #[test]
+    fn qos1_retained_puback_keeps_its_frozen_publish_occurrence_after_pi_reuse() {
+        let mut world = World::connected();
+        let first = world.submit(qos1_publish(7, 1, false));
+        world.applied(committed(&first));
+        let old_ack = world.held().pending().next().expect("ACK retained").id();
+        world.applied(qos1_publish(7, 2, true));
+        let effects = world.drain();
+        assert_eq!(kinds(&effects), ["EmitPuback", "Persist", "ArmDeadline"]);
+        assert_eq!(effects[0].0, old_ack);
+        let Effect::EmitFrame { publish_order, .. } = effects[0].1 else {
+            panic!("the retained ACK")
+        };
+        assert_eq!(
+            publish_order,
+            Some(1),
+            "late adapter acceptance cannot infer the reused PI's new order"
+        );
+        assert_eq!(world.owner.slots.len(), 2);
+        assert_eq!(used(&world), (8, 2));
+    }
+
+    fn qos1_pending_world() -> World {
+        let mut world = World::connected();
+        let _ = world.submit(qos1_publish(7, 1, false));
+        world
+    }
+
+    fn qos1_ack_pending_world() -> World {
+        let mut world = qos1_pending_world();
+        let flight = world.flights[0];
+        let _ = qos1_commit(&mut world, &flight, 1);
+        world
+    }
+
+    #[test]
+    fn qos1_new_transitions_reserve_before_mutating() {
+        handed_back(World::connected, &|_| qos1_publish(7, 1, false), 2);
+        handed_back(qos1_pending_world, &|world| committed(&world.flights[0]), 1);
+        handed_back(qos1_pending_world, &|world| rejected(&world.flights[0]), 1);
+        handed_back(
+            qos1_ack_pending_world,
+            &|world| {
+                let SlotState::AckPending { effect, connection } =
+                    world.owner.slots.as_slice()[0].state
+                else {
+                    panic!("an ACK pending")
+                };
+                Input::FrameResult {
+                    effect,
+                    connection,
+                    progress: FrameProgress::Written {
+                        confirmed: 4,
+                        total: 4,
+                    },
+                }
+            },
+            0,
+        );
+    }
+
+    #[test]
+    fn qos1_closed_ack_scan_requires_its_bounded_work_before_cleanup() {
+        let mut world = qos1_ack_pending_world();
+        let before = world.snapshot();
+        let input = Input::ConnectionClosed {
+            connection: ConnectionGeneration::new(CONN),
+        };
+        let expected = Input::ConnectionClosed {
+            connection: ConnectionGeneration::new(CONN),
+        };
+        assert_eq!(
+            world.owner.step(
+                input,
+                TurnGrant {
+                    work_limit: WorkUnits::new(1)
+                }
+            ),
+            StepOutcome::NeedCapacity {
+                input: expected,
+                need: CapacityNeed {
+                    resource: Resource::Work,
+                    amount: 9,
+                    wake: WakeCondition::TurnGranted
+                },
+                work_used: WorkUnits::new(1),
+            }
+        );
+        assert_eq!(
+            world.snapshot(),
+            before,
+            "the live binding, ACK and lease remain intact"
+        );
+        world.applied(Input::ConnectionClosed {
+            connection: ConnectionGeneration::new(CONN),
+        });
+        assert_eq!(used(&world), (0, 0));
     }
 
     // ----- The machine `inbound_qos2`: one test per rule, named after it -----
