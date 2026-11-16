@@ -225,6 +225,13 @@ impl Owner {
         })
     }
 
+    /// Whether this token is the current collector deadline, as distinct
+    /// from ordinary command timers using the same bounded timer adapter.
+    #[must_use]
+    pub fn collection_deadline_is_live(&self, _token: DeadlineToken) -> bool {
+        false
+    }
+
     /// Only a live unresolved command or collector retains its current timer.
     #[must_use]
     pub fn deadline_is_live(&self, token: DeadlineToken) -> bool {

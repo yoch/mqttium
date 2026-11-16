@@ -8787,4 +8787,35 @@ mod tests {
         assert_eq!(world.phase(7), None);
         assert_eq!(world.owner.leases.held(), 0);
     }
+
+    #[test]
+    fn receipt_collection_deadline_query_reserves_only_the_current_collector_timer() {
+        let mut world = World::connected();
+        gc_register(&mut world);
+        let ordinary = gc_admit(&mut world, 7, Qos::ExactlyOnce);
+        assert!(world.owner.deadline_is_live(ordinary.deadline));
+        assert!(!world.owner.collection_deadline_is_live(ordinary.deadline));
+        world.owner.receipts.test_request_sweep();
+        gc_apply(&mut world, Input::MaintainReceipts);
+        let collection = world.drain();
+        let Effect::ArmDeadline { token, .. } = collection[1].1 else {
+            panic!("collector timer")
+        };
+        assert!(world.owner.collection_deadline_is_live(token));
+        gc_apply(&mut world, deadline(token));
+        let retry = world.drain();
+        let Effect::ArmDeadline {
+            token: replacement, ..
+        } = retry[1].1
+        else {
+            panic!("replacement collector timer")
+        };
+        assert!(
+            !world.owner.collection_deadline_is_live(token),
+            "retained old reply correlations do not keep an obsolete timer live"
+        );
+        assert!(world.owner.collection_deadline_is_live(replacement));
+        assert!(world.owner.deadline_is_live(ordinary.deadline));
+        assert!(!world.owner.collection_deadline_is_live(ordinary.deadline));
+    }
 }
