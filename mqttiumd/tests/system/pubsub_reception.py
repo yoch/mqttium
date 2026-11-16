@@ -865,7 +865,7 @@ def atomic_capacity_refusal(binary: Path, case: Path) -> dict:
                 db.execute("UPDATE meta SET limit_references=?", ((1).to_bytes(8, "big"),))
             rejected = publisher(broker, case, "capacity-publisher-rejected", "mqttium", topic,
                                  b"must-not-partially-admit", expected="rejected")
-            require(any(event["kind"] == "receipt_rejected" and event.get("reason_code") == 0x97
+            require(any(event["kind"] == "publication_rejected" and event.get("reason_code") == 0x97
                         for event in rejected["result"]["events"]), "capacity_refusal_wrong_reason")
             after = durable(broker.db)
             require(len(after["admissions"]) == 0 and len(obligations(after)) == 0,
