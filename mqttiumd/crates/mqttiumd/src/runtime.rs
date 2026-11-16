@@ -85,6 +85,7 @@ struct Peer {
     created: Instant,
     last_packet: Instant,
     connected: bool,
+    session: Option<SessionId>,
     pending: bool,
     keep_alive: u16,
     max_packet: usize,
@@ -714,6 +715,7 @@ impl Runtime<'_> {
                             self.events.emit("session_established",json!({"connection":pending.connection.get().to_string(),"details":{"request":request.to_string(),"session":session.id.get().to_string(),"session_present":session.present,"source":"writer_confirmation"}})).map_err(event_failure)?;
                             let connection = self.peers.get_mut(&pending.connection).map(|p| {
                                 p.connected = true;
+                                p.session = Some(session.id);
                                 pending.connection
                             });
                             self.queue(Input::SessionEstablished {
@@ -884,6 +886,7 @@ impl Runtime<'_> {
             self.events.emit("session_established",json!({"connection":generation.get().to_string(),"details":{"session":session.id.get().to_string(),"session_present":true,"source":"durable_cache"}})).map_err(event_failure)?;
             if let Some(p) = self.peers.get_mut(&generation) {
                 p.connected = true;
+                p.session = Some(session.id);
                 p.pending = true;
             }
             self.queue(Input::Packet {
@@ -1070,12 +1073,16 @@ impl Runtime<'_> {
                     return self.close(generation, "receive_maximum");
                 }
                 if let InboundPacket::Puback { packet_id, reason } = packet {
+                    // The durable identity belongs to this transport's
+                    // confirmed CONNECT. A takeover may already have moved
+                    // owner authority while its old Close effect is blocked.
+                    // Preserve the original key, never retarget or fail other
+                    // connections merely because this generation is stale.
                     let session = self
-                        .sessions
-                        .values()
-                        .find(|session| self.owner.connection_of(session.id) == Some(generation))
-                        .ok_or_else(|| Failure::plain("puback_connection_unbound"))?
-                        .id;
+                        .peers
+                        .get(&generation)
+                        .and_then(|peer| peer.session)
+                        .ok_or_else(|| Failure::plain("puback_session_unconfirmed"))?;
                     let connection = ConnectionKey {
                         session,
                         generation,
@@ -2640,6 +2647,7 @@ fn run_inner(
                                 created: Instant::now(),
                                 last_packet: Instant::now(),
                                 connected: false,
+                                session: None,
                                 pending: false,
                                 keep_alive: 0,
                                 max_packet: 268435455,

@@ -190,6 +190,7 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             created: Instant::now(),
             last_packet: Instant::now(),
             connected: false,
+            session: None,
             pending: false,
             keep_alive: 0,
             max_packet: 268435455,
