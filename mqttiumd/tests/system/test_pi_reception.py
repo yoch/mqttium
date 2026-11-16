@@ -4,6 +4,11 @@ import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
+import os
+import shutil
+import subprocess
+import sys
+import time
 
 from pi_reception import FinishCursor, WireOccurrences, verify_normal_bounds
 from tcp_probe import Frame, FrameDecoder, ReceiptFailure, packet, utf8
@@ -23,6 +28,69 @@ def publish(number, identifier=1):
 
 
 class PiWireTests(unittest.TestCase):
+    def test_wrapper_build_uses_pinned_source_when_caller_commits_during_build(self):
+        tool = Path(__file__).resolve().parents[2] / 'tools/run_pi_reception.sh'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); repository = root / 'repository'; control = root / 'control'
+            controls = root / 'bin'; controls.mkdir(); control.mkdir()
+            product = repository / 'mqttiumd'
+            (product / 'tools').mkdir(parents=True)
+            (product / 'tests/system').mkdir(parents=True)
+            (product / 'tests/system/__init__.py').write_text('')
+            (product / 'tests/system/test_stub.py').write_text(
+                'import unittest\nclass Stub(unittest.TestCase):\n def test_preflight(self): self.assertTrue(True)\n')
+            target_tool = product / 'tools/run_pi_reception.sh'
+            shutil.copyfile(tool, target_tool); target_tool.chmod(0o755)
+            (product / 'sentinel').write_text('before')
+            for command in (['git', 'init', '-q', str(repository)],
+                            ['git', '-C', str(repository), 'config', 'user.email', 'probe@example.invalid'],
+                            ['git', '-C', str(repository), 'config', 'user.name', 'Wrapper probe'],
+                            ['git', '-C', str(repository), 'add', '.'],
+                            ['git', '-C', str(repository), '-c', 'commit.gpgsign=false', 'commit', '-qm', 'before']):
+                subprocess.run(command, check=True, capture_output=True)
+            cargo = controls / 'cargo'
+            cargo.write_text('''#!/usr/bin/env python3
+from pathlib import Path
+import json, os, sys, time
+control=Path(os.environ['PI_WRAPPER_TEST_CONTROL'])
+if sys.argv[1]=='build':
+ (control/'ready').touch()
+ deadline=time.monotonic()+10
+ while not (control/'release').exists():
+  if time.monotonic()>deadline: raise SystemExit(72)
+  time.sleep(.01)
+ (control/'observed.json').write_text(json.dumps({'cwd':str(Path.cwd()),'sentinel':Path('sentinel').read_text()}))
+ raise SystemExit(71) # deliberate stop after observing the build source; no broker is fabricated
+print('mqttiumd features=' if sys.argv[1]=='tree' else 'cargo-test-stub')
+''')
+            cargo.chmod(0o755)
+            rustc = controls / 'rustc'; rustc.write_text('#!/bin/sh\necho rustc-test-stub\n'); rustc.chmod(0o755)
+            environment = dict(os.environ, PATH=str(controls) + os.pathsep + os.environ['PATH'],
+                               PYTHON=sys.executable, PI_WRAPPER_TEST_CONTROL=str(control),
+                               MQTTIUMD_PI_TARGET_ROOT=str(root / 'targets'))
+            process = subprocess.Popen([str(target_tool), str(root / 'out')], cwd=product,
+                                       env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 10
+                while not (control / 'ready').exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.01)
+                error = process.stderr.read().decode() if process.poll() is not None else ''
+                if process.poll() is not None:
+                    error += ''.join(path.name + ': ' + path.read_text()[-1024:]
+                                     for path in (root / 'out').glob('*.log'))
+                self.assertTrue((control / 'ready').exists(), 'Cargo pause was not reached: ' + error[-1024:])
+                (product / 'sentinel').write_text('after')
+                subprocess.run(['git', '-C', str(repository), 'add', '.'], check=True, capture_output=True)
+                subprocess.run(['git', '-C', str(repository), '-c', 'commit.gpgsign=false', 'commit', '-qm', 'after'],
+                               check=True, capture_output=True)
+            finally:
+                (control / 'release').touch()
+                stdout, stderr = process.communicate(timeout=15)
+            self.assertEqual(process.returncode, 71, (stdout + stderr).decode()[-512:])
+            observed = json.loads((control / 'observed.json').read_text())
+            self.assertEqual(observed['sentinel'], 'before', 'build read the moving caller checkout')
+            self.assertNotEqual(Path(observed['cwd']), product)
+
     def long_evidence(self, floors=(64, 128, 192, 256), limit=8192):
         def snapshot(floor):
             return {"metadata": {"limit_receipt_slots": limit.to_bytes(8, "big").hex()},
