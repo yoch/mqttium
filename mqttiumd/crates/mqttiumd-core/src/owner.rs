@@ -3697,6 +3697,69 @@ mod tests {
         assert_ne!(next.facts, first.facts);
     }
 
+    // ----- Incoming QoS 1 uses the same command and bounded owner path -----
+
+    #[test]
+    fn qos1_admission_is_durable_without_a_pubrel_slot() {
+        let mut world = World::connected();
+        world.applied(publish_with(CONN, 7, Qos::AtLeastOnce, b"qos1"));
+        let effects = world.drain();
+        assert_eq!(
+            kinds(&effects),
+            ["Persist", "ArmDeadline"],
+            "valid QoS 1 must submit its admission, with no positive acknowledgement yet"
+        );
+        let (_, Effect::Persist { command }) = &effects[0] else {
+            panic!("the existing store admission path")
+        };
+        let Recipe::AdmitPublication(admit) = command.recipe.get() else {
+            panic!("an admission, never ReleaseInbound for QoS 1")
+        };
+        assert_eq!(admit.qos, Qos::AtLeastOnce);
+        assert_eq!(admit.costs.exchange_slots, ExchangeSlots::ZERO);
+        assert!(
+            admit
+                .targets
+                .as_slice()
+                .iter()
+                .all(|target| target.effective_qos <= Qos::AtLeastOnce)
+        );
+        assert_eq!(
+            used(&world),
+            (4, 1),
+            "pending operations still cost volatile credits"
+        );
+        assert_eq!(world.phase(7), PENDING);
+    }
+
+    #[test]
+    fn qos1_unknown_admission_uses_the_same_operation_and_emits_no_ack() {
+        let mut world = World::connected();
+        let flight = world.submit(publish_with(CONN, 7, Qos::AtLeastOnce, b"qos1"));
+        assert!(world.sent(unknown(&flight)).is_empty());
+        assert!(
+            world
+                .sent(publish_with(CONN, 7, Qos::AtLeastOnce, b"qos1"))
+                .is_empty()
+        );
+        assert_eq!(world.in_flight(7).operation, flight.operation);
+        world.applied(deadline(flight.deadline));
+        let effects = world.drain();
+        assert_eq!(kinds(&effects), ["ResolveAndFence", "ArmDeadline"]);
+        assert_eq!(
+            effects[0].1,
+            Effect::ResolveAndFence {
+                operation: flight.operation
+            }
+        );
+        assert_eq!(used(&world), (4, 1));
+        assert_eq!(
+            world.flights.len(),
+            1,
+            "a replay cannot get a new identity to erase uncertainty"
+        );
+    }
+
     // ----- The machine `inbound_qos2`: one test per rule, named after it -----
 
     const PENDING: Option<ExchangePhase> = Some(ExchangePhase::AdmissionPending);
