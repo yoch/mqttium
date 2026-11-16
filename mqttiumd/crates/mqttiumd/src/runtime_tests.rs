@@ -2508,3 +2508,135 @@ fn zero_expiry_reconnect_first_resumes_then_ends_the_existing_incarnation() {
         assert!(runtime.peers[&next].session.unwrap().get() > original.get());
     });
 }
+
+fn relay_control_reply(runtime: &mut Runtime<'_>, response: ControlResponse) {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(crate::writer::CONTROL_QUEUE);
+    let original = std::mem::replace(&mut runtime.writer.control_receiver, receiver);
+    sender.send(response).unwrap();
+    let result = runtime.writer_results();
+    runtime.writer.control_receiver = original;
+    result.unwrap();
+}
+
+#[test]
+fn disconnect_zero_before_connack_ends_the_exact_committed_infinite_open() {
+    with_runtime(128, |runtime, directory| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"early-end"))
+            .unwrap();
+        runtime.drain_inputs().unwrap();
+        let response = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let ControlResponse::Lifecycle {
+            operation,
+            reply:
+                StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                    SessionChange::Opened {
+                        session,
+                        expiry: SessionExpiry::Never,
+                        ..
+                    },
+                ))),
+            ..
+        } = response.clone()
+        else {
+            panic!("actual Open commit, not a fabricated result");
+        };
+        assert!(runtime.peers[&generation].pending);
+        assert!(
+            runtime.sessions.is_empty(),
+            "unknown Open cannot announce readiness"
+        );
+        // The pending reader must still observe an explicit end before CONNACK.
+        client
+            .write_all(&[0xe0, 7, 0, 5, 0x11, 0, 0, 0, 0])
+            .unwrap();
+        until(runtime, |r| !r.peers.contains_key(&generation));
+        assert!(
+            runtime
+                .session_requests
+                .values()
+                .any(|pending| pending.operation == Some(operation) && pending.zero_end),
+            "late exact Open result retains the observed DISCONNECT policy"
+        );
+        relay_control_reply(runtime, response.clone());
+        runtime.drain_inputs().unwrap();
+        until(runtime, |r| {
+            !r.owner.session_status().lifecycle_pending
+                && r.lifecycle_inflight.is_empty()
+                && r.closing_inputs.is_empty()
+        });
+        assert!(
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite"))
+                .unwrap()
+                .sessions
+                .is_empty(),
+            "early_disconnect_zero_did_not_end_known_open"
+        );
+        let (replacement, mut next) = peer(runtime);
+        runtime
+            .connect(replacement, connect_packet(b"early-end"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(&read_frame(&mut next).1[..2], &[0, 0]);
+        let current = runtime.peers[&replacement].session.unwrap();
+        assert_ne!(current, session);
+        relay_control_reply(runtime, response);
+        runtime.drain_inputs().unwrap();
+        assert_eq!(
+            runtime.peers[&replacement].session,
+            Some(current),
+            "late authentic old Open response cannot rebind a reused ClientID"
+        );
+    });
+}
+
+#[test]
+fn closing_an_ephemeral_transport_keeps_accepted_frame_facts_under_input_pressure() {
+    with_runtime(128, |runtime, directory| {
+        let (generation, mut client) = peer(runtime);
+        let mut connect = connect_packet(b"close-pressure");
+        connect.expiry = SessionExpiry::OnDisconnect;
+        runtime.connect(generation, connect).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        until(runtime, |r| r.frames.is_empty() && r.inputs.is_empty());
+        runtime.packet(generation, 0x32, publish_body(1)).unwrap();
+        until(runtime, |r| {
+            r.frames.values().any(|frame| frame.kind == "PUBACK")
+        });
+        assert_eq!(read_frame(&mut client).0, 0x40);
+        for order in 0..INPUTS {
+            runtime
+                .queue(Input::Packet {
+                    connection: generation,
+                    ingress_order: 100 + order as u64,
+                    packet: InboundPacket::Pingreq,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            runtime.inputs.len(),
+            INPUTS,
+            "actual configured ordinary input budget is full"
+        );
+        let close = runtime.close(generation, "test_input_pressure");
+        assert!(
+            close.is_ok(),
+            "session_close_lost_accepted_frame_fact_under_input_pressure: {close:?}"
+        );
+        until(runtime, |r| {
+            r.sessions.is_empty()
+                && !r.owner.session_status().lifecycle_pending
+                && r.closing_inputs.is_empty()
+                && r.frames.is_empty()
+        });
+        let durable =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert!(durable.sessions.is_empty() && durable.publications.is_empty());
+    });
+}
