@@ -228,8 +228,10 @@ impl Owner {
     /// Whether this token is the current collector deadline, as distinct
     /// from ordinary command timers using the same bounded timer adapter.
     #[must_use]
-    pub fn collection_deadline_is_live(&self, _token: DeadlineToken) -> bool {
-        false
+    pub fn collection_deadline_is_live(&self, token: DeadlineToken) -> bool {
+        self.receipts
+            .pending
+            .is_some_and(|flight| flight.deadline == token)
     }
 
     /// Only a live unresolved command or collector retains its current timer.
