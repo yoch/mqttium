@@ -83,7 +83,7 @@ No proof BODY file or immutable French archive changed.
 | - | - | - |
 | A | mqttium creates/resumes sessions, completes repeated QoS 1 and mixed 1/2; Paho completes QoS 1 and resumes; both survive a clean broker restart | Same cases; independent SQLite admission/release and normal metadata collection |
 | B | Core/codec regressions require durable-before-ACK behavior | Synced actual SQLite admission.prepared point and OperationId; independent read sees the old state, no positive PUBACK; release permits raw PUBACK and the original mqttium receipt |
-| C | Equal content, DUP, repeated PI, fragmentation/concatenation and cross-QoS reuse | Actual PUBACK received while its internal receipt is held; new PI1 QoS 2 plus seven other exchanges fill the window; releasing the old receipt cannot admit a ninth. A normal real-reactor test also orders a new QoS 1 admission before the old Written result |
+| C | Equal content, DUP, repeated PI, fragmentation/concatenation and cross-QoS reuse | Raw same-QoS control: after receiving the first PUBACK, an equal/DUP QoS 1 PUBLISH with the same PI reaches its own SQL-prepared point; the old receipt cannot release its credit or authorize PUBACK before the second commit. Separately new PI1 QoS 2 plus seven exchanges fill the window; the old PUBACK cannot admit a ninth. A normal real-reactor test also covers this scheduling |
 | D | Session/restart in A | SIGKILL -9 after admission commit before PUBACK, same-file restart and retransmission; separately a proxy captures a complete server PUBACK, forwards none to the client and cuts transport. The same mqttium process/application publish/original receipt reconnects under a finite policy and completes. Both constructions expect two QoS 1 admissions |
 | E | Two clients and mixed QoS progress; partial sender does not block the other | Certain payload-quota refusals produce 0x97/PublishRejectedError, repeated >8 times with reusable credits. An exhausted receipt budget produces PendingOrUnknown and no ACK; restoring it allows the same OperationId's resolution to fence and return 0x83. Takeover during a held admission reconciles its late result safely |
 | F | Existing QoS 2 A/B/E/F/G-concurrency | All QoS 2 A–H, both G cases, typed invalid/over-budget startup, writer cleanup and historical controls retained |
@@ -148,6 +148,10 @@ Their shared source archive is
 `7b6135e0bd6770ca9575baa9d63ee1bb08057a79a2d209148cc38c103e5a2caa`.
 CI independently rebuilds/runs both wrappers for its own exact head, with
 artifacts `mqttiumd-tcp-product-<SHA>` and `mqttiumd-tcp-qos1-<SHA>`.
+The current instrumented suite additionally includes C-late-same-qos (11
+cases). Its positive run and the stale-receipt mutation were executed for
+PASS / stale_receipt_released respectively. Historical 10-case archives above
+retain their own scope; the final CI artifact records the expanded suite.
 
 Executed local checks: formatting, strict workspace Clippy, **766 normal** and
 **774 instrumented** Rust tests, **47** product-hook tests, **142** unchanged

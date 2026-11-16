@@ -71,6 +71,12 @@ That compiler error is not a detection. Only the initializer/hunk count was
 refreshed, keeping mutation, verdict/assertion/reason unchanged. Both complete
 loops passed locally: all 5 simulator / 11 SQLite controls were rejected for
 their expected reasons, including M3's premature PUBREC before known commit.
+The additional raw C-late-same-qos case establishes the literal QoS 1 race:
+client receives first PUBACK, equal/DUP PI reuse reaches a distinct operation's
+actual prepared transaction, then the old receipt arrives without freeing the
+new credit. Second PUBACK follows only its own commit. Positive and isolated
+stale-receipt runs give PASS / stale_receipt_released. The current hooked suite
+has 11 cases; earlier 10-case runs are not relabeled.
 The product event artifacts were downloaded, ZIP hashes checked, all 1,133
 archived mqttiumd source blobs matched Git, and client source identity matched
 its 62 Python files. Broker and independent-client event streams have separate
