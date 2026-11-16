@@ -514,3 +514,122 @@ fn a_real_delayed_pubcomp_write_receipt_cannot_release_a_new_packet_identifier_u
         );
     });
 }
+
+fn connect_then_subscribe(client_id: &[u8]) -> Vec<u8> {
+    let mut body = vec![
+        0, 4, b'M', b'Q', b'T', b'T', 5, 0, 0, 10, 5, 0x11, 255, 255, 255, 255,
+    ];
+    body.extend_from_slice(&u16::try_from(client_id.len()).unwrap().to_be_bytes());
+    body.extend_from_slice(client_id);
+    let mut packets = vec![0x10, u8::try_from(body.len()).unwrap()];
+    packets.extend_from_slice(&body);
+    // Valid MQTT 5 SUBSCRIBE, outside this product's documented profile.
+    packets.extend_from_slice(&[0x82, 7, 0, 9, 0, 0, 1, b't', 2]);
+    packets
+}
+
+fn concatenated_subscription_waits_for_connack(known: bool) {
+    with_runtime(1, |runtime, _| {
+        let client_id = b"handshake";
+        if known {
+            let (previous, mut previous_client) = peer(runtime);
+            runtime
+                .connect(previous, connect_packet(client_id))
+                .unwrap();
+            until(runtime, |r| r.session_requests.is_empty());
+            assert_eq!(read_frame(&mut previous_client).0, 0x20);
+            runtime.close(previous, "test_disconnect").unwrap();
+            runtime.drain_inputs().unwrap();
+        }
+        let (generation, mut client) = peer(runtime);
+        client
+            .write_all(&connect_then_subscribe(client_id))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        if known {
+            // The cached path must also defer the second TCP packet while
+            // ConnectResume remains queued and unapplied.
+            while !runtime.inputs.iter().any(|input| {
+                matches!(input, Input::Packet { connection, packet: InboundPacket::ConnectResume { .. }, .. }
+                    if *connection == generation)
+            }) && Instant::now() < deadline
+            {
+                runtime.connections().unwrap();
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(runtime.inputs.iter().any(|input| {
+                matches!(input, Input::Packet { connection, packet: InboundPacket::ConnectResume { .. }, .. }
+                    if *connection == generation)
+            }), "known CONNECT reached the owner input queue");
+        } else {
+            while runtime.session_requests.is_empty() && Instant::now() < deadline {
+                runtime.connections().unwrap();
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                !runtime.session_requests.is_empty(),
+                "fresh CONNECT reached writer"
+            );
+            while !runtime.session_requests.is_empty() && Instant::now() < deadline {
+                runtime.writer_results().unwrap();
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                runtime.session_requests.is_empty(),
+                "session result is correlated"
+            );
+            assert!(
+                runtime.inputs.iter().any(|input| {
+                    matches!(input, Input::SessionEstablished { connection: Some(found), .. }
+                    if *found == generation)
+                }),
+                "confirmed creation remains queued before owner application"
+            );
+        }
+        let session = runtime.sessions[client_id.as_slice()].id;
+        assert_eq!(runtime.owner.connection_of(session), None);
+        // Hold owner input application while polling the actual transport.
+        // A ready SQLite result alone must not permit a DISCONNECT to overtake
+        // the core-authorized CONNACK in this connection's write FIFO.
+        let poll_deadline = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < poll_deadline {
+            runtime.connections().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut first = [0];
+        match client.read(&mut first) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            result => panic!(
+                "server emitted output before queued CONNECT was applied (known={known}): {result:?}, first byte={:#04x}",
+                first[0]
+            ),
+        }
+        runtime.drain_inputs().unwrap();
+        until(runtime, |r| !r.peers.contains_key(&generation));
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (kind, body) = read_frame(&mut client);
+        assert_eq!(kind, 0x20, "CONNACK must be the first server packet");
+        assert_eq!(body[0], u8::from(known), "accurate Session Present");
+        assert_eq!(body[1], 0);
+        assert_eq!(read_frame(&mut client), (0xe0, vec![0x83, 0]));
+    });
+}
+
+#[test]
+fn fresh_connect_pipeline_cannot_send_disconnect_before_core_connack() {
+    concatenated_subscription_waits_for_connack(false);
+}
+
+#[test]
+fn known_connect_pipeline_cannot_send_disconnect_before_core_connack() {
+    concatenated_subscription_waits_for_connack(true);
+}
