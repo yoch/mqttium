@@ -24,4 +24,5 @@ pub mod ids;
 pub mod opening;
 pub mod outcome;
 pub mod packet;
+pub mod pubsub;
 pub mod step;

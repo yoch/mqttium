@@ -6,8 +6,9 @@
 
 use alloc::sync::Arc;
 
-use crate::ids::InboundPacketId;
+use crate::ids::{InboundPacketId, OutboundPacketId};
 use crate::outcome::RejectReason;
+use crate::pubsub::{FilterList, FilterResults, SubscriptionFilter};
 
 /// MQTT quality of service.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -107,6 +108,19 @@ pub enum InboundPacket {
     Pubrel { packet_id: InboundPacketId },
     /// A validated MQTT PINGREQ, without a body.
     Pingreq,
+    Subscribe {
+        packet_id: InboundPacketId,
+        filters: FilterList<SubscriptionFilter>,
+    },
+    Unsubscribe {
+        packet_id: InboundPacketId,
+        filters: FilterList<SharedBytes>,
+    },
+    /// The decoder accepts only the MQTT 5 PUBACK reason-code domain.
+    Puback {
+        packet_id: OutboundPacketId,
+        reason: u8,
+    },
 }
 
 /// Outcome carried by a PUBREC or PUBCOMP of the subset.
@@ -182,6 +196,14 @@ impl PubackReason {
 /// client's Packet Identifier space.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OutboundFrame {
+    Suback {
+        packet_id: InboundPacketId,
+        results: FilterResults,
+    },
+    Unsuback {
+        packet_id: InboundPacketId,
+        results: FilterResults,
+    },
     /// Response to a validated PINGREQ on a connected session.
     Pingresp,
     Connack {

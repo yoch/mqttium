@@ -33,10 +33,11 @@ use alloc::vec::Vec;
 
 use crate::capacity::{BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References};
 use crate::ids::{
-    DeliveryId, ExchangeGeneration, ExchangeId, InboundPacketId, OperationId, PayloadId,
-    PublicationId, RequestId, Revision, SessionId,
+    DeliveryId, ExchangeGeneration, ExchangeId, InboundPacketId, OperationId, OutboundPacketId,
+    PayloadId, PublicationId, RequestId, Revision, SessionId,
 };
 use crate::packet::{Qos, SharedBytes};
+use crate::pubsub::{MAX_FILTERS, SubscriptionChange};
 
 const MAGIC: &[u8; 4] = b"MQDR";
 
@@ -45,6 +46,9 @@ pub const RECIPE_FORMAT: u16 = 1;
 
 const KIND_ADMIT_PUBLICATION: u8 = 1;
 const KIND_RELEASE_INBOUND: u8 = 2;
+const KIND_CHANGE_SUBSCRIPTIONS: u8 = 3;
+const KIND_CLAIM_DELIVERY: u8 = 4;
+const KIND_FINISH_DELIVERY: u8 = 5;
 
 /// Why an obligation exists. The cause stays inspectable by the oracle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -153,6 +157,34 @@ pub struct ReleaseInbound {
     pub exchange: ExchangeId,
 }
 
+#[derive(PartialEq, Eq, Debug)]
+pub struct ChangeSubscriptions {
+    pub operation: OperationId,
+    pub session: SessionId,
+    pub session_revision: Revision,
+    pub route_revision: Revision,
+    pub changes: BoundedVec<SubscriptionChange>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ClaimDelivery {
+    pub operation: OperationId,
+    pub delivery: DeliveryId,
+    pub target: SessionId,
+    pub target_revision: Revision,
+    pub packet_id: OutboundPacketId,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FinishDelivery {
+    pub operation: OperationId,
+    pub delivery: DeliveryId,
+    pub target: SessionId,
+    pub target_revision: Revision,
+    pub packet_id: OutboundPacketId,
+    pub claim: OperationId,
+}
+
 /// The closed set of recipes of the S0 perimeter.
 #[expect(
     clippy::large_enum_variant,
@@ -162,6 +194,9 @@ pub struct ReleaseInbound {
 pub enum Recipe {
     AdmitPublication(AdmitPublication),
     ReleaseInbound(ReleaseInbound),
+    ChangeSubscriptions(ChangeSubscriptions),
+    ClaimDelivery(ClaimDelivery),
+    FinishDelivery(FinishDelivery),
 }
 
 /// A recipe is not well formed, or cannot be decoded.
@@ -195,6 +230,22 @@ fn put_exchange_generation(out: &mut Vec<u8>, exchange: ExchangeId) {
     out.extend_from_slice(&exchange.generation.to_be_bytes());
 }
 
+fn encode_delivery(
+    out: &mut Vec<u8>,
+    operation: OperationId,
+    delivery: DeliveryId,
+    target: SessionId,
+    revision: Revision,
+    packet_id: OutboundPacketId,
+) {
+    out.extend_from_slice(&operation.to_be_bytes());
+    out.extend_from_slice(&delivery.publication.to_be_bytes());
+    out.extend_from_slice(&delivery.index.to_be_bytes());
+    out.extend_from_slice(&target.to_be_bytes());
+    out.extend_from_slice(&revision.to_be_bytes());
+    out.extend_from_slice(&packet_id.get().to_be_bytes());
+}
+
 impl Recipe {
     /// The operation this recipe belongs to.
     #[must_use]
@@ -202,12 +253,35 @@ impl Recipe {
         match self {
             Self::AdmitPublication(admit) => admit.operation,
             Self::ReleaseInbound(release) => release.operation,
+            Self::ChangeSubscriptions(change) => change.operation,
+            Self::ClaimDelivery(claim) => claim.operation,
+            Self::FinishDelivery(finish) => finish.operation,
         }
     }
 
     /// Checks the internal consistency the canonical layout relies on.
     pub fn check(&self) -> Result<(), RecipeError> {
         match self {
+            Self::ChangeSubscriptions(change) => {
+                if change.changes.is_empty() || change.changes.len() > MAX_FILTERS {
+                    return Err(RecipeError::InvalidField("subscription_count"));
+                }
+                for entry in change.changes.as_slice() {
+                    if entry.topic.is_empty()
+                        || entry.topic.len() > usize::from(u16::MAX)
+                        || entry
+                            .topic
+                            .as_slice()
+                            .iter()
+                            .any(|b| matches!(*b, 0 | b'+' | b'#'))
+                        || core::str::from_utf8(entry.topic.as_slice()).is_err()
+                    {
+                        return Err(RecipeError::InvalidField("exact_filter"));
+                    }
+                }
+                Ok(())
+            }
+            Self::ClaimDelivery(_) | Self::FinishDelivery(_) => Ok(()),
             Self::AdmitPublication(admit) => {
                 if admit.source.exchange.session != admit.source.session {
                     return Err(RecipeError::ForeignExchange);
@@ -248,6 +322,42 @@ impl Recipe {
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
         match self {
+            Self::ChangeSubscriptions(change) => {
+                out.push(KIND_CHANGE_SUBSCRIPTIONS);
+                out.extend_from_slice(&change.operation.to_be_bytes());
+                out.extend_from_slice(&change.session.to_be_bytes());
+                out.extend_from_slice(&change.session_revision.to_be_bytes());
+                out.extend_from_slice(&change.route_revision.to_be_bytes());
+                out.push(change.changes.len() as u8);
+                for entry in change.changes.as_slice() {
+                    out.push(u8::from(entry.subscribe));
+                    out.extend_from_slice(&(entry.topic.len() as u16).to_be_bytes());
+                    out.extend_from_slice(entry.topic.as_slice());
+                }
+            }
+            Self::ClaimDelivery(claim) => {
+                out.push(KIND_CLAIM_DELIVERY);
+                encode_delivery(
+                    out,
+                    claim.operation,
+                    claim.delivery,
+                    claim.target,
+                    claim.target_revision,
+                    claim.packet_id,
+                );
+            }
+            Self::FinishDelivery(finish) => {
+                out.push(KIND_FINISH_DELIVERY);
+                encode_delivery(
+                    out,
+                    finish.operation,
+                    finish.delivery,
+                    finish.target,
+                    finish.target_revision,
+                    finish.packet_id,
+                );
+                out.extend_from_slice(&finish.claim.to_be_bytes());
+            }
             Self::AdmitPublication(admit) => {
                 out.push(KIND_ADMIT_PUBLICATION);
                 out.extend_from_slice(&admit.operation.to_be_bytes());
@@ -306,6 +416,61 @@ impl Recipe {
             return Err(RecipeError::UnknownFormat(format));
         }
         let recipe = match reader.u8()? {
+            KIND_CHANGE_SUBSCRIPTIONS => {
+                let operation = reader.operation()?;
+                let session = SessionId::new(reader.u64()?);
+                let session_revision = Revision::new(reader.u64()?);
+                let route_revision = Revision::new(reader.u64()?);
+                let count = usize::from(reader.u8()?);
+                if count == 0 || count > MAX_FILTERS {
+                    return Err(RecipeError::InvalidField("subscription_count"));
+                }
+                let mut changes =
+                    BoundedVec::with_capacity(count).map_err(|_| RecipeError::AllocationFailed)?;
+                for _ in 0..count {
+                    let subscribe = reader.boolean("subscribe")?;
+                    let len = usize::from(reader.u16()?);
+                    if len > max_topic_len {
+                        return Err(RecipeError::TopicTooLong(len));
+                    }
+                    let topic = SharedBytes::copy_from(reader.take(len)?, max_topic_len)
+                        .map_err(|_| RecipeError::TopicTooLong(len))?;
+                    changes
+                        .try_push(SubscriptionChange { topic, subscribe })
+                        .map_err(|_| RecipeError::AllocationFailed)?;
+                }
+                Self::ChangeSubscriptions(ChangeSubscriptions {
+                    operation,
+                    session,
+                    session_revision,
+                    route_revision,
+                    changes,
+                })
+            }
+            KIND_CLAIM_DELIVERY => {
+                let (operation, delivery, target, target_revision, packet_id) =
+                    reader.delivery()?;
+                Self::ClaimDelivery(ClaimDelivery {
+                    operation,
+                    delivery,
+                    target,
+                    target_revision,
+                    packet_id,
+                })
+            }
+            KIND_FINISH_DELIVERY => {
+                let (operation, delivery, target, target_revision, packet_id) =
+                    reader.delivery()?;
+                let claim = reader.operation()?;
+                Self::FinishDelivery(FinishDelivery {
+                    operation,
+                    delivery,
+                    target,
+                    target_revision,
+                    packet_id,
+                    claim,
+                })
+            }
             KIND_ADMIT_PUBLICATION => {
                 let operation = reader.operation()?;
                 let request = RequestId::from_be_slice(reader.take(32)?)
@@ -405,6 +570,7 @@ impl Recipe {
         if !reader.bytes.is_empty() {
             return Err(RecipeError::TrailingBytes);
         }
+        recipe.check()?;
         Ok(recipe)
     }
 }
@@ -414,6 +580,31 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+    fn delivery(
+        &mut self,
+    ) -> Result<
+        (
+            OperationId,
+            DeliveryId,
+            SessionId,
+            Revision,
+            OutboundPacketId,
+        ),
+        RecipeError,
+    > {
+        let operation = self.operation()?;
+        let publication =
+            PublicationId::from_be_slice(self.take(32)?).map_err(|_| RecipeError::Truncated)?;
+        let delivery = DeliveryId {
+            publication,
+            index: self.u32()?,
+        };
+        let target = SessionId::new(self.u64()?);
+        let revision = Revision::new(self.u64()?);
+        let packet = OutboundPacketId::new(self.u16()?)
+            .ok_or(RecipeError::InvalidField("outbound_packet_id"))?;
+        Ok((operation, delivery, target, revision, packet))
+    }
     fn take(&mut self, len: usize) -> Result<&'a [u8], RecipeError> {
         if self.bytes.len() < len {
             return Err(RecipeError::Truncated);
@@ -746,10 +937,10 @@ mod tests {
             Err(RecipeError::UnknownFormat(2))
         );
         let mut kind = bytes.clone();
-        kind[6] = 3;
+        kind[6] = 255;
         assert_eq!(
             Recipe::decode_canonical(&kind, 4, 64),
-            Err(RecipeError::UnknownKind(3))
+            Err(RecipeError::UnknownKind(255))
         );
     }
 

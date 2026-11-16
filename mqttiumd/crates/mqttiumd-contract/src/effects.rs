@@ -17,12 +17,13 @@ use crate::capacity::{
 };
 use crate::command::Command;
 use crate::ids::{
-    ConnectionGeneration, ConnectionKey, ContinuationId, DeadlineToken, EffectId, ExchangeId,
-    InboundPacketId, LogicalDuration, LogicalOwnerId, LogicalTime, OperationId, OutboxSerial,
-    PublicationId, Revision, RunEpoch, SessionId, StoreIncarnation,
+    ConnectionGeneration, ConnectionKey, ContinuationId, DeadlineToken, DeliveryId, EffectId,
+    ExchangeId, InboundPacketId, LogicalDuration, LogicalOwnerId, LogicalTime, OperationId,
+    OutboundPacketId, OutboxSerial, PublicationId, Revision, RunEpoch, SessionId, StoreIncarnation,
 };
 use crate::outcome::{EpochGrant, Knowledge, StoreReply};
 use crate::packet::{InboundPacket, OutboundFrame, Qos, SharedBytes};
+use crate::pubsub::{DeliveryClaim, WorkItem};
 
 /// Durable phase of an inbound QoS 2 exchange.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -38,6 +39,12 @@ pub enum InboundPhase {
 /// [`RecoveryOrder`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum RecoveredFact {
+    OutboundDelivery {
+        delivery: DeliveryId,
+        target: SessionId,
+        target_revision: Revision,
+        claim: Option<DeliveryClaim>,
+    },
     /// The data set and the run epoch opened for this run.
     Epoch {
         incarnation: StoreIncarnation,
@@ -92,6 +99,7 @@ pub enum FactRank {
     Route,
     Session,
     InboundExchange,
+    OutboundDelivery,
     Operation,
 }
 
@@ -114,6 +122,7 @@ impl RecoveredFact {
             Self::Route { .. } => FactRank::Route,
             Self::Session { .. } => FactRank::Session,
             Self::InboundExchange { .. } => FactRank::InboundExchange,
+            Self::OutboundDelivery { .. } => FactRank::OutboundDelivery,
             Self::Operation { .. } => FactRank::Operation,
         }
     }
@@ -198,6 +207,17 @@ pub enum FrameProgress {
 /// It is moved, never copied: a step either consumes it or hands it back.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Input {
+    ConnectionSettings {
+        connection: ConnectionGeneration,
+        receive_maximum: u16,
+        maximum_packet_size: u32,
+    },
+    WorkPage {
+        effect: EffectId,
+        session: SessionId,
+        items: BoundedVec<WorkItem>,
+        next: Option<DeliveryId>,
+    },
     /// A session fact confirmed by the exclusive durable writer, outside
     /// recovery. The adapter correlates its request before constructing it.
     /// `None` installs a late result without binding a closed connection.
@@ -269,7 +289,20 @@ pub enum Effect {
     /// has its own `EffectId` while targeting the same `OperationId`.
     ResolveAndFence { operation: OperationId },
     /// Read a coherent bounded page of existing obligations.
-    LoadWork { session: SessionId, limit: u32 },
+    LoadWork {
+        session: SessionId,
+        limit: u32,
+        after: Option<DeliveryId>,
+    },
+    EmitPublish {
+        connection: ConnectionKey,
+        delivery: DeliveryId,
+        packet_id: OutboundPacketId,
+        claim: OperationId,
+        topic: SharedBytes,
+        payload: SharedBytes,
+        dup: bool,
+    },
     /// Emit one precise frame on one connection generation.
     EmitFrame {
         connection: ConnectionKey,
@@ -1089,6 +1122,7 @@ mod tests {
             Effect::LoadWork {
                 session: SessionId::new(sequence),
                 limit: 8,
+                after: None,
             },
         )
     }

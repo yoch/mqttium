@@ -8,11 +8,29 @@
 //! are in `opening` (ADR 0009).
 
 use crate::capacity::Resource;
-use crate::ids::{ExchangeId, PublicationId};
+use crate::ids::{
+    DeliveryId, ExchangeId, OperationId, OutboundPacketId, PublicationId, Revision, SessionId,
+};
 
 /// The durable facts established by a committed command.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CommitFacts {
+    SubscriptionsChanged {
+        session: SessionId,
+        route_revision: Revision,
+    },
+    DeliveryClaimed {
+        delivery: DeliveryId,
+        target: SessionId,
+        packet_id: OutboundPacketId,
+        claim: OperationId,
+    },
+    DeliveryFinished {
+        delivery: DeliveryId,
+        target: SessionId,
+        packet_id: OutboundPacketId,
+        claim: OperationId,
+    },
     /// Publication, obligations, inbound QoS 2 state, accounts and receipt
     /// were committed together.
     PublicationAdmitted {
