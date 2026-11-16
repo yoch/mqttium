@@ -528,7 +528,8 @@ def concurrency(binary: Path, case: Path) -> dict:
                 while time.monotonic() < deadline:
                     events = [event for event in broker.events() if int(event["seq"]) > before
                               and event.get("connection") == generation]
-                    retained = [event for event in events if event["kind"] == "effect_retained"]
+                    retained = [event for event in events if event["kind"] == "effect_retained"
+                                and event.get("details", {}).get("code") == "output_queue_full"]
                     closed = [event for event in events if event["kind"] == "connection_closed"]
                     if retained or closed:
                         break
@@ -560,7 +561,8 @@ def concurrency(binary: Path, case: Path) -> dict:
             while time.monotonic() < deadline:
                 events = [event for event in broker.events() if int(event["seq"]) > before
                           and event.get("connection") == generation]
-                retained = [event for event in events if event["kind"] == "effect_retained"]
+                retained = [event for event in events if event["kind"] == "effect_retained"
+                            and event.get("details", {}).get("code") == "output_queue_full"]
                 if retained and any(event["kind"] == "frame_failed" and event.get("details", {}).get("effect")
                                    in {r["details"]["effect"] for r in retained} for event in events):
                     break
