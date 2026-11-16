@@ -1,7 +1,11 @@
 """Independent wire-observer invariants for the outgoing PI reception."""
 import unittest
+import json
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 
-from pi_reception import WireOccurrences
+from pi_reception import FinishCursor, WireOccurrences
 from tcp_probe import Frame, FrameDecoder, ReceiptFailure, packet, utf8
 
 
@@ -19,6 +23,14 @@ def publish(number, identifier=1):
 
 
 class PiWireTests(unittest.TestCase):
+    def test_product_cursor_starts_at_the_real_sequence_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "broker.events.jsonl"
+            path.write_text(json.dumps({"seq": "1", "pid": 7, "kind": "starting"}) + "\n")
+            cursor = FinishCursor(SimpleNamespace(events_path=path, process=SimpleNamespace(pid=7)))
+            cursor.read()
+            self.assertEqual(cursor.last_sequence, 1)
+
     def test_fragmented_and_concatenated_packets_keep_exact_bytes(self):
         frames = (publish(1), Frame(0x40, b"\x00\x01"))
         wire = b"".join(packet(frame.header, frame.body) for frame in frames)
