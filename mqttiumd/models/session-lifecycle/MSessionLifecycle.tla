@@ -39,7 +39,7 @@ Copies == [op : 0..MaxOps, sid : 0..MaxSessionId, token : 0..MaxOps]
 
 VARIABLES
     current, rows, policy, token, revision, nextSession,
-    obligations, inbound, claims, references,
+    obligations, inbound, claims, references, exchangeSlots,
     transport, ownerSession, ownerToken, ownerRows,
     issued, recipes, receipts, flight, stage, requestAlive,
     consumed, floor, replyCopy,
@@ -48,7 +48,7 @@ VARIABLES
     hOtherFinished, hFlags
 
 vars == <<current, rows, policy, token, revision, nextSession,
-          obligations, inbound, claims, references,
+          obligations, inbound, claims, references, exchangeSlots,
           transport, ownerSession, ownerToken, ownerRows,
           issued, recipes, receipts, flight, stage, requestAlive,
           consumed, floor, replyCopy, epoch, running,
@@ -63,7 +63,7 @@ Init ==
     /\ nextSession = 3
     \* One shared payload was admitted by Source, with its result still lost.
     /\ obligations = {Other, Source} /\ inbound = {Source} /\ claims = {Source}
-    /\ references = 3
+    /\ references = 2 /\ exchangeSlots = 2
     /\ transport = TRUE /\ ownerSession = Source /\ ownerToken = 0
     /\ ownerRows = rows
     /\ issued = 1
@@ -100,7 +100,7 @@ SubmitOpen(clean, expiry) ==
        /\ transport' = FALSE /\ ownerSession' = 0 /\ ownerToken' = 0
        /\ requestAlive' = TRUE
        /\ UNCHANGED <<current, rows, policy, token, revision, nextSession,
-                      obligations, inbound, claims, references, ownerRows,
+                      obligations, inbound, claims, references, exchangeSlots, ownerRows,
                       receipts, consumed, floor, replyCopy, epoch, running,
                       hCreated, hClosed, hExpired, hExecuted, hConsumed,
                       hWrongClose, hOtherFinished, hFlags>>
@@ -122,7 +122,7 @@ SubmitClose(saved) ==
        /\ ownerToken' = IF closeCurrent THEN 0 ELSE ownerToken
        /\ requestAlive' = FALSE
        /\ UNCHANGED <<current, rows, policy, token, revision, nextSession,
-                      obligations, inbound, claims, references, ownerRows,
+                      obligations, inbound, claims, references, exchangeSlots, ownerRows,
                       receipts, consumed, floor, replyCopy, epoch, running,
                       hCreated, hClosed, hExpired, hExecuted, hConsumed,
                       hWrongClose, hOtherFinished, hFlags>>
@@ -131,7 +131,8 @@ GuardMatches(r) ==
     /\ r.sid = current
     /\ IF current = 0 THEN r.token = 0 ELSE r.token = token[current]
 RemovedRefs(victims) == Cardinality(obligations \cap victims)
-                        + Cardinality(inbound \cap victims)
+RemovedSlots(victims) == Cardinality(inbound \cap victims)
+                         + Cardinality(claims \cap victims)
 CleanupRows(victims) == IF Mutation = "KeepTerminal" THEN rows ELSE rows \ victims
 CleanupTargets(victims) ==
     IF Mutation = "DeleteOther" /\ victims # {} THEN Active(current) ELSE victims
@@ -164,6 +165,7 @@ CommitOpen ==
        /\ nextSession' = IF fresh THEN nextSession + 1 ELSE nextSession
        /\ obligations' = obligations \ victims /\ inbound' = inbound \ victims
        /\ claims' = claims \ victims /\ references' = references - CleanupCount(victims)
+       /\ exchangeSlots' = exchangeSlots - RemovedSlots(victims)
        /\ receipts' = [receipts EXCEPT ![o] =
             [kind |-> "Opened", sid |-> s,
              retired |-> IF removed = {} THEN 0 ELSE current,
@@ -198,6 +200,7 @@ CommitClose ==
        /\ revision' = [i \in Ids |-> IF i \in removed THEN 0 ELSE revision[i]]
        /\ obligations' = obligations \ victims /\ inbound' = inbound \ victims
        /\ claims' = claims \ victims /\ references' = references - CleanupCount(victims)
+       /\ exchangeSlots' = exchangeSlots - RemovedSlots(victims)
        /\ receipts' = [receipts EXCEPT ![o] =
             [kind |-> IF accept THEN "Closed" ELSE "Refused",
              sid |-> r.sid, retired |-> IF accept THEN current ELSE 0,
@@ -218,7 +221,7 @@ ResolveResult ==
     /\ running /\ stage = "Unknown" /\ receipts[flight] # NoOutcome
     /\ stage' = "Known"
     /\ UNCHANGED <<current, rows, policy, token, revision, nextSession,
-                   obligations, inbound, claims, references,
+                   obligations, inbound, claims, references, exchangeSlots,
                    transport, ownerSession, ownerToken, ownerRows,
                    issued, recipes, receipts, flight, requestAlive,
                    consumed, floor, replyCopy, epoch, running,
@@ -241,7 +244,7 @@ ApplyResult ==
        /\ consumed' = consumed \cup {o} /\ hConsumed' = hConsumed \cup {o}
        /\ flight' = 0 /\ stage' = "Idle" /\ requestAlive' = FALSE
        /\ UNCHANGED <<current, rows, policy, token, revision, nextSession,
-                      obligations, inbound, claims, references, issued,
+                      obligations, inbound, claims, references, exchangeSlots, issued,
                       recipes, receipts, floor, replyCopy, epoch, running,
                       hCreated, hClosed, hExpired, hExecuted,
                       hWrongClose, hOtherFinished, hFlags>>
@@ -250,7 +253,7 @@ EndPendingTransport ==
     /\ Scenario = "any" /\ requestAlive
     /\ requestAlive' = FALSE
     /\ UNCHANGED <<current, rows, policy, token, revision, nextSession,
-                   obligations, inbound, claims, references,
+                   obligations, inbound, claims, references, exchangeSlots,
                    transport, ownerSession, ownerToken, ownerRows,
                    issued, recipes, receipts, flight, stage,
                    consumed, floor, replyCopy, epoch, running,
@@ -262,7 +265,7 @@ SaveReply ==
     /\ replyCopy' = [op |-> flight, sid |-> receipts[flight].sid,
                      token |-> receipts[flight].token]
     /\ UNCHANGED <<current, rows, policy, token, revision, nextSession,
-                   obligations, inbound, claims, references,
+                   obligations, inbound, claims, references, exchangeSlots,
                    transport, ownerSession, ownerToken, ownerRows,
                    issued, recipes, receipts, flight, stage, requestAlive,
                    consumed, floor, epoch, running,
@@ -275,7 +278,7 @@ ReplayReply ==
     /\ replyCopy.op # flight
     /\ hFlags' = hFlags \cup {"OldReplyIgnored"}
     /\ UNCHANGED <<current, rows, policy, token, revision, nextSession,
-                   obligations, inbound, claims, references,
+                   obligations, inbound, claims, references, exchangeSlots,
                    transport, ownerSession, ownerToken, ownerRows,
                    issued, recipes, receipts, flight, stage, requestAlive,
                    consumed, floor, replyCopy, epoch, running,
@@ -288,7 +291,7 @@ ResolveAdmission ==
     \* Source termination does not turn this unknown commit into rejection.
     /\ consumed' = consumed \cup {1} /\ hConsumed' = hConsumed \cup {1}
     /\ UNCHANGED <<current, rows, policy, token, revision, nextSession,
-                   obligations, inbound, claims, references,
+                   obligations, inbound, claims, references, exchangeSlots,
                    transport, ownerSession, ownerToken, ownerRows,
                    issued, recipes, receipts, flight, stage, requestAlive,
                    floor, replyCopy, epoch, running,
@@ -302,7 +305,7 @@ CollectPrefix ==
        /\ receipts' = [receipts EXCEPT ![o] = NoOutcome]
        /\ recipes' = [recipes EXCEPT ![o] = NoRecipe]
        /\ UNCHANGED <<current, rows, policy, token, revision, nextSession,
-                      obligations, inbound, claims, references,
+                      obligations, inbound, claims, references, exchangeSlots,
                       transport, ownerSession, ownerToken, ownerRows,
                       issued, flight, stage, requestAlive, replyCopy, epoch,
                       running, hCreated, hClosed, hExpired, hExecuted,
@@ -319,7 +322,7 @@ FinishOther ==
     /\ obligations' = obligations \ {Other} /\ references' = references - 1
     /\ hOtherFinished' = TRUE
     /\ UNCHANGED <<current, rows, policy, token, revision, nextSession,
-                   inbound, claims, transport, ownerSession, ownerToken,
+                   inbound, claims, exchangeSlots, transport, ownerSession, ownerToken,
                    ownerRows, issued, recipes, receipts, flight, stage,
                    requestAlive, consumed, floor, replyCopy, epoch, running,
                    hCreated, hClosed, hExpired, hExecuted, hConsumed,
@@ -334,7 +337,7 @@ Crash ==
     /\ requestAlive' = FALSE
     /\ stage' = IF stage = "Known" THEN "Unknown" ELSE stage
     /\ UNCHANGED <<current, rows, policy, token, revision, nextSession,
-                   obligations, inbound, claims, references,
+                   obligations, inbound, claims, references, exchangeSlots,
                    issued, recipes, receipts, flight, consumed, floor,
                    replyCopy, epoch, hCreated, hClosed, hExpired, hExecuted,
                    hConsumed, hWrongClose, hOtherFinished, hFlags>>
@@ -353,6 +356,7 @@ OpenEpoch ==
        /\ revision' = [i \in Ids |-> IF i \in removed THEN 0 ELSE revision[i]]
        /\ obligations' = obligations \ victims /\ inbound' = inbound \ victims
        /\ claims' = claims \ victims /\ references' = references - CleanupCount(victims)
+       /\ exchangeSlots' = exchangeSlots - RemovedSlots(victims)
        /\ ownerRows' = remaining
        /\ hClosed' = hClosed \cup removed /\ hExpired' = hExpired \cup expected
        /\ hFlags' = hFlags
@@ -370,7 +374,7 @@ DuplicateOpenEpoch ==
             IF current # 0 /\ policy[current] = "Zero"
                THEN {"DuplicateOpeningPreservedZero"} ELSE {}
     /\ UNCHANGED <<current, rows, policy, token, revision, nextSession,
-                   obligations, inbound, claims, references,
+                   obligations, inbound, claims, references, exchangeSlots,
                    transport, ownerSession, ownerToken, ownerRows,
                    issued, recipes, receipts, flight, stage, requestAlive,
                    consumed, floor, replyCopy, epoch, running,
@@ -404,7 +408,7 @@ TypeOK ==
     /\ token \in [Ids -> 0..MaxOps] /\ revision \in [Ids -> 0..1]
     /\ nextSession \in 3..(MaxSessionId + 1)
     /\ obligations \subseteq Ids /\ inbound \subseteq Ids /\ claims \subseteq Ids
-    /\ references \in (-3)..3
+    /\ references \in (-3)..3 /\ exchangeSlots \in 0..2
     /\ transport \in BOOLEAN /\ ownerSession \in 0..MaxSessionId
     /\ ownerToken \in 0..MaxOps /\ ownerRows \subseteq Ids
     /\ issued \in 1..MaxOps /\ recipes \in [Ops -> Recipes]
@@ -427,7 +431,8 @@ ActiveMetadata == /\ Active(current) \subseteq rows
                   /\ \A s \in Active(current) : policy[s] \in Policies
                   /\ claims \subseteq obligations
                   /\ obligations \cup inbound \subseteq Active(current)
-CreditsExact == references = Cardinality(obligations) + Cardinality(inbound)
+CreditsExact == /\ references = Cardinality(obligations)
+                /\ exchangeSlots = Cardinality(inbound) + Cardinality(claims)
 OtherResponsibilityPreserved == ~hOtherFinished => Other \in obligations
 NoStaleClose == ~hWrongClose
 NoZeroAfterRestart == rows \cap hExpired = {}
@@ -449,5 +454,5 @@ NoCleanupWitness ==
       /\ Cardinality(hCreated) > Capacity
       /\ rows = Active(current) /\ floor >= 3
       /\ {"ResumedToZero", "ZeroTakeoverFresh", "UnknownSurvivedClosure"} \subseteq hFlags
-      /\ obligations = {Other} /\ inbound = {} /\ references = 1
+      /\ obligations = {Other} /\ inbound = {} /\ references = 1 /\ exchangeSlots = 0
 =============================================================================

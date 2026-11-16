@@ -54,7 +54,8 @@ remain codec/system-test obligations outside this model.
 
 The initial state includes one already committed, still unknown QoS2 admission
 by SessionId2. Its immutable shared payload has two destination obligations,
-one claim for target2 and one inbound marker for source2: three references.
+one claim for target2 and one inbound marker for source2: two payload references
+and two exchange-slot credits.
 This initialized admission is a finite fixture for the specification, not a
 product fixture or an observation fabricated after execution.
 
@@ -62,8 +63,9 @@ Closing/replacing a session atomically removes its physical row, its inbound
 marker, its own destination obligation/claim and corresponding references.
 The other destination's obligation remains even after the producer disappears.
 `FinishOther` models its independent durable terminal action and returns its
-last reference once. Claim state is a subset of obligations and does not add a
-second payload reference. Exact counters distinguish cancellation from delivery
+last reference once. Claim state is a subset of obligations and adds an exchange slot, not a
+second payload reference. An inbound marker adds an exchange slot and keeps
+publication metadata, not another payload reference. Exact counters distinguish cancellation from delivery
 success. The model abstracts finite preflight and the existing bounded cleanup
 helpers; it does not establish their Rust iteration or allocation bounds.
 
@@ -132,7 +134,7 @@ universal proof over all possible executions.
 | - | - |
 | `SessionRowsBounded`, `SessionIdentitiesMonotone` | At most two physical/owner rows; removed incarnations never become active or reuse an allocated identity. |
 | `BusinessRevisionStable`, `ActiveMetadata` | Policy/attachment changes do not invalidate business revisions; claims and responsibilities have active destinations. |
-| `CreditsExact`, `OtherResponsibilityPreserved` | Reference count matches the remaining responsibilities, and source/target cleanup cannot cancel the other destination. |
+| `CreditsExact`, `OtherResponsibilityPreserved` | Payload references and exchange slots match their distinct holders; source/target cleanup cannot cancel the other destination. |
 | `NoStaleClose`, `OwnerReadyAuthentic` | Frozen old guard/reply cannot authorize deletion or readiness for a new binding. |
 | `NoZeroAfterRestart` | Every Zero session selected at actual startup is absent after that cut and cannot resurrect. |
 | `UnknownResultsRetained`, `ClosedPrefixConsumed` | A removed source does not erase unresolved receipts, and retirement cannot cross an unconsumed result. |
@@ -157,32 +159,38 @@ by any TLC counterexample.
 
 ## Correspondence
 
-This table records intended implementation predicates, not executed Rust
-replays. At the public interface freeze used to create this model the shared
-types exist in [`session.rs`](../../crates/mqttiumd-contract/src/session.rs)
-and the historical cardinality regression exists in
-[`session_lifecycle.rs`](../../crates/mqttiumd-store-sqlite/tests/session_lifecycle.rs).
-The latter was still red before the implementation. The sidecar deliberately
-has no `tests` entries or refinement status. Complete and receive the exact
-implementation-test correspondence on the integrated revision; do not infer
-it from this specification run.
+The shared types are in
+[`session.rs`](../../crates/mqttiumd-contract/src/session.rs). Store lifecycle
+regressions are in
+[`session_lifecycle.rs`](../../crates/mqttiumd-store-sqlite/tests/session_lifecycle.rs),
+owner tests in
+[`owner/sessions.rs`](../../crates/mqttiumd-core/src/owner/sessions.rs), and
+transport tests in
+[`runtime_tests.rs`](../../crates/mqttiumd/src/runtime_tests.rs).
+
+The table identifies concrete implementation checks and the separate model
+configurations. Test names describe coverage, not a claim that this model-only
+lot executed the Rust/system suites or established a trace refinement. The
+integrated reception records those executions against its own SHA. The sidecar
+therefore retains `specification` and `tests: []`: no exact TLC-counterexample
+Rust replay is registered as a refinement. Gaps remain explicit below.
 
 | Model action | Implementation predicate | Replay |
 | - | - | - |
-| `SubmitOpen` | Canonical SessionLifecycle Open, old transport closed before the durable cut. | Safety/cleanup configurations; concrete core/runtime replay owed at integration. |
-| `SubmitClose` | Immutable SessionGuard from confirmed transport, same-operation receipt path. | `mut-old-token`; concrete saved-Close replay owed at integration. |
-| `CommitOpen` | Store transaction compares expected SessionId/token, resumes or atomically replaces without an extra active slot. | Safety/cleanup configurations; concrete Open store replay owed at integration. |
-| `CommitClose` | Guarded destination-only removal and exact ref cleanup. | Terminal/other/credit mutants; existing512-cycle cardinality regression needs the integrated store fix. |
-| `ResolveResult` | ResolveAndFence returns the same OperationId terminal facts. | Safety/startup configurations; lost lifecycle reply replay owed at integration. |
-| `ApplyResult` | Correlated known result updates owner/session cache before CONNACK, preserving dead-transport guard. | Safety/startup configurations; late Open result replay owed at integration. |
-| `EndPendingTransport` | Pending request cancellation retained despite closed-generation ring eviction. | Safety/startup configurations; runtime early-close replay owed at integration. |
-| `SaveReply` | Test retains an authentic correlated lifecycle response. | Safety/startup configurations; response-copy replay owed at integration. |
-| `ReplayReply` | Old response cannot acquire a new flight's operation/token. | Safety/startup configurations; stale response replay owed at integration. |
-| `ResolveAdmission` | Detached old admission consumes its own result without recreating input or emitting to retired source. | Cleanup witness; unknown old admission replay owed at integration. |
-| `CollectPrefix` | Existing receipt consumer advances only a contiguous consumed prefix. | Cleanup witness; existing receipt-closure model independently covers its detailed contract. |
-| `ReplayCommand` | Existing retained receipt/retired floor prevents any execution with that old identity. | Both safety configurations; detailed canonical replay remains covered by receipt reception. |
-| `FinishOther` | Guarded Finish on the surviving destination returns its last ref independently. | Safety/startup configurations; shared-payload termination replay owed at integration. |
-| `Crash` | Prior process connections disappear while durable objects and receipt guards remain. | Startup configuration; actual process/signal scenarios owed to system reception. |
-| `OpenEpoch` | Actual new epoch transaction removes zero-policy sessions before grant and recovery. | Startup and `mut-resume-zero`; actual startup replay owed at integration. |
-| `DuplicateOpenEpoch` | Already-opened epoch response does not run zero-expiry cleanup again. | Startup configuration; duplicate-opening store replay owed at integration. |
-| `Idle` | No fairness or latency assumption. | Every configuration; useful product progress remains system evidence. |
+| `SubmitOpen` | Canonical SessionLifecycle Open; old transport closes before the durable cut. | Core `five_hundred_twelve_ephemeral_lifecycles_leave_only_bounded_rings`, `full_capacity_refuses_a_new_name_but_clean_start_replaces_in_one_slot`; actual close-before-open transport ordering is received separately by the system suite. |
+| `SubmitClose` | Immutable SessionGuard from confirmed transport, through the receipted path. | Store `lifecycle_replay_and_attachment_cas_preserve_business_state`; core `resuming_an_infinite_session_with_zero_expiry_rebinds_before_later_closure` checks the old token/generation. |
+| `CommitOpen` | Store compares expected SessionId/token; resume preserves business revision and replacement needs no extra active slot. | Store `lifecycle_replay_and_attachment_cas_preserve_business_state`, `replacement_at_the_full_session_quota_reuses_only_its_own_slot`; safety/cleanup configurations. |
+| `CommitClose` | Atomic destination-only removal and exact payload-reference/exchange-slot cleanup. | Store `loaded_termination_cancels_only_its_target_and_keeps_shared_payloads`; cardinality regressions `memory_session_cycles_do_not_retain_terminal_history`, `sqlite_session_cycles_do_not_retain_terminal_history`; terminal/other/credit mutants. |
+| `ResolveResult` | ResolveAndFence returns the same OperationId terminal facts. | Core `unknown_closure_keeps_capacity_and_resolves_the_same_operation`; genuine lost writer outcomes remain separate system evidence. |
+| `ApplyResult` | Correlated known result updates owner/cache before CONNACK and retains a dead-request guard. | Core `a_new_ephemeral_session_ends_and_releases_the_owner_slot`, `closing_an_unknown_open_survives_eviction_from_the_closed_generation_ring`; safety/startup configurations. |
+| `EndPendingTransport` | Pending request cancellation survives closed-generation ring eviction. | Core `closing_an_unknown_open_survives_eviction_from_the_closed_generation_ring`; actual sockets remain a runtime/system obligation. |
+| `SaveReply` | A test retains an authentic already correlated response. | Safety/startup configurations; product retention/duplication is an explicit system injection, not synthesized by a different operation. |
+| `ReplayReply` | An old response cannot acquire a newer flight's OperationId or attachment. | Core `unknown_closure_keeps_capacity_and_resolves_the_same_operation` checks an old duplicate after application; replay after another incarnation must also be received by the system suite. |
+| `ResolveAdmission` | Detached old business flights consume their own results without recreating work or emitting to the retired source. | Core `lifecycle_retired_unknown_inbound_result_closes_its_receipt_hole_without_ack` and `lifecycle_retired_claim_finish_and_consume_results_close_receipt_holes_without_emitting`; cleanup witness. The model's single admission hole abstracts those separate tested command paths. |
+| `CollectPrefix` | Receipt consumer advances only a contiguous consumed prefix. | Store `receipted_ephemeral_cycles_collect_without_reusing_session_or_attachment_identities`; the independent receipt-closure model checks the detailed floor contract. |
+| `ReplayCommand` | Retained canonical receipt or compact retired floor prevents old-operation execution. | Store `lifecycle_replay_and_attachment_cas_preserve_business_state`, `receipted_ephemeral_cycles_collect_without_reusing_session_or_attachment_identities`; exact recipe and retired-result checks remain distinct. |
+| `FinishOther` | Guarded Finish on the surviving destination returns its last ref independently of the source's deletion. | Store `loaded_termination_cancels_only_its_target_and_keeps_shared_payloads` terminates the surviving obligations and checks final zero counters. |
+| `Crash` | Old process connections disappear while durable objects/receipt guards survive. | Startup configuration; store reopen/failed-commit tests do not replace the separate real-process SIGKILL witnesses. |
+| `OpenEpoch` | A genuinely new epoch removes Zero sessions before grant and recovery. | Store `only_an_actual_epoch_open_expires_zero_sessions_and_commit_failure_is_atomic`; `mut-resume-zero`. |
+| `DuplicateOpenEpoch` | An already-opened epoch response does not repeat zero-expiry cleanup. | Store `only_an_actual_epoch_open_expires_zero_sessions_and_commit_failure_is_atomic` creates a current-epoch Zero session before repeating the opener; startup configuration. |
+| `Idle` | No fairness, timing or useful-progress assumption. | Every configuration;512-cycle public-client capacity recovery remains system evidence. |
