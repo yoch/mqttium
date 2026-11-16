@@ -444,7 +444,19 @@ async def numbered_deliveries(broker: Broker, case: Path, count: int):
 
 def verify_normal_bounds(evidence: dict, final_storage: dict):
     """Explicit long-run receipt/quota evidence, independent of traffic count."""
-    return None
+    samples = [window["storage"] for window in evidence["windows"]] + [final_storage]
+    for sample in samples:
+        require(int(sample["metadata"]["limit_receipt_slots"], 16) == 8192, "receipt_limit_changed")
+        require(sample["counts"].get("operations", 0) + sample["counts"].get("fences", 0) <= 8192,
+                "physical_receipt_limit_exceeded")
+    floors = [max((int(row["consumed_through"], 16)
+                   for row in sample["retirement"].get("receipt_origins", [])), default=0)
+              for sample in samples]
+    advances = sum(right > left for left, right in zip([0] + floors, floors))
+    applied = evidence["event_counts"].get("receipt_collection_applied", 0)
+    require(advances >= 4 and applied >= 5, "receipt_collection_not_observed")
+    return {"sampled_nonzero_advances": advances, "applied_collection_facts": applied,
+            "sampled_floors": floors, "unchanged_receipt_limit": 8192}
 
 
 def normal_long(binary: Path, case: Path, count=TARGET_DELIVERIES):
