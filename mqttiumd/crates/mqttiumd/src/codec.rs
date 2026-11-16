@@ -969,4 +969,109 @@ mod tests {
             [0x50, 2, 0, 7]
         );
     }
+
+    #[test]
+    fn server_only_disconnect_reasons_are_protocol_errors_from_a_client() {
+        kind(decode(0xe0, &[0x87], BOUNDS), ErrorKind::Protocol);
+    }
+
+    #[test]
+    fn a_refusal_never_sends_a_reason_from_the_wrong_packet_role() {
+        let version = Error {
+            kind: ErrorKind::Unsupported,
+            code: "UnsupportedProtocolVersion",
+            reason: 0x84,
+        };
+        assert_eq!(refusal(version, true), [0x20, 3, 0, 0x84, 0]);
+        assert_eq!(refusal(version, false), [0xe0, 2, 0x83, 0]);
+        let impossible_success = Error {
+            reason: 0,
+            ..version
+        };
+        assert_eq!(refusal(impossible_success, false), [0xe0, 2, 0x83, 0]);
+    }
+
+    #[test]
+    fn field_bounds_accept_the_boundary_and_refuse_one_byte_more() {
+        let client = vec![b'c'; BOUNDS.max_client_id];
+        assert!(decode(0x10, &connect(EXPIRY, &client), BOUNDS).is_ok());
+        let body = |topic: &[u8], payload: &[u8]| {
+            let mut b = (topic.len() as u16).to_be_bytes().to_vec();
+            b.extend_from_slice(topic);
+            b.extend_from_slice(&[0, 7, 0]);
+            b.extend_from_slice(payload);
+            b
+        };
+        let topic = vec![b't'; BOUNDS.max_topic];
+        let payload = vec![b'x'; BOUNDS.max_payload];
+        assert!(decode(0x34, &body(&topic, &payload), BOUNDS).is_ok());
+        kind(
+            decode(
+                0x34,
+                &body(&vec![b't'; BOUNDS.max_topic + 1], &payload),
+                BOUNDS,
+            ),
+            ErrorKind::Oversized,
+        );
+        kind(
+            decode(
+                0x34,
+                &body(&topic, &vec![b'x'; BOUNDS.max_payload + 1]),
+                BOUNDS,
+            ),
+            ErrorKind::Oversized,
+        );
+    }
+
+    #[test]
+    fn utf8_bom_is_preserved_and_unsupported_tails_are_validated() {
+        let id = b"\xef\xbb\xbfclient";
+        let Packet::Connect(c) = decode(0x10, &connect(EXPIRY, id), BOUNDS).unwrap() else {
+            panic!("CONNECT")
+        };
+        assert_eq!(c.client_id.as_slice(), id);
+        let mut will = connect(EXPIRY, b"will-client");
+        will[7] = 4;
+        kind(decode(0x10, &will, BOUNDS), ErrorKind::Malformed);
+        will.extend_from_slice(&[0, 0, 3, b'a', b'/', b'b', 0, 0]);
+        kind(decode(0x10, &will, BOUNDS), ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn a_finite_header_and_body_mutation_sweep_never_panics_or_owns_over_budget_fields() {
+        let cases = [
+            (0x10, connect(EXPIRY, b"bounded-client")),
+            (0x34, b"\0\x03a/b\0\x07\0payload".to_vec()),
+            (0x62, vec![0, 7]),
+            (0xc0, vec![]),
+            (0xe0, vec![]),
+            (0x82, b"\0\x01\0\0\x03a/#\x02".to_vec()),
+        ];
+        let mut attempts = 0usize;
+        let mut check = |first, body: &[u8]| {
+            if let Ok(Packet::Core(InboundPacket::Publish { topic, payload, .. })) =
+                decode(first, body, BOUNDS)
+            {
+                assert!(topic.len() <= BOUNDS.max_topic && payload.len() <= BOUNDS.max_payload);
+            }
+            attempts += 1;
+        };
+        for first in 0..=u8::MAX {
+            let _ = header(&[first, 0], BOUNDS.max_packet);
+            check(first, &[]);
+        }
+        for (first, body) in cases {
+            for end in 0..=body.len() {
+                check(first, &body[..end]);
+            }
+            for index in 0..body.len() {
+                for byte in [0, 0x80, 0xff] {
+                    let mut changed = body.clone();
+                    changed[index] = byte;
+                    check(first, &changed);
+                }
+            }
+        }
+        assert!(attempts < 2048);
+    }
 }
