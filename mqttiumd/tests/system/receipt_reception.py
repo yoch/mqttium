@@ -583,6 +583,15 @@ def operation_floor(state: dict, operation: dict) -> int:
     return matching[0] if matching else 0
 
 
+def wait_control_or_pressure(broker, control, *, after: int, pressure_ready,
+                             timeout: float = 12, clock=None):
+    """Wait for a business response or its explicit causal pressure witness."""
+    frame = control.poll(.3)
+    if frame is None or (frame.kind == 0x90 and any(code >= 128 for code in decode_filter_ack(frame)[1])):
+        return frame, broker.wait_event("receipt_window_pressure", after=after, timeout=2)
+    return frame, None
+
+
 def unknown_hole(binary: Path, case: Path) -> dict:
     broker = Broker(binary, case, test_control=True)
     held = HeldBusiness(broker, case)
@@ -614,9 +623,9 @@ def unknown_hole(binary: Path, case: Path) -> dict:
             pressure = None
             for attempt in range(1, 1026):
                 control.send(subscribe_packet(1, [("reception/receipt-pressure", attempt % 2)]))
-                frame = control.poll(.3)
-                if frame is None or (frame.kind == 0x90 and any(code >= 128 for code in decode_filter_ack(frame)[1])):
-                    pressure = broker.wait_event("receipt_window_pressure", after=int(hit["seq"]), timeout=2)
+                frame, pressure = wait_control_or_pressure(
+                    broker, control, after=int(hit["seq"]), pressure_ready=lambda event: True)
+                if pressure is not None:
                     require(pressure["details"]["code"] in
                             ("receipt_window_business_full", "receipt_window_total_full"),
                             "wrong_pressure_reason")
