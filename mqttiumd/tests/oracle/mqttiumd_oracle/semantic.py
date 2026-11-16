@@ -938,7 +938,7 @@ def _by_schema(contracts, document, out):
 # (record 0014), and the kinds an inventory holds at most once.
 FACT_RANKS = (
     "Epoch", "Limits", "RouteTable", "Route", "Session", "InboundExchange",
-    "OutboundDelivery", "Operation",
+    "OutboundDelivery", "ReceiptFrontier", "Operation",
 )
 FACTS_ONCE = ("Epoch", "Limits", "RouteTable")
 
@@ -1007,6 +1007,8 @@ def _key(value):
 # diagnostic points. The schema says what a member is; its value never
 # does: topic bytes made of decimal digits are bytes.
 _SNAPSHOT_KEYS = [
+    ("/receipt_frontiers", [("/origin/incarnation", "decimal"), ("/origin/epoch", "decimal"),
+                            ("/origin/owner", "decimal")], "/origin"),
     ("/sessions", [("/session", "decimal")], "/session"),
     ("/route_table/routes", [("/topic_hex", "bytes")], "/topic_hex"),
     ("/operations", [("/operation_id", "scoped")], "/operation_id"),
@@ -1081,6 +1083,15 @@ def _product_event(contracts, document, out):
     if "operation" in document:
         for member in ("incarnation", "epoch", "owner", "sequence"):
             _u64(document, f"/operation/{member}", out)
+    if document["kind"] in {
+        "receipt_collection_submitted", "receipt_collection_result", "receipt_collection_applied",
+        "log_rotated",
+    } or document.get("command_kind") == "ReceiptCollection":
+        for member in ("incarnation", "epoch", "owner", "through", "publication_through",
+                       "payload_through", "retained", "retained_from", "previous_last_seq",
+                       "discarded_through"):
+            if member in document.get("details", {}):
+                _u64(document, f"/details/{member}", out)
 
 
 _RULES = {

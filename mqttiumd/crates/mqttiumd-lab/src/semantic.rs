@@ -15,6 +15,7 @@ use mqttiumd_contract::ids::{
 };
 use mqttiumd_contract::outcome::Knowledge;
 use mqttiumd_contract::packet::{Qos, SharedBytes};
+use mqttiumd_contract::receipts::{ReceiptClosure, ReceiptOrigin};
 use serde_json::Value;
 
 use crate::diagnostic::{Diagnostic, MAX_DIAGNOSTICS, Report, code};
@@ -147,6 +148,32 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
                         &format!("/operation/{member}"),
                         &mut report.diagnostics,
                     );
+                }
+            }
+            if matches!(
+                text(document, "kind"),
+                "receipt_collection_submitted"
+                    | "receipt_collection_result"
+                    | "receipt_collection_applied"
+                    | "log_rotated"
+            ) || text(document, "command_kind") == "ReceiptCollection"
+            {
+                for member in [
+                    "incarnation",
+                    "epoch",
+                    "owner",
+                    "through",
+                    "publication_through",
+                    "payload_through",
+                    "retained",
+                    "retained_from",
+                    "previous_last_seq",
+                    "discarded_through",
+                ] {
+                    let pointer = format!("/details/{member}");
+                    if document.pointer(&pointer).is_some() {
+                        u64_at(document, &pointer, &mut report.diagnostics);
+                    }
                 }
             }
         }
@@ -1509,6 +1536,9 @@ pub fn representative_fact(kind: &str, topic_hex: &str) -> Option<RecoveredFact>
         PublicationSeq::new(0),
     );
     Some(match kind {
+        "ReceiptFrontier" => {
+            RecoveredFact::ReceiptFrontier(ReceiptClosure::empty(ReceiptOrigin::of(zero)))
+        }
         "Epoch" => RecoveredFact::Epoch {
             incarnation: StoreIncarnation::new(0),
             epoch: RunEpoch::new(0),
@@ -1660,7 +1690,16 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
         &'static [(&'static str, KeyKind)],
         &'static str,
     );
-    const TABLES: [Table; 9] = [
+    const TABLES: [Table; 10] = [
+        (
+            "/receipt_frontiers",
+            &[
+                ("/origin/incarnation", KeyKind::Decimal),
+                ("/origin/epoch", KeyKind::Decimal),
+                ("/origin/owner", KeyKind::Decimal),
+            ],
+            "/origin",
+        ),
         ("/sessions", &[("/session", KeyKind::Decimal)], "/session"),
         (
             "/route_table/routes",
@@ -1755,7 +1794,10 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
 /// Names of the members that hold a 64-bit decimal string, in a trace
 /// payload or a snapshot. A test walks the schemas and fails when one of
 /// their 64-bit members is missing here.
-const COMPONENTS: [&str; 43] = [
+const COMPONENTS: [&str; 46] = [
+    "through",
+    "publication_through",
+    "payload_through",
     "incarnation",
     "process_incarnation",
     "epoch",

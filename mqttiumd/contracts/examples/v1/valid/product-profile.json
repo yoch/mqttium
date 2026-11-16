@@ -49,5 +49,11 @@
   ],
   "max_volatile_deliveries": 128,
   "volatile_payload_reference_bytes": 4194304,
-  "outbox_slots": 128
+  "outbox_slots": 128,
+  "receipt_window": 1024,
+  "receipt_data_window": 768,
+  "receipt_control_reserve": 512,
+  "receipt_collection_rows": 128,
+  "receipt_collection_trigger": 64,
+  "max_receipt_origins": 64
 }

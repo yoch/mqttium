@@ -13,6 +13,7 @@
     "meta",
     "sessions",
     "route_table",
+    "receipt_frontiers",
     "operations",
     "fences",
     "payloads",
@@ -818,6 +819,14 @@
             "const": "MayHaveStarted"
           }
         }
+      }
+    },
+    "receipt_frontiers": {
+      "description": "Compact committed guards by origin (incarnation, epoch, owner), at most 64. A zero registration carries no retired commands. Not every physical row below a guard need have been deleted; accounting describes actual retained rows.",
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "$ref": "primitives.schema.json#/$defs/receipt_closure"
       }
     }
   }

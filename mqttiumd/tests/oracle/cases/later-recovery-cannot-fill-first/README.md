@@ -12,6 +12,7 @@ current contract identity explicitly; an old-digest or schema rejection
 does not count as detection. It also constructs a structurally valid
 partial inventory of startup 2 from these observations.
 
-The descriptive snapshots include the empty outgoing-claim table of ADR 0025.
+The descriptive snapshots include the empty outgoing-claim table of ADR 0025
+and empty compact receipt-frontier table of ADR 0027.
 Their citations were regenerated with that format; the missing first inventory
 and the synthetic history are unchanged.

@@ -313,7 +313,8 @@
         "Snapshot",
         "Inspect",
         "Recovery",
-        "Work"
+        "Work",
+        "Maintenance"
       ]
     },
     "processControlCode": {
@@ -356,6 +357,51 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 4294967295
+        }
+      }
+    },
+    "receipt_origin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "incarnation",
+        "epoch",
+        "owner"
+      ],
+      "properties": {
+        "incarnation": {
+          "$ref": "#/$defs/u64"
+        },
+        "epoch": {
+          "$ref": "#/$defs/u64"
+        },
+        "owner": {
+          "$ref": "#/$defs/u64"
+        }
+      }
+    },
+    "receipt_closure": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A committed non-execution prefix, not a rejection receipt. Physical rows below the boundary may remain until later bounded sweeps. Identity boundaries are producer issuance guards, never reconstructed from the largest retained admission.",
+      "required": [
+        "origin",
+        "through",
+        "publication_through",
+        "payload_through"
+      ],
+      "properties": {
+        "origin": {
+          "$ref": "#/$defs/receipt_origin"
+        },
+        "through": {
+          "$ref": "#/$defs/u64"
+        },
+        "publication_through": {
+          "$ref": "#/$defs/u64"
+        },
+        "payload_through": {
+          "$ref": "#/$defs/u64"
         }
       }
     }

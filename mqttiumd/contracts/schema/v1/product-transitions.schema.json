@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "Bounded product pub/sub transition subset",
+  "title": "Bounded product transition subsets",
   "description": "Descriptive product transitions with system-test scope. This is a subset, not a complete guard partition or an extension of the fixture-based qualifier.",
   "type": "object",
   "additionalProperties": false,
@@ -22,10 +22,16 @@
       "const": 1
     },
     "id": {
-      "const": "tcp-qos0-exact-pubsub-v1"
+      "enum": [
+        "tcp-qos0-exact-pubsub-v1",
+        "tcp-receipt-maintenance-v1"
+      ]
     },
     "decision": {
-      "const": "0026"
+      "enum": [
+        "0026",
+        "0027"
+      ]
     },
     "scope": {
       "const": "product-system-tests"
@@ -65,7 +71,8 @@
               "SubscriptionMutation",
               "OutgoingQos1",
               "VolatileQos0",
-              "ConsumedQos0"
+              "ConsumedQos0",
+              "ReceiptMaintenance"
             ]
           },
           "state_class": {
@@ -80,7 +87,12 @@
               "Terminal",
               "ConsumePending",
               "EmissionPending",
-              "Dropped"
+              "Dropped",
+              "WindowOpen",
+              "GapBlocked",
+              "CollectionPending",
+              "FrontierKnown",
+              "ClosedEpochPending"
             ]
           },
           "event_class": {
@@ -103,7 +115,12 @@
               "Terminal",
               "ConsumePending",
               "EmissionPending",
-              "Dropped"
+              "Dropped",
+              "WindowOpen",
+              "GapBlocked",
+              "CollectionPending",
+              "FrontierKnown",
+              "ClosedEpochPending"
             ]
           },
           "required_actions": {
@@ -143,5 +160,45 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "const": "tcp-qos0-exact-pubsub-v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "const": "0026"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "const": "tcp-receipt-maintenance-v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "const": "0027"
+          }
+        }
+      }
+    }
+  ]
 }

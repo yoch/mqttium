@@ -12,10 +12,10 @@ use mqttiumd_contract::command::{
     ChangeSubscriptions, ClaimDelivery, Command, ConsumeDelivery, FinishDelivery, FrozenRecipe,
     Recipe, UpdateSubscriptions,
 };
-use mqttiumd_contract::effects::{Effect, EffectSink, OwnedEffect, SubmitResult};
+use mqttiumd_contract::effects::{Effect, EffectSink, OwnedEffect, RecoveredFact, SubmitResult};
 use mqttiumd_contract::ids::{
-    DeliveryId, EffectId, EffectSeq, LogicalOwnerId, OperationId, OutboundPacketId, Revision,
-    SessionId, StoreIncarnation,
+    DeliveryId, EffectId, EffectSeq, LogicalOwnerId, OperationId, OperationSeq, OutboundPacketId,
+    PayloadSeq, PublicationSeq, Revision, RunEpoch, SessionId, StoreIncarnation,
 };
 use mqttiumd_contract::packet::{Qos, SharedBytes};
 use mqttiumd_contract::pubsub::{GrantedSubscriptionChange, SubscriptionChange};
@@ -90,6 +90,7 @@ fn a_snapshot_after_a_commit_is_the_example_of_the_corpus() {
         "checkpoint",
         "backend",
         "sessions",
+        "receipt_frontiers",
         "fences",
         "payloads",
         "publications",
@@ -118,6 +119,38 @@ fn a_snapshot_after_a_commit_is_the_example_of_the_corpus() {
         );
     }
     assert!(written["meta"]["opened_by"]["startup_hex"].is_string());
+}
+
+/// Descriptive format coverage, not a claim that this artificial frontier was
+/// obtained by the producer's consumption protocol.
+#[test]
+fn compact_receipt_frontier_snapshot_and_recovery_fact_match_the_examples() {
+    use mqttiumd_contract::receipts::{ReceiptClosure, ReceiptOrigin};
+
+    let closure = ReceiptClosure {
+        origin: ReceiptOrigin {
+            incarnation: StoreIncarnation::new(1),
+            epoch: RunEpoch::new(1),
+            owner: LogicalOwnerId::new(0),
+        },
+        through: OperationSeq::new(1),
+        publication_through: PublicationSeq::new(1),
+        payload_through: PayloadSeq::new(1),
+    };
+    let store = MemoryStore::create(StoreIncarnation::new(1), fixture_limits());
+    let mut state = store.snapshot().unwrap();
+    state.receipt_frontiers.insert(closure.origin, closure);
+    let written = snapshot(&state, CONTEXT);
+    accepted(&workspace(), &written);
+    assert_eq!(
+        written["receipt_frontiers"],
+        example("store-snapshot-receipt-frontier-collected.json")["receipt_frontiers"]
+    );
+    let fact = recovered_fact(&RecoveredFact::ReceiptFrontier(closure));
+    assert_eq!(
+        fact,
+        example("trace-record-recovery-page-receipt-frontier.json")["payload"]["facts"][3]
+    );
 }
 
 /// New product rows retain the exact durable identities that their public

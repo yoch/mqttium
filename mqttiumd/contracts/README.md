@@ -217,7 +217,7 @@ and a fixture alike, and the semantic pass refuses a value above
 4294967295 (`u32-out-of-range`). The facts of a page follow the order
 of an inventory, which is the rule of `RecoveryOrder::admit`: `Epoch`,
 `Limits`, `RouteTable`, `Route`, `Session`, `InboundExchange`,
-`Operation`, ranks never decreasing; the first three at most once
+`OutboundDelivery`, `ReceiptFrontier`, `Operation`, ranks never decreasing; the first three at most once
 (`duplicate-name`); routes sorted by the bytes of their topic, equal
 topics accepted (`rows-out-of-order` for a rank or a topic out of place).
 A reader of documents sees one page. That the pages of one recovery form
@@ -323,6 +323,7 @@ oracle and never an input of the broker.
 | `meta` | Store incarnation; the last opened epoch (every earlier one is closed) and the attempt that opened it; the revision frontier; the next session |
 | `sessions` | SessionId, ClientID bytes, revision, state. A deleted session stays, terminal |
 | `route_table` | Its revision, and each exact topic with its target sessions and their QoS |
+| `receipt_frontiers` | At most 64 committed producer-origin guards, ordered by incarnation, epoch, owner; explicit operation/publication/payload boundaries, distinct from rejection receipts |
 | `operations` | Receipts: OperationId, the exact canonical bytes of the recipe, the terminal decision with its content (commit facts, or the reason of a certain rejection) |
 | `fences` | Identities fenced without a recipe: definitively not executable |
 | `payloads` | PayloadId, length, digest, count of live obligations that refer to it |
@@ -335,6 +336,13 @@ Every table is present, even empty: an absent table is not an empty one.
 What is volatile (a command in transit, a transaction in preparation, a
 result not yet delivered, the control state of an opening) is not in a
 snapshot; the trace shows it.
+
+ADR 0027 adds compact receipt frontiers. A frontier is committed durable
+non-execution knowledge, even while a bounded sweep leaves physical receipt
+rows below it. It does not say that an old operation had no effect. Historical
+recipes can be unavailable after collection; retained canonical bytes are still
+compared. Positive live frontiers remain outside the existing fixture-based
+qualifier. Empty frontiers and zero registration do not extend that scope.
 
 The revision of the route table is what the store writes; the oracle
 never computes it. The store advances it at each `AddRoute`, so the

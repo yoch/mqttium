@@ -1718,7 +1718,7 @@
       }
     },
     "recovered_fact": {
-      "description": "One fact of a recovery page, as the store adapter reads it from the store the broker opened. The semantic pass enforces the order of the facts of a page: Epoch, Limits, RouteTable, Route, Session, InboundExchange, OutboundDelivery, Operation.",
+      "description": "One fact of a recovery page, as the store adapter reads it from the store the broker opened. The semantic pass enforces the order of the facts of a page: Epoch, Limits, RouteTable, Route, Session, InboundExchange, OutboundDelivery, ReceiptFrontier, Operation.",
       "type": "object",
       "required": [
         "kind"
@@ -1733,6 +1733,7 @@
             "Session",
             "InboundExchange",
             "OutboundDelivery",
+            "ReceiptFrontier",
             "Operation"
           ]
         }
@@ -2040,6 +2041,46 @@
                 }
               }
             ]
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ReceiptFrontier"
+              }
+            }
+          },
+          "then": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "origin",
+              "through",
+              "publication_through",
+              "payload_through"
+            ],
+            "properties": {
+              "kind": {
+                "const": "ReceiptFrontier"
+              },
+              "origin": {
+                "$ref": "primitives.schema.json#/$defs/receipt_origin"
+              },
+              "through": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "publication_through": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "payload_through": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              }
+            }
           }
         },
         {

@@ -413,6 +413,39 @@ class Campaign(unittest.TestCase):
         (self.campaign / "run-result.json").write_text(json.dumps(self.result))
         self.assertEqual(self.refused(), self.unqualified(results.FIXTURE_QOS0_SCOPE))
 
+    def test_live_receipt_frontier_is_readable_but_not_fixture_qualified(self):
+        def frontier(value):
+            value["receipt_frontiers"] = [{
+                "origin": {"incarnation": "1", "epoch": "1", "owner": "0"},
+                "through": "1", "publication_through": "1", "payload_through": "1",
+            }]
+
+        self.revise_evidence(snapshot_edit=frontier)
+        self.assertEqual(self.produce_rebuilt(), ["not qualifying: " + results.FIXTURE_RECEIPT_SCOPE])
+        self.assertTrue(all(entry["status"] == "PASS" for entry in self.result["assertions"]))
+        self.assertEqual((self.result["qualification"], self.result["verdict"]),
+                         ("provisional", "INCONCLUSIVE"))
+        # A forged qualifying result must fail R1 at recompute as well.
+        self.result.update(qualification="qualifying", verdict="PASS", exit_code=0, reasons=[])
+        (self.campaign / "run-result.json").write_text(json.dumps(self.result))
+        self.assertEqual(self.refused(), self.unqualified(results.FIXTURE_RECEIPT_SCOPE))
+
+    def test_receipt_scope_refusal_does_not_soften_an_established_failure(self):
+        def conflict(value):
+            value["receipt_frontiers"] = [{
+                "origin": {"incarnation": "1", "epoch": "1", "owner": "0"},
+                "through": "1", "publication_through": "1", "payload_through": "1",
+            }]
+            if value["checkpoint"] == "final":
+                value["operations"][0]["recipe_hex"] += "00"
+
+        self.revise_evidence(snapshot_edit=conflict)
+        self.assertEqual(self.produce_rebuilt(), ["not qualifying: " + results.FIXTURE_RECEIPT_SCOPE])
+        self.assertEqual((self.result["qualification"], self.result["verdict"]),
+                         ("provisional", "FAIL"))
+        statuses = {entry["name"]: entry["status"] for entry in self.result["assertions"]}
+        self.assertEqual(statuses["same_recipe_for_op_A"], "FAIL")
+
     def test_new_qos_grant_recipe_is_readable_without_extending_qualification(self):
         source = ROOT / "contracts/examples/v1/valid/store-snapshot-subscription-qos0-receipt.json"
         update = json.loads(source.read_text())["operations"][-1]

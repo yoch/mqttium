@@ -1557,6 +1557,19 @@ PAGE = {
 }
 PAGE_READ = record(14, "store-adapter", 2, "RecoveryPageRead", PAGE)
 ok("trace-record-recovery-page-read.json", PAGE_READ)
+RECEIPT_FRONTIER = {
+    "origin": {"incarnation": "1", "epoch": "1", "owner": "0"},
+    "through": "1", "publication_through": "1", "payload_through": "1",
+}
+frontier_page = copy.deepcopy(PAGE)
+frontier_page["facts"].insert(-1, {"kind": "ReceiptFrontier", **RECEIPT_FRONTIER})
+ok("trace-record-recovery-page-receipt-frontier.json",
+   record(14, "store-adapter", 2, "RecoveryPageRead", frontier_page))
+late_frontier_page = copy.deepcopy(frontier_page)
+late_frontier_page["facts"][-2:] = reversed(late_frontier_page["facts"][-2:])
+bad("trace-record-recovery-page-late-frontier.json", "rows-out-of-order", "/payload/facts/4/kind",
+    "Compact retirement frontiers precede operation facts; they are not rejection facts.",
+    record(14, "store-adapter", 2, "RecoveryPageRead", late_frontier_page))
 OUTBOUND_QUEUED = {
     "kind": "OutboundDelivery",
     "delivery_id": {"publication_id": PUBLICATION, "index": 0},
@@ -2234,6 +2247,7 @@ LIMITS = {name: fixture["capacities"][name] for name in SIZES} | {
 EXCHANGE = {"session": "1", "generation": "1"}
 snapshot = env(
     "mqttiumd.store-snapshot",
+    receipt_frontiers=[],
     run_id="p1-02-example",
     checkpoint="after_commit_before_crash",
     backend="sim-store",
@@ -2414,6 +2428,33 @@ consumed_snapshot["obligations"].pop(0)
 consumed_snapshot["payloads"][0]["references"] = "1"
 consumed_snapshot["account"]["used"].update(references="1", receipt_slots="2")
 ok("store-snapshot-delivery-consume-receipt.json", consumed_snapshot)
+retained_frontier_snapshot = copy.deepcopy(snapshot)
+retained_frontier_snapshot["receipt_frontiers"] = [copy.deepcopy(RECEIPT_FRONTIER)]
+ok("store-snapshot-receipt-frontier-retained-rows.json", retained_frontier_snapshot)
+collected_snapshot = copy.deepcopy(retained_frontier_snapshot)
+collected_snapshot["operations"] = []
+collected_snapshot["account"]["used"]["receipt_slots"] = "0"
+ok("store-snapshot-receipt-frontier-collected.json", collected_snapshot)
+bad("store-snapshot-receipt-frontier-missing-bound.json", "schema-violation",
+    "/receipt_frontiers/0", "All three durable identity boundaries are explicit.",
+    edited(collected_snapshot, lambda v: v["receipt_frontiers"][0].pop("payload_through")))
+bad("store-snapshot-receipt-frontier-duplicate.json", "duplicate-name", "/receipt_frontiers/1/origin",
+    "There is one compact frontier per origin, not per operation.",
+    edited(collected_snapshot, lambda v: v["receipt_frontiers"].append(copy.deepcopy(RECEIPT_FRONTIER))))
+bad("store-snapshot-receipt-frontier-out-of-order.json", "rows-out-of-order", "/receipt_frontiers/1/origin",
+    "Origins sort numerically by incarnation, epoch and owner.",
+    edited(collected_snapshot, lambda v: v["receipt_frontiers"].insert(0, {
+        **RECEIPT_FRONTIER, "origin": {**RECEIPT_FRONTIER["origin"], "owner": "2"}})))
+bad("store-snapshot-receipt-frontier-origin-limit.json", "schema-violation", "/receipt_frontiers",
+    "Compact origin guards are bounded independently of retained receipt rows.",
+    edited(collected_snapshot, lambda v: v.update(receipt_frontiers=[{
+        **RECEIPT_FRONTIER, "origin": {**RECEIPT_FRONTIER["origin"], "owner": str(owner)}}
+        for owner in range(65)])))
+for component in ("through", "publication_through", "payload_through"):
+    bad(f"store-snapshot-receipt-frontier-{component}-overflow.json", "u64-out-of-range",
+        f"/receipt_frontiers/0/{component}", "Prefix boundaries are checked u64 decimal strings.",
+        edited(collected_snapshot, lambda v, component=component:
+               v["receipt_frontiers"][0].update({component: OVER})))
 bad("store-snapshot-consumed-with-packet-id.json", "schema-violation", "/operations/1/decision/facts",
     "A consumed QoS 0 obligation never has an outgoing MQTT Packet Identifier.",
     edited(consumed_snapshot, lambda v: v["operations"][1]["decision"]["facts"].update(packet_id=1)))
@@ -2421,6 +2462,7 @@ ok(
     "store-snapshot-empty.json",
     env(
         "mqttiumd.store-snapshot",
+        receipt_frontiers=[],
         run_id="p1-02-example",
         checkpoint="initial",
         backend="sqlite",
@@ -3342,6 +3384,11 @@ for kind_name, origin in [
 ok("product-profile.json", json.loads((V1 / "product-profile.json").read_text()))
 product_transitions = json.loads((V1 / "pubsub.transitions.json").read_text())
 ok("product-pubsub-transitions.json", product_transitions)
+receipt_transitions = json.loads((V1 / "receipts.transitions.json").read_text())
+ok("product-receipt-transitions.json", receipt_transitions)
+bad("product-receipt-transitions-wrong-decision.json", "schema-violation", "/decision",
+    "The receipt subset refers to its own proposed decision, without relabeling the pub/sub subset.",
+    {**receipt_transitions, "decision": "0026"})
 bad("product-transitions-claiming-complete.json", "schema-violation", "/partition_complete",
     "The product transition subset is not a complete guard partition.",
     {**product_transitions, "partition_complete": True})
@@ -3354,6 +3401,23 @@ bad("product-transitions-duplicate-rule.json", "duplicate-name", "/rules/1/id",
 product_event = env("mqttiumd.product-event", seq="1", kind="startup_refused", pid=1,
                     cause="InvalidData", phase="Snapshot", details={"code": "durable_read"})
 ok("product-event.json", product_event)
+maintenance_event = env("mqttiumd.product-event", seq="8", kind="receipt_collection_applied", pid=1,
+    command_kind="ReceiptCollection", details={"effect": "1/0/9", "incarnation": "1", "epoch": "1",
+    "owner": "0", "through": "64", "publication_through": "32", "payload_through": "32",
+    "limit": 128, "attempt": 1, "outcome": "Applied", "removed": 64, "retained": "8", "more": False})
+ok("product-receipt-collection.json", maintenance_event)
+ok("product-receipt-prepared.json", env("mqttiumd.product-event", seq="9", kind="barrier_hit", pid=1,
+    point="receipt.close.prepared", command_kind="ReceiptCollection", details={
+    "incarnation": "1", "epoch": "1", "owner": "0", "through": "64",
+    "publication_through": "32", "payload_through": "32"}))
+ok("product-maintenance-read-refused.json", env("mqttiumd.product-event", seq="10", kind="runtime_refused",
+    pid=1, cause="Io", phase="Maintenance", details={"code": "durable_read"}))
+bad("product-receipt-collection-overflow.json", "u64-out-of-range", "/details/through",
+    "Maintenance uses stable scalar decimal identity guards, not diagnostic text.",
+    edited(maintenance_event, lambda v: v["details"].update(through="18446744073709551616")))
+bad("product-receipt-collection-fake-operation.json", "schema-violation", "",
+    "Collection is a dedicated control and does not invent an OperationId or recursive receipt.",
+    {**maintenance_event, "operation": OP})
 ok("product-ack-receipt.json", env("mqttiumd.product-event", seq="2", kind="barrier_hit", pid=1,
    connection="1", point="ack.receipt", details={"effect":"2/0/7", "packet_id":1,
    "publish_order":"3", "bytes":4, "socket_write_complete":True}))

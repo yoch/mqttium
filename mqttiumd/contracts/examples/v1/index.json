@@ -50,6 +50,7 @@
     "contracts/examples/v1/valid/trace-record-deadline-armed.json",
     "contracts/examples/v1/valid/trace-record-deadline-delivered.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-read.json",
+    "contracts/examples/v1/valid/trace-record-recovery-page-receipt-frontier.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-outbound-queued.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-outbound-claimed.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-outbound-qos0.json",
@@ -74,6 +75,8 @@
     "contracts/examples/v1/valid/store-snapshot-delivery-finish-receipt.json",
     "contracts/examples/v1/valid/store-snapshot-subscription-qos0-receipt.json",
     "contracts/examples/v1/valid/store-snapshot-delivery-consume-receipt.json",
+    "contracts/examples/v1/valid/store-snapshot-receipt-frontier-retained-rows.json",
+    "contracts/examples/v1/valid/store-snapshot-receipt-frontier-collected.json",
     "contracts/examples/v1/valid/store-snapshot-empty.json",
     "contracts/examples/v1/valid/store-snapshot-orphan-obligation.json",
     "contracts/examples/v1/valid/store-snapshot-refused-and-fenced.json",
@@ -96,7 +99,11 @@
     "contracts/examples/v1/valid/wide.catalog.json",
     "contracts/examples/v1/valid/product-profile.json",
     "contracts/examples/v1/valid/product-pubsub-transitions.json",
+    "contracts/examples/v1/valid/product-receipt-transitions.json",
     "contracts/examples/v1/valid/product-event.json",
+    "contracts/examples/v1/valid/product-receipt-collection.json",
+    "contracts/examples/v1/valid/product-receipt-prepared.json",
+    "contracts/examples/v1/valid/product-maintenance-read-refused.json",
     "contracts/examples/v1/valid/product-ack-receipt.json",
     "contracts/examples/v1/valid/product-puback-credit.json"
   ],
@@ -780,6 +787,12 @@
       "why": "S0 fixtures hold persistent sessions only."
     },
     {
+      "file": "contracts/examples/v1/invalid/trace-record-recovery-page-late-frontier.json",
+      "code": "rows-out-of-order",
+      "pointer": "/payload/facts/4/kind",
+      "why": "Compact retirement frontiers precede operation facts; they are not rejection facts."
+    },
+    {
       "file": "contracts/examples/v1/invalid/trace-record-recovery-page-qos0-claim.json",
       "code": "schema-violation",
       "pointer": "/payload/facts/3/claim",
@@ -1198,6 +1211,48 @@
       "code": "u64-out-of-range",
       "pointer": "/outbound/0/claim_operation_id/sequence",
       "why": "Outgoing claim rows retain bounded identities, unique DeliveryIds and valid packet identifiers."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-receipt-frontier-missing-bound.json",
+      "code": "schema-violation",
+      "pointer": "/receipt_frontiers/0",
+      "why": "All three durable identity boundaries are explicit."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-receipt-frontier-duplicate.json",
+      "code": "duplicate-name",
+      "pointer": "/receipt_frontiers/1/origin",
+      "why": "There is one compact frontier per origin, not per operation."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-receipt-frontier-out-of-order.json",
+      "code": "rows-out-of-order",
+      "pointer": "/receipt_frontiers/1/origin",
+      "why": "Origins sort numerically by incarnation, epoch and owner."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-receipt-frontier-origin-limit.json",
+      "code": "schema-violation",
+      "pointer": "/receipt_frontiers",
+      "why": "Compact origin guards are bounded independently of retained receipt rows."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-receipt-frontier-through-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/receipt_frontiers/0/through",
+      "why": "Prefix boundaries are checked u64 decimal strings."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-receipt-frontier-publication_through-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/receipt_frontiers/0/publication_through",
+      "why": "Prefix boundaries are checked u64 decimal strings."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-receipt-frontier-payload_through-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/receipt_frontiers/0/payload_through",
+      "why": "Prefix boundaries are checked u64 decimal strings."
     },
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-consumed-with-packet-id.json",
@@ -1830,6 +1885,12 @@
       "why": "A kind of record is stated by its one origin; another may not state it."
     },
     {
+      "file": "contracts/examples/v1/invalid/product-receipt-transitions-wrong-decision.json",
+      "code": "schema-violation",
+      "pointer": "/decision",
+      "why": "The receipt subset refers to its own proposed decision, without relabeling the pub/sub subset."
+    },
+    {
       "file": "contracts/examples/v1/invalid/product-transitions-claiming-complete.json",
       "code": "schema-violation",
       "pointer": "/partition_complete",
@@ -1846,6 +1907,18 @@
       "code": "duplicate-name",
       "pointer": "/rules/1/id",
       "why": "Each documented product transition has one stable identifier."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-receipt-collection-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/details/through",
+      "why": "Maintenance uses stable scalar decimal identity guards, not diagnostic text."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-receipt-collection-fake-operation.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "Collection is a dedicated control and does not invent an OperationId or recursive receipt."
     },
     {
       "file": "contracts/examples/v1/invalid/product-event-untyped-cause.json",

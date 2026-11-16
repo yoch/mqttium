@@ -24,6 +24,7 @@ use mqttiumd_contract::outcome::{
     CommitFacts, Knowledge, RejectReason, StoreOutcome, StoreReply, StoreViolation,
 };
 use mqttiumd_contract::packet::Qos;
+use mqttiumd_contract::receipts::ReceiptClosure;
 
 use super::adapter::{Answer, FaultId, FaultPoint, StoreEvent, Uncorrelated, WorkId, WorkKind};
 use super::durable::{Decision, DurableState, ObligationPhase, SessionState};
@@ -31,6 +32,19 @@ use super::durable::{Decision, DurableState, ObligationPhase, SessionState};
 /// A 64-bit value, as every JSON format of the bench writes it.
 fn decimal(value: u64) -> Value {
     Value::String(value.to_string())
+}
+
+fn receipt_closure(closure: ReceiptClosure) -> Value {
+    json!({
+        "origin": {
+            "incarnation": decimal(closure.origin.incarnation.get()),
+            "epoch": decimal(closure.origin.epoch.get()),
+            "owner": decimal(closure.origin.owner.get()),
+        },
+        "through": decimal(closure.through.get()),
+        "publication_through": decimal(closure.publication_through.get()),
+        "payload_through": decimal(closure.payload_through.get()),
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -358,6 +372,8 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
             "routes": routes,
         },
         "operations": operations,
+        "receipt_frontiers": state.receipt_frontiers.values().copied()
+            .map(receipt_closure).collect::<Vec<_>>(),
         "fences": fences,
         "payloads": payloads,
         "publications": publications,
@@ -392,6 +408,11 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
 #[must_use]
 pub fn recovered_fact(fact: &RecoveredFact) -> Value {
     match fact {
+        RecoveredFact::ReceiptFrontier(closure) => {
+            let mut fact = receipt_closure(*closure);
+            fact["kind"] = json!("ReceiptFrontier");
+            fact
+        }
         RecoveredFact::Epoch { incarnation, epoch } => json!({
             "kind": "Epoch",
             "incarnation": decimal(incarnation.get()),

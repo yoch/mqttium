@@ -217,6 +217,7 @@ def snapshot(run, checkpoint, admissions, releases=(), open_exchange=True, epoch
                 }
             ],
         },
+        "receipt_frontiers": [],
         "operations": sorted(
             [
                 {

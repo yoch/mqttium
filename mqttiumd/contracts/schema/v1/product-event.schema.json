@@ -74,7 +74,9 @@
         "finish.committed",
         "consume.prepared",
         "consume.committed",
-        "consume.emission"
+        "consume.emission",
+        "receipt.close.prepared",
+        "receipt.close.committed"
       ]
     },
     "command_kind": {
@@ -84,7 +86,8 @@
         "Subscriptions",
         "Claim",
         "Finish",
-        "Consume"
+        "Consume",
+        "ReceiptCollection"
       ]
     },
     "cause": {
@@ -105,7 +108,8 @@
         "Snapshot",
         "Inspect",
         "Recovery",
-        "Work"
+        "Work",
+        "Maintenance"
       ]
     },
     "details": {
@@ -131,5 +135,26 @@
         ]
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "command_kind"
+        ],
+        "properties": {
+          "command_kind": {
+            "const": "ReceiptCollection"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "operation"
+          ]
+        }
+      }
+    }
+  ]
 }

@@ -43,7 +43,13 @@
     "granted_subscription_qos",
     "max_volatile_deliveries",
     "volatile_payload_reference_bytes",
-    "outbox_slots"
+    "outbox_slots",
+    "receipt_window",
+    "receipt_data_window",
+    "receipt_control_reserve",
+    "receipt_collection_rows",
+    "receipt_collection_trigger",
+    "max_receipt_origins"
   ],
   "properties": {
     "format": {
@@ -178,6 +184,24 @@
     },
     "outbox_slots": {
       "const": 128
+    },
+    "receipt_window": {
+      "const": 1024
+    },
+    "receipt_data_window": {
+      "const": 768
+    },
+    "receipt_control_reserve": {
+      "const": 512
+    },
+    "receipt_collection_rows": {
+      "const": 128
+    },
+    "receipt_collection_trigger": {
+      "const": 64
+    },
+    "max_receipt_origins": {
+      "const": 64
     }
   }
 }

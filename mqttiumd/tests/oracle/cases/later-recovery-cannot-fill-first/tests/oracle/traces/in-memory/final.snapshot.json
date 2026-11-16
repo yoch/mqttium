@@ -189,5 +189,6 @@
       "max_route_targets": "8"
     }
   },
-  "outbound": []
+  "outbound": [],
+  "receipt_frontiers": []
 }
