@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 
-from pi_reception import FinishCursor, WireOccurrences
+from pi_reception import FinishCursor, WireOccurrences, verify_normal_bounds
 from tcp_probe import Frame, FrameDecoder, ReceiptFailure, packet, utf8
 
 
@@ -23,6 +23,30 @@ def publish(number, identifier=1):
 
 
 class PiWireTests(unittest.TestCase):
+    def long_evidence(self, floors=(64, 128, 192, 256), limit=8192):
+        def snapshot(floor):
+            return {"metadata": {"limit_receipt_slots": limit.to_bytes(8, "big").hex()},
+                    "counts": {"operations": 3, "fences": 0},
+                    "retirement": {"receipt_origins": [{"consumed_through": floor.to_bytes(8, "big").hex()}]}}
+        return ({"windows": [{"storage": snapshot(floor)} for floor in floors],
+                 "event_counts": {"receipt_collection_applied": len(floors) + 1}}, snapshot(floors[-1]))
+
+    def test_receipt_registration_alone_does_not_prove_active_collection(self):
+        evidence, final = self.long_evidence((0, 0, 0, 0))
+        with self.assertRaises(ReceiptFailure) as raised:
+            verify_normal_bounds(evidence, final)
+        self.assertEqual(raised.exception.code, 'receipt_collection_not_observed')
+
+    def test_changed_receipt_quota_cannot_be_hidden_in_long_summary(self):
+        evidence, final = self.long_evidence(limit=16384)
+        with self.assertRaises(ReceiptFailure) as raised:
+            verify_normal_bounds(evidence, final)
+        self.assertEqual(raised.exception.code, 'receipt_limit_changed')
+
+    def test_multiple_real_floor_advances_and_unchanged_quota_are_received(self):
+        evidence, final = self.long_evidence()
+        verify_normal_bounds(evidence, final)
+
     def test_product_cursor_starts_at_the_real_sequence_one(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "broker.events.jsonl"

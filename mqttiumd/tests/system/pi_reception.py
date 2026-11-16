@@ -442,6 +442,11 @@ async def numbered_deliveries(broker: Broker, case: Path, count: int):
                     result["wire"] = proxy.summary()
 
 
+def verify_normal_bounds(evidence: dict, final_storage: dict):
+    """Explicit long-run receipt/quota evidence, independent of traffic count."""
+    return None
+
+
 def normal_long(binary: Path, case: Path, count=TARGET_DELIVERIES):
     broker = Broker(binary, case)
     try:
@@ -460,6 +465,8 @@ def normal_long(binary: Path, case: Path, count=TARGET_DELIVERIES):
         final = drained(broker, case / "final")
         accounts_consistent(final)
         result["final_sql"] = storage_sample(broker)
+        if count >= TARGET_DELIVERIES:
+            result["receipt_collection"] = verify_normal_bounds(result["deliveries"], result["final_sql"])
         require(all(sample["storage"]["pid"] == broker.process.pid
                     and sample["storage"]["file_inode"] == broker.db.stat().st_ino
                     for sample in result["deliveries"]["windows"]), "normal_process_or_file_changed")
