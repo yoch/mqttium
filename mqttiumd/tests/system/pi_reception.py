@@ -25,7 +25,7 @@ from external_mqttium import client_identity
 from pubsub_probe import PubsubWire, decode_publish, durable, puback_packet, session_key
 from pubsub_reception import accounts_consistent, assignment, drained, until
 from pubsub_reception import Client, publisher
-from receipt_reception import PahoPeer, storage_sample
+from receipt_reception import PahoPeer, storage_sample, wait_committed_resolution
 from tcp_probe import (Frame, FrameDecoder, ReceiptFailure, operation_hex, packet,
                        publish_packet, pubrel_packet, require, write_json)
 from tcp_reception import Broker, writer_available
@@ -531,6 +531,103 @@ def require_live_assignment(broker, target, expected, case, code):
     return state
 
 
+def uncertainty(binary: Path, case: Path, *, finish: bool):
+    """Short real-SQL uncertainty, with no later ACK overtaking an earlier one."""
+    broker = Broker(binary, case, test_control=True)
+    result = {"criterion": "C-finish" if finish else "C-claim", "status": "PASS"}
+    try:
+        result["ready"] = broker.ready()
+        with PubsubWire(broker.address, broker.observations, "uncertain-target") as target, \
+                PubsubWire(broker.address, broker.observations, "uncertain-source") as source:
+            target.connect("pi-uncertain-target", session_present=False, receive_maximum=2, keep_alive=0)
+            target.subscribe(1, [("reception/pi-uncertain-a", 1), ("reception/pi-uncertain-b", 1),
+                                 ("reception/pi-uncertain-c", 1)])
+            source.connect("pi-uncertain-source", session_present=False, keep_alive=0)
+            file = "hold-finish-result" if finish else "hold-claim-result"
+            if not finish:
+                (broker.control / file).touch(exist_ok=False)
+            source.publish(1, "reception/pi-uncertain-a", b"uncertain-A", qos=1)
+            if finish:
+                first = target.next_publication()
+                first_fact = queued_publication(broker)
+                require(first.packet_id == 1, "first_identifier_not_one")
+                (broker.control / file).touch(exist_ok=False)
+                target.acknowledge(first)
+            held = broker.wait_event("store_result_held")
+            require(held.get("command_kind") == ("Finish" if finish else "Claim")
+                    and held["details"]["outcome"] == "Committed", "wrong_outgoing_result_held")
+            state = durable(broker.db)
+            session = session_key(state, "pi-uncertain-target")
+            if finish:
+                require(state["counts"]["outbound"] == 0, "held_finish_not_committed")
+            else:
+                assigned = assignment(state, session)["row"]
+                require(assigned["packet_id"] == 1 and assigned["claim"] == operation_hex(held["operation"]),
+                        "held_claim_not_committed")
+            write_json(case / "actual-committed-result-unknown.json", state)
+            result["held"] = held
+            source.publish(2, "reception/pi-uncertain-b", b"uncertain-B", qos=1)
+            def second_assignment():
+                current = durable(broker.db)
+                rows = [row for row in current["tables"]["outbound"] if row["target"] == session]
+                if not finish and len(rows) < 2:
+                    return None
+                return rows
+            assigned_rows = until(second_assignment, "second_claim_not_discovered", ACTION_TIMEOUT)
+            require({row["packet_id"] for row in assigned_rows} == ({2} if finish else {1, 2}),
+                    "pi_freed_before_finish_known" if finish else "unknown_claim_identifier_reused")
+            target.send(b"\xc0\x00")
+            target.wait(0xD0)
+            # A different destination retains an independent control/window.
+            with PubsubWire(broker.address, broker.observations, "independent-target") as other:
+                other.connect("pi-independent-target", session_present=False, keep_alive=0)
+                other.subscribe(1, [("reception/pi-independent", 1)])
+                source.publish(3, "reception/pi-independent", b"independent", qos=1)
+                independent = other.next_publication()
+                other.acknowledge(independent)
+                result["independent_progress"] = independent.observation()
+            release_after = latest_sequence(broker)
+            (broker.control / file).unlink()
+            result["resolved"] = wait_committed_resolution(broker, held["operation"], after=release_after,
+                                                           timeout=15)
+            if finish:
+                known_finish(broker, first_fact["details"]["delivery"], after=release_after)
+                second = target.next_publication()
+                require(second.packet_id == 2 and second.payload == b"uncertain-B", "unknown_finish_slot_was_reused")
+                source.publish(4, "reception/pi-uncertain-c", b"after-known-C", qos=1)
+                third = target.next_publication()
+                require(third.packet_id == 1 and third.payload == b"after-known-C" and not third.dup,
+                        "known_finish_did_not_make_identifier_available")
+                before = durable(broker.db)
+                rows_before = [row for row in before["tables"]["outbound"] if row["target"] == session]
+                target.publish(1, "reception/pi-inbound-only", b"same-integer-other-direction", qos=1)
+                target.publish_qos0("reception/pi-inbound-only", b"qos0-no-wire-slot")
+                target.send(b"\xc0\x00"); target.wait(0xD0)
+                after = durable(broker.db)
+                require([row for row in after["tables"]["outbound"] if row["target"] == session] == rows_before,
+                        "incoming_packet_released_outgoing_identifier")
+                # B was sent before C: terminal ACKs retain that wire order.
+                target.acknowledge(second)
+                target.acknowledge(third)
+                result["publications"] = [first.observation(), second.observation(), third.observation()]
+            else:
+                received = [target.next_publication(timeout=15), target.next_publication(timeout=15)]
+                require({publication.payload for publication in received} == {b"uncertain-A", b"uncertain-B"}
+                        and {publication.packet_id for publication in received} == {1, 2},
+                        "resolved_claim_occurrence_changed")
+                for publication in received:
+                    target.acknowledge(publication)
+                result["publications"] = [publication.observation() for publication in received]
+            drained(broker, case / "final")
+        result["final_sql"] = storage_sample(broker)
+        result["stop_status"] = broker.stop()
+        writer_available(broker.db)
+        write_json(case / "observation.json", result)
+        return result
+    finally:
+        broker.cleanup()
+
+
 def copied_ack(binary: Path, case: Path, *, no_target=False, takeover=False):
     """Replay a real already-associated copy; the original is never withheld."""
     broker = Broker(binary, case, test_control=True)
@@ -718,7 +815,7 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--binary-source-head")
-    parser.add_argument("--case", choices=("B", "reverse", "smoke", "D-copy", "D-none", "D-takeover",
+    parser.add_argument("--case", choices=("B", "reverse", "smoke", "C-claim", "C-finish", "D-copy", "D-none", "D-takeover",
                                           "E-claim", "E-observed", "E-finish"), default="B")
     parser.add_argument("--count", type=int)
     args = parser.parse_args()
@@ -732,7 +829,9 @@ def main():
                          "sha256": hashlib.sha256(args.binary.read_bytes()).hexdigest()}, "cases": []}
     try:
         count = args.count if args.count is not None else 128 if args.case == "smoke" else TARGET_DELIVERIES
-        if args.case.startswith("D-"):
+        if args.case.startswith("C-"):
+            case = uncertainty(args.binary.resolve(), args.out / args.case, finish=args.case == "C-finish")
+        elif args.case.startswith("D-"):
             case = copied_ack(args.binary.resolve(), args.out / args.case,
                               no_target=args.case == "D-none", takeover=args.case == "D-takeover")
         elif args.case.startswith("E-"):
