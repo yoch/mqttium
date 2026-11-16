@@ -50,6 +50,8 @@ pub fn recipe_kind(recipe: &Recipe) -> &'static str {
         Recipe::ChangeSubscriptions(_) => "Subscriptions",
         Recipe::ClaimDelivery(_) => "Claim",
         Recipe::FinishDelivery(_) => "Finish",
+        Recipe::ConsumeDelivery(_) => "Consume",
+        Recipe::UpdateSubscriptions(_) => "Subscriptions",
     }
 }
 #[derive(Clone, Debug)]
@@ -191,7 +193,7 @@ impl Writer {
                                 #[cfg(feature="test-hooks")]
                                 {
                                     let hc=hooks.clone();let ev=events.clone();let stop=cancel.clone();
-                                    let point=match kind {"Admission"=>"admission.prepared","Release"=>"release.prepared","Subscriptions"=>"subscription.prepared","Claim"=>"claim.prepared",_=>"finish.prepared"};
+                                    let point=match kind {"Admission"=>"admission.prepared","Release"=>"release.prepared","Subscriptions"=>"subscription.prepared","Claim"=>"claim.prepared","Consume"=>"consume.prepared",_=>"finish.prepared"};
                                     // The hook is inside the actual transaction, after all writes and before COMMIT.
                                     let hook=Box::new(move|p|{if p==mqttiumd_store_sqlite::kill_points::KillPoint::CommitPrepared && hc.barrier(point,kind,id,&ev,&stop).is_err(){stop.store(true,Ordering::Relaxed);}});
                                     if store.set_kill_hook(Some(hook)).is_err(){cancel.store(true,Ordering::Relaxed);}
@@ -200,7 +202,7 @@ impl Writer {
                                 #[cfg(feature="test-hooks")]
                                 {
                                     let _=store.set_kill_hook(None);
-                                    let point=match kind {"Admission"=>Some("admission.committed"),"Claim"=>Some("claim.committed"),"Finish"=>Some("finish.committed"),_=>None};
+                                    let point=match kind {"Admission"=>Some("admission.committed"),"Claim"=>Some("claim.committed"),"Finish"=>Some("finish.committed"),"Consume"=>Some("consume.committed"),_=>None};
                                     if applied.committed_now && let Some(point)=point && hooks.barrier(point,kind,id,&events,&cancel).is_err(){cancel.store(true,Ordering::Relaxed);}
                                 }
                                 if events.emit("store_result",json!({"operation":operation(id),"command_kind":kind,"details":{"committed_now":applied.committed_now,"wrote":applied.wrote,"outcome":outcome_name(applied.reply)}})).is_err(){cancel.store(true,Ordering::Relaxed);}
@@ -209,7 +211,7 @@ impl Writer {
                                 #[cfg(feature="test-hooks")]
                                 let mut reply=applied.reply;
                                 #[cfg(feature="test-hooks")]
-                                if applied.committed_now && matches!(kind,"Claim"|"Finish") && let Some(dir)=&hooks.directory {
+                                if applied.committed_now && matches!(kind,"Claim"|"Finish"|"Consume") && let Some(dir)=&hooks.directory {
                                     let file=dir.join(format!("drop-next-{}-result",kind.to_ascii_lowercase()));
                                     if file.exists() && std::fs::remove_file(file).is_ok(){
                                         let _=events.emit("store_result_dropped",json!({"operation":operation(id),"command_kind":kind}));
@@ -285,11 +287,11 @@ fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
         .routes
         .values()
         .flatten()
-        .any(|t| t.qos != mqttiumd_contract::packet::Qos::AtLeastOnce)
+        .any(|t| t.qos == mqttiumd_contract::packet::Qos::ExactlyOnce)
         || state
             .obligations
             .values()
-            .any(|o| o.qos != mqttiumd_contract::packet::Qos::AtLeastOnce)
+            .any(|o| o.qos == mqttiumd_contract::packet::Qos::ExactlyOnce)
     {
         return Err(Failure::read(ReadError::InvalidData, ReadPhase::Snapshot));
     }
