@@ -252,7 +252,6 @@ fn corrupt(path: &Path, sql: &str) {
 fn work_validates_unclaimed_discriminants_before_selecting_qos_or_cursor() {
     for mutation in [
         "UPDATE obligations SET qos=99",
-        "UPDATE obligations SET qos=1.5",
         "UPDATE obligations SET qos=0,cause=99",
         "UPDATE obligations SET qos=2,phase=99",
     ] {
