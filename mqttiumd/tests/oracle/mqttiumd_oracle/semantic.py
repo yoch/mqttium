@@ -1061,7 +1061,18 @@ def _store_snapshot(contracts, document, out):
                 previous = key
 
 
+def _product_event(contracts, document, out):
+    """The product format shares the range of the durable identities."""
+    _u64(document, "/seq", out)
+    if "connection" in document:
+        _u64(document, "/connection", out)
+    if "operation" in document:
+        for member in ("incarnation", "epoch", "owner", "sequence"):
+            _u64(document, f"/operation/{member}", out)
+
+
 _RULES = {
+    "mqttiumd.product-event": _product_event,
     "mqttiumd.scenario": _scenario,
     "mqttiumd.fixture": _fixture,
     "mqttiumd.transition-registry": _registry,

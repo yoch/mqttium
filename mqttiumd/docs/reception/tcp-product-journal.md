@@ -54,8 +54,17 @@
   the store cleanup. Only the contexts are refreshed; `expected.json` remains
   byte-identical (SHA-256
   `0c270a3626109a31a3e78704d2d9957c54e33452991274fabe899f05647f9bd7`).
-  A patch refusal is not semantic detection. Replay both complete mutant loops
-  and the clean-source product receipt before the final publication/checks.
+  A patch refusal is not semantic detection. Both complete loops executed at
+  `ca4cfac79e8e041ee148ed92f5e91943aa4e38fb`: 5/5 simulator and 11/11 SQLite
+  controls matched their exact verdict/assertion/reason. Its fresh A–H wrapper
+  and both runtime mutants also passed; archive `ca4cfac7.tar.gz`, SHA-256
+  `d0aa45d5df4f5f62506f2d855bfcd89c5dcd8043a4c5c8b50c42f9b408767d33`.
+- Three generated product-event overflow examples then failed on both readers
+  (u64::MAX + 1 in sequence, connection and operation identity). Explicit
+  semantic range checks now preserve the shared u64 rule; both readers pass.
+  Contract JSON bytes/digest are unchanged. The corpus has 365 derived files,
+  380 schema documents, and the trace corpus remains 405 files. Final source
+  receipts are regenerated; earlier archives keep their original identities.
 - Final SHA-specific CI and fresh K1/K2b/K3 qualification are retained in the
   updated PR and its workflow artifacts. The final source identity is always
   `index.json.source_head`; development archives are never relabelled.

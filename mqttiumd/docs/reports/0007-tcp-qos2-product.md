@@ -101,7 +101,8 @@ process tests do not establish power-loss or universal storage guarantees.
 Proposed record [0022](../decisions/0022-product-tcp-qos2.md) covers the public
 session/close/PING types, metadata lifecycle, product bounds and test hooks.
 New bounded product profile/event formats are registered with both readers,
-with valid/invalid generated examples. The contract digest changes from
+with valid/invalid generated examples, including semantic u64 overflow refusal
+by both independent readers. The contract digest changes from
 `sha256:880b0f581567526780da13b4ea66b29e43d32bb781fbeb64c300f4644e8f8c67` to
 `sha256:775794a5e47f5e1d881f0572cdc3e64fa250d46e796e7474d9c5854c102fa5cc`.
 The four mandatory checks, normal/instrumented suites, both format readers and

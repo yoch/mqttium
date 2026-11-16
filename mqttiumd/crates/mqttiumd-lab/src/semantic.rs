@@ -135,6 +135,21 @@ fn requirements_known(
 /// Runs the semantic pass that matches the format of `document`.
 pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
     match text(document, "format") {
+        "mqttiumd.product-event" => {
+            u64_at(document, "/seq", &mut report.diagnostics);
+            if document.get("connection").is_some() {
+                u64_at(document, "/connection", &mut report.diagnostics);
+            }
+            if document.get("operation").is_some() {
+                for member in ["incarnation", "epoch", "owner", "sequence"] {
+                    u64_at(
+                        document,
+                        &format!("/operation/{member}"),
+                        &mut report.diagnostics,
+                    );
+                }
+            }
+        }
         "mqttiumd.scenario" => scenario(workspace, document, &mut report.diagnostics),
         "mqttiumd.fixture" => fixture(workspace, document, &mut report.diagnostics),
         "mqttiumd.transition-registry" => registry(workspace, document, report),
