@@ -21,6 +21,7 @@ import queue
 import re
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 
@@ -991,6 +992,7 @@ def main() -> int:
     result = {"format": "mqttiumd.receipt-system-reception", "schema_version": 1,
               "qualification": "system-test-only", "source_head": args.binary_source_head or harness,
               "harness_source_head": harness, "binary": {"path": str(args.binary.resolve()), "sha256": digest},
+              "command": [sys.executable, *sys.argv],
               "build_mode": args.build_mode,
               "cases": []}
     try:
