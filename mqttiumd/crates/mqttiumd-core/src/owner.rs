@@ -6862,6 +6862,99 @@ mod tests {
         );
     }
 
+    fn qos0_work_world() -> World {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 1));
+        let _ = world.drain();
+        let mut item = work_item(0);
+        item.qos = Qos::AtMostOnce;
+        load_work(&mut world, &[item], None);
+        world
+    }
+
+    #[test]
+    fn product_qos0_consumption_resolves_original_operation_and_emits_once() {
+        let mut world = qos0_work_world();
+        let consume = pubsub_flight(&mut world, work_available());
+        world.applied(result(&consume, StoreOutcome::PendingOrUnknown));
+        assert!(world.drain().is_empty());
+        assert!(!world.owner.has_ready_work(SessionId::new(PRODUCER)));
+        world.applied(deadline(consume.deadline));
+        let resolve = world.drain();
+        assert!(
+            matches!(resolve[0].1,Effect::ResolveAndFence{operation} if operation==consume.operation)
+        );
+        world.applied(Input::StoreResult {
+            effect: resolve[0].0,
+            operation: consume.operation,
+            reply: StoreReply::Outcome(StoreOutcome::Committed(consume.facts)),
+        });
+        let emission = world.drain();
+        assert_eq!(kinds(&emission), ["EmitQos0"]);
+        world.applied(committed(&consume));
+        assert!(
+            world.drain().is_empty(),
+            "a duplicate committed result grants no second attempt"
+        );
+        let connection = ConnectionKey {
+            session: SessionId::new(PRODUCER),
+            generation: ConnectionGeneration::new(CONN),
+        };
+        world.applied(Input::FrameResult {
+            effect: emission[0].0,
+            connection,
+            progress: FrameProgress::Written {
+                confirmed: 7,
+                total: 7,
+            },
+        });
+        assert!(world.drain().is_empty());
+        assert!(world.owner.pubsub.deliveries.is_empty());
+        let remembered = world
+            .owner
+            .finished
+            .iter()
+            .filter(|f| f.operation == consume.operation)
+            .count();
+        assert_eq!(
+            remembered, 1,
+            "a consumed operation uses one terminal-history entry"
+        );
+        world.applied(committed(&consume));
+        assert!(world.drain().is_empty());
+        world.applied(Input::FrameResult {
+            effect: emission[0].0,
+            connection,
+            progress: FrameProgress::Written {
+                confirmed: 7,
+                total: 7,
+            },
+        });
+        assert!(world.drain().is_empty());
+    }
+
+    #[test]
+    fn product_qos0_late_consumption_results_do_not_close_a_new_generation() {
+        let mut world = qos0_work_world();
+        let consume = pubsub_flight(&mut world, work_available());
+        world.applied(product_settings(CONN + 1, 1));
+        let _ = world.drain();
+        world.applied(connect(CONN + 1, b"p1-producer"));
+        let _ = world.drain();
+        world.applied(result(
+            &consume,
+            StoreOutcome::RejectedCertain(RejectReason::PreconditionFailed),
+        ));
+        assert!(
+            world.drain().is_empty(),
+            "the old refused command must not close the new generation"
+        );
+        assert_eq!(
+            world.owner.connection_of(SessionId::new(PRODUCER)),
+            Some(ConnectionGeneration::new(CONN + 1))
+        );
+    }
+
     fn queued_product() -> World {
         let mut world = product_world();
         world.applied(product_settings(CONN, 1));
