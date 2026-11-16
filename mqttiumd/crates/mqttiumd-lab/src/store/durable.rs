@@ -380,6 +380,18 @@ fn delivery_claim(
 }
 
 fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
+    if state.receipt_frontiers.len() > MAX_RECEIPT_ORIGINS {
+        return Err(ReadError::LimitExceeded);
+    }
+    for (origin, closure) in &state.receipt_frontiers {
+        if *origin != closure.origin
+            || origin.incarnation != state.ledger.incarnation()
+            || origin.epoch.get() == 0
+            || origin.epoch > state.ledger.last_opened()
+        {
+            return Err(ReadError::InvalidData);
+        }
+    }
     let mut rows = 3usize;
     for size in [
         state.routes.len(),
@@ -1167,7 +1179,14 @@ impl Staging for DurableState {
     fn inventory(&self) -> impl Iterator<Item = FactRef<'_>> {
         let incarnation = self.ledger.incarnation();
         let open = self.ledger.open_epoch();
-        let older = move |operation: &OperationId| Some(operation.epoch()) != open;
+        let older = move |operation: &OperationId| {
+            Some(operation.epoch()) != open
+                && !(operation.epoch().get() != 0 && operation.epoch() <= self.collected_through)
+                && !self
+                    .receipt_frontiers
+                    .get(&ReceiptOrigin::of(*operation))
+                    .is_some_and(|closure| operation.sequence() <= closure.through)
+        };
         let epoch = open.map(|epoch| FactRef::Epoch(incarnation, epoch));
         let routes = self.routes.iter().flat_map(|(topic, targets)| {
             targets
@@ -1811,26 +1830,32 @@ impl MemoryStore {
                 more,
             });
         }
-        let mut staged = self.committed.clone();
-        staged.receipt_frontiers.insert(origin, closure);
+        // Prepare only compact metadata (at most 64 origins), not a copy of
+        // every live business object. No fallible work follows the mutation.
+        let mut frontiers = self.committed.receipt_frontiers.clone();
+        frontiers.insert(origin, closure);
+        let Some(revision) = self.committed.revision.checked_add(1) else {
+            return refused(ReceiptCollectionRefusal::Exhausted);
+        };
+        if self.durability == Durability::Failing {
+            return Ok(ReceiptCollectionReply::PendingOrUnknown);
+        }
+        self.committed.receipt_frontiers = frontiers;
         for (operation, fence) in keys {
             if fence {
-                staged.fences.remove(&operation);
+                self.committed.fences.remove(&operation);
             } else {
-                staged.operations.remove(&operation);
+                self.committed.operations.remove(&operation);
             }
         }
-        staged.accounts.receipt_slots = ReceiptSlots::new(retained);
-        if self.commit(staged) {
-            Ok(ReceiptCollectionReply::Applied {
-                closure,
-                removed,
-                retained,
-                more,
-            })
-        } else {
-            Ok(ReceiptCollectionReply::PendingOrUnknown)
-        }
+        self.committed.accounts.receipt_slots = ReceiptSlots::new(retained);
+        self.committed.revision = revision;
+        Ok(ReceiptCollectionReply::Applied {
+            closure,
+            removed,
+            retained,
+            more,
+        })
     }
 
     fn collect_closed_receipts_inner(
@@ -1926,29 +1951,31 @@ impl MemoryStore {
                 more,
             });
         }
-        let mut staged = self.committed.clone();
-        staged.collected_through = through;
+        let Some(revision) = self.committed.revision.checked_add(1) else {
+            return refused(ReceiptCollectionRefusal::Exhausted);
+        };
+        if self.durability == Durability::Failing {
+            return Ok(ClosedReceiptReply::PendingOrUnknown);
+        }
+        self.committed.collected_through = through;
         for (id, fence) in keys {
             if fence {
-                staged.fences.remove(&id);
+                self.committed.fences.remove(&id);
             } else {
-                staged.operations.remove(&id);
+                self.committed.operations.remove(&id);
             }
         }
         for origin in origins {
-            staged.receipt_frontiers.remove(&origin);
+            self.committed.receipt_frontiers.remove(&origin);
         }
-        staged.accounts.receipt_slots = ReceiptSlots::new(retained);
-        if self.commit(staged) {
-            Ok(ClosedReceiptReply::Applied {
-                through,
-                removed,
-                removed_origins,
-                retained,
-                more,
-            })
-        } else {
-            Ok(ClosedReceiptReply::PendingOrUnknown)
-        }
+        self.committed.accounts.receipt_slots = ReceiptSlots::new(retained);
+        self.committed.revision = revision;
+        Ok(ClosedReceiptReply::Applied {
+            through,
+            removed,
+            removed_origins,
+            retained,
+            more,
+        })
     }
 }

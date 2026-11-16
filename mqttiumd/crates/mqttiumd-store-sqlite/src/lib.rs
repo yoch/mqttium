@@ -2124,8 +2124,11 @@ impl SqliteStore {
         // What is established about the operations of older epochs: the
         // epoch is bytes 9 to 16 of the identity, compared as bytes.
         section(
-            "SELECT id, decision, publication, exchange, reason, resource, facts FROM operations
-              WHERE ?1 = ?1 AND substr(id, 9, 8) != ?2 ORDER BY id",
+            "SELECT o.id,o.decision,o.publication,o.exchange,o.reason,o.resource,o.facts FROM operations o
+              WHERE ?1=?1 AND substr(o.id,9,8)!=?2
+                AND (substr(o.id,9,8)=zeroblob(8) OR substr(o.id,9,8)>(SELECT collected_through FROM meta WHERE one=1))
+                AND NOT EXISTS(SELECT 1 FROM receipt_origins r WHERE r.epoch=substr(o.id,9,8) AND r.owner=substr(o.id,17,8) AND substr(o.id,25,8)<=r.consumed_through)
+              ORDER BY o.id",
             &mut out,
             &mut position,
             &mut |row| {
@@ -2144,7 +2147,10 @@ impl SqliteStore {
             },
         )?;
         section(
-            "SELECT id FROM fences WHERE ?1 = ?1 AND substr(id, 9, 8) != ?2 ORDER BY id",
+            "SELECT o.id FROM fences o WHERE ?1=?1 AND substr(o.id,9,8)!=?2
+                AND (substr(o.id,9,8)=zeroblob(8) OR substr(o.id,9,8)>(SELECT collected_through FROM meta WHERE one=1))
+                AND NOT EXISTS(SELECT 1 FROM receipt_origins r WHERE r.epoch=substr(o.id,9,8) AND r.owner=substr(o.id,17,8) AND substr(o.id,25,8)<=r.consumed_through)
+              ORDER BY o.id",
             &mut out,
             &mut position,
             &mut |row| {
