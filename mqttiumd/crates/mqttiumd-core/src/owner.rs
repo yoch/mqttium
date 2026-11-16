@@ -57,11 +57,16 @@ use crate::leases::{LeaseRefused, LeaseTable};
 mod pubsub;
 mod receipts;
 mod sessions;
+pub use sessions::SessionStatus;
 
 /// The largest reservation of effect slots one transition makes. The
 /// constructor of an owner refuses a box that is smaller (ADR 0006,
 /// amendment).
 pub const MAX_TRANSITION_SLOTS: usize = 2;
+/// The opt-in lifecycle path may reserve close + persist + deadline together.
+/// Historical S0 construction keeps its two-slot minimum; an insufficient
+/// lifecycle box receives the existing permanent reservation refusal.
+const MAX_TRANSITION_EFFECTS: usize = 3;
 
 /// How many times the durable termination of one exchange is prepared,
 /// the first one included, while the store refuses it because a
@@ -228,6 +233,8 @@ struct Session {
     revision: Revision,
     /// The connection that is current for the session, if one is.
     connection: Option<ConnectionGeneration>,
+    expiry: crate::contract::session::SessionExpiry,
+    opened_by: Option<OperationId>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -385,6 +392,9 @@ struct Slot {
     /// The durable terminations of the exchange prepared so far.
     release_preparations: u32,
     state: SlotState,
+    /// A known durable lifecycle cut cancelled this session's own exchange.
+    /// Unknown command knowledge remains here until its receipt is consumed.
+    retired: bool,
 }
 
 impl Slot {
@@ -434,6 +444,7 @@ struct Refusal {
 )]
 #[derive(Debug)]
 enum Change {
+    Session(sessions::Change),
     Receipts(receipts::Change),
     Pubsub(pubsub::Change),
     /// The input is absorbed: late, repeated, or answered by effects only.
@@ -517,7 +528,7 @@ enum Change {
 /// their publication.
 #[derive(Debug)]
 struct Effects {
-    items: [Option<OwnedEffect>; MAX_TRANSITION_SLOTS],
+    items: [Option<OwnedEffect>; MAX_TRANSITION_EFFECTS],
     count: usize,
 }
 
@@ -722,6 +733,8 @@ pub struct Owner {
     resolution_delay: LogicalDuration,
     pubsub: pubsub::State,
     receipts: receipts::State,
+    lifecycle: Option<sessions::Flight>,
+    lifecycle_enabled: bool,
     release_continuation: Option<ContinuationId>,
     release_continuations_started: bool,
     /// The one box of this owner. A renewal replaces it in place.
@@ -836,6 +849,8 @@ impl Owner {
             resolution_delay: config.resolution_delay,
             pubsub,
             receipts,
+            lifecycle: None,
+            lifecycle_enabled: false,
             release_continuation: None,
             release_continuations_started: false,
             outbox,
@@ -858,7 +873,25 @@ impl Owner {
             self.outbox
                 .dispatch_receipt_controls(sink, effect, deadline)
         });
-        let mut report = self.outbox.dispatch(sink);
+        let lifecycle = if self.lifecycle_enabled {
+            let flight = self.lifecycle_dispatch();
+            Some(self.outbox.dispatch_session_controls(sink, flight))
+        } else {
+            None
+        };
+        let mut report = if let Some(ref control) = lifecycle
+            && control.blocked.is_some()
+        {
+            DispatchReport {
+                accepted: 0,
+                blocked: control.blocked,
+            }
+        } else {
+            self.outbox.dispatch(sink)
+        };
+        if let Some(control) = lifecycle {
+            report.accepted += control.accepted;
+        }
         if let Some(priority) = priority {
             report.accepted += priority.accepted;
         }
@@ -1025,6 +1058,7 @@ impl Owner {
         let Input::Recovery { facts, last } = input else {
             return WorkUnits::new(
                 1u64.saturating_add(self.pubsub.work_bound(input, self.routes.capacity()))
+                    .saturating_add(self.session_work_bound(input))
                     .saturating_add(self.receipts.work(input))
                     .saturating_add(
                         if self.receipts.enabled
@@ -1083,7 +1117,7 @@ impl Owner {
             owner: self.id,
             counters: self.counters,
             effects: Effects {
-                items: [None, None],
+                items: [None, None, None],
                 count: 0,
             },
             progress: Progress::Complete,
@@ -1156,7 +1190,17 @@ impl Owner {
         }
         match input {
             Input::MaintainReceipts => self.plan_receipt_maintenance(draft),
-            Input::OpenSession { .. } | Input::EndSession { .. } => Err(IMPOSSIBLE),
+            Input::OpenSession {
+                connection,
+                client_id,
+                clean_start,
+                expiry,
+            } => self.plan_session_open(*connection, client_id, *clean_start, *expiry, draft),
+            Input::EndSession {
+                connection,
+                opened_by,
+                reason,
+            } => self.plan_session_end(*connection, *opened_by, *reason, draft),
             Input::ReceiptsCollected {
                 effect,
                 collection,
@@ -1326,6 +1370,8 @@ impl Owner {
                 client_id: client_id.clone(),
                 revision,
                 connection,
+                expiry: crate::contract::session::SessionExpiry::Never,
+                opened_by: None,
             },
         })
     }
@@ -1337,6 +1383,9 @@ impl Owner {
         connection: ConnectionGeneration,
         draft: &mut Draft,
     ) -> Result<Change, Stop> {
+        if let Some(change) = self.plan_session_transport_closed(connection, draft)? {
+            return Ok(change);
+        }
         if self.closed.iter().any(|closed| *closed == connection) {
             return Ok(Change::Nothing);
         }
@@ -1421,7 +1470,9 @@ impl Owner {
         if self.control_collision(connection, packet) {
             return protocol_error(draft);
         }
-        if matches!(packet, InboundPacket::Publish { .. }) && self.pubsub.control_pending() {
+        if matches!(packet, InboundPacket::Publish { .. })
+            && (self.pubsub.control_pending() || self.lifecycle.is_some())
+        {
             return Err(Stop::Need(CapacityNeed {
                 resource: Resource::ResultSlots,
                 amount: 1,
@@ -1872,6 +1923,9 @@ impl Owner {
             return Err(IMPOSSIBLE);
         }
         let contradiction = Stop::Fatal(CoreFault::ContradictoryOutcome { operation });
+        if let Some(change) = self.plan_session_result(effect, operation, reply, draft)? {
+            return Ok(change);
+        }
         if let Some(change) = self.plan_pubsub_result(effect, operation, reply, draft)? {
             return Ok(change);
         }
@@ -1930,6 +1984,12 @@ impl Owner {
                 // The owner publishes what depends on the commit in this
                 // transition: the command is consumed.
                 let finished = finished(CommandPhase::Consumed, Some(facts));
+                if slot.retired {
+                    return Ok(Change::End {
+                        slot: index,
+                        finished,
+                    });
+                }
                 if admission {
                     if slot.qos == Qos::AtLeastOnce {
                         return self.plan_puback(index, finished, PubackReason::Success, draft);
@@ -1954,6 +2014,12 @@ impl Owner {
             ) => {
                 draft.receipt_consumed = Some(operation);
                 let finished = finished(CommandPhase::RejectedCertain, None);
+                if slot.retired {
+                    return Ok(Change::End {
+                        slot: index,
+                        finished,
+                    });
+                }
                 if admission {
                     if slot.qos == Qos::AtLeastOnce {
                         return self.plan_puback(
@@ -2068,6 +2134,9 @@ impl Owner {
             return Err(IMPOSSIBLE);
         }
         if let Some(change) = self.plan_receipt_deadline(token, draft)? {
+            return Ok(change);
+        }
+        if let Some(change) = self.plan_session_deadline(token, draft)? {
             return Ok(change);
         }
         if let Some(change) = self.plan_pubsub_deadline(token, draft)? {
@@ -2344,6 +2413,11 @@ impl Owner {
         self.receipts.apply_issued(receipt_issued)?;
         self.receipts.consume(receipt_consumed)?;
         if let Some(connection) = closed {
+            if let Some(flight) = self.lifecycle.as_mut()
+                && flight.connection == connection
+            {
+                flight.connection_closed = true;
+            }
             // Closing a generation is terminal for its queued/emitting
             // ACKs, even if the adapter never accepted their Outbox effect.
             // Uncertain admissions are deliberately kept for reconciliation.
@@ -2370,6 +2444,7 @@ impl Owner {
     fn apply_change(&mut self, change: Change, input: Input) -> Result<(), CoreFault> {
         const STALE: CoreFault = CoreFault::StalePlan;
         match change {
+            Change::Session(change) => self.apply_session(change)?,
             Change::Receipts(change) => self.receipts.apply(change)?,
             Change::Pubsub(change) => self.apply_pubsub(change, input)?,
             Change::Nothing => {}
@@ -2421,6 +2496,7 @@ impl Owner {
                     admission: None,
                     release_preparations: 0,
                     state: SlotState::AdmissionPending(in_flight),
+                    retired: false,
                 };
                 self.slots.try_push(slot).map_err(|_| STALE)?;
             }
@@ -2588,13 +2664,16 @@ impl Owner {
                 session,
                 client_id,
                 revision,
-                ..
+                expiry,
+                opened_by,
             } => {
                 let session = Session {
                     id: *session,
                     client_id: client_id.clone(),
                     revision: *revision,
                     connection: None,
+                    expiry: *expiry,
+                    opened_by: *opened_by,
                 };
                 self.sessions.try_push(session).map_err(|_| STALE)?;
             }
@@ -2625,6 +2704,7 @@ impl Owner {
                     admission: None,
                     release_preparations: 0,
                     state: SlotState::AwaitPubrel,
+                    retired: false,
                 };
                 self.slots.try_push(slot).map_err(|_| STALE)?;
             }

@@ -68,10 +68,14 @@ pub(super) struct Delivery {
     frame: Option<(EffectId, ConnectionKey)>,
     local_write_completed: bool,
     may_have_started: bool,
+    retired: bool,
 }
 
 impl Delivery {
     fn waiting_to_send(&self, generation: ConnectionGeneration) -> bool {
+        if self.retired {
+            return false;
+        }
         match self.phase {
             Phase::FinishPending(_) | Phase::Qos0Writing(_) => false,
             Phase::AwaitPuback => {
@@ -116,6 +120,7 @@ impl Delivery {
             frame: None,
             local_write_completed: false,
             may_have_started: claim.is_some(),
+            retired: false,
         }
     }
 }
@@ -231,6 +236,36 @@ pub(super) enum Change {
 }
 
 impl State {
+    pub(super) fn retired_flights(&self) -> usize {
+        self.deliveries
+            .as_slice()
+            .iter()
+            .filter(|d| d.retired && d.in_flight().is_some())
+            .count()
+    }
+    pub(super) fn retire_session(&mut self, session: SessionId) {
+        let mut index = 0;
+        while index < self.deliveries.len() {
+            let d = &mut self.deliveries.as_mut_slice()[index];
+            if d.target != session {
+                index += 1;
+                continue;
+            }
+            if d.in_flight().is_some() || matches!(d.phase, Phase::Qos0Writing(_)) {
+                d.retired = true;
+                d.window = None;
+                d.topic = None;
+                d.payload = None;
+                index += 1;
+            } else {
+                let last = self.deliveries.len() - 1;
+                self.deliveries.as_mut_slice().swap(index, last);
+                let _ = self.deliveries.pop();
+            }
+        }
+        // Volatile attempts retain their existing callback/continuation:
+        // that bounded path records their explicit closed-destination drop.
+    }
     fn reserves_packet_id(delivery: &Delivery, session: SessionId) -> bool {
         delivery.target == session
             && delivery.claim.is_some()
@@ -918,6 +953,9 @@ impl Owner {
                 draft,
             );
         }
+        if self.lifecycle.is_some() {
+            return Err(blocked());
+        }
         let (packet_id, subscribing) = match packet {
             InboundPacket::Subscribe { packet_id, .. } => (*packet_id, true),
             InboundPacket::Unsubscribe { packet_id, .. } => (*packet_id, false),
@@ -1505,6 +1543,50 @@ impl Owner {
                     })));
                 }
                 let (slot, d) = delivery.ok_or(IMPOSSIBLE)?;
+                if d.retired {
+                    let expected = match d.phase {
+                        Phase::ConsumePending(_, _) => CommitFacts::DeliveryConsumed {
+                            delivery: d.id,
+                            target: d.target,
+                        },
+                        Phase::ClaimPending(_) => {
+                            let claim = d.claim.ok_or(IMPOSSIBLE)?;
+                            CommitFacts::DeliveryClaimed {
+                                delivery: d.id,
+                                target: d.target,
+                                packet_id: claim.packet_id,
+                                claim: claim.operation,
+                            }
+                        }
+                        Phase::FinishPending(_) => {
+                            let claim = d.claim.ok_or(IMPOSSIBLE)?;
+                            CommitFacts::DeliveryFinished {
+                                delivery: d.id,
+                                target: d.target,
+                                packet_id: claim.packet_id,
+                                claim: claim.operation,
+                            }
+                        }
+                        _ => return Err(IMPOSSIBLE),
+                    };
+                    if facts != expected {
+                        return Err(Stop::Fatal(CoreFault::ContradictoryOutcome { operation }));
+                    }
+                    if matches!(d.phase, Phase::ConsumePending(_, _)) {
+                        draft.emit(Effect::Qos0Dropped {
+                            origin: Qos0Origin::Consumed {
+                                delivery: d.id,
+                                operation,
+                            },
+                            target: Some(d.target),
+                            reason: Qos0DropReason::ConnectionClosed,
+                        })?;
+                    }
+                    return Ok(Some(changed(Change::Finished {
+                        slot,
+                        finished: done,
+                    })));
+                }
                 if let Phase::ConsumePending(_, connection) = d.phase {
                     if facts
                         != (CommitFacts::DeliveryConsumed {
@@ -1613,6 +1695,12 @@ impl Owner {
                     })));
                 }
                 let (slot, d) = delivery.ok_or(IMPOSSIBLE)?;
+                if d.retired {
+                    return Ok(Some(changed(Change::Finished {
+                        slot,
+                        finished: done,
+                    })));
+                }
                 if let Some(connection) = self.connection_of(d.target)
                     && !matches!(d.phase,Phase::ConsumePending(_,key) if key.generation!=connection)
                 {
