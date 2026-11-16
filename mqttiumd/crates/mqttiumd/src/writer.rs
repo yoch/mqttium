@@ -104,12 +104,22 @@ pub enum Request {
 }
 /// A reserved lane: maintenance never waits for a network/business slot.
 pub enum ControlRequest {
-    Collect { effect: EffectId, collection: ReceiptCollection },
+    Collect {
+        effect: EffectId,
+        collection: ReceiptCollection,
+    },
     Closed(ClosedReceiptCollection),
 }
 pub enum ControlResponse {
-    Collected { effect: EffectId, collection: ReceiptCollection, result: Result<ReceiptCollectionReply, Failure> },
-    Closed { collection: ClosedReceiptCollection, result: Result<ClosedReceiptReply, Failure> },
+    Collected {
+        effect: EffectId,
+        collection: ReceiptCollection,
+        result: Result<ReceiptCollectionReply, Failure>,
+    },
+    Closed {
+        collection: ClosedReceiptCollection,
+        result: Result<ClosedReceiptReply, Failure>,
+    },
 }
 pub enum Response {
     Recovery(Result<RecoveryPage, RecoveryRefused>),
@@ -150,13 +160,31 @@ impl Hooks {
         events: &Events,
         cancel: &AtomicBool,
     ) -> Result<(), Failure> {
-        self.barrier_fields(point, json!({"point":point,"command_kind":kind,"operation":operation(id)}), events, cancel)
+        self.barrier_fields(
+            point,
+            json!({"point":point,"command_kind":kind,"operation":operation(id)}),
+            events,
+            cancel,
+        )
     }
     #[cfg(feature = "test-hooks")]
-    fn barrier_fields(&self, point: &'static str, fields: serde_json::Value, events: &Events, cancel: &AtomicBool) -> Result<(), Failure> {
-        if !self.pause.iter().any(|p| p == point) { return Ok(()); }
-        let dir = self.directory.as_ref().ok_or_else(|| Failure::plain("hook_directory"))?;
-        events.emit("barrier_hit", fields).map_err(|_| Failure::plain("events_unavailable"))?;
+    fn barrier_fields(
+        &self,
+        point: &'static str,
+        fields: serde_json::Value,
+        events: &Events,
+        cancel: &AtomicBool,
+    ) -> Result<(), Failure> {
+        if !self.pause.iter().any(|p| p == point) {
+            return Ok(());
+        }
+        let dir = self
+            .directory
+            .as_ref()
+            .ok_or_else(|| Failure::plain("hook_directory"))?;
+        events
+            .emit("barrier_hit", fields)
+            .map_err(|_| Failure::plain("events_unavailable"))?;
         let release = dir.join(format!("release-{point}"));
         let start = Instant::now();
         while !cancel.load(Ordering::Relaxed) {
@@ -194,47 +222,71 @@ impl Writer {
         let (btx, brx) = mpsc::sync_channel(1);
         let (ctx, crx) = mpsc::sync_channel(CONTROL_QUEUE);
         let (cctx, ccrx) = mpsc::sync_channel(CONTROL_QUEUE);
-        let handle = thread::Builder::new().name("sqlite-writer".into()).spawn(move || {
-            let (mut store, boot) = match bootstrap(&path) {
-                Ok(value) => value,
-                Err(error) => { let _ = btx.send(Err(error)); return; }
-            };
-            if btx.send(Ok(boot)).is_err() { return; }
-            let mut pending = None;
-            let mut pending_control = None;
-            let mut stopping = false;
-            loop {
-                if let Some(reply) = pending_control.take() {
-                    match cctx.try_send(reply) {
-                        Ok(()) => {},
-                        Err(TrySendError::Full(reply)) => pending_control = Some(reply),
-                        Err(TrySendError::Disconnected(_)) => return,
+        let handle = thread::Builder::new()
+            .name("sqlite-writer".into())
+            .spawn(move || {
+                let (mut store, boot) = match bootstrap(&path) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = btx.send(Err(error));
+                        return;
+                    }
+                };
+                if btx.send(Ok(boot)).is_err() {
+                    return;
+                }
+                let mut pending = None;
+                let mut pending_control = None;
+                let mut stopping = false;
+                loop {
+                    if let Some(reply) = pending_control.take() {
+                        match cctx.try_send(reply) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(reply)) => pending_control = Some(reply),
+                            Err(TrySendError::Disconnected(_)) => return,
+                        }
+                    }
+                    if let Some(reply) = pending.take() {
+                        match rtx.try_send(reply) {
+                            Ok(()) if stopping => return,
+                            Ok(()) => {}
+                            Err(TrySendError::Full(reply)) => pending = Some(reply),
+                            Err(TrySendError::Disconnected(_)) => return,
+                        }
+                    }
+                    // Even a completely unread ordinary result lane cannot prevent
+                    // a reserved receipt closure from committing and replying.
+                    if pending_control.is_none() {
+                        match crx.try_recv() {
+                            Ok(request) => {
+                                pending_control = Some(control_response(
+                                    &mut store, request, &events, &hooks, &cancel,
+                                ))
+                            }
+                            Err(TryRecvError::Empty) => {}
+                            Err(TryRecvError::Disconnected) => return,
+                        }
+                    }
+                    if pending.is_none() && !stopping {
+                        match rx.recv_timeout(Duration::from_millis(1)) {
+                            Ok(Request::Stop) => {
+                                pending = Some(Response::Stopped);
+                                stopping = true;
+                            }
+                            Ok(request) => {
+                                pending = Some(business_response(
+                                    &mut store, request, &events, &hooks, &cancel,
+                                ))
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
+                    } else {
+                        thread::sleep(Duration::from_millis(1));
                     }
                 }
-                if let Some(reply) = pending.take() {
-                    if rtx.send(reply).is_err() || stopping { return; }
-                }
-                // Even a completely unread ordinary result lane cannot prevent
-                // a reserved receipt closure from committing and replying.
-                if pending_control.is_none() {
-                    match crx.try_recv() {
-                        Ok(request) => pending_control = Some(control_response(&mut store, request, &events, &hooks, &cancel)),
-                        Err(TryRecvError::Empty) => {},
-                        Err(TryRecvError::Disconnected) => return,
-                    }
-                }
-                if pending.is_none() && !stopping {
-                    match rx.recv_timeout(Duration::from_millis(1)) {
-                        Ok(Request::Stop) => { pending = Some(Response::Stopped); stopping = true; },
-                        Ok(request) => pending = Some(business_response(&mut store, request, &events, &hooks, &cancel)),
-                        Err(mpsc::RecvTimeoutError::Timeout) => {},
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    }
-                } else {
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
-        }).map_err(|_| Failure::plain("writer_spawn"))?;
+            })
+            .map_err(|_| Failure::plain("writer_spawn"))?;
         Ok(Self {
             sender: tx,
             receiver: rrx,
@@ -258,103 +310,250 @@ impl Writer {
         }
     }
 }
-fn business_response(store: &mut SqliteStore, request: Request, events: &Events, hooks: &Hooks, cancel: &Arc<AtomicBool>) -> Response {
+fn business_response(
+    store: &mut SqliteStore,
+    request: Request,
+    events: &Events,
+    hooks: &Hooks,
+    cancel: &Arc<AtomicBool>,
+) -> Response {
     let _ = (hooks, cancel);
-                match request {
-                    Request::Stop=>Response::Stopped,
-                    Request::Recovery(cursor)=>Response::Recovery(store.recover(cursor,64)),
-                    Request::Session{request,client}=>Response::Session{request,result:session(store,client)},
-                    Request::Effect(effect)=>{
-                        let (effect,work)=effect.into_parts();
-                        match work {
-                            Effect::Persist{command}=>{
-                                let id=command.recipe.operation();
-                                let kind=recipe_kind(command.recipe.get());
-                                let targets=match command.recipe.get(){Recipe::AdmitPublication(a)=>a.targets.as_slice().iter().map(|t|t.session).collect(),_=>Vec::new()};
-                                #[cfg(feature="test-hooks")]
-                                {
-                                    let hc=hooks.clone();let ev=events.clone();let stop=cancel.clone();
-                                    let point=match kind {"Admission"=>"admission.prepared","Release"=>"release.prepared","Subscriptions"=>"subscription.prepared","Claim"=>"claim.prepared","Consume"=>"consume.prepared",_=>"finish.prepared"};
-                                    // The hook is inside the actual transaction, after all writes and before COMMIT.
-                                    let hook=Box::new(move|p|{if p==mqttiumd_store_sqlite::kill_points::KillPoint::CommitPrepared && hc.barrier(point,kind,id,&ev,&stop).is_err(){stop.store(true,Ordering::Relaxed);}});
-                                    if store.set_kill_hook(Some(hook)).is_err(){cancel.store(true,Ordering::Relaxed);}
-                                }
-                                let applied=store.apply(&command);
-                                #[cfg(feature="test-hooks")]
-                                {
-                                    let _=store.set_kill_hook(None);
-                                    let point=match kind {"Admission"=>Some("admission.committed"),"Claim"=>Some("claim.committed"),"Finish"=>Some("finish.committed"),"Consume"=>Some("consume.committed"),_=>None};
-                                    if applied.committed_now && let Some(point)=point && hooks.barrier(point,kind,id,&events,&cancel).is_err(){cancel.store(true,Ordering::Relaxed);}
-                                }
-                                if events.emit("store_result",json!({"operation":operation(id),"command_kind":kind,"details":{"committed_now":applied.committed_now,"wrote":applied.wrote,"outcome":outcome_name(applied.reply)}})).is_err(){cancel.store(true,Ordering::Relaxed);}
-                                #[cfg(not(feature="test-hooks"))]
-                                let reply=applied.reply;
-                                #[cfg(feature="test-hooks")]
-                                let mut reply=applied.reply;
-                                #[cfg(feature="test-hooks")]
-                                if applied.committed_now && matches!(kind,"Claim"|"Finish"|"Consume") && let Some(dir)=&hooks.directory {
-                                    let file=dir.join(format!("drop-next-{}-result",kind.to_ascii_lowercase()));
-                                    if file.exists() && std::fs::remove_file(file).is_ok(){
-                                        let _=events.emit("store_result_dropped",json!({"operation":operation(id),"command_kind":kind}));
-                                        reply=StoreReply::Outcome(mqttiumd_contract::outcome::StoreOutcome::PendingOrUnknown);
-                                    }
-                                }
-                                Response::Store{effect,operation:id,reply,targets}
+    match request {
+        Request::Stop => Response::Stopped,
+        Request::Recovery(cursor) => Response::Recovery(store.recover(cursor, 64)),
+        Request::Session { request, client } => Response::Session {
+            request,
+            result: session(store, client),
+        },
+        Request::Effect(effect) => {
+            let (effect, work) = effect.into_parts();
+            match work {
+                Effect::Persist { command } => {
+                    let id = command.recipe.operation();
+                    let kind = recipe_kind(command.recipe.get());
+                    let targets = match command.recipe.get() {
+                        Recipe::AdmitPublication(a) => {
+                            a.targets.as_slice().iter().map(|t| t.session).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    #[cfg(feature = "test-hooks")]
+                    {
+                        let hc = hooks.clone();
+                        let ev = events.clone();
+                        let stop = cancel.clone();
+                        let point = match kind {
+                            "Admission" => "admission.prepared",
+                            "Release" => "release.prepared",
+                            "Subscriptions" => "subscription.prepared",
+                            "Claim" => "claim.prepared",
+                            "Consume" => "consume.prepared",
+                            _ => "finish.prepared",
+                        };
+                        // The hook is inside the actual transaction, after all writes and before COMMIT.
+                        let hook = Box::new(move |p| {
+                            if p == mqttiumd_store_sqlite::kill_points::KillPoint::CommitPrepared
+                                && hc.barrier(point, kind, id, &ev, &stop).is_err()
+                            {
+                                stop.store(true, Ordering::Relaxed);
                             }
-                            Effect::ResolveAndFence{operation:id}=>{
-                                let reply=StoreReply::Outcome(store.resolve_and_fence(id).outcome);
-                                if events.emit("store_resolved",json!({"operation":operation(id),"details":{"outcome":outcome_name(reply).to_ascii_lowercase()}})).is_err(){cancel.store(true,Ordering::Relaxed);}
-                                Response::Store{effect,operation:id,reply,targets:Vec::new()}
-                            }
-                            Effect::LoadWork{session,after,limit}=>Response::Work{effect,session,result:store.read_work(session,after,limit as usize)},
-                            _=>{cancel.store(true,Ordering::Relaxed);Response::Stopped}
+                        });
+                        if store.set_kill_hook(Some(hook)).is_err() {
+                            cancel.store(true, Ordering::Relaxed);
                         }
                     }
+                    let applied = store.apply(&command);
+                    #[cfg(feature = "test-hooks")]
+                    {
+                        let _ = store.set_kill_hook(None);
+                        let point = match kind {
+                            "Admission" => Some("admission.committed"),
+                            "Claim" => Some("claim.committed"),
+                            "Finish" => Some("finish.committed"),
+                            "Consume" => Some("consume.committed"),
+                            _ => None,
+                        };
+                        if applied.committed_now
+                            && let Some(point) = point
+                            && hooks.barrier(point, kind, id, &events, &cancel).is_err()
+                        {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    if events.emit("store_result",json!({"operation":operation(id),"command_kind":kind,"details":{"committed_now":applied.committed_now,"wrote":applied.wrote,"outcome":outcome_name(applied.reply)}})).is_err(){cancel.store(true,Ordering::Relaxed);}
+                    #[cfg(not(feature = "test-hooks"))]
+                    let reply = applied.reply;
+                    #[cfg(feature = "test-hooks")]
+                    let mut reply = applied.reply;
+                    #[cfg(feature = "test-hooks")]
+                    if applied.committed_now
+                        && matches!(kind, "Claim" | "Finish" | "Consume")
+                        && let Some(dir) = &hooks.directory
+                    {
+                        let file =
+                            dir.join(format!("drop-next-{}-result", kind.to_ascii_lowercase()));
+                        if file.exists() && std::fs::remove_file(file).is_ok() {
+                            let _ = events.emit(
+                                "store_result_dropped",
+                                json!({"operation":operation(id),"command_kind":kind}),
+                            );
+                            reply = StoreReply::Outcome(
+                                mqttiumd_contract::outcome::StoreOutcome::PendingOrUnknown,
+                            );
+                        }
+                    }
+                    Response::Store {
+                        effect,
+                        operation: id,
+                        reply,
+                        targets,
+                    }
                 }
+                Effect::ResolveAndFence { operation: id } => {
+                    let reply = StoreReply::Outcome(store.resolve_and_fence(id).outcome);
+                    if events.emit("store_resolved",json!({"operation":operation(id),"details":{"outcome":outcome_name(reply).to_ascii_lowercase()}})).is_err(){cancel.store(true,Ordering::Relaxed);}
+                    Response::Store {
+                        effect,
+                        operation: id,
+                        reply,
+                        targets: Vec::new(),
+                    }
+                }
+                Effect::LoadWork {
+                    session,
+                    after,
+                    limit,
+                } => Response::Work {
+                    effect,
+                    session,
+                    result: store.read_work(session, after, limit as usize),
+                },
+                _ => {
+                    cancel.store(true, Ordering::Relaxed);
+                    Response::Stopped
+                }
+            }
+        }
+    }
 }
 
-fn control_response(store: &mut SqliteStore, request: ControlRequest, events: &Events, hooks: &Hooks, cancel: &Arc<AtomicBool>) -> ControlResponse {
+fn control_response(
+    store: &mut SqliteStore,
+    request: ControlRequest,
+    events: &Events,
+    hooks: &Hooks,
+    cancel: &Arc<AtomicBool>,
+) -> ControlResponse {
     let _ = hooks;
     match request {
-        ControlRequest::Closed(collection) => ControlResponse::Closed { collection, result: store.collect_closed_receipts(collection).map_err(|e| Failure::read(e, ReadPhase::Maintenance)) },
+        ControlRequest::Closed(collection) => ControlResponse::Closed {
+            collection,
+            result: store
+                .collect_closed_receipts(collection)
+                .map_err(|e| Failure::read(e, ReadPhase::Maintenance)),
+        },
         ControlRequest::Collect { effect, collection } => {
-            #[cfg(not(feature="test-hooks"))]
+            #[cfg(not(feature = "test-hooks"))]
             let effective = collection;
-            #[cfg(feature="test-hooks")]
-            let effective = ReceiptCollection { limit: if hooks.directory.as_ref().is_some_and(|d| d.join("receipt-collection-limit-one").exists()) {1} else {collection.limit}, ..collection };
-            #[cfg(feature="test-hooks")]
+            #[cfg(feature = "test-hooks")]
+            let effective = ReceiptCollection {
+                limit: if hooks
+                    .directory
+                    .as_ref()
+                    .is_some_and(|d| d.join("receipt-collection-limit-one").exists())
+                {
+                    1
+                } else {
+                    collection.limit
+                },
+                ..collection
+            };
+            #[cfg(feature = "test-hooks")]
             {
-                let hc = hooks.clone(); let ev = events.clone(); let stop = cancel.clone();
+                let hc = hooks.clone();
+                let ev = events.clone();
+                let stop = cancel.clone();
                 store.set_receipt_hook(Some(Box::new(move |point, current| {
                     let mut details = collection_details(current);
                     details["requested_limit"] = json!(collection.limit);
                     if hc.barrier_fields(point.name(), json!({"point":point.name(),"command_kind":"ReceiptCollection","details":details}), &ev, &stop).is_err() { stop.store(true, Ordering::Relaxed); }
                 })));
             }
-            let result = store.collect_receipts(effective).map_err(|e| Failure::read(e, ReadPhase::Maintenance));
-            #[cfg(feature="test-hooks")]
+            let result = store
+                .collect_receipts(effective)
+                .map_err(|e| Failure::read(e, ReadPhase::Maintenance));
+            #[cfg(feature = "test-hooks")]
             store.set_receipt_hook(None);
             let mut details = collection_details(effective);
             details["requested_limit"] = json!(collection.limit);
-            details["effect"] = json!(format!("{}/{}/{}",effect.epoch.get(),effect.owner.get(),effect.sequence.get()));
+            details["effect"] = json!(format!(
+                "{}/{}/{}",
+                effect.epoch.get(),
+                effect.owner.get(),
+                effect.sequence.get()
+            ));
             match result {
-                Ok(ReceiptCollectionReply::Applied { removed, retained, more, .. }) => { details["outcome"] = json!("Applied"); details["removed"] = json!(removed); details["retained"] = json!(retained.to_string()); details["more"] = json!(more); },
-                Ok(ReceiptCollectionReply::PendingOrUnknown) => details["outcome"] = json!("PendingOrUnknown"),
-                Ok(ReceiptCollectionReply::Refused(reason)) => { details["outcome"] = json!("Refused"); details["reason"] = json!(format!("{reason:?}")); },
-                Err(ref failure) => { details["outcome"] = json!("ReadError"); if let Some((cause, _)) = failure.read { details["cause"] = json!(cause.code()); } },
+                Ok(ReceiptCollectionReply::Applied {
+                    removed,
+                    retained,
+                    more,
+                    ..
+                }) => {
+                    details["outcome"] = json!("Applied");
+                    details["removed"] = json!(removed);
+                    details["retained"] = json!(retained.to_string());
+                    details["more"] = json!(more);
+                }
+                Ok(ReceiptCollectionReply::PendingOrUnknown) => {
+                    details["outcome"] = json!("PendingOrUnknown")
+                }
+                Ok(ReceiptCollectionReply::Refused(reason)) => {
+                    details["outcome"] = json!("Refused");
+                    details["reason"] = json!(format!("{reason:?}"));
+                }
+                Err(ref failure) => {
+                    details["outcome"] = json!("ReadError");
+                    if let Some((cause, _)) = failure.read {
+                        details["cause"] = json!(cause.code());
+                    }
+                }
             }
-            if events.emit("receipt_collection_result", json!({"command_kind":"ReceiptCollection","details":details})).is_err() { cancel.store(true,Ordering::Relaxed); }
-            #[cfg(feature="test-hooks")]
-            let result = if matches!(result, Ok(ReceiptCollectionReply::Applied { .. })) && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("drop-next-close-result"))) {
-                let _ = events.emit("receipt_collection_result_dropped", json!({"command_kind":"ReceiptCollection","details":details}));
+            if events
+                .emit(
+                    "receipt_collection_result",
+                    json!({"command_kind":"ReceiptCollection","details":details}),
+                )
+                .is_err()
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            #[cfg(feature = "test-hooks")]
+            let result = if matches!(result, Ok(ReceiptCollectionReply::Applied { .. }))
+                && hooks
+                    .directory
+                    .as_ref()
+                    .is_some_and(|d| consume_file(&d.join("drop-next-close-result")))
+            {
+                let _ = events.emit(
+                    "receipt_collection_result_dropped",
+                    json!({"command_kind":"ReceiptCollection","details":details}),
+                );
                 Ok(ReceiptCollectionReply::PendingOrUnknown)
-            } else { result };
-            ControlResponse::Collected { effect, collection, result }
+            } else {
+                result
+            };
+            ControlResponse::Collected {
+                effect,
+                collection,
+                result,
+            }
         }
     }
 }
-#[cfg(feature="test-hooks")]
-fn consume_file(path: &Path) -> bool { path.exists() && std::fs::remove_file(path).is_ok() }
+#[cfg(feature = "test-hooks")]
+fn consume_file(path: &Path) -> bool {
+    path.exists() && std::fs::remove_file(path).is_ok()
+}
 fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
     // Existing files, including empty/truncated files, are never silently initialised.
     let mut store = if path
@@ -436,9 +635,18 @@ fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
     let grant = opening
         .hand_over()
         .map_err(|_| Failure::plain("opening_grant"))?;
-    let collect_closed = state.receipt_frontiers.len() >= 32 || state.accounts.receipt_slots.get() >= 4096;
+    let collect_closed =
+        state.receipt_frontiers.len() >= 32 || state.accounts.receipt_slots.get() >= 4096;
     let sqlite = store.effective_settings().clone();
-    Ok((store, Boot { grant, sessions, collect_closed, sqlite }))
+    Ok((
+        store,
+        Boot {
+            grant,
+            sessions,
+            collect_closed,
+            sqlite,
+        },
+    ))
 }
 fn session(store: &mut SqliteStore, client: SharedBytes) -> Result<Session, Failure> {
     let state = store
@@ -504,42 +712,83 @@ mod tests {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     #[test]
     fn reserved_collection_progresses_while_ordinary_replies_are_unread() {
-        let path = std::env::temp_dir().join(format!("mqttiumd-control-lane-{}-{}",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
+        let path = std::env::temp_dir().join(format!(
+            "mqttiumd-control-lane-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir(&path).unwrap();
         let db = path.join("store.sqlite");
         let events = Events::open(&path.join("events.jsonl")).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut writer = Writer::spawn(db.clone(),events,Hooks::default(),cancel.clone()).unwrap();
-        let boot = writer.boot.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
-        let origin = ReceiptOrigin { incarnation:boot.grant.incarnation(), epoch:boot.grant.epoch(), owner:LogicalOwnerId::new(0) };
+        let mut writer =
+            Writer::spawn(db.clone(), events, Hooks::default(), cancel.clone()).unwrap();
+        let boot = writer
+            .boot
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        let origin = ReceiptOrigin {
+            incarnation: boot.grant.incarnation(),
+            epoch: boot.grant.epoch(),
+            owner: LogicalOwnerId::new(0),
+        };
         // Exactly 64 ordinary reply slots are left unread. The 65th command
         // still has a real durable session effect, so an independent snapshot
         // establishes the worker reached the blocked reply, rather than merely
         // assuming it did from elapsed time.
         for request in 1..=65 {
-            writer.sender.send(Request::Session { request, client:SharedBytes::copy_from(format!("lane-{request}").as_bytes(),MAX_CLIENT).unwrap() }).unwrap();
+            writer
+                .sender
+                .send(Request::Session {
+                    request,
+                    client: SharedBytes::copy_from(
+                        format!("lane-{request}").as_bytes(),
+                        MAX_CLIENT,
+                    )
+                    .unwrap(),
+                })
+                .unwrap();
         }
-        let deadline = Instant::now()+Duration::from_secs(3);
-        while SqliteStore::inspect(&db).unwrap().sessions.len()!=65 && Instant::now()<deadline { thread::sleep(Duration::from_millis(1)); }
-        let established = SqliteStore::inspect(&db).unwrap().sessions.len()==65;
-        let collection = ReceiptCollection { closure:ReceiptClosure::empty(origin), limit:128 };
-        let effect = EffectId { epoch:origin.epoch, owner:origin.owner, sequence:EffectSeq::new(1) };
-        writer.control_sender.send(ControlRequest::Collect { effect, collection }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while SqliteStore::inspect(&db).unwrap().sessions.len() != 65 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let established = SqliteStore::inspect(&db).unwrap().sessions.len() == 65;
+        let collection = ReceiptCollection {
+            closure: ReceiptClosure::empty(origin),
+            limit: 128,
+        };
+        let effect = EffectId {
+            epoch: origin.epoch,
+            owner: origin.owner,
+            sequence: EffectSeq::new(1),
+        };
+        writer
+            .control_sender
+            .send(ControlRequest::Collect { effect, collection })
+            .unwrap();
         let reply = writer.control_receiver.recv_timeout(Duration::from_secs(2));
         // Cleanup before asserting: even the original blocked implementation
         // must release its writer and terminate when the semantic test fails.
-        cancel.store(true,Ordering::Relaxed);
+        cancel.store(true, Ordering::Relaxed);
         while writer.receiver.try_recv().is_ok() {}
         writer.sender.send(Request::Stop).unwrap();
-        let deadline = Instant::now()+Duration::from_secs(3);
-        while !writer.is_finished() && Instant::now()<deadline {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !writer.is_finished() && Instant::now() < deadline {
             while writer.receiver.try_recv().is_ok() {}
             while writer.control_receiver.try_recv().is_ok() {}
             thread::sleep(Duration::from_millis(1));
         }
         writer.join_finished().unwrap();
         let _ = std::fs::remove_dir_all(path);
-        assert!(established,"all65 ordinary commands actually completed while their replies stayed unread");
-        assert!(matches!(reply,Ok(ControlResponse::Collected { effect:e,collection:c,result:Ok(ReceiptCollectionReply::Applied { removed:0,.. }) }) if e==effect && c==collection),"reserved maintenance must reply even when the ordinary result lane is demonstrably full");
+        assert!(
+            established,
+            "all65 ordinary commands actually completed while their replies stayed unread"
+        );
+        assert!(
+            matches!(reply,Ok(ControlResponse::Collected { effect:e,collection:c,result:Ok(ReceiptCollectionReply::Applied { removed:0,.. }) }) if e==effect && c==collection),
+            "reserved maintenance must reply even when the ordinary result lane is demonstrably full"
+        );
     }
 }

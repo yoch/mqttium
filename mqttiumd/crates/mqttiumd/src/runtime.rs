@@ -4,7 +4,7 @@ use crate::{
     events::{Events, operation},
     net,
     receiving::Terminal,
-    writer::{Failure, Hooks, Request, Response, Session, Writer},
+    writer::{ControlRequest, ControlResponse, Failure, Hooks, Request, Response, Session, Writer},
 };
 use mqttiumd_contract::capacity::{PayloadBytes, Resource, WakeCondition, WorkUnits};
 use mqttiumd_contract::command::Recipe;
@@ -19,6 +19,9 @@ use mqttiumd_contract::ids::{
 use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome, StoreReply};
 use mqttiumd_contract::packet::{InboundPacket, OutboundFrame};
 use mqttiumd_contract::pubsub::{Qos0DropReason, Qos0Origin};
+use mqttiumd_contract::receipts::{
+    ClosedReceiptCollection, ClosedReceiptReply, ReceiptCollectionReply,
+};
 use mqttiumd_contract::step::{StepOutcome, TurnGrant};
 #[cfg(feature = "test-hooks")]
 use mqttiumd_contract::{ids::DeliveryId, pubsub::WorkItem};
@@ -121,6 +124,7 @@ struct Runtime<'a> {
     inflight: BTreeMap<EffectId, OperationId>,
     work_reads: BTreeMap<EffectId, SessionId>,
     last_work_scan: Instant,
+    maintenance_needed: bool,
     #[cfg(feature = "test-hooks")]
     work_cache: BTreeMap<DeliveryId, WorkItem>,
     #[cfg(feature = "test-hooks")]
@@ -255,7 +259,26 @@ impl Runtime<'_> {
                 } => Some((*operation, *delivery)),
                 _ => None,
             };
-            let wakes_business = matches!(input, Input::StoreResult { .. });
+            let wakes_business = matches!(
+                input,
+                Input::StoreResult { .. } | Input::ReceiptsCollected { .. }
+            );
+            let collected = match &input {
+                Input::ReceiptsCollected {
+                    effect,
+                    collection,
+                    reply:
+                        ReceiptCollectionReply::Applied {
+                            removed,
+                            retained,
+                            more,
+                            ..
+                        },
+                } if self.owner.collection_reply_is_live(*effect, *collection) => {
+                    Some((*collection, *removed, *retained, *more))
+                }
+                _ => None,
+            };
             let ready_work = self.work_progress_hint(&input);
             let mut applied = false;
             match self.owner.step(
@@ -266,6 +289,21 @@ impl Runtime<'_> {
             ) {
                 StepOutcome::Applied { .. } => {
                     applied = true;
+                    if wakes_business && self.owner.collection_ready() {
+                        self.maintenance_needed = true;
+                    }
+                    if let Some((collection, removed, retained, more)) = collected {
+                        let mut details = crate::writer::collection_details(collection);
+                        details["removed"] = json!(removed);
+                        details["retained"] = json!(retained.to_string());
+                        details["more"] = json!(more);
+                        self.events
+                            .emit(
+                                "receipt_collection_applied",
+                                json!({"command_kind":"ReceiptCollection","details":details}),
+                            )
+                            .map_err(event_failure)?;
+                    }
                     if let Some((id, delivery)) = finish {
                         self.events.emit("core_finish_observed",json!({"operation":operation(id),"details":{"delivery":delivery_text(delivery)}})).map_err(event_failure)?;
                     }
@@ -280,9 +318,19 @@ impl Runtime<'_> {
                 StepOutcome::NeedCapacity { input, need, .. } => {
                     match input {
                         packet @ Input::Packet { .. }
-                            if need.resource == Resource::ResultSlots
-                                && need.wake == WakeCondition::ResultDelivered =>
+                            if matches!(
+                                need.resource,
+                                Resource::ResultSlots | Resource::ReceiptSlots
+                            ) && need.wake == WakeCondition::ResultDelivered =>
                         {
+                            if need.resource == Resource::ReceiptSlots {
+                                let (span, holes) = self
+                                    .owner
+                                    .receipt_status()
+                                    .map(|(_, s, h)| (s, h))
+                                    .unwrap_or((0, 0));
+                                self.events.emit("receipt_window_pressure",json!({"details":{"resource":"ReceiptSlots","code":"receipt_window_business_full","span":span,"unconsumed_holes":holes}})).map_err(event_failure)?;
+                            }
                             self.deferred_inputs.push_back(packet)
                         }
                         Input::Packet { connection, .. } => {
@@ -309,14 +357,28 @@ impl Runtime<'_> {
                 // A terminal result is consumed only after the exact input was
                 // applied. The pure owner, rather than elapsed wall time or a
                 // received reply, decides which deadlines remain meaningful.
-                self.timers.retain(|token, _| self.owner.deadline_is_live(*token));
+                self.timers
+                    .retain(|token, _| self.owner.deadline_is_live(*token));
             }
             self.dispatch()?;
             if applied && let Some((session, initial)) = ready_work {
                 self.rearm_ready_work(session, initial);
             }
         }
+        self.schedule_maintenance();
         Ok(())
+    }
+    fn schedule_maintenance(&mut self) {
+        if self.maintenance_needed
+            && self.inputs.len() + self.deferred_inputs.len() < INPUTS
+            && !self
+                .inputs
+                .iter()
+                .any(|i| matches!(i, Input::MaintainReceipts))
+        {
+            self.inputs.push_back(Input::MaintainReceipts);
+            self.maintenance_needed = false;
+        }
     }
     fn dispatch(&mut self) -> Result<(), Failure> {
         let bindings: BTreeMap<_, _> = self
@@ -358,9 +420,43 @@ impl Runtime<'_> {
         for (generation, code) in close {
             self.close(generation, code)?;
         }
+        self.timers
+            .retain(|token, _| self.owner.deadline_is_live(*token));
         Ok(())
     }
     fn writer_results(&mut self) -> Result<(), Failure> {
+        // Replies have their own reserved capacity. The owner retains bounded
+        // attempt correlation; no adapter history or second retry loop exists.
+        for _ in 0..crate::writer::CONTROL_QUEUE {
+            let response = match self.writer.control_receiver.try_recv() {
+                Ok(reply) => reply,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    return Err(Failure::plain("writer_control_disconnected"));
+                }
+            };
+            match response {
+                ControlResponse::Collected {
+                    effect,
+                    collection,
+                    result,
+                } => {
+                    let reply = result?;
+                    if self.owner.collection_reply_is_live(effect, collection) {
+                        self.queue(Input::ReceiptsCollected {
+                            effect,
+                            collection,
+                            reply,
+                        })?;
+                    } else {
+                        self.events.emit("receipt_collection_result_ignored",json!({"command_kind":"ReceiptCollection","details":crate::writer::collection_details(collection)})).map_err(event_failure)?;
+                    }
+                }
+                ControlResponse::Closed { .. } => {
+                    return Err(Failure::plain("unexpected_closed_collection"));
+                }
+            }
+        }
         for _ in 0..64 {
             let response = match self.writer.receiver.try_recv() {
                 Ok(r) => r,
@@ -1592,7 +1688,38 @@ impl EffectSink for Sink<'_> {
                 let _ = effect.into_parts();
                 SubmitResult::Accepted
             }
-            Effect::CollectReceipts { .. } => refused(effect, SubmitBlock::Closed),
+            Effect::CollectReceipts { collection } => {
+                let collection = *collection;
+                match self
+                    .writer
+                    .control_sender
+                    .try_send(ControlRequest::Collect {
+                        effect: id,
+                        collection,
+                    }) {
+                    Ok(()) => {
+                        let mut details = crate::writer::collection_details(collection);
+                        details["effect"] = json!(effect_text(id));
+                        if self
+                            .events
+                            .emit(
+                                "receipt_collection_submitted",
+                                json!({"command_kind":"ReceiptCollection","details":details}),
+                            )
+                            .is_err()
+                        {
+                            self.error = Some(Failure::plain("events_unavailable"));
+                        }
+                        let _ = effect.into_parts();
+                        SubmitResult::Accepted
+                    }
+                    Err(TrySendError::Full(_)) => refused(effect, SubmitBlock::QueueFull),
+                    Err(TrySendError::Disconnected(_)) => {
+                        self.error = Some(Failure::plain("writer_control_disconnected"));
+                        refused(effect, SubmitBlock::Closed)
+                    }
+                }
+            }
             Effect::ArmDeadline { token, after } => {
                 if self.timers.len() >= TIMERS {
                     return refused(effect, SubmitBlock::QueueFull);
@@ -1826,6 +1953,7 @@ pub fn run(config: Config) -> Result<(), Failure> {
             stop_sent = true;
         }
         while writer.receiver.try_recv().is_ok() {}
+        while writer.control_receiver.try_recv().is_ok() {}
         thread::sleep(Duration::from_millis(2));
     }
     if !writer.is_finished() {
@@ -1853,6 +1981,8 @@ fn run_inner(
         .map_err(|_| Failure::plain("startup_deadline"))??;
     let epoch = boot.grant.epoch();
     let incarnation = boot.grant.incarnation();
+    let collect_closed = boot.collect_closed;
+    let sqlite = boot.sqlite.clone();
     let mut authority = OwnerAuthority::from_grant(boot.grant, NonZeroU32::MIN)
         .map_err(|_| Failure::plain("authority_allocation"))?;
     let outbox = authority
@@ -1894,6 +2024,7 @@ fn run_inner(
         inflight: BTreeMap::new(),
         work_reads: BTreeMap::new(),
         last_work_scan: Instant::now(),
+        maintenance_needed: false,
         #[cfg(feature = "test-hooks")]
         work_cache: BTreeMap::new(),
         #[cfg(feature = "test-hooks")]
@@ -1970,6 +2101,80 @@ fn run_inner(
         if !saw_epoch || runtime.owner.is_recovering() {
             return Err(Failure::plain("recovery_incomplete"));
         }
+        if collect_closed {
+            let collection = ClosedReceiptCollection {
+                through: mqttiumd_contract::ids::RunEpoch::new(
+                    epoch
+                        .get()
+                        .checked_sub(1)
+                        .ok_or_else(|| Failure::plain("epoch_underflow"))?,
+                ),
+                limit: 128,
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut completed = false;
+            for _ in 0..128 {
+                if Instant::now() >= deadline {
+                    return Err(Failure::plain("startup_collection_deadline"));
+                }
+                runtime
+                    .writer
+                    .control_sender
+                    .send(ControlRequest::Closed(collection))
+                    .map_err(|_| Failure::plain("writer_control_disconnected"))?;
+                let ControlResponse::Closed {
+                    collection: found,
+                    result,
+                } = runtime
+                    .writer
+                    .control_receiver
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|_| Failure::plain("startup_collection_deadline"))?
+                else {
+                    return Err(Failure::plain("startup_collection_protocol"));
+                };
+                if found != collection {
+                    return Err(Failure::plain("startup_collection_protocol"));
+                }
+                match result? {
+                    ClosedReceiptReply::Applied {
+                        through,
+                        removed,
+                        removed_origins,
+                        retained,
+                        more,
+                    } => {
+                        events.emit("closed_receipts_collected",json!({"details":{"through":through.get().to_string(),"removed":removed,"removed_origins":removed_origins,"retained":retained.to_string(),"more":more}})).map_err(event_failure)?;
+                        if !more {
+                            completed = true;
+                            break;
+                        }
+                    }
+                    ClosedReceiptReply::PendingOrUnknown => thread::sleep(Duration::from_millis(2)),
+                    ClosedReceiptReply::Refused(_) => {
+                        return Err(Failure::plain("startup_collection_refused"));
+                    }
+                }
+            }
+            if !completed {
+                return Err(Failure::plain("startup_collection_budget"));
+            }
+        }
+        // Empty-prefix registration is itself an exact owner transition. No
+        // listener or business command exists until its durable reply is applied.
+        runtime.queue(Input::MaintainReceipts)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !runtime.owner.collection_ready() {
+            if Instant::now() >= deadline {
+                return Err(Failure::plain("receipt_registration_deadline"));
+            }
+            runtime.writer_results()?;
+            runtime.drain_inputs()?;
+            runtime.dispatch()?;
+            thread::sleep(Duration::from_millis(1));
+        }
+        events.emit("receipt_policy",json!({"details":{"receipt_window":1024,"receipt_data_window":768,"receipt_control_reserve":512,"receipt_collection_rows":128,"receipt_collection_trigger":64,"max_receipt_origins":64,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
+        events.emit("sqlite_configuration",json!({"details":{"journal_mode":sqlite.journal_mode,"synchronous":sqlite.synchronous,"wal_autocheckpoint":sqlite.wal_autocheckpoint,"checkpoint_policy":sqlite.checkpoint_policy,"sqlite_version":sqlite.sqlite_version,"user_version":sqlite.user_version,"page_size":sqlite.page_size,"kill_points":sqlite.kill_points,"hooks_active":false,"install_order":"sqlite-autocheckpoint-before-optional-business-hook"}})).map_err(event_failure)?;
         let listener =
             TcpListener::bind(listen).map_err(|_| Failure::plain("listen_unavailable"))?;
         listener
