@@ -626,7 +626,9 @@ def unknown_hole(binary: Path, case: Path) -> dict:
                 if attempt % 32 == 0:
                     state = durable(broker.db)
                     floor = operation_floor(state, operation)
-                    require(floor < int(operation["sequence"]), "closure_crossed_unknown")
+                    write_json(case / "hole-latest-check.json", state)
+                    require(floor < int(operation["sequence"]), "closure_crossed_unknown",
+                            f"durable floor={floor}, unknown operation sequence={operation['sequence']}")
                     require(any(row["id"] == key for row in state["tables"]["operations"]),
                             "unknown_receipt_deleted")
                     result["samples"].append({"through_positive": positives, "floor": floor,
@@ -733,9 +735,10 @@ def retired_replays(binary: Path, case: Path) -> dict:
                 (broker.control / f"replay-retired-{mode}").touch(exist_ok=False)
                 observed = broker.wait_event("receipt_replay_result", after=last)
                 require(observed["details"]["mode"] == mode, "wrong_replay_probe")
+                after = durable(broker.db)
+                write_json(case / f"replay-{mode}-state.json", after)
                 require(observed["details"]["outcome"] == expected, failure,
                         str(observed["details"]["outcome"]))
-                after = durable(broker.db)
                 require(all(after["counts"][name] == 0
                             for name in ("publications", "payloads", "obligations", "inbound", "outbound")),
                         failure, "a replay recreated a live business object")
@@ -789,6 +792,7 @@ def close_crash(binary: Path, case: Path, *, committed: bool, limit_one: bool = 
             operation = {key: details[key] for key in ("incarnation", "epoch", "owner")}
             operation["sequence"] = details["through"]
             before = durable(broker.db)
+            write_json(case / "at-close-barrier.json", before)
             floor = operation_floor(before, operation)
             if committed:
                 deleted_seed_receipts = held.seed_receipts - {row["id"] for row in before["tables"]["operations"]}
@@ -800,7 +804,6 @@ def close_crash(binary: Path, case: Path, *, committed: bool, limit_one: bool = 
                 require(floor < int(details["through"]), "uncommitted_closure_visible")
             result["hit"], result["positive_subacks_before_hit"], result["visible_floor_at_hit"] = hit, positives, floor
             result["storage_at_hit"] = storage_sample(broker)
-            write_json(case / "at-close-barrier.json", before)
             inode = broker.db.stat().st_ino
             result["kill_status"] = broker.stop(killed=True)
         held.close()
