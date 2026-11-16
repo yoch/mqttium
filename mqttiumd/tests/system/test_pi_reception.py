@@ -31,6 +31,40 @@ class PiWireTests(unittest.TestCase):
             cursor.read()
             self.assertEqual(cursor.last_sequence, 1)
 
+    def test_finish_duplicates_do_not_inflate_distinct_delivery_count(self):
+        operation = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "4"}
+        queued = {"seq": "1", "pid": 7, "kind": "frame_queued", "connection": "1",
+                  "details": {"packet_kind": "PUBLISH", "packet_id": 1, "dup": False,
+                              "claim": "1/1/0/2", "delivery": "1/1/0/1/0", "effect": "1/0/3"}}
+        finished = {"seq": "2", "pid": 7, "kind": "core_finish_observed", "operation": operation,
+                    "details": {"delivery": "1/1/0/1/0"}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "broker.events.jsonl"
+            path.write_text(''.join(json.dumps(row) + '\n' for row in
+                                    (queued, finished, {**finished, "seq": "3"})))
+            cursor = FinishCursor(SimpleNamespace(events_path=path, process=SimpleNamespace(pid=7)))
+            cursor.read()
+            self.assertEqual(cursor.finishes, 1)
+            self.assertEqual(cursor.duplicate_finishes, 1)
+
+    def test_old_finish_identity_cannot_be_rebound_to_new_occupant(self):
+        operation = {"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "4"}
+        first = {"seq": "1", "pid": 7, "kind": "frame_queued", "connection": "1",
+                 "details": {"packet_kind": "PUBLISH", "packet_id": 1, "dup": False,
+                             "claim": "1/1/0/2", "delivery": "1/1/0/1/0", "effect": "1/0/3"}}
+        done = {"seq": "2", "pid": 7, "kind": "core_finish_observed", "operation": operation,
+                "details": {"delivery": "1/1/0/1/0"}}
+        newer = {**first, "seq": "3", "details": {**first['details'], "claim": "1/1/0/5",
+                                                    "delivery": "1/1/0/2/0", "effect": "1/0/6"}}
+        rebound = {**done, "seq": "4", "details": {"delivery": "1/1/0/2/0"}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "broker.events.jsonl"
+            path.write_text(''.join(json.dumps(row) + '\n' for row in (first, done, newer, rebound)))
+            cursor = FinishCursor(SimpleNamespace(events_path=path, process=SimpleNamespace(pid=7)))
+            with self.assertRaises(ReceiptFailure) as raised:
+                cursor.read()
+            self.assertEqual(raised.exception.code, 'old_finish_rebound_to_new_delivery')
+
     def test_fragmented_and_concatenated_packets_keep_exact_bytes(self):
         frames = (publish(1), Frame(0x40, b"\x00\x01"))
         wire = b"".join(packet(frame.header, frame.body) for frame in frames)
