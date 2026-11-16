@@ -460,12 +460,14 @@ def identities_and_windows(binary: Path, case: Path) -> dict:
         with PubsubWire(broker.address, broker.observations, "bidirectional") as subscriber:
             subscriber.connect("bidirectional", session_present=False, receive_maximum=1)
             subscriber.subscribe(1, [(topic, 1)])
-            # PI1 in a client PUBLISH and a broker PUBLISH are separate spaces.
-            subscriber.publish(1, topic, b"both-directions", qos=1)
+            seeded = publisher(broker, case, "window-publisher", "mqttium", topic, b"both-directions", 1)
             initial = subscriber.next_publication()
             message_matches(initial, topic, b"both-directions")
-            require(initial.packet_id == 1, "first_outgoing_identifier_not_one")
-            publisher(broker, case, "window-publisher", "paho", topic, b"queued-second", 2)
+            # The subscriber now deliberately chooses the broker's observed
+            # outgoing PI for its own PUBLISH, while that outgoing exchange is
+            # still unacknowledged. The namespaces are independent; no choice
+            # of the broker's allocation algorithm is assumed by this test.
+            subscriber.publish(initial.packet_id, topic, b"queued-second", qos=2)
             pending = durable(broker.db)
             require(len(obligations(pending)) == 2, "window_durable_backlog_missing")
             for _ in range(4):
@@ -505,7 +507,8 @@ def identities_and_windows(binary: Path, case: Path) -> dict:
         require(not any(bytes.fromhex(row["topic"]) == b"reception/collision"
                         for row in state["tables"]["routes"]), "colliding_subscription_became_durable")
         broker.stop()
-        return {"criterion": "F", "status": "PASS", "same_integer_both_directions": 1,
+        return {"criterion": "F", "status": "PASS", "clients": [seeded],
+                "same_integer_both_directions": initial.packet_id,
                 "receive_maximum": 1, "no_live_periodic_retransmission": True,
                 "negative_puback_terminal": True, "same_sender_collision_refused": True}
     finally:
