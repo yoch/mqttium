@@ -119,6 +119,7 @@ struct Runtime<'a> {
     next_session_request: u64,
     generation: ConnectionGeneration,
     inputs: VecDeque<Input>,
+    control_inputs: VecDeque<Input>,
     deferred_inputs: VecDeque<Input>,
     timers: BTreeMap<DeadlineToken, Instant>,
     inflight: BTreeMap<EffectId, OperationId>,
@@ -146,6 +147,16 @@ struct Runtime<'a> {
 }
 impl Runtime<'_> {
     fn queue(&mut self, input: Input) -> Result<(), Failure> {
+        if matches!(
+            input,
+            Input::ReceiptsCollected { .. } | Input::MaintainReceipts | Input::Deadline { .. }
+        ) {
+            if self.control_inputs.len() >= crate::writer::CONTROL_QUEUE {
+                return Err(Failure::plain("core_control_input_budget"));
+            }
+            self.control_inputs.push_back(input);
+            return Ok(());
+        }
         if self.inputs.len() + self.deferred_inputs.len() >= INPUTS {
             return Err(Failure::plain("core_input_budget"));
         }
@@ -204,8 +215,12 @@ impl Runtime<'_> {
         Ok(())
     }
     fn drain_inputs(&mut self) -> Result<(), Failure> {
-        for _ in 0..self.inputs.len().min(64) {
-            let Some(input) = self.inputs.pop_front() else {
+        for _ in 0..(self.inputs.len() + self.control_inputs.len()).min(64) {
+            let Some(input) = self
+                .control_inputs
+                .pop_front()
+                .or_else(|| self.inputs.pop_front())
+            else {
                 break;
             };
             if let Some(connection) = business_connection(&input)
@@ -340,6 +355,9 @@ impl Runtime<'_> {
                             self.events.emit("input_capacity_refused",json!({"connection":connection.get().to_string(),"details":{"accepted_command_rejected":false}})).map_err(event_failure)?;
                             self.close(connection, "input_capacity")?;
                         }
+                        other @ (Input::ReceiptsCollected { .. }
+                        | Input::MaintainReceipts
+                        | Input::Deadline { .. }) => self.control_inputs.push_back(other),
                         other => self.inputs.push_back(other),
                     }
                 }
@@ -371,15 +389,39 @@ impl Runtime<'_> {
     }
     fn schedule_maintenance(&mut self) {
         if self.maintenance_needed
-            && self.inputs.len() + self.deferred_inputs.len() < INPUTS
+            && self.control_inputs.len() < crate::writer::CONTROL_QUEUE
             && !self
-                .inputs
+                .control_inputs
                 .iter()
                 .any(|i| matches!(i, Input::MaintainReceipts))
         {
-            self.inputs.push_back(Input::MaintainReceipts);
+            self.control_inputs.push_back(Input::MaintainReceipts);
             self.maintenance_needed = false;
         }
+    }
+    fn due_deadlines(&mut self) -> Result<(), Failure> {
+        let now = Instant::now();
+        let due: Vec<_> = self
+            .timers
+            .iter()
+            .filter(|(_, due)| **due <= now)
+            .map(|(token, _)| *token)
+            .take(crate::writer::CONTROL_QUEUE.saturating_sub(self.control_inputs.len()))
+            .collect();
+        for token in due {
+            self.timers.remove(&token);
+            self.queue(Input::Deadline {
+                token,
+                now: LogicalTime::new(
+                    self.started
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .map_err(|_| Failure::plain("clock_exhausted"))?,
+                ),
+            })?;
+        }
+        Ok(())
     }
     fn dispatch(&mut self) -> Result<(), Failure> {
         let bindings: BTreeMap<_, _> = self
@@ -2020,6 +2062,7 @@ fn run_inner(
         next_session_request: 0,
         generation: ConnectionGeneration::new(0),
         inputs: VecDeque::new(),
+        control_inputs: VecDeque::new(),
         deferred_inputs: VecDeque::new(),
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
@@ -2164,17 +2207,18 @@ fn run_inner(
         // Empty-prefix registration is itself an exact owner transition. No
         // listener or business command exists until its durable reply is applied.
         runtime.queue(Input::MaintainReceipts)?;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while !runtime.owner.collection_ready() {
             if Instant::now() >= deadline {
                 return Err(Failure::plain("receipt_registration_deadline"));
             }
             runtime.writer_results()?;
+            runtime.due_deadlines()?;
             runtime.drain_inputs()?;
             runtime.dispatch()?;
             thread::sleep(Duration::from_millis(1));
         }
-        events.emit("receipt_policy",json!({"details":{"receipt_window":1024,"receipt_data_window":768,"receipt_control_reserve":512,"receipt_collection_rows":128,"receipt_collection_trigger":64,"max_receipt_origins":64,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
+        events.emit("receipt_policy",json!({"details":{"receipt_window":1024,"receipt_data_window":768,"receipt_control_reserve":512,"receipt_collection_rows":128,"receipt_collection_trigger":64,"max_receipt_origins":64,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE,"control_input_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
         events.emit("sqlite_configuration",json!({"details":{"journal_mode":sqlite.journal_mode,"synchronous":sqlite.synchronous,"wal_autocheckpoint":sqlite.wal_autocheckpoint,"checkpoint_policy":sqlite.checkpoint_policy,"sqlite_version":sqlite.sqlite_version,"user_version":sqlite.user_version,"page_size":sqlite.page_size,"kill_points":sqlite.kill_points,"hooks_active":false,"install_order":"sqlite-autocheckpoint-before-optional-business-hook"}})).map_err(event_failure)?;
         let listener =
             TcpListener::bind(listen).map_err(|_| Failure::plain("listen_unavailable"))?;
@@ -2232,26 +2276,7 @@ fn run_inner(
             runtime.writer_results()?;
             runtime.connections()?;
             runtime.discover_work();
-            let due: Vec<_> = runtime
-                .timers
-                .iter()
-                .filter(|(_, due)| **due <= Instant::now())
-                .map(|(t, _)| *t)
-                .collect();
-            for token in due {
-                runtime.timers.remove(&token);
-                runtime.queue(Input::Deadline {
-                    token,
-                    now: LogicalTime::new(
-                        runtime
-                            .started
-                            .elapsed()
-                            .as_millis()
-                            .try_into()
-                            .map_err(|_| Failure::plain("clock_exhausted"))?,
-                    ),
-                })?;
-            }
+            runtime.due_deadlines()?;
             #[cfg(feature = "test-hooks")]
             runtime.controls()?;
             runtime.drain_inputs()?;
