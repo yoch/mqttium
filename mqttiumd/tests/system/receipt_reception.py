@@ -15,6 +15,7 @@ from collections import Counter, deque
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import queue
 import re
@@ -33,6 +34,39 @@ from tcp_reception import Broker, writer_available
 HISTORICAL_RECEIPT_LIMIT = 8192
 BUSINESS_COMMANDS = 32769
 WINDOW_COMMANDS = 1024
+
+
+class BusinessTranscript:
+    """Every public business ACK is retained on disk, not in a growing list."""
+    def __init__(self, path: Path):
+        self.path = path
+        self.stream = path.open("xb")
+        self.records, self.bytes = 0, 0
+        self.digest = hashlib.sha256()
+
+    def record(self, kind: str, **fields):
+        record = {"kind": kind, "sequence": self.records,
+                  "monotonic_ns": str(time.monotonic_ns()), **fields}
+        encoded = (json.dumps(record, sort_keys=True) + "\n").encode()
+        require(len(encoded) <= 2048 and self.bytes + len(encoded) <= 16 * 1024 * 1024,
+                "business_transcript_budget")
+        self.stream.write(encoded)
+        self.digest.update(encoded)
+        self.records += 1
+        self.bytes += len(encoded)
+
+    def flush(self):
+        self.stream.flush()
+        os.fsync(self.stream.fileno())
+
+    def close(self):
+        self.flush()
+        self.stream.close()
+
+    def identity(self) -> dict:
+        return {"path": str(self.path), "sha256": self.digest.hexdigest(),
+                "records": self.records, "bytes": self.bytes,
+                "scope": "public API observations; packet bytes are separate transport witnesses"}
 
 
 def storage_sample(broker: Broker) -> dict:
@@ -336,6 +370,7 @@ async def live_public_workload(broker: Broker, case: Path, terminal_commands: in
                          max_write_queue_messages=16, max_write_queue_bytes=65536,
                          message_delivery="iterator", manual_ack=True, connect_timeout=3)
     paho = None
+    transcript = BusinessTranscript(case / "public-client-transcript.jsonl")
     tail = EventTail(broker.events_path, broker.process.pid)
     result = {"clients": {"mqttium": client_identity()}, "windows": [], "mixed_exchanges": [],
               "business_terminal": {"subscription_replacements": 0, "mqttium_publications": 0,
@@ -349,19 +384,26 @@ async def live_public_workload(broker: Broker, case: Path, terminal_commands: in
         connack = await client.connect(*broker.address, timeout=3)
         require(not connack.session_present and connack.reason_code == 0, "mqttium_connack_invalid")
         result["mqttium_connack"] = {"session_present": connack.session_present, "reason": connack.reason_code}
+        transcript.record("mqttium_connack", **result["mqttium_connack"])
         paho = await asyncio.to_thread(PahoPeer, broker.address, topic)
         result["clients"]["paho"] = paho.identity
         result["paho_connack"], result["paho_suback"] = paho.connect_observation, paho.suback
+        transcript.record("paho_connack", **paho.connect_observation)
+        transcript.record("paho_suback", **paho.suback)
         iterator = client.messages()
         first_mid = last_mid = None
         for attempt in range(1, terminal_commands + 1):
             granted = (attempt // WINDOW_COMMANDS) % 2
+            request_started = time.monotonic_ns()
             acknowledgement = await client.subscribe([(topic, granted)], timeout=12)
             require(acknowledgement.reason_codes == (granted,), "live_subscription_refused")
             require(1 <= acknowledgement.mid <= 65535, "live_subscription_packet_identifier")
             first_mid = first_mid if first_mid is not None else acknowledgement.mid
             last_mid = acknowledgement.mid
             result["business_terminal"]["subscription_replacements"] += 1
+            transcript.record("mqttium_suback", attempt=attempt, packet_id=acknowledgement.mid,
+                              reason_codes=list(acknowledgement.reason_codes),
+                              elapsed_ms=(time.monotonic_ns() - request_started) / 1e6)
             if attempt % WINDOW_COMMANDS == 0 or attempt == terminal_commands:
                 # Both durable input QoS classes and both output paths are
                 # observed; no QoS 0 local client receipt stands in for receipt.
@@ -392,6 +434,8 @@ async def live_public_workload(broker: Broker, case: Path, terminal_commands: in
                         await client.ack(reverse)
                     row["paho_self_delivery"] = await asyncio.to_thread(paho.receive, topic, reverse_payload)
                 result["mixed_exchanges"].append(row)
+                transcript.record("mixed_exchange_completed", **row)
+                transcript.flush()
                 now = time.monotonic_ns()
                 sample = {"through_replacement": attempt, "elapsed_ms": (now - started) / 1e6,
                           "window_ms": (now - previous) / 1e6,
@@ -416,13 +460,17 @@ async def live_public_workload(broker: Broker, case: Path, terminal_commands: in
                 and len({window["storage"]["file_inode"] for window in result["windows"]}) == 1,
                 "live_process_or_file_changed")
         result["elapsed_ms"] = (time.monotonic_ns() - started) / 1e6
+        result["transcript"] = transcript.identity()
         return result
     finally:
         try:
             await asyncio.wait_for(client.disconnect(), timeout=3)
         finally:
-            if paho:
-                await asyncio.to_thread(paho.close)
+            try:
+                if paho:
+                    await asyncio.to_thread(paho.close)
+            finally:
+                transcript.close()
 
 
 def live_receipts(binary: Path, case: Path, terminal_commands: int = BUSINESS_COMMANDS) -> dict:
