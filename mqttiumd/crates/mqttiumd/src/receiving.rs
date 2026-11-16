@@ -27,8 +27,12 @@ impl Window {
     }
 
     /// The runtime captures the serial when it accepts a PUBCOMP frame.
-    pub fn complete(&mut self, id: u16, _serial: Option<u64>) {
-        self.receiving.remove(&id);
+    pub fn complete(&mut self, id: u16, serial: Option<u64>) {
+        if let Some(serial) = serial
+            && self.receiving.get(&id).copied() == Some(serial)
+        {
+            self.receiving.remove(&id);
+        }
     }
 }
 
