@@ -137,8 +137,9 @@ facts and independent durable/cardinality observations.
 
 The previous contract digest is
 `8884608f0e66e905307a546b6296934099db688ae5b2829d187dc816dda0bb05`;
-the final `validate` output and run artifacts record the resulting digest after
-all profile/schema/registry changes. Lifecycle evidence deliberately remains
+the resulting digest is
+`c249cd468b460b8304b043a5ced515fee14ac13d3f5bb676d5dd0f0180b5c897`.
+Final `validate` and run artifacts bind that identity to each exact source. Lifecycle evidence deliberately remains
 OUT_OF_SCOPE for the fixture oracle. Existing K1/K2b/K3 qualifications retain
 their own assertions, source/rebuild/features and system witnesses.
 
