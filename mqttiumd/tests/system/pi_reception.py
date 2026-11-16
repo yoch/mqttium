@@ -276,21 +276,29 @@ class FinishCursor:
     def read(self):
         records = []
         live_streams = set()
+        offsets = dict(self.offsets)
         for path in sorted(self.broker.events_path.parent.glob(self.broker.events_path.name + "*")):
             if not path.is_file():
-                continue
-            with path.open("rb") as stream:
+                return
+            try:
+                stream = path.open("rb")
+            except FileNotFoundError:
+                # Rotation renames current→previous before creating current.
+                # Retry on the caller's bounded next poll, without consuming
+                # buffered records or any offsets from this incomplete scan.
+                return
+            with stream:
                 inode = os.fstat(stream.fileno()).st_ino
                 first = stream.readline(2049)
                 if not first or not first.endswith(b"\n"):
-                    continue
+                    return
                 require(len(first) <= 2048, "product_event_record_budget")
                 # A later rotation may recycle a retired inode. Its first
                 # sequence identifies the new stream even if it has already
                 # grown beyond the retired stream's offset.
                 generation = (inode, int(json.loads(first)["seq"]))
                 live_streams.add(generation)
-                offset = self.offsets.get(generation, 0)
+                offset = offsets.get(generation, 0)
                 stream.seek(offset)
                 while True:
                     raw = stream.readline(2049)
@@ -300,8 +308,8 @@ class FinishCursor:
                     records.append(json.loads(raw))
                     require(len(records) <= 16384, "product_event_window_budget")
                     offset = stream.tell()
-                self.offsets[generation] = offset
-        self.offsets = {generation: value for generation, value in self.offsets.items()
+                offsets[generation] = offset
+        self.offsets = {generation: value for generation, value in offsets.items()
                         if generation in live_streams}
         require(len(self.offsets) <= 4, "product_log_rotation_budget")
         for event in sorted(records, key=lambda row: int(row["seq"])):
