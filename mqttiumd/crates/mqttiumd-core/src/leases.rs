@@ -460,8 +460,14 @@ mod tests {
         assert_eq!(count("self.account.reserve("), 2, "charged elsewhere");
 
         // No other module of the core touches a record or an account.
-        for entry in std::fs::read_dir("src").expect("the sources of this crate") {
-            let path = entry.expect("a source file").path();
+        let mut pending = vec![std::path::PathBuf::from("src")];
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(path).expect("a source directory") {
+                    pending.push(entry.expect("a source entry").path());
+                }
+                continue;
+            }
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())

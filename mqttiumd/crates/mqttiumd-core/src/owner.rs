@@ -54,6 +54,8 @@ use crate::contract::step::{CoreFault, Exhaustion, PlanStamp, Progress, StepOutc
 use crate::credits::{Credits, ReleaseOutcome};
 use crate::leases::{LeaseRefused, LeaseTable};
 
+mod pubsub;
+
 /// The largest reservation of effect slots one transition makes. The
 /// constructor of an owner refuses a box that is smaller (ADR 0006,
 /// amendment).
@@ -422,20 +424,25 @@ struct Refusal {
 )]
 #[derive(Debug)]
 enum Change {
+    Pubsub(pubsub::Change),
     /// The input is absorbed: late, repeated, or answered by effects only.
     Nothing,
     /// The facts of the recovery page in the input join the state.
     Recover,
     /// The exclusive writer confirmed this durable session after the
     /// recovery inventory closed. Its table place was checked by the plan.
-    Establish { session: Session },
+    Establish {
+        session: Session,
+    },
     /// The connection becomes the current one of the session.
     Bind {
         session: usize,
         connection: ConnectionGeneration,
     },
     /// The session has no current connection any more.
-    Unbind { session: usize },
+    Unbind {
+        session: usize,
+    },
     /// A new exchange, its admission submitted.
     Admit {
         session: SessionId,
@@ -448,7 +455,10 @@ enum Change {
         in_flight: InFlight,
     },
     /// The admission of the exchange is known committed.
-    Committed { slot: usize, admission: Finished },
+    Committed {
+        slot: usize,
+        admission: Finished,
+    },
     /// A repeated active PUBLISH keeps the same operation and refreshes
     /// only the network occurrence to which its future ACK is correlated.
     Replay {
@@ -463,7 +473,10 @@ enum Change {
     },
     /// The exchange ends with the operation it waited for, and gives its
     /// lease back.
-    End { slot: usize, finished: Finished },
+    End {
+        slot: usize,
+        finished: Finished,
+    },
     /// The operation in flight changes phase, and, after a resolution,
     /// deadline and the effects that answer it.
     Await {
@@ -683,6 +696,7 @@ pub struct Owner {
     /// The latest connections that were closed; see `OwnerConfig`.
     closed: BoundedQueue<ConnectionGeneration>,
     resolution_delay: LogicalDuration,
+    pubsub: pubsub::State,
     /// The one box of this owner. A renewal replaces it in place.
     outbox: Outbox,
 }
@@ -763,9 +777,10 @@ impl Owner {
                 LeaseTable::new(config.account, credit, config.max_exchanges)?,
                 ring(config.retained_operations)?,
                 ring(config.remembered_connections)?,
+                pubsub::State::new(config)?,
             ))
         })();
-        let Ok((routes, sessions, slots, leases, finished, closed)) = tables else {
+        let Ok((routes, sessions, slots, leases, finished, closed, pubsub)) = tables else {
             let reason = OwnerRefusal::AllocationFailed;
             return Err(OwnerRefused { outbox, reason });
         };
@@ -786,6 +801,7 @@ impl Owner {
             finished,
             closed,
             resolution_delay: config.resolution_delay,
+            pubsub,
             outbox,
         })
     }
@@ -940,7 +956,9 @@ impl Owner {
     /// that closes the inventory compares every route with every session.
     fn cost(&self, input: &Input) -> WorkUnits {
         let Input::Recovery { facts, last } = input else {
-            return WorkUnits::new(1);
+            return WorkUnits::new(
+                1u64.saturating_add(self.pubsub.work_bound(input, self.routes.capacity())),
+            );
         };
         let routes = capacity_of(self.routes.capacity());
         let sessions = capacity_of(self.sessions.capacity());
@@ -1008,6 +1026,7 @@ impl Owner {
                     capacity_of(self.slots.capacity())
                         .saturating_mul(3)
                         .saturating_add(capacity_of(self.sessions.capacity()))
+                        .saturating_add(self.pubsub.close_work())
                 } else {
                     0
                 };
@@ -1053,7 +1072,17 @@ impl Owner {
             };
         }
         match input {
-            Input::ConnectionSettings { .. } | Input::WorkPage { .. } => Err(IMPOSSIBLE),
+            Input::ConnectionSettings {
+                connection,
+                receive_maximum,
+                maximum_packet_size,
+            } => self.plan_settings(*connection, *receive_maximum, *maximum_packet_size, draft),
+            Input::WorkPage {
+                effect,
+                session,
+                items,
+                next,
+            } => self.plan_work_page(*effect, *session, items.as_slice(), *next),
             Input::SessionEstablished {
                 connection,
                 session,
@@ -1074,7 +1103,7 @@ impl Owner {
             Input::Recovery { .. } | Input::Continue { .. } => Err(IMPOSSIBLE),
             // A wake-up carries no authority, and this perimeter keeps no
             // work behind one.
-            Input::WorkAvailable { .. } => Ok(Change::Nothing),
+            Input::WorkAvailable { session } => self.plan_work(*session, draft),
             Input::Packet {
                 connection,
                 ingress_order,
@@ -1287,10 +1316,22 @@ impl Owner {
             session: session.id,
             generation: connection,
         };
+        if self.control_collision(connection, packet) {
+            return protocol_error(draft);
+        }
+        if matches!(packet, InboundPacket::Publish { .. }) && self.pubsub.control_pending() {
+            return Err(Stop::Need(CapacityNeed {
+                resource: Resource::ResultSlots,
+                amount: 1,
+                wake: WakeCondition::ResultDelivered,
+            }));
+        }
         match packet {
             InboundPacket::Subscribe { .. }
             | InboundPacket::Unsubscribe { .. }
-            | InboundPacket::Puback { .. } => protocol_error(draft),
+            | InboundPacket::Puback { .. } => {
+                self.plan_pubsub_packet(index, connection, packet, draft)
+            }
             InboundPacket::ConnectResume { .. } => Err(IMPOSSIBLE),
             InboundPacket::Pingreq => {
                 draft.frame(key, OutboundFrame::Pingresp)?;
@@ -1658,6 +1699,9 @@ impl Owner {
             return Err(IMPOSSIBLE);
         }
         let contradiction = Stop::Fatal(CoreFault::ContradictoryOutcome { operation });
+        if let Some(change) = self.plan_pubsub_result(effect, operation, reply, draft)? {
+            return Ok(change);
+        }
         let slots = self.slots.as_slice();
         let waiting = slots.iter().position(|slot| {
             slot.in_flight()
@@ -1798,6 +1842,7 @@ impl Owner {
             .iter()
             .filter_map(|slot| slot.admission)
             .chain(self.finished.iter().copied())
+            .chain(self.pubsub.known(operation))
             .find(|finished| finished.operation == operation);
         let Some(known) = known else {
             return Ok(Change::Nothing);
@@ -1827,6 +1872,9 @@ impl Owner {
     fn plan_deadline(&self, token: DeadlineToken, draft: &mut Draft) -> Result<Change, Stop> {
         if !issued(token, self.counters.deadline) {
             return Err(IMPOSSIBLE);
+        }
+        if let Some(change) = self.plan_pubsub_deadline(token, draft)? {
+            return Ok(change);
         }
         let waiting = self
             .slots
@@ -1870,6 +1918,9 @@ impl Owner {
         progress: FrameProgress,
         draft: &mut Draft,
     ) -> Result<Change, Stop> {
+        if let Some(change) = self.plan_pubsub_frame(effect, connection, progress) {
+            return Ok(change);
+        }
         let failed = matches!(progress, FrameProgress::Failed);
         let completed = matches!(
             progress,
@@ -1940,7 +1991,19 @@ impl Owner {
             // The earlier facts of this kind on this page.
             let same = run(facts, &starts, rank, position);
             let valid = match fact {
-                RecoveredFact::OutboundDelivery { .. } => false,
+                RecoveredFact::OutboundDelivery {
+                    delivery,
+                    target,
+                    target_revision,
+                    claim,
+                } => self.valid_outbound_fact(
+                    *delivery,
+                    *target,
+                    *target_revision,
+                    *claim,
+                    same,
+                    run(facts, &starts, FactRank::Session, position),
+                ),
                 RecoveredFact::Epoch { incarnation, epoch } => {
                     epoch_recovered = true;
                     *incarnation == self.incarnation && *epoch == self.epoch
@@ -2076,6 +2139,7 @@ impl Owner {
             // ACKs, even if the adapter never accepted their Outbox effect.
             // Uncertain admissions are deliberately kept for reconciliation.
             self.finish_closed_acks(connection)?;
+            self.pubsub.close(connection);
             if let Some(session) = self.session_of(connection) {
                 self.sessions.as_mut_slice()[session].connection = None;
             }
@@ -2097,6 +2161,7 @@ impl Owner {
     fn apply_change(&mut self, change: Change, input: Input) -> Result<(), CoreFault> {
         const STALE: CoreFault = CoreFault::StalePlan;
         match change {
+            Change::Pubsub(change) => self.apply_pubsub(change, input)?,
             Change::Nothing => {}
             Change::Recover => {
                 let Input::Recovery { facts, last } = input else {
@@ -2262,7 +2327,12 @@ impl Owner {
             order.admit(fact).map_err(|_| STALE)?;
         }
         match fact {
-            RecoveredFact::OutboundDelivery { .. } => return Err(CoreFault::ImpossibleInput),
+            RecoveredFact::OutboundDelivery {
+                delivery,
+                target,
+                target_revision,
+                claim,
+            } => self.add_outbound_fact(*delivery, *target, *target_revision, *claim)?,
             RecoveredFact::Epoch { .. } => self.epoch_recovered = true,
             RecoveredFact::Limits {
                 max_targets_per_admission,
@@ -6405,9 +6475,181 @@ mod tests {
         }
     }
 
+    fn product_world() -> World {
+        let mut cfg = config();
+        cfg.max_routes = bound(4);
+        let mut world = World::with(cfg, EPOCH, CAPACITY);
+        world.applied(page(&fixture(EPOCH), true));
+        world.applied(connect(CONN, b"p1-producer"));
+        assert_eq!(kinds(&world.drain()), ["EmitConnack"]);
+        world
+    }
+
+    fn work_item(index: u32) -> crate::contract::pubsub::WorkItem {
+        crate::contract::pubsub::WorkItem {
+            delivery: DeliveryId {
+                publication: PublicationId::new(
+                    StoreIncarnation::new(INCARNATION),
+                    RunEpoch::new(EPOCH - 1),
+                    LogicalOwnerId::new(4),
+                    PublicationSeq::new(1),
+                ),
+                index,
+            },
+            target: SessionId::new(PRODUCER),
+            target_revision: Revision::new(PRODUCER + 10),
+            topic: bytes(b"fresh"),
+            payload: bytes(b"payload"),
+            claim: None,
+        }
+    }
+
+    fn work_available() -> Input {
+        Input::WorkAvailable {
+            session: SessionId::new(PRODUCER),
+        }
+    }
+
+    fn load_work(
+        world: &mut World,
+        items: &[crate::contract::pubsub::WorkItem],
+        next: Option<DeliveryId>,
+    ) {
+        world.applied(work_available());
+        let effects = world.drain();
+        assert_eq!(kinds(&effects), ["LoadWork"]);
+        world.applied(Input::WorkPage {
+            effect: effects[0].0,
+            session: SessionId::new(PRODUCER),
+            items: BoundedVec::from_slice(items, 8).unwrap(),
+            next,
+        });
+        assert!(world.drain().is_empty(), "a page alone grants no emission");
+    }
+
+    fn pubsub_flight(world: &mut World, input: Input) -> Flight {
+        world.applied(input);
+        let effects = world.drain();
+        assert_eq!(kinds(&effects), ["Persist", "ArmDeadline"]);
+        let (effect, Effect::Persist { command }) = &effects[0] else {
+            panic!("command")
+        };
+        let (_, Effect::ArmDeadline { token, .. }) = effects[1] else {
+            panic!("deadline")
+        };
+        let facts = match command.recipe.get() {
+            Recipe::ClaimDelivery(c) => CommitFacts::DeliveryClaimed {
+                delivery: c.delivery,
+                target: c.target,
+                packet_id: c.packet_id,
+                claim: c.operation,
+            },
+            Recipe::FinishDelivery(c) => CommitFacts::DeliveryFinished {
+                delivery: c.delivery,
+                target: c.target,
+                packet_id: c.packet_id,
+                claim: c.claim,
+            },
+            Recipe::ChangeSubscriptions(c) => CommitFacts::SubscriptionsChanged {
+                session: c.session,
+                route_revision: c.route_revision.checked_next().unwrap(),
+            },
+            _ => panic!("pubsub command"),
+        };
+        Flight {
+            effect: *effect,
+            operation: command.recipe.operation(),
+            deadline: token,
+            facts,
+        }
+    }
+
+    fn outgoing_puback(connection: u64, raw: u16, reason: u8) -> Input {
+        Input::Packet {
+            connection: ConnectionGeneration::new(connection),
+            ingress_order: 1,
+            packet: InboundPacket::Puback {
+                packet_id: crate::contract::ids::OutboundPacketId::new(raw).unwrap(),
+                reason,
+            },
+        }
+    }
+
+    #[test]
+    fn product_pubsub_claim_and_finish_each_require_their_own_commit() {
+        let mut world = product_world();
+        world.applied(product_settings(CONN, 1));
+        load_work(&mut world, &[work_item(0), work_item(1)], None);
+        let claim = pubsub_flight(&mut world, work_available());
+        assert!(
+            world.sent(work_available()).is_empty(),
+            "claim consumes the peer window before commit"
+        );
+        world.applied(committed(&claim));
+        let effects = world.drain();
+        assert_eq!(kinds(&effects), ["EmitPublish"]);
+        let (
+            emission,
+            Effect::EmitPublish {
+                delivery,
+                packet_id,
+                claim: identity,
+                dup,
+                connection,
+                ..
+            },
+        ) = &effects[0]
+        else {
+            panic!("PUBLISH")
+        };
+        assert_eq!(*delivery, work_item(0).delivery);
+        assert_eq!(*identity, claim.operation);
+        assert_eq!(packet_id.get(), 1);
+        assert!(!*dup);
+        world.applied(Input::FrameResult {
+            effect: *emission,
+            connection: *connection,
+            progress: FrameProgress::Written {
+                confirmed: 20,
+                total: 20,
+            },
+        });
+        assert!(
+            world.drain().is_empty(),
+            "a local write never finishes an obligation"
+        );
+        let finish = pubsub_flight(&mut world, outgoing_puback(CONN, 1, 0));
+        assert!(
+            world.sent(work_available()).is_empty(),
+            "finish pending holds its peer window"
+        );
+        world.applied(committed(&finish));
+        assert!(world.drain().is_empty());
+        let next = pubsub_flight(&mut world, work_available());
+        let CommitFacts::DeliveryClaimed {
+            packet_id,
+            delivery,
+            ..
+        } = next.facts
+        else {
+            panic!("claim")
+        };
+        assert_eq!(
+            packet_id.get(),
+            2,
+            "no live-generation network identifier reuse"
+        );
+        assert_eq!(delivery, work_item(1).delivery);
+        // A delayed duplicate acknowledgment on the old network identifier
+        // cannot finish the second occurrence.
+        assert!(world.sent(outgoing_puback(CONN, 1, 0)).is_empty());
+        world.applied(committed(&next));
+        assert_eq!(kinds(&world.drain()), ["EmitPublish"]);
+    }
+
     #[test]
     fn product_pubsub_settings_enable_bounded_durable_work_discovery() {
-        let mut world = World::connected();
+        let mut world = product_world();
         world.applied(product_settings(CONN, 1));
         let effects = world.sent(Input::WorkAvailable {
             session: SessionId::new(PRODUCER),
@@ -6421,7 +6663,7 @@ mod tests {
 
     #[test]
     fn product_pubsub_suback_requires_commit_then_routing_projection() {
-        let mut world = World::connected();
+        let mut world = product_world();
         world.applied(product_settings(CONN, 1));
         world.applied(subscribe(CONN, 9, b"fresh"));
         let effects = world.drain();
