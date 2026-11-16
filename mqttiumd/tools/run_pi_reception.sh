@@ -114,6 +114,9 @@ pi_run() {
 for pi_case in C-claim C-finish D-copy D-none D-takeover E-claim E-observed E-finish E-reuse; do
     pi_run "hooks-$pi_case" "$pi_case" "$pi_out/binaries/mqttiumd-hooks"
 done
+pi_small_domain=owner::pubsub::tests::the_complete_small_domain_counts_unknown_finish_and_unloaded_recovered_claims
+pi_record core-small-domain cargo test -p mqttiumd-core --lib --locked --target-dir "$pi_targets/core-mutants" "$pi_small_domain" -- --exact --nocapture
+cargo test -p mqttiumd-core --lib --locked --target-dir "$pi_targets/core-mutants" "$pi_small_domain" -- --exact --nocapture >"$pi_out/core-small-domain.log" 2>&1
 pi_record core-transition-mutants "$pi_python" "$pi_root/tools/run_pi_core_mutants.py" "$pi_out/core-mutants" --target-dir "$pi_targets/core-mutants"
 "$pi_python" "$pi_root/tools/run_pi_core_mutants.py" "$pi_out/core-mutants" --target-dir "$pi_targets/core-mutants" >"$pi_out/core-mutants.log" 2>&1
 pi_mutant_source="$pi_out/runtime-mutant-worktree"
@@ -172,7 +175,7 @@ for ledger in (evidence['ledger'], evidence['wire']['ledger']):
         raise SystemExit('streamed ledger identity differs')
 index = {'format': 'mqttiumd.pi-system-reception-index', 'schema_version': 1,
          'status': 'PASS', 'qualification': 'system-test-only', 'source_head': sys.argv[2],
-         'reception_scope': ['B-normal-long', 'B-normal-reverse', 'C-real-uncertainty', 'D-runtime-association', 'E-real-crashes', 'F-protected-resource'],
+         'reception_scope': ['B-normal-long', 'B-normal-reverse', 'C-real-uncertainty', 'C-pure-small-domain', 'D-runtime-association', 'E-real-crashes', 'F-protected-resource'],
          'source_archive': {'path': 'source.tar', 'sha256': hashlib.sha256((out / 'source.tar').read_bytes()).hexdigest()},
          'commands': 'commands.jsonl', 'system_witnesses': 'same-run-strace' if int(sys.argv[3]) else 'process-status-only',
          'source_pin': json.loads((out / 'source-pin.json').read_text()),
@@ -182,6 +185,7 @@ index = {'format': 'mqttiumd.pi-system-reception-index', 'schema_version': 1,
              'elapsed_ms': evidence['elapsed_ms'], 'publisher_connections': evidence['publisher_connections'],
              'subscriber_connections': evidence['subscriber_connections'], 'proxy_connections': evidence['wire']['connections']},
          'receipt_collection': long['receipt_collection'],
+         'small_domain': {'path': 'core-small-domain.log', 'scope': 'pure Owner transition, four actual occupied identifiers'},
          'mutations': {'pure_transition': {'path': 'core-mutants/result.json', 'cases': [
              {'flag': item['flag'], 'reason': item['expected_reason'], 'scope': 'pure Owner transition'} for item in core['mutants']]},
              'runtime_queue': {'path': 'runtime-rebind/receipt.json', 'reason': 'observed_puback_rebound',
