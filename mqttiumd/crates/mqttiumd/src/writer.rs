@@ -339,6 +339,10 @@ struct BusinessState {
     #[cfg(feature = "test-hooks")]
     held_admission: Option<OperationId>,
     #[cfg(feature = "test-hooks")]
+    held_claim: Option<OperationId>,
+    #[cfg(feature = "test-hooks")]
+    held_finish: Option<OperationId>,
+    #[cfg(feature = "test-hooks")]
     captured: Option<mqttiumd_contract::command::Command>,
 }
 fn business_response(
@@ -447,7 +451,7 @@ fn business_response(
                         }
                     }
                     #[cfg(feature = "test-hooks")]
-                    let reply = hold_admission_reply(state, hooks, id, kind, reply, events);
+                    let reply = hold_business_reply(state, hooks, id, kind, reply, events);
                     Response::Store {
                         effect,
                         operation: id,
@@ -458,7 +462,7 @@ fn business_response(
                 Effect::ResolveAndFence { operation: id } => {
                     let reply = StoreReply::Outcome(store.resolve_and_fence(id).outcome);
                     #[cfg(feature = "test-hooks")]
-                    let reply = hold_admission_reply(state, hooks, id, "Resolution", reply, events);
+                    let reply = hold_business_reply(state, hooks, id, "Resolution", reply, events);
                     if events.emit("store_resolved",json!({"operation":operation(id),"details":{"outcome":outcome_name(reply).to_ascii_lowercase()}})).is_err(){cancel.store(true,Ordering::Relaxed);}
                     Response::Store {
                         effect,
@@ -485,6 +489,44 @@ fn business_response(
     }
 }
 
+#[cfg(feature = "test-hooks")]
+fn hold_business_reply(
+    state: &mut BusinessState,
+    hooks: &Hooks,
+    id: OperationId,
+    kind: &str,
+    reply: StoreReply,
+    events: &Events,
+) -> StoreReply {
+    let reply = hold_admission_reply(state, hooks, id, kind, reply, events);
+    for (name, file, held) in [
+        ("Claim", "hold-claim-result", &mut state.held_claim),
+        ("Finish", "hold-finish-result", &mut state.held_finish),
+    ] {
+        let active = hooks
+            .directory
+            .as_ref()
+            .is_some_and(|dir| dir.join(file).exists());
+        if !active {
+            *held = None;
+            continue;
+        }
+        if kind == name
+            && held.is_none()
+            && matches!(
+                reply,
+                StoreReply::Outcome(mqttiumd_contract::outcome::StoreOutcome::Committed(_))
+            )
+        {
+            *held = Some(id);
+        }
+        if *held == Some(id) {
+            let _=events.emit("store_result_held",json!({"operation":operation(id),"command_kind":name,"details":{"outcome":outcome_name(reply),"source":kind}}));
+            return StoreReply::Outcome(mqttiumd_contract::outcome::StoreOutcome::PendingOrUnknown);
+        }
+    }
+    reply
+}
 #[cfg(feature = "test-hooks")]
 fn hold_admission_reply(
     state: &mut BusinessState,

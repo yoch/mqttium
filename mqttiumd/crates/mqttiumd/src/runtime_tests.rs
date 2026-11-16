@@ -107,6 +107,14 @@ fn with_runtime(max_exchanges: u32, test: impl FnOnce(&mut Runtime<'_>, &Path)) 
         frames: BTreeMap::new(),
         outgoing_bindings: BTreeMap::new(),
         puback_observation: 0,
+        #[cfg(feature = "test-hooks")]
+        copied_puback: None,
+        #[cfg(feature = "test-hooks")]
+        deferred_outgoing_written: None,
+        #[cfg(feature = "test-hooks")]
+        copied_outgoing_frame: None,
+        #[cfg(feature = "test-hooks")]
+        last_finish_result: None,
     };
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut cursor = None;

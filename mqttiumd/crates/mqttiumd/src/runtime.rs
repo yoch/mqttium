@@ -71,6 +71,8 @@ const MUTANT_EARLY_QOS0: bool = false;
 const MUTANT_REPLAY_QOS0: bool = false;
 #[cfg(feature = "test-hooks")]
 const MUTANT_QOS0_ACCOUNTING: bool = false;
+#[cfg(feature = "test-hooks")]
+const MUTANT_REBIND_OBSERVED_PUBACK: bool = false;
 
 pub struct Config {
     pub db: PathBuf,
@@ -147,6 +149,14 @@ struct Runtime<'a> {
     frames: BTreeMap<EffectId, PendingFrame>,
     outgoing_bindings: BTreeMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
     puback_observation: u64,
+    #[cfg(feature = "test-hooks")]
+    copied_puback: Option<CopiedPuback>,
+    #[cfg(feature = "test-hooks")]
+    deferred_outgoing_written: Option<(EffectId, ConnectionKey, usize, Instant)>,
+    #[cfg(feature = "test-hooks")]
+    copied_outgoing_frame: Option<(EffectId, ConnectionKey, FrameProgress)>,
+    #[cfg(feature = "test-hooks")]
+    last_finish_result: Option<(EffectId, OperationId, StoreReply)>,
 }
 impl Runtime<'_> {
     fn queue(&mut self, input: Input) -> Result<(), Failure> {
@@ -252,8 +262,27 @@ impl Runtime<'_> {
                     target,
                 } => {
                     if !self.admit_generation(connection.generation)? {
+                        self.events
+                            .emit(
+                                "puback_ignored",
+                                puback_fields(
+                                    connection,
+                                    packet_id,
+                                    reason,
+                                    target,
+                                    None,
+                                    "connection_closed",
+                                ),
+                            )
+                            .map_err(event_failure)?;
                         continue;
                     }
+                    #[cfg(feature = "test-hooks")]
+                    let target = if MUTANT_REBIND_OBSERVED_PUBACK {
+                        self.owner.puback_target(connection, packet_id)
+                    } else {
+                        target
+                    };
                     if target.is_none() || self.owner.puback_target(connection, packet_id) != target
                     {
                         self.events
@@ -602,6 +631,15 @@ impl Runtime<'_> {
                     )) = reply
                     {
                         self.work_cache.remove(&delivery);
+                    }
+                    #[cfg(feature = "test-hooks")]
+                    if matches!(
+                        reply,
+                        StoreReply::Outcome(StoreOutcome::Committed(
+                            CommitFacts::DeliveryFinished { .. }
+                        ))
+                    ) {
+                        self.last_finish_result = Some((effect, operation, reply));
                     }
                     self.queue(Input::StoreResult {
                         effect,
@@ -1066,6 +1104,22 @@ impl Runtime<'_> {
                             ),
                         )
                         .map_err(event_failure)?;
+                    #[cfg(feature = "test-hooks")]
+                    if self.hooks.directory.as_ref().is_some_and(|dir| {
+                        consume_control(&dir.join("copy-next-puback-observation"))
+                    }) {
+                        let copied = CopiedPuback {
+                            connection,
+                            packet_id,
+                            reason,
+                            target,
+                            observation: self.puback_observation,
+                        };
+                        self.events
+                            .emit("puback_observation_copied", copied.fields("copied"))
+                            .map_err(event_failure)?;
+                        self.copied_puback = Some(copied);
+                    }
                     return self.queue(Input::ObservedPuback {
                         connection,
                         packet_id,
@@ -1146,6 +1200,31 @@ impl Runtime<'_> {
                 match written {
                     Ok(net::Written::Complete { correlation, bytes }) => {
                         if let Some((effect, connection)) = correlation {
+                            #[cfg(feature = "test-hooks")]
+                            if self
+                                .frames
+                                .get(&effect)
+                                .is_some_and(|frame| frame.kind == "PUBLISH")
+                                && self.hooks.directory.as_ref().is_some_and(|dir| {
+                                    consume_control(&dir.join("hold-next-outgoing-written"))
+                                })
+                            {
+                                if self.deferred_outgoing_written.is_some() {
+                                    return Err(Failure::plain("outgoing_written_hold_overlap"));
+                                }
+                                self.copied_outgoing_frame = Some((
+                                    effect,
+                                    connection,
+                                    FrameProgress::Written {
+                                        confirmed: bytes as u64,
+                                        total: bytes as u64,
+                                    },
+                                ));
+                                self.deferred_outgoing_written =
+                                    Some((effect, connection, bytes, Instant::now()));
+                                self.events.emit("outgoing_written_held",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"socket_write_complete":true,"bytes":bytes}})).map_err(event_failure)?;
+                                continue;
+                            }
                             #[cfg(feature = "test-hooks")]
                             if !self.deferred_ack_used
                                 && self.hooks.pause.iter().any(|p| p == "ack.receipt")
@@ -1338,6 +1417,24 @@ impl Runtime<'_> {
             };
             self.events.emit("receive_credit", json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id,"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"released":released}})).map_err(event_failure)?;
         }
+        #[cfg(feature = "test-hooks")]
+        if kind == "PUBLISH"
+            && self
+                .hooks
+                .directory
+                .as_ref()
+                .is_some_and(|dir| consume_control(&dir.join("copy-next-outgoing-frame-result")))
+        {
+            self.copied_outgoing_frame = Some((
+                effect,
+                connection,
+                FrameProgress::Written {
+                    confirmed: bytes as u64,
+                    total: bytes as u64,
+                },
+            ));
+            self.events.emit("outgoing_frame_result_copied",json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(effect),"bytes":bytes}})).map_err(event_failure)?;
+        }
         self.queue(Input::FrameResult {
             effect,
             connection,
@@ -1349,6 +1446,51 @@ impl Runtime<'_> {
     }
     #[cfg(feature = "test-hooks")]
     fn controls(&mut self) -> Result<(), Failure> {
+        if let Some(dir) = self.hooks.directory.clone() {
+            if consume_control(&dir.join("replay-copied-puback-observation")) {
+                let copied = self
+                    .copied_puback
+                    .ok_or_else(|| Failure::plain("puback_copy_missing"))?;
+                self.events
+                    .emit("puback_observation_replayed", copied.fields("replayed"))
+                    .map_err(event_failure)?;
+                self.queue(copied.input())?;
+            }
+            if let Some((effect, connection, bytes, since)) = self.deferred_outgoing_written {
+                if !self.frames.contains_key(&effect) {
+                    self.deferred_outgoing_written = None;
+                    self.events.emit("outgoing_written_discarded",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"code":"connection_closed"}})).map_err(event_failure)?;
+                } else if since.elapsed() > Duration::from_secs(30) {
+                    return Err(Failure::plain("outgoing_written_deadline"));
+                } else if consume_control(&dir.join("release-outgoing-written")) {
+                    self.deferred_outgoing_written = None;
+                    self.written_complete(effect, connection, bytes)?;
+                    self.events.emit("outgoing_written_released",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect)}})).map_err(event_failure)?;
+                }
+            }
+            if consume_control(&dir.join("replay-last-outgoing-frame-result")) {
+                let (effect, connection, progress) = self
+                    .copied_outgoing_frame
+                    .ok_or_else(|| Failure::plain("outgoing_frame_copy_missing"))?;
+                self.queue(Input::FrameResult {
+                    effect,
+                    connection,
+                    progress,
+                })?;
+                self.events.emit("outgoing_frame_result_replayed",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect)}})).map_err(event_failure)?;
+            }
+            if consume_control(&dir.join("replay-last-finish-result")) {
+                let (effect, operation_id, reply) = self
+                    .last_finish_result
+                    .ok_or_else(|| Failure::plain("finish_result_copy_missing"))?;
+                self.queue(Input::StoreResult {
+                    effect,
+                    operation: operation_id,
+                    reply,
+                })?;
+                self.events.emit("finish_result_replayed",json!({"operation":operation(operation_id),"command_kind":"Finish","details":{"effect":effect_text(effect)}})).map_err(event_failure)?;
+            }
+        }
         if self
             .hooks
             .directory
@@ -1432,6 +1574,40 @@ impl Runtime<'_> {
         }
         Ok(())
     }
+}
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy)]
+struct CopiedPuback {
+    connection: ConnectionKey,
+    packet_id: OutboundPacketId,
+    reason: u8,
+    target: Option<PubackTarget>,
+    observation: u64,
+}
+#[cfg(feature = "test-hooks")]
+impl CopiedPuback {
+    fn input(self) -> Input {
+        Input::ObservedPuback {
+            connection: self.connection,
+            packet_id: self.packet_id,
+            reason: self.reason,
+            target: self.target,
+        }
+    }
+    fn fields(self, code: &str) -> serde_json::Value {
+        puback_fields(
+            self.connection,
+            self.packet_id,
+            self.reason,
+            self.target,
+            Some(self.observation),
+            code,
+        )
+    }
+}
+#[cfg(feature = "test-hooks")]
+fn consume_control(path: &std::path::Path) -> bool {
+    path.exists() && std::fs::remove_file(path).is_ok()
 }
 #[cfg(feature = "test-hooks")]
 struct HeldEmission {
@@ -2276,6 +2452,14 @@ fn run_inner(
         frames: BTreeMap::new(),
         outgoing_bindings: BTreeMap::new(),
         puback_observation: 0,
+        #[cfg(feature = "test-hooks")]
+        copied_puback: None,
+        #[cfg(feature = "test-hooks")]
+        deferred_outgoing_written: None,
+        #[cfg(feature = "test-hooks")]
+        copied_outgoing_frame: None,
+        #[cfg(feature = "test-hooks")]
+        last_finish_result: None,
     };
     let result = (|| {
         let mut cursor = None;
