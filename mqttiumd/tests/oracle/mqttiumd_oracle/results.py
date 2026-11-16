@@ -171,6 +171,11 @@ UNCORROBORATED_QUEUED = (
 )
 
 
+def _positive_receipt_frontier(row):
+    return any(int(row[member]) > 0
+               for member in ("through", "publication_through", "payload_through"))
+
+
 def _scope_unmet(contracts, scenario_path, trace_path):
     """Descriptive support for a new format does not qualify its semantics.
 
@@ -190,7 +195,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
     for _, snapshot in run.snapshots.values():
         # A zero producer registration does not establish collection. A
         # positive compact boundary belongs to a new, unexamined state machine.
-        receipt_retirement |= any(int(row["through"]) > 0
+        receipt_retirement |= any(_positive_receipt_frontier(row)
                                   for row in snapshot.get("receipt_frontiers", ()))
         unsupported |= bool(snapshot["outbound"])
         qos0_delivery |= any(row.get("effective_qos") == 0
@@ -228,7 +233,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
             continue
         for fact in payload["facts"]:
             if fact["kind"] == "ReceiptFrontier":
-                receipt_retirement |= int(fact["through"]) > 0
+                receipt_retirement |= _positive_receipt_frontier(fact)
                 continue
             if fact["kind"] != "OutboundDelivery":
                 continue
