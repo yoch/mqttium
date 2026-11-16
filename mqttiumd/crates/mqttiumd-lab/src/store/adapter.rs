@@ -142,6 +142,7 @@ pub enum WorkKind {
     FinishDelivery,
     ConsumeDelivery,
     UpdateSubscriptions,
+    SessionLifecycle,
     ResolveAndFence,
     OpenEpoch,
 }
@@ -158,6 +159,7 @@ impl WorkKind {
             Self::FinishDelivery => "FinishDelivery",
             Self::ConsumeDelivery => "ConsumeDelivery",
             Self::UpdateSubscriptions => "UpdateSubscriptions",
+            Self::SessionLifecycle => "SessionLifecycle",
             Self::ResolveAndFence => "ResolveAndFence",
             Self::OpenEpoch => "OpenEpoch",
         }
@@ -482,6 +484,9 @@ fn describe(work: &Work) -> (WorkKind, Option<OperationId>, Source) {
             }
             Recipe::UpdateSubscriptions(change) => {
                 (WorkKind::UpdateSubscriptions, Some(change.operation), None)
+            }
+            Recipe::SessionLifecycle(change) => {
+                (WorkKind::SessionLifecycle, Some(change.operation), None)
             }
         },
         Work::Resolve(operation) => (WorkKind::ResolveAndFence, Some(*operation), None),

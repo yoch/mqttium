@@ -479,11 +479,15 @@ pub fn recovered_fact(fact: &RecoveredFact) -> Value {
             session: id,
             client_id,
             revision,
+            expiry,
+            opened_by,
         } => json!({
             "kind": "Session",
             "session": session(*id),
             "client_id_hex": hex(client_id.as_slice()),
             "revision": decimal(revision.get()),
+            "expiry": match expiry { SessionExpiry::OnDisconnect => "OnDisconnect", SessionExpiry::Never => "Never" },
+            "opened_by": opened_by.map(operation_id),
         }),
         RecoveredFact::InboundExchange {
             exchange,
@@ -827,7 +831,8 @@ impl<'a> TraceWriter<'a> {
                     | WorkKind::ClaimDelivery
                     | WorkKind::FinishDelivery
                     | WorkKind::ConsumeDelivery
-                    | WorkKind::UpdateSubscriptions => self.record(
+                    | WorkKind::UpdateSubscriptions
+                    | WorkKind::SessionLifecycle => self.record(
                         "store-adapter",
                         "CommandSubmitted",
                         &[],

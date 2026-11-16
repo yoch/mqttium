@@ -32,7 +32,6 @@ use mqttiumd_contract::packet::{Qos, SharedBytes};
 use super::durable::{
     Accounts, AdminCommand, AdminDone, AdminRefused, Decision, DurableState, DurableStore, Limits,
     MAX_CLIENT_ID_BYTES, ObligationPhase, ReadBudget, ReadError, RecoveryRefused, Resolved,
-    SessionState,
 };
 
 /// The incarnation every check creates its data set with.
