@@ -1,6 +1,6 @@
-//! Receive Maximum accounting is scoped to a PUBLISH occurrence, not only its
-//! reusable packet identifier. A delayed PUBCOMP receipt cannot free a later
-//! exchange's slot.
+//! Receive Maximum accounting is scoped to a PUBLISH occurrence and its QoS,
+//! not only its reusable packet identifier. A delayed terminal ACK receipt
+//! cannot free a later exchange's slot, including a use with another QoS.
 
 use std::collections::BTreeMap;
 
@@ -15,43 +15,67 @@ pub enum Terminal {
     RejectedPubrec,
 }
 
+impl Terminal {
+    fn qos(self) -> Qos {
+        match self {
+            Self::Puback => Qos::AtLeastOnce,
+            Self::Pubcomp | Self::RejectedPubrec => Qos::ExactlyOnce,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Occurrence {
+    serial: u64,
+    qos: Qos,
+}
+
 #[derive(Default)]
 pub struct Window {
-    receiving: BTreeMap<u16, u64>,
+    receiving: BTreeMap<u16, Occurrence>,
 }
 
 impl Window {
-    pub fn publish_qos(&mut self, id: u16, serial: u64, _qos: Qos) -> Result<(), ()> {
-        self.publish(id, serial)
+    /// Refreshing a reusable identifier does not consume another receive
+    /// slot. Older accepted frames retain their own frozen occurrence serial.
+    pub fn publish_qos(&mut self, id: u16, serial: u64, qos: Qos) -> Result<(), ()> {
+        if qos == Qos::AtMostOnce
+            || (!self.receiving.contains_key(&id) && self.receiving.len() >= MAXIMUM)
+        {
+            return Err(());
+        }
+        self.receiving.insert(id, Occurrence { serial, qos });
+        Ok(())
     }
 
-    pub fn complete_frame(&mut self, id: u16, serial: Option<u64>, _terminal: Terminal) -> bool {
-        let complete = serial.is_some() && self.serial(id) == serial;
-        self.complete(id, serial);
-        complete
+    /// Only a terminal ACK for this QoS and this exact PUBLISH occurrence
+    /// releases its credit. The caller supplies a core-frozen serial, never
+    /// one inferred later from the current use of the Packet Identifier.
+    pub fn complete_frame(&mut self, id: u16, serial: Option<u64>, terminal: Terminal) -> bool {
+        if let Some(serial) = serial
+            && self.receiving.get(&id).is_some_and(|occurrence| {
+                occurrence.serial == serial && occurrence.qos == terminal.qos()
+            })
+        {
+            self.receiving.remove(&id);
+            return true;
+        }
+        false
     }
 
     /// A repeated identifier refreshes its serial without consuming another
     /// slot. The runtime supplies a checked, monotonically increasing serial.
     pub fn publish(&mut self, id: u16, serial: u64) -> Result<(), ()> {
-        if !self.receiving.contains_key(&id) && self.receiving.len() >= MAXIMUM {
-            return Err(());
-        }
-        self.receiving.insert(id, serial);
-        Ok(())
+        self.publish_qos(id, serial, Qos::ExactlyOnce)
     }
 
     pub fn serial(&self, id: u16) -> Option<u64> {
-        self.receiving.get(&id).copied()
+        self.receiving.get(&id).map(|occurrence| occurrence.serial)
     }
 
     /// The runtime captures the serial when it accepts a PUBCOMP frame.
     pub fn complete(&mut self, id: u16, serial: Option<u64>) {
-        if let Some(serial) = serial
-            && self.receiving.get(&id).copied() == Some(serial)
-        {
-            self.receiving.remove(&id);
-        }
+        self.complete_frame(id, serial, Terminal::Pubcomp);
     }
 }
 
