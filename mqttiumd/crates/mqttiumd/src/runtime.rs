@@ -14,11 +14,11 @@ use mqttiumd_contract::effects::{
 };
 use mqttiumd_contract::ids::{
     AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, EffectId, LogicalDuration,
-    LogicalOwnerId, LogicalTime, OperationId, SessionId,
+    LogicalOwnerId, LogicalTime, OperationId, OutboundPacketId, SessionId,
 };
 use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome, StoreReply};
 use mqttiumd_contract::packet::{InboundPacket, OutboundFrame};
-use mqttiumd_contract::pubsub::{Qos0DropReason, Qos0Origin};
+use mqttiumd_contract::pubsub::{PubackTarget, Qos0DropReason, Qos0Origin};
 use mqttiumd_contract::receipts::{
     ClosedReceiptCollection, ClosedReceiptReply, ReceiptCollectionReply,
 };
@@ -44,6 +44,7 @@ const CONNECTIONS: usize = 16;
 const IN_FLIGHT: usize = 16;
 const TIMERS: usize = 512;
 const INPUTS: usize = 128;
+const OUTGOING_BINDINGS: usize = 128;
 const BOUNDS: Bounds = Bounds {
     max_packet: 65536,
     max_client_id: 1024,
@@ -144,6 +145,8 @@ struct Runtime<'a> {
     #[cfg(feature = "test-hooks")]
     deferred_ack_used: bool,
     frames: BTreeMap<EffectId, PendingFrame>,
+    outgoing_bindings: BTreeMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
+    puback_observation: u64,
 }
 impl Runtime<'_> {
     fn queue(&mut self, input: Input) -> Result<(), Failure> {
@@ -200,9 +203,10 @@ impl Runtime<'_> {
                     })?;
                 }
             }
-            self.deferred_inputs.retain(
-                |input| !matches!(input,Input::Packet {connection,..} if *connection==generation),
-            );
+            self.deferred_inputs
+                .retain(|input| input_connection(input) != Some(generation));
+            self.outgoing_bindings
+                .retain(|(connection, _), _| connection.generation != generation);
             peer.io.close();
             self.retiring.push(peer.io);
             self.events
@@ -241,6 +245,42 @@ impl Runtime<'_> {
                 continue;
             }
             let input = match input {
+                Input::ObservedPuback {
+                    connection,
+                    packet_id,
+                    reason,
+                    target,
+                } => {
+                    if !self.admit_generation(connection.generation)? {
+                        continue;
+                    }
+                    if target.is_none() || self.owner.puback_target(connection, packet_id) != target
+                    {
+                        self.events
+                            .emit(
+                                "puback_ignored",
+                                puback_fields(
+                                    connection,
+                                    packet_id,
+                                    reason,
+                                    target,
+                                    None,
+                                    "no_current_matching_occurrence",
+                                ),
+                            )
+                            .map_err(event_failure)?;
+                    }
+                    Input::ObservedPuback {
+                        connection,
+                        packet_id,
+                        reason,
+                        target,
+                    }
+                }
+                Input::Packet {
+                    packet: InboundPacket::Puback { .. },
+                    ..
+                } => return Err(Failure::plain("uncorrelated_puback_input")),
                 Input::Packet {
                     connection,
                     ingress_order,
@@ -381,6 +421,7 @@ impl Runtime<'_> {
                 }
             }
             if applied {
+                self.prune_outgoing_bindings();
                 // A terminal result is consumed only after the exact input was
                 // applied. The pure owner, rather than elapsed wall time or a
                 // received reply, decides which deadlines remain meaningful.
@@ -394,6 +435,13 @@ impl Runtime<'_> {
         }
         self.schedule_maintenance();
         Ok(())
+    }
+    fn prune_outgoing_bindings(&mut self) {
+        let owner = &self.owner;
+        self.outgoing_bindings
+            .retain(|(connection, packet_id), target| {
+                owner.puback_target(*connection, *packet_id) == Some(*target)
+            });
     }
     fn schedule_maintenance(&mut self) {
         if self.maintenance_needed
@@ -464,6 +512,7 @@ impl Runtime<'_> {
             inputs: &mut self.inputs,
             deferred_count: self.deferred_inputs.len(),
             frames: &mut self.frames,
+            outgoing_bindings: &mut self.outgoing_bindings,
             close: Vec::new(),
             error: None,
         };
@@ -705,6 +754,7 @@ impl Runtime<'_> {
                     })),
                 ..
             } => Some((*session, false)),
+            Input::ObservedPuback { connection, .. } => Some((connection.session, false)),
             Input::FrameResult { connection, .. } | Input::Qos0EmitRefused { connection, .. } => {
                 Some((connection.session, false))
             }
@@ -980,6 +1030,48 @@ impl Runtime<'_> {
                         return Ok(());
                     }
                     return self.close(generation, "receive_maximum");
+                }
+                if let InboundPacket::Puback { packet_id, reason } = packet {
+                    let session = self
+                        .sessions
+                        .values()
+                        .find(|session| self.owner.connection_of(session.id) == Some(generation))
+                        .ok_or_else(|| Failure::plain("puback_connection_unbound"))?
+                        .id;
+                    let connection = ConnectionKey {
+                        session,
+                        generation,
+                    };
+                    // This is the authoritative observation boundary: decoded
+                    // bytes have left the reader channel, but this input has
+                    // not entered either owner queue. Missing means finalNone.
+                    let target = self
+                        .outgoing_bindings
+                        .get(&(connection, packet_id))
+                        .copied();
+                    self.puback_observation = self
+                        .puback_observation
+                        .checked_add(1)
+                        .ok_or_else(|| Failure::plain("puback_observation_exhausted"))?;
+                    self.events
+                        .emit(
+                            "puback_observed",
+                            puback_fields(
+                                connection,
+                                packet_id,
+                                reason,
+                                target,
+                                Some(self.puback_observation),
+                                "observed",
+                            ),
+                        )
+                        .map_err(event_failure)?;
+                    return self.queue(Input::ObservedPuback {
+                        connection,
+                        packet_id,
+                        reason,
+                        target,
+                    });
                 }
                 self.queue(Input::Packet {
                     connection: generation,
@@ -1366,6 +1458,7 @@ struct Sink<'a> {
     inputs: &'a mut VecDeque<Input>,
     deferred_count: usize,
     frames: &'a mut BTreeMap<EffectId, PendingFrame>,
+    outgoing_bindings: &'a mut BTreeMap<(ConnectionKey, OutboundPacketId), PubackTarget>,
     close: Vec<(ConnectionGeneration, &'static str)>,
     error: Option<Failure>,
 }
@@ -1860,6 +1953,22 @@ impl EffectSink for Sink<'_> {
                         return refused(effect, SubmitBlock::Closed);
                     }
                 };
+                let binding_key = (connection, packet_id);
+                let binding = PubackTarget {
+                    delivery,
+                    claim,
+                    frame: id,
+                };
+                if self.outgoing_bindings.contains_key(&binding_key) {
+                    self.error = Some(Failure::plain("outgoing_binding_conflict"));
+                    return refused(effect, SubmitBlock::InFlightLimit);
+                }
+                if self.outgoing_bindings.len() >= OUTGOING_BINDINGS {
+                    return refused(effect, SubmitBlock::InFlightLimit);
+                }
+                // Register before the network task can observe this frame.
+                // A rejected queue submission rolls this precise entry back.
+                self.outgoing_bindings.insert(binding_key, binding);
                 match peer.io.outgoing.try_send(net::Write {
                     correlation: Some((id, connection)),
                     bytes,
@@ -1881,10 +1990,12 @@ impl EffectSink for Sink<'_> {
                         SubmitResult::Accepted
                     }
                     Err(TrySendError::Full(_)) => {
+                        self.outgoing_bindings.remove(&binding_key);
                         self.close.push((generation, "outgoing_queue_full"));
                         refused(effect, SubmitBlock::QueueFull)
                     }
                     Err(TrySendError::Disconnected(_)) => {
+                        self.outgoing_bindings.remove(&binding_key);
                         self.close.push((generation, "outgoing_queue_full"));
                         refused(effect, SubmitBlock::Closed)
                     }
@@ -1892,6 +2003,28 @@ impl EffectSink for Sink<'_> {
             }
         }
     }
+}
+fn input_connection(input: &Input) -> Option<ConnectionGeneration> {
+    match input {
+        Input::Packet { connection, .. } => Some(*connection),
+        Input::ObservedPuback { connection, .. } => Some(connection.generation),
+        _ => None,
+    }
+}
+fn puback_fields(
+    connection: ConnectionKey,
+    packet_id: OutboundPacketId,
+    reason: u8,
+    target: Option<PubackTarget>,
+    observation: Option<u64>,
+    code: &str,
+) -> serde_json::Value {
+    let target=target.map(|target|json!({"delivery_id":{"publication_id":{"incarnation":target.delivery.publication.incarnation().get().to_string(),"epoch":target.delivery.publication.epoch().get().to_string(),"owner":target.delivery.publication.owner().get().to_string(),"sequence":target.delivery.publication.sequence().get().to_string()},"index":target.delivery.index},"claim_operation_id":operation(target.claim),"frame_effect_id":{"epoch":target.frame.epoch.get().to_string(),"owner":target.frame.owner.get().to_string(),"sequence":target.frame.sequence.get().to_string()}}));
+    let mut puback = json!({"connection":{"session":connection.session.get().to_string(),"generation":connection.generation.get().to_string()},"packet_id":packet_id.get(),"reason_code":reason,"target":target});
+    if let Some(sequence) = observation {
+        puback["source_observation_sequence"] = json!(sequence.to_string());
+    }
+    json!({"connection":connection.generation.get().to_string(),"puback":puback,"details":{"authority":"reader_dequeue","code":code}})
 }
 fn frame_info(frame: OutboundFrame) -> (&'static str, Option<u16>) {
     match frame {
@@ -2141,6 +2274,8 @@ fn run_inner(
         #[cfg(feature = "test-hooks")]
         deferred_ack_used: false,
         frames: BTreeMap::new(),
+        outgoing_bindings: BTreeMap::new(),
+        puback_observation: 0,
     };
     let result = (|| {
         let mut cursor = None;
@@ -2291,7 +2426,7 @@ fn run_inner(
             .local_addr()
             .map_err(|_| Failure::plain("listen_address"))?;
         check_startup_cancel(&cancel)?;
-        events.emit("ready",json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100}})).map_err(event_failure)?;
+        events.emit("ready",json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100}})).map_err(event_failure)?;
         println!("mqttiumd ready {address} (experimental exact pub/sub)");
         while !cancel.load(Ordering::Relaxed) {
             for _ in 0..4 {
