@@ -510,8 +510,12 @@ impl Draft {
     }
 
     fn frame(&mut self, connection: ConnectionKey, frame: OutboundFrame) -> Result<(), Stop> {
-        self.emit(Effect::EmitFrame { connection, frame })
-            .map(|_| ())
+        self.emit(Effect::EmitFrame {
+            connection,
+            frame,
+            publish_order: None,
+        })
+        .map(|_| ())
     }
 
     fn close(&mut self, connection: ConnectionGeneration, reason: CloseReason) -> Result<(), Stop> {
@@ -2357,6 +2361,7 @@ mod tests {
             Effect::ArmDeadline { .. } => "ArmDeadline",
             Effect::Continue { .. } => "Continue",
             Effect::EmitFrame { frame, .. } => match frame {
+                OutboundFrame::Puback { .. } => "EmitPuback",
                 OutboundFrame::Pingresp => "EmitPingresp",
                 OutboundFrame::Connack { .. } => "EmitConnack",
                 OutboundFrame::Pubrec {
@@ -3277,6 +3282,7 @@ mod tests {
                 frame: OutboundFrame::Connack {
                     session_present: true,
                 },
+                publish_order: None,
             }
         );
         assert_eq!(effects.len(), 1);
@@ -3467,6 +3473,7 @@ mod tests {
                 frame: OutboundFrame::Connack {
                     session_present: false,
                 },
+                publish_order: None,
             }
         );
         assert_eq!(world.owner.sessions.len(), 1);
@@ -3708,6 +3715,7 @@ mod tests {
                 generation: ConnectionGeneration::new(connection),
             },
             frame,
+            publish_order: None,
         }
     }
 

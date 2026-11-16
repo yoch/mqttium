@@ -13,6 +13,7 @@ pub enum Kind {
     Connect,
     Connack,
     Publish,
+    Puback,
     Pubrec,
     Pubrel,
     Pubcomp,
@@ -27,6 +28,7 @@ impl Kind {
             Self::Connect => "CONNECT",
             Self::Connack => "CONNACK",
             Self::Publish => "PUBLISH",
+            Self::Puback => "PUBACK",
             Self::Pubrec => "PUBREC",
             Self::Pubrel => "PUBREL",
             Self::Pubcomp => "PUBCOMP",
@@ -41,6 +43,7 @@ impl Kind {
             Self::Connect,
             Self::Connack,
             Self::Publish,
+            Self::Puback,
             Self::Pubrec,
             Self::Pubrel,
             Self::Pubcomp,
@@ -206,8 +209,10 @@ pub mod peer {
                     session_present: Some(flags & 1 == 1),
                 })
             }
-            0x50 | 0x70 => {
-                let kind = if first == 0x50 {
+            0x40 | 0x50 | 0x70 => {
+                let kind = if first == 0x40 {
+                    Kind::Puback
+                } else if first == 0x50 {
                     Kind::Pubrec
                 } else {
                     Kind::Pubcomp
@@ -342,6 +347,13 @@ pub mod transport {
     /// The bytes of a frame: the short form when the reason is Success.
     pub fn encode(frame: OutboundFrame) -> Result<Vec<u8>, &'static str> {
         match frame {
+            OutboundFrame::Puback { packet_id, reason } => {
+                let mut body = packet_id.get().to_be_bytes().to_vec();
+                if reason.to_wire() != 0 {
+                    body.push(reason.to_wire());
+                }
+                packet(0x40, &body)
+            }
             OutboundFrame::Pingresp => packet(0xd0, &[]),
             OutboundFrame::Connack { session_present } => {
                 packet(0x20, &[u8::from(session_present), 0x00, 0x00])
@@ -367,6 +379,7 @@ pub mod transport {
     #[must_use]
     pub fn describe(frame: OutboundFrame) -> (Kind, Option<u16>) {
         match frame {
+            OutboundFrame::Puback { packet_id, .. } => (Kind::Puback, Some(packet_id.get())),
             OutboundFrame::Pingresp => (Kind::Pingresp, None),
             OutboundFrame::Connack { .. } => (Kind::Connack, None),
             OutboundFrame::Pubrec { packet_id, .. } => (Kind::Pubrec, Some(packet_id.get())),

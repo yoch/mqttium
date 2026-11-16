@@ -43,7 +43,7 @@
       "const": 1
     },
     "id": {
-      "const": "tcp-inbound-qos2-v1"
+      "const": "tcp-inbound-qos1-qos2-v1"
     },
     "mqtt_version": {
       "const": 5
@@ -59,6 +59,7 @@
     },
     "incoming_qos": {
       "const": [
+        1,
         2
       ]
     },

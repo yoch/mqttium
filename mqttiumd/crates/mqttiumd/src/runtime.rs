@@ -687,7 +687,9 @@ impl EffectSink for Sink<'_> {
                     _ => unreachable!(),
                 }
             }
-            Effect::EmitFrame { connection, frame } => {
+            Effect::EmitFrame {
+                connection, frame, ..
+            } => {
                 let (connection, frame) = (*connection, *frame);
                 let generation = connection.generation;
                 let (kind, packet_id) = frame_info(frame);
@@ -795,6 +797,7 @@ fn frame_info(frame: OutboundFrame) -> (&'static str, Option<u16>) {
     match frame {
         OutboundFrame::Connack { .. } => ("CONNACK", None),
         OutboundFrame::Pingresp => ("PINGRESP", None),
+        OutboundFrame::Puback { packet_id, .. } => ("PUBACK", Some(packet_id.get())),
         OutboundFrame::Pubrec { packet_id, .. } => ("PUBREC", Some(packet_id.get())),
         OutboundFrame::Pubcomp { packet_id, .. } => ("PUBCOMP", Some(packet_id.get())),
     }

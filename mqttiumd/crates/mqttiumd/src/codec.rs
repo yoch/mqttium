@@ -698,6 +698,14 @@ pub fn encode(frame: OutboundFrame) -> Result<Vec<u8>, Error> {
         })
     };
     match frame {
+        OutboundFrame::Puback { packet_id, reason } => {
+            let [high, low] = packet_id.get().to_be_bytes();
+            if reason.to_wire() == 0 {
+                Ok(vec![0x40, 2, high, low])
+            } else {
+                Ok(vec![0x40, 3, high, low, reason.to_wire()])
+            }
+        }
         OutboundFrame::Connack { session_present } => Ok(vec![
             0x20,
             22,

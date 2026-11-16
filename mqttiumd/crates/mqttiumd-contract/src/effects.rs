@@ -274,6 +274,10 @@ pub enum Effect {
     EmitFrame {
         connection: ConnectionKey,
         frame: OutboundFrame,
+        /// PUBLISH occurrence on this connection, frozen by the core when
+        /// making the ACK eligible. Never inferred later from a reusable
+        /// Packet Identifier. None for frames without a current PUBLISH.
+        publish_order: Option<u64>,
     },
     /// Close the designated connection.
     CloseConnection {

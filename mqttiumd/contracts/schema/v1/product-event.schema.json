@@ -65,7 +65,8 @@
       "enum": [
         "admission.prepared",
         "release.prepared",
-        "admission.committed"
+        "admission.committed",
+        "ack.receipt"
       ]
     },
     "command_kind": {

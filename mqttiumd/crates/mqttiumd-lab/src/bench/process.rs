@@ -188,6 +188,15 @@ fn ack_reason(frame: OutboundFrame) -> Option<&'static str> {
     use mqttiumd_contract::packet::AckReason;
     let reason = match frame {
         OutboundFrame::Connack { .. } | OutboundFrame::Pingresp => return None,
+        OutboundFrame::Puback { reason, .. } => {
+            return Some(match reason {
+                mqttiumd_contract::packet::PubackReason::Success => "Success",
+                mqttiumd_contract::packet::PubackReason::QuotaExceeded => "QuotaExceeded",
+                mqttiumd_contract::packet::PubackReason::ImplementationSpecificError => {
+                    "ImplementationSpecificError"
+                }
+            });
+        }
         OutboundFrame::Pubrec { reason, .. } | OutboundFrame::Pubcomp { reason, .. } => reason,
     };
     Some(match reason {
@@ -540,7 +549,9 @@ impl<S: DurableStore> EffectSink for Sink<'_, S> {
                 let _ = effect.into_parts();
                 SubmitResult::Accepted
             }
-            Effect::EmitFrame { connection, frame } => {
+            Effect::EmitFrame {
+                connection, frame, ..
+            } => {
                 let (connection, frame) = (*connection, *frame);
                 let bytes = match transport::encode(frame) {
                     Ok(bytes) => bytes,

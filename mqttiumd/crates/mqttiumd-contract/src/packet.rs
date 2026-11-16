@@ -2,7 +2,7 @@
 //!
 //! The decoder turns bytes into these values only after validation; a
 //! malformed scenario supplies bytes and never builds an impossible value
-//! here. The subset is closed: resume of a prepared session, inbound QoS 2.
+//! here. The subset includes durable incoming QoS 1 and QoS 2.
 
 use alloc::sync::Arc;
 
@@ -144,6 +144,38 @@ impl AckReason {
     }
 }
 
+/// PUBACK reasons implemented by the incoming QoS 1 receiver. Kept separate
+/// from PUBCOMP: Packet Identifier not found (0x92) is not valid in PUBACK.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PubackReason {
+    Success,
+    QuotaExceeded,
+    ImplementationSpecificError,
+}
+
+impl PubackReason {
+    #[must_use]
+    pub const fn refusing(rejection: RejectReason) -> Self {
+        match rejection {
+            RejectReason::CapacityExceeded(_) => Self::QuotaExceeded,
+            RejectReason::Fenced | RejectReason::PreconditionFailed | RejectReason::EpochClosed => {
+                Self::ImplementationSpecificError
+            }
+        }
+    }
+
+    /// MQTT 5 section 3.4.2.1. No reason belonging only to another ACK can
+    /// be represented by this type.
+    #[must_use]
+    pub const fn to_wire(self) -> u8 {
+        match self {
+            Self::Success => 0,
+            Self::QuotaExceeded => 0x97,
+            Self::ImplementationSpecificError => 0x83,
+        }
+    }
+}
+
 /// A frame the core may make eligible on a connection.
 ///
 /// PUBREC and PUBCOMP answer the client's exchange, so they carry the
@@ -154,6 +186,10 @@ pub enum OutboundFrame {
     Pingresp,
     Connack {
         session_present: bool,
+    },
+    Puback {
+        packet_id: InboundPacketId,
+        reason: PubackReason,
     },
     Pubrec {
         packet_id: InboundPacketId,
