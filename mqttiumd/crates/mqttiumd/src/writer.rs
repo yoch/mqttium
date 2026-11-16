@@ -864,4 +864,82 @@ mod tests {
             "reserved maintenance must reply even when the ordinary result lane is demonstrably full"
         );
     }
+    #[test]
+    fn collection_observation_reports_actual_absolute_frontier_after_reordered_request() {
+        use mqttiumd_contract::ids::OperationSeq;
+        let path = std::env::temp_dir().join(format!(
+            "mqttiumd-absolute-closure-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let events = Events::open(&path.join("events.jsonl")).unwrap();
+        let (mut store, boot) = bootstrap(&path.join("store.sqlite")).unwrap();
+        let origin = ReceiptOrigin {
+            incarnation: boot.grant.incarnation(),
+            epoch: boot.grant.epoch(),
+            owner: LogicalOwnerId::new(0),
+        };
+        let empty = ReceiptClosure::empty(origin);
+        assert!(matches!(
+            store.collect_receipts(ReceiptCollection {
+                closure: empty,
+                limit: 128
+            }),
+            Ok(ReceiptCollectionReply::Applied { .. })
+        ));
+        for sequence in 1..=64 {
+            let _ = store.resolve_and_fence(OperationId::new(
+                origin.incarnation,
+                origin.epoch,
+                origin.owner,
+                OperationSeq::new(sequence),
+            ));
+        }
+        let closed = ReceiptClosure {
+            through: OperationSeq::new(64),
+            ..empty
+        };
+        assert!(matches!(
+            store.collect_receipts(ReceiptCollection {
+                closure: closed,
+                limit: 128
+            }),
+            Ok(ReceiptCollectionReply::Applied { .. })
+        ));
+        let request = ReceiptCollection {
+            closure: ReceiptClosure {
+                through: OperationSeq::new(32),
+                ..empty
+            },
+            limit: 128,
+        };
+        let effect = EffectId {
+            epoch: origin.epoch,
+            owner: origin.owner,
+            sequence: EffectSeq::new(1),
+        };
+        let response = control_response(
+            &mut store,
+            ControlRequest::Collect {
+                effect,
+                collection: request,
+            },
+            &events,
+            &Hooks::default(),
+            &Arc::new(AtomicBool::new(false)),
+        );
+        assert!(
+            matches!(response,ControlResponse::Collected {result:Ok(ReceiptCollectionReply::Applied {closure,..}),..} if closure==closed)
+        );
+        let text = std::fs::read_to_string(path.join("events.jsonl")).unwrap();
+        let event: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(event["details"]["through"], "32");
+        assert_eq!(
+            event["details"]["returned_through"], "64",
+            "observation must preserve returned absolute knowledge rather than relabel the old request"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
