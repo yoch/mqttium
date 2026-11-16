@@ -382,8 +382,8 @@ fn malformed_claim_metadata_stays_typed_through_all_outgoing_readers() {
 }
 
 #[test]
-fn schema_one_and_two_refusal_preserves_main_and_uncheckpointed_wal_bytes() {
-    for version in [1, 2] {
+fn earlier_schema_refusal_preserves_main_and_uncheckpointed_wal_bytes() {
+    for version in [1, 2, 3] {
         let path = fresh_path("schema1");
         let raw = rusqlite::Connection::open(&path).unwrap();
         raw.execute_batch(&format!("PRAGMA journal_mode=WAL;PRAGMA wal_autocheckpoint=0;PRAGMA user_version={version};CREATE TABLE old_store(one INTEGER PRIMARY KEY, contents BLOB);INSERT INTO old_store VALUES(1,x'01020304');")).unwrap();

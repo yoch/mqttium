@@ -2282,6 +2282,13 @@ pub fn recovery_field_limits_include_fixed_identities<S: DurableStore>(
 
 /// Every check of this module, in order.
 pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
+    live_receipt_collection_is_bounded_and_never_reexecutes(make);
+    live_receipt_collection_refuses_holes_and_preserves_identity_guards(make);
+    live_receipt_collection_has_a_control_reserve(make);
+    live_receipt_registration_preserves_legacy_zero(make);
+    recovery_omits_logically_retired_receipts_but_preserves_live_claims(make);
+    live_receipt_frontiers_validate_registration_and_bounds(make);
+    collection_at_full_quota_preserves_business_and_startup_collapses_origins(make);
     qos0_grants_and_consumption_preserve_durable_delivery_identity(make);
     qos0_consumption_preserves_unknown_and_atomic_capacity(make);
     replacing_and_removing_qos0_routes_preserves_older_work(make);
@@ -3691,4 +3698,244 @@ pub fn recovery_omits_logically_retired_receipts_but_preserves_live_claims<S: Du
     assert!(finished.outbound.is_empty());
     assert_eq!(finished.payloads.values().next().unwrap().references, 1);
     assert_eq!(accounts_match_what_is_held(&finished), Ok(()));
+}
+
+/// Floors cannot jump over missing receipts, silently reinterpret sequence
+/// zero, or lose admission identity evidence by closing too small an ID floor.
+pub fn live_receipt_frontiers_validate_registration_and_bounds<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::receipts::{
+        MAX_RECEIPT_ORIGINS, ReceiptClosure, ReceiptCollection, ReceiptCollectionRefusal,
+        ReceiptCollectionReply, ReceiptOrigin,
+    };
+    let mut limits = fixture_limits();
+    limits.receipt_slots = ReceiptSlots::new(2048);
+    let mut world = World::with_limits(make, limits);
+    let empty = ReceiptClosure::empty(ReceiptOrigin::of(operation_id(world.epoch, 1)));
+    let request = |closure, limit| ReceiptCollection { closure, limit };
+    assert!(matches!(
+        world.store.collect_receipts(request(empty, 128)),
+        Ok(ReceiptCollectionReply::Applied { .. })
+    ));
+    let before = world.store.snapshot().unwrap();
+    for (request, why) in [
+        (request(empty, 0), ReceiptCollectionRefusal::LimitExceeded),
+        (request(empty, 129), ReceiptCollectionRefusal::LimitExceeded),
+        (
+            request(
+                ReceiptClosure {
+                    through: OperationSeq::new(129),
+                    ..empty
+                },
+                128,
+            ),
+            ReceiptCollectionRefusal::LimitExceeded,
+        ),
+        (
+            request(
+                ReceiptClosure {
+                    publication_through: PublicationSeq::new(1),
+                    ..empty
+                },
+                128,
+            ),
+            ReceiptCollectionRefusal::InvalidFrontier,
+        ),
+        (
+            request(
+                ReceiptClosure {
+                    origin: ReceiptOrigin {
+                        incarnation: StoreIncarnation::new(2),
+                        ..empty.origin
+                    },
+                    ..empty
+                },
+                128,
+            ),
+            ReceiptCollectionRefusal::OriginMismatch,
+        ),
+        (
+            request(
+                ReceiptClosure {
+                    origin: ReceiptOrigin {
+                        epoch: RunEpoch::new(2),
+                        ..empty.origin
+                    },
+                    ..empty
+                },
+                128,
+            ),
+            ReceiptCollectionRefusal::FutureEpoch,
+        ),
+    ] {
+        assert_eq!(
+            world.store.collect_receipts(request),
+            Ok(ReceiptCollectionReply::Refused(why))
+        );
+        assert_eq!(world.store.snapshot().unwrap(), before);
+    }
+    let far = altered(&world.admission(769, 7, b"p", &[]), |admit| {
+        admit.qos = Qos::AtLeastOnce;
+        admit.costs.exchange_slots = ExchangeSlots::ZERO;
+    });
+    assert_eq!(
+        outcome(world.store.apply(&far).reply),
+        StoreOutcome::PendingOrUnknown
+    );
+    assert_eq!(
+        world
+            .store
+            .resolve_and_fence(operation_id(world.epoch, 1025))
+            .outcome,
+        StoreOutcome::PendingOrUnknown
+    );
+    assert_eq!(world.store.snapshot().unwrap(), before);
+    for owner in 1..MAX_RECEIPT_ORIGINS {
+        let closure = ReceiptClosure::empty(ReceiptOrigin {
+            owner: LogicalOwnerId::new(owner as u64),
+            ..empty.origin
+        });
+        assert!(matches!(
+            world.store.collect_receipts(request(closure, 128)),
+            Ok(ReceiptCollectionReply::Applied { .. })
+        ));
+    }
+    let full = world.store.snapshot().unwrap();
+    let extra = ReceiptClosure::empty(ReceiptOrigin {
+        owner: LogicalOwnerId::new(MAX_RECEIPT_ORIGINS as u64),
+        ..empty.origin
+    });
+    assert_eq!(
+        world.store.collect_receipts(request(extra, 128)),
+        Ok(ReceiptCollectionReply::Refused(
+            ReceiptCollectionRefusal::OriginCapacity
+        ))
+    );
+    assert_eq!(world.store.snapshot().unwrap(), full);
+    for payload in [false, true] {
+        let mut legacy = World::new(make);
+        let zero_id = altered(&legacy.admission(1, 7, b"gone", &[]), |admit| {
+            admit.qos = Qos::AtLeastOnce;
+            admit.costs.exchange_slots = ExchangeSlots::ZERO;
+            if payload {
+                admit.payload.id =
+                    PayloadId::new(INCARNATION, legacy.epoch, OWNER, PayloadSeq::new(0));
+            } else {
+                admit.publication = publication_id(legacy.epoch, 0);
+            }
+        });
+        assert!(legacy.store.apply(&zero_id).committed_now);
+        let before = legacy.store.snapshot().unwrap();
+        let closure = ReceiptClosure::empty(ReceiptOrigin::of(zero_id.recipe.operation()));
+        assert_eq!(
+            legacy.store.collect_receipts(request(closure, 128)),
+            Ok(ReceiptCollectionReply::Refused(
+                ReceiptCollectionRefusal::InvalidFrontier
+            ))
+        );
+        assert_eq!(legacy.store.snapshot().unwrap(), before);
+    }
+}
+
+/// A full receipt budget still permits collection; live inbound markers do
+/// not pin their old receipts, and a release uses the resulting control room.
+pub fn collection_at_full_quota_preserves_business_and_startup_collapses_origins<
+    S: DurableStore,
+>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::receipts::{
+        ClosedReceiptCollection, ClosedReceiptReply, RECEIPT_CONTROL_RESERVE, ReceiptClosure,
+        ReceiptCollection, ReceiptCollectionReply, ReceiptOrigin,
+    };
+    let mut limits = fixture_limits();
+    limits.receipt_slots = ReceiptSlots::new(RECEIPT_CONTROL_RESERVE + 2);
+    let mut world = World::with_limits(make, limits);
+    let old_epoch = world.epoch;
+    let empty = ReceiptClosure::empty(ReceiptOrigin::of(operation_id(old_epoch, 1)));
+    assert!(matches!(
+        world.store.collect_receipts(ReceiptCollection {
+            closure: empty,
+            limit: 128
+        }),
+        Ok(ReceiptCollectionReply::Applied { .. })
+    ));
+    for seq in 1..=2 {
+        assert!(
+            world
+                .store
+                .apply(&world.admission(seq, seq as u16 + 6, b"alive", &[]))
+                .committed_now
+        );
+    }
+    for seq in 3..=RECEIPT_CONTROL_RESERVE + 2 {
+        assert!(
+            world
+                .store
+                .resolve_and_fence(operation_id(old_epoch, seq))
+                .fenced_now
+        );
+    }
+    let full = world.store.snapshot().unwrap();
+    assert_eq!(full.accounts.receipt_slots, limits.receipt_slots);
+    let closure = ReceiptClosure {
+        through: OperationSeq::new(128),
+        publication_through: PublicationSeq::new(2),
+        payload_through: PayloadSeq::new(2),
+        ..empty
+    };
+    assert!(matches!(
+        world.store.collect_receipts(ReceiptCollection {
+            closure,
+            limit: 128
+        }),
+        Ok(ReceiptCollectionReply::Applied { removed: 128, .. })
+    ));
+    let after = world.store.snapshot().unwrap();
+    assert_eq!(after.inbound, full.inbound);
+    assert_eq!(after.publications, full.publications);
+    assert!(world.store.apply(&world.release(515, 7, 1)).committed_now);
+    world.epoch = open(&mut world.store);
+    let before = world.store.snapshot().unwrap();
+    let mut passes = 0;
+    loop {
+        passes += 1;
+        let reply = world
+            .store
+            .collect_closed_receipts(ClosedReceiptCollection {
+                through: old_epoch,
+                limit: 17,
+            })
+            .unwrap();
+        let ClosedReceiptReply::Applied {
+            removed,
+            removed_origins,
+            more,
+            ..
+        } = reply
+        else {
+            panic!("{reply:?}");
+        };
+        assert!(u32::from(removed) + u32::from(removed_origins) <= 17);
+        let state = world.store.snapshot().unwrap();
+        assert_eq!(state.inbound, before.inbound);
+        assert_eq!(state.publications, before.publications);
+        assert_eq!(state.payloads, before.payloads);
+        assert_eq!(state.obligations, before.obligations);
+        assert_eq!(accounts_match_what_is_held(&state), Ok(()));
+        if !more {
+            break;
+        }
+        assert!(passes < 40, "bounded physical progress");
+    }
+    let collected = world.store.snapshot().unwrap();
+    assert!(collected.receipt_frontiers.is_empty());
+    assert_eq!(collected.accounts.receipt_slots.get(), 0);
+    assert_eq!(collected.collected_through, old_epoch);
+    assert_eq!(
+        world.store.established(operation_id(old_epoch, 514)),
+        Ok(Some(StoreOutcome::RetiredOutcomeUnavailable))
+    );
+    assert!(world.store.apply(&world.release(1, 8, 2)).committed_now);
 }
