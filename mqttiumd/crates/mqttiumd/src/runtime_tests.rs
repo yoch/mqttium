@@ -2130,24 +2130,39 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
             );
             assert_eq!(runtime.inflight.len(), IN_FLIGHT);
             assert_eq!(read_frame(&mut new).0, 0x20);
-            until_phase(runtime, path, "release blocked Close and CONNACK", |r| {
-                r.inflight.is_empty()
-                    && r.inputs.is_empty()
-                    && !r.peers.contains_key(&old_generation)
-                    && r.peers.get(&new_generation).is_some_and(|p| !p.pending)
-            });
             runtime.packet(new_generation, 0xc0, vec![]).unwrap();
+            runtime.packet(third, 0xc0, vec![]).unwrap();
             runtime.drain_inputs().unwrap();
             assert_eq!(
                 read_frame(&mut new).0,
                 0xd0,
-                "the replacement and independent control traffic remain usable"
+                "the replacement answers PING before the remaining store replies are released"
+            );
+            assert_eq!(
+                read_frame(&mut third_client).0,
+                0xd0,
+                "an independent connection answers PING while its admission remains inflight"
+            );
+            assert_eq!(
+                runtime.inflight.len(),
+                IN_FLIGHT,
+                "control progress must not depend on collecting the held store replies"
             );
         }));
+        // Restore the real adapter even if an assertion panics. Afterwards,
+        // require every held effect's own correlated reply to be collected;
+        // each wait measures one operation's progress, not total quiescence.
         runtime.writer.receiver = worker_receiver;
         if let Err(payload) = outcome {
             std::panic::resume_unwind(payload);
         }
+        let pending = runtime.inflight.keys().copied().collect::<Vec<_>>();
+        for effect in pending {
+            until_phase(runtime, path, "collect held correlated admission", |r| {
+                !r.inflight.contains_key(&effect)
+            });
+        }
+        assert!(runtime.inflight.is_empty());
     });
 }
 
