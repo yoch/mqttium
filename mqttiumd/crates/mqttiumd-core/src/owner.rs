@@ -55,6 +55,7 @@ use crate::credits::{Credits, ReleaseOutcome};
 use crate::leases::{LeaseRefused, LeaseTable};
 
 mod pubsub;
+mod receipts;
 
 /// The largest reservation of effect slots one transition makes. The
 /// constructor of an owner refuses a box that is smaller (ADR 0006,
@@ -428,6 +429,7 @@ struct Refusal {
 )]
 #[derive(Debug)]
 enum Change {
+    Receipts(receipts::Change),
     Pubsub(pubsub::Change),
     /// The input is absorbed: late, repeated, or answered by effects only.
     Nothing,
@@ -523,6 +525,8 @@ struct Plan {
     progress: Progress,
     /// The connection the transition closes, or saw fail.
     closed: Option<ConnectionGeneration>,
+    receipt_issued: Option<receipts::Entry>,
+    receipt_consumed: Option<OperationId>,
 }
 
 /// What a plan draws and publishes while it is computed.
@@ -533,6 +537,8 @@ struct Draft {
     effects: Effects,
     progress: Progress,
     closed: Option<ConnectionGeneration>,
+    receipt_issued: Option<receipts::Entry>,
+    receipt_consumed: Option<OperationId>,
 }
 
 impl Draft {
@@ -701,6 +707,7 @@ pub struct Owner {
     closed: BoundedQueue<ConnectionGeneration>,
     resolution_delay: LogicalDuration,
     pubsub: pubsub::State,
+    receipts: receipts::State,
     /// The one box of this owner. A renewal replaces it in place.
     outbox: Outbox,
 }
@@ -782,9 +789,15 @@ impl Owner {
                 ring(config.retained_operations)?,
                 ring(config.remembered_connections)?,
                 pubsub::State::new(config)?,
+                receipts::State::new(crate::contract::receipts::ReceiptOrigin {
+                    incarnation: id.incarnation(),
+                    epoch: id.epoch(),
+                    owner: id.owner(),
+                })?,
             ))
         })();
-        let Ok((routes, sessions, slots, leases, finished, closed, pubsub)) = tables else {
+        let Ok((routes, sessions, slots, leases, finished, closed, pubsub, receipts)) = tables
+        else {
             let reason = OwnerRefusal::AllocationFailed;
             return Err(OwnerRefused { outbox, reason });
         };
@@ -806,6 +819,7 @@ impl Owner {
             closed,
             resolution_delay: config.resolution_delay,
             pubsub,
+            receipts,
             outbox,
         })
     }
@@ -821,7 +835,15 @@ impl Owner {
 
     /// Hands the effects of the box to `sink`, in order.
     pub fn dispatch(&mut self, sink: &mut dyn EffectSink) -> DispatchReport {
-        self.outbox.dispatch(sink)
+        let priority = self.receipts.priority().map(|(effect, deadline)| {
+            self.outbox
+                .dispatch_receipt_controls(sink, effect, deadline)
+        });
+        let mut report = self.outbox.dispatch(sink);
+        if let Some(priority) = priority {
+            report.accepted += priority.accepted;
+        }
+        report
     }
 
     /// Replaces the box of the owner under `authority` by a new one for
@@ -931,6 +953,24 @@ impl Owner {
                 };
             }
         };
+        if self.receipts.enabled
+            && !self.receipts.maintenance_input(&input)
+            && plan.effects.count > 0
+            && self.outbox.free_slots() < plan.effects.count.saturating_add(2)
+        {
+            return StepOutcome::NeedCapacity {
+                input,
+                need: CapacityNeed {
+                    resource: Resource::EffectSlots,
+                    amount: u64::try_from(
+                        plan.effects.count.saturating_add(2) - self.outbox.free_slots(),
+                    )
+                    .unwrap_or(u64::MAX),
+                    wake: WakeCondition::EffectAccepted,
+                },
+                work_used: plan.planned_work,
+            };
+        }
         let work_used = plan.work;
         let planned_work = plan.planned_work;
         // The last acquisition, and the only one a plan cannot check: one
@@ -962,7 +1002,8 @@ impl Owner {
     fn cost(&self, input: &Input) -> WorkUnits {
         let Input::Recovery { facts, last } = input else {
             return WorkUnits::new(
-                1u64.saturating_add(self.pubsub.work_bound(input, self.routes.capacity())),
+                1u64.saturating_add(self.pubsub.work_bound(input, self.routes.capacity()))
+                    .saturating_add(self.receipts.work(input)),
             );
         };
         let routes = capacity_of(self.routes.capacity());
@@ -976,9 +1017,11 @@ impl Owner {
                 FactRank::InboundExchange | FactRank::OutboundDelivery => {
                     sessions.saturating_add(slots)
                 }
-                FactRank::Epoch | FactRank::Limits | FactRank::RouteTable | FactRank::ReceiptFrontier | FactRank::Operation => {
-                    0
-                }
+                FactRank::Epoch
+                | FactRank::Limits
+                | FactRank::RouteTable
+                | FactRank::ReceiptFrontier
+                | FactRank::Operation => 0,
             };
             work = work.saturating_add(compared.saturating_add(1));
         }
@@ -1014,6 +1057,8 @@ impl Owner {
             },
             progress: Progress::Complete,
             closed: None,
+            receipt_issued: None,
+            receipt_consumed: None,
         };
         let planned = self
             .revision
@@ -1060,6 +1105,8 @@ impl Owner {
                     effects: draft.effects,
                     progress: draft.progress,
                     closed: draft.closed,
+                    receipt_issued: draft.receipt_issued,
+                    receipt_consumed: draft.receipt_consumed,
                 })
             }
             Err(stop) => Err(Refusal {
@@ -1077,7 +1124,12 @@ impl Owner {
             };
         }
         match input {
-            Input::MaintainReceipts | Input::ReceiptsCollected { .. } => Ok(Change::Nothing),
+            Input::MaintainReceipts => self.plan_receipt_maintenance(draft),
+            Input::ReceiptsCollected {
+                effect,
+                collection,
+                reply,
+            } => self.plan_receipt_result(*effect, *collection, *reply),
             Input::Qos0EmitRefused {
                 effect,
                 connection,
@@ -1435,6 +1487,7 @@ impl Owner {
         payload: Option<SharedBytes>,
         draft: &mut Draft,
     ) -> Result<InFlight, Stop> {
+        self.prepare_receipt_entry(&recipe, draft)?;
         let Verdict::Transition(phase) = CommandPhase::Prepared.on(CommandEvent::Submit) else {
             return Err(IMPOSSIBLE);
         };
@@ -1771,6 +1824,7 @@ impl Owner {
                 if facts != expected {
                     return Err(contradiction);
                 }
+                draft.receipt_consumed = Some(operation);
                 let packet_id = slot.packet_id;
                 let reason = AckReason::Success;
                 // The owner publishes what depends on the commit in this
@@ -1798,6 +1852,7 @@ impl Owner {
                 Verdict::Transition(CommandPhase::RejectedCertain),
                 StoreOutcome::RejectedCertain(rejection),
             ) => {
+                draft.receipt_consumed = Some(operation);
                 let finished = finished(CommandPhase::RejectedCertain, None);
                 if admission {
                     if slot.qos == Qos::AtLeastOnce {
@@ -1876,6 +1931,9 @@ impl Owner {
             }
             StoreReply::Outcome(outcome) => *outcome,
         };
+        if outcome == StoreOutcome::RetiredOutcomeUnavailable && self.receipts.retired(operation) {
+            return Ok(Change::Nothing);
+        }
         let contradiction = Stop::Fatal(CoreFault::ContradictoryOutcome { operation });
         let event = CommandEvent::StoreResult(OutcomeClass::of(&outcome));
         if known.phase.on(event) == Verdict::Fault {
@@ -1892,6 +1950,9 @@ impl Owner {
     fn plan_deadline(&self, token: DeadlineToken, draft: &mut Draft) -> Result<Change, Stop> {
         if !issued(token, self.counters.deadline) {
             return Err(IMPOSSIBLE);
+        }
+        if let Some(change) = self.plan_receipt_deadline(token, draft)? {
+            return Ok(change);
         }
         if let Some(change) = self.plan_pubsub_deadline(token, draft)? {
             return Ok(change);
@@ -2014,7 +2075,10 @@ impl Owner {
             // The earlier facts of this kind on this page.
             let same = run(facts, &starts, rank, position);
             let valid = match fact {
-                RecoveredFact::ReceiptFrontier(closure) => closure.origin.incarnation == self.incarnation && closure.origin.epoch < self.epoch,
+                RecoveredFact::ReceiptFrontier(closure) => {
+                    closure.origin.incarnation == self.incarnation
+                        && closure.origin.epoch < self.epoch
+                }
                 RecoveredFact::OutboundDelivery {
                     delivery,
                     target,
@@ -2141,6 +2205,8 @@ impl Owner {
             effects,
             progress,
             closed,
+            receipt_issued,
+            receipt_consumed,
             ..
         } = plan;
         let reserved = match reservation {
@@ -2159,6 +2225,8 @@ impl Owner {
             .map_err(|_| CoreFault::StalePlan)?;
 
         self.apply_change(change, input)?;
+        self.receipts.apply_issued(receipt_issued)?;
+        self.receipts.consume(receipt_consumed)?;
         if let Some(connection) = closed {
             // Closing a generation is terminal for its queued/emitting
             // ACKs, even if the adapter never accepted their Outbox effect.
@@ -2186,6 +2254,7 @@ impl Owner {
     fn apply_change(&mut self, change: Change, input: Input) -> Result<(), CoreFault> {
         const STALE: CoreFault = CoreFault::StalePlan;
         match change {
+            Change::Receipts(change) => self.receipts.apply(change)?,
             Change::Pubsub(change) => self.apply_pubsub(change, input)?,
             Change::Nothing => {}
             Change::Recover => {
@@ -2506,6 +2575,7 @@ mod tests {
         continuation: (Option<crate::contract::ids::ContinuationId>, bool),
         subscription: Option<ControlSnapshot>,
         leases: (Credits, Vec<crate::leases::LeaseSlotView>),
+        receipts: receipts::Snapshot,
         finished: Vec<Finished>,
         closed: Vec<ConnectionGeneration>,
         waiting: Vec<EffectId>,
@@ -2943,6 +3013,7 @@ mod tests {
         fn snapshot(&self) -> Snapshot {
             let owner = &self.owner;
             Snapshot {
+                receipts: owner.receipts.snapshot(),
                 revision: owner.revision,
                 counters: owner.counters,
                 recovery: owner.recovery.clone(),
@@ -8104,9 +8175,206 @@ mod tests {
         let _ = world.drain();
         let input = publish(7);
         let before = world.snapshot();
-        assert!(matches!(world.step(input), StepOutcome::NeedCapacity { .. }),
-            "business cannot precede the durable empty-origin registration");
+        assert!(
+            matches!(world.step(input), StepOutcome::NeedCapacity { .. }),
+            "business cannot precede the durable empty-origin registration"
+        );
         assert_eq!(world.snapshot(), before);
     }
 
+    const GC_GRANT: TurnGrant = TurnGrant {
+        work_limit: WorkUnits::new(100_000),
+    };
+
+    fn gc_apply(world: &mut World, input: Input) {
+        let result = world.owner.step(input, GC_GRANT);
+        assert!(matches!(result, StepOutcome::Applied { .. }), "{result:?}");
+    }
+
+    fn gc_register(world: &mut World) {
+        gc_apply(world, Input::MaintainReceipts);
+        let effects = world.drain();
+        let Effect::CollectReceipts { collection } = effects[0].1 else {
+            panic!("registration")
+        };
+        assert!(!world.owner.collection_ready());
+        assert!(
+            world
+                .owner
+                .collection_reply_is_live(effects[0].0, collection)
+        );
+        gc_apply(
+            world,
+            Input::ReceiptsCollected {
+                effect: effects[0].0,
+                collection,
+                reply: crate::contract::receipts::ReceiptCollectionReply::Applied {
+                    closure: collection.closure,
+                    removed: 0,
+                    retained: 0,
+                    more: false,
+                },
+            },
+        );
+        assert!(world.owner.collection_ready());
+        assert!(world.drain().is_empty());
+    }
+
+    fn gc_admit(world: &mut World, packet: u16, qos: Qos) -> Flight {
+        gc_apply(world, publish_with(CONN, packet, qos, b"payload"));
+        let effects = world.drain();
+        let (effect, Effect::Persist { command }) = &effects[0] else {
+            panic!("admission")
+        };
+        let Recipe::AdmitPublication(admit) = command.recipe.get() else {
+            panic!("admit")
+        };
+        let Effect::ArmDeadline { token, .. } = effects[1].1 else {
+            panic!("deadline")
+        };
+        Flight {
+            effect: *effect,
+            operation: admit.operation,
+            deadline: token,
+            facts: CommitFacts::PublicationAdmitted {
+                publication: admit.publication,
+                exchange: admit.source.exchange,
+            },
+        }
+    }
+
+    fn gc_complete_qos1(world: &mut World, flight: &Flight) {
+        gc_apply(world, committed(flight));
+        let effects = world.drain();
+        let Effect::EmitFrame {
+            connection,
+            frame: OutboundFrame::Puback { .. },
+            ..
+        } = effects[0].1
+        else {
+            panic!("puback")
+        };
+        gc_apply(
+            world,
+            Input::FrameResult {
+                effect: effects[0].0,
+                connection,
+                progress: FrameProgress::Written {
+                    confirmed: 4,
+                    total: 4,
+                },
+            },
+        );
+        assert!(world.drain().is_empty());
+    }
+
+    #[test]
+    fn receipt_frontier_waits_for_consumption_and_ignores_finished_history_eviction() {
+        let mut world = World::connected();
+        gc_register(&mut world);
+        let hole = gc_admit(&mut world, 7, Qos::ExactlyOnce);
+        gc_apply(&mut world, unknown(&hole));
+        assert!(world.owner.deadline_is_live(hole.deadline));
+        for _ in 0..64 {
+            let flight = gc_admit(&mut world, 8, Qos::AtLeastOnce);
+            gc_complete_qos1(&mut world, &flight);
+            assert!(!world.owner.deadline_is_live(flight.deadline));
+        }
+        assert_eq!(world.owner.finished.len(), world.owner.finished.capacity());
+        gc_apply(&mut world, Input::MaintainReceipts);
+        assert!(world.drain().is_empty(), "closure_crossed_unknown");
+        let (closure, span, holes) = world.owner.receipt_status().unwrap();
+        assert_eq!((closure.through.get(), span, holes), (0, 65, 1));
+        gc_apply(&mut world, committed(&hole));
+        assert!(!world.owner.deadline_is_live(hole.deadline));
+        assert_eq!(kinds(&world.drain()), ["EmitPubrec"]);
+        gc_apply(&mut world, Input::MaintainReceipts);
+        let effects = world.drain();
+        let Effect::CollectReceipts { collection } = effects[0].1 else {
+            panic!("collection")
+        };
+        assert_eq!(collection.closure.through.get(), 65);
+        assert_eq!(collection.closure.publication_through.get(), 65);
+        gc_apply(
+            &mut world,
+            Input::ReceiptsCollected {
+                effect: effects[0].0,
+                collection,
+                reply: crate::contract::receipts::ReceiptCollectionReply::Applied {
+                    closure: collection.closure,
+                    removed: 65,
+                    retained: 0,
+                    more: false,
+                },
+            },
+        );
+        assert!(
+            world
+                .owner
+                .exchange(SessionId::new(PRODUCER), packet_id(7))
+                .is_some(),
+            "the live QoS2 responsibility survives receipt retirement"
+        );
+        gc_apply(&mut world, retired(&hole));
+        assert!(world.drain().is_empty());
+        assert_eq!(world.owner.receipt_status().unwrap().1, 0);
+    }
+
+    #[test]
+    fn receipt_collection_lost_result_retries_same_closure_with_bounded_correlation() {
+        let mut world = World::connected();
+        gc_apply(&mut world, Input::MaintainReceipts);
+        let first = world.drain();
+        let Effect::CollectReceipts { collection } = first[0].1 else {
+            panic!("collection")
+        };
+        let Effect::ArmDeadline { token, .. } = first[1].1 else {
+            panic!("deadline")
+        };
+        gc_apply(
+            &mut world,
+            Input::ReceiptsCollected {
+                effect: first[0].0,
+                collection,
+                reply: crate::contract::receipts::ReceiptCollectionReply::PendingOrUnknown,
+            },
+        );
+        gc_apply(&mut world, Input::MaintainReceipts);
+        assert!(world.drain().is_empty());
+        gc_apply(&mut world, deadline(token));
+        let retry = world.drain();
+        assert_ne!(first[0].0, retry[0].0);
+        assert_eq!(retry[0].1, Effect::CollectReceipts { collection });
+        assert!(!world.owner.deadline_is_live(token));
+        assert!(world.owner.collection_reply_is_live(first[0].0, collection));
+        gc_apply(
+            &mut world,
+            Input::ReceiptsCollected {
+                effect: first[0].0,
+                collection,
+                reply: crate::contract::receipts::ReceiptCollectionReply::Applied {
+                    closure: collection.closure,
+                    removed: 0,
+                    retained: 0,
+                    more: false,
+                },
+            },
+        );
+        assert!(world.owner.collection_ready());
+        gc_apply(
+            &mut world,
+            Input::ReceiptsCollected {
+                effect: retry[0].0,
+                collection,
+                reply: crate::contract::receipts::ReceiptCollectionReply::Applied {
+                    closure: collection.closure,
+                    removed: 128,
+                    retained: 0,
+                    more: false,
+                },
+            },
+        );
+        assert_eq!(world.owner.counters.operation, Some(OperationSeq::new(1)));
+        assert_eq!(world.owner.receipt_status().unwrap().1, 0);
+    }
 }

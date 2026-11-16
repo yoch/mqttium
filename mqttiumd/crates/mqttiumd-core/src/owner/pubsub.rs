@@ -322,6 +322,18 @@ impl State {
             }
         }
     }
+    pub(super) fn deadline_is_live(&self, token: DeadlineToken) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(|c| c.in_flight.deadline == token)
+            || self
+                .deliveries
+                .as_slice()
+                .iter()
+                .filter_map(Delivery::in_flight)
+                .any(|f| f.deadline == token)
+    }
+
     pub(super) fn known(&self, operation: OperationId) -> Option<Finished> {
         self.deliveries
             .as_slice()
@@ -1394,6 +1406,7 @@ impl Owner {
         };
         match (verdict, outcome) {
             (Verdict::Transition(CommandPhase::Committed), StoreOutcome::Committed(facts)) => {
+                draft.receipt_consumed = Some(operation);
                 let done = finished(CommandPhase::Consumed, Some(facts));
                 if let Some(c) = control {
                     let revision = self
@@ -1502,6 +1515,7 @@ impl Owner {
                 Verdict::Transition(CommandPhase::RejectedCertain),
                 StoreOutcome::RejectedCertain(reason),
             ) => {
+                draft.receipt_consumed = Some(operation);
                 let done = finished(CommandPhase::RejectedCertain, None);
                 if let Some(c) = control {
                     let mut results = c.results;

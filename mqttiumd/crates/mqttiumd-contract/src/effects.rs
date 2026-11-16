@@ -805,6 +805,52 @@ impl Outbox {
         Ok(returned)
     }
 
+    /// Dispatch only one collector attempt and its deadline around blocked
+    /// ordinary effects. One bounded rotation preserves every remaining
+    /// effect's relative order; a refused attempt keeps its deadline held.
+    pub fn dispatch_receipt_controls(
+        &mut self,
+        sink: &mut dyn EffectSink,
+        collection: EffectId,
+        deadline: DeadlineToken,
+    ) -> DispatchReport {
+        let mut waiting = self.queue.iter().any(|effect| effect.id() == collection);
+        let mut accepted = 0;
+        let mut blocked = None;
+        let count = self.queue.len();
+        for _ in 0..count {
+            let Some(effect) = self.queue.pop_front() else {
+                break;
+            };
+            let is_collection = effect.id() == collection
+                && matches!(effect.effect(), Effect::CollectReceipts { .. });
+            let is_deadline = !waiting
+                && matches!(effect.effect(),Effect::ArmDeadline {token,..} if *token == deadline);
+            let restore = if is_collection || is_deadline {
+                match sink.try_submit(effect) {
+                    SubmitResult::Accepted => {
+                        accepted += 1;
+                        if is_collection {
+                            waiting = false;
+                        }
+                        None
+                    }
+                    SubmitResult::NotSubmitted { effect, reason } => {
+                        blocked = Some(reason);
+                        Some(effect)
+                    }
+                }
+            } else {
+                Some(effect)
+            };
+            if let Some(effect) = restore {
+                let restored = self.queue.try_push_back(effect);
+                debug_assert!(restored.is_ok(), "the scanned slot was taken");
+            }
+        }
+        DispatchReport { accepted, blocked }
+    }
+
     /// Moves effects to `sink` in order until one is refused. The refused
     /// effect returns to the head of the box with the same identity.
     pub fn dispatch(&mut self, sink: &mut dyn EffectSink) -> DispatchReport {
