@@ -8377,4 +8377,127 @@ mod tests {
         assert_eq!(world.owner.counters.operation, Some(OperationSeq::new(1)));
         assert_eq!(world.owner.receipt_status().unwrap().1, 0);
     }
+
+    #[test]
+    fn receipt_collection_bypasses_blocked_network_without_starting_a_refused_attempt_timer() {
+        struct Controls {
+            taken: Vec<Effect>,
+            accept_collection: bool,
+        }
+        impl EffectSink for Controls {
+            fn try_submit(&mut self, effect: OwnedEffect) -> SubmitResult {
+                let accept = matches!(effect.effect(), Effect::CollectReceipts { .. })
+                    && self.accept_collection
+                    || matches!(effect.effect(), Effect::ArmDeadline { .. });
+                if accept {
+                    self.taken.push(effect.into_parts().1);
+                    SubmitResult::Accepted
+                } else {
+                    SubmitResult::NotSubmitted {
+                        effect,
+                        reason: crate::contract::effects::SubmitBlock::QueueFull,
+                    }
+                }
+            }
+        }
+        let mut world = World::recovered();
+        gc_apply(&mut world, connect(CONN, b"p1-producer"));
+        let original = world.owner.outbox.pending().next().unwrap().id();
+        gc_apply(&mut world, Input::MaintainReceipts);
+        let before: Vec<_> = world.owner.outbox.pending().map(OwnedEffect::id).collect();
+        let mut sink = Controls {
+            taken: Vec::new(),
+            accept_collection: false,
+        };
+        assert_eq!(world.owner.dispatch(&mut sink).accepted, 0);
+        assert!(
+            sink.taken.is_empty(),
+            "a refused collector cannot start its deadline"
+        );
+        assert_eq!(
+            world
+                .owner
+                .outbox
+                .pending()
+                .map(OwnedEffect::id)
+                .collect::<Vec<_>>(),
+            before
+        );
+        sink.accept_collection = true;
+        assert_eq!(world.owner.dispatch(&mut sink).accepted, 2);
+        assert!(matches!(
+            sink.taken.as_slice(),
+            [Effect::CollectReceipts { .. }, Effect::ArmDeadline { .. }]
+        ));
+        assert_eq!(
+            world
+                .owner
+                .outbox
+                .pending()
+                .map(OwnedEffect::id)
+                .collect::<Vec<_>>(),
+            [original]
+        );
+    }
+
+    #[test]
+    fn receipt_collection_keeps_two_effect_slots_reserved_for_maintenance() {
+        let mut world = World::cold(EPOCH, 4);
+        world.applied(page(&fixture(EPOCH), true));
+        world.applied(connect(CONN, b"p1-producer"));
+        let _ = world.drain();
+        gc_register(&mut world);
+        let ping = || Input::Packet {
+            connection: ConnectionGeneration::new(CONN),
+            ingress_order: 0,
+            packet: InboundPacket::Pingreq,
+        };
+        gc_apply(&mut world, ping());
+        gc_apply(&mut world, ping());
+        assert_eq!(world.owner.outbox.free_slots(), 2);
+        let before = world.snapshot();
+        assert!(matches!(
+            world.owner.step(ping(), GC_GRANT),
+            StepOutcome::NeedCapacity { .. }
+        ));
+        assert_eq!(world.snapshot(), before);
+        // A physical sweep is the same control capacity as a new prefix.
+        world.owner.receipts.test_request_sweep();
+        gc_apply(&mut world, Input::MaintainReceipts);
+        assert_eq!(world.owner.outbox.free_slots(), 0);
+        let mut sink = Taking(Vec::new());
+        assert_eq!(world.owner.dispatch(&mut sink).accepted, 4);
+        assert!(matches!(sink.0[0].effect(), Effect::CollectReceipts { .. }));
+        assert!(matches!(sink.0[1].effect(), Effect::ArmDeadline { .. }));
+    }
+
+    #[test]
+    fn receipt_collection_unresolved_result_can_never_be_reported_retired() {
+        let mut world = World::connected();
+        gc_register(&mut world);
+        let flight = gc_admit(&mut world, 7, Qos::AtLeastOnce);
+        assert_eq!(
+            world.owner.step(retired(&flight), GC_GRANT),
+            StepOutcome::Fatal(CoreFault::ImpossibleInput)
+        );
+        assert_eq!(world.owner.receipt_status().unwrap().2, 1);
+    }
+
+    #[test]
+    fn receipt_collection_counter_and_tracker_rollback_on_effect_reservation_refusal() {
+        let mut world = World::connected();
+        gc_register(&mut world);
+        let key = world.owner.outbox.reserve(nonzero(CAPACITY - 2)).unwrap();
+        let before = world.snapshot();
+        let outcome = world.owner.step(publish(7), GC_GRANT);
+        assert!(
+            matches!(outcome, StepOutcome::NeedCapacity { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(world.snapshot(), before);
+        assert_eq!(world.owner.outbox.release(key), Ok(CAPACITY - 2));
+        let flight = gc_admit(&mut world, 7, Qos::ExactlyOnce);
+        assert_eq!(flight.operation.sequence().get(), 1);
+        assert_eq!(world.owner.receipt_status().unwrap().1, 1);
+    }
 }

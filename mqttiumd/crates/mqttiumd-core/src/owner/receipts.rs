@@ -55,6 +55,11 @@ pub(super) struct Snapshot {
 
 impl State {
     #[cfg(test)]
+    pub(super) fn test_request_sweep(&mut self) {
+        self.sweep = true;
+    }
+
+    #[cfg(test)]
     pub(super) fn snapshot(&self) -> Snapshot {
         Snapshot {
             enabled: self.enabled,
@@ -181,9 +186,9 @@ impl State {
         }
         match input {
             Input::StoreResult { .. } => u64::try_from(self.entries.len()).unwrap_or(u64::MAX),
-            Input::MaintainReceipts | Input::ReceiptsCollected { .. } => {
-                u64::from(MAX_COLLECTION_ROWS)
-            }
+            Input::MaintainReceipts => u64::from(MAX_COLLECTION_ROWS),
+            Input::ReceiptsCollected { .. } => u64::from(MAX_COLLECTION_ROWS)
+                .saturating_add(u64::try_from(self.entries.len()).unwrap_or(u64::MAX)),
             _ => 0,
         }
     }
