@@ -1398,3 +1398,46 @@ fn collection_reply_keeps_reserved_owner_input_capacity_under_business_pressure(
         );
     });
 }
+
+fn finish_startup_writer(writer:&mut Writer) {
+    let deadline=Instant::now()+Duration::from_secs(3);
+    if !writer.is_finished() { let _=writer.sender.send(Request::Stop); }
+    while !writer.is_finished() && Instant::now()<deadline {
+        while writer.receiver.try_recv().is_ok() {}
+        while writer.control_receiver.try_recv().is_ok() {}
+        thread::sleep(Duration::from_millis(1));
+    }
+    writer.join_finished().expect("cancelled startup releases its writer within the cleanup budget");
+}
+
+#[test]
+fn cancelled_startup_never_announces_ready_and_releases_its_opened_epoch() {
+    let directory=Directory::new();
+    let path=directory.0.join("store.sqlite");
+    let event_path=directory.0.join("events.jsonl");
+    let events=Events::open(&event_path).unwrap();
+    let cancel=Arc::new(AtomicBool::new(true));
+    let mut writer=Writer::spawn(path.clone(),events.clone(),Hooks::default(),cancel.clone()).unwrap();
+    let result=run_inner(&"127.0.0.1:0".parse().unwrap(),Hooks::default(),&events,cancel,&mut writer);
+    finish_startup_writer(&mut writer);
+    let store=mqttiumd_store_sqlite::SqliteStore::open(&path).expect("the startup writer is no longer alive");
+    let state=mqttiumd_store_api::DurableStore::snapshot(&store).unwrap();
+    assert_eq!(state.ledger.last_opened().get(),1,"opening an epoch was already accepted and is not called rejected by cancellation");
+    assert!(state.sessions.is_empty() && state.operations.is_empty() && state.inbound.is_empty());
+    assert!(matches!(result,Err(Failure {code:"startup_cancelled",read:None})),"an already cancelled startup must terminate as cancelled before declaring readiness");
+    assert!(!std::fs::read_to_string(event_path).unwrap().lines().any(|line|serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"]=="ready"),"a stop request before startup cannot publish a transient Ready observation");
+}
+
+#[test]
+fn established_typed_startup_failure_takes_precedence_over_cancellation() {
+    let directory=Directory::new();
+    let path=directory.0.join("store.sqlite");
+    std::fs::write(&path,[]).unwrap();
+    let events=Events::open(&directory.0.join("events.jsonl")).unwrap();
+    let cancel=Arc::new(AtomicBool::new(true));
+    let mut writer=Writer::spawn(path.clone(),events.clone(),Hooks::default(),cancel.clone()).unwrap();
+    let result=run_inner(&"127.0.0.1:0".parse().unwrap(),Hooks::default(),&events,cancel,&mut writer);
+    finish_startup_writer(&mut writer);
+    assert!(matches!(result,Err(Failure {code:"durable_read",read:Some((ReadError::InvalidData,ReadPhase::Open))})),"a typed failure already established by bootstrap must not be flattened into startup cancellation");
+    assert!(!matches!(mqttiumd_store_sqlite::SqliteStore::open(&path),Err(mqttiumd_store_sqlite::OpenError::WriterAlive)),"even failed bootstrap releases writer authority");
+}
