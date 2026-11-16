@@ -3274,6 +3274,280 @@ mod tests {
         assert_eq!(world.owner.connection_of(SessionId::new(PRODUCER)), None);
     }
 
+    // ----- Product session facts and transport lifecycle -----
+
+    fn empty_recovered() -> World {
+        let mut world = World::cold(EPOCH, CAPACITY);
+        world.applied(page(
+            &[
+                epoch_fact(EPOCH),
+                LIMITS,
+                RecoveredFact::RouteTable {
+                    revision: Revision::new(0),
+                },
+            ],
+            true,
+        ));
+        world
+    }
+
+    fn established(
+        connection: Option<u64>,
+        session: u64,
+        client_id: &[u8],
+        revision: u64,
+        session_present: bool,
+    ) -> Input {
+        Input::SessionEstablished {
+            connection: connection.map(ConnectionGeneration::new),
+            session: SessionId::new(session),
+            client_id: bytes(client_id),
+            revision: Revision::new(revision),
+            session_present,
+        }
+    }
+
+    fn transport_closed(connection: u64) -> Input {
+        Input::ConnectionClosed {
+            connection: ConnectionGeneration::new(connection),
+        }
+    }
+
+    fn ping(connection: u64) -> Input {
+        Input::Packet {
+            connection: ConnectionGeneration::new(connection),
+            ingress_order: 0,
+            packet: InboundPacket::Pingreq,
+        }
+    }
+
+    #[test]
+    fn product_confirmed_creation_binds_and_answers_without_session_present() {
+        let mut world = empty_recovered();
+        world.applied(established(Some(CONN), PRODUCER, b"new-client", 1, false));
+        assert_eq!(
+            world.drain()[0].1,
+            Effect::EmitFrame {
+                connection: ConnectionKey {
+                    session: SessionId::new(PRODUCER),
+                    generation: ConnectionGeneration::new(CONN),
+                },
+                frame: OutboundFrame::Connack {
+                    session_present: false,
+                },
+            }
+        );
+        assert_eq!(world.owner.sessions.len(), 1);
+        assert_eq!(world.owner.sessions.as_slice()[0].revision, Revision::new(1));
+        assert_eq!(
+            world.owner.connection_of(SessionId::new(PRODUCER)),
+            Some(ConnectionGeneration::new(CONN))
+        );
+        absorbed(
+            &mut world,
+            established(Some(CONN), PRODUCER, b"new-client", 1, false),
+        );
+    }
+
+    #[test]
+    fn product_confirmed_existing_session_resumes_and_can_take_over() {
+        let mut world = World::recovered();
+        world.applied(established(
+            Some(CONN),
+            PRODUCER,
+            b"p1-producer",
+            PRODUCER + 10,
+            true,
+        ));
+        assert_eq!(
+            world.drain()[0].1,
+            frame_to(
+                CONN,
+                OutboundFrame::Connack {
+                    session_present: true,
+                }
+            )
+        );
+        assert_eq!(
+            world.sent(established(
+                Some(11),
+                PRODUCER,
+                b"p1-producer",
+                PRODUCER + 10,
+                true
+            )),
+            ["CloseConnection", "EmitConnack"]
+        );
+        assert_eq!(
+            world.owner.connection_of(SessionId::new(PRODUCER)),
+            Some(ConnectionGeneration::new(11))
+        );
+        absorbed(
+            &mut world,
+            established(Some(11), PRODUCER, b"p1-producer", PRODUCER + 10, true),
+        );
+    }
+
+    #[test]
+    fn product_late_creation_installs_knowledge_without_binding_or_acknowledging() {
+        let mut world = empty_recovered();
+        assert!(world
+            .sent(established(None, PRODUCER, b"new-client", 1, false))
+            .is_empty());
+        assert_eq!(world.owner.connection_of(SessionId::new(PRODUCER)), None);
+        assert_eq!(world.owner.sessions.len(), 1);
+        world.applied(connect(11, b"new-client"));
+        let effects = world.drain();
+        assert_eq!(
+            effects[0].1,
+            frame_to(
+                11,
+                OutboundFrame::Connack {
+                    session_present: true,
+                }
+            )
+        );
+        absorbed(&mut world, established(None, PRODUCER, b"new-client", 1, false));
+        assert_eq!(
+            world.owner.connection_of(SessionId::new(PRODUCER)),
+            Some(ConnectionGeneration::new(11))
+        );
+    }
+
+    #[test]
+    fn product_closed_generation_cannot_receive_a_late_creation_acknowledgement() {
+        let mut world = empty_recovered();
+        assert!(world.sent(transport_closed(CONN)).is_empty());
+        assert!(world
+            .sent(established(Some(CONN), PRODUCER, b"new-client", 1, false))
+            .is_empty());
+        assert_eq!(world.owner.sessions.len(), 1);
+        assert_eq!(world.owner.connection_of(SessionId::new(PRODUCER)), None);
+        absorbed(&mut world, connect(CONN, b"new-client"));
+        assert_eq!(world.sent(connect(11, b"new-client")), ["EmitConnack"]);
+    }
+
+    #[test]
+    fn product_session_identity_contradictions_are_fatal_without_mutation() {
+        let cases = [
+            established(Some(CONN), PRODUCER, b"another-name", PRODUCER + 10, true),
+            established(Some(CONN), 99, b"p1-producer", PRODUCER + 10, true),
+            established(Some(CONN), PRODUCER, b"p1-producer", 99, true),
+            established(Some(CONN), PRODUCER, b"p1-producer", PRODUCER + 10, false),
+            established(Some(CONN), 4, b"new-client", 1, false),
+        ];
+        for input in cases {
+            let mut world = World::recovered();
+            faulted(&mut world, input, CoreFault::ImpossibleInput);
+        }
+        // A writer result cannot change which session an already bound
+        // generation denotes.
+        let mut world = World::connected();
+        faulted(
+            &mut world,
+            established(Some(CONN), 2, b"p1-b", 12, true),
+            CoreFault::ImpossibleInput,
+        );
+    }
+
+    #[test]
+    fn product_lifecycle_facts_do_not_bypass_incomplete_recovery() {
+        for input in [
+            established(Some(CONN), PRODUCER, b"new-client", 1, false),
+            established(None, PRODUCER, b"new-client", 1, false),
+            transport_closed(CONN),
+            ping(CONN),
+        ] {
+            let mut world = World::cold(EPOCH, CAPACITY);
+            faulted(&mut world, input, CoreFault::ImpossibleInput);
+        }
+    }
+
+    #[test]
+    fn product_registration_obeys_work_effect_and_reservation_boundaries() {
+        handed_back(
+            empty_recovered,
+            &|_| established(Some(CONN), PRODUCER, b"new-client", 1, false),
+            1,
+        );
+        handed_back(
+            World::connected,
+            &|_| established(Some(11), PRODUCER, b"p1-producer", PRODUCER + 10, true),
+            2,
+        );
+        handed_back(
+            empty_recovered,
+            &|_| established(None, PRODUCER, b"new-client", 1, false),
+            0,
+        );
+    }
+
+    #[test]
+    fn product_transport_close_unbinds_but_keeps_an_inflight_operation() {
+        let mut world = World::admission_pending();
+        let admission = world.flights[0];
+        assert!(world.sent(transport_closed(CONN)).is_empty());
+        assert_eq!(world.owner.connection_of(SessionId::new(PRODUCER)), None);
+        assert_eq!(world.phase(7), Some(ExchangePhase::AdmissionPending));
+        assert_eq!(world.owner.leases.held(), 1);
+        assert!(world.sent(committed(&admission)).is_empty());
+        assert_eq!(world.phase(7), Some(ExchangePhase::AwaitPubrel));
+        assert_eq!(world.sent(connect(11, b"p1-producer")), ["EmitConnack"]);
+        assert_eq!(
+            world.sent(publish_with(11, 7, Qos::ExactlyOnce, b"payload")),
+            ["EmitPubrec"]
+        );
+    }
+
+    #[test]
+    fn product_old_transport_close_does_not_unbind_a_new_connection() {
+        let mut world = World::connected();
+        assert_eq!(
+            world.sent(connect(11, b"p1-producer")),
+            ["CloseConnection", "EmitConnack"]
+        );
+        absorbed(&mut world, transport_closed(CONN));
+        assert_eq!(
+            world.owner.connection_of(SessionId::new(PRODUCER)),
+            Some(ConnectionGeneration::new(11))
+        );
+    }
+
+    #[test]
+    fn product_transport_close_needs_no_outbox_slot() {
+        handed_back(World::connected, &|_| transport_closed(CONN), 0);
+    }
+
+    #[test]
+    fn product_ping_is_answered_only_on_a_bound_live_connection() {
+        let mut world = World::connected();
+        world.applied(ping(CONN));
+        assert_eq!(world.drain()[0].1, frame_to(CONN, OutboundFrame::Pingresp));
+        world.applied(transport_closed(CONN));
+        absorbed(&mut world, ping(CONN));
+        let mut world = World::recovered();
+        assert_eq!(world.sent(ping(13)), ["CloseConnection"]);
+        absorbed(&mut world, ping(13));
+        handed_back(World::connected, &|_| ping(CONN), 1);
+    }
+
+    #[test]
+    fn product_new_session_reuses_a_completed_packet_identifier_for_a_new_exchange() {
+        let mut world = empty_recovered();
+        assert_eq!(
+            world.sent(established(Some(CONN), PRODUCER, b"new-client", 1, false)),
+            ["EmitConnack"]
+        );
+        let first = world.submit(publish(7));
+        assert_eq!(world.sent(committed(&first)), ["EmitPubrec"]);
+        let release = world.submit(pubrel(7));
+        assert_eq!(world.sent(committed(&release)), ["EmitPubcomp"]);
+        assert_eq!(world.phase(7), None);
+        let next = world.submit(publish(7));
+        assert_ne!(next.operation, first.operation);
+        assert_ne!(next.facts, first.facts);
+    }
+
     // ----- The machine `inbound_qos2`: one test per rule, named after it -----
 
     const PENDING: Option<ExchangePhase> = Some(ExchangePhase::AdmissionPending);
