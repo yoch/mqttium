@@ -61,6 +61,10 @@ impl Error {
     pub const fn reason_code(self) -> u8 {
         self.reason
     }
+    /// Peer response limit established by a fully validated CONNECT.
+    pub const fn peer_maximum(self) -> Option<u32> {
+        None
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -821,6 +825,34 @@ mod tests {
             panic!("CONNECT")
         };
         assert_eq!(c.max_packet_size, 1);
+    }
+
+    #[test]
+    fn an_unsupported_connect_retains_its_validated_response_limit() {
+        let mut props = EXPIRY.to_vec();
+        props.extend_from_slice(&[0x27, 0, 0, 0, 3]);
+        let mut clean = connect(&props, b"small-refusal");
+        clean[7] = 2; // Clean Start is valid MQTT 5, outside this profile.
+        let error = decode(0x10, &clean, BOUNDS).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unsupported);
+        assert_eq!(error.peer_maximum(), Some(3));
+        assert!(refusal(error, true).len() > error.peer_maximum().unwrap() as usize);
+
+        let absent = decode(0x10, &connect(&[], b"unsupported-expiry"), BOUNDS).unwrap_err();
+        assert_eq!(absent.peer_maximum(), Some(u32::MAX));
+        clean.pop();
+        assert_eq!(
+            decode(0x10, &clean, BOUNDS).unwrap_err().peer_maximum(),
+            None
+        );
+        let mut duplicate = props;
+        duplicate.extend_from_slice(&[0x27, 0, 0, 0, 2]);
+        assert_eq!(
+            decode(0x10, &connect(&duplicate, b"bad"), BOUNDS)
+                .unwrap_err()
+                .peer_maximum(),
+            None
+        );
     }
 
     #[test]
