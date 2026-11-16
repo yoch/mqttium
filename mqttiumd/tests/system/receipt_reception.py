@@ -133,11 +133,11 @@ def storage_sample(broker: Broker) -> dict:
 
 
 class EventTail:
-    """Observe a long run without retaining its whole product stream in RAM.
+    """Retain bounded counters while following each opened log generation.
 
-    File offsets follow inodes, so a bounded product log rotation may rename
-    the current file. Only counters and 256 maintenance witnesses are retained
-    here; the actual retained files belong to this same process and run.
+    A first sequence distinguishes a recycled inode from its old contents.
+    A complete scan commits offsets together; a rename/open gap consumes no
+    observations. The retained files belong to this same process and run.
     """
     def __init__(self, path: Path, pid: int):
         self.path, self.pid = path, pid
@@ -146,30 +146,65 @@ class EventTail:
         self.recent = deque(maxlen=256)
         self.last_sequence = 0
 
+    def _observations(self) -> dict:
+        return {"last_sequence": str(self.last_sequence), "counts": dict(self.counts),
+                "recent_maintenance": list(self.recent)}
+
     def read(self) -> dict:
-        streams = [path for path in self.path.parent.glob(self.path.name + "*") if path.is_file()]
+        streams = sorted(self.path.parent.glob(self.path.name + "*"))
         require(len(streams) <= 16, "event_rotation_budget")
+        if not streams:
+            return self._observations()
         records = []
+        offsets = dict(self.offsets)
+        live_streams = set()
         for path in streams:
-            inode = path.stat().st_ino
-            offset = self.offsets.get(inode, 0)
-            with path.open("rb") as stream:
+            try:
+                stream = path.open("rb")
+            except FileNotFoundError:
+                # Rotation renames current before creating its replacement.
+                # The caller's bounded next measurement retries the whole scan.
+                return self._observations()
+            with stream:
+                inode = os.fstat(stream.fileno()).st_ino
+                first = stream.readline(2049)
+                require(len(first) <= 2048, "product_event_record_budget")
+                if not first or not first.endswith(b"\n"):
+                    return self._observations()
+                initial = json.loads(first)
+                require(initial["pid"] == self.pid, "wrong_event_process")
+                generation = (inode, int(initial["seq"]))
+                live_streams.add(generation)
+                offset = offsets.get(generation, 0)
                 stream.seek(offset)
                 total = 0
                 while True:
                     line = stream.readline(2049)
+                    require(len(line) <= 2048, "product_event_record_budget")
                     if not line or not line.endswith(b"\n"):
                         break
-                    require(len(line) <= 2048, "product_event_record_budget")
                     total += len(line)
                     require(total <= 32 * 1024 * 1024, "measurement_event_window_budget")
                     event = json.loads(line)
                     require(event["pid"] == self.pid, "wrong_event_process")
                     records.append(event)
                     offset = stream.tell()
-            self.offsets[inode] = offset
-        # Rotation can expose an older retained segment after a newer one.
-        for event in sorted(records, key=lambda value: int(value["seq"])):
+                offsets[generation] = offset
+        # Validate the entire buffered observation prefix before committing any
+        # offsets or counters. An explicit gap can never become a later success.
+        records.sort(key=lambda value: int(value["seq"]))
+        last_sequence = self.last_sequence
+        for event in records:
+            sequence = int(event["seq"])
+            if sequence <= last_sequence:
+                continue
+            require(sequence == last_sequence + 1, "receipt_event_observation_gap")
+            last_sequence = sequence
+        offsets = {generation: value for generation, value in offsets.items()
+                   if generation in live_streams}
+        require(len(offsets) <= 64, "event_inode_budget")
+        self.offsets = offsets
+        for event in records:
             sequence = int(event["seq"])
             if sequence <= self.last_sequence:
                 continue
@@ -177,9 +212,7 @@ class EventTail:
             self.counts[event["kind"]] += 1
             if any(word in event["kind"] for word in ("receipt", "retire", "collect", "frontier", "confirm", "closure")):
                 self.recent.append(event)
-        require(len(self.offsets) <= 64, "event_inode_budget")
-        return {"last_sequence": str(self.last_sequence), "counts": dict(self.counts),
-                "recent_maintenance": list(self.recent)}
+        return self._observations()
 
 
 class PahoPeer:
