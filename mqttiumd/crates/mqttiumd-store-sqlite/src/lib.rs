@@ -1235,7 +1235,7 @@ pub fn writer_lock_path(path: &Path) -> PathBuf {
 /// Takes the writer's lock of the database at `path`, without waiting.
 /// The lock file is created if it is missing and never truncated or
 /// removed.
-fn writer_lock(path: &Path) -> Result<File, OpenError> {
+fn writer_lock(path: &Path) -> Result<WriterLease, OpenError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -1244,9 +1244,25 @@ fn writer_lock(path: &Path) -> Result<File, OpenError> {
         .open(writer_lock_path(path))
         .map_err(OpenError::WriterLock)?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(WriterLease { file }),
         Err(TryLockError::WouldBlock) => Err(OpenError::WriterAlive),
         Err(TryLockError::Error(error)) => Err(OpenError::WriterLock(error)),
+    }
+}
+
+/// Closing one descriptor does not release a lock while a descriptor inherited
+/// across fork still refers to the same open file description. The logical
+/// owner explicitly releases its lease; a transient child descriptor carries
+/// no authority after that point. This guard always outlives the connection.
+struct WriterLease {
+    file: File,
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        // If unlocking fails, closing the descriptor remains conservative:
+        // another opener still has to acquire the exclusive kernel lock.
+        let _ = self.file.unlock();
     }
 }
 
@@ -1357,7 +1373,7 @@ pub struct SqliteStore {
     kill_hook: kill_points::Shared,
     #[cfg(feature = "kill-points")]
     autocheckpoint_before_hook: Option<i64>,
-    _writer_lock: File,
+    _writer_lock: WriterLease,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -1410,7 +1426,7 @@ impl SqliteStore {
         write_meta(&tx, &meta).map_err(|_| OpenError::Corrupt)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
-        Self::verified(conn, lock)
+        Self::verified(lock, conn)
     }
 
     /// Opens an existing data set: its schema version is checked before
@@ -1427,7 +1443,7 @@ impl SqliteStore {
         if version != SCHEMA_VERSION {
             return Err(OpenError::SchemaVersion(version));
         }
-        Self::verified(conn, lock)
+        Self::verified(lock, conn)
     }
 
     /// Reads the durable state of the file at `path` without the writer,
@@ -1467,7 +1483,9 @@ impl SqliteStore {
         Ok(state)
     }
 
-    fn verified(conn: Connection, lock: File) -> Result<Self, OpenError> {
+    // Parameters drop in reverse order on an early error: close/checkpoint
+    // SQLite before releasing the lease, as the fields of a live store do.
+    fn verified(lock: WriterLease, conn: Connection) -> Result<Self, OpenError> {
         let settings = settle(&conn)?;
         // Before an epoch is opened: every page of the file is checked,
         // not only those opening reads.
@@ -2337,6 +2355,7 @@ mod writer_lease_tests {
         // to make that otherwise narrow scheduling window deterministic.
         let inherited = store
             ._writer_lock
+            .file
             .try_clone()
             .expect("duplicated descriptor");
         assert!(matches!(
