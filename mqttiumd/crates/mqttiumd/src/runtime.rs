@@ -692,9 +692,13 @@ impl EffectSink for Sink<'_> {
                 if self.inputs.len() >= INPUTS {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
-                let Some(peer) = self.peers.get(&generation) else {
+                let Some(peer) = self
+                    .peers
+                    .get(&generation)
+                    .filter(|peer| peer.closing.is_none())
+                else {
                     let _ = effect.into_parts();
-                    if self.events.emit("frame_failed",json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(id),"packet_kind":kind,"code":"closed_generation"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                    if self.events.emit("frame_failed",json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(id),"packet_kind":kind,"code":"unusable_generation"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                     self.inputs.push_back(Input::FrameResult {
                         effect: id,
                         connection,

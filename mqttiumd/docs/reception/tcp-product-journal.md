@@ -65,6 +65,18 @@
   Contract JSON bytes/digest are unchanged. The corpus has 365 derived files,
   380 schema documents, and the trace corpus remains 405 files. Final source
   receipts are regenerated; earlier archives keep their original identities.
+- The 081cff42 product CI explicitly failed `output_saturation_not_reached`:
+  the client configured SO_RCVBUF after SYN and uploaded its finite byte budget
+  before the output point was established. The failed artifact 14191885577 is
+  retained. The pilot now configures receive buffer/window clamp before connect,
+  tracks actual partial sends, and waits for the real queue-full/retained-effect
+  event within 128 KiB / 12 seconds. Input pressure remains a distinct failure.
+  Ten pilot tests pass; the target is also reached after 5.119 seconds with
+  injected slow reads, rather than counting the old deadline as detection.
+- A separate actual reactor regression established a late PUBREC after queued
+  DISCONNECT. The output sink now refuses closing generations while consuming
+  the correlated commit; the new socket replays its original durable admission.
+  A–H and the precise mutants are regenerated after this code change.
 - Final SHA-specific CI and fresh K1/K2b/K3 qualification are retained in the
   updated PR and its workflow artifacts. The final source identity is always
   `index.json.source_head`; development archives are never relabelled.

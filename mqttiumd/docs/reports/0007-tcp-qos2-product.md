@@ -58,6 +58,7 @@ before core delivery, beyond the core's remembered closed window.
 | Full exchange table precedes another client's release/result | Close only the unaccepted packet's transport; bounded fair retry of nonpacket inputs | Real socket/SQLite reactor regression failed on the starved release, then passed |
 | CONNECT and PUBLISH arrive together for a new ClientID | Keep the bounded transport pending until its session confirmation | Real reactor regression failed on premature closure, then passed with CONNACK before PUBREC |
 | New PI use arrives before an old PUBCOMP write receipt | Match completion against the latest PUBLISH ingress serial | Red receive-window test lost the new entry; fixed tests include the actual socket/worker receipt race and ninth-PUBLISH refusal |
+| A late commit follows queued DISCONNECT | Reconcile the commit and fail the closing generation's frame; a fresh generation resumes it | Actual socket red test read PUBREC after DISCONNECT; the fix preserves inbound/operation identities without readmission |
 | Unsupported CONNECT has a tiny Maximum Packet Size | Preserve only structurally validated limit context; flush a fitting refusal through the bounded writer | Codec red test and actual reactor tests cover both fitting refusal and close without oversized output |
 
 The two historical M1 payload-loss control patches are refreshed for the new
@@ -76,6 +77,12 @@ products, runs the external client and independent TCP pilot, then builds
 isolated premature-ACK and stale-generation mutations. The output includes
 source identity, effective features, client observations, durable facts,
 process statuses, each run's own system witness, SHA256SUMS and an archive.
+The nonreader pilot sets its receive buffer/window clamp before SYN and uses
+a finite 128 KiB / 12-second pressure budget. It requires the actual output
+queue-full event and terminal handling of the same effect identities. An
+earlier CI run that missed that point is retained as failed, not relabelled
+as detection; injected slow-read verification reaches it after 5.119 seconds.
+
 The workflow artifact is named `mqttiumd-tcp-product-<published HEAD>`.
 Its `index.json.source_head` and binary hashes name the exact received content.
 
