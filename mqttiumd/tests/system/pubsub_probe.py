@@ -82,7 +82,9 @@ class Publication:
 
     def observation(self) -> dict:
         return {"packet_id": self.packet_id, "topic": self.topic,
-                "payload": self.payload.hex(), "payload_sha256": hashlib.sha256(self.payload).hexdigest(),
+                "payload_prefix": self.payload[:128].hex(), "payload_bytes": len(self.payload),
+                "payload_truncated": len(self.payload) > 128,
+                "payload_sha256": hashlib.sha256(self.payload).hexdigest(),
                 "qos": self.qos, "dup": self.dup, "retain": self.retain}
 
 
