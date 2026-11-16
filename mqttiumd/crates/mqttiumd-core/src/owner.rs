@@ -6961,6 +6961,54 @@ mod tests {
     }
 
     #[test]
+    fn product_pubsub_identical_pending_control_packet_still_reuses_a_live_identifier() {
+        for subscribing in [true, false] {
+            let request = || {
+                if subscribing {
+                    subscribe(CONN, 9, b"fresh")
+                } else {
+                    unsubscribe(CONN, 9, b"fresh")
+                }
+            };
+            let mut world = product_world();
+            world.applied(product_settings(CONN, 1));
+            let original = pubsub_flight(&mut world, request());
+            assert_eq!(
+                world.sent(request()),
+                ["CloseConnection"],
+                "identical MQTT control bytes do not permit reusing an active sender identifier"
+            );
+            assert_eq!(
+                world
+                    .owner
+                    .pubsub
+                    .control
+                    .as_ref()
+                    .unwrap()
+                    .in_flight
+                    .operation,
+                original.operation,
+                "transport refusal preserves the uncertain original durable command"
+            );
+            world.applied(committed(&original));
+            assert!(
+                world.drain().is_empty(),
+                "late terminal result cannot acknowledge the closed generation"
+            );
+            assert_eq!(
+                world
+                    .owner
+                    .routes
+                    .as_slice()
+                    .iter()
+                    .any(|r| r.topic == bytes(b"fresh") && r.target == SessionId::new(PRODUCER)),
+                subscribing,
+                "original committed projection remains authoritative"
+            );
+        }
+    }
+
+    #[test]
     fn product_pubsub_claim_and_finish_each_require_their_own_commit() {
         let mut world = product_world();
         world.applied(product_settings(CONN, 1));
