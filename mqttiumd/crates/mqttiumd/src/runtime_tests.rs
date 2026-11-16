@@ -1928,3 +1928,54 @@ fn a_no_target_puback_observed_before_the_first_claim_cannot_bind_to_it_later() 
         );
     });
 }
+
+#[test]
+fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connections() {
+    with_runtime(128,|runtime,_| {
+        let (old_generation,mut old)=peer(runtime);
+        runtime.connect(old_generation,connect_packet(b"takeover-boundary")).unwrap();
+        until(runtime,|r|r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut old).0,0x20);
+        let session=runtime.sessions[b"takeover-boundary".as_slice()].id;
+        let (first,mut first_client)=peer(runtime);
+        runtime.connect(first,connect_packet(b"takeover-pressure-a")).unwrap();
+        until(runtime,|r|r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut first_client).0,0x20);
+        let (second,mut second_client)=peer(runtime);
+        runtime.connect(second,connect_packet(b"takeover-pressure-b")).unwrap();
+        until(runtime,|r|r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut second_client).0,0x20);
+        for identifier in 1..=8 {
+            runtime.packet(first,0x32,publish_body(identifier)).unwrap();
+            runtime.drain_inputs().unwrap();
+            runtime.packet(second,0x32,publish_body(identifier)).unwrap();
+            runtime.drain_inputs().unwrap();
+        }
+        assert_eq!(runtime.inflight.len(),IN_FLIGHT,"sixteen actual submissions block the ordinary effect head until their correlated replies are collected");
+        runtime.packet(old_generation,0x32,publish_body(1)).unwrap();
+        runtime.drain_inputs().unwrap();
+        assert!(!runtime.owner.outbox().unwrap().is_empty());
+        let (new_generation,mut new)=peer(runtime);
+        runtime.connect(new_generation,connect_packet(b"takeover-boundary")).unwrap();
+        runtime.drain_inputs().unwrap();
+        assert_eq!(runtime.owner.connection_of(session),Some(new_generation));
+        assert!(runtime.peers.contains_key(&old_generation),"the actual old transport survives while CloseConnection waits behind the refused Persist");
+        let observed_before=runtime.puback_observation;
+        old.write_all(&[0x40,2,0,1]).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(2);
+        let mut result=Ok(());
+        while runtime.puback_observation==observed_before && Instant::now()<deadline {
+            result=runtime.connections();
+            if result.is_err() {break;}
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(result.is_ok(),"stale_puback_stopped_reactor: a live old socket with superseded authority must not cause global failure: {:?}",result.err());
+        assert!(runtime.puback_observation>observed_before,"the real reader must reach the superseded generation's PUBACK");
+        assert!(runtime.inputs.iter().any(|input|matches!(input,Input::ObservedPuback {connection,target:None,..} if connection.session==session && connection.generation==old_generation)),"the observation retains its original durable session/generation and never acquires the replacement connection");
+        until(runtime,|r|r.inflight.is_empty() && r.inputs.is_empty() && !r.peers.contains_key(&old_generation) && r.peers.get(&new_generation).is_some_and(|p|!p.pending));
+        assert_eq!(read_frame(&mut new).0,0x20);
+        runtime.packet(new_generation,0xc0,vec![]).unwrap();
+        runtime.drain_inputs().unwrap();
+        assert_eq!(read_frame(&mut new).0,0xd0,"the replacement and independent control traffic remain usable");
+    });
+}
