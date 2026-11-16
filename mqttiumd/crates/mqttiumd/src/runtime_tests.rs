@@ -82,6 +82,10 @@ fn with_runtime(max_exchanges: u32, test: impl FnOnce(&mut Runtime<'_>, &Path)) 
         inputs: VecDeque::new(),
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
+        work_reads: BTreeMap::new(),
+        last_work_scan: Instant::now(),
+        #[cfg(feature = "test-hooks")]
+        work_cache: BTreeMap::new(),
         started: Instant::now(),
         #[cfg(feature = "test-hooks")]
         captured: None,
@@ -349,9 +353,9 @@ fn closing_transport_reconciles_late_commit_without_acknowledging_after_disconne
                 .is_some_and(|(_, phase)| phase == ExchangePhase::AdmissionPending)
         );
 
-        // A valid SUBSCRIBE is outside this product profile. It queues a
+        // The valid No Local option is outside this product profile. It queues a
         // DISCONNECT while the admitted command's response is still withheld.
-        let subscription = vec![0, 9, 0, 0, 1, b't', 2];
+        let subscription = vec![0, 9, 0, 0, 1, b't', 6];
         assert_eq!(
             codec::decode(0x82, &subscription, BOUNDS)
                 .unwrap_err()
@@ -880,8 +884,8 @@ fn connect_then_subscribe(client_id: &[u8]) -> Vec<u8> {
     body.extend_from_slice(client_id);
     let mut packets = vec![0x10, u8::try_from(body.len()).unwrap()];
     packets.extend_from_slice(&body);
-    // Valid MQTT 5 SUBSCRIBE, outside this product's documented profile.
-    packets.extend_from_slice(&[0x82, 7, 0, 9, 0, 0, 1, b't', 2]);
+    // Valid MQTT 5 No Local option, outside this product's documented profile.
+    packets.extend_from_slice(&[0x82, 7, 0, 9, 0, 0, 1, b't', 6]);
     packets
 }
 

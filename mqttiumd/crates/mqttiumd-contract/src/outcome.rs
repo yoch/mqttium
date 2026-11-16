@@ -128,6 +128,10 @@ impl Knowledge {
     /// A late `PendingOrUnknown` never replaces a terminal result, an answer
     /// after collection reopens nothing, a repeated terminal result changes
     /// nothing, and two different terminal results are a fault.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a contradiction preserves both complete terminal facts without allocation"
+    )]
     pub fn observe(self, reported: StoreOutcome) -> Result<Self, ContradictoryOutcome> {
         let conflict = ContradictoryOutcome {
             established: self,

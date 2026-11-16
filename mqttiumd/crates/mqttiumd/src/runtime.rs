@@ -6,17 +6,21 @@ use crate::{
     receiving::Terminal,
     writer::{Failure, Hooks, Request, Response, Session, Writer},
 };
-use mqttiumd_contract::capacity::{PayloadBytes, WorkUnits};
+use mqttiumd_contract::capacity::{PayloadBytes, Resource, WakeCondition, WorkUnits};
+use mqttiumd_contract::command::Recipe;
 use mqttiumd_contract::effects::{
     CloseReason, Effect, EffectSink, FrameProgress, Input, OwnedEffect, OwnerAuthority,
     RecoveredFact, SubmitBlock, SubmitResult,
 };
 use mqttiumd_contract::ids::{
     AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, EffectId, LogicalDuration,
-    LogicalOwnerId, LogicalTime, OperationId,
+    LogicalOwnerId, LogicalTime, OperationId, SessionId,
 };
+use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome, StoreReply};
 use mqttiumd_contract::packet::{InboundPacket, OutboundFrame};
 use mqttiumd_contract::step::{StepOutcome, TurnGrant};
+#[cfg(feature = "test-hooks")]
+use mqttiumd_contract::{ids::DeliveryId, pubsub::WorkItem};
 use mqttiumd_core::owner::{Owner, OwnerConfig};
 use mqttiumd_store_api::{ReadError, ReadPhase};
 use serde_json::json;
@@ -50,6 +54,12 @@ const MUTANT_ALLOW_STALE: bool = false;
 const MUTANT_EARLY_PUBACK: bool = false;
 #[cfg(feature = "test-hooks")]
 const MUTANT_STALE_RECEIPT: bool = false;
+#[cfg(feature = "test-hooks")]
+const MUTANT_EARLY_OUTGOING: bool = false;
+#[cfg(feature = "test-hooks")]
+const MUTANT_EARLY_FINISH: bool = false;
+#[cfg(feature = "test-hooks")]
+const MUTANT_NOTIFICATIONS_ONLY: bool = false;
 
 pub struct Config {
     pub db: PathBuf,
@@ -101,6 +111,10 @@ struct Runtime<'a> {
     inputs: VecDeque<Input>,
     timers: BTreeMap<DeadlineToken, Instant>,
     inflight: BTreeMap<EffectId, OperationId>,
+    work_reads: BTreeMap<EffectId, SessionId>,
+    last_work_scan: Instant,
+    #[cfg(feature = "test-hooks")]
+    work_cache: BTreeMap<DeliveryId, WorkItem>,
     started: Instant,
     #[cfg(feature = "test-hooks")]
     captured: Option<(ConnectionGeneration, codec::Connect)>,
@@ -175,15 +189,37 @@ impl Runtime<'_> {
                 },
                 other => other,
             };
+            let finish = match &input {
+                Input::StoreResult {
+                    operation,
+                    reply:
+                        StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::DeliveryFinished {
+                            delivery,
+                            ..
+                        })),
+                    ..
+                } => Some((*operation, *delivery)),
+                _ => None,
+            };
             match self.owner.step(
                 input,
                 TurnGrant {
                     work_limit: WorkUnits::new(65536),
                 },
             ) {
-                StepOutcome::Applied { .. } => {}
-                StepOutcome::NeedCapacity { input, .. } => {
+                StepOutcome::Applied { .. } => {
+                    if let Some((id, delivery)) = finish {
+                        self.events.emit("core_finish_observed",json!({"operation":operation(id),"details":{"delivery":delivery_text(delivery)}})).map_err(event_failure)?;
+                    }
+                }
+                StepOutcome::NeedCapacity { input, need, .. } => {
                     match input {
+                        packet @ Input::Packet { .. }
+                            if need.resource == Resource::ResultSlots
+                                && need.wake == WakeCondition::ResultDelivered =>
+                        {
+                            self.inputs.push_back(packet)
+                        }
                         Input::Packet { connection, .. } => {
                             // No transition applied and no effect was submitted for this packet.
                             // Close its transport rather than reorder its positive acknowledgements.
@@ -209,11 +245,20 @@ impl Runtime<'_> {
         Ok(())
     }
     fn dispatch(&mut self) -> Result<(), Failure> {
+        let bindings: BTreeMap<_, _> = self
+            .sessions
+            .values()
+            .filter_map(|s| self.owner.connection_of(s.id).map(|c| (s.id, c)))
+            .collect();
         let mut sink = Sink {
             writer: self.writer,
             peers: &mut self.peers,
             events: &self.events,
             inflight: &mut self.inflight,
+            work_reads: &mut self.work_reads,
+            bindings: &bindings,
+            #[cfg(feature = "test-hooks")]
+            work_cache: &self.work_cache,
             timers: &mut self.timers,
             inputs: &mut self.inputs,
             frames: &mut self.frames,
@@ -246,6 +291,7 @@ impl Runtime<'_> {
                     effect,
                     operation,
                     reply,
+                    targets,
                 } => {
                     if self.inflight.remove(&effect) != Some(operation) {
                         return Err(Failure::plain("uncorrelated_store_result"));
@@ -254,6 +300,41 @@ impl Runtime<'_> {
                         effect,
                         operation,
                         reply,
+                    })?;
+                    if matches!(
+                        reply,
+                        StoreReply::Outcome(StoreOutcome::Committed(
+                            CommitFacts::PublicationAdmitted { .. }
+                        ))
+                    ) {
+                        for target in targets {
+                            self.notify_work(target)?;
+                        }
+                    }
+                }
+                Response::Work {
+                    effect,
+                    session,
+                    result,
+                } => {
+                    if self.work_reads.remove(&effect) != Some(session) {
+                        return Err(Failure::plain("uncorrelated_work_page"));
+                    }
+                    let page = result.map_err(|e| Failure::read(e, ReadPhase::Work))?;
+                    #[cfg(feature = "test-hooks")]
+                    for item in page.items.as_slice() {
+                        if self.work_cache.len() >= 128
+                            && !self.work_cache.contains_key(&item.delivery)
+                        {
+                            return Err(Failure::plain("work_cache_budget"));
+                        }
+                        self.work_cache.insert(item.delivery, item.clone());
+                    }
+                    self.queue(Input::WorkPage {
+                        effect,
+                        session,
+                        items: page.items,
+                        next: page.next,
                     })?;
                 }
                 Response::Session { request, result } => {
@@ -298,6 +379,54 @@ impl Runtime<'_> {
         }
         Ok(())
     }
+    fn notify_work(&mut self, session: SessionId) -> Result<(), Failure> {
+        #[cfg(feature = "test-hooks")]
+        if self
+            .hooks
+            .directory
+            .as_ref()
+            .is_some_and(|d| d.join("drop-work-notifications").exists())
+        {
+            self.events
+                .emit(
+                    "work_notification_dropped",
+                    json!({"details":{"session":session.get().to_string()}}),
+                )
+                .map_err(event_failure)?;
+            return Ok(());
+        }
+        self.queue_work(session);
+        Ok(())
+    }
+    fn queue_work(&mut self, session: SessionId) {
+        if self.inputs.len() < INPUTS
+            && !self
+                .inputs
+                .iter()
+                .any(|i| matches!(i,Input::WorkAvailable{session:s} if *s==session))
+        {
+            self.inputs.push_back(Input::WorkAvailable { session });
+        }
+    }
+    fn discover_work(&mut self) {
+        #[cfg(feature = "test-hooks")]
+        if MUTANT_NOTIFICATIONS_ONLY {
+            return;
+        }
+        if self.last_work_scan.elapsed() < Duration::from_millis(100) {
+            return;
+        }
+        self.last_work_scan = Instant::now();
+        let sessions: Vec<_> = self
+            .sessions
+            .values()
+            .filter(|s| self.owner.connection_of(s.id).is_some())
+            .map(|s| s.id)
+            .collect();
+        for session in sessions {
+            self.queue_work(session);
+        }
+    }
     fn connect(
         &mut self,
         generation: ConnectionGeneration,
@@ -317,6 +446,11 @@ impl Runtime<'_> {
             self.events.emit("input_captured",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"CONNECT"}})).map_err(event_failure)?;
             self.captured = Some((generation, connect.clone()));
         }
+        self.queue(Input::ConnectionSettings {
+            connection: generation,
+            receive_maximum: connect.receive_maximum,
+            maximum_packet_size: connect.max_packet_size,
+        })?;
         if let Some(session) = self.sessions.get(connect.client_id.as_slice()) {
             self.events.emit("session_established",json!({"connection":generation.get().to_string(),"details":{"session":session.id.get().to_string(),"session_present":true,"source":"durable_cache"}})).map_err(event_failure)?;
             if let Some(p) = self.peers.get_mut(&generation) {
@@ -791,6 +925,10 @@ struct Sink<'a> {
     peers: &'a mut BTreeMap<ConnectionGeneration, Peer>,
     events: &'a Events,
     inflight: &'a mut BTreeMap<EffectId, OperationId>,
+    work_reads: &'a mut BTreeMap<EffectId, SessionId>,
+    bindings: &'a BTreeMap<SessionId, ConnectionGeneration>,
+    #[cfg(feature = "test-hooks")]
+    work_cache: &'a BTreeMap<DeliveryId, WorkItem>,
     timers: &'a mut BTreeMap<DeadlineToken, Instant>,
     inputs: &'a mut VecDeque<Input>,
     frames: &'a mut BTreeMap<EffectId, PendingFrame>,
@@ -810,6 +948,41 @@ impl EffectSink for Sink<'_> {
                     return refused(effect, SubmitBlock::InFlightLimit);
                 }
                 let operation_id = command.recipe.operation();
+                let command_kind = crate::writer::recipe_kind(command.recipe.get());
+                let details = recipe_details(command.recipe.get());
+                #[cfg(feature = "test-hooks")]
+                let early_finish = if MUTANT_EARLY_FINISH
+                    && let Recipe::FinishDelivery(f) = command.recipe.get()
+                {
+                    Some(Input::StoreResult {
+                        effect: id,
+                        operation: operation_id,
+                        reply: StoreReply::Outcome(StoreOutcome::Committed(
+                            CommitFacts::DeliveryFinished {
+                                delivery: f.delivery,
+                                target: f.target,
+                                packet_id: f.packet_id,
+                                claim: f.claim,
+                            },
+                        )),
+                    })
+                } else {
+                    None
+                };
+                #[cfg(feature = "test-hooks")]
+                if MUTANT_EARLY_OUTGOING
+                    && let Recipe::ClaimDelivery(c) = command.recipe.get()
+                    && let Some(item) = self.work_cache.get(&c.delivery)
+                    && let Some(generation) = self.bindings.get(&c.target)
+                    && let Some(peer) = self.peers.get(generation)
+                    && let Ok(bytes) =
+                        codec::encode_publish(c.packet_id, &item.topic, &item.payload, false)
+                {
+                    let _ = peer.io.outgoing.try_send(net::Write {
+                        correlation: None,
+                        bytes,
+                    });
+                }
                 #[cfg(feature = "test-hooks")]
                 if MUTANT_EARLY_ACK
                     && let mqttiumd_contract::command::Recipe::AdmitPublication(admission) =
@@ -853,11 +1026,15 @@ impl EffectSink for Sink<'_> {
                 match self.writer.sender.try_send(Request::Effect(effect)) {
                     Ok(()) => {
                         self.inflight.insert(id, operation_id);
+                        #[cfg(feature = "test-hooks")]
+                        if let Some(input) = early_finish {
+                            self.inputs.push_back(input);
+                        }
                         if self
                             .events
                             .emit(
                                 "command_submitted",
-                                json!({"operation":operation(operation_id)}),
+                                json!({"operation":operation(operation_id),"command_kind":command_kind,"details":details}),
                             )
                             .is_err()
                         {
@@ -916,11 +1093,10 @@ impl EffectSink for Sink<'_> {
                 if self.inputs.len() >= INPUTS {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
-                let Some(peer) = self
-                    .peers
-                    .get_mut(&generation)
-                    .filter(|peer| peer.closing.is_none())
-                else {
+                let Some(peer) = self.peers.get_mut(&generation).filter(|peer| {
+                    peer.closing.is_none()
+                        && self.bindings.get(&connection.session) == Some(&generation)
+                }) else {
                     let _ = effect.into_parts();
                     if self.events.emit("frame_failed",json!({"connection":generation.get().to_string(),"details":{"effect":effect_text(id),"packet_kind":kind,"code":"unusable_generation"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                     self.inputs.push_back(Input::FrameResult {
@@ -1008,9 +1184,89 @@ impl EffectSink for Sink<'_> {
                 let _ = effect.into_parts();
                 SubmitResult::Accepted
             }
-            Effect::LoadWork { .. } => {
-                self.error = Some(Failure::plain("outgoing_delivery_out_of_profile"));
-                refused(effect, SubmitBlock::Closed)
+            Effect::LoadWork { session, .. } => {
+                if self.work_reads.len() >= IN_FLIGHT {
+                    return refused(effect, SubmitBlock::InFlightLimit);
+                }
+                let session = *session;
+                match self.writer.sender.try_send(Request::Effect(effect)) {
+                    Ok(()) => {
+                        self.work_reads.insert(id, session);
+                        SubmitResult::Accepted
+                    }
+                    Err(TrySendError::Full(Request::Effect(e))) => {
+                        refused(e, SubmitBlock::QueueFull)
+                    }
+                    Err(TrySendError::Disconnected(Request::Effect(e))) => {
+                        self.error = Some(Failure::plain("writer_disconnected"));
+                        refused(e, SubmitBlock::Closed)
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Effect::EmitPublish {
+                connection,
+                delivery,
+                packet_id,
+                claim,
+                topic,
+                payload,
+                dup,
+            } => {
+                let (connection, delivery, packet_id, claim, dup) =
+                    (*connection, *delivery, *packet_id, *claim, *dup);
+                if self.inputs.len() >= INPUTS {
+                    return refused(effect, SubmitBlock::QueueFull);
+                }
+                let generation = connection.generation;
+                let Some(peer) = self.peers.get_mut(&generation).filter(|p| {
+                    p.closing.is_none()
+                        && self.bindings.get(&connection.session) == Some(&generation)
+                }) else {
+                    let _ = effect.into_parts();
+                    self.inputs.push_back(Input::FrameResult {
+                        effect: id,
+                        connection,
+                        progress: FrameProgress::Failed,
+                    });
+                    return SubmitResult::Accepted;
+                };
+                let bytes = match codec::encode_publish(packet_id, topic, payload, dup) {
+                    Ok(bytes) if bytes.len() <= peer.max_packet => bytes,
+                    _ => {
+                        self.close.push((generation, "outgoing_packet_limit"));
+                        return refused(effect, SubmitBlock::Closed);
+                    }
+                };
+                match peer.io.outgoing.try_send(net::Write {
+                    correlation: Some((id, connection)),
+                    bytes,
+                }) {
+                    Ok(()) => {
+                        self.frames.insert(
+                            id,
+                            PendingFrame {
+                                connection,
+                                kind: "PUBLISH",
+                                packet_id: Some(packet_id.get()),
+                                receive_serial: None,
+                                terminal: None,
+                                wire_released: false,
+                            },
+                        );
+                        let _ = effect.into_parts();
+                        if self.events.emit("frame_queued",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","effect":effect_text(id),"delivery":delivery_text(delivery),"target":connection.session.get().to_string(),"packet_id":packet_id.get(),"claim":operation(claim),"dup":dup}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                        SubmitResult::Accepted
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        self.close.push((generation, "outgoing_queue_full"));
+                        refused(effect, SubmitBlock::QueueFull)
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        self.close.push((generation, "outgoing_queue_full"));
+                        refused(effect, SubmitBlock::Closed)
+                    }
+                }
             }
         }
     }
@@ -1022,6 +1278,29 @@ fn frame_info(frame: OutboundFrame) -> (&'static str, Option<u16>) {
         OutboundFrame::Puback { packet_id, .. } => ("PUBACK", Some(packet_id.get())),
         OutboundFrame::Pubrec { packet_id, .. } => ("PUBREC", Some(packet_id.get())),
         OutboundFrame::Pubcomp { packet_id, .. } => ("PUBCOMP", Some(packet_id.get())),
+        OutboundFrame::Suback { packet_id, .. } => ("SUBACK", Some(packet_id.get())),
+        OutboundFrame::Unsuback { packet_id, .. } => ("UNSUBACK", Some(packet_id.get())),
+    }
+}
+fn delivery_text(id: mqttiumd_contract::ids::DeliveryId) -> String {
+    format!(
+        "{}/{}/{}/{}/{}",
+        id.publication.incarnation().get(),
+        id.publication.epoch().get(),
+        id.publication.owner().get(),
+        id.publication.sequence().get(),
+        id.index
+    )
+}
+fn recipe_details(recipe: &Recipe) -> serde_json::Value {
+    match recipe {
+        Recipe::ClaimDelivery(c) => {
+            json!({"delivery":delivery_text(c.delivery),"target":c.target.get().to_string(),"packet_id":c.packet_id.get()})
+        }
+        Recipe::FinishDelivery(c) => {
+            json!({"delivery":delivery_text(c.delivery),"target":c.target.get().to_string(),"packet_id":c.packet_id.get(),"claim":operation(c.claim)})
+        }
+        _ => json!({}),
     }
 }
 fn effect_text(id: EffectId) -> String {
@@ -1110,7 +1389,7 @@ fn run_inner(
     let owner = Owner::new(
         OwnerConfig {
             max_sessions: nz(128),
-            max_routes: nz(1),
+            max_routes: nz(128),
             max_exchanges: nz(128),
             account: AccountId::new(1),
             payload_bytes: PayloadBytes::new(4 * 1024 * 1024),
@@ -1136,6 +1415,10 @@ fn run_inner(
         inputs: VecDeque::new(),
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
+        work_reads: BTreeMap::new(),
+        last_work_scan: Instant::now(),
+        #[cfg(feature = "test-hooks")]
+        work_cache: BTreeMap::new(),
         started: Instant::now(),
         #[cfg(feature = "test-hooks")]
         captured: None,
@@ -1213,7 +1496,7 @@ fn run_inner(
             .local_addr()
             .map_err(|_| Failure::plain("listen_address"))?;
         events.emit("ready",json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8}})).map_err(event_failure)?;
-        println!("mqttiumd ready {address} (experimental incoming QoS 2)");
+        println!("mqttiumd ready {address} (experimental exact pub/sub)");
         while !cancel.load(Ordering::Relaxed) {
             for _ in 0..4 {
                 match listener.accept() {
@@ -1259,6 +1542,7 @@ fn run_inner(
             }
             runtime.writer_results()?;
             runtime.connections()?;
+            runtime.discover_work();
             let due: Vec<_> = runtime
                 .timers
                 .iter()

@@ -185,11 +185,7 @@ pub struct FinishDelivery {
     pub claim: OperationId,
 }
 
-/// The closed set of recipes of the S0 perimeter.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "a recipe lives behind the Arc of FrozenRecipe; boxing would add an allocation"
-)]
+/// The closed set of durable recipes of the received perimeter.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Recipe {
     AdmitPublication(AdmitPublication),

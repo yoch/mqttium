@@ -730,6 +730,10 @@ impl Outbox {
     /// Returns the slots the reservation still holds. Zero means that the
     /// reservation ended: its table entry is released, which is the
     /// `ResourceReleased` wake-up of a lack of table entries.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a refusal returns the owned effect intact without another allocation"
+    )]
     pub fn publish(
         &mut self,
         key: EffectReservation,

@@ -26,6 +26,11 @@ fn arguments() -> Result<Config, &'static str> {
                         "release.prepared",
                         "admission.committed",
                         "ack.receipt",
+                        "subscription.prepared",
+                        "claim.prepared",
+                        "finish.prepared",
+                        "claim.committed",
+                        "finish.committed",
                     ]
                     .contains(&point)
                     {

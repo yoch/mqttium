@@ -10,7 +10,7 @@ use mqttiumd_contract::outcome::{
 use mqttiumd_contract::packet::SharedBytes;
 use mqttiumd_store_api::{
     AdminCommand, AdminDone, DurableStore, Limits, ReadError, ReadPhase, RecoveryCursor,
-    RecoveryPage, RecoveryRefused, SessionState,
+    RecoveryPage, RecoveryRefused, SessionState, WorkPage,
 };
 use mqttiumd_store_sqlite::SqliteStore;
 use serde_json::json;
@@ -36,11 +36,20 @@ pub fn limits() -> Limits {
         references: References::new(128),
         exchange_slots: ExchangeSlots::new(128),
         receipt_slots: ReceiptSlots::new(8192),
-        max_targets_per_admission: 1,
+        max_targets_per_admission: 16,
         max_topic_bytes: MAX_TOPIC,
         max_payload_bytes: MAX_PAYLOAD,
         max_sessions: SESSIONS,
-        max_route_targets: 1,
+        max_route_targets: 16,
+    }
+}
+pub fn recipe_kind(recipe: &Recipe) -> &'static str {
+    match recipe {
+        Recipe::AdmitPublication(_) => "Admission",
+        Recipe::ReleaseInbound(_) => "Release",
+        Recipe::ChangeSubscriptions(_) => "Subscriptions",
+        Recipe::ClaimDelivery(_) => "Claim",
+        Recipe::FinishDelivery(_) => "Finish",
     }
 }
 #[derive(Clone, Debug)]
@@ -94,6 +103,12 @@ pub enum Response {
         effect: EffectId,
         operation: OperationId,
         reply: StoreReply,
+        targets: Vec<SessionId>,
+    },
+    Work {
+        effect: EffectId,
+        session: SessionId,
+        result: Result<WorkPage, ReadError>,
     },
     Stopped,
 }
@@ -171,11 +186,12 @@ impl Writer {
                         match work {
                             Effect::Persist{command}=>{
                                 let id=command.recipe.operation();
-                                let kind=match command.recipe.get(){Recipe::AdmitPublication(_)=>"Admission",Recipe::ReleaseInbound(_)=>"Release"};
+                                let kind=recipe_kind(command.recipe.get());
+                                let targets=match command.recipe.get(){Recipe::AdmitPublication(a)=>a.targets.as_slice().iter().map(|t|t.session).collect(),_=>Vec::new()};
                                 #[cfg(feature="test-hooks")]
                                 {
                                     let hc=hooks.clone();let ev=events.clone();let stop=cancel.clone();
-                                    let point=if kind=="Admission"{"admission.prepared"}else{"release.prepared"};
+                                    let point=match kind {"Admission"=>"admission.prepared","Release"=>"release.prepared","Subscriptions"=>"subscription.prepared","Claim"=>"claim.prepared",_=>"finish.prepared"};
                                     // The hook is inside the actual transaction, after all writes and before COMMIT.
                                     let hook=Box::new(move|p|{if p==mqttiumd_store_sqlite::kill_points::KillPoint::CommitPrepared && hc.barrier(point,kind,id,&ev,&stop).is_err(){stop.store(true,Ordering::Relaxed);}});
                                     if store.set_kill_hook(Some(hook)).is_err(){cancel.store(true,Ordering::Relaxed);}
@@ -184,12 +200,30 @@ impl Writer {
                                 #[cfg(feature="test-hooks")]
                                 {
                                     let _=store.set_kill_hook(None);
-                                    if applied.committed_now && kind=="Admission" && hooks.barrier("admission.committed",kind,id,&events,&cancel).is_err(){cancel.store(true,Ordering::Relaxed);}
+                                    let point=match kind {"Admission"=>Some("admission.committed"),"Claim"=>Some("claim.committed"),"Finish"=>Some("finish.committed"),_=>None};
+                                    if applied.committed_now && let Some(point)=point && hooks.barrier(point,kind,id,&events,&cancel).is_err(){cancel.store(true,Ordering::Relaxed);}
                                 }
                                 if events.emit("store_result",json!({"operation":operation(id),"command_kind":kind,"details":{"committed_now":applied.committed_now,"wrote":applied.wrote,"outcome":outcome_name(applied.reply)}})).is_err(){cancel.store(true,Ordering::Relaxed);}
-                                Response::Store{effect,operation:id,reply:applied.reply}
+                                #[cfg(not(feature="test-hooks"))]
+                                let reply=applied.reply;
+                                #[cfg(feature="test-hooks")]
+                                let mut reply=applied.reply;
+                                #[cfg(feature="test-hooks")]
+                                if applied.committed_now && matches!(kind,"Claim"|"Finish") && let Some(dir)=&hooks.directory {
+                                    let file=dir.join(format!("drop-next-{}-result",kind.to_ascii_lowercase()));
+                                    if file.exists() && std::fs::remove_file(file).is_ok(){
+                                        let _=events.emit("store_result_dropped",json!({"operation":operation(id),"command_kind":kind}));
+                                        reply=StoreReply::Outcome(mqttiumd_contract::outcome::StoreOutcome::PendingOrUnknown);
+                                    }
+                                }
+                                Response::Store{effect,operation:id,reply,targets}
                             }
-                            Effect::ResolveAndFence{operation}=>Response::Store{effect,operation,reply:StoreReply::Outcome(store.resolve_and_fence(operation).outcome)},
+                            Effect::ResolveAndFence{operation:id}=>{
+                                let reply=StoreReply::Outcome(store.resolve_and_fence(id).outcome);
+                                if events.emit("store_resolved",json!({"operation":operation(id),"details":{"outcome":outcome_name(reply).to_ascii_lowercase()}})).is_err(){cancel.store(true,Ordering::Relaxed);}
+                                Response::Store{effect,operation:id,reply,targets:Vec::new()}
+                            }
+                            Effect::LoadWork{session,after,limit}=>Response::Work{effect,session,result:store.read_work(session,after,limit as usize)},
                             _=>{cancel.store(true,Ordering::Relaxed);return;}
                         }
                     }
@@ -236,8 +270,28 @@ fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
     let state = store
         .snapshot()
         .map_err(|e| Failure::read(e, ReadPhase::Snapshot))?;
-    if state.limits != limits() || !state.routes.is_empty() {
+    if state.limits != limits() {
         return Err(Failure::plain("durable_profile_mismatch"));
+    }
+    let route_count = state
+        .routes
+        .values()
+        .try_fold(0usize, |n, targets| n.checked_add(targets.len()))
+        .ok_or_else(|| Failure::read(ReadError::LimitExceeded, ReadPhase::Snapshot))?;
+    if route_count > 128 {
+        return Err(Failure::read(ReadError::LimitExceeded, ReadPhase::Snapshot));
+    }
+    if state
+        .routes
+        .values()
+        .flatten()
+        .any(|t| t.qos != mqttiumd_contract::packet::Qos::AtLeastOnce)
+        || state
+            .obligations
+            .values()
+            .any(|o| o.qos != mqttiumd_contract::packet::Qos::AtLeastOnce)
+    {
+        return Err(Failure::read(ReadError::InvalidData, ReadPhase::Snapshot));
     }
     let mut sessions = BTreeMap::new();
     for (id, s) in &state.sessions {
