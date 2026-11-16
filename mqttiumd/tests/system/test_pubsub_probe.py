@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from pubsub_probe import (
@@ -36,6 +37,11 @@ class PubsubProbeTests(unittest.TestCase):
             puback_packet(1, 0x92)
         with self.assertRaises(ValueError):
             subscribe_packet(1, [("a", 1)] * 9)
+
+    def test_maximum_profile_payload_has_a_bounded_observation(self):
+        message = decode_publish(Frame(0x32, b"\x00\x01a\x00\x01\x00" + b"p" * 32768))
+        self.assertLess(len(json.dumps(message.observation()).encode()), 8192,
+                        "a valid maximum payload must not overflow the independent observer")
 
 
 if __name__ == "__main__":
