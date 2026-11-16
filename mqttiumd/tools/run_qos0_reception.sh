@@ -85,6 +85,14 @@ q0_run() {
         "${q0_command[@]}"
     fi
 }
+q0_ready=("$q0_python" "$q0_root/tests/system/ready_backlog.py" --binary "$q0_out/binaries/mqttiumd-normal" --out "$q0_out/ready-backlog" --binary-source-head "$q0_sha")
+q0_record ready-backlog-witness "${q0_ready[@]}"
+if [[ ${#q0_trace[@]} != 0 ]]; then
+    "${q0_trace[@]}" "$q0_out/ready-backlog.strace" "${q0_ready[@]}" >"$q0_out/ready-backlog.log"
+else
+    "${q0_ready[@]}" >"$q0_out/ready-backlog.log"
+fi
+cp -- "$q0_out/ready-backlog/result.json" "$q0_out/ready-backlog/receipt.json"
 q0_run normal "$q0_out/binaries/mqttiumd-normal" --mode normal
 q0_run product "$q0_out/binaries/mqttiumd-hooks" --mode complete
 
@@ -130,6 +138,10 @@ import hashlib, json, sys
 out = Path(sys.argv[1])
 names = ('normal', 'product', 'early-qos0', 'replay-qos0', 'qos0-accounting')
 receipts = {name: json.loads((out / name / 'receipt.json').read_text()) for name in names}
+ready = json.loads((out / 'ready-backlog/receipt.json').read_text())
+if (ready['status'] != 'PASS' or ready['source_head'] != sys.argv[2]
+        or ready['binary']['sha256'] != receipts['normal']['binary']['sha256']):
+    raise SystemExit('ready-backlog witness must use the same normal binary and source')
 for receipt in receipts.values():
     binary = receipt['binary']
     if hashlib.sha256(Path(binary['path']).read_bytes()).hexdigest() != binary['sha256']:
@@ -139,6 +151,10 @@ index = {'format': 'mqttiumd.qos0-system-reception-index', 'schema_version': 1,
          'status': 'PASS', 'qualification': 'system-test-only', 'source_head': sys.argv[2],
          'source_archive': {'path': 'source.tar', 'sha256': hashlib.sha256((out / 'source.tar').read_bytes()).hexdigest()},
          'commands': 'commands.jsonl',
+         'ready_backlog': {'path': 'ready-backlog/receipt.json', 'status': ready['status'],
+                           'messages': ready['messages'], 'receive_maximum': ready['receive_maximum'],
+                           'drain_since_connack_ms': ready['drain_since_connack_ms'],
+                           'scope': ready['scope']},
          'system_witnesses': 'same-run-strace' if int(sys.argv[3]) else 'process-wait-status-only',
          'cases': {name: receipt['cases'] for name, receipt in receipts.items()},
          'receipts': {name: {'path': f'{name}/receipt.json', 'status': receipt['status'],
