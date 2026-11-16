@@ -2097,16 +2097,13 @@ fn observed_puback_copy_and_actual_old_callbacks_cannot_finish_a_reused_identifi
                     effect,
                     operation,
                     reply:
-                        StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::DeliveryFinished {
-                            delivery,
-                            ..
-                        })),
+                        reply @ StoreReply::Outcome(StoreOutcome::Committed(
+                            CommitFacts::DeliveryFinished { delivery, .. },
+                        )),
                 } = input
                     && *delivery == first_target.delivery
                 {
-                    if let Input::StoreResult { reply, .. } = input {
-                        old_finish = Some((*effect, *operation, *reply));
-                    }
+                    old_finish = Some((*effect, *operation, *reply));
                 }
             }
             runtime.drain_inputs().unwrap();
