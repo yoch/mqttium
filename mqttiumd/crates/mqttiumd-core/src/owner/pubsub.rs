@@ -2632,4 +2632,310 @@ mod tests {
             "untargeted_puback_rebound: an immutable no-target observation cannot finish a later claim: {effects:?}"
         );
     }
+
+    #[test]
+    fn a_valid_puback_can_precede_the_local_write_callback_and_duplicates_do_not_finish_twice() {
+        let mut owner = world();
+        queued(&mut owner, 0);
+        let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command } = &claim[0].1 else {
+            panic!("claim")
+        };
+        let _ = known(&mut owner, claim[0].0, command);
+        assert!(!owner.pubsub.deliveries.as_slice()[0].local_write_completed);
+        let key = ConnectionKey {
+            session: TARGET,
+            generation: CONNECTION,
+        };
+        let pi = OutboundPacketId::new(1).unwrap();
+        let target = owner.puback_target(key, pi).unwrap();
+        let finish = apply(
+            &mut owner,
+            Input::ObservedPuback {
+                connection: key,
+                packet_id: pi,
+                reason: 0,
+                target: Some(target),
+            },
+        );
+        assert!(matches!(finish[0].1, Effect::Persist { .. }));
+        assert_eq!(
+            owner.puback_target(key, pi),
+            None,
+            "FinishPending has no second eligible ACK target"
+        );
+        assert_eq!(owner.pubsub.active(CONNECTION), 1);
+        let counter = owner.counters.operation;
+        assert!(
+            apply(
+                &mut owner,
+                Input::ObservedPuback {
+                    connection: key,
+                    packet_id: pi,
+                    reason: 0,
+                    target: Some(target)
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(owner.counters.operation, counter);
+        assert_eq!(owner.pubsub.active(CONNECTION), 1);
+        let Effect::Persist { command } = &finish[0].1 else {
+            panic!("finish")
+        };
+        assert!(known(&mut owner, finish[0].0, command).is_empty());
+        assert_eq!(owner.pubsub.active(CONNECTION), 0);
+    }
+
+    #[test]
+    fn an_immutable_target_requires_every_causal_identity_and_the_current_connection() {
+        let mut owner = world();
+        queued(&mut owner, 0);
+        let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command } = &claim[0].1 else {
+            panic!("claim")
+        };
+        let _ = known(&mut owner, claim[0].0, command);
+        let key = ConnectionKey {
+            session: TARGET,
+            generation: CONNECTION,
+        };
+        let pi = OutboundPacketId::new(1).unwrap();
+        let target = owner.puback_target(key, pi).unwrap();
+        let wrong_frame = EffectId {
+            sequence: EffectSeq::new(999),
+            ..target.frame
+        };
+        let cases = [
+            (
+                key,
+                pi,
+                Some(PubackTarget {
+                    delivery: delivery(99),
+                    ..target
+                }),
+            ),
+            (
+                key,
+                pi,
+                Some(PubackTarget {
+                    claim: operation(999),
+                    ..target
+                }),
+            ),
+            (
+                key,
+                pi,
+                Some(PubackTarget {
+                    frame: wrong_frame,
+                    ..target
+                }),
+            ),
+            (key, OutboundPacketId::new(2).unwrap(), Some(target)),
+            (
+                ConnectionKey {
+                    session: SessionId::new(2),
+                    ..key
+                },
+                pi,
+                Some(target),
+            ),
+            (
+                ConnectionKey {
+                    generation: ConnectionGeneration::new(11),
+                    ..key
+                },
+                pi,
+                Some(target),
+            ),
+        ];
+        let counter = owner.counters.operation;
+        for (connection, packet_id, target) in cases {
+            assert!(
+                apply(
+                    &mut owner,
+                    Input::ObservedPuback {
+                        connection,
+                        packet_id,
+                        reason: 0,
+                        target
+                    }
+                )
+                .is_empty()
+            );
+            assert_eq!(owner.counters.operation, counter);
+            assert_eq!(owner.pubsub.active(CONNECTION), 1);
+        }
+        assert_eq!(owner.puback_target(key, pi), Some(target));
+    }
+
+    #[test]
+    fn old_finish_results_and_frame_callbacks_cannot_change_a_reused_slot() {
+        let mut owner = world();
+        queued(&mut owner, 0);
+        let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command } = &claim[0].1 else {
+            panic!("claim A")
+        };
+        let emitted = known(&mut owner, claim[0].0, command);
+        let key = ConnectionKey {
+            session: TARGET,
+            generation: CONNECTION,
+        };
+        let pi = OutboundPacketId::new(1).unwrap();
+        let original = owner.puback_target(key, pi).unwrap();
+        assert_eq!(emitted[0].0, original.frame);
+        let finish = apply(
+            &mut owner,
+            Input::ObservedPuback {
+                connection: key,
+                packet_id: pi,
+                reason: 0,
+                target: Some(original),
+            },
+        );
+        let Effect::Persist { command } = &finish[0].1 else {
+            panic!("finish A")
+        };
+        let _ = known(&mut owner, finish[0].0, command);
+        queued(&mut owner, 1);
+        let claim_b = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command: second } = &claim_b[0].1 else {
+            panic!("claim B")
+        };
+        let _ = known(&mut owner, claim_b[0].0, second);
+        let current = owner.puback_target(key, pi).unwrap();
+        assert_ne!(current.claim, original.claim);
+        assert!(
+            known(&mut owner, finish[0].0, command).is_empty(),
+            "old_finish_released_reused_pi"
+        );
+        assert!(
+            apply(
+                &mut owner,
+                Input::FrameResult {
+                    effect: original.frame,
+                    connection: key,
+                    progress: FrameProgress::Written {
+                        confirmed: 20,
+                        total: 20
+                    }
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(owner.puback_target(key, pi), Some(current));
+        assert_eq!(
+            owner.pubsub.active(CONNECTION),
+            1,
+            "old_callback_returned_current_credit"
+        );
+        assert!(
+            !owner.pubsub.deliveries.as_slice()[0].local_write_completed,
+            "old_callback_rebound: a local callback belongs to its exact frame occurrence"
+        );
+    }
+
+    #[test]
+    fn takeover_keeps_claim_and_number_but_replaces_the_connection_and_emission_target() {
+        let mut owner = world();
+        queued(&mut owner, 0);
+        let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command } = &claim[0].1 else {
+            panic!("claim")
+        };
+        let _ = known(&mut owner, claim[0].0, command);
+        let pi = OutboundPacketId::new(1).unwrap();
+        let old_key = ConnectionKey {
+            session: TARGET,
+            generation: CONNECTION,
+        };
+        let original = owner.puback_target(old_key, pi).unwrap();
+        let replacement = ConnectionGeneration::new(11);
+        let _ = apply(
+            &mut owner,
+            Input::Packet {
+                connection: replacement,
+                ingress_order: 0,
+                packet: InboundPacket::ConnectResume {
+                    client_id: bytes(b"subscriber"),
+                },
+            },
+        );
+        let _ = apply(
+            &mut owner,
+            Input::ConnectionSettings {
+                connection: replacement,
+                receive_maximum: 8,
+                maximum_packet_size: 65536,
+            },
+        );
+        assert_eq!(owner.puback_target(old_key, pi), None);
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(), 2);
+        let replay = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        assert!(
+            matches!(replay[0].1,Effect::EmitPublish {packet_id,claim,dup:true,..} if packet_id==pi && claim==original.claim)
+        );
+        let key = ConnectionKey {
+            session: TARGET,
+            generation: replacement,
+        };
+        let current = owner.puback_target(key, pi).unwrap();
+        assert_eq!(current.delivery, original.delivery);
+        assert_eq!(current.claim, original.claim);
+        assert_ne!(current.frame, original.frame);
+        assert!(
+            apply(
+                &mut owner,
+                Input::ObservedPuback {
+                    connection: old_key,
+                    packet_id: pi,
+                    reason: 0,
+                    target: Some(original)
+                }
+            )
+            .is_empty()
+        );
+        assert!(
+            apply(
+                &mut owner,
+                Input::ObservedPuback {
+                    connection: key,
+                    packet_id: pi,
+                    reason: 0,
+                    target: Some(original)
+                }
+            )
+            .is_empty()
+        );
+        assert!(
+            apply(
+                &mut owner,
+                Input::FrameResult {
+                    effect: original.frame,
+                    connection: old_key,
+                    progress: FrameProgress::Written {
+                        confirmed: 20,
+                        total: 20
+                    }
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(owner.puback_target(key, pi), Some(current));
+        let finish = apply(
+            &mut owner,
+            Input::ObservedPuback {
+                connection: key,
+                packet_id: pi,
+                reason: 0,
+                target: Some(current),
+            },
+        );
+        let Effect::Persist { command } = &finish[0].1 else {
+            panic!("current target finishes")
+        };
+        let _ = known(&mut owner, finish[0].0, command);
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(), 1);
+    }
 }
