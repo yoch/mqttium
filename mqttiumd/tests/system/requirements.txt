@@ -1,0 +1,2 @@
+# Independent external MQTT 5 client for product TCP system reception.
+paho-mqtt==2.1.0
