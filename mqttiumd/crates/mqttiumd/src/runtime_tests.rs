@@ -197,6 +197,7 @@ fn connect_packet(client: &[u8]) -> codec::Connect {
 fn pump(runtime: &mut Runtime<'_>) {
     runtime.writer_results().unwrap();
     runtime.connections().unwrap();
+    runtime.discover_work();
     runtime.drain_inputs().unwrap();
     runtime.dispatch().unwrap();
 }
