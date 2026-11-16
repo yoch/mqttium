@@ -3233,6 +3233,14 @@ bad("product-event-untyped-cause.json", "schema-violation", "/cause",
 bad("product-event-unbounded-detail.json", "schema-violation", "/details/code",
     "Product diagnostics never copy unbounded values.",
     {**product_event, "details": {"code": "x" * 257}})
+for pointer, edit in [
+    ("/seq", {**product_event, "seq": "18446744073709551616"}),
+    ("/connection", {**product_event, "connection": "18446744073709551616"}),
+    ("/operation/sequence", {**product_event, "operation": {
+        "incarnation": "1", "epoch": "1", "owner": "0", "sequence": "18446744073709551616"}}),
+]:
+    bad("product-event-overflow-" + pointer.rsplit("/", 1)[1] + ".json", "u64-out-of-range", pointer,
+        "Product event identities retain the shared 64-bit range.", edit)
 dump(EX / "index.json", env("mqttiumd.example-index", valid=valid, invalid=invalid))
 
 

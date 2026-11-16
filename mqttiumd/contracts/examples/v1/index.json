@@ -1792,6 +1792,24 @@
       "code": "schema-violation",
       "pointer": "/details/code",
       "why": "Product diagnostics never copy unbounded values."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-event-overflow-seq.json",
+      "code": "u64-out-of-range",
+      "pointer": "/seq",
+      "why": "Product event identities retain the shared 64-bit range."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-event-overflow-connection.json",
+      "code": "u64-out-of-range",
+      "pointer": "/connection",
+      "why": "Product event identities retain the shared 64-bit range."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-event-overflow-sequence.json",
+      "code": "u64-out-of-range",
+      "pointer": "/operation/sequence",
+      "why": "Product event identities retain the shared 64-bit range."
     }
   ]
 }
