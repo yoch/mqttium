@@ -20,8 +20,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mqttiumd_contract::capacity::{ExchangeSlots, PayloadBytes, ReceiptSlots, References};
-use mqttiumd_contract::command::Command as StoreCommand;
-use mqttiumd_lab::store::conformance::{World, accounts_match_what_is_held, fixture_limits};
+use mqttiumd_contract::command::{ClaimDelivery, Command as StoreCommand, FrozenRecipe, Recipe};
+use mqttiumd_contract::ids::{DeliveryId, OutboundPacketId, Revision};
+use mqttiumd_contract::packet::SharedBytes;
+use mqttiumd_contract::session::{
+    SessionAction, SessionEndReason, SessionExpiry, SessionGuard, SessionLifecycle,
+};
+use mqttiumd_lab::store::conformance::{
+    World, accounts_match_what_is_held, altered, fixture_limits, operation_id, publication_id,
+};
 use mqttiumd_lab::store::durable::{DurableStore, Limits, MemoryStore};
 use mqttiumd_store_sqlite::SqliteStore;
 use mqttiumd_store_sqlite::kill_points::KillPoint;
@@ -30,6 +37,8 @@ use mqttiumd_store_sqlite::kill_points::KillPoint;
 const CHILD: &str = "MQTTIUMD_KILL_POINT_CHILD";
 /// Set in the environment of the child: the point it stops at.
 const POINT: &str = "MQTTIUMD_KILL_POINT";
+/// Optional bounded session-lifecycle transaction, using the same child topology.
+const SCENARIO: &str = "MQTTIUMD_KILL_SESSION_SCENARIO";
 /// The prefix of the line the child prints when it stands at its point,
 /// followed by the index of the command it stands in.
 const AT: &str = "kill-point-child: at ";
@@ -108,6 +117,62 @@ fn reference() -> World<MemoryStore> {
     world
 }
 
+/// The target is also a producer. Its own marker and claimed destination must
+/// end, while obligations of its publication towards C remain the broker's.
+fn lifecycle_prefix<S: DurableStore>(world: &mut World<S>) {
+    let own = altered(
+        &world.admission(8, 19, b"B-produced-for-C", &[world.c]),
+        |admit| {
+            admit.source.session = world.b;
+            admit.source.exchange.session = world.b;
+        },
+    );
+    assert!(world.store.apply(&own).committed_now);
+    let claim = StoreCommand {
+        recipe: FrozenRecipe::freeze(Recipe::ClaimDelivery(ClaimDelivery {
+            operation: operation_id(world.epoch, 9),
+            delivery: DeliveryId {
+                publication: publication_id(world.epoch, 2),
+                index: 0,
+            },
+            target: world.b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(7).unwrap(),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    assert!(world.store.apply(&claim).committed_now);
+}
+
+fn lifecycle_command<S>(world: &World<S>, scenario: &str) -> StoreCommand {
+    let guard = SessionGuard {
+        session: world.b,
+        opened_by: None,
+    };
+    let action = match scenario {
+        "close" => SessionAction::Close {
+            guard,
+            reason: SessionEndReason::Disconnect,
+        },
+        "replace" => SessionAction::Open {
+            client_id: SharedBytes::copy_from(b"p1-b", 1024).unwrap(),
+            expected: Some(guard),
+            clean_start: true,
+            expiry: SessionExpiry::Never,
+        },
+        _ => panic!("unknown lifecycle scenario"),
+    };
+    StoreCommand {
+        recipe: FrozenRecipe::freeze(Recipe::SessionLifecycle(SessionLifecycle {
+            operation: operation_id(world.epoch, 10),
+            action,
+        }))
+        .unwrap(),
+        payload: None,
+    }
+}
+
 fn point_name(point: KillPoint) -> &'static str {
     match point {
         KillPoint::CommitPrepared => "store.commit.prepared",
@@ -142,6 +207,15 @@ fn kill_point_child() {
     for n in 1..=BEFORE {
         exchange(&mut world, n);
     }
+    let scenario = std::env::var(SCENARIO)
+        .ok()
+        .filter(|value| !value.is_empty());
+    let commands = if let Some(scenario) = &scenario {
+        lifecycle_prefix(&mut world);
+        vec![lifecycle_command(&world, scenario)]
+    } else {
+        commands(&world)
+    };
     let index = Arc::new(AtomicU64::new(0));
     let current = Arc::clone(&index);
     if let Some(point) = store_point {
@@ -154,7 +228,7 @@ fn kill_point_child() {
             })))
             .expect("armed");
     }
-    for (at, command) in commands(&world).iter().enumerate() {
+    for (at, command) in commands.iter().enumerate() {
         index.store(u64::try_from(at).expect("fits"), Ordering::SeqCst);
         let applied = world.store.apply(command);
         if point == "store.commit.applied" {
@@ -185,6 +259,10 @@ impl Holder {
     /// returns once the child stands at `point`, with the index of the
     /// command it stands in.
     fn spawn(path: &Path, point: &str) -> (Self, usize) {
+        Self::spawn_scenario(path, point, "")
+    }
+
+    fn spawn_scenario(path: &Path, point: &str, scenario: &str) -> (Self, usize) {
         let mut child = Command::new(std::env::current_exe().expect("the test binary"))
             .args([
                 "--exact",
@@ -194,6 +272,7 @@ impl Holder {
             ])
             .env(CHILD, path)
             .env(POINT, point)
+            .env(SCENARIO, scenario)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -428,4 +507,85 @@ fn full_state_equality_detects_a_missing_obligation_in_a_sound_sqlite_file() {
 #[test]
 fn a_kill_after_apply_before_result_delivery_recovers_the_whole_command() {
     assert_eq!(killed_at("store.commit.applied", true), 0);
+}
+
+fn killed_lifecycle_at(scenario: &str, point: &str, durable: bool) {
+    let path = fresh_path();
+    let mut expected = reference();
+    lifecycle_prefix(&mut expected);
+    let command = lifecycle_command(&expected, scenario);
+    let before = expected.store.snapshot().unwrap();
+    if durable {
+        assert!(expected.store.apply(&command).committed_now);
+    }
+    let (holder, cut) = Holder::spawn_scenario(&path, point, scenario);
+    assert_eq!(cut, 0, "the lifecycle command itself reaches the hook");
+    let pid = holder.child.id();
+    holder.kill();
+    let mut reopened = SqliteStore::open(&path).expect("same file after confirmed SIGKILL");
+    assert_eq!(reopened.effective_settings().user_version, 5);
+    let found = reopened.snapshot().unwrap();
+    assert_eq!(
+        found,
+        expected.store.snapshot().unwrap(),
+        "lifecycle_atomicity: complete logical state at {scenario}/{point}"
+    );
+    assert_eq!(accounts_match_what_is_held(&found), Ok(()));
+    if durable {
+        assert!(!found.sessions.contains_key(&expected.b));
+        assert_eq!(
+            found.obligations.len(),
+            4,
+            "three original C obligations plus the old producer's C obligation survive"
+        );
+        assert!(
+            found
+                .obligations
+                .values()
+                .all(|row| row.target == expected.c)
+        );
+        assert!(found.outbound.is_empty() && found.inbound.is_empty());
+        assert_eq!(found.accounts.references.get(), 4);
+        assert_eq!(
+            found.sessions.len(),
+            if scenario == "replace" { 3 } else { 2 }
+        );
+    } else {
+        assert_eq!(found, before);
+    }
+    let retried = expected.store.apply(&command);
+    assert_eq!(retried.committed_now, !durable);
+    assert_eq!(reopened.apply(&command), retried);
+    assert_eq!(
+        reopened.snapshot().unwrap(),
+        expected.store.snapshot().unwrap()
+    );
+    println!(
+        "session-lifecycle-kill scenario={scenario} point={point} pid={pid} signal=9 same_file=true full_state=true command_durable={durable}"
+    );
+}
+
+#[test]
+fn session_close_before_commit_keeps_the_complete_previous_state() {
+    killed_lifecycle_at("close", "store.commit.prepared", false);
+}
+#[test]
+fn session_close_logged_commit_cancels_only_its_own_responsibilities() {
+    killed_lifecycle_at("close", "store.commit.logged", true);
+}
+#[test]
+fn session_close_applied_commit_replays_without_another_cancellation() {
+    killed_lifecycle_at("close", "store.commit.applied", true);
+}
+#[test]
+fn session_replace_before_commit_keeps_the_complete_previous_state() {
+    killed_lifecycle_at("replace", "store.commit.prepared", false);
+}
+#[test]
+fn session_replace_logged_commit_has_one_fresh_incarnation() {
+    killed_lifecycle_at("replace", "store.commit.logged", true);
+}
+#[test]
+fn session_replace_applied_commit_cannot_repeat_the_replacement() {
+    killed_lifecycle_at("replace", "store.commit.applied", true);
 }

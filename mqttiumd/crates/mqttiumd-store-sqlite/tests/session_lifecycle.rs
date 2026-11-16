@@ -454,7 +454,21 @@ fn loaded_termination_cancels_only_its_target_and_keeps_shared_payloads() {
         },
         SessionEndReason::Disconnect,
     );
-    let closed = p.apply(&close);
+    let closed = p.sql.store.apply(&close);
+    assert_eq!(closed, p.mem.store.apply(&close));
+    assert_eq!(
+        p.sql
+            .store
+            .snapshot()
+            .unwrap()
+            .obligations
+            .values()
+            .filter(|row| row.target == p.mem.c)
+            .count(),
+        2,
+        "session_other_destination_cancelled: closing B must conserve both responsibilities towards C"
+    );
+    p.state();
     assert_eq!(
         closed.reply,
         StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
@@ -627,6 +641,12 @@ fn invalid_policy_is_reported_before_empty_work_or_recovery_can_hide_it() {
     assert_eq!(store.snapshot(), Err(ReadError::InvalidData));
     assert_eq!(
         store.recover(None, 8),
+        Err(RecoveryRefused::Read(ReadError::InvalidData))
+    );
+    let first = store.recover(None, 3).expect("metadata prefix is coherent");
+    assert!(first.next.is_some());
+    assert_eq!(
+        store.recover(first.next, 8),
         Err(RecoveryRefused::Read(ReadError::InvalidData))
     );
     assert_eq!(

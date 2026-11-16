@@ -1844,7 +1844,6 @@ impl SqliteStore {
         if orphan {
             return Err(Fault::Corrupt);
         }
-        sessions::validate_metadata(conn, meta, None)?;
         let mut out = Vec::new();
         out.try_reserve_exact(count)
             .map_err(|_| ReadError::AllocationFailed)?;
