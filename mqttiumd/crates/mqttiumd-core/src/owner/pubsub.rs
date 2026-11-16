@@ -12,6 +12,7 @@ use crate::contract::pubsub::{
 // Isolated transition mutants. Production builds retain these false values.
 const MUTANT_EARLY_PI_RELEASE: bool = false;
 const MUTANT_IGNORE_OCCUPIED_PI: bool = false;
+const MUTANT_STALE_OUTGOING_FRAME_RESULT: bool = false;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Read {
@@ -1714,7 +1715,11 @@ impl Owner {
             .deliveries
             .as_slice()
             .iter()
-            .position(|d| d.frame == Some((effect, connection)))
+            .position(|d| {
+                d.frame.is_some_and(|(frame, sent)| {
+                    sent == connection && (frame == effect || MUTANT_STALE_OUTGOING_FRAME_RESULT)
+                })
+            })
             .map(|slot| changed(Change::Written { slot }))
     }
 
@@ -2822,6 +2827,8 @@ mod tests {
             known(&mut owner, finish[0].0, command).is_empty(),
             "old_finish_released_reused_pi"
         );
+        let before_callback = owner.pubsub.deliveries.as_slice().to_vec();
+        let before_counters = owner.counters;
         assert!(
             apply(
                 &mut owner,
@@ -2836,6 +2843,12 @@ mod tests {
             )
             .is_empty()
         );
+        assert_eq!(
+            owner.pubsub.deliveries.as_slice(),
+            before_callback.as_slice(),
+            "stale_outgoing_frame_result_applied"
+        );
+        assert_eq!(owner.counters, before_counters);
         assert_eq!(owner.puback_target(key, pi), Some(current));
         assert_eq!(
             owner.pubsub.active(CONNECTION),
