@@ -26,7 +26,7 @@
   guard observation and ordinary deadlines occupying the maintenance reserve.
   Model-only b16c0eb9 has ten exact TLC outcomes, archivecca014ee...8dd401.
 - Final descriptive registry includes deferred Release; current digest is
-  92d4192f1f701224395818686f52caaff59ff6859569c62f8570650bddec5cf9.
+  162a9cd3b9e1f5a623ebcba47f75ac852e1c5c02674867dd74496b03a5e6126d.
   Canonical recipe kinds1..7 remain unchanged. SQLite schema4 refuses1/2/3.
 - Next: receive the clean final command tools/run_receipt_reception.sh, normal/
   instrumented suites sequentially, old product regressions, fresh K1/K2b/K3
@@ -34,3 +34,8 @@
   Final SHA, archive hashes and check identities belong in PR648 and indexes,
   without retrospectively relabeling diagnostics. No merge/ADR acceptance.
   Outgoing Packet Identifier recycling remains the next operational increment.
+
+- Final profile edge: red8cf2cb18 exposed128 legal eight-filter recipes
+  exceeding a1MiB page (1,076,224bytes); API6a61c42e and store8791ff2b use
+  a separate2MiB collection proof budget, preserving ordinary pages/row/quota
+  bounds. Actual both-store normal21/instrumented22 cases and Clippy pass.

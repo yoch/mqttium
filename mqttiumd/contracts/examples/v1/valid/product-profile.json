@@ -55,5 +55,6 @@
   "receipt_control_reserve": 512,
   "receipt_collection_rows": 128,
   "receipt_collection_trigger": 64,
-  "max_receipt_origins": 64
+  "max_receipt_origins": 64,
+  "receipt_collection_bytes": 2097152
 }

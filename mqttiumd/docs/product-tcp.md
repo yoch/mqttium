@@ -335,7 +335,10 @@ progress when ordinary result/input queues or network output are blocked.
 
 The owner closes only a contiguous consumed prefix, with the PublicationSeq
 and PayloadSeq issuance boundaries at that exact position. At most 128 new
-positions and 128 physical rows are handled per pass. A known absolute closure
+positions and 128 physical receipt/fence rows are handled per pass. Prefix
+validation has a separate 2 MiB aggregate/1 MiB field budget, sufficient for
+128 maximum-profile subscription recipes; ordinary work/recovery pages keep
+their original 1 MiB budget. A known absolute closure
 returns issuance capacity once; repeated/lost replies never grant credits twice.
 The usual trigger is 64 consumed results. Hole-blocked or empty producers do
 not spin. A deferred fenced Release can consume its terminal result at a full

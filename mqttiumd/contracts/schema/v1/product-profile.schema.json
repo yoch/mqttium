@@ -49,7 +49,8 @@
     "receipt_control_reserve",
     "receipt_collection_rows",
     "receipt_collection_trigger",
-    "max_receipt_origins"
+    "max_receipt_origins",
+    "receipt_collection_bytes"
   ],
   "properties": {
     "format": {
@@ -202,6 +203,11 @@
     },
     "max_receipt_origins": {
       "const": 64
+    },
+    "receipt_collection_bytes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
     }
   }
 }

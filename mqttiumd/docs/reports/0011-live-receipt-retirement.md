@@ -126,7 +126,7 @@ control. Bounded snapshots/recovery add ReceiptFrontier; logically retired
 history is unavailable, never a false certain rejection. The existing fixture
 oracle refuses qualification of positive live-retirement scopes. Contract
 digest changes from 6d1a0045c03e2d85f8bd89bc2759e4f6974a226e8184a3d2bc95ae0a6c3042c7
-to 92d4192f1f701224395818686f52caaff59ff6859569c62f8570650bddec5cf9.
+to 162a9cd3b9e1f5a623ebcba47f75ac852e1c5c02674867dd74496b03a5e6126d.
 SQLite schema 4 refuses 1/2/3 before write-affecting pragmas, preserving main/WAL
 bytes; no implicit migration/reset.
 
@@ -135,7 +135,10 @@ positions, 512 reserved physical receipt slots, 128 new positions/removed rows p
 pass, 64 origins, 64-result trigger and 4-slot maintenance lanes. At 32 old origins
 or 4096 receipts startup sweeps closed scopes in bounded passes. One-time legacy
 registration compatibility uses the existing 65536-row/32 MiB snapshot budget;
-normal product origins register fresh/empty. Event retention is 16 MiB active plus
+normal product origins register fresh/empty. Prefix proof reads use a separate
+2 MiB aggregate/1 MiB field budget: both stores now accept the legal
+1,076,224-byte/128-recipe maximum-profile case, while ordinary pages remain
+1 MiB and oversized fields still fail with LimitExceeded. Event retention is 16 MiB active plus
 one 16 MiB previous segment. Typed reads and checked arithmetic remain required.
 
 ```bash

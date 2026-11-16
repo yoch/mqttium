@@ -75,3 +75,8 @@ Outgoing QoS 1 Packet Identifiers, finite session/epoch identities, storage
 availability and other profile limits remain. The new reception is system-test
 evidence; K1/K2b/K3 retain their own qualification. A focused finite model covers
 closure/gaps/identity guards and their assumptions, not full MQTT liveness.
+
+Collection proof reads have a separate 2 MiB aggregate/1 MiB field budget.
+128 valid eight-filter/1024-byte subscription recipes exceed the ordinary
+1 MiB page budget; a test-first correction handles that legal profile without
+widening work/recovery pages, increasing receipt quota or removing row bounds.
