@@ -7,16 +7,24 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use mqttiumd_contract::capacity::References;
+use mqttiumd_contract::capacity::{BoundedVec, References};
+use mqttiumd_contract::command::{
+    ChangeSubscriptions, ClaimDelivery, Command, FinishDelivery, FrozenRecipe, Recipe,
+};
 use mqttiumd_contract::effects::{Effect, EffectSink, OwnedEffect, SubmitResult};
 use mqttiumd_contract::ids::{
-    EffectId, EffectSeq, LogicalOwnerId, OperationId, Revision, StoreIncarnation,
+    DeliveryId, EffectId, EffectSeq, LogicalOwnerId, OperationId, OutboundPacketId, Revision,
+    StoreIncarnation,
 };
+use mqttiumd_contract::packet::SharedBytes;
+use mqttiumd_contract::pubsub::SubscriptionChange;
 use mqttiumd_lab::store::adapter::{
     AdapterLimits, Answer, FaultAction, FaultPoint, FaultSpec, Performed, SimStore, StoreAction,
     StoreEvent, WorkId, WorkKind, startup_nonce,
 };
-use mqttiumd_lab::store::conformance::{World, altered, fixture_limits, operation_id};
+use mqttiumd_lab::store::conformance::{
+    World, altered, fixture_limits, operation_id, publication_id,
+};
 use mqttiumd_lab::store::durable::{AdminCommand, DurableStore, Limits, MemoryStore};
 use mqttiumd_lab::store::evidence::{
     Cause, CauseRefused, SnapshotContext, TraceWriter, outcome_fields, recovered_fact, snapshot,
@@ -86,6 +94,7 @@ fn a_snapshot_after_a_commit_is_the_example_of_the_corpus() {
         "publications",
         "obligations",
         "inbound_exchanges",
+        "outbound",
         "account",
     ] {
         assert_eq!(written[member], expected[member], "{member}");
@@ -108,6 +117,100 @@ fn a_snapshot_after_a_commit_is_the_example_of_the_corpus() {
         );
     }
     assert!(written["meta"]["opened_by"]["startup_hex"].is_string());
+}
+
+/// New product rows retain the exact durable identities that their public
+/// canonical examples describe; schema acceptance alone would not check this.
+#[test]
+fn outgoing_claim_and_finish_snapshots_match_the_canonical_examples() {
+    let mut limits = fixture_limits();
+    limits.max_route_targets = 8;
+    let mut world = World::with_limits(&memory, limits);
+    let admission = world.admission(1, 7, b"payload", &[world.b, world.c]);
+    assert!(world.store.apply(&admission).committed_now);
+    let delivery = DeliveryId {
+        publication: publication_id(world.epoch, 1),
+        index: 0,
+    };
+    let packet_id = OutboundPacketId::new(5).unwrap();
+    let claim = operation_id(world.epoch, 21);
+    let commands = [
+        (
+            Recipe::ClaimDelivery(ClaimDelivery {
+                operation: claim,
+                delivery,
+                target: world.b,
+                target_revision: Revision::new(1),
+                packet_id,
+            }),
+            "store-snapshot-delivery-claim-receipt.json",
+        ),
+        (
+            Recipe::FinishDelivery(FinishDelivery {
+                operation: operation_id(world.epoch, 22),
+                delivery,
+                target: world.b,
+                target_revision: Revision::new(1),
+                packet_id,
+                claim,
+            }),
+            "store-snapshot-delivery-finish-receipt.json",
+        ),
+    ];
+    let workspace = workspace();
+    for (recipe, name) in commands {
+        let command = Command {
+            recipe: FrozenRecipe::freeze(recipe).unwrap(),
+            payload: None,
+        };
+        assert!(world.store.apply(&command).committed_now);
+        let written = snapshot(&world.store.snapshot().unwrap(), CONTEXT);
+        accepted(&workspace, &written);
+        let expected = example(name);
+        for member in [
+            "operations",
+            "outbound",
+            "obligations",
+            "payloads",
+            "account",
+        ] {
+            assert_eq!(written[member], expected[member], "{name}/{member}");
+        }
+    }
+}
+
+#[test]
+fn subscription_commit_facts_preserve_session_and_route_revision() {
+    let mut limits = fixture_limits();
+    limits.max_route_targets = 8;
+    let mut world = World::with_limits(&memory, limits);
+    let admission = world.admission(1, 7, b"payload", &[world.b, world.c]);
+    assert!(world.store.apply(&admission).committed_now);
+    let mut changes = BoundedVec::with_capacity(1).unwrap();
+    changes
+        .try_push(SubscriptionChange {
+            topic: SharedBytes::copy_from(b"p1/example", 256).unwrap(),
+            subscribe: true,
+        })
+        .unwrap();
+    let command = Command {
+        recipe: FrozenRecipe::freeze(Recipe::ChangeSubscriptions(ChangeSubscriptions {
+            operation: operation_id(world.epoch, 20),
+            session: world.b,
+            session_revision: Revision::new(1),
+            route_revision: world.route_revision,
+            changes,
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    assert!(world.store.apply(&command).committed_now);
+    let written = snapshot(&world.store.snapshot().unwrap(), CONTEXT);
+    accepted(&workspace(), &written);
+    let expected = example("store-snapshot-subscription-receipt.json");
+    for member in ["operations", "route_table", "account", "outbound"] {
+        assert_eq!(written[member], expected[member], "{member}");
+    }
 }
 
 /// Every kind of row: a commit, a capacity rejection with its resource,
