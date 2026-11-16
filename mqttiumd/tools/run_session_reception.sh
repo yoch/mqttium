@@ -107,37 +107,64 @@ session_run() {
         "${session_command[@]}" >"$session_out/$session_name.log" 2>&1
     fi
 }
+session_run faults faults "$session_out/binaries/mqttiumd-hooks"
+session_record core-negative-controls "$session_python" tools/run_session_core_controls.py "$session_out/core-controls" --target-dir "$session_targets/core-controls"
+"$session_python" tools/run_session_core_controls.py "$session_out/core-controls" --target-dir "$session_targets/core-controls" >"$session_out/core-controls.log" 2>&1
+session_record store-negative-controls "$session_python" tools/run_session_store_controls.py "$session_out/store-controls"
+"$session_python" tools/run_session_store_controls.py "$session_out/store-controls" >"$session_out/store-controls.log" 2>&1
 session_run normal nominal
 "$session_python" - "$session_out" "$session_sha" "${#session_trace[@]}" <<'PY'
 from pathlib import Path
 import hashlib,json,sys
 out=Path(sys.argv[1]);result=json.loads((out/'normal/receipt.json').read_text())
-if result['status']!='PASS' or result['source_head']!=sys.argv[2] or result['harness_source_head']!=sys.argv[2]:
-    raise SystemExit('normal session reception source/verdict differs')
+faults=json.loads((out/'faults/receipt.json').read_text())
+for name,receipt in [('normal',result),('faults',faults)]:
+    if receipt['status']!='PASS' or receipt['source_head']!=sys.argv[2] or receipt['harness_source_head']!=sys.argv[2]:
+        raise SystemExit(f'{name} session reception source/verdict differs')
+    binary=receipt['binary']
+    if hashlib.sha256(Path(binary['path']).read_bytes()).hexdigest()!=binary['sha256']:
+        raise SystemExit(f'{name} retained and executed binary differs')
 by_criterion={item['criterion']:item for item in result['cases']}
 if set(by_criterion)!=set('ABCD'):
     raise SystemExit('normal session criteria missing')
+fault_criteria={item['criterion']:item for item in faults['cases']}
+if set(fault_criteria)!=set('EF'):
+    raise SystemExit('authentic unknown results or product crash criteria missing')
 cycles=by_criterion['B']
 if cycles['completed_cycles']<512 or not cycles['long_requirement_met'] or cycles['session_quota']!=128:
     raise SystemExit('512 complete sessions with unchanged quota required')
-binary=result['binary']
-if hashlib.sha256(Path(binary['path']).read_bytes()).hexdigest()!=binary['sha256']:
-    raise SystemExit('retained and executed binary differs')
+core=json.loads((out/'core-controls/result.json').read_text())
+store=json.loads((out/'store-controls/result.json').read_text())
+core_reasons={'session_capacity_released_before_close_commit','old_session_close_rebound'}
+store_reasons={'session_terminal_history_grew','session_other_destination_cancelled'}
+if (core['source_revision']!=sys.argv[2] or not core['passed'] or not core['source_restored']
+        or {item['expected_reason'] for item in core['mutants']}!=core_reasons
+        or not all(item['detected'] for item in core['mutants'])):
+    raise SystemExit('compiled core negative controls not detected exactly')
+if (store['source_sha']!=sys.argv[2] or not store['original_checkout_unchanged']
+        or {item['expected_reason'] for item in store['controls']}!=store_reasons
+        or not all(item['detected'] and item['compiled_and_executed'] for item in store['controls'])):
+    raise SystemExit('compiled store negative controls not detected exactly')
 index={'format':'mqttiumd.session-system-reception-index','schema_version':1,
        'status':'PASS','qualification':'system-test-only','source_head':sys.argv[2],
-       'scope':['A-public-matrix','B-512-cycles','C-128-capacity','D-targeted-cancellation'],
-       'complete_mission_scope':False,
+       'scope':['A-public-matrix','B-512-cycles','C-128-capacity','D-targeted-cancellation',
+                'E-authentic-unknown-results-and-old-events','F-product-SIGKILL','G-four-compiled-mutations'],
+       'complete_mission_scope':True,
        'source_pin':json.loads((out/'source-pin.json').read_text()),
        'source_archive':{'path':'source.tar','sha256':hashlib.sha256((out/'source.tar').read_bytes()).hexdigest()},
        'system_witnesses':'same-run-strace' if int(sys.argv[3]) else 'process-status-only',
-       'normal':{'receipt':'normal/receipt.json','binary':binary,'cycles':cycles['completed_cycles'],
+       'normal':{'receipt':'normal/receipt.json','binary':result['binary'],'cycles':cycles['completed_cycles'],
                  'same_main_pid':cycles['same_main_pid'],'same_sqlite_inode':cycles['same_sqlite_inode']},
-       'limitations':['Nominal A-D system evidence only; E/F/G must be received separately before full lifecycle acceptance.',
-                      'Local DISCONNECT completion alone is not a broker cleanup fact.']}
+       'faults':{'receipt':'faults/receipt.json','binary':faults['binary']},
+       'negative_controls':{'core':{'result':'core-controls/result.json','reasons':sorted(core_reasons)},
+                            'store':{'result':'store-controls/result.json','reasons':sorted(store_reasons)}},
+       'limitations':['Finite system and compiled transition/store evidence; no automatic independent-oracle qualification.',
+                      'Local DISCONNECT completion alone is not a broker cleanup fact.',
+                      'Intermediate finite expirations remain outside the product profile.']}
 (out/'index.json').write_text(json.dumps(index,indent=2,sort_keys=True)+'\n')
 files=sorted(path for path in out.rglob('*') if path.is_file())
 (out/'SHA256SUMS').write_text(''.join(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(out)}\n' for path in files))
-print(json.dumps({'status':'PASS','scope':'nominal-A-D-only','source_head':sys.argv[2],'index':str(out/'index.json')}))
+print(json.dumps({'status':'PASS','scope':'session-lifecycle-A-G','source_head':sys.argv[2],'index':str(out/'index.json')}))
 PY
 tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
     -czf "$session_out.tar.gz" -C "$(dirname -- "$session_out")" "$(basename -- "$session_out")"

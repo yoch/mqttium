@@ -826,11 +826,13 @@ async def uncertain_lifecycle(binary, case):
                 'session_close_resolution_changed_identity')
         rows.append({'case': 'unknown-close', 'before': old, 'held': held,
                      'sql_while_unknown': state, 'unknown_resolution': resolved, 'known': known})
+        takeover = await takeover_and_old_events(broker, cursor)
         independent.session_disconnect(0);independent = None
         final = await gone(broker, cursor, 'unknown-independent')
         assert_drained(final)
         broker.stop()
         return {'criterion': 'E', 'status': 'PASS', 'startup': startup, 'cases': rows,
+                'takeovers_and_old_events': takeover,
                 'final_sql': final, 'clients': [c.result for c in clients],
                 'stop_status': broker.process.returncode}
     finally:
@@ -843,6 +845,87 @@ async def uncertain_lifecycle(binary, case):
         for client in clients:
             if not client.closed:
                 await client.disconnect()
+
+
+async def takeover_and_old_events(broker, cursor):
+    """Real socket takeovers plus copies captured at the actual runtime guards."""
+    rows = []
+    for index, (old_expiry, clean, new_expiry, present, same) in enumerate((
+            (INFINITE, False, INFINITE, True, True),
+            (INFINITE, True, INFINITE, False, False),
+            (0, False, INFINITE, False, False),
+            (INFINITE, False, 0, True, True))):
+        name = f'takeover-{index}'
+        old = replacement = None
+        try:
+            if index in (0, 1):
+                (broker.control / 'capture-next-session-change').touch(exist_ok=False)
+            cursor.read();before = cursor.last
+            old = SessionWire(broker.address, broker.observations, name + '-old')
+            old.session_connect(name, expiry=old_expiry, expected_present=False)
+            original = session_row(session_snapshot(broker), name)
+            old_open = await fact(broker, cursor, 'session_changed', after=before,
+                                  predicate=lambda e: e.get('details', {}).get('action') == 'Opened'
+                                  and e['details'].get('session') == str(identity(original)))
+            if index in (0, 1):
+                captured_change = await fact(broker, cursor, 'session_change_copied', after=before)
+                require(captured_change['operation'] == old_open['operation'],
+                        'session_change_not_captured_at_real_effect')
+                (broker.control / 'capture-next-session-close').touch(exist_ok=False)
+            cursor.read();before_takeover = cursor.last
+            replacement = SessionWire(broker.address, broker.observations, name + '-new')
+            replacement.session_connect(name, clean_start=clean, expiry=new_expiry,
+                                         expected_present=present)
+            disconnect = old.wait(0xE0)
+            require(disconnect.body and disconnect.body[0] == 0x8E, 'takeover_reason_wrong')
+            current = session_row(session_snapshot(broker), name)
+            require((current['id'] == original['id']) == same, 'takeover_session_identity_wrong')
+            policy(current, new_expiry)
+            known = await fact(broker, cursor, 'session_changed', after=before_takeover,
+                               predicate=lambda e: e.get('details', {}).get('action') == 'Opened'
+                               and e['details'].get('session') == str(identity(current)))
+            closed = await fact(broker, cursor, 'connection_closed', after=before_takeover,
+                                predicate=lambda e: e.get('connection') == old_open['connection'])
+            require(int(closed['seq']) < int(known['seq']), 'takeover_open_preceded_old_close')
+            replay = None
+            if index in (0, 1):
+                copied_close = await fact(broker, cursor, 'session_close_copied', after=before_takeover)
+                require(copied_close['connection'] == old_open['connection']
+                        and copied_close['details']['session'] == str(identity(original))
+                        and copied_close['operation'] == old_open['operation'],
+                        'session_close_lost_original_transport_identity')
+                cursor.read();before_replay = cursor.last
+                (broker.control / 'replay-session-close').touch(exist_ok=False)
+                (broker.control / 'replay-session-change').touch(exist_ok=False)
+                replayed_close = await fact(broker, cursor, 'session_close_replayed', after=before_replay)
+                replayed_change = await fact(broker, cursor, 'session_change_replayed', after=before_replay)
+                ignored = await fact(broker, cursor, 'session_change_ignored', after=before_replay,
+                                     predicate=lambda e: e.get('operation') == old_open['operation'])
+                require(ignored['details']['code'] == 'stale_lifecycle_result',
+                        'stale_session_change_rebound')
+                require(replayed_change['operation'] == captured_change['operation']
+                        and replayed_close['connection'] == copied_close['connection'],
+                        'old_session_fact_recorrelated')
+                replay = {'captured_change': captured_change, 'captured_close': copied_close,
+                          'replayed_change': replayed_change, 'replayed_close': replayed_close,
+                          'ignored_change': ignored}
+            replacement.send(b'\xc0\x00')
+            require(replacement.wait(0xD0).body == b'', 'old_close_ended_new_incarnation')
+            stable = session_row(session_snapshot(broker), name)
+            require(stable['id'] == current['id'] and stable['opened_by'] == current['opened_by'],
+                    'stale_session_change_rebound')
+            replacement.session_disconnect(0);replacement = None
+            await gone(broker, cursor, name)
+            rows.append({'case': name, 'clean_start': clean, 'old_expiry': old_expiry,
+                         'new_expiry': new_expiry, 'expected_session_present': present,
+                         'original': original, 'current': current, 'old_transport_closed': closed,
+                         'known_new_attachment': known, 'old_wire_disconnect': disconnect.body.hex(),
+                         'replayed_internal_copies': replay})
+        finally:
+            for wire in (old, replacement):
+                if wire is not None:
+                    wire.close()
+    return rows
 
 
 async def lifecycle_crashes(binary, case):
