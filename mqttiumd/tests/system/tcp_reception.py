@@ -120,33 +120,42 @@ def paho(binary: Path, case: Path) -> dict:
     try:
         ready = broker.ready()
         receipts = []
-        for index in range(2):
-            command = [sys.executable, str(Path(__file__).with_name("external_paho.py")),
+        clients = (("mqttium", "external-mqttium", False, True),
+                   ("mqttium", "external-mqttium", True, True),
+                   ("paho", "external-paho", False, True),
+                   ("paho", "external-paho", True, False))
+        for index, (name, client_id, present, publishes) in enumerate(clients):
+            command = [sys.executable, str(Path(__file__).with_name(f"external_{name}.py")),
                        "--host", broker.address[0], "--port", str(broker.address[1]),
-                       "--client-id", "external-paho"]
-            if index:
+                       "--client-id", client_id]
+            if name == "mqttium":
+                command += ["--qos", "2", "--expected-session-present", str(int(present))]
+            if not publishes:
                 command.append("--connect-only")
             result = subprocess.run(command, capture_output=True, text=True, timeout=15)
-            (case / f"paho-{index}.stderr").write_text(result.stderr)
+            (case / f"{name}-{index}.stderr").write_text(result.stderr)
             require(result.returncode == 0, "external_client_failed", result.stderr[-512:])
             receipt = json.loads(result.stdout)
-            write_json(case / f"paho-{index}.json", receipt)
-            require(receipt["session_present"] == bool(index), "wrong_session_present")
-            if index == 0:
-                require(any(event["kind"] == "qos2_completed" for event in receipt["events"]), "external_not_completed")
+            write_json(case / f"{name}-{index}.json", receipt)
+            require(receipt["session_present"] == present, "wrong_session_present")
+            if publishes:
+                completed = any(event["kind"] == "qos2_completed" or
+                                (event["kind"] == "receipt_success" and event.get("qos") == 2)
+                                for event in receipt["events"])
+                require(completed, "external_not_completed")
             receipts.append({"command": command, "result": receipt})
         state = database(broker.db)
         write_json(case / "durable.json", state)
-        require(state["counts"]["sessions"] == 1, "session_not_created_once")
-        require(len(state["admissions"]) == 1 and len(state["releases"]) == 1, "exchange_not_committed")
+        require(state["counts"]["sessions"] == 2, "session_not_created_once")
+        require(len(state["admissions"]) == 3 and len(state["releases"]) == 3, "exchange_not_committed")
         require(all(state["counts"][name] == 0 for name in ("inbound", "publications", "payloads", "obligations")),
                 "publication_retained_after_normal_cycle")
         established = [event for event in broker.events() if event["kind"] == "session_established"]
-        require(len(established) == 2 and [event["details"]["session_present"] for event in established] == [False, True],
+        require(len(established) == 4 and [event["details"]["session_present"] for event in established] == [False, True, False, True],
                 "session_establishment_observation")
         acknowledgements = [event for event in broker.events() if event["kind"] == "frame_queued"
                             and event.get("details", {}).get("packet_kind") == "CONNACK"]
-        require(len(acknowledgements) == 2 and all(int(e["seq"]) < int(a["seq"])
+        require(len(acknowledgements) == 4 and all(int(e["seq"]) < int(a["seq"])
                 for e, a in zip(established, acknowledgements)), "connack_before_session_confirmation")
         broker.stop()
         return {"criterion": "A", "status": "PASS", "ready": ready,
