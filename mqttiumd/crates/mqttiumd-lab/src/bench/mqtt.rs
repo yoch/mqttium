@@ -16,6 +16,7 @@ pub enum Kind {
     Pubrec,
     Pubrel,
     Pubcomp,
+    Pingresp,
 }
 
 impl Kind {
@@ -29,6 +30,7 @@ impl Kind {
             Self::Pubrec => "PUBREC",
             Self::Pubrel => "PUBREL",
             Self::Pubcomp => "PUBCOMP",
+            Self::Pingresp => "PINGRESP",
         }
     }
 
@@ -42,6 +44,7 @@ impl Kind {
             Self::Pubrec,
             Self::Pubrel,
             Self::Pubcomp,
+            Self::Pingresp,
         ]
         .into_iter()
         .find(|kind| kind.name() == name)
@@ -339,6 +342,7 @@ pub mod transport {
     /// The bytes of a frame: the short form when the reason is Success.
     pub fn encode(frame: OutboundFrame) -> Result<Vec<u8>, &'static str> {
         match frame {
+            OutboundFrame::Pingresp => packet(0xd0, &[]),
             OutboundFrame::Connack { session_present } => {
                 packet(0x20, &[u8::from(session_present), 0x00, 0x00])
             }
@@ -363,6 +367,7 @@ pub mod transport {
     #[must_use]
     pub fn describe(frame: OutboundFrame) -> (Kind, Option<u16>) {
         match frame {
+            OutboundFrame::Pingresp => (Kind::Pingresp, None),
             OutboundFrame::Connack { .. } => (Kind::Connack, None),
             OutboundFrame::Pubrec { packet_id, .. } => (Kind::Pubrec, Some(packet_id.get())),
             OutboundFrame::Pubcomp { packet_id, .. } => (Kind::Pubcomp, Some(packet_id.get())),

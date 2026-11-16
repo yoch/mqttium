@@ -967,6 +967,8 @@ impl Owner {
             };
         }
         match input {
+            // Product lifecycle inputs are implemented by the TCP core lot.
+            Input::SessionEstablished { .. } | Input::ConnectionClosed { .. } => Err(IMPOSSIBLE),
             Input::Recovery { .. } | Input::Continue { .. } => Err(IMPOSSIBLE),
             // A wake-up carries no authority, and this perimeter keeps no
             // work behind one.
@@ -1073,7 +1075,7 @@ impl Owner {
             generation: connection,
         };
         match packet {
-            InboundPacket::ConnectResume { .. } => Err(IMPOSSIBLE),
+            InboundPacket::ConnectResume { .. } | InboundPacket::Pingreq => Err(IMPOSSIBLE),
             InboundPacket::Publish {
                 topic,
                 qos,
@@ -2223,6 +2225,7 @@ mod tests {
             Effect::ArmDeadline { .. } => "ArmDeadline",
             Effect::Continue { .. } => "Continue",
             Effect::EmitFrame { frame, .. } => match frame {
+                OutboundFrame::Pingresp => "EmitPingresp",
                 OutboundFrame::Connack { .. } => "EmitConnack",
                 OutboundFrame::Pubrec {
                     reason: AckReason::Success,

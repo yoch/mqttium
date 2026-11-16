@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/mqttiumd",
     "crates/mqttiumd-contract",
     "crates/mqttiumd-core",
     "crates/mqttiumd-lab",

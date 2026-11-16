@@ -105,6 +105,8 @@ pub enum InboundPacket {
     },
     /// PUBREL of an inbound QoS 2 exchange.
     Pubrel { packet_id: InboundPacketId },
+    /// A validated MQTT PINGREQ, without a body.
+    Pingreq,
 }
 
 /// Outcome carried by a PUBREC or PUBCOMP of the subset.
@@ -148,6 +150,8 @@ impl AckReason {
 /// client's Packet Identifier space.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OutboundFrame {
+    /// Response to a validated PINGREQ on a connected session.
+    Pingresp,
     Connack {
         session_present: bool,
     },

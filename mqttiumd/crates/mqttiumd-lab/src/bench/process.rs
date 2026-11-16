@@ -187,7 +187,7 @@ fn opening_reply_json(reply: &OpeningReply) -> Value {
 fn ack_reason(frame: OutboundFrame) -> Option<&'static str> {
     use mqttiumd_contract::packet::AckReason;
     let reason = match frame {
-        OutboundFrame::Connack { .. } => return None,
+        OutboundFrame::Connack { .. } | OutboundFrame::Pingresp => return None,
         OutboundFrame::Pubrec { reason, .. } | OutboundFrame::Pubcomp { reason, .. } => reason,
     };
     Some(match reason {

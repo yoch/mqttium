@@ -198,6 +198,18 @@ pub enum FrameProgress {
 /// It is moved, never copied: a step either consumes it or hands it back.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Input {
+    /// A session fact confirmed by the exclusive durable writer, outside
+    /// recovery. The adapter correlates its request before constructing it.
+    /// `None` installs a late result without binding a closed connection.
+    SessionEstablished {
+        connection: Option<ConnectionGeneration>,
+        session: SessionId,
+        client_id: SharedBytes,
+        revision: Revision,
+        session_present: bool,
+    },
+    /// The transport permanently closed this non-reused generation.
+    ConnectionClosed { connection: ConnectionGeneration },
     /// A validated packet, its connection and its ingress order.
     Packet {
         connection: ConnectionGeneration,
