@@ -2283,6 +2283,9 @@ pub fn recovery_field_limits_include_fixed_identities<S: DurableStore>(
 pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     subscriptions_replace_and_remove_without_duplicate_or_hole(make);
     qos1_claim_and_finish_are_conditional_and_idempotent(make);
+    outgoing_work_is_bounded_and_independent_of_notifications(make);
+    outgoing_capacity_and_filter_guards_are_atomic(make);
+    deleting_a_claimed_target_releases_only_its_resources(make);
     opening_opens_the_next_epoch_and_closes_the_older_ones(make);
     an_opening_that_expected_another_epoch_opens_nothing(make);
     an_opening_delivered_again_returns_its_commit(make);
@@ -2530,4 +2533,265 @@ pub fn qos1_claim_and_finish_are_conditional_and_idempotent<S: DurableStore>(
             RejectReason::PreconditionFailed
         ))
     );
+}
+
+/// A live work scan needs no notification, copies no more than its budget, and
+/// reconstructs queued and claimed identities from committed facts alone.
+pub fn outgoing_work_is_bounded_and_independent_of_notifications<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::command::ClaimDelivery;
+    use mqttiumd_contract::ids::OutboundPacketId;
+    use mqttiumd_contract::pubsub::DeliveryClaim;
+    let mut limits = fixture_limits();
+    limits.receipt_slots = ReceiptSlots::new(32);
+    let mut world = World::with_limits(make, limits);
+    for sequence in 1..=9 {
+        let command = altered(
+            &world.admission(sequence, 7, b"payload", &[world.b]),
+            |admit| {
+                admit.qos = Qos::AtLeastOnce;
+                admit.costs.exchange_slots = ExchangeSlots::ZERO;
+            },
+        );
+        assert!(world.store.apply(&command).committed_now);
+    }
+    let first_delivery = DeliveryId {
+        publication: publication_id(world.epoch, 1),
+        index: 0,
+    };
+    let claim = DeliveryClaim {
+        operation: operation_id(world.epoch, 20),
+        packet_id: OutboundPacketId::new(7).unwrap(),
+    };
+    let command = Command {
+        recipe: FrozenRecipe::freeze(Recipe::ClaimDelivery(ClaimDelivery {
+            operation: claim.operation,
+            delivery: first_delivery,
+            target: world.b,
+            target_revision: Revision::new(1),
+            packet_id: claim.packet_id,
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    assert!(world.store.apply(&command).committed_now);
+    let before = world.store.snapshot().unwrap();
+    let page = world.store.read_work(world.b, None, 8).unwrap();
+    assert_eq!(page.items.len(), 8);
+    let first = &page.items.as_slice()[0];
+    assert_eq!(first.delivery, first_delivery);
+    assert_eq!(first.claim, Some(claim));
+    assert_eq!(first.target, world.b);
+    assert_eq!(first.target_revision, Revision::new(1));
+    assert_eq!(first.topic.as_slice(), TOPIC);
+    assert_eq!(first.payload.as_slice(), b"payload");
+    for (rank, item) in page.items.as_slice().iter().enumerate() {
+        assert_eq!(
+            item.delivery.publication,
+            publication_id(world.epoch, (rank + 1) as u64)
+        );
+        assert_eq!(item.claim.is_some(), rank == 0);
+    }
+    assert_eq!(page.next, Some(page.items.as_slice()[7].delivery));
+    let last = world.store.read_work(world.b, page.next, 8).unwrap();
+    assert_eq!(last.items.len(), 1);
+    assert_eq!(
+        last.items.as_slice()[0].delivery.publication,
+        publication_id(world.epoch, 9)
+    );
+    assert!(last.next.is_none());
+    assert!(
+        world
+            .store
+            .read_work(world.c, None, 8)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    for limit in [0, 9, usize::MAX] {
+        assert_eq!(
+            world.store.read_work(world.b, None, limit),
+            Err(ReadError::LimitExceeded)
+        );
+    }
+    for budget in [
+        ReadBudget {
+            max_rows: 0,
+            ..ReadBudget::PAGE
+        },
+        ReadBudget {
+            max_bytes: 1,
+            ..ReadBudget::PAGE
+        },
+        ReadBudget {
+            max_field_bytes: 6,
+            ..ReadBudget::PAGE
+        },
+    ] {
+        assert_eq!(
+            world.store.read_work_with_budget(world.b, None, 8, budget),
+            Err(ReadError::LimitExceeded)
+        );
+    }
+    assert_eq!(
+        world.store.snapshot().unwrap(),
+        before,
+        "failed reads do not claim or discard durable work"
+    );
+    assert_eq!(accounts_match_what_is_held(&before), Ok(()));
+    world.epoch = open(&mut world.store);
+    let recovery = world.store.recover(None, 64).unwrap();
+    let recovered: Vec<_> = recovery
+        .facts
+        .as_slice()
+        .iter()
+        .filter_map(|fact| match fact {
+            RecoveredFact::OutboundDelivery {
+                delivery,
+                target,
+                target_revision,
+                claim,
+            } => Some((*delivery, *target, *target_revision, *claim)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(recovered.len(), 9);
+    assert_eq!(
+        recovered[0],
+        (first_delivery, world.b, Revision::new(1), Some(claim))
+    );
+    assert_eq!(
+        world
+            .store
+            .read_work(world.b, None, 8)
+            .unwrap()
+            .items
+            .as_slice()[0]
+            .claim,
+        Some(claim)
+    );
+}
+
+/// Subscription and slot capacity guards are atomic. A failed batch cannot
+/// leave an earlier filter installed, and a rejected claim owns no slot.
+pub fn outgoing_capacity_and_filter_guards_are_atomic<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::command::{ChangeSubscriptions, ClaimDelivery};
+    use mqttiumd_contract::ids::OutboundPacketId;
+    use mqttiumd_contract::pubsub::SubscriptionChange;
+    let mut limits = fixture_limits();
+    limits.exchange_slots = ExchangeSlots::new(1);
+    limits.max_route_targets = 2;
+    let mut world = World::with_limits(make, limits);
+    let changed = Command {
+        recipe: FrozenRecipe::freeze(Recipe::ChangeSubscriptions(ChangeSubscriptions {
+            operation: operation_id(world.epoch, 1),
+            session: world.producer,
+            session_revision: Revision::new(1),
+            route_revision: world.route_revision,
+            changes: BoundedVec::from_slice(
+                &[
+                    SubscriptionChange {
+                        topic: SharedBytes::copy_from(b"new/filter", 256).unwrap(),
+                        subscribe: true,
+                    },
+                    SubscriptionChange {
+                        topic: SharedBytes::copy_from(TOPIC, 256).unwrap(),
+                        subscribe: true,
+                    },
+                ],
+                8,
+            )
+            .unwrap(),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    let before = world.store.snapshot().unwrap();
+    assert_eq!(
+        outcome(world.store.apply(&changed).reply),
+        StoreOutcome::RejectedCertain(RejectReason::CapacityExceeded(Resource::References))
+    );
+    let refused = world.store.snapshot().unwrap();
+    assert_eq!(refused.routes, before.routes);
+    assert_eq!(refused.route_revision, before.route_revision);
+    let admission = world.admission(2, 7, b"payload", &[world.b]);
+    assert!(world.store.apply(&admission).committed_now);
+    let claim = Command {
+        recipe: FrozenRecipe::freeze(Recipe::ClaimDelivery(ClaimDelivery {
+            operation: operation_id(world.epoch, 3),
+            delivery: DeliveryId {
+                publication: publication_id(world.epoch, 2),
+                index: 0,
+            },
+            target: world.b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(7).unwrap(),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    let before = world.store.snapshot().unwrap();
+    assert_eq!(
+        outcome(world.store.apply(&claim).reply),
+        StoreOutcome::RejectedCertain(RejectReason::CapacityExceeded(Resource::ExchangeSlots))
+    );
+    let refused = world.store.snapshot().unwrap();
+    assert!(refused.outbound.is_empty());
+    assert_eq!(refused.obligations, before.obligations);
+    assert_eq!(refused.payloads, before.payloads);
+    assert_eq!(
+        refused.accounts.exchange_slots,
+        before.accounts.exchange_slots
+    );
+    assert_eq!(accounts_match_what_is_held(&refused), Ok(()));
+}
+
+/// Deleting the target releases a claimed slot once, preserving references
+/// belonging to another target and the producer's independent inbound slot.
+pub fn deleting_a_claimed_target_releases_only_its_resources<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::command::ClaimDelivery;
+    use mqttiumd_contract::ids::OutboundPacketId;
+    let mut world = World::new(make);
+    let admission = world.admission(1, 7, b"payload", &[world.b, world.c]);
+    assert!(world.store.apply(&admission).committed_now);
+    let claim = Command {
+        recipe: FrozenRecipe::freeze(Recipe::ClaimDelivery(ClaimDelivery {
+            operation: operation_id(world.epoch, 2),
+            delivery: DeliveryId {
+                publication: publication_id(world.epoch, 1),
+                index: 0,
+            },
+            target: world.b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(7).unwrap(),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    assert!(world.store.apply(&claim).committed_now);
+    assert_eq!(
+        world
+            .store
+            .admin(AdminCommand::DeleteSession { session: world.b }),
+        Ok(AdminDone::SessionDeleted)
+    );
+    let after = world.store.snapshot().unwrap();
+    assert!(after.outbound.is_empty());
+    assert_eq!(after.obligations.len(), 1);
+    assert_eq!(after.obligations.values().next().unwrap().target, world.c);
+    assert_eq!(after.accounts.exchange_slots.get(), 1);
+    assert_eq!(after.payloads.values().next().unwrap().references, 1);
+    assert_eq!(accounts_match_what_is_held(&after), Ok(()));
+    assert_eq!(
+        world
+            .store
+            .admin(AdminCommand::DeleteSession { session: world.b }),
+        Err(AdminRefused::UnknownSession)
+    );
+    assert_eq!(world.store.snapshot().unwrap(), after);
 }
