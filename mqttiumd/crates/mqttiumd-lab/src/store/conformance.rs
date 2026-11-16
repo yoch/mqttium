@@ -3595,3 +3595,100 @@ pub fn live_receipt_registration_preserves_legacy_zero<S: DurableStore>(
         StoreOutcome::Committed(_)
     ));
 }
+
+/// A compact closure supersedes any physical receipt left by a partial sweep.
+/// Recovery must not republish that retained row as an unconsumed terminal fact.
+pub fn recovery_omits_logically_retired_receipts_but_preserves_live_claims<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::command::{ClaimDelivery, FinishDelivery};
+    use mqttiumd_contract::ids::OutboundPacketId;
+    use mqttiumd_contract::receipts::{
+        ReceiptClosure, ReceiptCollection, ReceiptCollectionReply, ReceiptOrigin,
+    };
+    let mut limits = fixture_limits();
+    limits.receipt_slots = ReceiptSlots::new(2048);
+    let mut world = World::with_limits(make, limits);
+    let old_epoch = world.epoch;
+    let origin = ReceiptOrigin::of(operation_id(old_epoch, 1));
+    let empty = ReceiptClosure::empty(origin);
+    assert!(matches!(
+        world.store.collect_receipts(ReceiptCollection {
+            closure: empty,
+            limit: 128
+        }),
+        Ok(ReceiptCollectionReply::Applied { .. })
+    ));
+    let admission = world.admission(1, 7, b"alive", &[world.b, world.c]);
+    assert!(world.store.apply(&admission).committed_now);
+    let delivery = DeliveryId {
+        publication: publication_id(old_epoch, 1),
+        index: 0,
+    };
+    let claim = Command {
+        recipe: FrozenRecipe::freeze(Recipe::ClaimDelivery(ClaimDelivery {
+            operation: operation_id(old_epoch, 2),
+            delivery,
+            target: world.b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(9).unwrap(),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    assert!(world.store.apply(&claim).committed_now);
+    let before = world.store.snapshot().unwrap();
+    let closure = ReceiptClosure {
+        through: OperationSeq::new(2),
+        publication_through: PublicationSeq::new(1),
+        payload_through: PayloadSeq::new(1),
+        ..empty
+    };
+    assert!(matches!(
+        world
+            .store
+            .collect_receipts(ReceiptCollection { closure, limit: 1 }),
+        Ok(ReceiptCollectionReply::Applied {
+            removed: 1,
+            more: true,
+            ..
+        })
+    ));
+    let after = world.store.snapshot().unwrap();
+    assert_eq!(after.obligations, before.obligations);
+    assert_eq!(after.outbound, before.outbound);
+    assert_eq!(after.inbound, before.inbound);
+    assert_eq!(after.payloads, before.payloads);
+    world.epoch = open(&mut world.store);
+    let inventory = world.store.recover(None, 64).unwrap();
+    assert!(
+        inventory
+            .facts
+            .as_slice()
+            .contains(&RecoveredFact::ReceiptFrontier(closure))
+    );
+    assert!(!inventory.facts.as_slice().iter().any(|fact| matches!(fact,
+        RecoveredFact::Operation { operation, .. } if ReceiptOrigin::of(*operation) == origin && operation.sequence() <= closure.through
+    )), "a physical leftover is already logically retired");
+    let finish = Command {
+        recipe: FrozenRecipe::freeze(Recipe::FinishDelivery(FinishDelivery {
+            operation: operation_id(world.epoch, 1),
+            delivery,
+            target: world.b,
+            target_revision: Revision::new(1),
+            packet_id: OutboundPacketId::new(9).unwrap(),
+            claim: operation_id(old_epoch, 2),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    assert!(
+        world.store.apply(&finish).committed_now,
+        "the old claim's receipt is not its live identity guard"
+    );
+    let finished = world.store.snapshot().unwrap();
+    assert_eq!(finished.obligations.len(), 1);
+    assert!(finished.outbound.is_empty());
+    assert_eq!(finished.payloads.values().next().unwrap().references, 1);
+    assert_eq!(accounts_match_what_is_held(&finished), Ok(()));
+}

@@ -41,3 +41,10 @@ fn legacy_zero() {
     conformance::live_receipt_registration_preserves_legacy_zero(&MemoryStore::create);
     conformance::live_receipt_registration_preserves_legacy_zero(&sqlite);
 }
+#[test]
+fn recovered_frontier_supersedes_leftover_receipt_without_ending_claim() {
+    conformance::recovery_omits_logically_retired_receipts_but_preserves_live_claims(
+        &MemoryStore::create,
+    );
+    conformance::recovery_omits_logically_retired_receipts_but_preserves_live_claims(&sqlite);
+}
