@@ -44,12 +44,17 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "probe_truncated")
 
     def test_premature_pubrec_and_pubcomp_are_detected_for_their_reason(self):
-        for header, code in ((0x50, "premature_pubrec"), (0x70, "premature_pubcomp")):
+        for header, code in ((0x40, "premature_puback"), (0x50, "premature_pubrec"),
+                             (0x70, "premature_pubcomp")):
             with self.assertRaises(ReceiptFailure) as failure:
                 assert_no_positive_ack([Frame(header, b"\x00\x07")], header, 7)
             self.assertEqual(failure.exception.code, code)
         assert_no_positive_ack([Frame(0x50, b"\x00\x07\x97\x00")], 0x50, 7)
         assert_no_positive_ack([], 0x50, 7)
+
+    def test_puback_is_decoded_and_its_negative_reason_is_preserved(self):
+        for data, expected in ((b"\x00\x07", (7, 0)), (b"\x00\x07\x97\x00", (7, 0x97))):
+            self.assertEqual(Frame(0x40, data).ack(), expected)
 
     def test_stale_forwarding_is_detected_even_if_another_guard_later_drops_it(self):
         events = [{"kind": "stale_generation_ignored", "connection": "1"}]
