@@ -140,7 +140,7 @@ def drained(broker: Broker, case: Path, admissions: int | None = None) -> dict:
     def read():
         state = durable(broker.db)
         return state if all(state["counts"][name] == 0
-                            for name in ("obligations", "payloads", "publications", "inbound")) else None
+                            for name in ("obligations", "payloads", "publications", "inbound", "outbound")) else None
     state = until(read, "delivery_resources_not_released")
     accounts_consistent(state)
     if admissions is not None:
