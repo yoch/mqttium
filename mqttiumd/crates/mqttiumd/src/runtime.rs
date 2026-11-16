@@ -189,6 +189,50 @@ struct Runtime<'a> {
     copied_session_close: Option<SessionCloseObservation>,
 }
 impl Runtime<'_> {
+    fn accept(&mut self, stream: std::net::TcpStream) -> Result<bool, Failure> {
+        // Retiring threads count against the same hard connection budget.
+        if self.peers.len() + self.retiring.len() >= CONNECTIONS
+            || self.closing_inputs.len() >= CONNECTIONS
+            || self.session_requests.len() >= CONNECTIONS
+        {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            self.events
+                .emit(
+                    "connection_refused",
+                    json!({"details":{"code":"connection_limit"}}),
+                )
+                .map_err(event_failure)?;
+            return Ok(false);
+        }
+        self.generation = self
+            .generation
+            .checked_next()
+            .map_err(|_| Failure::plain("generation_exhausted"))?;
+        let io = net::spawn(stream).map_err(|_| Failure::plain("socket_spawn"))?;
+        let sendbuf = io.send_buffer_bytes();
+        self.peers.insert(
+            self.generation,
+            Peer {
+                io,
+                created: Instant::now(),
+                last_packet: Instant::now(),
+                connected: false,
+                session: None,
+                opened_by: None,
+                connect_expiry: SessionExpiry::OnDisconnect,
+                handshake_packet: None,
+                pending: false,
+                keep_alive: 0,
+                max_packet: 268435455,
+                ingress: 0,
+                receiving: crate::receiving::Window::default(),
+                closing: None,
+                deferred_publish: None,
+            },
+        );
+        self.events.emit("connection_opened", json!({"connection":self.generation.get().to_string(),"details":{"send_buffer_bytes":sendbuf}})).map_err(event_failure)?;
+        Ok(true)
+    }
     fn queue(&mut self, input: Input) -> Result<(), Failure> {
         if Self::terminal_input(&input) {
             if self.terminal_inputs.iter().any(|queued| queued == &input) {
@@ -2050,18 +2094,18 @@ impl Runtime<'_> {
                 }
             }
         }
-        if let Some(dir) = &self.hooks.directory {
-            if consume_control(&dir.join("replay-session-close")) {
-                let copied = self
-                    .copied_session_close
-                    .ok_or_else(|| Failure::plain("no_copied_session_close"))?;
-                self.events
-                    .emit("session_close_replayed", copied.fields())
-                    .map_err(event_failure)?;
-                self.queue(Input::ConnectionClosed {
-                    connection: copied.generation,
-                })?;
-            }
+        if let Some(dir) = &self.hooks.directory
+            && consume_control(&dir.join("replay-session-close"))
+        {
+            let copied = self
+                .copied_session_close
+                .ok_or_else(|| Failure::plain("no_copied_session_close"))?;
+            self.events
+                .emit("session_close_replayed", copied.fields())
+                .map_err(event_failure)?;
+            self.queue(Input::ConnectionClosed {
+                connection: copied.generation,
+            })?;
         }
         if let Some(dir) = &self.hooks.directory
             && consume_control(&dir.join("replay-session-change"))
@@ -3346,47 +3390,7 @@ fn run_inner(
             for _ in 0..4 {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        // Retiring threads count against the same hard connection budget.
-                        if runtime.peers.len() + runtime.retiring.len() >= CONNECTIONS
-                            || runtime.closing_inputs.len() >= CONNECTIONS
-                            || runtime.session_requests.len() >= CONNECTIONS
-                        {
-                            let _ = stream.shutdown(std::net::Shutdown::Both);
-                            events
-                                .emit(
-                                    "connection_refused",
-                                    json!({"details":{"code":"connection_limit"}}),
-                                )
-                                .map_err(event_failure)?;
-                            continue;
-                        }
-                        runtime.generation = runtime
-                            .generation
-                            .checked_next()
-                            .map_err(|_| Failure::plain("generation_exhausted"))?;
-                        let io = net::spawn(stream).map_err(|_| Failure::plain("socket_spawn"))?;
-                        let sendbuf = io.send_buffer_bytes();
-                        runtime.peers.insert(
-                            runtime.generation,
-                            Peer {
-                                io,
-                                created: Instant::now(),
-                                last_packet: Instant::now(),
-                                connected: false,
-                                session: None,
-                                opened_by: None,
-                                connect_expiry: SessionExpiry::OnDisconnect,
-                                handshake_packet: None,
-                                pending: false,
-                                keep_alive: 0,
-                                max_packet: 268435455,
-                                ingress: 0,
-                                receiving: crate::receiving::Window::default(),
-                                closing: None,
-                                deferred_publish: None,
-                            },
-                        );
-                        events.emit("connection_opened",json!({"connection":runtime.generation.get().to_string(),"details":{"send_buffer_bytes":sendbuf}})).map_err(event_failure)?;
+                        let _ = runtime.accept(stream)?;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => return Err(Failure::plain("accept_failed")),

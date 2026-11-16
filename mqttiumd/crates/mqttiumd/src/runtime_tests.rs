@@ -2728,3 +2728,164 @@ fn copied_lifecycle_effect_and_actual_old_close_cannot_rebind_a_replaced_client_
         }
     });
 }
+
+#[test]
+fn real_accept_reserves_both_future_close_facts_behind_a_held_lifecycle() {
+    with_runtime(128, |runtime, _| {
+        let mut confirmed = Vec::new();
+        let mut clients = Vec::new();
+        for index in 0..CONNECTIONS {
+            let (generation, mut client) = peer(runtime);
+            let mut connect = connect_packet(format!("close-reserve-{index}").as_bytes());
+            connect.expiry = SessionExpiry::OnDisconnect;
+            runtime.connect(generation, connect).unwrap();
+            until(runtime, |r| r.session_requests.is_empty());
+            assert_eq!(read_frame(&mut client).0, 0x20);
+            confirmed.push(generation);
+            clients.push(client);
+        }
+        until(runtime, |r| {
+            r.frames.is_empty() && r.inputs.is_empty() && r.work_reads.is_empty()
+        });
+        runtime.close(confirmed[0], "test_hold_close").unwrap();
+        runtime.drain_inputs().unwrap();
+        let committed = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            matches!(
+                committed,
+                ControlResponse::Lifecycle {
+                    reply: StoreReply::Outcome(StoreOutcome::Committed(
+                        CommitFacts::SessionLifecycle(SessionChange::Closed { .. })
+                    )),
+                    ..
+                }
+            ),
+            "hold an authentic committed lifecycle result"
+        );
+        for generation in &confirmed[1..8] {
+            runtime.close(*generation, "test_closing_backlog").unwrap();
+        }
+        assert_eq!(runtime.closing_inputs.len(), 14);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !runtime.retiring.is_empty() && Instant::now() < deadline {
+            runtime.connections().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(runtime.retiring.is_empty());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut accepted = 0;
+        for _ in 0..CONNECTIONS {
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            if runtime.accept(stream).unwrap() {
+                accepted += 1;
+                clients.push(client);
+            }
+            assert!(
+                runtime.closing_inputs.len() + 2 * runtime.peers.len() <= CLOSING_INPUTS,
+                "session_close_reservation_overcommitted: queued={} peers={} reserve={}",
+                runtime.closing_inputs.len(),
+                runtime.peers.len(),
+                CLOSING_INPUTS
+            );
+        }
+        assert_eq!(
+            accepted, 1,
+            "new transport consumes its conservative two-fact close reservation"
+        );
+        let independent = confirmed[8];
+        runtime.packet(independent, 0xc0, vec![]).unwrap();
+        runtime.drain_inputs().unwrap();
+        assert_eq!(
+            read_frame(&mut clients[8]).0,
+            0xd0,
+            "independent control progresses while new acceptance is bounded"
+        );
+        relay_control_reply(runtime, committed);
+        until(runtime, |r| {
+            r.closing_inputs.is_empty() && !r.owner.session_status().lifecycle_pending
+        });
+        drop(clients);
+    });
+}
+
+#[test]
+fn accepted_frames_reserve_their_terminal_fact_before_reactor_backpressure() {
+    with_runtime(128, |runtime, _| {
+        let mut generations = Vec::new();
+        let mut clients = Vec::new();
+        for index in 0..CONNECTIONS {
+            let (generation, mut client) = peer(runtime);
+            runtime
+                .connect(
+                    generation,
+                    connect_packet(format!("frame-reserve-{index}").as_bytes()),
+                )
+                .unwrap();
+            until(runtime, |r| r.session_requests.is_empty());
+            assert_eq!(read_frame(&mut client).0, 0x20);
+            generations.push(generation);
+            clients.push(client);
+        }
+        until(runtime, |r| {
+            r.frames.is_empty() && r.inputs.is_empty() && r.work_reads.is_empty()
+        });
+        let mut retained = false;
+        for _ in 0..12 {
+            for generation in &generations {
+                for _ in 0..3 {
+                    runtime.packet(*generation, 0xc0, vec![]).unwrap();
+                }
+            }
+            runtime.drain_inputs().unwrap();
+            assert!(
+                runtime.terminal_inputs.len() + runtime.frames.len() <= TERMINAL_INPUTS,
+                "terminal_fact_reservation_overcommitted: facts={} accepted_frames={} reserve={}",
+                runtime.terminal_inputs.len(),
+                runtime.frames.len(),
+                TERMINAL_INPUTS
+            );
+            if runtime.owner.outbox().unwrap().pending().any(|effect| {
+                matches!(
+                    effect.effect(),
+                    Effect::EmitFrame {
+                        frame: OutboundFrame::Pingresp,
+                        ..
+                    }
+                )
+            }) {
+                retained = true;
+                break;
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !runtime.frames.is_empty() && Instant::now() < deadline {
+                runtime.connections().unwrap();
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                runtime.frames.is_empty(),
+                "every prior frame had an actual local write completion before the next pass"
+            );
+        }
+        assert!(
+            retained,
+            "finite genuine PING traffic reached the terminal reservation, retaining effects in the owner"
+        );
+        until(runtime, |r| {
+            r.inputs.is_empty()
+                && r.terminal_inputs.is_empty()
+                && r.frames.is_empty()
+                && r.owner.outbox().unwrap().is_empty()
+        });
+        assert_eq!(
+            runtime.peers.len(),
+            CONNECTIONS,
+            "bounded write-fact backpressure did not close independent peers"
+        );
+        drop(clients);
+    });
+}
