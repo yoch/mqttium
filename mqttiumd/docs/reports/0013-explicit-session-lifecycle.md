@@ -85,7 +85,10 @@ binary is relabeled as the final publication.
 B/A/C/D use agent integration88a667c1; its B ledger SHA256 is
 72719fa5c9417c59f5d4e47c90a15971836b71fa80f3d9a02bacbb56795d97d1.
 E held-result diagnostics use88a667c1, actual takeover/copy diagnosticsfccb42a8,
-and F uses0253eeb5. All retain their process/client/SQL observations separately.
+and F uses0253eeb5. An additional authentic source-unknown case atc8ca500a
+holds committed admissionseq4, ends sourceSID2, creates same-nameSID3, then
+resolves the original operation without old ACK. The other targetSID1 keeps
+its byte-identical obligation/payload and receives it through public mqttium. All retain their process/client/SQL observations separately.
 
 The final launcher below reruns the complete A–G scope from its own clean pinned
 source and keeps its exact source SHA, binaries/features, imported clients,

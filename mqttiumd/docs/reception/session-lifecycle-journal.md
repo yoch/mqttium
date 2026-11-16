@@ -63,3 +63,10 @@
   receipts/PI/pubsub/transaction CI and protected publication. The final run
   index/source-head, PR receipt and exact-head checks supply publication binding;
   no diagnostic archive is relabeled.
+- The last actual source-unknown case passes atc8ca500a: authentic admission4
+  held after commit; original sourceSID2 ends with one retired flight; new
+  same-nameSID3 stays independent; original operation resolves/no old ACK;
+  targetSID1's byte-identical obligation/payload survives and completes through
+  public mqttium. Hooks binaryf0ece3696f92f3cd81ea13fd7974949c9493d621a4a937ba64688660ce24b4a1.
+  Integrated harness requires this case before complete A-G PASS. Freeze now;
+  final validation/reception use only private pinned checkouts.
