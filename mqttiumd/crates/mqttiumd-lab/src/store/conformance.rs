@@ -2284,3 +2284,99 @@ pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
     recovery_field_limits_apply_to_the_selected_page(make);
     recovery_field_limits_include_fixed_identities(make);
 }
+
+/// A network subscription mutation is a normal receipted operation: replacing
+/// an existing target has no duplicate, and removing it preserves old work.
+pub fn subscriptions_replace_and_remove_without_duplicate_or_hole<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    use mqttiumd_contract::command::ChangeSubscriptions;
+    use mqttiumd_contract::pubsub::SubscriptionChange;
+    let mut world = World::new(make);
+    let before = world.store.snapshot().unwrap();
+    let mut changes = BoundedVec::with_capacity(1).unwrap();
+    changes
+        .try_push(SubscriptionChange {
+            topic: SharedBytes::copy_from(TOPIC, 128).unwrap(),
+            subscribe: true,
+        })
+        .unwrap();
+    let command = Command {
+        recipe: FrozenRecipe::freeze(Recipe::ChangeSubscriptions(ChangeSubscriptions {
+            operation: operation_id(world.epoch, 91),
+            session: world.b,
+            session_revision: Revision::new(1),
+            route_revision: before.route_revision,
+            changes,
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    let reply = world.store.apply(&command);
+    let expected =
+        StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SubscriptionsChanged {
+            session: world.b,
+            route_revision: before.route_revision.checked_next().unwrap(),
+        }));
+    assert_eq!(
+        reply.reply, expected,
+        "subscription upsert must commit through the ordinary operation pipeline"
+    );
+    let replaced = world.store.snapshot().unwrap();
+    assert_eq!(
+        replaced.routes[TOPIC].len(),
+        2,
+        "resubscribe must not duplicate a destination"
+    );
+    assert_eq!(
+        replaced.sessions[&world.b].revision,
+        before.sessions[&world.b].revision
+    );
+    assert_eq!(world.store.apply(&command).reply, expected);
+    assert_eq!(
+        world.store.snapshot().unwrap(),
+        replaced,
+        "repeated OperationId is idempotent"
+    );
+    world.route_revision = replaced.route_revision;
+    let admission = world.admission(92, 7, b"held", &[world.b, world.c]);
+    assert!(matches!(
+        world.store.apply(&admission).reply,
+        StoreReply::Outcome(StoreOutcome::Committed(_))
+    ));
+    let mut changes = BoundedVec::with_capacity(1).unwrap();
+    changes
+        .try_push(SubscriptionChange {
+            topic: SharedBytes::copy_from(TOPIC, 128).unwrap(),
+            subscribe: false,
+        })
+        .unwrap();
+    let remove = Command {
+        recipe: FrozenRecipe::freeze(Recipe::ChangeSubscriptions(ChangeSubscriptions {
+            operation: operation_id(world.epoch, 93),
+            session: world.b,
+            session_revision: Revision::new(1),
+            route_revision: replaced.route_revision,
+            changes,
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    assert!(matches!(
+        world.store.apply(&remove).reply,
+        StoreReply::Outcome(StoreOutcome::Committed(_))
+    ));
+    let removed = world.store.snapshot().unwrap();
+    assert_eq!(
+        removed.routes[TOPIC]
+            .iter()
+            .map(|r| r.session)
+            .collect::<Vec<_>>(),
+        vec![world.c]
+    );
+    assert_eq!(
+        removed.obligations.len(),
+        2,
+        "unsubscribe must retain both already admitted obligations"
+    );
+}

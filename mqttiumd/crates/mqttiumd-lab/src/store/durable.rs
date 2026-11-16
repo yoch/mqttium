@@ -385,6 +385,7 @@ fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadEr
         let decision_bytes = match record.decision {
             Decision::Committed(CommitFacts::PublicationAdmitted { .. }) => 56,
             Decision::Committed(CommitFacts::InboundReleased { .. }) => 24,
+            Decision::Committed(_) => 96,
             Decision::Rejected(RejectReason::CapacityExceeded(_)) => 24,
             Decision::Rejected(_) => 16,
         };
@@ -1021,6 +1022,7 @@ impl DurableStore for MemoryStore {
                 staged.stage_admission(admit, command.payload.as_ref())
             }
             Recipe::ReleaseInbound(release) => staged.stage_release(release),
+            _ => Err(RejectReason::PreconditionFailed),
         };
         match facts {
             Ok(facts) => {
