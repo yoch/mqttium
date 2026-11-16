@@ -11,6 +11,7 @@ use crate::contract::pubsub::{
 
 // Isolated transition mutants. Production builds retain these false values.
 const MUTANT_EARLY_PI_RELEASE: bool = false;
+const MUTANT_IGNORE_OCCUPIED_PI: bool = false;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct Read {
@@ -250,12 +251,14 @@ impl State {
         let candidates = occupied.saturating_add(1).min(usize::from(maximum));
         for raw in 1..=candidates {
             let packet_id = u16::try_from(raw).ok().and_then(OutboundPacketId::new)?;
-            if !self.deliveries.as_slice().iter().any(|delivery| {
-                Self::reserves_packet_id(delivery, session)
-                    && delivery
-                        .claim
-                        .is_some_and(|claim| claim.packet_id == packet_id)
-            }) {
+            if MUTANT_IGNORE_OCCUPIED_PI
+                || !self.deliveries.as_slice().iter().any(|delivery| {
+                    Self::reserves_packet_id(delivery, session)
+                        && delivery
+                            .claim
+                            .is_some_and(|claim| claim.packet_id == packet_id)
+                })
+            {
                 return Some(packet_id);
             }
         }
@@ -2946,5 +2949,31 @@ mod tests {
         };
         let _ = known(&mut owner, finish[0].0, command);
         assert_eq!(owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(), 1);
+    }
+
+    #[test]
+    fn an_unknown_claim_keeps_its_packet_identifier_unavailable() {
+        let mut owner = world();
+        queued(&mut owner, 0);
+        let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command } = &claim[0].1 else {
+            panic!("claim")
+        };
+        assert!(
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect: claim[0].0,
+                    operation: command.recipe.operation(),
+                    reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown)
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            owner.pubsub.free_packet_id(TARGET, 4).unwrap().get(),
+            2,
+            "occupied_unknown_pi_reused"
+        );
     }
 }
