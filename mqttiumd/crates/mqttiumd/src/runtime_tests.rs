@@ -81,9 +81,14 @@ fn with_runtime(max_exchanges: u32, test: impl FnOnce(&mut Runtime<'_>, &Path)) 
         generation: ConnectionGeneration::new(0),
         inputs: VecDeque::new(),
         control_inputs: VecDeque::new(),
+        closing_inputs: VecDeque::new(),
         deferred_inputs: VecDeque::new(),
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
+        lifecycle_inflight: BTreeMap::new(),
+        last_session_change: None,
+        session_cardinality_dirty: false,
+        last_session_cardinality: None,
         work_reads: BTreeMap::new(),
         last_work_scan: Instant::now(),
         maintenance_needed: false,
@@ -191,6 +196,9 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             last_packet: Instant::now(),
             connected: false,
             session: None,
+            opened_by: None,
+            connect_expiry: SessionExpiry::OnDisconnect,
+            handshake_packet: None,
             pending: false,
             keep_alive: 0,
             max_packet: 268435455,
@@ -206,6 +214,8 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
 fn connect_packet(client: &[u8]) -> codec::Connect {
     codec::Connect {
         client_id: SharedBytes::copy_from(client, BOUNDS.max_client_id).unwrap(),
+        clean_start: false,
+        expiry: SessionExpiry::Never,
         keep_alive: 10,
         max_packet_size: 65536,
         receive_maximum: 8,
@@ -2349,5 +2359,104 @@ fn observed_puback_copy_and_actual_old_callbacks_cannot_finish_a_reused_identifi
                 && final_state.payloads.is_empty()
         );
         assert!(runtime.outgoing_bindings.is_empty());
+    });
+}
+
+#[test]
+fn ephemeral_sessions_return_owner_cache_and_durable_capacity() {
+    with_runtime(128, |runtime, directory| {
+        let mut previous = 0;
+        for cycle in 0..6 {
+            let (generation, mut client) = peer(runtime);
+            let mut connect = connect_packet(format!("ephemeral-{cycle}").as_bytes());
+            connect.expiry = SessionExpiry::OnDisconnect;
+            runtime.connect(generation, connect).unwrap();
+            until(runtime, |r| r.session_requests.is_empty());
+            let (kind, body) = read_frame(&mut client);
+            assert_eq!(kind, 0x20);
+            assert_eq!(&body[..2], &[0, 0]);
+            let session = runtime.peers[&generation].session.unwrap();
+            assert!(session.get() > previous, "SessionId must never recycle");
+            previous = session.get();
+            runtime.packet(generation, 0x32, publish_body(1)).unwrap();
+            until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+            assert_eq!(read_frame(&mut client).0, 0x40);
+            runtime.packet(generation, 0xe0, vec![]).unwrap();
+            until(runtime, |r| {
+                let status = r.owner.session_status();
+                r.sessions.is_empty()
+                    && status.sessions == 0
+                    && status.bindings == 0
+                    && status.inbound == 0
+                    && status.outgoing == 0
+                    && status.retired_flights == 0
+                    && !status.lifecycle_pending
+                    && r.closing_inputs.is_empty()
+                    && r.lifecycle_inflight.is_empty()
+                    && r.work_reads.is_empty()
+                    && r.frames.is_empty()
+                    && r.timers.is_empty()
+            });
+            let durable =
+                mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite"))
+                    .unwrap();
+            assert!(
+                durable.sessions.is_empty(),
+                "terminal session history must be physically reclaimed"
+            );
+            assert!(durable.routes.is_empty() && durable.inbound.is_empty());
+            assert!(durable.obligations.is_empty() && durable.publications.is_empty());
+            assert!(runtime.owner.session_status().closed_generations <= 8);
+        }
+    });
+}
+
+#[test]
+fn zero_expiry_reconnect_first_resumes_then_ends_the_existing_incarnation() {
+    with_runtime(128, |runtime, directory| {
+        let name = b"resume-then-end";
+        let (old, mut old_client) = peer(runtime);
+        runtime.connect(old, connect_packet(name)).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut old_client).0, 0x20);
+        let original = runtime.peers[&old].session.unwrap();
+        runtime
+            .packet(old, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
+            .unwrap();
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut old_client).0, 0x90);
+        runtime.close(old, "test_offline").unwrap();
+        runtime.drain_inputs().unwrap();
+        let (current, mut client) = peer(runtime);
+        let mut connect = connect_packet(name);
+        connect.expiry = SessionExpiry::OnDisconnect;
+        runtime.connect(current, connect).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        let (kind, body) = read_frame(&mut client);
+        assert_eq!(kind, 0x20);
+        assert_eq!(&body[..2], &[1, 0]);
+        assert_eq!(runtime.peers[&current].session, Some(original));
+        assert_eq!(
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite"))
+                .unwrap()
+                .routes
+                .len(),
+            1,
+            "expiry0 resumes existing state before its future closure"
+        );
+        runtime.packet(current, 0xe0, vec![]).unwrap();
+        until(runtime, |r| {
+            r.sessions.is_empty()
+                && !r.owner.session_status().lifecycle_pending
+                && r.closing_inputs.is_empty()
+        });
+        let durable =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert!(durable.sessions.is_empty() && durable.routes.is_empty());
+        let (next, mut new_client) = peer(runtime);
+        runtime.connect(next, connect_packet(name)).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(&read_frame(&mut new_client).1[..2], &[0, 0]);
+        assert!(runtime.peers[&next].session.unwrap().get() > original.get());
     });
 }
