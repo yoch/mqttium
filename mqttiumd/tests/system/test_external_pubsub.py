@@ -127,6 +127,27 @@ class ExternalPubsubTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result['subscriptions'], [])
                 self.assertTrue(result['messages'][0]['dup'])
 
+    async def test_hold_without_release_disconnects_without_terminal_ack(self):
+        for kind in ('mqttium', 'paho'):
+            with self.subTest(client=kind):
+                async def script(reader, writer, _connection):
+                    await connack(reader, writer)
+                    first, body = await read_packet(reader)
+                    self.assertEqual(first, 0x82)
+                    writer.write(packet(0x90, body[:2] + b'\0\x01'))
+                    writer.write(server_publish('reception/unacked', b'pending'))
+                    await writer.drain()
+                    self.assertEqual(await read_packet(reader), (0xE0, b''),
+                                     'intentional disconnect must not implicitly acknowledge the message')
+
+                async with ScriptedBroker(script) as broker:
+                    result = await call(kind, 'receive', '127.0.0.1', broker.port, f'{kind}-unacked',
+                                        filters=('reception/unacked',), ack_policy='hold')
+                self.assertEqual(result['status'], 'success', result)
+                kinds = [event['kind'] for event in result['events']]
+                self.assertIn('ack_held', kinds)
+                self.assertNotIn('manual_ack_submitted', kinds)
+
     async def test_refusal_is_not_subscription_ready_and_retains_filter_order(self):
         for kind in ('mqttium', 'paho'):
             with self.subTest(client=kind):
