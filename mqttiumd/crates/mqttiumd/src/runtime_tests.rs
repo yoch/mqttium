@@ -1932,31 +1932,84 @@ fn a_no_target_puback_observed_before_the_first_claim_cannot_bind_to_it_later() 
 
 #[test]
 fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connections() {
-    with_runtime(128, |runtime, _| {
+    fn until_phase(
+        runtime: &mut Runtime<'_>,
+        path: &Path,
+        phase: &str,
+        condition: impl Fn(&Runtime<'_>) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !condition(runtime) && Instant::now() < deadline {
+            pump(runtime);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            condition(runtime),
+            "takeover phase {phase} failed to make bounded progress: session_requests={}, inflight={:?}, inputs={:?}, deferred={:?}, control={:?}, outbox={:?}, peers={:?}, latest_events={:?}",
+            runtime.session_requests.len(),
+            runtime.inflight,
+            runtime.inputs,
+            runtime.deferred_inputs,
+            runtime.control_inputs,
+            runtime
+                .owner
+                .outbox()
+                .unwrap()
+                .pending()
+                .collect::<Vec<_>>(),
+            runtime
+                .peers
+                .iter()
+                .map(|(generation, peer)| (
+                    generation,
+                    peer.session,
+                    peer.connected,
+                    peer.pending,
+                    peer.closing
+                ))
+                .collect::<Vec<_>>(),
+            std::fs::read_to_string(path.join("events.jsonl"))
+                .unwrap()
+                .lines()
+                .rev()
+                .take(12)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    with_runtime(128, |runtime, path| {
         let (old_generation, mut old) = peer(runtime);
         runtime
             .connect(old_generation, connect_packet(b"takeover-boundary"))
             .unwrap();
-        until(runtime, |r| r.session_requests.is_empty());
+        until_phase(runtime, path, "establish old transport", |r| {
+            r.session_requests.is_empty()
+        });
         assert_eq!(read_frame(&mut old).0, 0x20);
         let session = runtime.sessions[b"takeover-boundary".as_slice()].id;
         let (first, mut first_client) = peer(runtime);
         runtime
             .connect(first, connect_packet(b"takeover-pressure-a"))
             .unwrap();
-        until(runtime, |r| r.session_requests.is_empty());
+        until_phase(runtime, path, "establish pressure peer A", |r| {
+            r.session_requests.is_empty()
+        });
         assert_eq!(read_frame(&mut first_client).0, 0x20);
         let (second, mut second_client) = peer(runtime);
         runtime
             .connect(second, connect_packet(b"takeover-pressure-b"))
             .unwrap();
-        until(runtime, |r| r.session_requests.is_empty());
+        until_phase(runtime, path, "establish pressure peer B", |r| {
+            r.session_requests.is_empty()
+        });
         assert_eq!(read_frame(&mut second_client).0, 0x20);
         let (third, mut third_client) = peer(runtime);
         runtime
             .connect(third, connect_packet(b"takeover-pressure-c"))
             .unwrap();
-        until(runtime, |r| r.session_requests.is_empty());
+        until_phase(runtime, path, "establish pressure peer C", |r| {
+            r.session_requests.is_empty()
+        });
         assert_eq!(read_frame(&mut third_client).0, 0x20);
         for identifier in 1..=8 {
             runtime
@@ -1975,7 +2028,18 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
         );
         runtime.packet(third, 0x32, publish_body(1)).unwrap();
         runtime.drain_inputs().unwrap();
-        assert!(!runtime.owner.outbox().unwrap().is_empty());
+        let blocked_persist = runtime
+            .owner
+            .outbox()
+            .unwrap()
+            .pending()
+            .next()
+            .expect("the seventeenth admission waits for a real store slot")
+            .id();
+        assert!(matches!(
+            runtime.owner.outbox().unwrap().pending().next().unwrap().effect(),
+            Effect::Persist { command } if matches!(command.recipe.get(), Recipe::AdmitPublication(admission) if admission.source.session == runtime.sessions[b"takeover-pressure-c".as_slice()].id)
+        ));
         let (new_generation, mut new) = peer(runtime);
         runtime
             .connect(new_generation, connect_packet(b"takeover-boundary"))
@@ -1986,6 +2050,17 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
             runtime.peers.contains_key(&old_generation),
             "the actual old transport survives while CloseConnection waits behind the refused Persist"
         );
+        let pending = runtime
+            .owner
+            .outbox()
+            .unwrap()
+            .pending()
+            .collect::<Vec<_>>();
+        assert_eq!(pending[0].id(), blocked_persist);
+        assert!(pending.iter().skip(1).any(|effect| matches!(
+            effect.effect(),
+            Effect::CloseConnection { connection, reason: CloseReason::SessionTakenOver } if *connection == old_generation
+        )), "takeover Close must really wait behind the same refused Persist");
         let observed_before = runtime.puback_observation;
         old.write_all(&[0x40, 2, 0, 1]).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2007,20 +2082,72 @@ fn stale_puback_during_takeover_with_a_blocked_close_cannot_stop_other_connectio
             "the real reader must reach the superseded generation's PUBACK"
         );
         assert!(runtime.inputs.iter().any(|input|matches!(input,Input::ObservedPuback {connection,target:None,..} if connection.session==session && connection.generation==old_generation)),"the observation retains its original durable session/generation and never acquires the replacement connection");
-        until(runtime, |r| {
-            r.inflight.is_empty()
-                && r.inputs.is_empty()
-                && !r.peers.contains_key(&old_generation)
-                && r.peers.get(&new_generation).is_some_and(|p| !p.pending)
-        });
-        assert_eq!(read_frame(&mut new).0, 0x20);
-        runtime.packet(new_generation, 0xc0, vec![]).unwrap();
-        runtime.drain_inputs().unwrap();
-        assert_eq!(
-            read_frame(&mut new).0,
-            0xd0,
-            "the replacement and independent control traffic remain usable"
-        );
+        // Relay one actual admission reply, retaining the real worker's other
+        // replies. This distinguishes takeover/control progress from global
+        // quiescence while preserving the adapter's original correlations.
+        let (released, receiver) = std::sync::mpsc::sync_channel(IN_FLIGHT * 2);
+        let worker_receiver = std::mem::replace(&mut runtime.writer.receiver, receiver);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut admission_released = false;
+            for _ in 0..=IN_FLIGHT {
+                let response = worker_receiver
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("the real worker completes an accepted admission");
+                let admission = matches!(
+                    &response,
+                    Response::Store {
+                        reply: StoreReply::Outcome(StoreOutcome::Committed(
+                            CommitFacts::PublicationAdmitted { .. }
+                        )),
+                        ..
+                    }
+                );
+                assert!(admission || matches!(&response, Response::Work { .. }));
+                if let Response::Store {
+                    effect, operation, ..
+                } = &response
+                {
+                    assert_eq!(runtime.inflight.get(effect), Some(operation));
+                }
+                released.send(response).unwrap();
+                if admission {
+                    admission_released = true;
+                    break;
+                }
+            }
+            assert!(
+                admission_released,
+                "bounded relay must reach the first real admission reply"
+            );
+            until_phase(
+                runtime,
+                path,
+                "first reply releases Close and CONNACK",
+                |r| {
+                    !r.peers.contains_key(&old_generation)
+                        && r.peers.get(&new_generation).is_some_and(|p| !p.pending)
+                },
+            );
+            assert_eq!(runtime.inflight.len(), IN_FLIGHT);
+            assert_eq!(read_frame(&mut new).0, 0x20);
+            until_phase(runtime, path, "release blocked Close and CONNACK", |r| {
+                r.inflight.is_empty()
+                    && r.inputs.is_empty()
+                    && !r.peers.contains_key(&old_generation)
+                    && r.peers.get(&new_generation).is_some_and(|p| !p.pending)
+            });
+            runtime.packet(new_generation, 0xc0, vec![]).unwrap();
+            runtime.drain_inputs().unwrap();
+            assert_eq!(
+                read_frame(&mut new).0,
+                0xd0,
+                "the replacement and independent control traffic remain usable"
+            );
+        }));
+        runtime.writer.receiver = worker_receiver;
+        if let Err(payload) = outcome {
+            std::panic::resume_unwind(payload);
+        }
     });
 }
 
