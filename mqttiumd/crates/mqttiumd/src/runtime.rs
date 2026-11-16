@@ -2010,6 +2010,41 @@ pub fn run(config: Config) -> Result<(), Failure> {
     events.emit("stopped",json!({"details":{"writer_released":true,"accepted_commands_certainly_rejected":false}})).map_err(event_failure)?;
     result
 }
+fn check_startup_cancel(cancel: &AtomicBool) -> Result<(), Failure> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(Failure::plain("startup_cancelled"))
+    } else {
+        Ok(())
+    }
+}
+fn startup_reply<T>(
+    receiver: &std::sync::mpsc::Receiver<T>,
+    cancel: &AtomicBool,
+    deadline: Instant,
+    code: &'static str,
+) -> Result<T, Failure> {
+    loop {
+        // An already produced typed failure is read before observing the stop
+        // flag. Cancelling an outstanding request never calls it rejected.
+        match receiver.try_recv() {
+            Ok(reply) => return Ok(reply),
+            Err(TryRecvError::Disconnected) => return Err(Failure::plain("writer_disconnected")),
+            Err(TryRecvError::Empty) => {}
+        }
+        check_startup_cancel(cancel)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Failure::plain(code));
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(reply) => return Ok(reply),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Failure::plain("writer_disconnected"));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
 fn run_inner(
     listen: &SocketAddr,
     hooks: Hooks,
@@ -2093,16 +2128,18 @@ fn run_inner(
         let mut rows = 0usize;
         let mut saw_epoch = false;
         loop {
+            check_startup_cancel(&cancel)?;
             runtime
                 .writer
                 .sender
                 .send(Request::Recovery(cursor))
                 .map_err(|_| Failure::plain("writer_closed"))?;
-            let response = runtime
-                .writer
-                .receiver
-                .recv_timeout(Duration::from_secs(10))
-                .map_err(|_| Failure::plain("recovery_deadline"))?;
+            let response = startup_reply(
+                &runtime.writer.receiver,
+                &cancel,
+                Instant::now() + Duration::from_secs(10),
+                "recovery_deadline",
+            )?;
             let Response::Recovery(page) = response else {
                 return Err(Failure::plain("recovery_protocol"));
             };
@@ -2112,6 +2149,7 @@ fn run_inner(
                 }
                 _ => Failure::plain(refused.code()),
             })?;
+            check_startup_cancel(&cancel)?;
             rows = rows
                 .checked_add(page.facts.as_slice().len())
                 .filter(|v| *v <= 65536)
@@ -2158,6 +2196,7 @@ fn run_inner(
             let deadline = Instant::now() + Duration::from_secs(10);
             let mut completed = false;
             for _ in 0..128 {
+                check_startup_cancel(&cancel)?;
                 if Instant::now() >= deadline {
                     return Err(Failure::plain("startup_collection_deadline"));
                 }
@@ -2169,11 +2208,12 @@ fn run_inner(
                 let ControlResponse::Closed {
                     collection: found,
                     result,
-                } = runtime
-                    .writer
-                    .control_receiver
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .map_err(|_| Failure::plain("startup_collection_deadline"))?
+                } = startup_reply(
+                    &runtime.writer.control_receiver,
+                    &cancel,
+                    deadline,
+                    "startup_collection_deadline",
+                )?
                 else {
                     return Err(Failure::plain("startup_collection_protocol"));
                 };
@@ -2206,6 +2246,7 @@ fn run_inner(
         }
         // Empty-prefix registration is itself an exact owner transition. No
         // listener or business command exists until its durable reply is applied.
+        check_startup_cancel(&cancel)?;
         runtime.queue(Input::MaintainReceipts)?;
         let deadline = Instant::now() + Duration::from_secs(30);
         while !runtime.owner.collection_ready() {
@@ -2213,6 +2254,7 @@ fn run_inner(
                 return Err(Failure::plain("receipt_registration_deadline"));
             }
             runtime.writer_results()?;
+            check_startup_cancel(&cancel)?;
             runtime.due_deadlines()?;
             runtime.drain_inputs()?;
             runtime.dispatch()?;
@@ -2220,6 +2262,7 @@ fn run_inner(
         }
         events.emit("receipt_policy",json!({"details":{"receipt_window":1024,"receipt_data_window":768,"receipt_control_reserve":512,"receipt_collection_rows":128,"receipt_collection_trigger":64,"max_receipt_origins":64,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE,"control_input_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
         events.emit("sqlite_configuration",json!({"details":{"journal_mode":sqlite.journal_mode,"synchronous":sqlite.synchronous,"wal_autocheckpoint":sqlite.wal_autocheckpoint,"checkpoint_policy":sqlite.checkpoint_policy,"sqlite_version":sqlite.sqlite_version,"user_version":sqlite.user_version,"page_size":sqlite.page_size,"kill_points":sqlite.kill_points,"hooks_active":false,"install_order":"sqlite-autocheckpoint-before-optional-business-hook"}})).map_err(event_failure)?;
+        check_startup_cancel(&cancel)?;
         let listener =
             TcpListener::bind(listen).map_err(|_| Failure::plain("listen_unavailable"))?;
         listener
@@ -2228,6 +2271,7 @@ fn run_inner(
         let address = listener
             .local_addr()
             .map_err(|_| Failure::plain("listen_address"))?;
+        check_startup_cancel(&cancel)?;
         events.emit("ready",json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100}})).map_err(event_failure)?;
         println!("mqttiumd ready {address} (experimental exact pub/sub)");
         while !cancel.load(Ordering::Relaxed) {
