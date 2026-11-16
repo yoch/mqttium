@@ -197,3 +197,51 @@ class SessionCorpus(unittest.TestCase):
             invalid = copy.deepcopy(value)
             edit(invalid)
             self.assertTrue(self.contracts.check_value(invalid))
+
+
+class FinalLifecycleObservations(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.contracts = Contracts.open(ROOT)
+
+    def event(self, kind):
+        event = {"format": "mqttiumd.product-event", "schema_version": 1,
+                 "seq": "7", "pid": 1, "kind": kind, "connection": "4",
+                 "operation": {"incarnation": "1", "epoch": "2", "owner": "0", "sequence": "8"},
+                 "details": {"session": "9"}}
+        if kind.startswith("session_change_"):
+            event["details"]["action"] = "Opened"
+        return event
+
+    def test_runtime_resource_limits_are_explicit_profile_fields(self):
+        profile = json.loads((ROOT / "contracts/v1/product-profile.json").read_text())
+        for key, value in (("closing_input_slots", 32), ("terminal_input_slots", 336),
+                           ("frame_registration_slots", 208), ("pre_connack_packet_slots", 1)):
+            with self.subTest(key=key):
+                self.assertEqual(profile.get(key), value)
+
+    def test_copied_lifecycle_facts_require_original_identities_and_exact_shape(self):
+        for kind in ("session_change_copied", "session_change_replayed",
+                     "session_close_copied", "session_close_replayed"):
+            valid = self.event(kind)
+            self.assertEqual(self.contracts.check_value(valid), [])
+            required = ("operation",) if kind.startswith("session_change_") else ("connection",)
+            for member in required:
+                with self.subTest(kind=kind, absent=member):
+                    invalid = copy.deepcopy(valid)
+                    invalid.pop(member)
+                    self.assertTrue(self.contracts.check_value(invalid))
+            invalid = copy.deepcopy(valid)
+            invalid["details"].pop("session")
+            with self.subTest(kind=kind, absent="details/session"):
+                self.assertTrue(self.contracts.check_value(invalid))
+            invalid = copy.deepcopy(valid)
+            invalid["details"]["client_id"] = "reusable-name"
+            with self.subTest(kind=kind, extra="client_id"):
+                self.assertTrue(self.contracts.check_value(invalid))
+
+    def test_close_observation_can_describe_a_legacy_null_attachment_by_omission(self):
+        for kind in ("session_close_copied", "session_close_replayed"):
+            value = self.event(kind)
+            value.pop("operation")
+            self.assertEqual(self.contracts.check_value(value), [])
