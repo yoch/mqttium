@@ -1000,3 +1000,7 @@ fn run_inner(
     }
     result.and(socket_result)
 }
+
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod tests;
