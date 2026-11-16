@@ -1,11 +1,11 @@
 {
   "format": "mqttiumd.product-transition-registry",
   "schema_version": 1,
-  "id": "tcp-exact-pubsub-v1",
-  "decision": "0025",
+  "id": "tcp-qos0-exact-pubsub-v1",
+  "decision": "0026",
   "scope": "product-system-tests",
   "partition_complete": true,
-  "description": "Added exact persistent subscription and outgoing QoS 1 paths. States name logical cuts, including transient committed/terminal cuts. Action names include store mutations and effect eligibility, not only Rust Effect variants. Reception groups refer to finite system tests; this table neither claims their execution nor completes P1/P2, extends S0 qualification, accepts ADR 0025, or supplies a formal runtime proof.",
+  "description": "Exact persistent subscriptions with QoS 0/1 grants, outgoing QoS 1, volatile QoS 0 and consumed durable QoS 0. This descriptive subset is incomplete. Existing subscription/QoS 1 rules refer to pubsub reception; QoS 0 rules refer to the separate A-H QoS 0 system reception. No execution, full P1/P2, fixture qualification, accepted ADR or formal runtime proof is inferred.",
   "rules": [
     {
       "id": "subscription.idle.change",
@@ -87,7 +87,7 @@
       "machine": "OutgoingQos1",
       "state_class": "Queued",
       "event_class": "WorkDiscovered",
-      "guard": "Bounded durable work read; current destination session/revision; available destination and local window; packet fits the destination maximum.",
+      "guard": "Bounded durable QoS 1 work; current destination session/revision and available destination/local window. Packet size is checked before emission; an oversized obligation is retained on connection refusal.",
       "next_state_class": "ClaimPending",
       "required_actions": [
         "PersistClaimDelivery",
@@ -252,6 +252,212 @@
       "reception_groups": [
         "E",
         "F"
+      ]
+    },
+    {
+      "id": "qos0.volatile.input",
+      "machine": "VolatileQos0",
+      "state_class": "Idle",
+      "event_class": "PublishQos0",
+      "guard": "Current source session/connection; non-retained QoS 0, no Packet Identifier and DUP=0; bounded routing cut and immutable shared payload.",
+      "next_state_class": "EmissionPending",
+      "required_actions": [
+        "DrawVolatileOccurrence",
+        "SnapshotDestinations"
+      ],
+      "forbidden_actions": [
+        "PersistPublication",
+        "CreateMqttIdentifier",
+        "ReserveReceiveMaximum",
+        "CreateClaim"
+      ],
+      "reception_groups": [
+        "A",
+        "B",
+        "H"
+      ]
+    },
+    {
+      "id": "qos0.volatile.absent",
+      "machine": "VolatileQos0",
+      "state_class": "EmissionPending",
+      "event_class": "DestinationAbsent",
+      "guard": "The captured target has no authorized live connection; initially QoS 0 publications do not enter its durable queue.",
+      "next_state_class": "Dropped",
+      "required_actions": [
+        "ObserveQos0Drop"
+      ],
+      "forbidden_actions": [
+        "PersistPublication",
+        "ReplayOnReconnect",
+        "SilentEffectLoss"
+      ],
+      "reception_groups": [
+        "B",
+        "C"
+      ]
+    },
+    {
+      "id": "qos0.volatile.pressure",
+      "machine": "VolatileQos0",
+      "state_class": "EmissionPending",
+      "event_class": "BoundedRefusal",
+      "guard": "Capacity, destination size or output pressure refuses the bounded attempt. The owner decides and records a reason; an Outbox effect is retained until the adapter accepts its transfer/refusal protocol.",
+      "next_state_class": "Dropped",
+      "required_actions": [
+        "ObserveQos0Drop"
+      ],
+      "forbidden_actions": [
+        "InventMqttAcknowledgement",
+        "ReplayOnAnotherConnection",
+        "SilentEffectLoss"
+      ],
+      "reception_groups": [
+        "C",
+        "H"
+      ]
+    },
+    {
+      "id": "qos0.volatile.accepted",
+      "machine": "VolatileQos0",
+      "state_class": "EmissionPending",
+      "event_class": "AdapterAccepted",
+      "guard": "One emission responsibility transfers on the captured connection generation. A started TCP frame completes or closes; no periodic or reconnect retry is authorized.",
+      "next_state_class": "Terminal",
+      "required_actions": [
+        "TransferVolatileEmission"
+      ],
+      "forbidden_actions": [
+        "AwaitPuback",
+        "PersistPublication",
+        "ReplayOnReconnect"
+      ],
+      "reception_groups": [
+        "A",
+        "B",
+        "C"
+      ]
+    },
+    {
+      "id": "qos0.durable.consume",
+      "machine": "ConsumedQos0",
+      "state_class": "Queued",
+      "event_class": "WorkDiscovered",
+      "guard": "An admitted QoS 0 obligation and payload have been loaded within volatile budgets. Capture its original destination generation; create no QoS 1 claim or outgoing Packet Identifier.",
+      "next_state_class": "ConsumePending",
+      "required_actions": [
+        "PersistConsumeDelivery",
+        "ArmDeadline"
+      ],
+      "forbidden_actions": [
+        "EmitQos0",
+        "CreateClaim",
+        "AwaitPuback"
+      ],
+      "reception_groups": [
+        "D",
+        "F",
+        "H"
+      ]
+    },
+    {
+      "id": "qos0.durable.unknown",
+      "machine": "ConsumedQos0",
+      "state_class": "ConsumePending",
+      "event_class": "UnknownOutcome",
+      "guard": "The original consumption operation remains uncertain. Absence, timeout and closure neither establish consumption nor authorize emission.",
+      "next_state_class": "ConsumePending",
+      "required_actions": [
+        "ResolveAndFence"
+      ],
+      "forbidden_actions": [
+        "EmitQos0",
+        "NewOperationIdentity"
+      ],
+      "reception_groups": [
+        "D",
+        "E"
+      ]
+    },
+    {
+      "id": "qos0.durable.consumed",
+      "machine": "ConsumedQos0",
+      "state_class": "ConsumePending",
+      "event_class": "KnownCommit",
+      "guard": "The correlated conditional consumption ended the obligation and decremented its reference exactly once. Retain the necessary bytes in RAM; eligibility names only the original live generation.",
+      "next_state_class": "EmissionPending",
+      "required_actions": [
+        "RetainVolatilePayload",
+        "EligibleSingleQos0Emission"
+      ],
+      "forbidden_actions": [
+        "CreateClaim",
+        "ReleaseUnconsumedReference",
+        "ReplayOnReconnect"
+      ],
+      "reception_groups": [
+        "D",
+        "E",
+        "F"
+      ]
+    },
+    {
+      "id": "qos0.durable.closed",
+      "machine": "ConsumedQos0",
+      "state_class": "EmissionPending",
+      "event_class": "OriginalGenerationClosed",
+      "guard": "Consumption is known but its captured destination generation is no longer authorized. Loss is permitted and explicit; another connection gains no emission permission.",
+      "next_state_class": "Dropped",
+      "required_actions": [
+        "ObserveQos0Drop"
+      ],
+      "forbidden_actions": [
+        "EmitOnNewConnection",
+        "RecreateObligation"
+      ],
+      "reception_groups": [
+        "C",
+        "D",
+        "E"
+      ]
+    },
+    {
+      "id": "qos0.durable.transferred",
+      "machine": "ConsumedQos0",
+      "state_class": "EmissionPending",
+      "event_class": "AdapterAccepted",
+      "guard": "The one volatile emission has transferred. Neither a local write receipt nor a repeated store answer recreates this consumed permission.",
+      "next_state_class": "Terminal",
+      "required_actions": [
+        "TransferVolatileEmission"
+      ],
+      "forbidden_actions": [
+        "AwaitPuback",
+        "EmitAgain",
+        "RecreateObligation"
+      ],
+      "reception_groups": [
+        "D",
+        "E",
+        "H"
+      ]
+    },
+    {
+      "id": "qos0.durable.recovery",
+      "machine": "ConsumedQos0",
+      "state_class": "Terminal",
+      "event_class": "RecoveredReceipt",
+      "guard": "Historical consumed operation knowledge is not live work. Only obligations still present before consumption can reappear in bounded work reads.",
+      "next_state_class": "Terminal",
+      "required_actions": [],
+      "forbidden_actions": [
+        "EmitQos0",
+        "RecreateObligation",
+        "CreateClaim"
+      ],
+      "reception_groups": [
+        "E",
+        "H"
       ]
     }
   ]

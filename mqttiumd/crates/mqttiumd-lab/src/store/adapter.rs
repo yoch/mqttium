@@ -140,6 +140,8 @@ pub enum WorkKind {
     ChangeSubscriptions,
     ClaimDelivery,
     FinishDelivery,
+    ConsumeDelivery,
+    UpdateSubscriptions,
     ResolveAndFence,
     OpenEpoch,
 }
@@ -154,6 +156,8 @@ impl WorkKind {
             Self::ChangeSubscriptions => "ChangeSubscriptions",
             Self::ClaimDelivery => "ClaimDelivery",
             Self::FinishDelivery => "FinishDelivery",
+            Self::ConsumeDelivery => "ConsumeDelivery",
+            Self::UpdateSubscriptions => "UpdateSubscriptions",
             Self::ResolveAndFence => "ResolveAndFence",
             Self::OpenEpoch => "OpenEpoch",
         }
@@ -472,6 +476,12 @@ fn describe(work: &Work) -> (WorkKind, Option<OperationId>, Source) {
             Recipe::ClaimDelivery(claim) => (WorkKind::ClaimDelivery, Some(claim.operation), None),
             Recipe::FinishDelivery(finish) => {
                 (WorkKind::FinishDelivery, Some(finish.operation), None)
+            }
+            Recipe::ConsumeDelivery(consume) => {
+                (WorkKind::ConsumeDelivery, Some(consume.operation), None)
+            }
+            Recipe::UpdateSubscriptions(change) => {
+                (WorkKind::UpdateSubscriptions, Some(change.operation), None)
             }
         },
         Work::Resolve(operation) => (WorkKind::ResolveAndFence, Some(*operation), None),

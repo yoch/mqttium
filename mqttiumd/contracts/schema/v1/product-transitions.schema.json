@@ -22,10 +22,10 @@
       "const": 1
     },
     "id": {
-      "const": "tcp-exact-pubsub-v1"
+      "const": "tcp-qos0-exact-pubsub-v1"
     },
     "decision": {
-      "const": "0025"
+      "const": "0026"
     },
     "scope": {
       "const": "product-system-tests"
@@ -63,7 +63,9 @@
           "machine": {
             "enum": [
               "SubscriptionMutation",
-              "OutgoingQos1"
+              "OutgoingQos1",
+              "VolatileQos0",
+              "ConsumedQos0"
             ]
           },
           "state_class": {
@@ -75,7 +77,10 @@
               "ClaimPending",
               "AwaitPuback",
               "FinishPending",
-              "Terminal"
+              "Terminal",
+              "ConsumePending",
+              "EmissionPending",
+              "Dropped"
             ]
           },
           "event_class": {
@@ -95,7 +100,10 @@
               "ClaimPending",
               "AwaitPuback",
               "FinishPending",
-              "Terminal"
+              "Terminal",
+              "ConsumePending",
+              "EmissionPending",
+              "Dropped"
             ]
           },
           "required_actions": {

@@ -615,12 +615,14 @@ impl<S: DurableStore> EffectSink for Sink<'_, S> {
                 SubmitResult::Accepted
             }
             // No adapter of S0 takes these: the box keeps them.
-            Effect::LoadWork { .. } | Effect::EmitPublish { .. } | Effect::Continue { .. } => {
-                SubmitResult::NotSubmitted {
-                    effect,
-                    reason: SubmitBlock::Closed,
-                }
-            }
+            Effect::LoadWork { .. }
+            | Effect::EmitPublish { .. }
+            | Effect::EmitQos0 { .. }
+            | Effect::Qos0Dropped { .. }
+            | Effect::Continue { .. } => SubmitResult::NotSubmitted {
+                effect,
+                reason: SubmitBlock::Closed,
+            },
         }
     }
 }

@@ -252,7 +252,8 @@
                             "InboundReleased",
                             "SubscriptionsChanged",
                             "DeliveryClaimed",
-                            "DeliveryFinished"
+                            "DeliveryFinished",
+                            "DeliveryConsumed"
                           ]
                         }
                       },
@@ -425,6 +426,38 @@
                               },
                               "claim_operation_id": {
                                 "$ref": "primitives.schema.json#/$defs/operation_id"
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "if": {
+                            "required": [
+                              "kind"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "DeliveryConsumed"
+                              }
+                            }
+                          },
+                          "then": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "kind",
+                              "delivery_id",
+                              "target_session"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "DeliveryConsumed"
+                              },
+                              "delivery_id": {
+                                "$ref": "primitives.schema.json#/$defs/delivery_id"
+                              },
+                              "target_session": {
+                                "$ref": "primitives.schema.json#/$defs/u64"
                               }
                             }
                           }

@@ -1974,6 +1974,7 @@
               "delivery_id",
               "target_session",
               "target_revision",
+              "qos",
               "claim"
             ],
             "properties": {
@@ -2011,8 +2012,34 @@
                     }
                   }
                 ]
+              },
+              "qos": {
+                "$ref": "primitives.schema.json#/$defs/qos"
               }
-            }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "required": [
+                    "qos"
+                  ],
+                  "properties": {
+                    "qos": {
+                      "not": {
+                        "const": 1
+                      }
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "claim": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ]
           }
         },
         {

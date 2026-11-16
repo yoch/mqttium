@@ -206,7 +206,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
     for record in run.trace.records:
         payload = record.payload
         unsupported |= payload.get("command_kind") in {
-            "ChangeSubscriptions", "ChangeSubscriptionsQos", "ClaimDelivery", "FinishDelivery"
+            "ChangeSubscriptions", "UpdateSubscriptions", "ClaimDelivery", "FinishDelivery"
         }
         qos0_delivery |= payload.get("command_kind") == "ConsumeDelivery"
         non_qos2 |= (record.kind == "ClientBytesReceived"

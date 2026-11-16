@@ -52,6 +52,7 @@
     "contracts/examples/v1/valid/trace-record-recovery-page-read.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-outbound-queued.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-outbound-claimed.json",
+    "contracts/examples/v1/valid/trace-record-recovery-page-outbound-qos0.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-delivered.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-with-routes-and-limits.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-of-routes-only.json",
@@ -71,6 +72,8 @@
     "contracts/examples/v1/valid/store-snapshot-subscription-receipt.json",
     "contracts/examples/v1/valid/store-snapshot-delivery-claim-receipt.json",
     "contracts/examples/v1/valid/store-snapshot-delivery-finish-receipt.json",
+    "contracts/examples/v1/valid/store-snapshot-subscription-qos0-receipt.json",
+    "contracts/examples/v1/valid/store-snapshot-delivery-consume-receipt.json",
     "contracts/examples/v1/valid/store-snapshot-empty.json",
     "contracts/examples/v1/valid/store-snapshot-orphan-obligation.json",
     "contracts/examples/v1/valid/store-snapshot-refused-and-fenced.json",
@@ -777,6 +780,12 @@
       "why": "S0 fixtures hold persistent sessions only."
     },
     {
+      "file": "contracts/examples/v1/invalid/trace-record-recovery-page-qos0-claim.json",
+      "code": "schema-violation",
+      "pointer": "/payload/facts/3/claim",
+      "why": "QoS 0 has no outgoing Packet Identifier or QoS 1 claim."
+    },
+    {
       "file": "contracts/examples/v1/invalid/trace-record-recovery-page-from-the-bench.json",
       "code": "schema-violation",
       "pointer": "/origin_component",
@@ -1189,6 +1198,12 @@
       "code": "u64-out-of-range",
       "pointer": "/outbound/0/claim_operation_id/sequence",
       "why": "Outgoing claim rows retain bounded identities, unique DeliveryIds and valid packet identifiers."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-consumed-with-packet-id.json",
+      "code": "schema-violation",
+      "pointer": "/operations/1/decision/facts",
+      "why": "A consumed QoS 0 obligation never has an outgoing MQTT Packet Identifier."
     },
     {
       "file": "contracts/examples/v1/invalid/store-snapshot-target-limit-over-32-bits.json",

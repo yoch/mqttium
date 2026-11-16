@@ -54,6 +54,7 @@
         },
         "target_session": "2",
         "target_revision": "1",
+        "qos": 1,
         "claim": {
           "operation_id": {
             "incarnation": "1",

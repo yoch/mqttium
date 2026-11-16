@@ -1555,6 +1555,7 @@ pub fn representative_fact(kind: &str, topic_hex: &str) -> Option<RecoveredFact>
             },
             target: SessionId::new(0),
             target_revision: Revision::new(0),
+            qos: mqttiumd_contract::packet::Qos::AtLeastOnce,
             claim: None,
         },
         "Operation" => RecoveredFact::Operation {

@@ -1,0 +1,72 @@
+{
+  "format": "mqttiumd.trace-record",
+  "schema_version": 1,
+  "run_id": "p1-02-example",
+  "record_sequence": "14",
+  "origin_component": "store-adapter",
+  "origin_incarnation": "1",
+  "origin_sequence": "2",
+  "causal_parents": [],
+  "time_domain": "logical-step",
+  "time_value": "14",
+  "kind": "RecoveryPageRead",
+  "payload": {
+    "run_epoch": "2",
+    "page": "0",
+    "last": true,
+    "facts": [
+      {
+        "kind": "Epoch",
+        "incarnation": "1",
+        "epoch": "2"
+      },
+      {
+        "kind": "Session",
+        "session": "1",
+        "client_id_hex": "70312d70726f6475636572",
+        "revision": "1"
+      },
+      {
+        "kind": "InboundExchange",
+        "exchange": {
+          "session": "1",
+          "generation": "1"
+        },
+        "packet_id": 7,
+        "publication": {
+          "incarnation": "1",
+          "epoch": "1",
+          "owner": "0",
+          "sequence": "1"
+        },
+        "phase": "AwaitPubrel"
+      },
+      {
+        "kind": "OutboundDelivery",
+        "delivery_id": {
+          "publication_id": {
+            "incarnation": "1",
+            "epoch": "1",
+            "owner": "0",
+            "sequence": "1"
+          },
+          "index": 0
+        },
+        "target_session": "2",
+        "target_revision": "1",
+        "qos": 0,
+        "claim": null
+      },
+      {
+        "kind": "Operation",
+        "operation_id": {
+          "incarnation": "1",
+          "epoch": "1",
+          "owner": "0",
+          "sequence": "1"
+        },
+        "knowledge": "Committed"
+      }
+    ]
+  }
+}

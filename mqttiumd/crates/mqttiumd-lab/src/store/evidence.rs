@@ -123,6 +123,10 @@ fn reason(reason: RejectReason) -> &'static str {
 
 fn facts(facts: CommitFacts) -> Value {
     match facts {
+        CommitFacts::DeliveryConsumed { delivery, target } => json!({
+            "kind": "DeliveryConsumed", "delivery_id": delivery_id(delivery),
+            "target_session": session(target),
+        }),
         CommitFacts::PublicationAdmitted {
             publication,
             exchange,
@@ -447,12 +451,14 @@ pub fn recovered_fact(fact: &RecoveredFact) -> Value {
             delivery,
             target,
             target_revision,
+            qos,
             claim,
         } => json!({
             "kind": "OutboundDelivery",
             "delivery_id": delivery_id(*delivery),
             "target_session": session(*target),
             "target_revision": decimal(target_revision.get()),
+            "qos": qos.to_wire(),
             "claim": claim.map(|claim| json!({
                 "operation_id": operation_id(claim.operation),
                 "packet_id": claim.packet_id.get(),
@@ -767,7 +773,9 @@ impl<'a> TraceWriter<'a> {
                     | WorkKind::ReleaseInbound
                     | WorkKind::ChangeSubscriptions
                     | WorkKind::ClaimDelivery
-                    | WorkKind::FinishDelivery => self.record(
+                    | WorkKind::FinishDelivery
+                    | WorkKind::ConsumeDelivery
+                    | WorkKind::UpdateSubscriptions => self.record(
                         "store-adapter",
                         "CommandSubmitted",
                         &[],

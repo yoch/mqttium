@@ -71,7 +71,10 @@
         "claim.prepared",
         "finish.prepared",
         "claim.committed",
-        "finish.committed"
+        "finish.committed",
+        "consume.prepared",
+        "consume.committed",
+        "consume.emission"
       ]
     },
     "command_kind": {
@@ -80,7 +83,8 @@
         "Release",
         "Subscriptions",
         "Claim",
-        "Finish"
+        "Finish",
+        "Consume"
       ]
     },
     "cause": {

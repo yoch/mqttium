@@ -17,6 +17,8 @@ RELEASE_INBOUND = 2
 CHANGE_SUBSCRIPTIONS = 3
 CLAIM_DELIVERY = 4
 FINISH_DELIVERY = 5
+CONSUME_DELIVERY = 6
+UPDATE_SUBSCRIPTIONS = 7
 
 
 class RecipeError(ValueError):
@@ -99,6 +101,28 @@ class Finish(Claim):
     kind = "FinishDelivery"
 
 
+@dataclass(frozen=True)
+class Consume:
+    operation: tuple
+    publication: tuple
+    index: int
+    target: int
+    target_revision: int
+
+    kind = "ConsumeDelivery"
+
+
+@dataclass(frozen=True)
+class GrantedSubscriptionChange:
+    topic: bytes
+    granted: int | None
+
+
+@dataclass(frozen=True)
+class UpdateSubscriptions(Subscriptions):
+    kind = "UpdateSubscriptions"
+
+
 class _Reader:
     def __init__(self, data: bytes) -> None:
         self.data = data
@@ -168,7 +192,7 @@ def decode(data: bytes):
         recipe = Release(reader.scoped(), reader.number(8), reader.number(2), reader.number(8))
         if recipe.packet_id == 0:
             raise RecipeError("invalid field")
-    elif kind == CHANGE_SUBSCRIPTIONS:
+    elif kind in (CHANGE_SUBSCRIPTIONS, UPDATE_SUBSCRIPTIONS):
         operation = reader.scoped()
         session, revision, route_revision = (reader.number(8) for _ in range(3))
         count = reader.number(1)
@@ -182,16 +206,22 @@ def decode(data: bytes):
                 topic.decode("utf-8", errors="strict")
             except UnicodeDecodeError as error:
                 raise RecipeError("invalid exact filter") from error
-            if subscribe not in (0, 1) or not topic or any(byte in topic for byte in (0, 35, 43)):
+            if (subscribe not in ((0, 1) if kind == CHANGE_SUBSCRIPTIONS else (0, 1, 2))
+                    or not topic or any(byte in topic for byte in (0, 35, 43))):
                 raise RecipeError("invalid exact filter")
-            changes.append(SubscriptionChange(topic, bool(subscribe)))
-        recipe = Subscriptions(operation, session, revision, route_revision, tuple(changes))
+            changes.append(SubscriptionChange(topic, bool(subscribe)) if kind == CHANGE_SUBSCRIPTIONS
+                           else GrantedSubscriptionChange(topic, None if subscribe == 0 else subscribe - 1))
+        cls = Subscriptions if kind == CHANGE_SUBSCRIPTIONS else UpdateSubscriptions
+        recipe = cls(operation, session, revision, route_revision, tuple(changes))
     elif kind in (CLAIM_DELIVERY, FINISH_DELIVERY):
         fields = (reader.scoped(), reader.scoped(), reader.number(4),
                   reader.number(8), reader.number(8), reader.number(2))
         if fields[-1] == 0:
             raise RecipeError("invalid outbound packet identifier")
         recipe = Claim(*fields) if kind == CLAIM_DELIVERY else Finish(*fields, reader.scoped())
+    elif kind == CONSUME_DELIVERY:
+        recipe = Consume(reader.scoped(), reader.scoped(), reader.number(4),
+                         reader.number(8), reader.number(8))
     else:
         raise RecipeError("unknown kind")
     if reader.at != len(data):

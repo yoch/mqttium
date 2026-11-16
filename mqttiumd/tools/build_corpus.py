@@ -1562,6 +1562,7 @@ OUTBOUND_QUEUED = {
     "delivery_id": {"publication_id": PUBLICATION, "index": 0},
     "target_session": "2",
     "target_revision": "1",
+    "qos": 1,
     "claim": None,
 }
 OUTBOUND_CLAIMED = {
@@ -1573,6 +1574,15 @@ for name, fact in [("queued", OUTBOUND_QUEUED), ("claimed", OUTBOUND_CLAIMED)]:
     page["facts"].insert(-1, fact)
     ok(f"trace-record-recovery-page-outbound-{name}.json",
        record(14, "store-adapter", 2, "RecoveryPageRead", page))
+qos0_page = copy.deepcopy(PAGE)
+qos0_page["facts"].insert(-1, {**OUTBOUND_QUEUED, "qos": 0})
+ok("trace-record-recovery-page-outbound-qos0.json",
+   record(14, "store-adapter", 2, "RecoveryPageRead", qos0_page))
+qos0_claim_record = record(14, "store-adapter", 2, "RecoveryPageRead", copy.deepcopy(qos0_page))
+qos0_claim_record["payload"]["facts"][3]["claim"] = OUTBOUND_CLAIMED["claim"]
+bad("trace-record-recovery-page-qos0-claim.json", "schema-violation", "/payload/facts/3/claim",
+    "QoS 0 has no outgoing Packet Identifier or QoS 1 claim.",
+    qos0_claim_record)
 ok(
     "trace-record-recovery-page-delivered.json",
     record(15, "broker-core", 3, "RecoveryPageDelivered", PAGE, [("store-adapter", 2)]),
@@ -2381,6 +2391,32 @@ finished_snapshot["obligations"].pop(0)
 finished_snapshot["payloads"][0]["references"] = "1"
 finished_snapshot["account"]["used"].update(references="1", exchange_slots="1", receipt_slots="3")
 ok("store-snapshot-delivery-finish-receipt.json", finished_snapshot)
+granted_snapshot = copy.deepcopy(snapshot)
+granted_snapshot["operations"].append(product_operation(
+    24, 7, be(2) + be(1) + be(2) + be(1, 1) + be(1, 1) + be(10, 2) + b"p1/example".hex(),
+    {"kind": "SubscriptionsChanged", "session": "2", "route_revision": "3"},
+))
+granted_snapshot["route_table"]["revision"] = "3"
+granted_snapshot["route_table"]["routes"][0]["targets"][0]["qos"] = 0
+granted_snapshot["account"]["used"]["receipt_slots"] = "2"
+ok("store-snapshot-subscription-qos0-receipt.json", granted_snapshot)
+consumed_snapshot = copy.deepcopy(snapshot)
+consumed_snapshot["route_table"]["routes"][0]["targets"][0]["qos"] = 0
+qos0_recipe = bytearray.fromhex(RECIPE_HEX)
+qos0_recipe[-24] = 0  # First target QoS; the canonical kind-1 layout is unchanged.
+consumed_snapshot["operations"][0]["recipe_hex"] = qos0_recipe.hex()
+consumed_snapshot["operations"].append(product_operation(
+    25, 6, scoped(1) + be(0, 4) + be(2) + be(1),
+    {"kind": "DeliveryConsumed", "delivery_id": OUTBOUND_SLOT["delivery_id"],
+     "target_session": "2"},
+))
+consumed_snapshot["obligations"].pop(0)
+consumed_snapshot["payloads"][0]["references"] = "1"
+consumed_snapshot["account"]["used"].update(references="1", receipt_slots="2")
+ok("store-snapshot-delivery-consume-receipt.json", consumed_snapshot)
+bad("store-snapshot-consumed-with-packet-id.json", "schema-violation", "/operations/1/decision/facts",
+    "A consumed QoS 0 obligation never has an outgoing MQTT Packet Identifier.",
+    edited(consumed_snapshot, lambda v: v["operations"][1]["decision"]["facts"].update(packet_id=1)))
 ok(
     "store-snapshot-empty.json",
     env(

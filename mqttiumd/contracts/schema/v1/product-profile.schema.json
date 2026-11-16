@@ -38,7 +38,9 @@
     "max_subscriptions",
     "max_outgoing_per_connection",
     "work_page_items",
-    "max_targets_per_admission"
+    "max_targets_per_admission",
+    "outgoing_qos",
+    "granted_subscription_qos"
   ],
   "properties": {
     "format": {
@@ -48,7 +50,7 @@
       "const": 1
     },
     "id": {
-      "const": "tcp-exact-pubsub-v1"
+      "const": "tcp-qos0-exact-pubsub-v1"
     },
     "mqtt_version": {
       "const": 5
@@ -64,6 +66,7 @@
     },
     "incoming_qos": {
       "const": [
+        0,
         1,
         2
       ]
@@ -151,6 +154,18 @@
     },
     "max_targets_per_admission": {
       "const": 16
+    },
+    "outgoing_qos": {
+      "const": [
+        0,
+        1
+      ]
+    },
+    "granted_subscription_qos": {
+      "const": [
+        0,
+        1
+      ]
     }
   }
 }

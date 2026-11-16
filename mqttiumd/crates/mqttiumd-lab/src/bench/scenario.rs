@@ -189,6 +189,8 @@ fn work_kind(name: &str) -> Result<WorkKind, String> {
         WorkKind::ChangeSubscriptions,
         WorkKind::ClaimDelivery,
         WorkKind::FinishDelivery,
+        WorkKind::ConsumeDelivery,
+        WorkKind::UpdateSubscriptions,
         WorkKind::ResolveAndFence,
         WorkKind::OpenEpoch,
     ]

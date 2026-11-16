@@ -1,12 +1,13 @@
 {
   "format": "mqttiumd.product-profile",
   "schema_version": 1,
-  "id": "tcp-exact-pubsub-v1",
+  "id": "tcp-qos0-exact-pubsub-v1",
   "mqtt_version": 5,
   "client_id": "explicit",
   "clean_start": false,
   "session_expiry_interval": 4294967295,
   "incoming_qos": [
+    0,
     1,
     2
   ],
@@ -37,5 +38,13 @@
   "max_subscriptions": 128,
   "max_outgoing_per_connection": 8,
   "work_page_items": 8,
-  "max_targets_per_admission": 16
+  "max_targets_per_admission": 16,
+  "outgoing_qos": [
+    0,
+    1
+  ],
+  "granted_subscription_qos": [
+    0,
+    1
+  ]
 }

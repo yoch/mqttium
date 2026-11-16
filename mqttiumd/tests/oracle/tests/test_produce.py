@@ -421,7 +421,7 @@ class Campaign(unittest.TestCase):
                 "kind": "OutboundDelivery",
                 "delivery_id": {"publication_id": obligation["publication_id"],
                                 "index": obligation["index"]},
-                "target_session": obligation["session"], "target_revision": "1", "claim": None,
+                "target_session": obligation["session"], "target_revision": "1", "qos": 1, "claim": None,
             }
             at = next((i for i, old in enumerate(page["facts"]) if old["kind"] == "Operation"),
                       len(page["facts"]))
@@ -442,7 +442,7 @@ class Campaign(unittest.TestCase):
                     "delivery_id": {"publication_id": {
                         "incarnation": "1", "epoch": "1", "owner": "0", "sequence": "900"
                     }, "index": 0},
-                    "target_session": "2", "target_revision": "1", "claim": None,
+                    "target_session": "2", "target_revision": "1", "qos": 1, "claim": None,
                 })
 
         self.revise_evidence(recovery_edit=recovered)
