@@ -419,7 +419,7 @@ fn business_response(
                         };
                         if applied.committed_now
                             && let Some(point) = point
-                            && hooks.barrier(point, kind, id, &events, &cancel).is_err()
+                            && hooks.barrier(point, kind, id, events, cancel).is_err()
                         {
                             cancel.store(true, Ordering::Relaxed);
                         }
