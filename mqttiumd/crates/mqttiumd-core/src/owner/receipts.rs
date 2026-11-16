@@ -54,6 +54,10 @@ impl State {
         })
     }
 
+    pub(super) fn control_available(&self) -> bool {
+        self.check(ReceiptClass::Control).is_ok()
+    }
+
     fn check(&self, class: ReceiptClass) -> Result<(), Stop> {
         if !self.enabled {
             return Ok(());
@@ -260,6 +264,9 @@ impl Owner {
         &self,
         draft: &mut Draft,
     ) -> Result<super::Change, Stop> {
+        if let Some(change) = self.plan_release_wake(draft)? {
+            return Ok(change);
+        }
         if self.receipts.pending.is_some() {
             return Ok(super::Change::Nothing);
         }

@@ -38,11 +38,11 @@ use crate::contract::effects::{
     ReplaceRefusal, RetireRefusal,
 };
 use crate::contract::ids::{
-    AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, DeliveryId, EffectId, EffectSeq,
-    ExchangeGeneration, ExchangeId, Exhausted, InboundPacketId, LeaseGeneration, LeaseKey,
-    LogicalDuration, LogicalOwnerId, OperationId, OperationSeq, PayloadId, PayloadSeq,
-    PublicationId, PublicationSeq, RequestId, RequestSeq, Revision, RunEpoch, SessionId,
-    StoreIncarnation,
+    AccountId, ConnectionGeneration, ConnectionKey, ContinuationId, DeadlineToken, DeliveryId,
+    EffectId, EffectSeq, ExchangeGeneration, ExchangeId, Exhausted, InboundPacketId,
+    LeaseGeneration, LeaseKey, LogicalDuration, LogicalOwnerId, OperationId, OperationSeq,
+    PayloadId, PayloadSeq, PublicationId, PublicationSeq, RequestId, RequestSeq, Revision,
+    RunEpoch, SessionId, StoreIncarnation,
 };
 use crate::contract::outcome::{
     CommitFacts, RejectReason, StoreOutcome, StoreReply, StoreViolation,
@@ -352,6 +352,8 @@ enum SlotState {
     AdmissionPending(InFlight),
     AwaitPubrel,
     ReleasePending(InFlight),
+    /// A known fenced termination awaits room for a fresh preparation.
+    ReleaseRetry(Finished),
     /// The admission ended, but its own PUBACK frame is still outstanding.
     /// A later PUBLISH may reuse the Packet Identifier before this frame's
     /// write receipt is processed. Only effect + generation identifies it.
@@ -390,7 +392,9 @@ impl Slot {
             SlotState::AdmissionPending(in_flight) | SlotState::ReleasePending(in_flight) => {
                 Some(in_flight)
             }
-            SlotState::AwaitPubrel | SlotState::AckPending { .. } => None,
+            SlotState::AwaitPubrel | SlotState::ReleaseRetry(_) | SlotState::AckPending { .. } => {
+                None
+            }
         }
     }
 }
@@ -492,7 +496,16 @@ enum Change {
     },
     /// The durable termination of the exchange is submitted, after the
     /// one the store refused if there was one.
+    ReleaseDeferred {
+        slot: usize,
+        refused: Finished,
+    },
+    ReleaseWake {
+        continuation: ContinuationId,
+    },
+    ReleaseYield,
     Release {
+        resumed: bool,
         slot: usize,
         in_flight: InFlight,
         refused: Option<Finished>,
@@ -708,6 +721,8 @@ pub struct Owner {
     resolution_delay: LogicalDuration,
     pubsub: pubsub::State,
     receipts: receipts::State,
+    release_continuation: Option<ContinuationId>,
+    release_continuations_started: bool,
     /// The one box of this owner. A renewal replaces it in place.
     outbox: Outbox,
 }
@@ -820,6 +835,8 @@ impl Owner {
             resolution_delay: config.resolution_delay,
             pubsub,
             receipts,
+            release_continuation: None,
+            release_continuations_started: false,
             outbox,
         })
     }
@@ -921,7 +938,9 @@ impl Owner {
         let phase = match slot.state {
             SlotState::AdmissionPending(_) => ExchangePhase::AdmissionPending,
             SlotState::AwaitPubrel => ExchangePhase::AwaitPubrel,
-            SlotState::ReleasePending(_) => ExchangePhase::ReleasePending,
+            SlotState::ReleasePending(_) | SlotState::ReleaseRetry(_) => {
+                ExchangePhase::ReleasePending
+            }
             SlotState::AckPending { .. } => return None,
         };
         Some((slot.exchange, phase))
@@ -1005,7 +1024,16 @@ impl Owner {
         let Input::Recovery { facts, last } = input else {
             return WorkUnits::new(
                 1u64.saturating_add(self.pubsub.work_bound(input, self.routes.capacity()))
-                    .saturating_add(self.receipts.work(input)),
+                    .saturating_add(self.receipts.work(input))
+                    .saturating_add(
+                        if self.receipts.enabled
+                            && matches!(input, Input::MaintainReceipts | Input::Continue { .. })
+                        {
+                            capacity_of(self.slots.capacity())
+                        } else {
+                            0
+                        },
+                    ),
             );
         };
         let routes = capacity_of(self.routes.capacity());
@@ -1165,7 +1193,7 @@ impl Owner {
             Input::ConnectionClosed { connection } => {
                 self.plan_connection_closed(*connection, draft)
             }
-            Input::Continue { continuation, .. } => self.plan_qos0_continue(*continuation, draft),
+            Input::Continue { continuation, .. } => self.plan_continue(*continuation, draft),
             Input::Recovery { .. } => Err(IMPOSSIBLE),
             // A wake-up carries no authority, and this perimeter keeps no
             // work behind one.
@@ -1450,7 +1478,9 @@ impl Owner {
                         })
                     }
                     // After its PUBREL a client may only resend PUBREL.
-                    SlotState::ReleasePending(_) => protocol_error(draft),
+                    SlotState::ReleasePending(_) | SlotState::ReleaseRetry(_) => {
+                        protocol_error(draft)
+                    }
                     SlotState::AckPending { .. } => Err(IMPOSSIBLE),
                 }
             }
@@ -1472,7 +1502,9 @@ impl Owner {
                     SlotState::AdmissionPending(_) => protocol_error(draft),
                     SlotState::AwaitPubrel => self.plan_release(slot, None, draft),
                     // No second release, and no PUBCOMP before the commit.
-                    SlotState::ReleasePending(_) => Ok(Change::Nothing),
+                    SlotState::ReleasePending(_) | SlotState::ReleaseRetry(_) => {
+                        Ok(Change::Nothing)
+                    }
                     SlotState::AckPending { .. } => Err(IMPOSSIBLE),
                 }
             }
@@ -1676,6 +1708,63 @@ impl Owner {
         })
     }
 
+    /// One counted wake represents all deferred known-fenced releases. It
+    /// is scheduled only after an absolute confirmed prefix leaves room.
+    fn plan_release_wake(&self, draft: &mut Draft) -> Result<Option<Change>, Stop> {
+        if !self.receipts.enabled
+            || self.release_continuation.is_some()
+            || !self.receipts.control_available()
+            || !self
+                .slots
+                .as_slice()
+                .iter()
+                .any(|slot| matches!(slot.state, SlotState::ReleaseRetry(_)))
+        {
+            return Ok(None);
+        }
+        let continuation = draw(
+            &mut draft.counters.continuation,
+            ContinuationId::checked_next,
+        )?;
+        draft.emit(Effect::Continue { continuation })?;
+        Ok(Some(Change::ReleaseWake { continuation }))
+    }
+
+    fn plan_continue(
+        &self,
+        continuation: ContinuationId,
+        draft: &mut Draft,
+    ) -> Result<Change, Stop> {
+        if self.release_continuation == Some(continuation) {
+            // Another control may have used the available room since the
+            // wake. Consume this wake without spinning or losing the work;
+            // a subsequent confirmed prefix makes it eligible again.
+            if !self.receipts.control_available() {
+                return Ok(Change::ReleaseYield);
+            }
+            let Some((slot, refused)) =
+                self.slots
+                    .as_slice()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(slot, held)| match held.state {
+                        SlotState::ReleaseRetry(refused) => Some((slot, refused)),
+                        _ => None,
+                    })
+            else {
+                return Err(IMPOSSIBLE);
+            };
+            return self.plan_release(slot, Some(refused), draft);
+        }
+        if self.release_continuations_started
+            && self.pubsub.continuation != Some(continuation)
+            && issued(continuation, self.counters.continuation)
+        {
+            return Ok(Change::Nothing);
+        }
+        self.plan_qos0_continue(continuation, draft)
+    }
+
     /// PUBREL, or a release the store certainly refused: the durable
     /// termination is submitted under a new operation.
     fn plan_release(
@@ -1694,6 +1783,7 @@ impl Owner {
         });
         let in_flight = self.plan_submission(operation, recipe, None, draft)?;
         Ok(Change::Release {
+            resumed: matches!(held.state, SlotState::ReleaseRetry(_)),
             slot,
             in_flight,
             refused,
@@ -1887,7 +1977,14 @@ impl Owner {
                     RejectReason::Fenced
                         if slot.release_preparations < MAX_RELEASE_PREPARATIONS =>
                     {
-                        self.plan_release(index, Some(finished), draft)
+                        if self.receipts.enabled && !self.receipts.control_available() {
+                            Ok(Change::ReleaseDeferred {
+                                slot: index,
+                                refused: finished,
+                            })
+                        } else {
+                            self.plan_release(index, Some(finished), draft)
+                        }
                     }
                     reason => Err(Stop::Fatal(CoreFault::ReleaseRefused { operation, reason })),
                 }
@@ -1918,6 +2015,15 @@ impl Owner {
             .as_slice()
             .iter()
             .filter_map(|slot| slot.admission)
+            .chain(
+                self.slots
+                    .as_slice()
+                    .iter()
+                    .filter_map(|slot| match slot.state {
+                        SlotState::ReleaseRetry(finished) => Some(finished),
+                        _ => None,
+                    }),
+            )
             .chain(self.finished.iter().copied())
             .chain(self.pubsub.known(operation))
             .find(|finished| finished.operation == operation);
@@ -2375,13 +2481,26 @@ impl Owner {
                     in_flight.answers = in_flight.answers.with(effect);
                 }
             }
+            Change::ReleaseDeferred { slot, refused } => {
+                let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
+                held.state = SlotState::ReleaseRetry(refused);
+            }
+            Change::ReleaseWake { continuation } => {
+                self.release_continuation = Some(continuation);
+                self.release_continuations_started = true;
+            }
+            Change::ReleaseYield => self.release_continuation = None,
             Change::Release {
+                resumed,
                 slot,
                 in_flight,
                 refused,
             } => {
                 let held = self.slots.as_mut_slice().get_mut(slot).ok_or(STALE)?;
                 held.state = SlotState::ReleasePending(in_flight);
+                if resumed {
+                    self.release_continuation = None;
+                }
                 held.release_preparations = held.release_preparations.saturating_add(1);
                 if let Some(refused) = refused {
                     remember(&mut self.finished, refused)?;
@@ -2578,6 +2697,7 @@ mod tests {
         subscription: Option<ControlSnapshot>,
         leases: (Credits, Vec<crate::leases::LeaseSlotView>),
         receipts: receipts::test_support::Snapshot,
+        release_continuation: (Option<ContinuationId>, bool),
         finished: Vec<Finished>,
         closed: Vec<ConnectionGeneration>,
         waiting: Vec<EffectId>,
@@ -3016,6 +3136,10 @@ mod tests {
             let owner = &self.owner;
             Snapshot {
                 receipts: owner.receipts.snapshot(),
+                release_continuation: (
+                    owner.release_continuation,
+                    owner.release_continuations_started,
+                ),
                 revision: owner.revision,
                 counters: owner.counters,
                 recovery: owner.recovery.clone(),
@@ -8557,6 +8681,27 @@ mod tests {
         );
         assert_eq!(world.owner.receipt_status().unwrap().2, 0);
         assert_eq!(world.phase(7), Some(ExchangePhase::ReleasePending));
+        gc_apply(
+            &mut world,
+            result(
+                &release,
+                StoreOutcome::RejectedCertain(RejectReason::Fenced),
+            ),
+        );
+        assert!(
+            world.drain().is_empty(),
+            "duplicate old refusal cannot schedule another retry"
+        );
+        gc_apply(&mut world, deadline(release.deadline));
+        assert!(
+            world.drain().is_empty(),
+            "the terminal operation's old timer is stale"
+        );
+        gc_apply(&mut world, pubrel(7));
+        assert!(
+            world.drain().is_empty(),
+            "client replay cannot create a parallel preparation"
+        );
         gc_apply(&mut world, Input::MaintainReceipts);
         let collection_effects = world.drain();
         let Effect::CollectReceipts { collection } = collection_effects[0].1 else {
@@ -8605,5 +8750,31 @@ mod tests {
             }
         );
         assert_eq!(world.owner.receipt_status().unwrap().1, 897);
+        let operation = command.operation;
+        let exchange = command.exchange;
+        gc_apply(
+            &mut world,
+            Input::Continue {
+                continuation,
+                budget: WorkUnits::new(100_000),
+            },
+        );
+        assert!(
+            world.drain().is_empty(),
+            "a repeated continuation cannot allocate another operation"
+        );
+        gc_apply(
+            &mut world,
+            Input::StoreResult {
+                effect: retry[0].0,
+                operation,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::InboundReleased {
+                    exchange,
+                })),
+            },
+        );
+        assert_eq!(kinds(&world.drain()), ["EmitPubcomp"]);
+        assert_eq!(world.phase(7), None);
+        assert_eq!(world.owner.leases.held(), 0);
     }
 }
