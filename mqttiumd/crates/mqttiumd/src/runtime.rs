@@ -305,6 +305,12 @@ impl Runtime<'_> {
                     return Err(Failure::plain("core_fault"));
                 }
             }
+            if applied {
+                // A terminal result is consumed only after the exact input was
+                // applied. The pure owner, rather than elapsed wall time or a
+                // received reply, decides which deadlines remain meaningful.
+                self.timers.retain(|token, _| self.owner.deadline_is_live(*token));
+            }
             self.dispatch()?;
             if applied && let Some((session, initial)) = ready_work {
                 self.rearm_ready_work(session, initial);
