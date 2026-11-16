@@ -13,6 +13,7 @@ from pathlib import Path
 import select
 import socket
 import sqlite3
+import threading
 import time
 from urllib.parse import quote
 
@@ -138,8 +139,13 @@ class Observations:
         self.path = path
         self.sequence = 0
         self.bytes = 0
+        self.lock = threading.Lock()
 
     def record(self, kind: str, **fields: object) -> None:
+        with self.lock:
+            self._record(kind, **fields)
+
+    def _record(self, kind: str, **fields: object) -> None:
         value = {"kind": kind, "seq": str(self.sequence), "monotonic_ns": str(time.monotonic_ns()), **fields}
         raw = (json.dumps(value, sort_keys=True) + "\n").encode()
         require(len(raw) <= 8192, "probe_record_budget")
