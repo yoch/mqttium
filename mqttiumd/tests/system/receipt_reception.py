@@ -26,8 +26,8 @@ import time
 
 from external_mqttium import client_identity
 from pubsub_probe import PubsubWire, decode_filter_ack, durable, session_key, subscribe_packet
-from pubsub_reception import accounts_consistent, assignment, delivery_keys, drained
-from tcp_probe import ReceiptFailure, publish_packet, require, write_json
+from pubsub_reception import accounts_consistent, assignment, delivery_keys, drained, until
+from tcp_probe import ReceiptFailure, operation_hex, publish_packet, pubrel_packet, require, write_json
 from tcp_reception import Broker, writer_available
 
 
@@ -514,6 +514,131 @@ def live_receipts(binary: Path, case: Path, terminal_commands: int = BUSINESS_CO
             restarted.cleanup()
 
 
+def sql_u64(value) -> int:
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{16}", value):
+        return int(value, 16)
+    return int(value)
+
+
+def operation_floor(state: dict, operation: dict) -> int:
+    """Read the compact origin guard, independently of the writer's reply."""
+    matching = []
+    prefix = operation_hex(operation)[:48]
+    for name, rows in state["tables"].items():
+        if not any(part in name for part in ("frontier", "origin")):
+            continue
+        for row in rows:
+            same = row.get("origin") == prefix or all(
+                key in row and sql_u64(row[key]) == int(operation[key])
+                for key in ("incarnation", "epoch", "owner"))
+            if same:
+                for field in ("through", "operation_through", "operation_floor", "op_floor"):
+                    if field in row:
+                        matching.append(sql_u64(row[field]))
+                        break
+                else:
+                    raise ReceiptFailure("origin_frontier_format_unrecognized", name)
+    require(len(matching) <= 1, "origin_frontier_duplicated")
+    return matching[0] if matching else 0
+
+
+def unknown_hole(binary: Path, case: Path) -> dict:
+    broker = Broker(binary, case, test_control=True)
+    held = HeldBusiness(broker, case)
+    result = {"criterion": "C-pressure", "status": "PASS", "samples": [],
+              "parameters": {"business_window": 768, "total_window": 1024,
+                             "attempt_budget": 1025, "result_release_timeout_s": 15}}
+    try:
+        result["ready"] = broker.ready()
+        result["held_continuations"] = held.prepare()
+        (broker.control / "hold-admission-result").touch(exist_ok=False)
+        with PubsubWire(broker.address, broker.observations, "committed-unknown-source") as source, \
+                PubsubWire(broker.address, broker.observations, "pressure-control") as control:
+            source.connect("receipt-unknown-source", session_present=False, keep_alive=0)
+            control.connect("receipt-pressure-control", session_present=False, keep_alive=0)
+            source.send(publish_packet("reception/receipt-unknown", b"committed-result-held", 1, qos=1))
+            hit = broker.wait_event("store_result_held")
+            require(hit.get("command_kind") == "Admission" and hit["details"]["outcome"] == "Committed",
+                    "wrong_result_held")
+            operation = hit["operation"]
+            key = operation_hex(operation)
+            before = durable(broker.db)
+            require(any(row["id"] == key and row["decision"] == 1 for row in before["tables"]["operations"]),
+                    "unknown_hole_not_committed")
+            require(source.poll(.02) is None, "unknown_admission_acknowledged")
+            result["held_result"], result["unknown_operation"] = hit, operation
+            result["known_committed_row"] = key
+            write_json(case / "hole-before-pressure.json", before)
+            positives = 0
+            pressure = None
+            for attempt in range(1, 1026):
+                control.send(subscribe_packet(1, [("reception/receipt-pressure", attempt % 2)]))
+                frame = control.poll(.3)
+                if frame is None or (frame.kind == 0x90 and any(code >= 128 for code in decode_filter_ack(frame)[1])):
+                    pressure = broker.wait_event("receipt_window_pressure", after=int(hit["seq"]), timeout=2)
+                    require(pressure["details"]["code"] in
+                            ("receipt_window_business_full", "receipt_window_total_full"),
+                            "wrong_pressure_reason")
+                    break
+                require(frame.kind == 0x90 and decode_filter_ack(frame) == (1, (attempt % 2,)),
+                        "unexpected_pressure_response")
+                positives += 1
+                if attempt % 32 == 0:
+                    state = durable(broker.db)
+                    floor = operation_floor(state, operation)
+                    require(floor < int(operation["sequence"]), "closure_crossed_unknown")
+                    require(any(row["id"] == key for row in state["tables"]["operations"]),
+                            "unknown_receipt_deleted")
+                    result["samples"].append({"through_positive": positives, "floor": floor,
+                                              "storage": storage_sample(broker)})
+            require(pressure is not None and positives <= 768, "planned_window_pressure_not_reached")
+            result["positive_commands_while_hole_open"], result["pressure"] = positives, pressure
+            blocked = durable(broker.db)
+            require(operation_floor(blocked, operation) < int(operation["sequence"]), "closure_crossed_unknown")
+            require(any(row["id"] == key for row in blocked["tables"]["operations"]), "unknown_receipt_deleted")
+            control_progress(control)
+            # These established responsibilities need continuation capacity,
+            # even while the next business command cannot enter the window.
+            held.claim_subscriber.acknowledge(held.first_claim)
+            held.source.send(pubrel_packet(77))
+            require(held.source.wait(0x70, 77).ack() == (77, 0), "reserved_release_did_not_progress")
+            until(lambda: durable(broker.db)["counts"]["outbound"] == 0,
+                  "reserved_finish_did_not_progress")
+            result["controls_and_terminations_progressed"] = True
+            write_json(case / "hole-at-pressure.json", blocked)
+            (broker.control / "hold-admission-result").unlink()
+            broker.observations.record("held_result_release", operation=operation)
+            require(source.wait(0x40, 1, timeout=15).ack() == (1, 0), "same_operation_resolution_did_not_ack")
+            resolved = broker.wait_event("store_resolved", after=int(hit["seq"]), timeout=3)
+            require(resolved["operation"] == operation and resolved["details"]["outcome"].lower() == "committed",
+                    "unknown_resolution_changed_operation")
+            result["same_operation_resolution"] = resolved
+        with PubsubWire(broker.address, broker.observations, "reopened-business") as reopened:
+            reopened.connect("receipt-reopened-control", session_present=False, keep_alive=0)
+            for identifier in range(1, 66):
+                reopened.subscribe(identifier, [("reception/receipt-reopened", identifier % 2)])
+            control_progress(reopened)
+        advanced = until(lambda: (state if operation_floor(state, operation) >= int(operation["sequence"]) else None)
+                         if (state := durable(broker.db)) else None,
+                         "frontier_did_not_reopen_after_resolution")
+        result["frontier_after_resolution"] = operation_floor(advanced, operation)
+        with PubsubWire(broker.address, broker.observations, "old-offline-after-pressure") as offline:
+            offline.connect("receipt-old-offline", session_present=True, keep_alive=0)
+            message = offline.next_publication()
+            require(message.payload == b"old-offline-obligation", "offline_after_pressure_wrong")
+            offline.acknowledge(message)
+        held.close()
+        drained(broker, case / "final")
+        result["final_storage"] = storage_sample(broker)
+        result["stop_status"] = broker.stop()
+        writer_available(broker.db)
+        write_json(case / "observation.json", result)
+        return result
+    finally:
+        held.close()
+        broker.cleanup()
+
+
 def table_counts(path: Path) -> dict:
     state = durable(path)
     return {"schema_version": state["schema_version"], "epoch": state["epoch"],
@@ -629,7 +754,7 @@ def main() -> int:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--binary-source-head")
     parser.add_argument("--expected-binary-sha256")
-    parser.add_argument("--case", choices=("A-ceiling", "B-live"), default="A-ceiling")
+    parser.add_argument("--case", choices=("A-ceiling", "B-live", "C-pressure"), default="A-ceiling")
     parser.add_argument("--build-mode", choices=("normal", "test-hooks"), default="normal")
     parser.add_argument("--business-commands", type=int, default=BUSINESS_COMMANDS)
     args = parser.parse_args()
@@ -649,6 +774,9 @@ def main() -> int:
         if args.case == "B-live":
             require(args.build_mode == "normal", "normal_build_required_for_live_measurements")
             observed = live_receipts(args.binary.resolve(), args.out / args.case, args.business_commands)
+        elif args.case == "C-pressure":
+            require(args.build_mode == "test-hooks", "instrumented_build_required")
+            observed = unknown_hole(args.binary.resolve(), args.out / args.case)
         else:
             observed = historical_ceiling(args.binary.resolve(), args.out / args.case)
         result["cases"].append(observed)
