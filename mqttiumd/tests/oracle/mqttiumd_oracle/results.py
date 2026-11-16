@@ -153,8 +153,80 @@ def unmet(contracts, scenario_path, manifest_path, trace_path=None):
         out += _kept_unmet(contracts, manifest["checkout"]["modified_paths"])
     if trace_path is not None:
         out += _broker_unmet(contracts, manifest, trace_path)
+        out += _scope_unmet(contracts, scenario_path, trace_path)
     out += _source_unmet(contracts, manifest)
     return out
+
+
+FIXTURE_PUBSUB_SCOPE = (
+    "the fixture-based qualifier does not cover outgoing claims or subscription mutations"
+)
+UNCORROBORATED_QUEUED = (
+    "queued recovery delivery metadata is not corroborated by a durable snapshot"
+)
+
+
+def _scope_unmet(contracts, scenario_path, trace_path):
+    """Descriptive support for a new format does not qualify its semantics.
+
+    The fixture-based assertions cover incoming QoS 2 with queued obligations.
+    They do not cover the product's subscription/claim/finish state machines.
+    Queued recovery metadata remains useful in that original profile, provided
+    an independently cited snapshot corroborates its durable identities.
+    """
+    try:
+        run = judge.Run.load(contracts, scenario_path, trace_path)
+    except (OSError, Refused):
+        # The ordinary readers and assertions retain their own missing-proof
+        # diagnostics. This condition adds no verdict for unreadable evidence.
+        return []
+    unsupported, non_qos2, uncorroborated = False, False, False
+    for _, snapshot in run.snapshots.values():
+        unsupported |= bool(snapshot["outbound"])
+        for operation in snapshot["operations"]:
+            recipe = bytes.fromhex(operation["recipe_hex"])
+            if recipe[:6] == b"MQDR\x00\x01" and len(recipe) >= 7:
+                unsupported |= recipe[6] in (3, 4, 5)
+                # The canonical AdmitPublication QoS byte follows its fixed
+                # identifiers and source/route fields (DEM-009).
+                non_qos2 |= recipe[6] == 1 and len(recipe) > 137 and recipe[137] != 2
+            facts = operation["decision"].get("facts", {})
+            unsupported |= facts.get("kind") in {
+                "SubscriptionsChanged", "DeliveryClaimed", "DeliveryFinished"
+            }
+    for record in run.trace.records:
+        payload = record.payload
+        unsupported |= payload.get("command_kind") in {
+            "ChangeSubscriptions", "ClaimDelivery", "FinishDelivery"
+        }
+        unsupported |= payload.get("packet_kind") in {
+            "SUBSCRIBE", "SUBACK", "UNSUBSCRIBE", "UNSUBACK"
+        }
+        unsupported |= record.kind == "FrameEligible" and payload.get("packet_kind") == "PUBLISH"
+        if record.kind not in {"RecoveryPageRead", "RecoveryPageDelivered"}:
+            continue
+        for fact in payload["facts"]:
+            if fact["kind"] != "OutboundDelivery":
+                continue
+            if fact["claim"] is not None:
+                unsupported = True
+                continue
+            supported = any(
+                snapshot["meta"]["last_opened_epoch"] == payload["run_epoch"]
+                and run.trace.before(record, inspection) is True
+                and any(
+                    obligation["publication_id"] == fact["delivery_id"]["publication_id"]
+                    and obligation["index"] == fact["delivery_id"]["index"]
+                    and obligation["session"] == fact["target_session"]
+                    and obligation["target_revision"] == fact["target_revision"]
+                    for obligation in snapshot["obligations"]
+                )
+                for inspection, snapshot in run.snapshots.values()
+            )
+            uncorroborated |= not supported
+    return ([FIXTURE_PUBSUB_SCOPE] if unsupported else []) + (
+        ["the fixture-based qualifier covers incoming QoS 2 only"] if non_qos2 else []
+    ) + ([UNCORROBORATED_QUEUED] if uncorroborated else [])
 
 
 def _broker_unmet(contracts, manifest, trace_path):

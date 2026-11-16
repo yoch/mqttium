@@ -357,6 +357,12 @@ class Campaign(unittest.TestCase):
         ])
         self.assertEqual((self.result["qualification"], self.result["verdict"]),
                          ("provisional", "INCONCLUSIVE"))
+        # R1 also checks the scope when a result claims qualification again.
+        self.result.update(qualification="qualifying", verdict="PASS", exit_code=0, reasons=[])
+        (self.campaign / "run-result.json").write_text(json.dumps(self.result))
+        self.assertEqual(self.refused(), self.unqualified(
+            "the fixture-based qualifier does not cover outgoing claims or subscription mutations"
+        ))
 
     def test_subscription_receipt_does_not_extend_fixture_qualification(self):
         def subscriptions(value):
