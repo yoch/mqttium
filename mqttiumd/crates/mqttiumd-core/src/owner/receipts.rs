@@ -55,6 +55,17 @@ pub(super) struct Snapshot {
 
 impl State {
     #[cfg(test)]
+    pub(super) fn test_fill_consumed_window(&mut self) {
+        let first = self.entries.as_slice()[0].boundary;
+        while self.entries.len() < RECEIPT_WINDOW {
+            let sequence = first.through.get() + u64::try_from(self.entries.len()).unwrap();
+            self.entries.try_push(Entry {boundary:ReceiptClosure {
+                through:OperationSeq::new(sequence), ..first
+            },consumed:true}).unwrap();
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn test_request_sweep(&mut self) {
         self.sweep = true;
     }
