@@ -293,7 +293,7 @@ fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
             .values()
             .any(|o| o.qos == mqttiumd_contract::packet::Qos::ExactlyOnce)
     {
-        return Err(Failure::read(ReadError::InvalidData, ReadPhase::Snapshot));
+        return Err(Failure::plain("durable_profile_mismatch"));
     }
     let mut sessions = BTreeMap::new();
     for (id, s) in &state.sessions {

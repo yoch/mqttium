@@ -18,6 +18,7 @@ use mqttiumd_contract::ids::{
 };
 use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome, StoreReply};
 use mqttiumd_contract::packet::{InboundPacket, OutboundFrame};
+use mqttiumd_contract::pubsub::{Qos0DropReason, Qos0Origin};
 use mqttiumd_contract::step::{StepOutcome, TurnGrant};
 #[cfg(feature = "test-hooks")]
 use mqttiumd_contract::{ids::DeliveryId, pubsub::WorkItem};
@@ -60,6 +61,12 @@ const MUTANT_EARLY_OUTGOING: bool = false;
 const MUTANT_EARLY_FINISH: bool = false;
 #[cfg(feature = "test-hooks")]
 const MUTANT_NOTIFICATIONS_ONLY: bool = false;
+#[cfg(feature = "test-hooks")]
+const MUTANT_EARLY_QOS0: bool = false;
+#[cfg(feature = "test-hooks")]
+const MUTANT_REPLAY_QOS0: bool = false;
+#[cfg(feature = "test-hooks")]
+const MUTANT_QOS0_ACCOUNTING: bool = false;
 
 pub struct Config {
     pub db: PathBuf,
@@ -116,6 +123,12 @@ struct Runtime<'a> {
     last_work_scan: Instant,
     #[cfg(feature = "test-hooks")]
     work_cache: BTreeMap<DeliveryId, WorkItem>,
+    #[cfg(feature = "test-hooks")]
+    deferred_work: VecDeque<Response>,
+    #[cfg(feature = "test-hooks")]
+    emission_barriers: BTreeMap<EffectId, (Instant, bool)>,
+    #[cfg(feature = "test-hooks")]
+    last_consume_result: Option<(EffectId, OperationId, StoreReply)>,
     started: Instant,
     #[cfg(feature = "test-hooks")]
     captured: Option<(ConnectionGeneration, codec::Connect)>,
@@ -286,6 +299,10 @@ impl Runtime<'_> {
             bindings: &bindings,
             #[cfg(feature = "test-hooks")]
             work_cache: &self.work_cache,
+            #[cfg(feature = "test-hooks")]
+            hooks: &self.hooks,
+            #[cfg(feature = "test-hooks")]
+            emission_barriers: &mut self.emission_barriers,
             timers: &mut self.timers,
             inputs: &mut self.inputs,
             deferred_count: self.deferred_inputs.len(),
@@ -325,8 +342,18 @@ impl Runtime<'_> {
                         return Err(Failure::plain("uncorrelated_store_result"));
                     }
                     #[cfg(feature = "test-hooks")]
+                    if matches!(
+                        reply,
+                        StoreReply::Outcome(StoreOutcome::Committed(
+                            CommitFacts::DeliveryConsumed { .. }
+                        ))
+                    ) {
+                        self.last_consume_result = Some((effect, operation, reply));
+                    }
+                    #[cfg(feature = "test-hooks")]
                     if let StoreReply::Outcome(StoreOutcome::Committed(
-                        CommitFacts::DeliveryFinished { delivery, .. },
+                        CommitFacts::DeliveryFinished { delivery, .. }
+                        | CommitFacts::DeliveryConsumed { delivery, .. },
                     )) = reply
                     {
                         self.work_cache.remove(&delivery);
@@ -352,6 +379,25 @@ impl Runtime<'_> {
                     session,
                     result,
                 } => {
+                    #[cfg(feature = "test-hooks")]
+                    if result.is_ok()
+                        && self
+                            .hooks
+                            .directory
+                            .as_ref()
+                            .is_some_and(|d| d.join("hold-work-pages").exists())
+                    {
+                        if self.deferred_work.len() >= IN_FLIGHT {
+                            return Err(Failure::plain("held_work_budget"));
+                        }
+                        self.deferred_work.push_back(Response::Work {
+                            effect,
+                            session,
+                            result,
+                        });
+                        self.events.emit("work_page_held",json!({"details":{"session":session.get().to_string(),"effect":effect_text(effect)}})).map_err(event_failure)?;
+                        continue;
+                    }
                     if self.work_reads.remove(&effect) != Some(session) {
                         return Err(Failure::plain("uncorrelated_work_page"));
                     }
@@ -450,7 +496,8 @@ impl Runtime<'_> {
                 reply:
                     StoreReply::Outcome(StoreOutcome::Committed(
                         CommitFacts::DeliveryClaimed { target, .. }
-                        | CommitFacts::DeliveryFinished { target, .. },
+                        | CommitFacts::DeliveryFinished { target, .. }
+                        | CommitFacts::DeliveryConsumed { target, .. },
                     )),
                 ..
             } => Some((*target, false)),
@@ -462,7 +509,9 @@ impl Runtime<'_> {
                     })),
                 ..
             } => Some((*session, false)),
-            Input::FrameResult { connection, .. } => Some((connection.session, false)),
+            Input::FrameResult { connection, .. } | Input::Qos0EmitRefused { connection, .. } => {
+                Some((connection.session, false))
+            }
             Input::Packet {
                 packet: InboundPacket::ConnectResume { client_id },
                 ..
@@ -654,6 +703,26 @@ impl Runtime<'_> {
                     .checked_add(1)
                     .ok_or_else(|| Failure::plain("ingress_exhausted"))?;
                 let ingress_order = p.ingress;
+                #[cfg(feature = "test-hooks")]
+                if MUTANT_QOS0_ACCOUNTING
+                    && matches!(
+                        &packet,
+                        InboundPacket::Publish {
+                            qos: mqttiumd_contract::packet::Qos::AtMostOnce,
+                            ..
+                        }
+                    )
+                {
+                    let charged = p
+                        .receiving
+                        .publish_qos(
+                            65535,
+                            ingress_order,
+                            mqttiumd_contract::packet::Qos::AtLeastOnce,
+                        )
+                        .is_ok();
+                    self.events.emit("qos0_receive_credit",json!({"connection":generation.get().to_string(),"details":{"charged":charged,"wrong_qos":1}})).map_err(event_failure)?;
+                }
                 if let InboundPacket::Publish {
                     packet_id: Some(id),
                     qos,
@@ -957,7 +1026,9 @@ impl Runtime<'_> {
         }
         let generation = connection.generation;
         let (kind, id) = (pending.kind, pending.packet_id);
-        if kind != "PINGRESP" {
+        if kind == "PUBLISH0" {
+            self.events.emit("frame_written",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","qos":0,"effect":effect_text(effect),"bytes":bytes}})).map_err(event_failure)?;
+        } else if kind != "PINGRESP" {
             self.events.emit("frame_written",json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id.unwrap_or(0),"publish_order":pending.receive_serial.map(|v|v.to_string()).unwrap_or_default(),"bytes":bytes}})).map_err(event_failure)?;
         }
         if let Some(terminal) = pending.terminal
@@ -990,6 +1061,56 @@ impl Runtime<'_> {
     }
     #[cfg(feature = "test-hooks")]
     fn controls(&mut self) -> Result<(), Failure> {
+        if self
+            .hooks
+            .directory
+            .as_ref()
+            .is_none_or(|d| !d.join("hold-work-pages").exists())
+        {
+            while let Some(response) = self.deferred_work.pop_front() {
+                let Response::Work {
+                    effect,
+                    session,
+                    result,
+                } = response
+                else {
+                    return Err(Failure::plain("held_work_kind"));
+                };
+                if self.work_reads.remove(&effect) != Some(session) {
+                    return Err(Failure::plain("uncorrelated_work_page"));
+                }
+                let page = result.map_err(|e| Failure::read(e, ReadPhase::Work))?;
+                for item in page.items.as_slice() {
+                    self.work_cache.insert(item.delivery, item.clone());
+                }
+                self.queue(Input::WorkPage {
+                    effect,
+                    session,
+                    items: page.items,
+                    next: page.next,
+                })?;
+            }
+        }
+        if let Some(dir) = &self.hooks.directory {
+            let replay = dir.join("replay-last-consume-result");
+            if replay.exists() {
+                std::fs::remove_file(replay).map_err(|_| Failure::plain("hook_release"))?;
+                let (effect, operation, reply) = self
+                    .last_consume_result
+                    .ok_or_else(|| Failure::plain("no_consume_result"))?;
+                self.queue(Input::StoreResult {
+                    effect,
+                    operation,
+                    reply,
+                })?;
+                self.events
+                    .emit(
+                        "consume_result_replayed",
+                        json!({"operation":crate::events::operation(operation)}),
+                    )
+                    .map_err(event_failure)?;
+            }
+        }
         if let Some((effect, connection, bytes, since)) = self.deferred_ack {
             if !self.frames.contains_key(&effect) {
                 self.deferred_ack = None;
@@ -1033,6 +1154,10 @@ struct Sink<'a> {
     bindings: &'a BTreeMap<SessionId, ConnectionGeneration>,
     #[cfg(feature = "test-hooks")]
     work_cache: &'a BTreeMap<DeliveryId, WorkItem>,
+    #[cfg(feature = "test-hooks")]
+    hooks: &'a Hooks,
+    #[cfg(feature = "test-hooks")]
+    emission_barriers: &'a mut BTreeMap<EffectId, (Instant, bool)>,
     timers: &'a mut BTreeMap<DeadlineToken, Instant>,
     inputs: &'a mut VecDeque<Input>,
     deferred_count: usize,
@@ -1048,6 +1173,119 @@ impl EffectSink for Sink<'_> {
             return refused(effect, SubmitBlock::Closed);
         }
         match effect.effect() {
+            Effect::Qos0Dropped {
+                origin,
+                target,
+                reason,
+            } => {
+                if self.events.emit("qos0_dropped",json!({"details":{"origin":qos0_origin(*origin),"target":target.map(|t|t.get().to_string()).unwrap_or_default(),"reason":reason.code()}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                let _ = effect.into_parts();
+                SubmitResult::Accepted
+            }
+            Effect::EmitQos0 {
+                connection,
+                origin,
+                topic,
+                payload,
+            } => {
+                let (connection, origin) = (*connection, *origin);
+                if self.inputs.len() + self.deferred_count >= INPUTS {
+                    return refused(effect, SubmitBlock::QueueFull);
+                }
+                #[cfg(feature = "test-hooks")]
+                if let Qos0Origin::Consumed {
+                    operation: id_op, ..
+                } = origin
+                    && self.hooks.pause.iter().any(|p| p == "consume.emission")
+                {
+                    let Some(dir) = &self.hooks.directory else {
+                        self.error = Some(Failure::plain("hook_directory"));
+                        return refused(effect, SubmitBlock::Closed);
+                    };
+                    let entry=self.emission_barriers.entry(id).or_insert_with(||{
+                        let _=self.events.emit("barrier_hit",json!({"point":"consume.emission","command_kind":"Consume","operation":operation(id_op)}));(Instant::now(),false)
+                    });
+                    if !entry.1 {
+                        let release = dir.join("release-consume.emission");
+                        if release.exists() {
+                            if std::fs::remove_file(release).is_err() {
+                                self.error = Some(Failure::plain("hook_release"));
+                            }
+                            entry.1 = true;
+                        } else if entry.0.elapsed() > Duration::from_secs(30) {
+                            self.error = Some(Failure::plain("hook_deadline"));
+                        } else {
+                            return refused(effect, SubmitBlock::QueueFull);
+                        }
+                    }
+                }
+                let generation = connection.generation;
+                let result = if let Some(peer) = self.peers.get_mut(&generation).filter(|p| {
+                    p.closing.is_none()
+                        && self.bindings.get(&connection.session) == Some(&generation)
+                }) {
+                    match codec::encode_qos0(topic, payload) {
+                        Ok(bytes) if bytes.len() <= peer.max_packet => {
+                            #[cfg(feature = "test-hooks")]
+                            let duplicate = if MUTANT_REPLAY_QOS0
+                                && matches!(origin, Qos0Origin::Consumed { .. })
+                            {
+                                Some(bytes.clone())
+                            } else {
+                                None
+                            };
+                            let result = peer.io.outgoing.try_send(net::Write {
+                                correlation: Some((id, connection)),
+                                bytes,
+                            });
+                            #[cfg(feature = "test-hooks")]
+                            if result.is_ok()
+                                && let Some(bytes) = duplicate
+                            {
+                                let _ = peer.io.outgoing.try_send(net::Write {
+                                    correlation: None,
+                                    bytes,
+                                });
+                            }
+                            match result {
+                                Ok(()) => Ok(()),
+                                Err(TrySendError::Full(_)) => Err(Qos0DropReason::OutputSaturated),
+                                Err(TrySendError::Disconnected(_)) => {
+                                    Err(Qos0DropReason::ConnectionClosed)
+                                }
+                            }
+                        }
+                        _ => Err(Qos0DropReason::PacketTooLarge),
+                    }
+                } else {
+                    Err(Qos0DropReason::ConnectionClosed)
+                };
+                #[cfg(feature = "test-hooks")]
+                self.emission_barriers.remove(&id);
+                match result {
+                    Ok(()) => {
+                        self.frames.insert(
+                            id,
+                            PendingFrame {
+                                connection,
+                                kind: "PUBLISH0",
+                                packet_id: None,
+                                receive_serial: None,
+                                terminal: None,
+                                wire_released: false,
+                            },
+                        );
+                        if self.events.emit("frame_queued",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","qos":0,"origin":qos0_origin(origin),"effect":effect_text(id)}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                    }
+                    Err(reason) => self.inputs.push_back(Input::Qos0EmitRefused {
+                        effect: id,
+                        connection,
+                        reason,
+                    }),
+                }
+                let _ = effect.into_parts();
+                SubmitResult::Accepted
+            }
             Effect::Persist { command } => {
                 if self.inflight.len() >= IN_FLIGHT {
                     return refused(effect, SubmitBlock::InFlightLimit);
@@ -1055,6 +1293,19 @@ impl EffectSink for Sink<'_> {
                 let operation_id = command.recipe.operation();
                 let command_kind = crate::writer::recipe_kind(command.recipe.get());
                 let details = recipe_details(command.recipe.get());
+                #[cfg(feature = "test-hooks")]
+                if MUTANT_EARLY_QOS0
+                    && let Recipe::ConsumeDelivery(c) = command.recipe.get()
+                    && let Some(item) = self.work_cache.get(&c.delivery)
+                    && let Some(g) = self.bindings.get(&c.target)
+                    && let Some(peer) = self.peers.get(g)
+                    && let Ok(bytes) = codec::encode_qos0(&item.topic, &item.payload)
+                {
+                    let _ = peer.io.outgoing.try_send(net::Write {
+                        correlation: None,
+                        bytes,
+                    });
+                }
                 #[cfg(feature = "test-hooks")]
                 let early_finish = if MUTANT_EARLY_FINISH
                     && let Recipe::FinishDelivery(f) = command.recipe.get()
@@ -1412,6 +1663,9 @@ fn delivery_text(id: mqttiumd_contract::ids::DeliveryId) -> String {
 }
 fn recipe_details(recipe: &Recipe) -> serde_json::Value {
     match recipe {
+        Recipe::ConsumeDelivery(c) => {
+            json!({"delivery":delivery_text(c.delivery),"target":c.target.get().to_string()})
+        }
         Recipe::ClaimDelivery(c) => {
             json!({"delivery":delivery_text(c.delivery),"target":c.target.get().to_string(),"packet_id":c.packet_id.get()})
         }
@@ -1419,6 +1673,24 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
             json!({"delivery":delivery_text(c.delivery),"target":c.target.get().to_string(),"packet_id":c.packet_id.get(),"claim":operation_text(c.claim)})
         }
         _ => json!({}),
+    }
+}
+fn qos0_origin(origin: Qos0Origin) -> String {
+    match origin {
+        Qos0Origin::Volatile { publication } => format!(
+            "volatile/{}/{}/{}",
+            publication.source.session.get(),
+            publication.source.generation.get(),
+            publication.ingress_order
+        ),
+        Qos0Origin::Consumed {
+            delivery,
+            operation: id,
+        } => format!(
+            "consumed/{}/{}",
+            delivery_text(delivery),
+            operation_text(id)
+        ),
     }
 }
 fn operation_text(id: OperationId) -> String {
@@ -1547,6 +1819,12 @@ fn run_inner(
         last_work_scan: Instant::now(),
         #[cfg(feature = "test-hooks")]
         work_cache: BTreeMap::new(),
+        #[cfg(feature = "test-hooks")]
+        deferred_work: VecDeque::new(),
+        #[cfg(feature = "test-hooks")]
+        emission_barriers: BTreeMap::new(),
+        #[cfg(feature = "test-hooks")]
+        last_consume_result: None,
         started: Instant::now(),
         #[cfg(feature = "test-hooks")]
         captured: None,

@@ -87,6 +87,12 @@ fn with_runtime(max_exchanges: u32, test: impl FnOnce(&mut Runtime<'_>, &Path)) 
         last_work_scan: Instant::now(),
         #[cfg(feature = "test-hooks")]
         work_cache: BTreeMap::new(),
+        #[cfg(feature = "test-hooks")]
+        deferred_work: VecDeque::new(),
+        #[cfg(feature = "test-hooks")]
+        emission_barriers: BTreeMap::new(),
+        #[cfg(feature = "test-hooks")]
+        last_consume_result: None,
         started: Instant::now(),
         #[cfg(feature = "test-hooks")]
         captured: None,
