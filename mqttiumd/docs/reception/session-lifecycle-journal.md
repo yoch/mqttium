@@ -70,3 +70,26 @@
   public mqttium. Hooks binaryf0ece3696f92f3cd81ea13fd7974949c9493d621a4a937ba64688660ce24b4a1.
   Integrated harness requires this case before complete A-G PASS. Freeze now;
   final validation/reception use only private pinned checkouts.
+- Firstprotectedpublication201c037b8da7757cb4a097b434e6239a54314204 succeeds;
+  connectorreadback/nativefetchmatchtree69e676f045b82851b16a0d88bf1a5ddb6ed7fc83,
+  13 critical connector blobs match. PR remains draft/unmerged, base unchanged.
+  FullA-GlocalPASS (archive3c545f6c...e74f3), plus CI session jobPASS. Local
+  fullgates922/937Rust+89hooks/207oracle/71pilotsPASS; gatearchive
+  df242a8429e7a13479e754fd700a8075fdd2f034ac9d03ce0e467fd3528c4033.
+- CI201c historical witnesses needed narrow updates, not broker changes:
+  TCPobsolete unsupportedCS1→finiteexpiry/exactcause; QoS0 count known distinct
+  commits across collection; QoS1 select publication result/refusal rows by
+  actual identity while retaining legitimate Life receipts and allowing a
+  writer-backed takeover through a genuinely held result. All old scenarios
+  then pass on retained201c binaries; exact mutations still detect their causes.
+- M3oldpatch compileE0004 is explicitly NOT a detection. eb54b014 adds only
+  the new non-admission variant; full loop mutant tools pass both backends and
+  M3 compiles then detects no_positive_ack_before_confirmed_commit. Receipt
+  observer RED9545727f/GREEN365ba04c covers six actual file-generation/race/gap
+  failures; bounded atomic cursors restore the existing long gate's observation.
+  Smoke1024 is distinct from required32769. Final integrated pilots85PASS.
+- Freeze the reception-only successor now; no crates/contracts/models/Cargo
+  content differs from201c. Repeat required normal gates and fresh source-pinned
+  A-G, then publish with expected201c lease. Final CI must complete existing
+  long receipt/PI, qualifying K1/K2b/K3/recompute, K2a/WAL and proof/model gates.
+  Original201c failures/archives remain tied to201c, not rewritten as successor.

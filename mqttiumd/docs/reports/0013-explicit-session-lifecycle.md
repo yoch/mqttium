@@ -117,6 +117,56 @@ maps the related focused Rust regressions. This is a specification model with
 explicit assumptions, not a Rust refinement or universal network/storage proof. The pilot
 proof's protected files and French archive remain unchanged.
 
+## First publication and reception compatibility
+
+Published201c037b8da7757cb4a097b434e6239a54314204 independently completes the
+full A–G launcher:512 cycles on PID1320550/inode2924382 in34,820.287ms,52 receipt
+collections, zero active/terminal/business rows and all zero postdrain volatile
+inventories except the closed-generation ring≤8.63 operation receipts remain
+before and after restart. The local archive SHA256 is
+`3c545f6ce271b6d000e2c22413d6602fe8c612fc431e5817b3600b33e48e74f3`.
+Independent audit matches2082 source Git blobs,832 retained hashes/833 packed
+files and all five same-supervisor SIGKILL/wait witnesses. Normal binary is
+`4f7e4d73aee0f811c1a496ac8d59f57cd73ecc7a4f70e694b0571edf3e3df057`.
+This is evidence of201c, not an implicit receipt of any successor.
+
+Its isolated gates pass922 normal Rust,937 instrumented Rust,89 product-hook
+Rust,207 oracle and71 system-pilot tests; formatting, three strict Clippy
+contexts, typed readers,515 schema examples, corpus/traces and8 focused TLC
+outcomes pass. CI also receives the new session reception, durable pub/sub and
+pilot proof. Its historical reception jobs expose compatibility defects in
+the witnesses; their original failures remain retained and are not negative
+control detections:
+
+- TCP still called now-supported Clean Start1 an unsupported feature. Use a
+  valid intermediate finite expiry and require its exact unsupported cause;
+  malformed flags retain their separate exact cause.
+- QoS0 matrix expected all eight historical admissions still to have detailed
+  SQL receipts. Extra lifecycle traffic legitimately crosses the collection
+  trigger. Count distinct actual known Admission commits and separately
+  corroborate retained rows, without disabling collection.
+- QoS1 refusal/unknown probes confused new lifecycle receipts with the targeted
+  publication result. Match the actual operation and preserve other committed
+  facts. A held committed result lets writer-backed takeover progress without
+  pretending the new durable Open can bypass a blocked writer.
+- The old premature-ACK mutation did not cover canonical kind8 and failed to
+  compile. Its narrow exhaustive-arm update restores actual compiled detection
+  of `no_positive_ack_before_confirmed_commit` on both stores.
+- The long receipt observer keyed offsets only by inode and observed stat
+  before open. A rotated/reused log inode produced an invalid mid-record read
+  after more than30,720 commands. Six real-file red tests and the correction
+  use the opened inode plus first sequence, atomic cursor/counter commit,
+  bounded live-generation pruning and explicit gap rejection. The strict
+  32,769-command requirement remains unchanged.
+
+These follow-ups change reception/mutation files only: broker Rust, contracts,
+models, quotas and the contract digest are byte-identical to201c. Actual retained
+201c binaries pass TCP5 normal/9 hooks, QoS0 eight normal/16 hooks plus its three
+exact mutants, and QoS1 three normal/11 hooks plus both exact mutants. The
+receipt observer's1024-replacement normal smoke is explicitly not the long
+requirement. The final source-pinned launcher and full CI must run afresh on
+the published successor; their source-head/index/archives provide that binding.
+
 ## Reproduction and remaining limits
 
 From `mqttiumd/`, with the pinned toolchain and system requirements installed:
