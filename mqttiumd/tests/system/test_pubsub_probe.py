@@ -2,8 +2,8 @@ import json
 import unittest
 
 from pubsub_probe import (
-    Frame, ReceiptFailure, decode_filter_ack, decode_publish, packet,
-    puback_packet, subscribe_packet, unsubscribe_packet,
+    Frame, PubsubWire, ReceiptFailure, decode_filter_ack, decode_publish, packet,
+    puback_packet, qos0_publish_packet, subscribe_packet, unsubscribe_packet,
 )
 
 
@@ -34,6 +34,29 @@ class PubsubProbeTests(unittest.TestCase):
                       Frame(0x30, b"\x00\x01a\x80\x00data")]:
             with self.assertRaises(ReceiptFailure):
                 decode_publish(frame)
+
+    def test_qos0_publisher_has_no_ack_wait_and_acknowledgement_is_impossible(self):
+        class Sender(PubsubWire):
+            def __init__(self):
+                self.sent = []
+
+            def send(self, value):
+                self.sent.append(value)
+
+            def wait(self, *_args, **_kwargs):
+                raise AssertionError('a QoS 0 send must not wait for a broker ACK')
+
+        sender = Sender()
+        sender.publish_qos0('a', b'p')
+        self.assertEqual(sender.sent, [bytes.fromhex('30050001610070')])
+        self.assertEqual(sender.sent[0], qos0_publish_packet('a', b'p'))
+        with self.assertRaises(ValueError):
+            sender.publish(1, 'a', b'p', qos=0)
+        with self.assertRaises(ValueError):
+            sender.publish(None, 'a', b'p', qos=0, dup=True)
+        with self.assertRaises(ReceiptFailure) as caught:
+            sender.acknowledge(decode_publish(Frame(0x30, b'\x00\x01a\x00p')))
+        self.assertEqual(caught.exception.code, 'probe_ack_for_qos0')
 
     def test_invalid_or_unbounded_outgoing_packets_are_refused(self):
         for frame in [Frame(0x34, b"\x00\x01a\x00\x01\x00"),

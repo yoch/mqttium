@@ -54,7 +54,8 @@ def _message(message):
             'payload_hex': payload[:128].hex(), 'payload_bytes': len(payload),
             'payload_truncated': len(payload) > 128,
             'payload_sha256': hashlib.sha256(payload).hexdigest(),
-            'qos': int(message.qos), 'packet_id': message.mid,
+            'qos': int(message.qos), 'packet_id': message.mid if int(message.qos) else None,
+            'client_message_id': message.mid,
             'dup': bool(message.dup), 'retain': bool(message.retain)}
 
 
@@ -76,20 +77,38 @@ def _subscription_event(row):
             'filter_sha256': [hashlib.sha256(value.encode()).hexdigest() for value in row['filters']]}
 
 
+def effective_qos(published_qos: int, granted_qos: int) -> int:
+    """The six cells of this receipt's explicitly bounded delivery profile."""
+    if published_qos not in (0, 1, 2) or granted_qos not in (0, 1):
+        raise ValueError('published QoS 0/1/2 and granted QoS 0/1 required')
+    return min(published_qos, granted_qos)
+
+
+def _expected_qoses(requested, granted, delivery):
+    if granted is not None and granted not in (0, 1):
+        raise ValueError('expected granted QoS must be 0 or 1')
+    if delivery is not None and delivery not in (0, 1):
+        raise ValueError('expected delivery QoS must be 0, 1 or None for mixed delivery')
+    return min(requested, 1) if granted is None else granted
+
+
 async def _mqttium(action, host, port, client_id, *, filters=(), count=1, qos=1,
                    events_path=None, ack_policy='immediate', ack_release=None,
                    expected_session_present=None, subscribe=True, wait_timeout=5,
                    receive_maximum=8, maximum_packet_size=65536,
-                   topic='reception/pubsub', payload=b'pubsub'):
+                   topic='reception/pubsub', payload=b'pubsub',
+                   expected_granted_qos=None, expected_delivery_qos=1):
     filters = tuple(filters)
     _check(filters, count, qos, wait_timeout, ack_policy, receive_maximum, maximum_packet_size)
-    if action == 'publish' and (qos == 0 or len(payload) > 32768):
-        raise ValueError('publisher supports bounded QoS 1/2 only')
+    granted = _expected_qoses(qos, expected_granted_qos, expected_delivery_qos)
+    if action == 'publish' and len(payload) > 32768:
+        raise ValueError('publisher supports bounded QoS 0/1/2 only')
     observations = Observations(events_path)
     result = _base('mqttium', client_identity(), host, port, client_id, observations,
                    action=action, filters=list(filters), requested_qos=qos, count=count,
                    ack_policy=ack_policy, receive_maximum=receive_maximum,
-                   maximum_packet_size=maximum_packet_size, wait_timeout=wait_timeout)
+                   maximum_packet_size=maximum_packet_size, wait_timeout=wait_timeout,
+                   expected_granted_qos=granted, expected_delivery_qos=expected_delivery_qos)
     client = AsyncClient(client_id, protocol=MQTTProtocolVersion.MQTTv5,
                          clean_start=False, keepalive=10,
                          connect_properties=Properties({'session_expiry_interval': 0xFFFFFFFF}),
@@ -117,8 +136,8 @@ async def _mqttium(action, host, port, client_id, *, filters=(), count=1, qos=1,
                    'granted_qos': [int(value) if value is not None else None for value in ack.granted_qos]}
             result['subscriptions'].append(row)
             observations.record('suback', **_subscription_event(row))
-            if ack.reason_codes != (1,) * len(filters):
-                raise AssertionError('profile must grant exactly QoS 1 in request order')
+            if ack.reason_codes != (granted,) * len(filters):
+                raise AssertionError('unexpected granted QoS in request order')
             observations.record('subscription_ready', **_subscription_event(row))
         if action == 'unsubscribe':
             ack = await client.unsubscribe(filters, timeout=wait_timeout)
@@ -129,7 +148,9 @@ async def _mqttium(action, host, port, client_id, *, filters=(), count=1, qos=1,
                 result['status'] = 'rejected'
         elif action == 'publish':
             receipt = await client.publish(topic, payload, qos=qos, retain=False, timeout=wait_timeout)
-            row = {'packet_id': receipt.mid, 'qos': qos, 'topic': topic,
+            row = {'packet_id': receipt.mid if qos else None,
+                   'client_receipt_id': receipt.mid, 'qos': qos, 'topic': topic,
+                   'completion_scope': 'mqtt-acknowledgement' if qos else 'local-write-only',
                    'payload_sha256': hashlib.sha256(payload).hexdigest()}
             result['publications'].append(row)
             observations.record('publish', **row)
@@ -137,7 +158,9 @@ async def _mqttium(action, host, port, client_id, *, filters=(), count=1, qos=1,
             if not receipt.is_done() or receipt.exception() is not None:
                 raise AssertionError('publication receipt did not complete successfully')
             row['result'] = 'success'
-            observations.record('receipt_success', packet_id=receipt.mid, qos=qos)
+            observations.record('receipt_success' if qos else 'local_write_complete',
+                                packet_id=row['packet_id'], client_receipt_id=receipt.mid,
+                                qos=qos, completion_scope=row['completion_scope'])
         elif action == 'receive':
             iterator = client.messages()
             async with asyncio.timeout(wait_timeout):
@@ -146,8 +169,14 @@ async def _mqttium(action, host, port, client_id, *, filters=(), count=1, qos=1,
                     row = _message(message)
                     result['messages'].append(row)
                     observations.record('message', **row)
-                    if int(message.qos) != 1:
-                        raise AssertionError('expected outgoing QoS 1')
+                    if int(message.qos) not in (0, 1) or (expected_delivery_qos is not None
+                                                        and int(message.qos) != expected_delivery_qos):
+                        raise AssertionError('unexpected outgoing QoS')
+                    if not int(message.qos):
+                        if message.dup:
+                            raise AssertionError('QoS 0 delivery must have DUP=0')
+                        observations.record('qos0_received_no_ack', packet_id=None)
+                        continue
                     if ack_policy == 'hold':
                         observations.record('ack_held', packet_id=message.mid)
                         if ack_release is None:
@@ -206,15 +235,17 @@ def _paho(action, host, port, client_id, *, filters=(), count=1, qos=1,
           events_path=None, ack_policy='immediate', ack_release=None,
           expected_session_present=None, subscribe=True, wait_timeout=5,
           receive_maximum=8, maximum_packet_size=65536,
-          topic='reception/pubsub', payload=b'pubsub'):
+          topic='reception/pubsub', payload=b'pubsub',
+          expected_granted_qos=None, expected_delivery_qos=1):
     import paho.mqtt.client as mqtt
     from paho.mqtt.packettypes import PacketTypes
     from paho.mqtt.properties import Properties as PahoProperties
 
     filters = tuple(filters)
     _check(filters, count, qos, wait_timeout, ack_policy, receive_maximum, maximum_packet_size)
-    if action == 'publish' and (qos == 0 or len(payload) > 32768):
-        raise ValueError('publisher supports bounded QoS 1/2 only')
+    granted = _expected_qoses(qos, expected_granted_qos, expected_delivery_qos)
+    if action == 'publish' and len(payload) > 32768:
+        raise ValueError('publisher supports bounded QoS 0/1/2 only')
     version = importlib.metadata.version('paho-mqtt')
     if version != '2.1.0':
         raise RuntimeError('paho-mqtt 2.1.0 required')
@@ -224,7 +255,8 @@ def _paho(action, host, port, client_id, *, filters=(), count=1, qos=1,
     result = _base('paho-mqtt', identity, host, port, client_id, observations,
                    action=action, filters=list(filters), requested_qos=qos, count=count,
                    ack_policy=ack_policy, receive_maximum=receive_maximum,
-                   maximum_packet_size=maximum_packet_size, wait_timeout=wait_timeout)
+                   maximum_packet_size=maximum_packet_size, wait_timeout=wait_timeout,
+                   expected_granted_qos=granted, expected_delivery_qos=expected_delivery_qos)
     connected, subscribed, unsubscribed, published = (threading.Event() for _ in range(4))
     incoming = queue.Queue(maxsize=32)
     callbacks = {}
@@ -246,7 +278,9 @@ def _paho(action, host, port, client_id, *, filters=(), count=1, qos=1,
         unsubscribed.set()
 
     def on_publish(_client, _userdata, mid, reason, _properties):
-        callbacks['publish'] = {'packet_id': mid, 'qos': qos, 'reason_code': reason.value,
+        callbacks['publish'] = {'packet_id': mid if qos else None, 'client_receipt_id': mid,
+                                'completion_scope': 'mqtt-acknowledgement' if qos else 'local-write-only',
+                                'qos': qos, 'reason_code': reason.value,
                                 'result': 'rejected' if reason.value >= 128 else 'success'}
         published.set()
 
@@ -300,8 +334,8 @@ def _paho(action, host, port, client_id, *, filters=(), count=1, qos=1,
                 result['status'] = 'rejected'
                 observations.record('subscription_rejected', **_subscription_event(row))
                 return result
-            if row['reason_codes'] != [1] * len(filters):
-                raise AssertionError('profile must grant exactly QoS 1 in request order')
+            if row['reason_codes'] != [granted] * len(filters):
+                raise AssertionError('unexpected granted QoS in request order')
             observations.record('subscription_ready', **_subscription_event(row))
         if action == 'unsubscribe':
             code, mid = client.unsubscribe(list(filters))
@@ -315,16 +349,18 @@ def _paho(action, host, port, client_id, *, filters=(), count=1, qos=1,
                 result['status'] = 'rejected'
         elif action == 'publish':
             info = client.publish(topic, payload, qos=qos, retain=False)
-            observations.record('publish', packet_id=info.mid, qos=qos, topic=topic,
+            observations.record('publish', packet_id=info.mid if qos else None,
+                                client_receipt_id=info.mid, qos=qos, topic=topic,
                                 payload_sha256=hashlib.sha256(payload).hexdigest())
             info.wait_for_publish(timeout=wait_timeout)
             if not info.is_published():
                 raise TimeoutError('publication receipt')
             wait(published, 'publication callback')
-            row = callbacks['publish'];assert row['packet_id'] == info.mid
+            row = callbacks['publish'];assert row['client_receipt_id'] == info.mid
             result['publications'].append(row)
             result['status'] = row['result']
-            observations.record('receipt_success' if result['status'] == 'success' else 'publication_rejected', **row)
+            event = ('local_write_complete' if qos == 0 else 'receipt_success') if result['status'] == 'success' else 'publication_rejected'
+            observations.record(event, **row)
         elif action == 'receive':
             deadline = time.monotonic() + wait_timeout
             for _ in range(count):
@@ -332,8 +368,14 @@ def _paho(action, host, port, client_id, *, filters=(), count=1, qos=1,
                 row = _message(message)
                 result['messages'].append(row)
                 observations.record('message', **row)
-                if message.qos != 1:
-                    raise AssertionError('expected outgoing QoS 1')
+                if message.qos not in (0, 1) or (expected_delivery_qos is not None
+                                               and message.qos != expected_delivery_qos):
+                    raise AssertionError('unexpected outgoing QoS')
+                if message.qos == 0:
+                    if message.dup:
+                        raise AssertionError('QoS 0 delivery must have DUP=0')
+                    observations.record('qos0_received_no_ack', packet_id=None)
+                    continue
                 if ack_policy == 'hold':
                     observations.record('ack_held', packet_id=message.mid)
                     if ack_release is None:
@@ -397,13 +439,19 @@ def main():
     parser.add_argument('--wait-timeout', type=float, default=5)
     parser.add_argument('--receive-maximum', type=int, default=8)
     parser.add_argument('--maximum-packet-size', type=int, default=65536)
+    parser.add_argument('--expected-granted-qos', type=int, choices=(0, 1))
+    expected = parser.add_mutually_exclusive_group()
+    expected.add_argument('--expected-delivery-qos', type=int, choices=(0, 1), default=1)
+    expected.add_argument('--allow-mixed-delivery-qos', action='store_true')
     args = parser.parse_args()
     options = dict(filters=args.filter, count=args.count, qos=args.qos,
                    events_path=args.events, expected_session_present=None if args.expected_session_present is None
                    else bool(args.expected_session_present), subscribe=not args.resume_without_subscribe,
                    ack_policy='hold' if args.hold_acks else 'immediate', ack_release=args.release_acks,
                    wait_timeout=args.wait_timeout, receive_maximum=args.receive_maximum,
-                   maximum_packet_size=args.maximum_packet_size, topic=args.topic, payload=args.payload.encode())
+                   maximum_packet_size=args.maximum_packet_size, topic=args.topic, payload=args.payload.encode(),
+                   expected_granted_qos=args.expected_granted_qos,
+                   expected_delivery_qos=None if args.allow_mixed_delivery_qos else args.expected_delivery_qos)
     result = asyncio.run(_mqttium(args.action, args.host, args.port, args.client_id, **options)) \
         if args.client == 'mqttium' else _paho(args.action, args.host, args.port, args.client_id, **options)
     print(json.dumps(result, indent=2, sort_keys=True))

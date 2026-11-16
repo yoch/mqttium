@@ -73,7 +73,7 @@ def _variable(data: bytes, offset: int) -> tuple[int, int]:
 
 @dataclass(frozen=True)
 class Publication:
-    packet_id: int
+    packet_id: int | None
     topic: str
     payload: bytes
     qos: int
@@ -89,26 +89,37 @@ class Publication:
 
 
 def decode_publish(frame: Frame) -> Publication:
-    require(frame.kind == 0x30 and (frame.header >> 1) & 3 == 1,
+    qos = (frame.header >> 1) & 3
+    require(frame.kind == 0x30 and qos in (0, 1),
             "unexpected_outgoing_qos", hex(frame.header))
+    require(qos != 0 or frame.header & 8 == 0, "probe_qos0_dup")
     require(frame.header & 1 == 0, "unexpected_retained_delivery")
     body = frame.body
-    require(len(body) >= 5, "probe_truncated_publish")
+    require(len(body) >= 4 + 2 * qos, "probe_truncated_publish")
     length = int.from_bytes(body[:2], "big")
-    require(0 < length <= MAX_TOPIC and 2 + length + 3 <= len(body), "probe_bad_topic_length")
+    require(0 < length <= MAX_TOPIC and 2 + length + 1 + 2 * qos <= len(body), "probe_bad_topic_length")
     try:
         topic = body[2:2 + length].decode("utf-8", "strict")
     except UnicodeDecodeError as error:
         raise ReceiptFailure("probe_invalid_topic_utf8") from error
     require(not any(c in topic for c in ("\x00", "+", "#")), "probe_invalid_topic")
     offset = 2 + length
-    identifier = int.from_bytes(body[offset:offset + 2], "big")
-    require(identifier != 0, "probe_zero_packet_identifier")
-    size, offset = _variable(body, offset + 2)
+    identifier = None
+    if qos:
+        identifier = int.from_bytes(body[offset:offset + 2], "big")
+        require(identifier != 0, "probe_zero_packet_identifier")
+        offset += 2
+    size, offset = _variable(body, offset)
     require(size == 0, "unexpected_outgoing_properties")
     payload = body[offset:]
     require(len(payload) <= MAX_PAYLOAD, "probe_payload_budget")
-    return Publication(identifier, topic, payload, 1, bool(frame.header & 8), False)
+    return Publication(identifier, topic, payload, qos, bool(frame.header & 8), False)
+
+
+def qos0_publish_packet(topic: str, payload: bytes) -> bytes:
+    if len(topic.encode()) > MAX_TOPIC or len(payload) > MAX_PAYLOAD:
+        raise ValueError('QoS 0 pilot packet exceeds the product bounds')
+    return packet(0x30, utf8(topic) + b'\x00' + payload)
 
 
 def decode_filter_ack(frame: Frame) -> tuple[int, tuple[int, ...]]:
@@ -179,7 +190,7 @@ class PubsubWire(Wire):
         self.send(subscribe_packet(identifier, filters))
         mid, reasons = decode_filter_ack(self.wait(0x90, identifier))
         require(mid == identifier and len(reasons) == len(filters), "suback_request_mismatch")
-        require(reasons == (expected if expected is not None else (1,) * len(filters)),
+        require(reasons == (expected if expected is not None else tuple(min(qos, 1) for _, qos in filters)),
                 "unexpected_suback_reasons", repr(reasons))
         self.observations.record("suback", label=self.label, packet_id=mid, reasons=list(reasons))
         return reasons
@@ -192,14 +203,24 @@ class PubsubWire(Wire):
         self.observations.record("unsuback", label=self.label, packet_id=mid, reasons=list(reasons))
         return reasons
 
-    def publish(self, identifier: int, topic: str, payload: bytes, *, qos: int = 1,
+    def publish(self, identifier: int | None, topic: str, payload: bytes, *, qos: int = 1,
                 dup: bool = False) -> None:
+        if qos == 0:
+            if identifier is not None or dup:
+                raise ValueError('QoS 0 has no Packet Identifier and requires DUP=0')
+            self.send(qos0_publish_packet(topic, payload))
+            return
+        if identifier is None:
+            raise ValueError('QoS 1/2 requires a Packet Identifier')
         self.send(publish_packet(topic, payload, identifier, qos=qos, dup=dup))
         frame = self.wait(0x40 if qos == 1 else 0x50, identifier)
         require(frame.ack() == (identifier, 0), "publisher_ack_refused")
         if qos == 2:
             self.send(pubrel_packet(identifier))
             require(self.wait(0x70, identifier).ack() == (identifier, 0), "publisher_completion_refused")
+
+    def publish_qos0(self, topic: str, payload: bytes) -> None:
+        self.publish(None, topic, payload, qos=0)
 
     def next_publication(self, timeout: float = 5) -> Publication:
         if self.publications:
@@ -217,6 +238,8 @@ class PubsubWire(Wire):
         raise ReceiptFailure("outgoing_delivery_missing")
 
     def acknowledge(self, publication: Publication, reason: int = 0) -> None:
+        require(publication.qos == 1 and publication.packet_id is not None,
+                'probe_ack_for_qos0')
         self.send(puback_packet(publication.packet_id, reason))
         self.observations.record("subscriber_puback_sent", label=self.label,
                                  packet_id=publication.packet_id, reason=reason)
