@@ -110,6 +110,32 @@ class ExternalPubsubTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn('manual_ack_submitted', kinds)
                 self.assertNotIn('ack_held', kinds)
 
+    async def test_one_qos1_subscription_can_receive_qos0_and_qos1_without_ack_confusion(self):
+        for kind in ('mqttium', 'paho'):
+            with self.subTest(client=kind):
+                async def script(reader, writer, _connection):
+                    await connack(reader, writer)
+                    first, body = await read_packet(reader)
+                    self.assertEqual(first, 0x82)
+                    self.assertEqual(filters(body, True), [('reception/mixed', 1)])
+                    writer.write(packet(0x90, body[:2] + b'\0\1'))
+                    writer.write(server_publish_qos0('reception/mixed', b'zero'))
+                    writer.write(server_publish('reception/mixed', b'one', mid=9))
+                    await writer.drain()
+                    self.assertEqual(await read_packet(reader), (0x40, b'\0\x09'))
+                    self.assertEqual(await read_packet(reader), (0xE0, b''))
+
+                async with ScriptedBroker(script) as broker:
+                    result = await call(kind, 'receive', '127.0.0.1', broker.port, f'{kind}-mixed-receiver',
+                                        filters=('reception/mixed',), qos=1, count=2,
+                                        expected_delivery_qos=None)
+                self.assertEqual(result['status'], 'success', result)
+                self.assertEqual([message['qos'] for message in result['messages']], [0, 1])
+                self.assertEqual([message['packet_id'] for message in result['messages']], [None, 9])
+                kinds = [event['kind'] for event in result['events']]
+                self.assertEqual(kinds.count('manual_ack_submitted'), 1)
+                self.assertEqual(kinds.count('qos0_received_no_ack'), 1)
+
     async def test_both_public_clients_wait_for_suback_and_receive_qos1(self):
         for kind in ('mqttium', 'paho'):
             with self.subTest(client=kind):
