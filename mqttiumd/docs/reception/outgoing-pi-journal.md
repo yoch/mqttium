@@ -69,3 +69,9 @@
   Normal Rust log at546a completes53 result groups/882 tests with zero failures;
   the environment interrupted its orchestration status recording, not cargo's
   complete log. A filesystem-backed runner records remaining gates/statuses.
+- Scan/open red27d15887/fixb947a378 covers disappearance before open and an
+  interrupted scan after another real file's Finish is already buffered.
+  Offsets are committed only for a complete scan; retry uses the existing
+  bounded caller, with no recursive retry or acceptance of a genuine gap.
+  PI17/system59 tests pass. Freeze this integrated source for a fresh strict
+  normal65537 and its own CI; all production Rust is unchanged by these fixes.
