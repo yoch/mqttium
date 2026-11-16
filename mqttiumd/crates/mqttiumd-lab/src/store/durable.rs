@@ -62,6 +62,7 @@ impl MemoryStore {
                 routes: BTreeMap::new(),
                 operations: BTreeMap::new(),
                 fences: BTreeSet::new(),
+                receipt_frontiers: BTreeMap::new(),
                 publications: BTreeMap::new(),
                 payloads: BTreeMap::new(),
                 obligations: BTreeMap::new(),
