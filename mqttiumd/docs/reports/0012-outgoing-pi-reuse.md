@@ -178,6 +178,76 @@ incomplete system run, not a broker safety violation or mutation detection.
 The collector must preserve its offsets across an interrupted scan and retry
 within the existing bounded observation deadline before the final fresh run.
 
+## Received full runs and publication record
+
+The completed source is f37fe364a28c9e594787120444fd3b2b252ad56e. The following
+two normal-build runs are independent; their counts and system witnesses are
+not combined. Both use public mqttium 1.3.0 publishing and Paho 2.1.0 receiving,
+one connection per client and one observer connection, with no SQL cleanup,
+quota increase or broker restart during the long stream.
+
+| Run | Received and durably finished | Observed PI reuse | Duration | Broker / SQLite inode |
+| - | -: | -: | -: | - |
+| CI 43938665922, artifact 14261919025 | 65,537 | 65,536, PI1 | 765,129.064 ms | PID6723 / 4752897 |
+| Local mqttium-pi-final-reception-f37f | 65,537 | 65,536, PI1 | 1,430,923.946 ms | PID1216151 / 2918080 |
+
+Every new occurrence has a distinct delivery, claim, frame and Finish identity,
+with initial DUP0. An independent decoder streamed the CI raw PUBLISH/PUBACK
+hex, joined it to all 65,537 recipient observations and committed/application
+facts, and checked the numbered payloads. This healthy-run absence of duplicate
+messages is not a general QoS 1 deduplication guarantee. Both runs end with
+zero publications, payloads, obligations, outbound claims or inbound markers,
+four retained receipts and normal broker exit0. The reversed public-client
+case also passes in each wrapper.
+
+Each stream applies 3,073 receipt collections, with 64 sampled nonzero floor
+advances. The receipt quota stays 8,192; session capacity stays 128. CI samples
+show one to four receipt rows, RSS 10,768,384–10,850,304 bytes, a 90,112-byte main
+file, WAL 4,152,992–4,161,232 bytes, 22 pages and five free pages. These finite
+measurements distinguish reusable pages from physical file size and establish
+no general performance claim.
+
+All nine C/D/E cases pass at that source. They retain same-operation resolution
+of unknown Claim/Finish outcomes, genuine reduced-domain exhaustion, actual
+associated and targetless queue copies, takeover, fast PUBACK before Written,
+old callbacks/results and four separate same-file SIGKILL/wait witnesses.
+Recovered live claims retain identity/PI and replay DUP1; committed Finish does
+not resurrect work. The reused live claim also survives retirement of its
+historical claim receipt. Three compiled pure-owner mutants and the compiled
+runtime-copy mutant fail for the four exact reasons documented above. Pure
+mutant executable bytes are not packaged; their build success, test status,
+recorded executable hashes and exact assertion logs are retained.
+
+The local bundle has SHA256
+ecced6d4a427aa68b72e7c53451431ffe6898dfda63f54d3dcf4dd3b194ed7aa.
+The CI outgoing-pi-product.tar.gz has SHA256
+29a43062b4e224184a0283583de6a890bd9995d94dba292fefdfcb1550e02766;
+its GitHub artifact ZIP has SHA256
+e4a95280cfbe1ec550b68034eed350cd5b913ac792f87f74ff24e7ae65bcf8b5.
+All 230 retained-file hashes and all 1,993 Git source blobs were checked.
+The local executed normal binary is SHA256
+6181281704733e6c7971b84cbb6eb74f7273b1056a1b78a97f0496ba8b020125.
+Each receipt names its own binary; this does not substitute one run's executable
+or process witness for another's. Source archives have SHA256
+e1e3a608a1d17a5b5c2a32eb3a8ba00d0794972f62d17eeb6dd600d62bcc615f.
+
+The same source's CI is green: all eight mqttiumd jobs, client CI (after retry
+of two cancelled-before-start macOS jobs), client models and docs. This includes
+882 normal / 891 instrumented Rust tests, 183 oracle tests, 59 system-pilot tests,
+452 agreed schema documents, 74 expected model outcomes, the pilot proof,
+existing TCP/pubsub/QoS0 receptions, qualifying K1/K2b/K3 with recompute, and the
+bounded K2a/WAL gates. Its separate receipt-GC artifact independently confirms
+32,811 completed business commands and 32 sampled floor advances; it is not the
+65,537-delivery PI run. The former historical/failed attempts keep their own
+identities and outcomes.
+
+This final narrative and journal are documentation-only successors of that
+received source. The PR and freshly generated receipt/index record the exact
+final publication SHA, its own CI and artifacts; they must not relabel the
+f37fe364 runs above. New PI evidence remains system-only. The authoritative
+correlation boundary and the upstream indistinguishable-ACK limitation remain
+as stated above.
+
 ## Remaining bounds and next increment
 
 The existing 128-session persistent/infinite-expiry bound remains; absent

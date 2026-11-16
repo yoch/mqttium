@@ -75,3 +75,24 @@
   bounded caller, with no recursive retry or acceptance of a genuine gap.
   PI17/system59 tests pass. Freeze this integrated source for a fresh strict
   normal65537 and its own CI; all production Rust is unchanged by these fixes.
+- Received f37fe364a28c9e594787120444fd3b2b252ad56e, tree
+  0880167c2f3e1bcb204a946c06a7fdf40694f7ca: 70 connector blobs and1993 archived
+  Git blobs match; PR draft/unmerged. Normal CI and local runs EACH receive and
+  durably finish65537, PI1 reuse65536, one publisher/subscriber/proxy connection,
+  same process/file,3073collections/64sampledflooradvances,8192quota unchanged.
+  CI765129.064ms, PID6723/inode4752897; local1430923.946ms,
+  PID1216151/inode2918080. All9shortcases,4ownSIGKILLs,4exactmutants received;
+  independent raw-wire/identity/SQL/hash audit PASS. Each final business state
+  is empty with4receipt rows and exit0. Reverse public-client case passes.
+- All8mqttiumd CI jobs43938665922 green, including qualifying K1/K2b/K3,
+  recompute and K2a/WAL; client43938665778/model43938665739/docs green after
+  retry of cancelled-before-start macOS jobs. Normal882/instrumented891,
+  oracle183, system59, schema452, models74 expected. Receipt-GC sourcef37
+  artifact separately receives32811businesscommands. No new global qualification.
+- Local archive ecced6d4a427aa68b72e7c53451431ffe6898dfda63f54d3dcf4dd3b194ed7aa;
+  CI inner29a43062b4e224184a0283583de6a890bd9995d94dba292fefdfcb1550e02766,
+  outerZIPe4a95280cfbe1ec550b68034eed350cd5b913ac792f87f74ff24e7ae65bcf8b5.
+  Report0012 records measured sourcef37 and all limits. Publish this final
+  documentation-only successor with expectedf37 ancestry/lease; verify its
+  exact-head content/CI and fresh PI index without relabeling historical runs.
+  Next increment: explicit safe session lifecycle beyond128 historical sessions.
