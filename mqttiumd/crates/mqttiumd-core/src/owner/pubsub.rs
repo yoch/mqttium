@@ -2330,6 +2330,10 @@ mod tests {
                 packet_id: c.packet_id,
                 claim: c.claim,
             },
+            Recipe::ConsumeDelivery(c) => CommitFacts::DeliveryConsumed {
+                delivery: c.delivery,
+                target: c.target,
+            },
             _ => panic!("delivery command"),
         };
         apply(
@@ -2391,6 +2395,140 @@ mod tests {
             1,
             "the allocator prefers the smallest free number"
         );
+    }
+
+    #[test]
+    fn lifecycle_retired_claim_finish_and_consume_results_close_receipt_holes_without_emitting() {
+        use crate::contract::receipts::ReceiptCollectionReply;
+        use crate::contract::session::{SessionCancellations, SessionChange, SessionEndReason};
+        for phase in 0..3 {
+            let mut owner = world();
+            let registration = apply(&mut owner, Input::MaintainReceipts);
+            let Effect::CollectReceipts { collection } = registration[0].1 else {
+                panic!("register origin")
+            };
+            apply(
+                &mut owner,
+                Input::ReceiptsCollected {
+                    effect: registration[0].0,
+                    collection,
+                    reply: ReceiptCollectionReply::Applied {
+                        closure: collection.closure,
+                        removed: 0,
+                        retained: 0,
+                        more: false,
+                    },
+                },
+            );
+            queued(&mut owner, 0);
+            if phase == 2 {
+                owner.pubsub.deliveries.as_mut_slice()[0].qos = Qos::AtMostOnce;
+            }
+            let mut other = Delivery::metadata(
+                delivery(1),
+                SessionId::new(2),
+                Revision::new(1),
+                Qos::AtLeastOnce,
+                None,
+            );
+            other.topic = Some(bytes(b"topic"));
+            other.payload = Some(bytes(b"shared-payload"));
+            owner.pubsub.deliveries.try_push(other.clone()).unwrap();
+            let mut pending = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+            if phase == 1 {
+                let Effect::Persist { command } = &pending[0].1 else {
+                    panic!("claim")
+                };
+                known(&mut owner, pending[0].0, command);
+                pending = apply(
+                    &mut owner,
+                    Input::Packet {
+                        connection: CONNECTION,
+                        ingress_order: 1,
+                        packet: InboundPacket::Puback {
+                            packet_id: OutboundPacketId::new(1).unwrap(),
+                            reason: 0,
+                        },
+                    },
+                );
+            }
+            let (old_effect, command) = pending
+                .iter()
+                .find_map(|(id, e)| match e {
+                    Effect::Persist { command } => Some((*id, command.clone())),
+                    _ => None,
+                })
+                .unwrap();
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect: old_effect,
+                    operation: command.recipe.operation(),
+                    reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown),
+                },
+            );
+            let close = apply(
+                &mut owner,
+                Input::EndSession {
+                    connection: ConnectionKey {
+                        session: TARGET,
+                        generation: CONNECTION,
+                    },
+                    opened_by: None,
+                    reason: SessionEndReason::Disconnect,
+                },
+            );
+            let (close_effect, close_operation) = close
+                .iter()
+                .find_map(|(id, e)| match e {
+                    Effect::Persist { command } => Some((*id, command.recipe.operation())),
+                    _ => None,
+                })
+                .unwrap();
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect: close_effect,
+                    operation: close_operation,
+                    reply: StoreReply::Outcome(StoreOutcome::Committed(
+                        CommitFacts::SessionLifecycle(SessionChange::Closed {
+                            session: TARGET,
+                            route_revision: Revision::new(0),
+                            cancelled: SessionCancellations {
+                                inbound: 0,
+                                deliveries: 1,
+                                routes: 0,
+                            },
+                        }),
+                    )),
+                },
+            );
+            assert_eq!(owner.session_status().retired_flights, 1);
+            let result = known(&mut owner, old_effect, &command);
+            assert!(
+                !result.iter().any(|(_, e)| matches!(
+                    e,
+                    Effect::EmitPublish { .. } | Effect::EmitQos0 { .. } | Effect::Persist { .. }
+                )),
+                "retired_delivery_result_reemitted phase={phase}"
+            );
+            assert_eq!(owner.session_status().retired_flights, 0);
+            assert_eq!(
+                owner.pubsub.deliveries.as_slice(),
+                &[other],
+                "other_destination_responsibility_changed phase={phase}"
+            );
+            owner.receipts.test_request_sweep();
+            let gc = apply(&mut owner, Input::MaintainReceipts);
+            let Effect::CollectReceipts { collection } = gc[0].1 else {
+                panic!("collect consumed flights")
+            };
+            assert_eq!(
+                collection.closure.through,
+                close_operation.sequence(),
+                "retired_delivery_receipt_hole_never_closed phase={phase}"
+            );
+        }
     }
 
     fn operation(sequence: u64) -> OperationId {

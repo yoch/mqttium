@@ -8910,4 +8910,83 @@ mod tests {
         assert!(world.owner.deadline_is_live(ordinary.deadline));
         assert!(!world.owner.collection_deadline_is_live(ordinary.deadline));
     }
+
+    #[test]
+    fn lifecycle_retired_unknown_inbound_result_closes_its_receipt_hole_without_ack() {
+        use crate::contract::session::{SessionCancellations, SessionChange, SessionEndReason};
+        let mut world = World::connected();
+        gc_register(&mut world);
+        let admission = gc_admit(&mut world, 7, Qos::ExactlyOnce);
+        gc_apply(&mut world, unknown(&admission));
+        assert_eq!(world.owner.leases.held(), 1);
+        gc_apply(
+            &mut world,
+            Input::EndSession {
+                connection: ConnectionKey {
+                    session: SessionId::new(PRODUCER),
+                    generation: ConnectionGeneration::new(CONN),
+                },
+                opened_by: None,
+                reason: SessionEndReason::Disconnect,
+            },
+        );
+        let effects = world.drain();
+        let (effect, command) = effects
+            .iter()
+            .find_map(|(id, e)| match e {
+                Effect::Persist { command } => Some((*id, command)),
+                _ => None,
+            })
+            .unwrap();
+        let operation = command.recipe.operation();
+        gc_apply(
+            &mut world,
+            Input::StoreResult {
+                effect,
+                operation,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                    SessionChange::Closed {
+                        session: SessionId::new(PRODUCER),
+                        route_revision: Revision::new(3),
+                        cancelled: SessionCancellations {
+                            inbound: 1,
+                            deliveries: 0,
+                            routes: 0,
+                        },
+                    },
+                ))),
+            },
+        );
+        assert_eq!(kinds(&world.drain()), ["SessionChanged"]);
+        assert_eq!(world.owner.session_status().retired_flights, 1);
+        assert_eq!(
+            world.owner.leases.held(),
+            1,
+            "an unknown admission retains its reconciliation credit"
+        );
+        gc_apply(&mut world, committed(&admission));
+        assert!(
+            world.drain().is_empty(),
+            "retired_inbound_result_emitted_ack"
+        );
+        assert_eq!(world.owner.leases.held(), 0);
+        assert_eq!(world.owner.session_status().retired_flights, 0);
+        assert!(world.owner.slots.is_empty());
+        world.owner.receipts.test_request_sweep();
+        gc_apply(&mut world, Input::MaintainReceipts);
+        let gc = world.drain();
+        let Effect::CollectReceipts { collection } = gc[0].1 else {
+            panic!("consumed retired result permits collection")
+        };
+        assert_eq!(
+            collection.closure.through,
+            operation.sequence(),
+            "retired_unknown_receipt_hole_never_closed"
+        );
+        assert_eq!(
+            world.owner.sessions.len(),
+            2,
+            "other destinations remain owned"
+        );
+    }
 }

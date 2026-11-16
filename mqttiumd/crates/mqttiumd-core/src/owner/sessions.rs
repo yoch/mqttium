@@ -682,12 +682,15 @@ impl Owner {
 mod tests {
     use super::super::*;
     use crate::contract::effects::{OwnerAuthority, SubmitResult};
+    use crate::contract::ids::LogicalTime;
     use crate::contract::opening::{
         EpochOpened, EpochOpening, OpeningOutcome, OpeningReply, StartupNonce,
     };
     use crate::contract::session::{
-        SessionAction, SessionCancellations, SessionChange, SessionExpiry, SessionLifecycle,
+        SessionAction, SessionCancellations, SessionChange, SessionEndReason, SessionExpiry,
+        SessionLifecycle,
     };
+    use alloc::string::ToString;
     use alloc::vec::Vec;
 
     const TURN: TurnGrant = TurnGrant {
@@ -720,6 +723,9 @@ mod tests {
         drain(owner)
     }
     fn world() -> Owner {
+        world_with_outbox(32)
+    }
+    fn world_with_outbox(capacity: usize) -> Owner {
         let incarnation = StoreIncarnation::new(1);
         let epoch = RunEpoch::new(2);
         let mut opening = EpochOpening::new(incarnation, StartupNonce::new([7; 16]));
@@ -735,7 +741,7 @@ mod tests {
         let outbox = authority
             .create_outbox(
                 LogicalOwnerId::new(4),
-                NonZeroUsize::new(32).unwrap(),
+                NonZeroUsize::new(capacity).unwrap(),
                 bound(8),
             )
             .unwrap();
@@ -829,6 +835,318 @@ mod tests {
                 expiry,
             },
         )
+    }
+    fn closed(session: u64) -> SessionChange {
+        SessionChange::Closed {
+            session: SessionId::new(session),
+            route_revision: Revision::new(0),
+            cancelled: SessionCancellations::default(),
+        }
+    }
+    fn answer(owner: &mut Owner, reply: StoreOutcome) -> Vec<(EffectId, Effect)> {
+        let flight = owner.lifecycle.as_ref().unwrap();
+        let input = Input::StoreResult {
+            effect: flight.in_flight.answers.persist,
+            operation: flight.command.operation,
+            reply: StoreReply::Outcome(reply),
+        };
+        apply(owner, input)
+    }
+    #[test]
+    fn five_hundred_twelve_ephemeral_lifecycles_leave_only_bounded_rings() {
+        let mut owner = world();
+        for sid in 1..=512 {
+            let first = submit(
+                &mut owner,
+                sid,
+                sid.to_string().as_bytes(),
+                SessionExpiry::OnDisconnect,
+            );
+            known(&mut owner, &first, opened(sid, SessionExpiry::OnDisconnect));
+            let close = apply(
+                &mut owner,
+                Input::ConnectionClosed {
+                    connection: ConnectionGeneration::new(sid),
+                },
+            );
+            known(&mut owner, &close, closed(sid));
+            let status = owner.session_status();
+            assert_eq!(
+                (
+                    status.sessions,
+                    status.bindings,
+                    status.inbound,
+                    status.outgoing,
+                    status.retired_flights
+                ),
+                (0, 0, 0, 0, 0)
+            );
+            assert!(!status.lifecycle_pending);
+            assert!(status.closed_generations <= 4);
+            assert!(owner.finished.len() <= 16);
+        }
+        assert!(owner.routes.is_empty());
+    }
+    #[test]
+    fn full_capacity_refuses_a_new_name_but_clean_start_replaces_in_one_slot() {
+        let mut owner = world();
+        let first = submit(&mut owner, 1, b"persistent", SessionExpiry::Never);
+        known(&mut owner, &first, opened(1, SessionExpiry::Never));
+        submit(&mut owner, 2, b"other", SessionExpiry::Never);
+        let refusal = answer(
+            &mut owner,
+            StoreOutcome::RejectedCertain(RejectReason::SessionCapacityExceeded),
+        );
+        assert!(
+            refusal
+                .iter()
+                .any(|(_, e)| matches!(e, Effect::SessionRefused { reason: 0x97, .. }))
+        );
+        assert_eq!(owner.sessions.as_slice()[0].id, SessionId::new(1));
+        let replacement = apply(
+            &mut owner,
+            Input::OpenSession {
+                connection: ConnectionGeneration::new(3),
+                client_id: bytes(b"persistent"),
+                clean_start: true,
+                expiry: SessionExpiry::Never,
+            },
+        );
+        let mut facts = opened(2, SessionExpiry::Never);
+        if let SessionChange::Opened { retired, .. } = &mut facts {
+            *retired = Some(SessionId::new(1));
+        }
+        known(&mut owner, &replacement, facts);
+        assert_eq!(owner.sessions.len(), 1);
+        assert_eq!(
+            owner.connection_of(SessionId::new(2)),
+            Some(ConnectionGeneration::new(3))
+        );
+        assert!(owner.connection_of(SessionId::new(1)).is_none());
+    }
+    #[test]
+    fn closing_an_unknown_open_survives_eviction_from_the_closed_generation_ring() {
+        let mut owner = world();
+        let opening = submit(&mut owner, 1, b"ephemeral", SessionExpiry::OnDisconnect);
+        let original = owner.lifecycle.clone().unwrap();
+        answer(&mut owner, StoreOutcome::PendingOrUnknown);
+        apply(
+            &mut owner,
+            Input::ConnectionClosed {
+                connection: ConnectionGeneration::new(1),
+            },
+        );
+        for generation in 2..=10 {
+            apply(
+                &mut owner,
+                Input::ConnectionClosed {
+                    connection: ConnectionGeneration::new(generation),
+                },
+            );
+        }
+        assert!(
+            !owner
+                .closed
+                .iter()
+                .any(|g| *g == ConnectionGeneration::new(1))
+        );
+        assert_eq!(
+            owner.opening_connection(),
+            Some(ConnectionGeneration::new(1))
+        );
+        let (operation, followup) =
+            known(&mut owner, &opening, opened(1, SessionExpiry::OnDisconnect));
+        assert!(!followup.iter().any(|(_, e)| matches!(
+            e,
+            Effect::EmitFrame {
+                frame: OutboundFrame::Connack { .. },
+                ..
+            }
+        )));
+        assert!(
+            matches!(owner.lifecycle.as_ref().unwrap().command.action, SessionAction::Close { guard, .. } if guard.session == SessionId::new(1) && guard.opened_by == Some(operation))
+        );
+        known(&mut owner, &followup, closed(1));
+        let effects = apply(
+            &mut owner,
+            Input::StoreResult {
+                effect: original.in_flight.answers.persist,
+                operation,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                    opened(1, SessionExpiry::OnDisconnect),
+                ))),
+            },
+        );
+        assert!(effects.is_empty());
+        assert_eq!(owner.session_status().sessions, 0);
+    }
+    #[test]
+    fn resuming_an_infinite_session_with_zero_expiry_rebinds_before_later_closure() {
+        let mut owner = world();
+        let first = submit(&mut owner, 1, b"persistent", SessionExpiry::Never);
+        let (old_token, _) = known(&mut owner, &first, opened(1, SessionExpiry::Never));
+        owner
+            .routes
+            .try_push(Route {
+                topic: bytes(b"kept"),
+                target: SessionId::new(1),
+                target_revision: Revision::new(1),
+                max_qos: Qos::AtLeastOnce,
+            })
+            .unwrap();
+        let resume = submit(&mut owner, 2, b"persistent", SessionExpiry::OnDisconnect);
+        let mut facts = opened(1, SessionExpiry::OnDisconnect);
+        if let SessionChange::Opened {
+            session_present, ..
+        } = &mut facts
+        {
+            *session_present = true;
+        }
+        let (new_token, frames) = known(&mut owner, &resume, facts);
+        assert!(frames.iter().any(|(_, e)| matches!(
+            e,
+            Effect::EmitFrame {
+                frame: OutboundFrame::Connack {
+                    session_present: true
+                },
+                ..
+            }
+        )));
+        assert_eq!(
+            owner.routes.len(),
+            1,
+            "zero expiry applies on closure, not on resume"
+        );
+        assert!(
+            apply(
+                &mut owner,
+                Input::EndSession {
+                    connection: ConnectionKey {
+                        session: SessionId::new(1),
+                        generation: ConnectionGeneration::new(1)
+                    },
+                    opened_by: Some(old_token),
+                    reason: SessionEndReason::Disconnect,
+                }
+            )
+            .is_empty(),
+            "old_session_close_rebound"
+        );
+        assert_eq!(
+            owner.connection_of(SessionId::new(1)),
+            Some(ConnectionGeneration::new(2))
+        );
+        let close = apply(
+            &mut owner,
+            Input::ConnectionClosed {
+                connection: ConnectionGeneration::new(2),
+            },
+        );
+        assert!(
+            matches!(owner.lifecycle.as_ref().unwrap().command.action, SessionAction::Close { guard, .. } if guard.opened_by == Some(new_token))
+        );
+        known(&mut owner, &close, closed(1));
+        assert!(owner.routes.is_empty());
+    }
+    #[test]
+    fn unknown_closure_keeps_capacity_and_resolves_the_same_operation() {
+        let mut owner = world();
+        let first = submit(&mut owner, 1, b"ephemeral", SessionExpiry::OnDisconnect);
+        known(&mut owner, &first, opened(1, SessionExpiry::OnDisconnect));
+        apply(
+            &mut owner,
+            Input::ConnectionClosed {
+                connection: ConnectionGeneration::new(1),
+            },
+        );
+        let original = owner.lifecycle.clone().unwrap();
+        answer(&mut owner, StoreOutcome::PendingOrUnknown);
+        assert_eq!(
+            owner.sessions.len(),
+            1,
+            "session_capacity_released_before_close_commit"
+        );
+        let result = owner.step(
+            Input::OpenSession {
+                connection: ConnectionGeneration::new(2),
+                client_id: bytes(b"other"),
+                clean_start: false,
+                expiry: SessionExpiry::Never,
+            },
+            TURN,
+        );
+        assert!(matches!(result, StepOutcome::NeedCapacity { .. }));
+        let resolve = apply(
+            &mut owner,
+            Input::Deadline {
+                token: original.in_flight.deadline,
+                now: LogicalTime::new(100),
+            },
+        );
+        let (effect, operation) = resolve
+            .iter()
+            .find_map(|(id, e)| match e {
+                Effect::ResolveAndFence { operation } => Some((*id, *operation)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(operation, original.command.operation);
+        apply(
+            &mut owner,
+            Input::StoreResult {
+                effect,
+                operation,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                    closed(1),
+                ))),
+            },
+        );
+        assert_eq!(owner.sessions.len(), 0);
+        assert!(
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect: original.in_flight.answers.persist,
+                    operation,
+                    reply: StoreReply::Outcome(StoreOutcome::Committed(
+                        CommitFacts::SessionLifecycle(closed(1))
+                    ))
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(owner.sessions.len(), 0);
+    }
+    #[test]
+    fn a_two_slot_legacy_outbox_refuses_a_three_effect_takeover_without_mutation() {
+        let mut owner = world_with_outbox(2);
+        let first = submit(&mut owner, 1, b"persistent", SessionExpiry::Never);
+        known(&mut owner, &first, opened(1, SessionExpiry::Never));
+        let before = owner.sessions.as_slice().to_vec();
+        let counters = owner.counters;
+        let result = owner.step(
+            Input::OpenSession {
+                connection: ConnectionGeneration::new(2),
+                client_id: bytes(b"persistent"),
+                clean_start: true,
+                expiry: SessionExpiry::Never,
+            },
+            TURN,
+        );
+        assert!(
+            matches!(
+                result,
+                StepOutcome::Fatal(CoreFault::BoxTooSmall {
+                    requested: 3,
+                    capacity: 2
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(owner.sessions.as_slice(), before.as_slice());
+        assert_eq!(owner.counters, counters);
+        assert!(!owner.session_status().lifecycle_pending);
+        assert!(drain(&mut owner).is_empty());
     }
     #[test]
     fn refused_takeover_still_closes_the_disconnected_ephemeral_incarnation() {
