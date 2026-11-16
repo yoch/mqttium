@@ -36,6 +36,8 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
                         "consume.prepared",
                         "consume.committed",
                         "consume.emission",
+                        "receipt.close.prepared",
+                        "receipt.close.committed",
                     ]
                     .contains(&point)
                     {
