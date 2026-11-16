@@ -603,6 +603,16 @@ def corrupt_live_work(binary: Path, case: Path) -> dict:
                 subscriber.connect("corrupt-subscriber", session_present=True)
             except ReceiptFailure as error:
                 require(error.code in ("peer_closed", "probe_truncated"), "unexpected_corruption_connect_failure", error.code)
+            deadline = time.monotonic() + 2
+            while broker.process.poll() is None and time.monotonic() < deadline:
+                time.sleep(.005)
+            if broker.process.poll() is None:
+                ping(subscriber)
+                masked = durable(broker.db)
+                require(len(obligations(masked)) == 1 and obligations(masked)[0]["qos"] == 99
+                        and not masked["tables"]["outbound"], "corruption_precondition_changed")
+                raise ReceiptFailure("invalid_work_was_silently_absent",
+                                     "invalid unclaimed obligation persists while the broker answers PING without a typed read failure")
             status = broker.process.wait(timeout=8)
         failure = [e for e in broker.events() if e["kind"] == "startup_or_runtime_refused"]
         require(status != 0 and failure and failure[-1].get("cause") == "InvalidData"
