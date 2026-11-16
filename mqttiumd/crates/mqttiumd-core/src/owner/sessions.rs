@@ -27,10 +27,6 @@ pub(super) struct Flight {
     pub(super) in_flight: InFlight,
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one allocation-free lifecycle plan keeps its bounded flight by value"
-)]
 #[derive(Debug)]
 pub(super) enum Change {
     Submit(Flight),
@@ -62,6 +58,14 @@ fn waiting() -> Stop {
 }
 
 impl Owner {
+    /// The one accepted opening request, including a transport already closed.
+    /// This is an observation for bounded adapter follow-up, not a session grant.
+    #[must_use]
+    pub fn opening_connection(&self) -> Option<ConnectionGeneration> {
+        self.lifecycle.as_ref().and_then(|f| {
+            matches!(f.command.action, SessionAction::Open { .. }).then_some(f.connection)
+        })
+    }
     #[must_use]
     pub fn lifecycle_dispatch(&self) -> Option<(OperationId, DeadlineToken)> {
         self.lifecycle
@@ -304,6 +308,44 @@ impl Owner {
         )
         .map(Some)
     }
+    fn followup_for_refused_takeover(
+        &self,
+        flight: &Flight,
+        draft: &mut Draft,
+    ) -> Result<Option<Flight>, Stop> {
+        let SessionAction::Open {
+            expected: Some(guard),
+            ..
+        } = flight.command.action
+        else {
+            return Ok(None);
+        };
+        let Some(previous) = self.sessions.as_slice().iter().find(|s| {
+            s.id == guard.session
+                && s.opened_by == guard.opened_by
+                && s.expiry == SessionExpiry::OnDisconnect
+                && s.connection.is_none()
+        }) else {
+            return Ok(None);
+        };
+        // The earlier takeover closed this ephemeral transport before Open.
+        // A refused Open cannot make that old incarnation persistent again.
+        // Keep the result unapplied if even the reserved close lane is full.
+        if !self.receipts.control_available() {
+            return Err(waiting());
+        }
+        self.session_flight(
+            SessionAction::Close {
+                guard,
+                reason: SessionEndReason::TransportLost,
+            },
+            previous.client_id.clone(),
+            flight.connection,
+            true,
+            draft,
+        )
+        .map(Some)
+    }
     pub(super) fn plan_session_result(
         &self,
         effect: EffectId,
@@ -398,10 +440,8 @@ impl Owner {
                         },
                     })?;
                 }
-                Ok(Some(changed(Change::Refused {
-                    finished,
-                    followup: None,
-                })))
+                let followup = self.followup_for_refused_takeover(flight, draft)?;
+                Ok(Some(changed(Change::Refused { finished, followup })))
             }
             (Verdict::Transition(CommandPhase::Indeterminate), _) => {
                 Ok(Some(changed(Change::Await {
@@ -442,7 +482,8 @@ impl Owner {
                 });
                 let resumes =
                     old.is_some_and(|s| !*clean_start && s.expiry == SessionExpiry::Never);
-                reported == *expiry
+                (expected.is_none() || old.is_some())
+                    && reported == *expiry
                     && session_present == resumes
                     && route_revision >= current_revision
                     && if resumes {
@@ -450,6 +491,7 @@ impl Owner {
                             && retired.is_none()
                     } else {
                         retired == old.map(|s| s.id)
+                            && (retired.is_some() || self.sessions.len() < self.sessions.capacity())
                             && revision == Revision::new(1)
                             && session.get() > 0
                             && !self.sessions.as_slice().iter().any(|s| s.id == session)
@@ -462,7 +504,15 @@ impl Owner {
                     route_revision,
                     ..
                 },
-            ) => session == guard.session && route_revision >= current_revision,
+            ) => {
+                session == guard.session
+                    && route_revision >= current_revision
+                    && self
+                        .sessions
+                        .as_slice()
+                        .iter()
+                        .any(|s| s.id == guard.session && s.opened_by == guard.opened_by)
+            }
             _ => false,
         }
     }
@@ -595,8 +645,7 @@ impl Owner {
         let mut index = 0;
         while index < self.routes.len() {
             if self.routes.as_slice()[index].target == session {
-                let last = self.routes.len() - 1;
-                self.routes.as_mut_slice().swap(index, last);
+                self.routes.as_mut_slice()[index..].rotate_left(1);
                 let _ = self.routes.pop();
             } else {
                 index += 1;

@@ -438,10 +438,6 @@ struct Refusal {
 
 /// The change of state of a transition. Indices name entries of the
 /// tables at the revision the plan was computed against.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "a plan lives once on the stack of a step; boxing would allocate while planning"
-)]
 #[derive(Debug)]
 enum Change {
     Session(sessions::Change),
@@ -524,7 +520,7 @@ enum Change {
     },
 }
 
-/// The effects of a plan: at most `MAX_TRANSITION_SLOTS`, in the order of
+/// The effects of a plan: at most `MAX_TRANSITION_EFFECTS`, in the order of
 /// their publication.
 #[derive(Debug)]
 struct Effects {
