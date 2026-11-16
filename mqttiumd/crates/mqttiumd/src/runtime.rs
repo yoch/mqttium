@@ -296,6 +296,13 @@ impl Runtime<'_> {
                     if self.inflight.remove(&effect) != Some(operation) {
                         return Err(Failure::plain("uncorrelated_store_result"));
                     }
+                    #[cfg(feature = "test-hooks")]
+                    if let StoreReply::Outcome(StoreOutcome::Committed(
+                        CommitFacts::DeliveryFinished { delivery, .. },
+                    )) = reply
+                    {
+                        self.work_cache.remove(&delivery);
+                    }
                     self.queue(Input::StoreResult {
                         effect,
                         operation,
@@ -542,7 +549,13 @@ impl Runtime<'_> {
         p.last_packet = Instant::now();
         match decoded {
             Packet::Connect(connect) => self.connect(generation, connect),
-            Packet::Disconnect => self.close(generation, "client_disconnect"),
+            Packet::Disconnect => {
+                // Earlier decoded packets precede this close in the TCP stream.
+                // Apply their facts while this generation is authoritative;
+                // accepted durable work then outlives its transport.
+                self.drain_inputs()?;
+                self.close(generation, "client_disconnect")
+            }
             Packet::Core(packet) => {
                 if !p.connected {
                     return self.close(generation, "packet_before_connack");
@@ -662,11 +675,13 @@ impl Runtime<'_> {
                         self.packet(generation, first, body)?
                     }
                     Ok(net::Incoming::Closed { code }) => {
+                        self.drain_inputs()?;
                         self.close(generation, code)?;
                         break;
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
+                        self.drain_inputs()?;
                         let code = self
                             .peers
                             .get(&generation)
@@ -1495,7 +1510,7 @@ fn run_inner(
         let address = listener
             .local_addr()
             .map_err(|_| Failure::plain("listen_address"))?;
-        events.emit("ready",json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8}})).map_err(event_failure)?;
+        events.emit("ready",json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100}})).map_err(event_failure)?;
         println!("mqttiumd ready {address} (experimental exact pub/sub)");
         while !cancel.load(Ordering::Relaxed) {
             for _ in 0..4 {

@@ -241,28 +241,46 @@ fn publish_body(packet_id: u16) -> Vec<u8> {
 fn recipient_puback_preceding_disconnect_is_applied_before_generation_closes() {
     with_runtime(128, |runtime, directory| {
         let (subscriber, mut receiver) = peer(runtime);
-        runtime.connect(subscriber, connect_packet(b"ordered-subscriber")).unwrap();
-        until(runtime, |r|r.session_requests.is_empty());
-        assert_eq!(read_frame(&mut receiver).0,0x20);
-        runtime.packet(subscriber,0x82,vec![0,1,0,0,1,b't',1]).unwrap();
-        until(runtime,|r|r.inflight.is_empty() && r.inputs.is_empty());
-        assert_eq!(read_frame(&mut receiver).0,0x90);
-        let (publisher,mut sender)=peer(runtime);
-        runtime.connect(publisher,connect_packet(b"ordered-publisher")).unwrap();
-        until(runtime,|r|r.session_requests.is_empty());
-        assert_eq!(read_frame(&mut sender).0,0x20);
-        runtime.packet(publisher,0x32,publish_body(1)).unwrap();
-        until(runtime,|_|std::fs::read_to_string(directory.join("events.jsonl")).unwrap().lines().any(|line|line.contains("\"frame_queued\"") && line.contains("\"PUBLISH\"")));
-        let (header,body)=read_frame(&mut receiver);
-        assert_eq!(header,0x32);
-        let packet_id=[body[3],body[4]];
+        runtime
+            .connect(subscriber, connect_packet(b"ordered-subscriber"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut receiver).0, 0x20);
+        runtime
+            .packet(subscriber, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
+            .unwrap();
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        assert_eq!(read_frame(&mut receiver).0, 0x90);
+        let (publisher, mut sender) = peer(runtime);
+        runtime
+            .connect(publisher, connect_packet(b"ordered-publisher"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut sender).0, 0x20);
+        runtime.packet(publisher, 0x32, publish_body(1)).unwrap();
+        until(runtime, |_| {
+            std::fs::read_to_string(directory.join("events.jsonl"))
+                .unwrap()
+                .lines()
+                .any(|line| line.contains("\"frame_queued\"") && line.contains("\"PUBLISH\""))
+        });
+        let (header, body) = read_frame(&mut receiver);
+        assert_eq!(header, 0x32);
+        let packet_id = [body[3], body[4]];
         // The actual reader can deliver both packets in one reactor turn.
         // Preserve their order even though close removes the live generation.
-        runtime.packet(subscriber,0x40,packet_id.to_vec()).unwrap();
-        runtime.packet(subscriber,0xe0,vec![]).unwrap();
+        runtime
+            .packet(subscriber, 0x40, packet_id.to_vec())
+            .unwrap();
+        runtime.packet(subscriber, 0xe0, vec![]).unwrap();
         pump(runtime);
-        let events=std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
-        assert!(events.lines().any(|line|line.contains("\"command_submitted\"") && line.contains("\"Finish\"")),"received PUBACK must submit its durable finish before the following DISCONNECT");
+        let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+        assert!(
+            events
+                .lines()
+                .any(|line| line.contains("\"command_submitted\"") && line.contains("\"Finish\"")),
+            "received PUBACK must submit its durable finish before the following DISCONNECT"
+        );
     });
 }
 

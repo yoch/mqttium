@@ -510,7 +510,7 @@ impl DecisionColumns {
                 self.reason.ok_or(Corrupt)?,
                 self.resource,
             )?)),
-            4 | 5 | 6 => Ok(Decision::Committed(pubsub::decode_facts(
+            4..=6 => Ok(Decision::Committed(pubsub::decode_facts(
                 self.decision,
                 self.facts.as_deref().ok_or(Corrupt)?,
             )?)),
