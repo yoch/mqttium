@@ -15,9 +15,10 @@ import time
 
 from external_mqttium import client_identity
 from external_sessions import INFINITE, MqttiumSession, PahoSession
-from pubsub_probe import PubsubWire
+from pubsub_probe import PubsubWire, durable
 from receipt_reception import storage_sample
-from tcp_probe import (ReceiptFailure, connect_packet, packet, require, write_json)
+from tcp_probe import (Observations, ReceiptFailure, connect_packet, packet, publish_packet,
+                       require, write_json)
 from tcp_reception import Broker, writer_available
 
 
@@ -189,6 +190,13 @@ def identity(row):
     return int(row['id'], 16)
 
 
+def policy(row, expiry):
+    require(row.get('expiry') == int(expiry == INFINITE), 'session_policy_not_durable')
+    token = row.get('opened_by')
+    require(isinstance(token, str) and len(token) == 64, 'session_open_guard_not_durable')
+    return row
+
+
 def connect_bytes(client_id, *, clean_start=False, expiry=INFINITE):
     properties = b'' if expiry is None else b'\x11' + expiry.to_bytes(4, 'big')
     properties += b'\x21\x00\x08\x27\x00\x01\x00\x00'
@@ -231,7 +239,7 @@ async def matrix(binary, case):
             clients.append(client)
             await client.open(False)
             state = session_snapshot(broker)
-            before = session_row(state, name)
+            before = policy(session_row(state, name), expiry)
             rows.append({'case': 'create', 'expiry': expiry, 'session': before})
             await client.disconnect()
             if expiry != INFINITE:
@@ -239,6 +247,14 @@ async def matrix(binary, case):
             else:
                 await until_state(broker, cursor, lambda state: any(
                     row['id'] == before['id'] for row in state['sessions']))
+        for index, expiry in enumerate((None, 0)):
+            name = f'matrix-cs0-{index}'
+            zero = MqttiumSession(broker.address, name, expiry=expiry,
+                                  events_path=case / f'cs0-{index}.jsonl')
+            clients.append(zero)
+            await zero.open(False)
+            await zero.disconnect()
+            await gone(broker, cursor, name)
         # Existing persistent state is resumed before expiry0 applies at close.
         owner = MqttiumSession(broker.address, 'matrix-resume', expiry=INFINITE,
                                events_path=case / 'owner.jsonl')
@@ -246,7 +262,15 @@ async def matrix(binary, case):
         await owner.open(False)
         await owner.subscribe('lifecycle/matrix')
         original = session_row(session_snapshot(broker), 'matrix-resume')
+        policy(original, INFINITE)
         await owner.disconnect()
+        retained = MqttiumSession(broker.address, 'matrix-resume', expiry=INFINITE,
+                                  events_path=case / 'retained.jsonl')
+        clients.append(retained)
+        await retained.open(True)
+        require(session_row(session_snapshot(broker), 'matrix-resume')['id'] == original['id'],
+                'persistent_resume_changed_identity')
+        await retained.disconnect()
         source = PahoSession(broker.address, 'matrix-source', clean_start=True, expiry=0,
                               events_path=case / 'source.jsonl')
         clients.append(source)
@@ -260,6 +284,7 @@ async def matrix(binary, case):
         await resumed.open(True)
         require(session_row(session_snapshot(broker), 'matrix-resume')['id'] == original['id'],
                 'expiry_zero_discarded_resumed_state')
+        policy(session_row(session_snapshot(broker), 'matrix-resume'), 0)
         await resumed.receive(b'old-state-before-zero-close')
         await until_state(broker, cursor, lambda state: state['counts']['outbound'] == 0
                           and state['counts']['obligations'] == 0)
@@ -280,6 +305,26 @@ async def matrix(binary, case):
         await terminate.disconnect(0)
         await gone(broker, cursor, 'matrix-resume')
         rows.append({'case': 'resume_then_zero_close', 'before': original, 'next': new})
+        absent = MqttiumSession(broker.address, 'matrix-absent-policy', expiry=INFINITE,
+                                events_path=case / 'absent-policy-before.jsonl')
+        clients.append(absent)
+        await absent.open(False)
+        absent_id = session_row(session_snapshot(broker), 'matrix-absent-policy')['id']
+        await absent.disconnect()
+        absent = MqttiumSession(broker.address, 'matrix-absent-policy', expiry=None,
+                                events_path=case / 'absent-policy-after.jsonl')
+        clients.append(absent)
+        await absent.open(True)
+        require(session_row(session_snapshot(broker), 'matrix-absent-policy')['id'] == absent_id,
+                'absent_expiry_discarded_resumed_state')
+        policy(session_row(session_snapshot(broker), 'matrix-absent-policy'), None)
+        await absent.disconnect()
+        await gone(broker, cursor, 'matrix-absent-policy')
+        kept = PahoSession(broker.address, 'matrix-create-2', expiry=INFINITE,
+                           events_path=case / 'disconnect-infinity.jsonl')
+        clients.append(kept)
+        await kept.open(True)
+        await kept.disconnect(INFINITE)
         # Replace a durable existing identity and prove its old filters disappear.
         clean = MqttiumSession(broker.address, 'matrix-create-2', clean_start=True, expiry=0,
                                events_path=case / 'clean-replace.jsonl')
@@ -290,16 +335,89 @@ async def matrix(binary, case):
         await clean.disconnect()
         final = await gone(broker, cursor, 'matrix-create-2')
         assert_drained(final)
+        protocol = await protocol_matrix(broker, cursor, case)
+        final = session_snapshot(broker)
+        assert_drained(final)
         write_json(case / 'durable-final.json', final)
         broker.stop()
         return {'criterion': 'A', 'status': 'PASS', 'startup': startup, 'decisions': rows,
                 'clients': [client.result for client in clients], 'final_sql': final,
+                'protocol_cases': protocol,
                 'event_counts': dict(cursor.counts), 'stop_status': broker.process.returncode}
     finally:
         for client in clients:
             if not client.closed:
                 await client.disconnect()
         broker.cleanup()
+
+
+async def protocol_matrix(broker, cursor, case):
+    observed, observations = [], Observations(case / 'protocol-wire.jsonl')
+    def rejected(wire, kind, code):
+        frame = wire.wait(kind)
+        actual = frame.body[1] if kind == 0x20 else (frame.body[0] if frame.body else 0)
+        require(actual == code, 'session_protocol_reason_mismatch', f'{actual}/{code}')
+        return {'header': frame.header, 'reason': actual, 'body': frame.body.hex()}
+    # Reject a well-formed unsupported CONNECT before touching a live same-name peer.
+    owner = SessionWire(broker.address, observations, 'protocol-owner')
+    try:
+        owner.session_connect('protocol-owner', expiry=INFINITE, expected_present=False)
+        original = session_row(session_snapshot(broker), 'protocol-owner')
+        duplicate = b'\x11\xff\xff\xff\xff' * 2
+        for name, command, reason in (
+            ('finite_connect', connect_bytes('protocol-owner', clean_start=True, expiry=1), 0x83),
+            ('duplicate_connect_expiry', connect_packet('protocol-owner', flags=2, properties=duplicate), 0x82),
+            ('truncated_connect_expiry', connect_packet('protocol-owner', flags=2, properties=b'\x11\0\0\0'), 0x81),
+        ):
+            wire = SessionWire(broker.address, observations, name)
+            try:
+                wire.send(command)
+                observed.append({'case': name, 'response': rejected(wire, 0x20, reason)})
+            finally:
+                wire.close()
+            owner.send(b'\xc0\x00')
+            require(owner.wait(0xD0).body == b'', 'invalid_connect_disrupted_existing_peer')
+            require(session_row(session_snapshot(broker), 'protocol-owner')['id'] == original['id'],
+                    'invalid_connect_replaced_session')
+        owner.session_disconnect(0)
+        await gone(broker, cursor, 'protocol-owner')
+    finally:
+        owner.close()
+    for index, value in enumerate((1, INFINITE)):
+        name = f'zero-increase-{index}'
+        wire = SessionWire(broker.address, observations, name)
+        try:
+            wire.session_connect(name, expiry=0, expected_present=False)
+            wire.send(disconnect_bytes(value))
+            observed.append({'case': 'zero_to_nonzero_disconnect', 'requested_expiry': value,
+                             'response': rejected(wire, 0xE0, 0x82)})
+        finally:
+            wire.close()
+        await gone(broker, cursor, name)
+    for name, properties, reason in (
+        ('duplicate_disconnect', b'\x11\0\0\0\0' * 2, 0x82),
+        ('finite_disconnect', b'\x11\0\0\0\x01', 0x83),
+        ('truncated_disconnect', b'\x11\0\0\0', 0x81),
+    ):
+        wire = SessionWire(broker.address, observations, name)
+        try:
+            wire.session_connect(name, expiry=INFINITE, expected_present=False)
+            old = session_row(session_snapshot(broker), name)
+            declared = len(properties) + (name == 'truncated_disconnect')
+            wire.send(packet(0xE0, b'\x00' + bytes([declared]) + properties))
+            observed.append({'case': name, 'response': rejected(wire, 0xE0, reason)})
+        finally:
+            wire.close()
+        persisted = session_row(session_snapshot(broker), name)
+        require(persisted['id'] == old['id'], 'invalid_disconnect_changed_session')
+        cleanup = SessionWire(broker.address, observations, name + '-cleanup')
+        try:
+            cleanup.session_connect(name, expiry=INFINITE, expected_present=True)
+            cleanup.session_disconnect(0)
+        finally:
+            cleanup.close()
+        await gone(broker, cursor, name)
+    return observed
 
 
 async def cycles(binary, case, count=TARGET_CYCLES):
@@ -320,7 +438,8 @@ async def cycles(binary, case, count=TARGET_CYCLES):
                                        expiry=None if number % 2 else 0, identity=client_info,
                                        events_path=case / f'client-{number:04}.jsonl')
                 await client.open(False)
-                opened = session_row(session_snapshot(broker), name)
+                opened = policy(session_row(session_snapshot(broker), name),
+                                None if number % 2 else 0)
                 require(identity(opened) > last_session, 'session_identity_reused')
                 last_session = identity(opened)
                 await client.subscribe('lifecycle/cycle')
@@ -396,7 +515,7 @@ async def capacity(binary, case):
             await client.open(False)
             if name == witness_name:
                 await client.subscribe('lifecycle/capacity-witness')
-            ids.append(session_row(session_snapshot(broker), name))
+            ids.append(policy(session_row(session_snapshot(broker), name), INFINITE))
             await client.disconnect()
         full = session_snapshot(broker)
         require(full['active_sessions'] == MAX_SESSIONS and full['terminal_sessions'] == 0,
@@ -468,12 +587,121 @@ async def capacity(binary, case):
         broker.cleanup()
 
 
+async def loaded_termination(binary, case):
+    broker, clients = Broker(binary, case), []
+    observations = Observations(case / 'loaded-wire.jsonl')
+    source_wire = None
+    try:
+        startup = broker.ready()
+        cursor = EventCursor(broker)
+        witness = MqttiumSession(broker.address, 'loaded-witness', expiry=INFINITE,
+                                 events_path=case / 'witness-setup.jsonl')
+        clients.append(witness)
+        await witness.open(False)
+        await witness.subscribe('lifecycle/shared')
+        await witness.subscribe('lifecycle/producer')
+        witness_id = session_row(session_snapshot(broker), 'loaded-witness')['id']
+        await witness.disconnect()
+        source_wire = SessionWire(broker.address, observations, 'loaded-owner')
+        source_wire.session_connect('loaded-owner', expiry=INFINITE, expected_present=False)
+        source_wire.subscribe(1, [('lifecycle/shared', 1)])
+        source_id = session_row(session_snapshot(broker), 'loaded-owner')['id']
+        publisher = PahoSession(broker.address, 'loaded-publisher', clean_start=True, expiry=0,
+                                events_path=case / 'publisher.jsonl')
+        clients.append(publisher)
+        await publisher.open(False)
+        await publisher.publish('lifecycle/shared', b'shared-with-another-destination', qos=2)
+        await publisher.disconnect()
+        await gone(broker, cursor, 'loaded-publisher')
+        held = source_wire.next_publication()
+        require(held.payload == b'shared-with-another-destination' and held.qos == 1,
+                'loaded_claim_not_observed')
+        # This client's second publication is admitted but deliberately waits for PUBREL.
+        source_wire.send(publish_packet('lifecycle/producer', b'producer-ended-but-still-due',
+                                         7, qos=2))
+        require(source_wire.wait(0x50, 7).ack() == (7, 0), 'loaded_inbound_not_admitted')
+        await until_state(broker, cursor, lambda state: state['counts']['outbound'] == 1
+                          and state['counts']['inbound'] == 1 and state['counts']['obligations'] == 3)
+        before = durable(broker.db)
+        owed = [row for row in before['tables']['obligations'] if row['target'] == witness_id]
+        require(len(owed) == 2 and len(before['tables']['payloads']) == 2,
+                'loaded_shared_fixture_incomplete')
+        require(any(row['source'] == source_id for row in before['tables']['publications']),
+                'loaded_producer_publication_missing')
+        cursor.read();before_close = cursor.last
+        source_wire.session_disconnect(0)
+        source_wire = None
+        await gone(broker, cursor, 'loaded-owner')
+        after = durable(broker.db)
+        require([row for row in after['tables']['obligations'] if row['target'] == witness_id] == owed,
+                'unrelated_destination_obligation_removed')
+        require(not any(row['target'] == source_id for row in after['tables']['obligations']),
+                'closed_destination_obligation_survived')
+        require(not any(row['session'] == source_id for row in after['tables']['inbound']),
+                'closed_inbound_survived')
+        require(not after['tables']['outbound'], 'closed_claim_survived')
+        require(len(after['tables']['payloads']) == 2
+                and all(int(row['refs'], 16) == 1 for row in after['tables']['payloads']),
+                'session_end_payload_reference_accounting')
+        cursor.read()
+        changes = [event for event in cursor.recent if int(event['seq']) > before_close
+                   and event['kind'] == 'session_changed'
+                   and event.get('details', {}).get('action') == 'Closed'
+                   and event['details'].get('session') == str(int(source_id, 16))]
+        require(len(changes) == 1, 'loaded_close_result_not_observed')
+        cancelled = changes[0]['details']
+        require(cancelled['cancelled_inbound'] == 1 and cancelled['cancelled_deliveries'] == 1
+                and cancelled['cancelled_routes'] == 1, 'session_cancellation_not_distinct')
+        new = MqttiumSession(broker.address, 'loaded-owner', expiry=0,
+                             events_path=case / 'new-owner.jsonl')
+        clients.append(new)
+        await new.open(False)
+        new_id = session_row(session_snapshot(broker), 'loaded-owner')['id']
+        require(new_id != source_id, 'session_identity_reused')
+        require(not any(row['target'] == new_id for row in durable(broker.db)['tables']['obligations']),
+                'old_work_rebound_to_new_incarnation')
+        recipient = MqttiumSession(broker.address, 'loaded-witness', expiry=0,
+                                   events_path=case / 'witness-resume.jsonl')
+        clients.append(recipient)
+        await recipient.open(True)
+        require(session_row(session_snapshot(broker), 'loaded-witness')['id'] == witness_id,
+                'loaded_witness_identity_changed')
+        received = [await recipient.receive() for _ in range(2)]
+        require({row['payload_sha256'] for row in received} == {
+            hashlib.sha256(b'shared-with-another-destination').hexdigest(),
+            hashlib.sha256(b'producer-ended-but-still-due').hexdigest()},
+            'loaded_witness_publication_missing')
+        await until_state(broker, cursor, lambda state: all(state['counts'][name] == 0
+                          for name in ('outbound', 'obligations', 'inbound', 'payloads', 'publications')))
+        await recipient.disconnect()
+        await gone(broker, cursor, 'loaded-witness')
+        await new.disconnect()
+        final = await gone(broker, cursor, 'loaded-owner')
+        assert_drained(final)
+        write_json(case / 'before-close.json', before)
+        write_json(case / 'after-close.json', after)
+        write_json(case / 'final.json', final)
+        broker.stop()
+        return {'criterion': 'D', 'status': 'PASS', 'startup': startup,
+                'closed_session': source_id, 'new_session': new_id, 'witness_session': witness_id,
+                'held_publish': held.observation(), 'cancelled': changes[0],
+                'original_witness_obligations': owed, 'received': received, 'final_sql': final,
+                'stop_status': broker.process.returncode}
+    finally:
+        if source_wire is not None:
+            source_wire.close()
+        for client in clients:
+            if not client.closed:
+                await client.disconnect()
+        broker.cleanup()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--binary-source-head', required=True)
-    parser.add_argument('--case', choices=('A', 'B', 'C', 'nominal'), default='nominal')
+    parser.add_argument('--case', choices=('A', 'B', 'C', 'D', 'nominal'), default='nominal')
     parser.add_argument('--cycles', type=int, default=TARGET_CYCLES)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -486,11 +714,11 @@ def main():
                'binary': {'path': str(args.binary.resolve()),
                           'sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest()}}
     try:
-        names = ('A', 'B', 'C') if args.case == 'nominal' else (args.case,)
+        names = ('A', 'B', 'C', 'D') if args.case == 'nominal' else (args.case,)
         for name in names:
             directory = args.out / name
             directory.mkdir()
-            function = {'A': matrix, 'B': cycles, 'C': capacity}[name]
+            function = {'A': matrix, 'B': cycles, 'C': capacity, 'D': loaded_termination}[name]
             parameters = (args.cycles,) if name == 'B' else ()
             receipt['cases'].append(asyncio.run(function(args.binary.resolve(), directory, *parameters)))
         receipt['status'] = 'PASS'

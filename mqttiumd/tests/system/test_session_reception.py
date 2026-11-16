@@ -6,7 +6,7 @@ import tempfile
 import unittest
 
 from external_sessions import INFINITE, MqttiumSession, PahoSession, exchange, options
-from session_reception import CARDINALITY_ZERO, assert_drained, cardinality_drained
+from session_reception import CARDINALITY_ZERO, assert_drained, cardinality_drained, policy
 from test_external_clients import ScriptedBroker, read_packet
 from tcp_probe import ReceiptFailure
 
@@ -143,3 +143,13 @@ class SessionEvidenceTests(unittest.TestCase):
         with self.assertRaises(ReceiptFailure) as raised:
             cardinality_drained({'details': dict(row, closed_generations=9)})
         self.assertEqual(raised.exception.code, 'session_closed_generation_memory_grew')
+
+    def test_public_policy_must_match_durable_enum_and_opening_guard(self):
+        for requested, stored in ((None, 0), (0, 0), (INFINITE, 1)):
+            self.assertEqual(policy({'expiry': stored, 'opened_by': '01' * 32}, requested)['expiry'], stored)
+            with self.assertRaises(ReceiptFailure) as raised:
+                policy({'expiry': 1 - stored, 'opened_by': '01' * 32}, requested)
+            self.assertEqual(raised.exception.code, 'session_policy_not_durable')
+        with self.assertRaises(ReceiptFailure) as raised:
+            policy({'expiry': 0, 'opened_by': None}, 0)
+        self.assertEqual(raised.exception.code, 'session_open_guard_not_durable')
