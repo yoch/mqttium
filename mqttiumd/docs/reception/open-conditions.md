@@ -115,7 +115,6 @@ This closes the former broker-startup row; it does not accept proposed ADRs.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| QoS 1/PUBACK and MQTT-4.3.2-5 Packet Identifier/reconnect semantics; no permanent QoS 1 deduplication claim | Next product increment | Lower-QoS interoperability and complete MQTT 5 conformance |
-| SUBSCRIBE, outgoing delivery, retained messages, expiry, Will and authentication remain outside the experimental incoming QoS 2 profile | Product follow-up lots | A complete or deployable broker |
+| QoS 0, SUBSCRIBE, outgoing delivery, retained messages, expiry, Will and authentication remain outside the experimental incoming QoS 1/2 profile. Incoming QoS 1 and MQTT-4.3.2-5 reuse/loss behavior have finite system reception in report 0008, without permanent MQTT-level deduplication or fixture-oracle qualification | Product follow-up lots | A complete or deployable broker |
 | Receipt slots (8,192), sessions/exchanges (128), timer and epoch collection bounds are finite; no operational indefinite-service guarantee or loaded-writer latency/performance target has been received | Store/runtime follow-up | Long-running operation and G4 |
 | A storage syscall can outlive graceful shutdown's deadline; the product reports incomplete shutdown/unknown outcome and process exit releases OS resources. Process-kill evidence is not power-loss evidence | Runtime/storage follow-up | Stronger system/storage failure guarantees |
