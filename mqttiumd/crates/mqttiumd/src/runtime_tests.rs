@@ -83,6 +83,7 @@ fn with_runtime(max_exchanges: u32, test: impl FnOnce(&mut Runtime<'_>, &Path)) 
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
         started: Instant::now(),
+        #[cfg(feature = "test-hooks")]
         captured: None,
         #[cfg(feature = "test-hooks")]
         hooks: Hooks::default(),
@@ -166,7 +167,8 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             keep_alive: 0,
             max_packet: 268435455,
             ingress: 0,
-            receiving: BTreeSet::new(),
+            receiving: crate::receiving::Window::default(),
+            closing: None,
         },
     );
     (generation, client)
@@ -314,5 +316,96 @@ fn concatenated_fresh_connect_and_publish_wait_for_confirmed_session_creation() 
         assert_eq!(body[0], 0, "a new session has Session Present=0");
         assert_eq!(body[1], 0, "successful CONNECT");
         assert_eq!(read_frame(&mut client).0, 0x50);
+    });
+}
+
+fn unsupported_connect_with_cap(cap: u32) -> Vec<u8> {
+    let mut body = vec![
+        0, 4, b'M', b'Q', b'T', b'T', 5, 2, 0, 10, 10, 0x11, 255, 255, 255, 255, 0x27,
+    ];
+    body.extend_from_slice(&cap.to_be_bytes());
+    body.extend_from_slice(&[0, 4, b't', b'i', b'n', b'y']);
+    body
+}
+
+#[test]
+fn a_validated_unsupported_connect_flushes_its_bounded_failure_before_close() {
+    with_runtime(1, |runtime, _| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .packet(generation, 0x10, unsupported_connect_with_cap(10))
+            .unwrap();
+        until(runtime, |r| !r.peers.contains_key(&generation));
+        let (first, body) = read_frame(&mut client);
+        assert_eq!(first, 0x20);
+        assert_ne!(body[1], 0, "unsupported profile never succeeds");
+        assert!(
+            runtime.sessions.is_empty(),
+            "refused CONNECT never creates a session"
+        );
+    });
+}
+
+#[test]
+fn a_refusal_never_exceeds_a_validated_connects_tiny_packet_limit() {
+    with_runtime(1, |runtime, _| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .packet(generation, 0x10, unsupported_connect_with_cap(3))
+            .unwrap();
+        until(runtime, |r| !r.peers.contains_key(&generation));
+        let mut byte = [0];
+        assert_eq!(
+            client.read(&mut byte).unwrap(),
+            0,
+            "five-byte refusal would exceed the peer's three-byte cap"
+        );
+        assert!(runtime.sessions.is_empty());
+    });
+}
+
+#[test]
+fn a_real_delayed_pubcomp_write_receipt_cannot_release_a_new_packet_identifier_use() {
+    with_runtime(8, |runtime, _| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"receive-window"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        let session = runtime.sessions[b"receive-window".as_slice()].id;
+        let id = InboundPacketId::new(1).unwrap();
+        runtime.packet(generation, 0x34, publish_body(1)).unwrap();
+        until(runtime, |r| {
+            r.owner
+                .exchange(session, id)
+                .is_some_and(|(_, p)| p == ExchangePhase::AwaitPubrel)
+        });
+        assert_eq!(read_frame(&mut client).0, 0x50);
+        runtime.packet(generation, 0x62, vec![0, 1]).unwrap();
+        until(runtime, |r| r.owner.exchange(session, id).is_none());
+        // The socket task writes PUBCOMP, but the reactor has not consumed its
+        // receipt. A real peer is already allowed to reuse this identifier.
+        assert_eq!(read_frame(&mut client).0, 0x70);
+        assert!(runtime.frames.values().any(|p| p.kind == "PUBCOMP"));
+        runtime.packet(generation, 0x34, publish_body(1)).unwrap();
+        let serial = runtime.peers[&generation].receiving.serial(1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.frames.values().any(|p| p.kind == "PUBCOMP") && Instant::now() < deadline {
+            runtime.connections().unwrap();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(runtime.peers[&generation].receiving.serial(1), Some(serial));
+        for next in 2..=8 {
+            runtime
+                .packet(generation, 0x34, publish_body(next))
+                .unwrap();
+        }
+        runtime.packet(generation, 0x34, publish_body(9)).unwrap();
+        assert_eq!(
+            runtime.peers[&generation].closing.map(|v| v.0),
+            Some("receive_maximum"),
+            "the ninth actual PUBLISH is refused despite the late old completion"
+        );
     });
 }

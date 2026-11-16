@@ -50,7 +50,7 @@ the assertions are true.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| **Core, limits of what it remembers** (lot L1, corrections of the review of its core). An operation that ended is kept in a bounded window (`OwnerConfig::retained_operations`); beyond it a contradicting result is absorbed. A connection the owner closed is kept in a bounded window (`remembered_connections`); beyond it what the connection still carries is no longer known as stale. Lot L4, which assigns connection generations, decides whether "older than the current one" closes the second limit | L1, L4 | S0 |
+| **Core, limits of what it remembers** (lot L1, corrections of the review of its core). An operation that ended is kept in a bounded window (`OwnerConfig::retained_operations`); beyond it a contradicting result is absorbed. The product TCP runtime now filters non-reused generations against its live connection map, including before core delivery, beyond the core's bounded closed window (report 0007). This does not extend the terminal-operation contradiction window or prove it universally sufficient | L1, L4 | S0 |
 | **Store, remaining deterministic-store scope.** Commands clone the durable state; terminal sessions are bounded by identity exhaustion rather than max_sessions, and epoch-0 receipts/fences are not collected. Typed bounded reads now distinguish invalid data, configured limits and allocation failure (proposed record 0021). These remaining write/storage-growth limits are unchanged | L7 | S0 workloads beyond the stated bounds |
 | **Store and formats, what is left.** The contract now has the outcome `Violation` with its `violation` (`RecipeMismatch`), carried unchanged by `StoreResultReady`, `StoreResultHandedOver` and `StoreResultDelivered` (lot L3, `ec65934`); the writer of the store writes it on `StoreResultReady` and `StoreResultHandedOver` (`ce64424d`, `evidence::outcome_fields`); the runner writes it on `StoreResultDelivered` with the same content, shown by a composition test in which one operation is presented with two recipes (`crates/mqttiumd-lab/tests/bench_violation.rs`); no scenario of the registry produces a violation, because no declared fault makes the store contradict itself. At `store.fence.transit` a fault on a resolution selects every resolution, because the adapter gives a resolution no source: enough while a scenario has one exchange | L3 if a scenario must produce a violation | G0 |
 | **SQLite store, remaining scope.** The durable trait, read-only inspector and recovery pages have fallible, bounded readers with stable causes (proposed record 0021); quick_check is supplemented by semantic decoding. Deterministic K1/K2b/K3 and complete DurableState comparisons remain received. Left: the guard on an already referenced payload and the collection scan of every operation/fence identifier have no new bound in this increment. Read budgets bound application fields, rows and logical bytes, not SQLite internal cache allocation or all storage failures | L7 | S0 workloads beyond the stated bounds |
@@ -76,9 +76,10 @@ Lot L1 is not received while a condition it closes is open. The creation
 authority is decided by record 0009 and split by lot: no part is closed by
 another lot's part.
 
-| Condition | Closed by | Blocks |
-| - | - | - |
-| **Creation authority, the real path** (ADR 0009). Done for the bench: `Process::start` of the runner opens an epoch, takes the grant, builds the authority with `OwnerAuthority::from_grant`, creates the box and the owner, and `bench_composition.rs` shows through that path that a second box for the active owner is refused, before and after a simulated crash and a new epoch. Left: the same for the start-up of the broker binary, which does not exist yet; the authority of the bench holds one owner | The lot that writes the broker binary | S1 |
+The creation-authority path is now also implemented and received in the product
+TCP executable: one durable epoch/grant/authority/Outbox/Owner and complete
+recovery before listening. See [report 0007](../reports/0007-tcp-qos2-product.md).
+This closes the former broker-startup row; it does not accept proposed ADRs.
 
 ## Pilot proof (DEM-021): reception of L6
 
@@ -109,3 +110,12 @@ another lot's part.
 | D1, expiry against uncertain emission | Open; S0 excludes expiry |
 | T1, temporal guarantees of the Will | Open; S0 excludes the Will |
 | Service targets of the real profiles | Not supplied; needed before G4, useful for the measurement of ADR 0008 |
+
+## Product TCP: remaining scope
+
+| Condition | Closed by | Blocks |
+| - | - | - |
+| QoS 1/PUBACK and MQTT-4.3.2-5 Packet Identifier/reconnect semantics; no permanent QoS 1 deduplication claim | Next product increment | Lower-QoS interoperability and complete MQTT 5 conformance |
+| SUBSCRIBE, outgoing delivery, retained messages, expiry, Will and authentication remain outside the experimental incoming QoS 2 profile | Product follow-up lots | A complete or deployable broker |
+| Receipt slots (8,192), sessions/exchanges (128), timer and epoch collection bounds are finite; no operational indefinite-service guarantee or loaded-writer latency/performance target has been received | Store/runtime follow-up | Long-running operation and G4 |
+| A storage syscall can outlive graceful shutdown's deadline; the product reports incomplete shutdown/unknown outcome and process exit releases OS resources. Process-kill evidence is not power-loss evidence | Runtime/storage follow-up | Stronger system/storage failure guarantees |

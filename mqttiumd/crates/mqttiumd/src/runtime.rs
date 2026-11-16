@@ -19,7 +19,7 @@ use mqttiumd_contract::step::{StepOutcome, TurnGrant};
 use mqttiumd_core::owner::{Owner, OwnerConfig};
 use mqttiumd_store_api::{ReadError, ReadPhase};
 use serde_json::json;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{SocketAddr, TcpListener};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
@@ -61,7 +61,14 @@ struct Peer {
     keep_alive: u16,
     max_packet: usize,
     ingress: u64,
-    receiving: BTreeSet<u16>,
+    receiving: crate::receiving::Window,
+    closing: Option<(&'static str, Instant)>,
+}
+struct PendingFrame {
+    connection: ConnectionKey,
+    kind: &'static str,
+    packet_id: Option<u16>,
+    receive_serial: Option<u64>,
 }
 struct PendingSession {
     connection: ConnectionGeneration,
@@ -82,10 +89,11 @@ struct Runtime<'a> {
     timers: BTreeMap<DeadlineToken, Instant>,
     inflight: BTreeMap<EffectId, OperationId>,
     started: Instant,
+    #[cfg(feature = "test-hooks")]
     captured: Option<(ConnectionGeneration, codec::Connect)>,
     #[cfg(feature = "test-hooks")]
     hooks: Hooks,
-    frames: BTreeMap<EffectId, (ConnectionKey, &'static str, Option<u16>)>,
+    frames: BTreeMap<EffectId, PendingFrame>,
 }
 impl Runtime<'_> {
     fn queue(&mut self, input: Input) -> Result<(), Failure> {
@@ -116,7 +124,7 @@ impl Runtime<'_> {
         Ok(())
     }
     fn drain_inputs(&mut self) -> Result<(), Failure> {
-        for _ in 0..64 {
+        for _ in 0..self.inputs.len().min(64) {
             let Some(input) = self.inputs.pop_front() else {
                 break;
             };
@@ -158,8 +166,15 @@ impl Runtime<'_> {
             ) {
                 StepOutcome::Applied { .. } => {}
                 StepOutcome::NeedCapacity { input, .. } => {
-                    self.inputs.push_front(input);
-                    break;
+                    match input {
+                        Input::Packet { connection, .. } => {
+                            // No transition applied and no effect was submitted for this packet.
+                            // Close its transport rather than reorder its positive acknowledgements.
+                            self.events.emit("input_capacity_refused",json!({"connection":connection.get().to_string(),"details":{"accepted_command_rejected":false}})).map_err(event_failure)?;
+                            self.close(connection, "input_capacity")?;
+                        }
+                        other => self.inputs.push_back(other),
+                    }
                 }
                 StepOutcome::Exhausted { .. } => return Err(Failure::plain("core_exhausted")),
                 StepOutcome::Fatal(fault) => {
@@ -234,7 +249,7 @@ impl Runtime<'_> {
                             if pending.client != session.client.as_slice() {
                                 return Err(Failure::plain("session_identity_mismatch"));
                             }
-                            self.events.emit("session_established",json!({"connection":pending.connection.get().to_string(),"details":{"request":request.to_string(),"session":session.id.get().to_string(),"session_present":session.present}})).map_err(event_failure)?;
+                            self.events.emit("session_established",json!({"connection":pending.connection.get().to_string(),"details":{"request":request.to_string(),"session":session.id.get().to_string(),"session_present":session.present,"source":"writer_confirmation"}})).map_err(event_failure)?;
                             let connection = self.peers.get_mut(&pending.connection).map(|p| {
                                 p.pending = false;
                                 p.connected = true;
@@ -272,6 +287,7 @@ impl Runtime<'_> {
         generation: ConnectionGeneration,
         connect: codec::Connect,
     ) -> Result<(), Failure> {
+        self.events.emit("connect_validated",json!({"connection":generation.get().to_string(),"details":{"keep_alive":connect.keep_alive,"max_packet_size":connect.max_packet_size,"receive_maximum":connect.receive_maximum,"topic_alias_maximum":connect.topic_alias_maximum,"request_problem_information":connect.request_problem_information}})).map_err(event_failure)?;
         if let Some(p) = self.peers.get_mut(&generation) {
             if p.connected || p.pending {
                 return self.close(generation, "second_connect");
@@ -280,11 +296,13 @@ impl Runtime<'_> {
             p.max_packet = connect.max_packet_size as usize;
             p.last_packet = Instant::now();
         }
+        #[cfg(feature = "test-hooks")]
         if self.captured.is_none() {
             self.events.emit("input_captured",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"CONNECT"}})).map_err(event_failure)?;
             self.captured = Some((generation, connect.clone()));
         }
-        if self.sessions.contains_key(connect.client_id.as_slice()) {
+        if let Some(session) = self.sessions.get(connect.client_id.as_slice()) {
+            self.events.emit("session_established",json!({"connection":generation.get().to_string(),"details":{"session":session.id.get().to_string(),"session_present":true,"source":"durable_cache"}})).map_err(event_failure)?;
             if let Some(p) = self.peers.get_mut(&generation) {
                 p.connected = true;
             }
@@ -339,14 +357,27 @@ impl Runtime<'_> {
             Ok(v) => v,
             Err(error) => {
                 self.events.emit("packet_refused",json!({"connection":generation.get().to_string(),"details":{"code":error.code(),"reason":error.reason_code()}})).map_err(event_failure)?;
-                // A refusal never blocks the reactor; if the bounded queue cannot accept it, close.
-                if let Some(p) = self.peers.get(&generation) {
-                    let bytes = codec::refusal(error, !p.connected);
-                    if bytes.len() <= p.max_packet {
-                        let _ = p.io.outgoing.try_send(net::Write {
-                            correlation: None,
-                            bytes,
-                        });
+                // Refusal output has the same bounded absolute write path as business frames.
+                if let Some(p) = self.peers.get_mut(&generation) {
+                    let cap = if p.connected {
+                        Some(p.max_packet as u32)
+                    } else {
+                        error.peer_maximum()
+                    };
+                    if let Some(cap) = cap {
+                        let bytes = codec::refusal(error, !p.connected);
+                        if bytes.len() <= cap as usize
+                            && p.io
+                                .outgoing
+                                .try_send(net::Write {
+                                    correlation: None,
+                                    bytes,
+                                })
+                                .is_ok()
+                        {
+                            p.closing = Some(("packet_refused", Instant::now()));
+                            return Ok(());
+                        }
                     }
                 }
                 return self.close(generation, "packet_refused");
@@ -364,21 +395,32 @@ impl Runtime<'_> {
                 if !p.connected {
                     return self.close(generation, "packet_before_connack");
                 }
-                if let InboundPacket::Publish {
-                    packet_id: Some(id),
-                    ..
-                } = &packet
-                {
-                    if !p.receiving.contains(&id.get()) && p.receiving.len() >= 8 {
-                        return self.close(generation, "receive_maximum");
-                    }
-                    p.receiving.insert(id.get());
-                }
                 p.ingress = p
                     .ingress
                     .checked_add(1)
                     .ok_or_else(|| Failure::plain("ingress_exhausted"))?;
                 let ingress_order = p.ingress;
+                if let InboundPacket::Publish {
+                    packet_id: Some(id),
+                    ..
+                } = &packet
+                    && p.receiving.publish(id.get(), ingress_order).is_err()
+                {
+                    let bytes = vec![0xe0, 2, 0x93, 0];
+                    if bytes.len() <= p.max_packet
+                        && p.io
+                            .outgoing
+                            .try_send(net::Write {
+                                correlation: None,
+                                bytes,
+                            })
+                            .is_ok()
+                    {
+                        p.closing = Some(("receive_maximum", Instant::now()));
+                        return Ok(());
+                    }
+                    return self.close(generation, "receive_maximum");
+                }
                 self.queue(Input::Packet {
                     connection: generation,
                     ingress_order,
@@ -414,6 +456,7 @@ impl Runtime<'_> {
         for generation in keys {
             for _ in 0..4 {
                 let incoming = match self.peers.get(&generation) {
+                    Some(p) if p.pending || p.closing.is_some() => break,
                     Some(p) => p.io.incoming.try_recv(),
                     None => break,
                 };
@@ -445,10 +488,11 @@ impl Runtime<'_> {
                 match written {
                     Ok(net::Written::Complete { correlation, bytes }) => {
                         if let Some((effect, connection)) = correlation {
-                            let (_, kind, id) = self
+                            let pending = self
                                 .frames
                                 .remove(&effect)
                                 .ok_or_else(|| Failure::plain("uncorrelated_frame_result"))?;
+                            let (kind, id) = (pending.kind, pending.packet_id);
                             if kind != "PINGRESP" {
                                 self.events.emit("frame_written",json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(effect),"packet_id":id.unwrap_or(0),"bytes":bytes}})).map_err(event_failure)?;
                             }
@@ -456,7 +500,7 @@ impl Runtime<'_> {
                                 && let Some(p) = self.peers.get_mut(&generation)
                                 && let Some(id) = id
                             {
-                                p.receiving.remove(&id);
+                                p.receiving.complete(id, pending.receive_serial);
                             }
                             self.queue(Input::FrameResult {
                                 effect,
@@ -466,6 +510,10 @@ impl Runtime<'_> {
                                     total: bytes as u64,
                                 },
                             })?;
+                        } else if let Some((code, _)) =
+                            self.peers.get(&generation).and_then(|p| p.closing)
+                        {
+                            self.close(generation, code)?;
                         }
                     }
                     Ok(net::Written::Failed { correlation, code }) => {
@@ -488,7 +536,11 @@ impl Runtime<'_> {
                 }
             }
             if let Some(p) = self.peers.get(&generation) {
-                let expired = if !p.connected && p.created.elapsed() > Duration::from_secs(3) {
+                let expired = if let Some((code, since)) = p.closing
+                    && since.elapsed() > Duration::from_millis(300)
+                {
+                    Some(code)
+                } else if !p.connected && p.created.elapsed() > Duration::from_secs(3) {
                     Some("connect_deadline")
                 } else if p.keep_alive != 0
                     && p.last_packet.elapsed()
@@ -507,8 +559,8 @@ impl Runtime<'_> {
         let stale: Vec<_> = self
             .frames
             .iter()
-            .filter(|(_, v)| !self.peers.contains_key(&v.0.generation))
-            .map(|(id, v)| (*id, v.0))
+            .filter(|(_, v)| !self.peers.contains_key(&v.connection.generation))
+            .map(|(id, v)| (*id, v.connection))
             .collect();
         for (effect, connection) in stale {
             self.frames.remove(&effect);
@@ -553,7 +605,7 @@ struct Sink<'a> {
     inflight: &'a mut BTreeMap<EffectId, OperationId>,
     timers: &'a mut BTreeMap<DeadlineToken, Instant>,
     inputs: &'a mut VecDeque<Input>,
-    frames: &'a mut BTreeMap<EffectId, (ConnectionKey, &'static str, Option<u16>)>,
+    frames: &'a mut BTreeMap<EffectId, PendingFrame>,
     close: Vec<(ConnectionGeneration, &'static str)>,
     error: Option<Failure>,
 }
@@ -574,10 +626,11 @@ impl EffectSink for Sink<'_> {
                 if MUTANT_EARLY_ACK
                     && let mqttiumd_contract::command::Recipe::AdmitPublication(admission) =
                         command.recipe.get()
-                    && let Some(p) = self
-                        .peers
-                        .values()
-                        .find(|p| p.receiving.contains(&admission.source.packet_id.get()))
+                    && let Some(p) = self.peers.values().find(|p| {
+                        p.receiving
+                            .serial(admission.source.packet_id.get())
+                            .is_some()
+                    })
                 {
                     let _ = p.io.outgoing.try_send(net::Write {
                         correlation: None,
@@ -661,7 +714,15 @@ impl EffectSink for Sink<'_> {
                     bytes,
                 }) {
                     Ok(()) => {
-                        self.frames.insert(id, (connection, kind, packet_id));
+                        self.frames.insert(
+                            id,
+                            PendingFrame {
+                                connection,
+                                kind,
+                                packet_id,
+                                receive_serial: packet_id.and_then(|id| peer.receiving.serial(id)),
+                            },
+                        );
                         let _ = effect.into_parts();
                         if kind!="PINGRESP"&&self.events.emit("frame_queued",json!({"connection":generation.get().to_string(),"details":{"packet_kind":kind,"effect":effect_text(id),"packet_id":packet_id.unwrap_or(0)}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         SubmitResult::Accepted
@@ -840,6 +901,7 @@ fn run_inner(
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
         started: Instant::now(),
+        #[cfg(feature = "test-hooks")]
         captured: None,
         #[cfg(feature = "test-hooks")]
         hooks,
@@ -910,7 +972,7 @@ fn run_inner(
         let address = listener
             .local_addr()
             .map_err(|_| Failure::plain("listen_address"))?;
-        events.emit("ready",json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8}})).map_err(event_failure)?;
+        events.emit("ready",json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8}})).map_err(event_failure)?;
         println!("mqttiumd ready {address} (experimental incoming QoS 2)");
         while !cancel.load(Ordering::Relaxed) {
             for _ in 0..4 {
@@ -944,7 +1006,8 @@ fn run_inner(
                                 keep_alive: 0,
                                 max_packet: 268435455,
                                 ingress: 0,
-                                receiving: BTreeSet::new(),
+                                receiving: crate::receiving::Window::default(),
+                                closing: None,
                             },
                         );
                         events.emit("connection_opened",json!({"connection":runtime.generation.get().to_string(),"details":{"send_buffer_bytes":sendbuf}})).map_err(event_failure)?;

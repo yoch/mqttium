@@ -18,6 +18,8 @@ it. The examples illustrate the contract and are not part of the digest.
 | `schema/v1/store-snapshot.schema.json` | The durable state of a store at one checkpoint, as `InspectDurableState` writes it |
 | `v1/fault-points.json` | Contractual injection points, what each carries (a command or a result) and the actions it offers |
 | `v1/profiles.json` | Profiles and their perimeter |
+| `v1/product-profile.json` | Fixed bounds and MQTT feature restrictions of the experimental TCP receiver |
+| `schema/v1/product-event.schema.json` | Bounded product observations; separate from fixture-based qualifying campaign traces |
 | `v1/assertions.json` | Assertion names, their meaning and the requirements they serve |
 | `v1/requirements.json` | Every identifier the specification defines, each with its source: a chapter or an accepted decision record |
 | `v1/p1.catalog.json` | Vocabulary of the transition registry: machines, state classes, event classes, guard dimensions, effects |

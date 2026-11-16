@@ -5,10 +5,10 @@ associated with MQTTium. Its central contract: in Durable mode, a positive
 acknowledgement becomes eligible only after every responsibility it stands
 for is durably committed.
 
-**Status: S0, incoming core and validation lab.** The pure Rust core runs
+**Status: experimental durable incoming QoS 2 over TCP, plus the S0 validation lab.** The pure Rust core runs
 against a deterministic store and SQLite. The lab and independent Python
 oracle receive bounded scenarios, including real process kills. This is
-not yet a network broker or an MQTT conformance or performance claim.
+a narrow product TCP receiver, not a complete MQTT broker or a conformance or performance claim. See [the product profile and commands](docs/product-tcp.md).
 
 ## What exists
 
@@ -19,6 +19,7 @@ not yet a network broker or an MQTT conformance or performance claim.
 | `crates/mqttiumd-contract/` | Identities, bounded quantities, the four store outcomes, the step interface, effect ownership, frozen recipes |
 | `crates/mqttiumd-core/` | Pure prepared/applied transitions, bounded effects, recovery and incoming exchange state |
 | `crates/mqttiumd-store-api/`, `crates/mqttiumd-store-sqlite/` | Durable-store contract, typed bounded readers and SQLite implementation |
+| `crates/mqttiumd/` | Product TCP executable, bounded socket adapters and exclusive SQLite worker |
 | `crates/mqttiumd-lab/` | Deterministic store, adapters, child supervisor, campaign runner and format reader |
 | `tests/oracle/` | Independent Python semantic reader, assertions and campaign qualification |
 | `tools/build_corpus.py` | Rebuilds the derived contract files: the requirement register and the examples |

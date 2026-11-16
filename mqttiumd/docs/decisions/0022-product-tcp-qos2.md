@@ -57,7 +57,13 @@ results remain correlated after socket closure. Unaccepted effects remain
 in their Outbox; transport failures resolve accepted frames explicitly.
 Generations never repeat. The runtime rejects stale ingress independently
 of the core's finite closed-connection window, while reconciling necessary
-late writer results. No global lock is held across socket I/O.
+late writer results. A pending fresh CONNECT holds its bounded ingress until
+session confirmation, including pipelined packets. A handed-back packet that
+cannot reserve volatile capacity closes its own transport; nonpacket retries
+make a bounded fair pass so releases/results cannot be starved. Receive
+Maximum completion uses the PUBLISH ingress serial, so an old PUBCOMP write
+receipt cannot free a reused Packet Identifier. No global lock is held across
+socket I/O.
 
 No publication is retained as an archive: metadata can be removed once its
 last inbound marker and obligation are gone. Existing committed admission

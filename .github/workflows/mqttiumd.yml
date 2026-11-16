@@ -220,3 +220,36 @@ jobs:
         run: |
           cargo fmt --all --check
           cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  tcp-product:
+    name: product TCP QoS 2
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+      - name: Install the independent external MQTT client
+        run: python -m pip install --disable-pip-version-check -r tests/system/requirements.txt
+      - name: Instrumented product remains lint-clean
+        run: cargo clippy -p mqttiumd --all-targets --features test-hooks --locked -- -D warnings
+      - name: Real product TCP reception and precise negative controls
+        run: tools/run_tcp_reception.sh "$RUNNER_TEMP/tcp-product"
+      - name: Keep each product run's own evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-tcp-product-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/tcp-product
+            ${{ runner.temp }}/tcp-product.tar.gz
+            ${{ runner.temp }}/tcp-product.tar.gz.sha256
+          if-no-files-found: error
