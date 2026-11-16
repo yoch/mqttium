@@ -80,6 +80,7 @@ fn with_runtime(max_exchanges: u32, test: impl FnOnce(&mut Runtime<'_>, &Path)) 
         next_session_request: 0,
         generation: ConnectionGeneration::new(0),
         inputs: VecDeque::new(),
+        deferred_inputs: VecDeque::new(),
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
         work_reads: BTreeMap::new(),
@@ -286,25 +287,49 @@ fn recipient_puback_preceding_disconnect_is_applied_before_generation_closes() {
 
 #[test]
 fn a_deferred_subscription_cannot_be_overtaken_by_its_later_unsubscribe() {
-    with_runtime(128, |runtime,directory| {
-        let (generation,mut client)=peer(runtime);
-        runtime.connect(generation,connect_packet(b"ordered-controls")).unwrap();
-        until(runtime,|r|r.session_requests.is_empty());
-        assert_eq!(read_frame(&mut client).0,0x20);
-        runtime.packet(generation,0x82,vec![0,1,0,0,1,b't',1]).unwrap();
+    with_runtime(128, |runtime, directory| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"ordered-controls"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        runtime
+            .packet(generation, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
+            .unwrap();
         runtime.drain_inputs().unwrap();
-        assert_eq!(runtime.inflight.len(),1);
-        runtime.packet(generation,0x82,vec![0,2,0,0,1,b'u',1]).unwrap();
-        let deadline=Instant::now()+Duration::from_secs(1);
-        while !runtime.inputs.iter().any(|i| matches!(i,Input::StoreResult{..})) && Instant::now()<deadline {
-            runtime.writer_results().unwrap();thread::sleep(Duration::from_millis(1));
+        assert_eq!(runtime.inflight.len(), 1);
+        runtime
+            .packet(generation, 0x82, vec![0, 2, 0, 0, 1, b'u', 1])
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !runtime
+            .inputs
+            .iter()
+            .any(|i| matches!(i, Input::StoreResult { .. }))
+            && Instant::now() < deadline
+        {
+            runtime.writer_results().unwrap();
+            thread::sleep(Duration::from_millis(1));
         }
-        assert!(runtime.inputs.iter().any(|i|matches!(i,Input::StoreResult{..})),"the first mutation result is between the two later controls");
-        runtime.packet(generation,0xa2,vec![0,3,0,0,1,b'u']).unwrap();
-        until(runtime,|r|r.inputs.is_empty() && r.inflight.is_empty());
-        let state=mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert!(
+            runtime
+                .inputs
+                .iter()
+                .any(|i| matches!(i, Input::StoreResult { .. })),
+            "the first mutation result is between the two later controls"
+        );
+        runtime
+            .packet(generation, 0xa2, vec![0, 3, 0, 0, 1, b'u'])
+            .unwrap();
+        until(runtime, |r| r.inputs.is_empty() && r.inflight.is_empty());
+        let state =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
         assert!(state.routes.contains_key(b"t".as_slice()));
-        assert!(!state.routes.contains_key(b"u".as_slice()),"SUBSCRIBE u preceding UNSUBSCRIBE u must leave no route, even across ResultSlots deferral");
+        assert!(
+            !state.routes.contains_key(b"u".as_slice()),
+            "SUBSCRIBE u preceding UNSUBSCRIBE u must leave no route, even across ResultSlots deferral"
+        );
     });
 }
 

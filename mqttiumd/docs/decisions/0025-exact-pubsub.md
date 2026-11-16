@@ -68,7 +68,7 @@ Initial product bounds: 128 sessions, 128 exact subscriptions globally,
 bounded outgoing metadata entries, eight outgoing slots per connection bounded
 further by the peer Receive Maximum, 32 KiB payload, 1 KiB topic and eight-item
 work pages. Existing receipt/epoch collection limits still bound service life.
-Peer Maximum Packet Size applies before claiming/emitting an oversized delivery;
+Peer Maximum Packet Size applies before emitting an oversized delivery;
 the obligation is retained and the connection safely refused, not discarded.
 
 SQLite schema 2 adds durable outgoing claims and bounded receipt fact bytes.

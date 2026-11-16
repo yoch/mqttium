@@ -109,6 +109,7 @@ struct Runtime<'a> {
     next_session_request: u64,
     generation: ConnectionGeneration,
     inputs: VecDeque<Input>,
+    deferred_inputs: VecDeque<Input>,
     timers: BTreeMap<DeadlineToken, Instant>,
     inflight: BTreeMap<EffectId, OperationId>,
     work_reads: BTreeMap<EffectId, SessionId>,
@@ -128,7 +129,7 @@ struct Runtime<'a> {
 }
 impl Runtime<'_> {
     fn queue(&mut self, input: Input) -> Result<(), Failure> {
-        if self.inputs.len() >= INPUTS {
+        if self.inputs.len() + self.deferred_inputs.len() >= INPUTS {
             return Err(Failure::plain("core_input_budget"));
         }
         self.inputs.push_back(input);
@@ -140,6 +141,9 @@ impl Runtime<'_> {
         code: &'static str,
     ) -> Result<(), Failure> {
         if let Some(peer) = self.peers.remove(&generation) {
+            self.deferred_inputs.retain(
+                |input| !matches!(input,Input::Packet {connection,..} if *connection==generation),
+            );
             peer.io.close();
             self.retiring.push(peer.io);
             self.events
@@ -159,6 +163,15 @@ impl Runtime<'_> {
             let Some(input) = self.inputs.pop_front() else {
                 break;
             };
+            if let Some(connection) = business_connection(&input)
+                && self
+                    .deferred_inputs
+                    .iter()
+                    .any(|older| business_connection(older) == Some(connection))
+            {
+                self.deferred_inputs.push_back(input);
+                continue;
+            }
             let input = match input {
                 Input::Packet {
                     connection,
@@ -201,6 +214,7 @@ impl Runtime<'_> {
                 } => Some((*operation, *delivery)),
                 _ => None,
             };
+            let wakes_business = matches!(input, Input::StoreResult { .. });
             match self.owner.step(
                 input,
                 TurnGrant {
@@ -211,6 +225,13 @@ impl Runtime<'_> {
                     if let Some((id, delivery)) = finish {
                         self.events.emit("core_finish_observed",json!({"operation":operation(id),"details":{"delivery":delivery_text(delivery)}})).map_err(event_failure)?;
                     }
+                    if wakes_business {
+                        // The earlier blocked packets stay ahead of later bytes
+                        // from their connections. Control packets can still pass
+                        // while a durable routing mutation remains unresolved.
+                        self.deferred_inputs.append(&mut self.inputs);
+                        std::mem::swap(&mut self.inputs, &mut self.deferred_inputs);
+                    }
                 }
                 StepOutcome::NeedCapacity { input, need, .. } => {
                     match input {
@@ -218,7 +239,7 @@ impl Runtime<'_> {
                             if need.resource == Resource::ResultSlots
                                 && need.wake == WakeCondition::ResultDelivered =>
                         {
-                            self.inputs.push_back(packet)
+                            self.deferred_inputs.push_back(packet)
                         }
                         Input::Packet { connection, .. } => {
                             // No transition applied and no effect was submitted for this packet.
@@ -261,6 +282,7 @@ impl Runtime<'_> {
             work_cache: &self.work_cache,
             timers: &mut self.timers,
             inputs: &mut self.inputs,
+            deferred_count: self.deferred_inputs.len(),
             frames: &mut self.frames,
             close: Vec::new(),
             error: None,
@@ -406,7 +428,7 @@ impl Runtime<'_> {
         Ok(())
     }
     fn queue_work(&mut self, session: SessionId) {
-        if self.inputs.len() < INPUTS
+        if self.inputs.len() + self.deferred_inputs.len() < INPUTS
             && !self
                 .inputs
                 .iter()
@@ -946,6 +968,7 @@ struct Sink<'a> {
     work_cache: &'a BTreeMap<DeliveryId, WorkItem>,
     timers: &'a mut BTreeMap<DeadlineToken, Instant>,
     inputs: &'a mut VecDeque<Input>,
+    deferred_count: usize,
     frames: &'a mut BTreeMap<EffectId, PendingFrame>,
     close: Vec<(ConnectionGeneration, &'static str)>,
     error: Option<Failure>,
@@ -1105,7 +1128,7 @@ impl EffectSink for Sink<'_> {
                 };
                 let generation = connection.generation;
                 let (kind, packet_id) = frame_info(frame);
-                if self.inputs.len() >= INPUTS {
+                if self.inputs.len() + self.deferred_count >= INPUTS {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
                 let Some(peer) = self.peers.get_mut(&generation).filter(|peer| {
@@ -1189,7 +1212,7 @@ impl EffectSink for Sink<'_> {
                 SubmitResult::Accepted
             }
             Effect::Continue { continuation } => {
-                if self.inputs.len() >= INPUTS {
+                if self.inputs.len() + self.deferred_count >= INPUTS {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
                 self.inputs.push_back(Input::Continue {
@@ -1230,7 +1253,7 @@ impl EffectSink for Sink<'_> {
             } => {
                 let (connection, delivery, packet_id, claim, dup) =
                     (*connection, *delivery, *packet_id, *claim, *dup);
-                if self.inputs.len() >= INPUTS {
+                if self.inputs.len() + self.deferred_count >= INPUTS {
                     return refused(effect, SubmitBlock::QueueFull);
                 }
                 let generation = connection.generation;
@@ -1295,6 +1318,19 @@ fn frame_info(frame: OutboundFrame) -> (&'static str, Option<u16>) {
         OutboundFrame::Pubcomp { packet_id, .. } => ("PUBCOMP", Some(packet_id.get())),
         OutboundFrame::Suback { packet_id, .. } => ("SUBACK", Some(packet_id.get())),
         OutboundFrame::Unsuback { packet_id, .. } => ("UNSUBACK", Some(packet_id.get())),
+    }
+}
+fn business_connection(input: &Input) -> Option<ConnectionGeneration> {
+    match input {
+        Input::Packet {
+            connection,
+            packet:
+                InboundPacket::Publish { .. }
+                | InboundPacket::Subscribe { .. }
+                | InboundPacket::Unsubscribe { .. },
+            ..
+        } => Some(*connection),
+        _ => None,
     }
 }
 fn delivery_text(id: mqttiumd_contract::ids::DeliveryId) -> String {
@@ -1437,6 +1473,7 @@ fn run_inner(
         next_session_request: 0,
         generation: ConnectionGeneration::new(0),
         inputs: VecDeque::new(),
+        deferred_inputs: VecDeque::new(),
         timers: BTreeMap::new(),
         inflight: BTreeMap::new(),
         work_reads: BTreeMap::new(),
