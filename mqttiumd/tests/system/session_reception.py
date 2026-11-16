@@ -17,8 +17,8 @@ from external_mqttium import client_identity
 from external_sessions import INFINITE, MqttiumSession, PahoSession
 from pubsub_probe import PubsubWire, durable
 from receipt_reception import storage_sample
-from tcp_probe import (Observations, ReceiptFailure, connect_packet, packet, publish_packet,
-                       require, write_json)
+from tcp_probe import (Observations, ReceiptFailure, connect_packet, operation_hex, packet,
+                       publish_packet, require, write_json)
 from tcp_reception import Broker, writer_available
 
 
@@ -184,6 +184,19 @@ async def gone(broker, cursor, client_id):
     key = client_id.encode().hex()
     return await until_state(broker, cursor, lambda state: not any(
         row['client_id'] == key for row in state['sessions']), code='session_close_not_durable')
+
+
+async def fact(broker, cursor, kind, *, after=0, predicate=lambda event: True, timeout=ACTION_TIMEOUT):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        cursor.read()
+        for event in cursor.recent:
+            if int(event['seq']) > after and event['kind'] == kind and predicate(event):
+                broker.observations.record('session_fact_retained', event=event)
+                return event
+        require(broker.process.poll() is None, 'session_broker_exited', str(broker.process.returncode))
+        await asyncio.sleep(.005)
+    raise ReceiptFailure('session_fact_not_reached', kind)
 
 
 def identity(row):
@@ -719,12 +732,273 @@ async def loaded_termination(binary, case):
         broker.cleanup()
 
 
+async def uncertain_lifecycle(binary, case):
+    """Authentic committed results stay unknown until same-OperationId resolve."""
+    broker = Broker(binary, case, test_control=True)
+    clients, rows, pending = [], [], None
+    independent = None
+    try:
+        startup = broker.ready();cursor = EventCursor(broker)
+        independent = SessionWire(broker.address, broker.observations, 'independent')
+        independent.session_connect('unknown-independent', expiry=INFINITE, expected_present=False)
+        for name, replacing in (('unknown-open', False), ('unknown-replace', True)):
+            original = None
+            if replacing:
+                prior = MqttiumSession(broker.address, name, expiry=INFINITE,
+                                        events_path=case / f'{name}-before.jsonl')
+                clients.append(prior)
+                await prior.open(False)
+                await prior.subscribe('lifecycle/unknown-old-route')
+                original = session_row(session_snapshot(broker), name)
+                await prior.disconnect()
+            hold = broker.control / 'hold-session-open-result'
+            hold.touch(exist_ok=False)
+            cursor.read();before = cursor.last
+            client = MqttiumSession(broker.address, name, clean_start=replacing, expiry=0,
+                                    events_path=case / f'{name}.jsonl')
+            clients.append(client)
+            pending = asyncio.create_task(client.open(False))
+            held = await fact(broker, cursor, 'store_result_held', after=before,
+                              predicate=lambda e: e.get('command_kind') == 'SessionOpen')
+            op = held['operation']
+            committed = session_row(session_snapshot(broker), name)
+            require(committed['opened_by'] == operation_hex(op), 'session_unknown_wrong_operation')
+            if original is not None:
+                require(committed['id'] != original['id'], 'session_replace_not_committed')
+                require(not any(row['session'] == original['id'] for row in
+                                durable(broker.db)['tables']['routes']), 'replaced_route_retained')
+            require(not pending.done(), 'connack_before_session_result_known')
+            independent.send(b'\xc0\x00')
+            require(independent.wait(0xD0).body == b'', 'session_unknown_control_blocked')
+            resolved = await fact(broker, cursor, 'store_resolved', after=int(held['seq']),
+                                  predicate=lambda e: e.get('operation') == op)
+            require(resolved['details']['outcome'] == 'pendingorunknown',
+                    'session_held_resolution_became_certain')
+            # The normal server's three-second CONNECT deadline precedes its
+            # ten-second resolution delay. This transport must therefore fail
+            # safely; durable knowledge still resolves the original operation.
+            outcome = (await asyncio.gather(pending, return_exceptions=True))[0]
+            pending = None
+            require(isinstance(outcome, Exception)
+                    and not any(e['kind'] == 'connack' for e in client.log.events),
+                    'connack_before_session_result_known')
+            hold.unlink()
+            broker.observations.record('session_result_released', operation=op)
+            known = await fact(broker, cursor, 'session_changed', after=int(held['seq']),
+                               predicate=lambda e: e.get('operation') == op)
+            require(known['details']['action'] == 'Opened'
+                    and known['details']['session'] == str(identity(committed)),
+                    'session_resolution_changed_identity')
+            await client.disconnect()
+            await gone(broker, cursor, name)
+            rows.append({'case': name, 'before': original, 'committed_while_unknown': committed,
+                         'held': held, 'unknown_resolution': resolved, 'known': known,
+                         'original_connect_result': type(outcome).__name__,
+                         'positive_connack_observed': False})
+        # The local DISCONNECT is not a server acknowledgement. Its actual
+        # durable close is inspected while the genuine result is withheld.
+        closing = PahoSession(broker.address, 'unknown-close', expiry=INFINITE,
+                               events_path=case / 'unknown-close.jsonl')
+        clients.append(closing)
+        await closing.open(False)
+        old = session_row(session_snapshot(broker), 'unknown-close')
+        hold = broker.control / 'hold-session-close-result'
+        hold.touch(exist_ok=False)
+        cursor.read();before = cursor.last
+        await closing.disconnect(0)
+        held = await fact(broker, cursor, 'store_result_held', after=before,
+                          predicate=lambda e: e.get('command_kind') == 'SessionClose')
+        op = held['operation']
+        state = await gone(broker, cursor, 'unknown-close')
+        require(not any(e['kind'] == 'session_changed' and e.get('operation') == op
+                        for e in cursor.recent), 'session_close_known_before_held_result')
+        independent.send(b'\xc0\x00')
+        require(independent.wait(0xD0).body == b'', 'session_unknown_control_blocked')
+        resolved = await fact(broker, cursor, 'store_resolved', after=int(held['seq']),
+                              predicate=lambda e: e.get('operation') == op)
+        require(resolved['details']['outcome'] == 'pendingorunknown',
+                'session_held_resolution_became_certain')
+        hold.unlink()
+        known = await fact(broker, cursor, 'session_changed', after=int(held['seq']),
+                           predicate=lambda e: e.get('operation') == op)
+        require(known['details']['action'] == 'Closed'
+                and known['details']['session'] == str(identity(old)),
+                'session_close_resolution_changed_identity')
+        rows.append({'case': 'unknown-close', 'before': old, 'held': held,
+                     'sql_while_unknown': state, 'unknown_resolution': resolved, 'known': known})
+        independent.session_disconnect(0);independent = None
+        final = await gone(broker, cursor, 'unknown-independent')
+        assert_drained(final)
+        broker.stop()
+        return {'criterion': 'E', 'status': 'PASS', 'startup': startup, 'cases': rows,
+                'final_sql': final, 'clients': [c.result for c in clients],
+                'stop_status': broker.process.returncode}
+    finally:
+        if pending is not None:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        if independent is not None:
+            independent.close()
+        broker.cleanup()
+        for client in clients:
+            if not client.closed:
+                await client.disconnect()
+
+
+async def lifecycle_crashes(binary, case):
+    """Each cut has its own process witness and restarts its own same file."""
+    rows = []
+    for index, (action, point, expected_present) in enumerate((
+            ('replace', 'session.open.prepared', True),
+            ('replace', 'session.open.committed', True),
+            ('close', 'session.close.prepared', True),
+            ('close', 'session.close.committed', False))):
+        directory = case / f'{index}-{action}-{point}'
+        setup = Broker(binary, directory, label='setup')
+        broker = restarted = wire = None
+        try:
+            setup.ready();cursor = EventCursor(setup)
+            wire = SessionWire(setup.address, setup.observations, 'setup-owner')
+            wire.session_connect('crash-owner', expiry=INFINITE, expected_present=False)
+            wire.subscribe(1, [('lifecycle/crash', 1)])
+            original = session_row(session_snapshot(setup), 'crash-owner')
+            wire.session_disconnect();wire = None
+            setup.stop();writer_available(setup.db)
+            broker = Broker(binary, directory, db=setup.db, label='cut', pauses=(point,))
+            broker.ready();cursor = EventCursor(broker)
+            wire = SessionWire(broker.address, broker.observations, 'cut-owner')
+            if action == 'replace':
+                wire.send(connect_bytes('crash-owner', clean_start=True, expiry=INFINITE))
+            else:
+                wire.session_connect('crash-owner', expiry=INFINITE, expected_present=True)
+                wire.send(disconnect_bytes(0))
+            reached = await fact(broker, cursor, 'barrier_hit',
+                                 predicate=lambda e: e.get('point') == point)
+            paused = session_snapshot(broker)
+            committed = point.endswith('.committed')
+            if action == 'replace':
+                paused_row = session_row(paused, 'crash-owner')
+                require((paused_row['id'] != original['id']) == committed,
+                        'replace_crash_frontier_wrong')
+                require(wire.poll(.03) is None, 'connack_before_session_result_known')
+            else:
+                require(bool(paused['sessions']) != committed, 'close_crash_frontier_wrong')
+            killed = broker.stop(killed=True)
+            writer_available(broker.db)
+            wire.close();wire = None
+            restarted = Broker(binary, directory, db=broker.db, label='restart')
+            restart_ready = restarted.ready();restart_cursor = EventCursor(restarted)
+            before_connect = session_snapshot(restarted)
+            require(before_connect['file_inode'] == paused['file_inode'],
+                    'session_crash_restarted_different_file')
+            if action == 'replace':
+                restored = session_row(before_connect, 'crash-owner')
+                require(restored['id'] == paused_row['id'], 'replaced_session_not_durable')
+                require(before_connect['counts']['routes'] == (0 if committed else 1),
+                        'replace_route_frontier_wrong')
+            elif committed:
+                assert_drained(before_connect)
+            else:
+                require(session_row(before_connect, 'crash-owner')['id'] == original['id'],
+                        'uncommitted_close_erased_session')
+            wire = SessionWire(restarted.address, restarted.observations, 'restart-owner')
+            wire.session_connect('crash-owner', expiry=INFINITE, expected_present=expected_present)
+            resumed = session_row(session_snapshot(restarted), 'crash-owner')
+            if action == 'close' and committed:
+                require(identity(resumed) > identity(original), 'session_identity_reused')
+            wire.session_disconnect(0);wire = None
+            final = await gone(restarted, restart_cursor, 'crash-owner')
+            assert_drained(final)
+            restarted.stop();writer_available(restarted.db)
+            rows.append({'action': action, 'point': point, 'reached': reached,
+                         'original_session': original, 'sql_at_cut': paused,
+                         'signal_status': killed, 'same_sqlite_inode': paused['file_inode'],
+                         'restart_ready': restart_ready, 'restart_before_connect': before_connect,
+                         'resumed_session': resumed, 'final_sql': final,
+                         'restart_stop_status': restarted.process.returncode})
+        finally:
+            if wire is not None:
+                wire.close()
+            for process in (setup, broker, restarted):
+                if process is not None:
+                    process.cleanup()
+    rows.append(await connected_crash(binary, case / '4-connected-ephemeral'))
+    return {'criterion': 'F', 'status': 'PASS', 'cases': rows,
+            'atomic_cleanup': True,
+            'scope': 'Product processes killed at real SQLite prepared/committed barriers; '
+                     'connected ephemeral session and persistent offline work share a separate run.'}
+
+
+async def connected_crash(binary, case):
+    broker = Broker(binary, case)
+    restarted = source = witness = None
+    try:
+        startup = broker.ready();cursor = EventCursor(broker)
+        witness = MqttiumSession(broker.address, 'crash-persistent', expiry=INFINITE,
+                                 events_path=case / 'witness-setup.jsonl')
+        await witness.open(False)
+        await witness.subscribe('lifecycle/crash-owned-by-other')
+        witness_id = session_row(session_snapshot(broker), 'crash-persistent')['id']
+        await witness.disconnect();witness = None
+        source = SessionWire(broker.address, broker.observations, 'ephemeral-source')
+        source.session_connect('crash-ephemeral', expiry=0, expected_present=False)
+        source.subscribe(1, [('lifecycle/ephemeral-filter', 1)])
+        old = session_row(session_snapshot(broker), 'crash-ephemeral')
+        source.send(publish_packet('lifecycle/crash-owned-by-other', b'survives-source-crash', 7, qos=2))
+        require(source.wait(0x50, 7).ack() == (7, 0), 'crash_source_not_admitted')
+        before = durable(broker.db)
+        owed = before['tables']['obligations']
+        require(len(owed) == 1 and owed[0]['target'] == witness_id, 'crash_witness_work_missing')
+        killed = broker.stop(killed=True);writer_available(broker.db)
+        source.close();source = None
+        restarted = Broker(binary, case, db=broker.db, label='restart')
+        restart_ready = restarted.ready();restart_cursor = EventCursor(restarted)
+        recovered = session_snapshot(restarted)
+        session_row(recovered, 'crash-ephemeral', absent=True)
+        require(session_row(recovered, 'crash-persistent')['id'] == witness_id,
+                'persistent_witness_erased_on_restart')
+        require(durable(restarted.db)['tables']['obligations'] == owed,
+                'other_destination_lost_during_ephemeral_startup_close')
+        require(recovered['counts']['inbound'] == 0, 'ephemeral_inbound_resurrected')
+        source = SessionWire(restarted.address, restarted.observations, 'new-ephemeral')
+        source.session_connect('crash-ephemeral', expiry=0, expected_present=False)
+        fresh = session_row(session_snapshot(restarted), 'crash-ephemeral')
+        require(identity(fresh) > identity(old), 'ephemeral_identity_reused_after_crash')
+        witness = MqttiumSession(restarted.address, 'crash-persistent', expiry=0,
+                                 events_path=case / 'witness-resumed.jsonl')
+        await witness.open(True)
+        received = await witness.receive(b'survives-source-crash')
+        await until_state(restarted, restart_cursor, lambda state: state['counts']['obligations'] == 0
+                          and state['counts']['outbound'] == 0)
+        await witness.disconnect();witness = None
+        source.session_disconnect();source = None
+        await gone(restarted, restart_cursor, 'crash-persistent')
+        final = await gone(restarted, restart_cursor, 'crash-ephemeral')
+        assert_drained(final)
+        restarted.stop();writer_available(restarted.db)
+        write_json(case / 'durable-before-kill.json', before)
+        return {'case': 'connected_ephemeral_and_persistent_offline_work', 'startup': startup,
+                'original_session': old, 'new_session': fresh, 'witness_session': witness_id,
+                'signal_status': killed, 'restart_ready': restart_ready,
+                'recovered_sql': recovered, 'received': received, 'final_sql': final,
+                'restart_stop_status': restarted.process.returncode}
+    finally:
+        if source is not None:
+            source.close()
+        for process in (broker, restarted):
+            if process is not None:
+                process.cleanup()
+        if witness is not None and not witness.closed:
+            await witness.disconnect()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--binary-source-head', required=True)
-    parser.add_argument('--case', choices=('A', 'B', 'C', 'D', 'nominal'), default='nominal')
+    parser.add_argument('--case', choices=('A', 'B', 'C', 'D', 'E', 'F', 'nominal', 'faults'),
+                        default='nominal')
     parser.add_argument('--cycles', type=int, default=TARGET_CYCLES)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -737,11 +1011,12 @@ def main():
                'binary': {'path': str(args.binary.resolve()),
                           'sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest()}}
     try:
-        names = ('A', 'B', 'C', 'D') if args.case == 'nominal' else (args.case,)
+        names = {'nominal': ('A', 'B', 'C', 'D'), 'faults': ('E', 'F')}.get(args.case, (args.case,))
         for name in names:
             directory = args.out / name
             directory.mkdir()
-            function = {'A': matrix, 'B': cycles, 'C': capacity, 'D': loaded_termination}[name]
+            function = {'A': matrix, 'B': cycles, 'C': capacity, 'D': loaded_termination,
+                        'E': uncertain_lifecycle, 'F': lifecycle_crashes}[name]
             parameters = (args.cycles,) if name == 'B' else ()
             receipt['cases'].append(asyncio.run(function(args.binary.resolve(), directory, *parameters)))
         receipt['status'] = 'PASS'
