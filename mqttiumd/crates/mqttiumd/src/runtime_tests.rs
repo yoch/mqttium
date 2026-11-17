@@ -2922,7 +2922,9 @@ fn accepted_frames_reserve_their_terminal_fact_before_reactor_backpressure() {
             r.frames.is_empty() && r.inputs.is_empty() && r.work_reads.is_empty()
         });
         let mut retained = false;
-        for _ in 0..12 {
+        // Drive the configured reservation to saturation, including both start
+        // and terminal facts reserved for expiring frames.
+        for _ in 0..(2 * TERMINAL_INPUTS / CONNECTIONS + 2) {
             for generation in &generations {
                 for _ in 0..3 {
                     runtime.packet(*generation, 0xc0, vec![]).unwrap();
@@ -2930,7 +2932,7 @@ fn accepted_frames_reserve_their_terminal_fact_before_reactor_backpressure() {
             }
             runtime.drain_inputs().unwrap();
             assert!(
-                runtime.terminal_inputs.len() + runtime.frames.len() <= TERMINAL_INPUTS,
+                runtime.terminal_inputs.len() + 2 * runtime.frames.len() <= TERMINAL_INPUTS,
                 "terminal_fact_reservation_overcommitted: facts={} accepted_frames={} reserve={}",
                 runtime.terminal_inputs.len(),
                 runtime.frames.len(),

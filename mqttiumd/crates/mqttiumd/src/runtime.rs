@@ -980,17 +980,27 @@ impl Runtime<'_> {
         Ok(())
     }
     fn drain_inputs(&mut self) -> Result<(), Failure> {
-        let now = self.message_now()?;
-        if !matches!(
-            self.owner.step(
-                Input::MessageClock { now },
-                TurnGrant {
-                    work_limit: WorkUnits::new(65536)
-                }
-            ),
-            StepOutcome::Applied { .. }
-        ) {
-            return Err(Failure::plain("message_clock_not_applied"));
+        // Clock observations support actual work; an empty or blocked ready
+        // set must not manufacture owner transitions on every reactor poll.
+        if !(self.inputs.is_empty()
+            && self.control_inputs.is_empty()
+            && self.closing_inputs.is_empty()
+            && self.terminal_inputs.is_empty()
+            && self.expiry_inputs.is_empty()
+            && self.message_expiry_input.is_none())
+        {
+            let now = self.message_now()?;
+            if !matches!(
+                self.owner.step(
+                    Input::MessageClock { now },
+                    TurnGrant {
+                        work_limit: WorkUnits::new(65536)
+                    }
+                ),
+                StepOutcome::Applied { .. }
+            ) {
+                return Err(Failure::plain("message_clock_not_applied"));
+            }
         }
         let mut control_budget = crate::writer::CONTROL_QUEUE;
         let mut closing_budget = self.closing_inputs.len().min(CONNECTIONS);
