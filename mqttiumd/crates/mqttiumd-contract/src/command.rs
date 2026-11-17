@@ -971,6 +971,17 @@ mod tests {
     }
 
     #[test]
+    fn retained_qos0_accepts_literal_dollar_share_topic_names() {
+        let Recipe::AdmitPublication(a) = admission(&[]) else { panic!() };
+        let recipe=Recipe::RetainedQos0(crate::retained::RetainedQos0 {
+            operation:a.operation,request:a.request,publication:a.publication,session:a.source.session,
+            session_revision:a.source.session_revision,connection:crate::ids::ConnectionGeneration::new(1),ingress_order:1,
+            route_revision:a.route_revision,topic:SharedBytes::copy_from(b"$share/literal",1024).unwrap(),payload:a.payload,costs:a.costs,targets:a.targets,retain_targets:0
+        });
+        assert_eq!(recipe.check(),Ok(()),"topic_name_misclassified_as_subscription");
+    }
+
+    #[test]
     fn retained_acknowledged_recipe_rejects_qos0() {
         let Recipe::AdmitPublication(mut admit) = admission(&[]) else {
             panic!()
