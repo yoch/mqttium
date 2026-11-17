@@ -3339,3 +3339,82 @@ fn blocked_expiration_keeps_its_reserved_lane_when_ordinary_inputs_are_full() {
         until(runtime, |r| !r.sessions.values().any(|s| s.id == session));
     });
 }
+
+#[test]
+fn certain_detach_failure_is_observable_instead_of_losing_offline_expiration() {
+    with_runtime(128, |runtime, directory| {
+        let (generation, mut client) = peer(runtime);
+        let mut connect = connect_packet(b"certain-no-detach");
+        connect.expiry = SessionExpiry::After(1);
+        runtime.connect(generation, connect).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        read_frame(&mut client);
+        let cached = runtime.sessions[b"certain-no-detach".as_slice()].clone();
+        let input = Input::DetachSession {
+            connection: ConnectionKey {
+                session: cached.id,
+                generation,
+            },
+            opened_by: cached.opened_by,
+            expiry: cached.expiry,
+            observed_at: runtime.session_now().unwrap(),
+        };
+        assert!(matches!(
+            runtime.owner.step(
+                input,
+                TurnGrant {
+                    work_limit: WorkUnits::new(65536)
+                }
+            ),
+            StepOutcome::Applied { .. }
+        ));
+        let (effect, operation) = runtime
+            .owner
+            .outbox()
+            .unwrap()
+            .pending()
+            .find_map(|pending| match pending.effect() {
+                Effect::Persist { command } => Some((pending.id(), command.recipe.operation())),
+                _ => None,
+            })
+            .unwrap();
+        // A real Resolve reaches the writer before the withheld Persist.
+        // Its durable fence proves no effect; no fabricated store result.
+        runtime
+            .writer
+            .control_sender
+            .send(ControlRequest::Lifecycle(OwnedEffect::new(
+                effect,
+                Effect::ResolveAndFence { operation },
+            )))
+            .unwrap();
+        let response = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let ControlResponse::Lifecycle { reply, .. } = response else {
+            panic!("actual writer fence result")
+        };
+        assert!(matches!(
+            reply,
+            StoreReply::Outcome(StoreOutcome::RejectedCertain(_))
+        ));
+        runtime
+            .queue(Input::StoreResult {
+                effect,
+                operation,
+                reply,
+            })
+            .unwrap();
+        let failure = runtime
+            .drain_inputs()
+            .expect_err("certain_detach_failure_silently_lost_expiry");
+        assert_eq!(failure.code, "session_detach_rejected");
+        assert!(!runtime.owner.lifecycle_operation_is_live(operation));
+        let durable =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert_eq!(durable.sessions.len(), 1);
+        assert!(durable.sessions[&cached.id].detached.is_none());
+    });
+}
