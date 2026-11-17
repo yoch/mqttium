@@ -660,7 +660,13 @@ async def invalid_temporal_image(binary, case):
         require(before['sessions'][0]['deadline'] == '0000000000000000',
                 'expiry_corruption_injection_not_reached')
         refused = Broker(binary, case / 'refused', db=source.db)
-        status = refused.process.wait(timeout=8)
+        end = time.monotonic() + 8
+        while refused.process.poll() is None and time.monotonic() < end:
+            require(not any(event['kind'] == 'ready' for event in refused.events()),
+                    'invalid_expiry_became_ready')
+            await asyncio.sleep(.01)
+        status = refused.process.poll()
+        require(status is not None, 'invalid_expiry_refusal_not_terminal')
         refused.observations.record('process_wait', pid=refused.process.pid, status=status,
                                      requested='observed-startup-refusal')
         events = refused.events()
