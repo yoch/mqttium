@@ -402,10 +402,7 @@ fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
                 || detached.operation.incarnation() != state.ledger.incarnation()
                 || detached.operation.epoch().get() == 0
                 || detached.operation.epoch() > state.ledger.last_opened()
-                || !matches!(
-                    (row.expiry, detached.deadline),
-                    (SessionExpiry::After(_), Some(_)) | (SessionExpiry::Never, None)
-                ))
+                || !detached.valid_for(row.expiry))
         {
             return Err(ReadError::InvalidData);
         }
@@ -1583,6 +1580,7 @@ impl DurableStore for MemoryStore {
         // every store. Only an opening writes; the command that opened
         // the last epoch, presented again, reads its own result.
         if let LedgerOpening::Opens { ledger } = self.committed.ledger.open(command) {
+            check_inventory_bound(&self.committed)?;
             let mut staged = self.committed.clone();
             staged.ledger = ledger;
             // Previous transports are gone. Already-detached deadlines never

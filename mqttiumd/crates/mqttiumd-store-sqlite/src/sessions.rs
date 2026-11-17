@@ -60,15 +60,14 @@ pub(super) fn detachment(
         (Some(token), deadline) if opened_by.is_some() => {
             let operation = attachment(Some(&token), meta)?.ok_or(Corrupt)?;
             let deadline = deadline.as_deref().map(blob_u64).transpose()?;
-            match (expiry, deadline) {
-                (SessionExpiry::After(_), Some(_)) | (SessionExpiry::Never, None) => {
-                    Ok(Some(SessionDetachment {
-                        operation,
-                        deadline,
-                    }))
-                }
-                _ => Err(Fault::Corrupt),
+            let detached = SessionDetachment {
+                operation,
+                deadline,
+            };
+            if !detached.valid_for(expiry) {
+                return Err(Fault::Corrupt);
             }
+            Ok(Some(detached))
         }
         _ => Err(Fault::Corrupt),
     }
@@ -742,19 +741,17 @@ pub(super) fn decode(bytes: &[u8]) -> Result<CommitFacts, Corrupt> {
             1 => Some(blob_u64(&bytes[46..54])?),
             _ => return Err(Corrupt),
         };
-        if !matches!(
-            (expiry, deadline),
-            (SessionExpiry::After(_), Some(_)) | (SessionExpiry::Never, None)
-        ) {
+        let detached = SessionDetachment {
+            operation,
+            deadline,
+        };
+        if !detached.valid_for(expiry) {
             return Err(Corrupt);
         }
         return Ok(CommitFacts::SessionLifecycle(SessionChange::Detached {
             session: id(&bytes[1..9])?,
             expiry,
-            detached: SessionDetachment {
-                operation,
-                deadline,
-            },
+            detached,
         }));
     }
     let (offset, session, opened, finite) = match bytes.first() {

@@ -699,22 +699,22 @@ fn session_row(
         None => Ok(None),
         Some((revision, state, expiry, binding, detached, deadline)) => {
             let policy = sessions::decode_expiry(expiry)?;
-            if detached.is_none() && deadline.is_some()
-                || detached.is_some()
-                    && (binding.is_none()
-                        || !matches!(
-                            (policy, deadline.is_some()),
-                            (mqttiumd_contract::session::SessionExpiry::After(_), true)
-                                | (mqttiumd_contract::session::SessionExpiry::Never, false)
-                        ))
-            {
-                return Err(Fault::Corrupt);
-            }
-            if let Some(bytes) = detached {
-                OperationId::from_be_slice(&bytes).map_err(|_| Corrupt)?;
-            }
-            if let Some(bytes) = deadline {
-                blob_u64(&bytes)?;
+            let operation = detached
+                .as_deref()
+                .map(OperationId::from_be_slice)
+                .transpose()
+                .map_err(|_| Corrupt)?;
+            let deadline = deadline.as_deref().map(blob_u64).transpose()?;
+            match operation {
+                None if deadline.is_none() => {}
+                Some(operation)
+                    if binding.is_some()
+                        && (mqttiumd_contract::session::SessionDetachment {
+                            operation,
+                            deadline,
+                        })
+                        .valid_for(policy) => {}
+                _ => return Err(Fault::Corrupt),
             }
             if let Some(bytes) = binding {
                 OperationId::from_be_slice(&bytes).map_err(|_| Corrupt)?;
