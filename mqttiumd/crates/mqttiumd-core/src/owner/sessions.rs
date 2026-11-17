@@ -2090,4 +2090,42 @@ mod tests {
             Some(ConnectionGeneration::new(2))
         );
     }
+
+    #[test]
+    fn an_expired_open_cannot_claim_session_present_because_the_timer_was_delayed() {
+        let mut owner = world();
+        let first = submit_at(&mut owner, 1, b"finite", SessionExpiry::After(1), 0);
+        let (opened_by, _) = known(&mut owner, &first, opened(1, SessionExpiry::After(1)));
+        detach_at(&mut owner, 1, opened_by, SessionExpiry::After(1), 0);
+        submit_at(
+            &mut owner,
+            2,
+            b"finite",
+            SessionExpiry::After(1),
+            1_000_000_000,
+        );
+        let flight = owner.lifecycle.as_ref().unwrap().clone();
+        let mut wrong = opened(1, SessionExpiry::After(1));
+        if let SessionChange::Opened {
+            session_present, ..
+        } = &mut wrong
+        {
+            *session_present = true;
+        }
+        let outcome = owner.step(
+            Input::StoreResult {
+                effect: flight.in_flight.answers.persist,
+                operation: flight.command.operation,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                    wrong,
+                ))),
+            },
+            TURN,
+        );
+        assert!(
+            matches!(outcome, StepOutcome::Fatal(CoreFault::ContradictoryOutcome { operation }) if operation == flight.command.operation),
+            "expired_open_resumed_without_timer"
+        );
+        assert!(owner.sessions.as_slice()[0].detached.is_some());
+    }
 }
