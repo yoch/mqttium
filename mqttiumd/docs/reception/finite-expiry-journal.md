@@ -26,3 +26,21 @@
 - Next: finish schema/readers/corpus, clean-source reception, bounded compiled
   controls, final sequential normal/instrumented gates and current CI. Publish
   with lease against confirmed6b583782; reread remote content and exact-SHA jobs.
+
+- Clean78d2aeb5 launcher PASS294.338s, archivea7fea47894cbc4575a6b93ca55ffd97b344b58896a0be7b9f8f407f3b3db61ff.
+  Normal354ccb2a…74fd8/hooks1eb094a3…f1723;2131sourceblobs/368hashes/369packedfiles
+  audited. PublicB/E/F/corruptimage, genuineunknown3/7,5ownSIGKILLs and4compiled
+  exact controls pass. Independent auditarchive9e55421c5515daae85057407b49cc27bc1c1c71011b06877dc844a876598f6a4.
+- Clean938dcd1e gates PASS:968normal/987instrumented sequential,fmt/Clippy/validate13,
+ 218oracle/91pilots/537schemas;newexpiry8+oldGC10 expectedmodels. Furtheroldmodels
+  stopped by explicit localbudget, not a detection; full90remains CI. Gatearchive
+ abaa2eb2168ab6d106bd04beda48be6cec97c5366552ffbe25f20bf09077d734.
+- Actual7666-event stream check exposed preexisting SessionLifecycle command_kind
+  missing from schema; REDa1ed87b3 fails actual_lifecycle_event_not_described.
+  Describe generic adapter kind explicitly; writer retains specific action kinds.
+  Add bounded real-stream reader to final reception, preserve old78d artifacts.
+  Contract digest5fada9d9…0ad0 becomes9269cee70ac3eaa90d78458e2227f2854bae0045d4c28c7842d264dc375493c7.
+- Final source also contains checkpoint-CAS age regression765c48ef and receipt
+  pressure-window RED570bd417/GREENaa20896d (profile512/1024, quota8192 unchanged).
+  Next action: commit stream-reader/report, run219oracle/currentformat readers,
+  publish with lease against6b583782 then receive exact-SHA CI10jobs/artifacts.

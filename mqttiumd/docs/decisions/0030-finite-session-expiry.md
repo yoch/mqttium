@@ -113,7 +113,10 @@ future formats are refused before write-affecting pragmas, with no implicit
 migration/reset. Readers validate domain/identity/tick/policy/deadline shape and
 row/byte budgets before allocation or selection. JSON preserves legacy expiry
 strings and represents finite policy as `{"After":seconds}` with optional
-bounded detachment/clock facts. The pure crates retain no_std + alloc and no I/O.
+bounded detachment/clock facts. Generic adapter submission events explicitly
+name SessionLifecycle; writer results retain the specific Open/Close/Detach/Expire
+kind. The stream reader validates actual retained events, not only examples.
+The pure crates retain no_std + alloc and no I/O.
 
 Reception comprises the actual-writer DISCONNECT0 RED/GREEN, injected boundary
 and restart tests, differential stores, actual mqttium/Paho offline/active paths,

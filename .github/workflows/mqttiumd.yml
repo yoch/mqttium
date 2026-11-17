@@ -331,7 +331,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install the independent external MQTT client
-        run: python -m pip install --disable-pip-version-check -r tests/system/requirements.txt
+        run: python -m pip install --disable-pip-version-check -r tests/system/requirements.txt -r tools/requirements.txt
       - name: Finite expiry, time boundaries, capacity, crashes and exact controls
         run: tools/run_expiry_reception.sh "$RUNNER_TEMP/expiry-product"
       - name: Keep each expiry run's own evidence

@@ -3740,6 +3740,9 @@ finite_changed = env("mqttiumd.product-event", seq="20", kind="session_changed",
     operation=detach_operation, connection="1", details={
         "action": "Detached", "session": "4", "expiry": {"After": 7},
         "detached_by": detach_operation, "deadline": "7000000100"})
+ok("product-lifecycle-submitted-finite.json", env("mqttiumd.product-event", seq="15", pid=1,
+    kind="command_submitted", operation=finite_operation, command_kind="SessionLifecycle",
+    details={"action":"Open", "clean_start":False, "expected_session":None, "expiry":{"After":1}}))
 ok("product-session-detached.json", finite_changed)
 ok("product-session-opened-finite.json", edited(session_changed, lambda v: v["details"].update(expiry={"After": 7})))
 for field in ("deadline", "detached_by"):

@@ -519,9 +519,9 @@ See [report 0012](reports/0012-outgoing-pi-reuse.md). This is system reception,
 not an extension of the fixture oracle's qualifying scope. The existing
 receipt, QoS 0/1/2 and pub/sub receptions remain separate regression gates.
 
-The 128 persistent infinite-expiry session limit remains. The next operational
-increment is an explicit session lifecycle that can release an eligible
-terminal session without evicting an absent session's live responsibilities.
+The simultaneous session limit remains128. Explicit termination and finite
+expiry recover eligible capacity; valid offline infinite sessions are preserved.
+No automatic eviction or unlimited-service claim follows from these mechanisms.
 
 
 ## Finite session expiry

@@ -99,7 +99,8 @@
         "SessionOpen",
         "SessionClose",
         "SessionDetach",
-        "SessionExpire"
+        "SessionExpire",
+        "SessionLifecycle"
       ]
     },
     "cause": {
