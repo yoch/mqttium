@@ -1063,6 +1063,7 @@ impl Owner {
                 1u64.saturating_add(self.pubsub.work_bound(input, self.routes.capacity()))
                     .saturating_add(self.session_work_bound(input))
                     .saturating_add(self.routing_work_bound(input))
+                    .saturating_add(self.retained_work_bound(input))
                     .saturating_add(self.receipts.work(input))
                     .saturating_add(
                         if self.receipts.enabled
@@ -1526,7 +1527,7 @@ impl Owner {
                 packet_id,
                 ..
             } => {
-                if *retain {
+                if *retain && (!self.lifecycle_enabled || *qos == Qos::AtMostOnce) {
                     return protocol_error(draft);
                 }
                 if *qos == Qos::AtMostOnce {
@@ -1658,6 +1659,7 @@ impl Owner {
             topic,
             packet_id: Some(packet_id),
             payload,
+            retain,
             ..
         } = packet
         else {
@@ -1720,7 +1722,10 @@ impl Owner {
             }
             Err(LeaseRefused::TableFull) => return Err(lacking(Resource::ExchangeSlots, 1)),
         }
-        let references = u64::try_from(targets).unwrap_or(u64::MAX);
+        let references = u64::try_from(targets)
+            .unwrap_or(u64::MAX)
+            .checked_add(u64::from(*retain && !payload.is_empty()))
+            .ok_or(IMPOSSIBLE)?;
         let mut list = BoundedVec::with_capacity(targets).map_err(Stop::from)?;
 
         let generation = draw(&mut draft.counters.generation, next_generation)?;
@@ -1764,7 +1769,7 @@ impl Owner {
             };
             list.try_push(target).map_err(|_| IMPOSSIBLE)?;
         }
-        let recipe = Recipe::AdmitPublication(AdmitPublication {
+        let admission = AdmitPublication {
             operation,
             request,
             publication,
@@ -1776,7 +1781,7 @@ impl Owner {
             },
             route_revision,
             qos,
-            retain: false,
+            retain: *retain,
             topic: topic.clone(),
             payload: PayloadRef {
                 id: payload_id,
@@ -1789,7 +1794,21 @@ impl Owner {
                 receipt_slots: ReceiptSlots::new(1),
             },
             targets: list,
-        });
+        };
+        let recipe = if *retain {
+            let mut retain_targets = 0u16;
+            for (index, selected) in selected.iter().enumerate() {
+                if selected.rap {
+                    retain_targets |= 1u16 << index;
+                }
+            }
+            Recipe::RetainedPublication(crate::contract::retained::RetainedPublication {
+                admission,
+                retain_targets,
+            })
+        } else {
+            Recipe::AdmitPublication(admission)
+        };
         let in_flight = self.plan_submission(operation, recipe, Some(payload.clone()), draft)?;
         Ok(Change::Admit {
             session: source.id,
@@ -3227,7 +3246,9 @@ mod tests {
                 | Recipe::ClaimDelivery(_)
                 | Recipe::FinishDelivery(_) => panic!("pubsub command needs its own facts"),
                 Recipe::SessionLifecycle(_) => panic!("lifecycle command needs its own facts"),
-                Recipe::RetainedPublication(_) | Recipe::RetainedQos0(_) | Recipe::ReplaySubscriptions(_) => panic!("retained command needs its own facts"),
+                Recipe::RetainedPublication(_)
+                | Recipe::RetainedQos0(_)
+                | Recipe::ReplaySubscriptions(_) => panic!("retained command needs its own facts"),
                 Recipe::AdmitPublication(admit) => {
                     assert!(command.payload.is_some());
                     CommitFacts::PublicationAdmitted {
@@ -3261,7 +3282,9 @@ mod tests {
                 | CommitFacts::SubscriptionsChanged { .. }
                 | CommitFacts::DeliveryClaimed { .. }
                 | CommitFacts::DeliveryFinished { .. } => RejectReason::PreconditionFailed,
-                CommitFacts::SessionLifecycle(_) | CommitFacts::RetainedQos0Stored { .. } => RejectReason::PreconditionFailed,
+                CommitFacts::SessionLifecycle(_) | CommitFacts::RetainedQos0Stored { .. } => {
+                    RejectReason::PreconditionFailed
+                }
                 CommitFacts::InboundReleased { .. } => RejectReason::Fenced,
                 CommitFacts::PublicationAdmitted { .. } => {
                     RejectReason::CapacityExceeded(Resource::PayloadBytes)
@@ -7065,9 +7088,17 @@ mod tests {
                 delivery: c.delivery,
                 target: c.target,
             },
-            Recipe::ReplaySubscriptions(c) => CommitFacts::SubscriptionsChanged { session:c.update.session, route_revision:c.update.route_revision.checked_next().unwrap() },
-            Recipe::RetainedQos0(c) => CommitFacts::RetainedQos0Stored { publication:c.publication },
-            Recipe::RetainedPublication(c) => CommitFacts::PublicationAdmitted { publication:c.admission.publication, exchange:c.admission.source.exchange },
+            Recipe::ReplaySubscriptions(c) => CommitFacts::SubscriptionsChanged {
+                session: c.update.session,
+                route_revision: c.update.route_revision.checked_next().unwrap(),
+            },
+            Recipe::RetainedQos0(c) => CommitFacts::RetainedQos0Stored {
+                publication: c.publication,
+            },
+            Recipe::RetainedPublication(c) => CommitFacts::PublicationAdmitted {
+                publication: c.admission.publication,
+                exchange: c.admission.source.exchange,
+            },
             Recipe::UpdateSubscriptions(c) => CommitFacts::SubscriptionsChanged {
                 session: c.session,
                 route_revision: c.route_revision.checked_next().unwrap(),
@@ -9056,7 +9087,11 @@ mod tests {
         let mut world = World::connected();
         world.owner.lifecycle_enabled = true;
         let mut input = publish_with(CONN, 7, Qos::AtLeastOnce, b"retained");
-        if let Input::Packet { packet: InboundPacket::Publish { topic, retain, .. }, .. } = &mut input {
+        if let Input::Packet {
+            packet: InboundPacket::Publish { topic, retain, .. },
+            ..
+        } = &mut input
+        {
             *topic = bytes(b"retained/new");
             *retain = true;
         }
@@ -9064,5 +9099,4 @@ mod tests {
         let effects = world.drain();
         assert!(effects.iter().any(|(_,effect)| matches!(effect,Effect::Persist {command} if matches!(command.recipe.get(),Recipe::RetainedPublication(value) if value.admission.targets.is_empty() && value.admission.retain))), "retained_publish_did_not_enter_durable_admission");
     }
-
 }

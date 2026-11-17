@@ -444,6 +444,22 @@ fn blocked() -> Stop {
 }
 
 impl Owner {
+    pub(super) fn retained_work_bound(&self, input: &Input) -> u64 {
+        if self.lifecycle_enabled
+            && matches!(
+                input,
+                Input::Packet {
+                    packet: InboundPacket::Subscribe { .. },
+                    ..
+                }
+            )
+        {
+            crate::contract::retained::MAX_REPLAYS as u64
+        } else {
+            0
+        }
+    }
+
     /// Whether a bounded work wake-up can advance already known online work.
     /// Empty scans are deliberately excluded; external notifications and the
     /// periodic fallback supply the authority to start a new discovery scan.
@@ -1036,13 +1052,31 @@ impl Owner {
             Err(error) => return Err(error),
         };
         let operation = self.operation(draft)?;
-        let recipe = Recipe::UpdateSubscriptions(UpdateSubscriptions {
+        let update = UpdateSubscriptions {
             operation,
             session: session.id,
             session_revision: session.revision,
             route_revision: self.route_revision.ok_or(IMPOSSIBLE)?,
             changes,
-        });
+        };
+        let recipe = if self.lifecycle_enabled && subscribing {
+            let first = draw(
+                &mut draft.counters.publication,
+                PublicationSeq::checked_next,
+            )?;
+            for _ in 1..crate::contract::retained::MAX_REPLAYS {
+                let _ = draw(
+                    &mut draft.counters.publication,
+                    PublicationSeq::checked_next,
+                )?;
+            }
+            Recipe::ReplaySubscriptions(crate::contract::retained::ReplaySubscriptions {
+                update,
+                first_publication: PublicationId::new(self.incarnation, self.epoch, self.id, first),
+            })
+        } else {
+            Recipe::UpdateSubscriptions(update)
+        };
         let in_flight = self.plan_submission(operation, recipe, None, draft)?;
         Ok(changed(Change::Control(Control {
             session: session.id,
@@ -2006,8 +2040,7 @@ impl Owner {
                             let d = &mut self.pubsub.deliveries.as_mut_slice()[i];
                             if d.topic.is_none() {
                                 d.retain = item.retain;
-                                d.retain = item.retain;
-                            d.topic = Some(item.topic.clone());
+                                d.topic = Some(item.topic.clone());
                                 d.payload = Some(item.payload.clone());
                             }
                         } else {
@@ -2018,6 +2051,7 @@ impl Owner {
                                 item.qos,
                                 item.claim,
                             );
+                            d.retain = item.retain;
                             d.topic = Some(item.topic.clone());
                             d.payload = Some(item.payload.clone());
                             self.pubsub.deliveries.try_push(d).map_err(|_| stale)?;

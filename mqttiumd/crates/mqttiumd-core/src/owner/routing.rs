@@ -8,6 +8,7 @@ pub(super) struct Selected {
     pub(super) session: SessionId,
     pub(super) revision: Revision,
     pub(super) qos: Qos,
+    pub(super) rap: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Refusal {
@@ -74,6 +75,7 @@ pub(super) fn select(
                 return Err(Refusal::Revision);
             }
             held.qos = held.qos.max(effective);
+            held.rap |= route.options.retain_as_published();
         } else {
             if selected.count == limit {
                 return Err(Refusal::Capacity);
@@ -82,6 +84,7 @@ pub(super) fn select(
                 session: route.target,
                 revision: route.target_revision,
                 qos: effective,
+                rap: route.options.retain_as_published(),
             });
             selected.count += 1;
         }
