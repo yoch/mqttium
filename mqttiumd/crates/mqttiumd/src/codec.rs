@@ -1059,6 +1059,149 @@ mod tests {
     }
 
     #[test]
+    fn message_expiry_preserves_wire_values_without_fabricating_a_clock_observation() {
+        for qos in [Qos::AtMostOnce, Qos::AtLeastOnce, Qos::ExactlyOnce] {
+            for interval in [0u32, 1, u32::MAX] {
+                let mut body = b"\0\x01t".to_vec();
+                if qos != Qos::AtMostOnce {
+                    body.extend_from_slice(&7u16.to_be_bytes());
+                }
+                body.extend_from_slice(&[5, 0x02]);
+                body.extend_from_slice(&interval.to_be_bytes());
+                body.extend_from_slice(b"payload");
+                let Packet::TimedPublish {
+                    packet:
+                        InboundPacket::Publish {
+                            qos: decoded_qos,
+                            topic,
+                            payload,
+                            retain,
+                            expiry,
+                            ..
+                        },
+                    interval: decoded_interval,
+                } = decode(0x31 | (qos.to_wire() << 1), &body, BOUNDS).unwrap()
+                else {
+                    panic!("timed PUBLISH");
+                };
+                assert_eq!(decoded_interval, interval);
+                assert_eq!(decoded_qos, qos);
+                assert_eq!(expiry, None);
+                assert_eq!(topic.as_slice(), b"t");
+                assert_eq!(payload.as_slice(), b"payload");
+                assert!(retain);
+            }
+        }
+        assert!(matches!(
+            decode(0x30, b"\0\x01t\0p", BOUNDS),
+            Ok(Packet::Core(InboundPacket::Publish { expiry: None, .. }))
+        ));
+    }
+
+    #[test]
+    fn message_expiry_keeps_duplicate_truncation_and_other_property_refusals() {
+        let duplicate = b"\0\x01t\x0a\x02\0\0\0\x01\x02\0\0\0\x02p";
+        assert_eq!(
+            decode(0x30, duplicate, BOUNDS).unwrap_err().code(),
+            "DuplicateProperty"
+        );
+        for value_bytes in 0..4 {
+            let mut truncated = b"\0\x01t\x05\x02".to_vec();
+            truncated.resize(truncated.len() + value_bytes, 0);
+            kind(decode(0x30, &truncated, BOUNDS), ErrorKind::Malformed);
+        }
+        assert_eq!(
+            decode(0x10, &connect(&[0x02, 0, 0, 0, 1], b"c"), BOUNDS)
+                .unwrap_err()
+                .code(),
+            "PropertyNotAllowed"
+        );
+        kind(
+            decode(0x30, b"\0\x01t\x09\x02\0\0\0\x01\x03\0\x01xp", BOUNDS),
+            ErrorKind::Unsupported,
+        );
+        assert_eq!(
+            decode(0x30, b"\0\x01t\x08\x02\0\0\0\x01\x23\0\x01p", BOUNDS)
+                .unwrap_err()
+                .reason_code(),
+            0x94
+        );
+    }
+
+    #[test]
+    fn publication_expiry_encoding_keeps_zero_present_and_exposes_only_its_value() {
+        let topic = SharedBytes::copy_from(b"t", 1).unwrap();
+        let payload = SharedBytes::copy_from(b"p", 1).unwrap();
+        for qos1 in [false, true] {
+            for remaining in [None, Some(0), Some(1), Some(u32::MAX)] {
+                let encoded = if qos1 {
+                    encode_publish_expiring(
+                        OutboundPacketId::new(7).unwrap(),
+                        &topic,
+                        &payload,
+                        true,
+                        true,
+                        remaining,
+                    )
+                } else {
+                    encode_qos0_expiring(&topic, &payload, true, remaining)
+                }
+                .unwrap();
+                assert_eq!(encoded.bytes[0], if qos1 { 0x3b } else { 0x31 });
+                let header = header(&encoded.bytes, encoded.bytes.len())
+                    .unwrap()
+                    .unwrap();
+                kind(
+                    header_decode(&encoded.bytes, encoded.bytes.len() - 1),
+                    ErrorKind::Oversized,
+                );
+                let decoded =
+                    decode(header.first, &encoded.bytes[header.encoded_len..], BOUNDS).unwrap();
+                match (remaining, encoded.expiry_value_offset, decoded) {
+                    (Some(value), Some(offset), Packet::TimedPublish { interval, .. }) => {
+                        assert_eq!(interval, value);
+                        assert_eq!(&encoded.bytes[offset - 2..offset], &[5, 0x02]);
+                        assert_eq!(&encoded.bytes[offset..offset + 4], &value.to_be_bytes());
+                        assert_eq!(&encoded.bytes[offset + 4..], b"p");
+                    }
+                    (None, None, Packet::Core(InboundPacket::Publish { expiry: None, .. })) => {}
+                    other => panic!("lost expiry presence: {other:?}"),
+                }
+            }
+        }
+    }
+
+    fn header_decode(bytes: &[u8], maximum: usize) -> Result<Packet, Error> {
+        let header = header(bytes, maximum)?.unwrap();
+        decode(header.first, &bytes[header.encoded_len..], BOUNDS)
+    }
+
+    #[test]
+    fn expiry_overhead_counts_remaining_length_boundary_growth() {
+        let topic = SharedBytes::copy_from(b"t", 1).unwrap();
+        for base_body in [122usize, 123, 127, 128, 16_378, 16_379, 16_383, 16_384] {
+            let payload = SharedBytes::copy_from(&vec![b'x'; base_body - 4], 32768).unwrap();
+            let plain = encode_qos0_expiring(&topic, &payload, false, None).unwrap();
+            let expiring = encode_qos0_expiring(&topic, &payload, false, Some(0)).unwrap();
+            let plain_header = header(&plain.bytes, 65536).unwrap().unwrap();
+            let timed_header = header(&expiring.bytes, 65536).unwrap().unwrap();
+            assert_eq!(plain_header.remaining, base_body);
+            assert_eq!(timed_header.remaining, base_body + 5);
+            assert_eq!(
+                expiring.bytes.len() - plain.bytes.len(),
+                5 + timed_header.encoded_len - plain_header.encoded_len
+            );
+            assert_eq!(
+                header(&expiring.bytes, expiring.bytes.len() - 1)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Oversized
+            );
+            assert!(header(&expiring.bytes, expiring.bytes.len()).is_ok());
+        }
+    }
+
+    #[test]
     fn qos0_has_no_mqtt_identifier_ack_or_duplicate_flag() {
         use mqttiumd_contract::packet::{InboundPacket, Qos, SharedBytes};
         assert!(matches!(

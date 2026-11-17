@@ -462,7 +462,8 @@ fn write_one(
             stream.write(bytes)
         },
         || {
-            frame.correlation.is_none()
+            frame.expiry.is_none()
+                || frame.correlation.is_none()
                 || report(
                     sender,
                     Written::Started {
@@ -594,15 +595,80 @@ fn write_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_time::{TimeError, testing::FakeClock};
+    use mqttiumd_contract::ids::{
+        ConnectionGeneration, EffectSeq, LogicalOwnerId, RunEpoch, SessionId,
+    };
+    use mqttiumd_contract::packet::SharedBytes;
+    use mqttiumd_store_api::SessionClockReading;
+    use std::cell::Cell;
     use std::net::{Shutdown, TcpListener};
     use std::thread;
     use std::time::{Duration, Instant};
 
     fn pair() -> (Connection, TcpStream) {
+        pair_with_clock(Arc::new(SystemClock::new().unwrap()))
+    }
+
+    fn pair_with_clock(clock: Arc<dyn SessionClock>) -> (Connection, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
-        (spawn(server).unwrap(), peer)
+        (spawn_with_clock(server, clock).unwrap(), peer)
+    }
+
+    fn control() -> Control {
+        Control {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            terminal: Arc::new(Mutex::new(None)),
+            pause_progress: Arc::new(AtomicBool::new(false)),
+            progress_waiting: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn reading(tick: u64) -> SessionClockReading {
+        SessionClockReading {
+            domain: [1; 32],
+            tick,
+        }
+    }
+
+    fn timed_frame() -> (Vec<u8>, WriteExpiry) {
+        let encoded = codec::encode_qos0_expiring(
+            &SharedBytes::copy_from(b"t", 1).unwrap(),
+            &SharedBytes::copy_from(b"payload", 7).unwrap(),
+            false,
+            Some(2),
+        )
+        .unwrap();
+        (
+            encoded.bytes,
+            WriteExpiry {
+                expiry: MessageExpiry {
+                    observed: MessageTime {
+                        domain: [1; 32],
+                        tick: 100,
+                    },
+                    interval: 2,
+                },
+                value_offset: encoded.expiry_value_offset.unwrap(),
+                started: false,
+            },
+        )
+    }
+
+    fn correlation(sequence: u64) -> Option<(EffectId, ConnectionKey)> {
+        Some((
+            EffectId {
+                epoch: RunEpoch::new(1),
+                owner: LogicalOwnerId::new(1),
+                sequence: EffectSeq::new(sequence),
+            },
+            ConnectionKey {
+                session: SessionId::new(1),
+                generation: ConnectionGeneration::new(1),
+            },
+        ))
     }
 
     fn incoming(connection: &Connection) -> Incoming {
@@ -628,6 +694,273 @@ mod tests {
             connection.join_finished(),
             "socket tasks outlived cancellation budget"
         );
+    }
+
+    #[test]
+    fn every_zero_progress_retry_rechecks_expiry_before_any_byte_can_leave() {
+        for error_kind in [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted] {
+            let clock = FakeClock::new(reading(100));
+            let (mut bytes, expiry) = timed_frame();
+            let attempts = Cell::new(0);
+            let result = write_attempts(
+                &mut bytes,
+                Some(expiry),
+                &control(),
+                &clock,
+                |_, _| {
+                    attempts.set(attempts.get() + 1);
+                    assert_eq!(attempts.get(), 1, "expired zero-progress retry reached I/O");
+                    clock.set(reading(expiry.expiry.deadline().unwrap()));
+                    Err(io::Error::from(error_kind))
+                },
+                || panic!("no byte was accepted"),
+            );
+            assert_eq!(
+                result,
+                Err(WriteFailure::NotStarted(MessageExpiryBlock::Expired))
+            );
+            assert_eq!(attempts.get(), 1);
+        }
+    }
+
+    #[test]
+    fn first_positive_progress_freezes_the_value_and_finishes_after_expiry() {
+        let clock = FakeClock::new(reading(1_000_000_100));
+        let (mut bytes, expiry) = timed_frame();
+        let original = bytes.clone();
+        let attempts = Cell::new(0);
+        let starts = Cell::new(0);
+        let mut observed = Vec::new();
+        let result = write_attempts(
+            &mut bytes,
+            Some(expiry),
+            &control(),
+            &clock,
+            |part, _| {
+                attempts.set(attempts.get() + 1);
+                let count = if attempts.get() == 1 { 1 } else { part.len() };
+                observed.extend_from_slice(&part[..count]);
+                // The blocking first attempt was authorized while fresh. Its
+                // positive result can arrive after the deadline.
+                clock.set(reading(expiry.expiry.deadline().unwrap()));
+                Ok(count)
+            },
+            || {
+                starts.set(starts.get() + 1);
+                clock.fail(TimeError::ClockUnavailable);
+                true
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(starts.get(), 1);
+        assert_eq!(observed, bytes);
+        assert_eq!(
+            &bytes[expiry.value_offset..expiry.value_offset + 4],
+            &1u32.to_be_bytes()
+        );
+        assert_eq!(
+            &bytes[..expiry.value_offset],
+            &original[..expiry.value_offset]
+        );
+        assert_eq!(
+            &bytes[expiry.value_offset + 4..],
+            &original[expiry.value_offset + 4..]
+        );
+    }
+
+    #[test]
+    fn uncertain_clock_readings_block_fresh_transmission_with_no_bytes() {
+        for case in 0..4 {
+            let clock = FakeClock::new(reading(100));
+            let (mut bytes, mut expiry) = timed_frame();
+            match case {
+                0 => clock.fail(TimeError::ClockUnavailable),
+                1 => clock.set(SessionClockReading {
+                    domain: [2; 32],
+                    tick: 100,
+                }),
+                2 => clock.set(reading(99)),
+                _ => expiry.expiry.observed.tick = u64::MAX,
+            }
+            assert_eq!(
+                write_attempts(
+                    &mut bytes,
+                    Some(expiry),
+                    &control(),
+                    &clock,
+                    |_, _| panic!("uncertain time granted a write"),
+                    || panic!("uncertain time cannot start a frame"),
+                ),
+                Err(WriteFailure::NotStarted(
+                    MessageExpiryBlock::TemporalUncertain
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn a_known_started_exchange_replays_with_zero_after_expiry_or_clock_uncertainty() {
+        for uncertain in [false, true] {
+            let (mut bytes, mut expiry) = timed_frame();
+            expiry.started = true;
+            let clock = FakeClock::new(reading(expiry.expiry.deadline().unwrap()));
+            if uncertain {
+                clock.fail(TimeError::ClockUnavailable);
+            }
+            let starts = Cell::new(0);
+            assert_eq!(
+                write_attempts(
+                    &mut bytes,
+                    Some(expiry),
+                    &control(),
+                    &clock,
+                    |part, _| {
+                        assert_eq!(&part[expiry.value_offset..expiry.value_offset + 4], &[0; 4]);
+                        Ok(part.len())
+                    },
+                    || {
+                        starts.set(starts.get() + 1);
+                        true
+                    },
+                ),
+                Ok(())
+            );
+            assert_eq!(starts.get(), 1);
+        }
+    }
+
+    #[test]
+    fn a_bad_expiry_value_offset_closes_without_touching_socket_bytes() {
+        let (mut bytes, mut expiry) = timed_frame();
+        expiry.value_offset = usize::MAX;
+        assert_eq!(
+            write_attempts(
+                &mut bytes,
+                Some(expiry),
+                &control(),
+                &FakeClock::new(reading(100)),
+                |_, _| panic!("bad patch granted I/O"),
+                || panic!("bad patch cannot start"),
+            ),
+            Err(WriteFailure::Failed("output_expiry_offset"))
+        );
+    }
+
+    #[test]
+    fn expired_queued_publication_is_disposed_without_closing_the_transport() {
+        let clock = Arc::new(FakeClock::new(reading(100)));
+        let (mut connection, mut peer) = pair_with_clock(clock.clone());
+        connection.pause_wire_progress(true);
+        connection
+            .outgoing
+            .send(Write {
+                correlation: correlation(1),
+                bytes: vec![0xd0, 0],
+                expiry: None,
+            })
+            .unwrap();
+        let wait = Instant::now() + Duration::from_millis(600);
+        while !connection.wire_progress_is_waiting() {
+            assert!(
+                Instant::now() < wait,
+                "first frame never reached the queue barrier"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let (bytes, expiry) = timed_frame();
+        connection
+            .outgoing
+            .send(Write {
+                correlation: correlation(2),
+                bytes,
+                expiry: Some(expiry),
+            })
+            .unwrap();
+        connection
+            .outgoing
+            .send(Write {
+                correlation: None,
+                bytes: vec![0xd0, 0],
+                expiry: None,
+            })
+            .unwrap();
+        clock.set(reading(expiry.expiry.deadline().unwrap()));
+        connection.pause_wire_progress(false);
+        assert!(
+            matches!(connection.written.recv_timeout(Duration::from_millis(600)).unwrap(), Written::Complete { correlation: value, .. } if value==correlation(1))
+        );
+        assert!(
+            matches!(connection.written.recv_timeout(Duration::from_millis(600)).unwrap(), Written::NotStarted { correlation: value, reason: MessageExpiryBlock::Expired } if value==correlation(2))
+        );
+        assert!(matches!(
+            connection
+                .written
+                .recv_timeout(Duration::from_millis(600))
+                .unwrap(),
+            Written::Complete {
+                correlation: None,
+                bytes: 2
+            }
+        ));
+        let mut actual = [0; 4];
+        peer.set_read_timeout(Some(Duration::from_millis(600)))
+            .unwrap();
+        peer.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, [0xd0, 0, 0xd0, 0]);
+        peer.write_all(&[0xc0, 0]).unwrap();
+        assert!(
+            matches!(incoming(&connection), Incoming::Packet {first:0xc0, body} if body.is_empty())
+        );
+        assert!(!connection.control.is_cancelled());
+        connection.close();
+        finish(&mut connection);
+    }
+
+    #[test]
+    fn a_started_receipt_and_peer_ack_precede_the_local_completion_receipt() {
+        let clock = Arc::new(FakeClock::new(reading(100)));
+        let (mut connection, mut peer) = pair_with_clock(clock);
+        connection.pause_wire_progress(true);
+        let (_, mut expiry) = timed_frame();
+        let encoded = codec::encode_publish_expiring(
+            mqttiumd_contract::ids::OutboundPacketId::new(7).unwrap(),
+            &SharedBytes::copy_from(b"t", 1).unwrap(),
+            &SharedBytes::copy_from(b"payload", 7).unwrap(),
+            false,
+            false,
+            Some(2),
+        )
+        .unwrap();
+        expiry.value_offset = encoded.expiry_value_offset.unwrap();
+        let bytes = encoded.bytes;
+        let expected = bytes.clone();
+        connection
+            .outgoing
+            .send(Write {
+                correlation: correlation(1),
+                bytes,
+                expiry: Some(expiry),
+            })
+            .unwrap();
+        assert!(
+            matches!(connection.written.recv_timeout(Duration::from_millis(600)).unwrap(), Written::Started {correlation:value} if value==correlation(1))
+        );
+        let mut actual = vec![0; expected.len()];
+        peer.set_read_timeout(Some(Duration::from_millis(600)))
+            .unwrap();
+        peer.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert!(connection.written.try_recv().is_err());
+        peer.write_all(&[0x40, 2, 0, 7]).unwrap();
+        assert!(matches!(incoming(&connection), Incoming::Packet {first:0x40,body} if body==[0,7]));
+        connection.pause_wire_progress(false);
+        assert!(
+            matches!(connection.written.recv_timeout(Duration::from_millis(600)).unwrap(), Written::Complete {correlation:value,..} if value==correlation(1))
+        );
+        assert!(connection.written.try_recv().is_err());
+        connection.close();
+        finish(&mut connection);
     }
 
     #[test]
