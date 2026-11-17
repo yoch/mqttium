@@ -4,7 +4,8 @@ import unittest
 from external_retained import MqttiumRetained, PahoRetained
 from external_wildcard import Subscription
 from retained_probe import decode_publish, retained_publish_packet
-from tcp_probe import Frame, ReceiptFailure
+from retained_boundaries import canonical_receipt
+from tcp_probe import Frame, ReceiptFailure, operation_hex
 from test_external_clients import ScriptedBroker, read_packet
 from test_session_reception import accept
 
@@ -29,6 +30,20 @@ class IndependentRetainedFrames(unittest.TestCase):
                 decode_publish(frame)
         with self.assertRaises(ValueError):
             retained_publish_packet('a', b'b', 1, qos=0)
+
+    def test_actual_wrapped_recipe_layout_correlates_inner_operation(self):
+        event = {'operation': {'incarnation': '1', 'epoch': '2', 'owner': '3', 'sequence': '4'}}
+        identity = operation_hex(event['operation'])
+        for tag, inner in ((10, 1), (12, 9)):
+            old = b'MQDR\x00\x01' + bytes([inner]) + bytes.fromhex(identity)
+            raw = b'MQDR\x00\x01' + bytes([tag]) + len(old).to_bytes(4, 'big') + old
+            state = {'tables': {'operations': [{'id': identity, 'recipe': raw.hex()}]}}
+            with self.subTest(tag=tag):
+                self.assertEqual(canonical_receipt(state, event, tag)['tag'], tag)
+                altered = raw[:18] + b'\xff' * 32
+                state['tables']['operations'][0]['recipe'] = altered.hex()
+                with self.assertRaisesRegex(ReceiptFailure, 'retained_result_canonical_identity_changed'):
+                    canonical_receipt(state, event, tag)
 
 
 class PublicRetainedAPIs(unittest.IsolatedAsyncioTestCase):
