@@ -5468,4 +5468,147 @@ mod tests {
         );
         assert_eq!(owner.message_now, previous);
     }
+
+    #[test]
+    fn message_expiry_clocked_subscription_reserves_all_replay_work_before_drawing_identities() {
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        let counters = owner.counters;
+        let result = owner.step(
+            product_subscribe(),
+            TurnGrant {
+                work_limit: WorkUnits::new(200),
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                StepOutcome::NeedCapacity {
+                    need: CapacityNeed {
+                        resource: Resource::Work,
+                        ..
+                    },
+                    work_used: WorkUnits::ZERO,
+                    ..
+                }
+            ),
+            "clocked_subscription_exceeded_work_grant"
+        );
+        assert_eq!(owner.counters, counters);
+        assert!(owner.pubsub.control.is_none());
+        assert!(drain(&mut owner).is_empty());
+    }
+
+    #[test]
+    fn message_expiry_partial_positive_progress_never_proves_a_claim_unsent() {
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        let (frame, key, _) = message_frame(&mut owner, 0);
+        assert!(
+            message_progress(
+                &mut owner,
+                frame,
+                key,
+                FrameProgress::Written {
+                    confirmed: 1,
+                    total: 18
+                }
+            )
+            .is_empty()
+        );
+        assert!(!owner.pubsub.deliveries.as_slice()[0].local_write_completed);
+        assert!(
+            !owner.pubsub.deliveries.as_slice()[0].claim.unwrap().started,
+            "partial_callback_invented_started_marker"
+        );
+        message_clock(&mut owner, 12);
+        assert!(
+            message_progress(
+                &mut owner,
+                frame,
+                key,
+                FrameProgress::NotStarted {
+                    reason: MessageExpiryBlock::Expired
+                }
+            )
+            .is_empty(),
+            "partial_positive_write_treated_as_unsent"
+        );
+        assert_eq!(owner.pubsub.deliveries.len(), 1);
+    }
+
+    #[test]
+    fn message_expiry_puback_while_started_marker_is_deferred_keeps_its_exact_target() {
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        let (frame, key, pi) = message_frame(&mut owner, 0);
+        let target = owner.puback_target(key, pi).unwrap();
+        let (effect, command) = message_command(message_progress(
+            &mut owner,
+            frame,
+            key,
+            FrameProgress::Started,
+        ));
+        apply(
+            &mut owner,
+            Input::StoreResult {
+                effect,
+                operation: command.recipe.operation(),
+                reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(RejectReason::Fenced)),
+            },
+        );
+        assert_eq!(
+            owner.puback_target(key, pi),
+            Some(target),
+            "fenced_marker_lost_puback_association"
+        );
+        assert!(message_puback(&mut owner, key, pi).is_empty());
+        let (effect, retry) =
+            message_command(apply(&mut owner, Input::WorkAvailable { session: TARGET }));
+        assert!(
+            matches!(retry.recipe.get(), Recipe::MarkDeliveryStarted(mark) if mark.claim == target.claim)
+        );
+        let (effect, finish) = message_command(known(&mut owner, effect, &retry));
+        known(&mut owner, effect, &finish);
+        assert!(owner.pubsub.deliveries.is_empty());
+    }
+
+    #[test]
+    fn message_expiry_regressive_loaded_origin_refuses_the_page_before_mutation() {
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        let effects = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let effect = effects
+            .iter()
+            .find_map(|(id, e)| matches!(e, Effect::LoadWork { .. }).then_some(*id))
+            .unwrap();
+        let item = WorkItem {
+            delivery: delivery(0),
+            target: TARGET,
+            target_revision: Revision::new(1),
+            qos: Qos::AtLeastOnce,
+            retain: false,
+            expiry: Some(MessageExpiry {
+                observed: message_time(11),
+                interval: 2,
+            }),
+            topic: bytes(b"topic"),
+            payload: bytes(b"payload"),
+            claim: None,
+        };
+        let result = owner.step(
+            Input::WorkPage {
+                effect,
+                session: TARGET,
+                items: BoundedVec::from_slice(&[item], 1).unwrap(),
+                next: None,
+            },
+            TURN,
+        );
+        assert!(
+            matches!(result, StepOutcome::Fatal(CoreFault::ImpossibleInput)),
+            "regressive_message_time_silently_quarantined"
+        );
+        assert!(owner.pubsub.deliveries.is_empty());
+    }
 }
