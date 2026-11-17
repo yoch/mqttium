@@ -120,3 +120,44 @@ class WillFormats(unittest.TestCase):
         self.assertIn("the fixture-based qualifier does not cover product Will publication",
                       unmet(record=SimpleNamespace(kind="CommandSubmitted",
                             payload={"command_kind": "WillPublication"})))
+
+    def will_snapshot(self):
+        return {**copy.deepcopy(self.snapshot), "wills": [{
+            "will_id": OPERATION, "source_session": "9", "client_id_hex": b"capteur-1".hex(),
+            "state": "Pending", "topic_hex": TOPIC.hex(), "payload_hex": PAYLOAD.hex()}]}
+
+    def test_intent_survives_an_absent_source_in_the_descriptive_inventory(self):
+        value = self.will_snapshot()
+        self.assertFalse(any(row["session"] == "9" for row in value["sessions"]))
+        self.assertEqual(self.contracts.check_value(value), [], "pending_intent_not_described")
+
+    def test_intent_states_octets_and_cardinality_remain_bounded(self):
+        for change in (
+            {"state": "Published"}, {"topic_hex": "00" * 1025},
+            {"payload_hex": "00" * 32769}, {"client_id_hex": "00" * 1025},
+            {"unexpected": 0},
+        ):
+            value = self.will_snapshot()
+            value["wills"][0].update(change)
+            self.assertTrue(self.contracts.check_value(value), change)
+        value = self.will_snapshot()
+        value["wills"] *= 257
+        self.assertTrue(self.contracts.check_value(value))
+
+    def test_intent_keys_are_numeric_scoped_and_unique(self):
+        value = self.will_snapshot()
+        value["wills"].append(copy.deepcopy(value["wills"][0]))
+        self.assertEqual([(d.code, d.pointer) for d in self.contracts.check_value(value)],
+                         [("duplicate-name", "/wills/1/will_id")])
+        value["wills"][1]["will_id"]["sequence"] = "7"
+        self.assertEqual([(d.code, d.pointer) for d in self.contracts.check_value(value)],
+                         [("rows-out-of-order", "/wills/1/will_id")])
+
+    def test_intent_identity_components_cannot_exceed_u64(self):
+        for member, pointer in (("source_session", "/wills/0/source_session"),
+                                ("sequence", "/wills/0/will_id/sequence")):
+            value = self.will_snapshot()
+            holder = value["wills"][0] if member == "source_session" else value["wills"][0]["will_id"]
+            holder[member] = "18446744073709551616"
+            self.assertEqual([(d.code, d.pointer) for d in self.contracts.check_value(value)],
+                             [("u64-out-of-range", pointer)])
