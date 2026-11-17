@@ -9,13 +9,40 @@ from tcp_probe import ReceiptFailure
 
 
 class SubscriptionEncodingTests(unittest.TestCase):
-    def canonical(self, *, wrapped=True, bad_identity=False):
+    def canonical(self, *, wrapped=True, timed=False, bad_identity=False):
         operation={"incarnation":"1","epoch":"2","owner":"0","sequence":"3"}
         identity=b"".join(int(operation[k]).to_bytes(8,"big") for k in ("incarnation","epoch","owner","sequence"))
         inner=b"MQDR\x00\x01\x09"+identity+(1).to_bytes(8,"big")*3+b"\x01\x02\x1c\x00\x03a/#"
         if bad_identity: inner=inner[:7]+bytes(32)+inner[39:]
         raw=(b"MQDR\x00\x01\x0c"+len(inner).to_bytes(4,"big")+inner+identity) if wrapped else inner
+        if timed:
+            raw = b"MQDR\x00\x01\x0e" + len(raw).to_bytes(4, "big") + raw + b"\xab" * 32 + (100).to_bytes(8, "big")
         return {"tables":{"operations":[{"id":identity.hex(),"recipe":raw.hex()}]}},{"operation":operation}
+
+    def test_timed_replay_preserves_the_original_options_and_operation(self):
+        state, event = self.canonical(timed=True)
+        observed = receipt_row(state, event)
+        self.assertEqual(observed["canonical_kind"], 14)
+        self.assertEqual(observed["semantic_kind"], 12)
+        self.assertEqual(observed["inner_kind"], 9)
+        self.assertEqual(observed["operation_hex"], state["tables"]["operations"][0]["id"])
+
+    def test_temporal_and_legacy_envelopes_reject_wrong_identity_lengths_and_trailing_bytes(self):
+        for timed in (False, True):
+            state, event = self.canonical(timed=timed, bad_identity=True)
+            with self.assertRaises(ReceiptFailure): receipt_row(state, event)
+            state, event = self.canonical(timed=timed)
+            raw = bytes.fromhex(state["tables"]["operations"][0]["recipe"])
+            for invalid in (raw[:-1], raw + b"\x00", raw[:7] + (65537).to_bytes(4, "big") + raw[11:]):
+                state["tables"]["operations"][0]["recipe"] = invalid.hex()
+                with self.assertRaises(ReceiptFailure): receipt_row(state, event)
+
+    def test_timed_replay_child_whitelist_forbids_another_temporal_envelope(self):
+        state, event = self.canonical(timed=True)
+        raw = bytes.fromhex(state["tables"]["operations"][0]["recipe"])
+        for tag in (1, 7, 9, 10, 11, 13, 14, 15, 16):
+            state["tables"]["operations"][0]["recipe"] = (raw[:17] + bytes([tag]) + raw[18:]).hex()
+            with self.assertRaises(ReceiptFailure): receipt_row(state, event)
 
     def test_versioned_replay_envelope_preserves_options_and_operation_correlation(self):
         state,event=self.canonical()
