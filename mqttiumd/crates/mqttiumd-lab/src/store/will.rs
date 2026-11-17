@@ -11,8 +11,15 @@ pub(super) fn validate(state: &DurableState) -> Result<(), ReadError> {
     }
     let mut bytes = 0u64;
     for (id, intent) in &state.wills {
+        if intent.client_id.len() > mqttiumd_contract::session::MAX_SESSION_CLIENT_BYTES
+            || intent.spec.topic.len() > mqttiumd_contract::will::MAX_WILL_TOPIC_BYTES
+            || intent.spec.payload.len() > mqttiumd_contract::will::MAX_WILL_PAYLOAD_BYTES
+        {
+            return Err(ReadError::LimitExceeded);
+        }
         if *id != intent.id
             || id.incarnation() != state.ledger.incarnation()
+            || id.sequence().get() == 0
             || id.epoch().get() == 0
             || id.epoch() > state.ledger.last_opened()
             || intent.session.get() == 0
@@ -33,7 +40,10 @@ pub(super) fn validate(state: &DurableState) -> Result<(), ReadError> {
         }
         if intent.state == WillState::Armed
             && !state.sessions.get(&intent.session).is_some_and(|s| {
-                s.state == SessionState::Active && s.opened_by == Some(*id) && s.detached.is_none()
+                s.state == SessionState::Active
+                    && s.opened_by == Some(*id)
+                    && s.client_id == intent.client_id.as_slice()
+                    && s.detached.is_none()
             })
         {
             return Err(ReadError::InvalidData);

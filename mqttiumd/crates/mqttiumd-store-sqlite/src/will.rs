@@ -15,11 +15,13 @@ fn state(raw: i64) -> Result<WillState, Fault> {
     }
 }
 fn metadata(
+    conn: &Connection,
     row: &rusqlite::Row<'_>,
     meta: &Meta,
 ) -> Result<(OperationId, SessionId, WillState, usize), Fault> {
     let id = OperationId::from_be_slice(reader::borrow_blob(row, 0, 32)?).map_err(|_| Corrupt)?;
     if id.incarnation() != meta.ledger.incarnation()
+        || id.sequence().get() == 0
         || id.epoch().get() == 0
         || id.epoch() > meta.ledger.last_opened()
     {
@@ -42,6 +44,22 @@ fn metadata(
     {
         return Err(Fault::Corrupt);
     }
+    if state == WillState::Armed {
+        let mut statement=conn.prepare_cached("SELECT opened_by,client_id FROM sessions WHERE id=?1 AND state=1 AND detached_by IS NULL")?;
+        let mut rows = statement.query([session.to_be_bytes().as_slice()])?;
+        let Some(binding) = rows.next()? else {
+            return Err(Fault::Corrupt);
+        };
+        if reader::borrow_blob(binding, 0, 32)? != id.to_be_bytes()
+            || reader::borrow_blob(
+                binding,
+                1,
+                mqttiumd_contract::session::MAX_SESSION_CLIENT_BYTES,
+            )? != client
+        {
+            return Err(Fault::Corrupt);
+        }
+    }
     let bytes = 128usize
         .checked_add(client.len())
         .and_then(|n| n.checked_add(topic.len()))
@@ -49,8 +67,13 @@ fn metadata(
         .ok_or(ReadError::LimitExceeded)?;
     Ok((id, session, state, bytes))
 }
-fn build(row: &rusqlite::Row<'_>, meta: &Meta, budget: ReadBudget) -> Result<WillIntent, Fault> {
-    let (id, session, state, bytes) = metadata(row, meta)?;
+fn build(
+    conn: &Connection,
+    row: &rusqlite::Row<'_>,
+    meta: &Meta,
+    budget: ReadBudget,
+) -> Result<WillIntent, Fault> {
+    let (id, session, state, bytes) = metadata(conn, row, meta)?;
     budget.check_totals(1, bytes)?;
     for (index, maximum) in [
         (3, mqttiumd_contract::session::MAX_SESSION_CLIENT_BYTES),
@@ -91,7 +114,7 @@ pub(super) fn snapshot(
         if out.len() >= MAX_WILL_INTENTS {
             return Err(ReadError::LimitExceeded.into());
         }
-        let (id, _, _, bytes) = metadata(row, meta)?;
+        let (id, _, _, bytes) = metadata(conn, row, meta)?;
         meter.charge(bytes)?;
         payload_bytes = payload_bytes
             .checked_add(reader::borrow_blob(row, 5, MAX_WILL_PAYLOAD_BYTES)?.len() as u64)
@@ -99,13 +122,7 @@ pub(super) fn snapshot(
         if payload_bytes > MAX_WILL_BYTES {
             return Err(ReadError::LimitExceeded.into());
         }
-        let intent = build(row, meta, budget)?;
-        if intent.state == WillState::Armed {
-            let binding: Option<Vec<u8>> = conn.query_row("SELECT opened_by FROM sessions WHERE id=?1 AND state=1 AND detached_by IS NULL", [intent.session.to_be_bytes().as_slice()], |r| r.get(0)).optional()?.flatten();
-            if binding.as_deref() != Some(id.to_be_bytes().as_slice()) {
-                return Err(Fault::Corrupt);
-            }
-        }
+        let intent = build(conn, row, meta, budget)?;
         out.insert(id, intent);
     }
     Ok(out)
@@ -134,7 +151,7 @@ pub(super) fn page(
             return Err(ReadError::LimitExceeded.into());
         }
         // Validate before filtering: corrupt state is never interpreted as no work.
-        let (id, _, state, bytes) = metadata(row, meta)?;
+        let (id, _, state, bytes) = metadata(conn, row, meta)?;
         payload_bytes = payload_bytes
             .checked_add(reader::borrow_blob(row, 5, MAX_WILL_PAYLOAD_BYTES)?.len() as u64)
             .ok_or(ReadError::LimitExceeded)?;
@@ -150,7 +167,7 @@ pub(super) fn page(
         }
         meter.charge(bytes)?;
         items
-            .try_push(build(row, meta, budget)?)
+            .try_push(build(conn, row, meta, budget)?)
             .map_err(|_| ReadError::AllocationFailed)?;
     }
     let next = more
@@ -160,9 +177,8 @@ pub(super) fn page(
 }
 
 pub(super) fn has_client(conn: &Connection, client: &[u8]) -> Result<bool, Fault> {
-    let mut statement = conn.prepare_cached(
-        "SELECT state,client_id,length(topic),length(payload) FROM wills LIMIT 257",
-    )?;
+    let meta = read_meta(conn)?;
+    let mut statement=conn.prepare_cached("SELECT w.state,w.client_id,length(w.topic),length(w.payload),w.id,w.session,s.opened_by,s.client_id,s.detached_by FROM wills w LEFT JOIN sessions s ON s.id=w.session LIMIT 257")?;
     let mut rows = statement.query([])?;
     let mut count = 0usize;
     let mut found = false;
@@ -172,10 +188,34 @@ pub(super) fn has_client(conn: &Connection, client: &[u8]) -> Result<bool, Fault
         if count > MAX_WILL_INTENTS {
             return Err(ReadError::LimitExceeded.into());
         }
-        state(row.get(0)?)?;
+        let phase = state(row.get(0)?)?;
+        let id =
+            OperationId::from_be_slice(reader::borrow_blob(row, 4, 32)?).map_err(|_| Corrupt)?;
+        let session =
+            SessionId::from_be_slice(reader::borrow_blob(row, 5, 8)?).map_err(|_| Corrupt)?;
+        if id.incarnation() != meta.ledger.incarnation()
+            || id.epoch().get() == 0
+            || id.epoch() > meta.ledger.last_opened()
+            || id.sequence().get() == 0
+            || session.get() == 0
+            || session >= meta.next_session
+        {
+            return Err(Fault::Corrupt);
+        }
         let stored =
             reader::borrow_blob(row, 1, mqttiumd_contract::session::MAX_SESSION_CLIENT_BYTES)?;
         if stored.is_empty() || stored.contains(&0) || std::str::from_utf8(stored).is_err() {
+            return Err(Fault::Corrupt);
+        }
+        if phase == WillState::Armed
+            && (reader::borrow_blob(row, 6, 32)? != id.to_be_bytes()
+                || reader::borrow_blob(
+                    row,
+                    7,
+                    mqttiumd_contract::session::MAX_SESSION_CLIENT_BYTES,
+                )? != stored
+                || !matches!(row.get_ref(8)?, rusqlite::types::ValueRef::Null))
+        {
             return Err(Fault::Corrupt);
         }
         let topic: i64 = row.get(2)?;
@@ -208,7 +248,7 @@ pub(super) fn recover(conn: &Connection, meta: &Meta) -> Result<(), Fault> {
         if count > MAX_WILL_INTENTS {
             return Err(ReadError::LimitExceeded.into());
         }
-        metadata(row, meta)?;
+        metadata(conn, row, meta)?;
         bytes = bytes
             .checked_add(reader::borrow_blob(row, 5, MAX_WILL_PAYLOAD_BYTES)?.len() as u64)
             .ok_or(ReadError::LimitExceeded)?;
@@ -364,7 +404,7 @@ pub(super) fn publish(
     let Some(row) = rows.next()? else {
         return refused(RejectReason::PreconditionFailed);
     };
-    let intent = build(row, meta, ReadBudget::PAGE)?;
+    let intent = build(conn, row, meta, ReadBudget::PAGE)?;
     if intent.state != WillState::Pending
         || value.topic != intent.spec.topic
         || payload != Some(&intent.spec.payload)

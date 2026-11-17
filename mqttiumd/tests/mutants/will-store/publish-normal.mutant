@@ -1,0 +1,11 @@
+--- a/mqttiumd/crates/mqttiumd-store-sqlite/src/will.rs
++++ b/mqttiumd/crates/mqttiumd-store-sqlite/src/will.rs
+@@ -375,7 +375,7 @@
+                 guard.session.to_be_bytes().as_slice()
+             ])?;
+     } else {
+-        conn.prepare_cached("DELETE FROM wills WHERE id=?1 AND session=?2 AND state=1")?
++        conn.prepare_cached("UPDATE wills SET state=2 WHERE id=?1 AND session=?2 AND state=1")?
+             .execute(params![
+                 key.as_slice(),
+                 guard.session.to_be_bytes().as_slice()

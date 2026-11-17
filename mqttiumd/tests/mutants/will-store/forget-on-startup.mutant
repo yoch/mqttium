@@ -1,0 +1,11 @@
+--- a/mqttiumd/crates/mqttiumd-store-sqlite/src/will.rs
++++ b/mqttiumd/crates/mqttiumd-store-sqlite/src/will.rs
+@@ -258,7 +258,7 @@
+     }
+     drop(rows);
+     drop(statement);
+-    conn.prepare_cached("UPDATE wills SET state=2 WHERE state=1")?
++    conn.prepare_cached("DELETE FROM wills WHERE state=1")?
+         .execute([])?;
+     Ok(())
+ }

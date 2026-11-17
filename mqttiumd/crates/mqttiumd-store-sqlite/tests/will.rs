@@ -11,6 +11,9 @@ use mqttiumd_contract::ids::{
 };
 use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome, StoreReply};
 use mqttiumd_contract::packet::{Qos, SharedBytes};
+use mqttiumd_contract::receipts::{
+    ReceiptClosure, ReceiptCollection, ReceiptCollectionReply, ReceiptOrigin,
+};
 use mqttiumd_contract::session::{
     SessionAction, SessionChange, SessionExpiry, SessionGuard, SessionLifecycle,
 };
@@ -143,7 +146,7 @@ fn lifecycle_and_independent_responsibilities(mut world: World<impl DurableStore
     let guard = establish(
         &mut world.store,
         world.epoch,
-        10,
+        1,
         SessionExpiry::OnDisconnect,
     );
     let armed = world.store.snapshot().unwrap();
@@ -161,7 +164,7 @@ fn lifecycle_and_independent_responsibilities(mut world: World<impl DurableStore
             .is_empty()
     );
     let end = command(
-        operation_id(world.epoch, 11),
+        operation_id(world.epoch, 2),
         SessionAction::EndWill {
             guard,
             expiry: SessionExpiry::OnDisconnect,
@@ -177,7 +180,7 @@ fn lifecycle_and_independent_responsibilities(mut world: World<impl DurableStore
         WillState::Pending,
         "will_disappeared_with_source"
     );
-    let publish = publication(&world, guard.opened_by.unwrap(), 12);
+    let publish = publication(&world, guard.opened_by.unwrap(), 3);
     let applied = world.store.apply(&publish);
     assert!(
         applied.committed_now,
@@ -194,7 +197,7 @@ fn lifecycle_and_independent_responsibilities(mut world: World<impl DurableStore
         admitted,
         "lost_result_repeated_will_admission"
     );
-    let again = publication(&world, guard.opened_by.unwrap(), 13);
+    let again = publication(&world, guard.opened_by.unwrap(), 4);
     assert!(
         !world.store.apply(&again).committed_now,
         "consumed_intent_recreated_permission"
@@ -214,7 +217,7 @@ fn lifecycle_and_independent_responsibilities(mut world: World<impl DurableStore
     );
     assert_eq!(held.payloads.values().next().unwrap().references, 1);
     let delivery = *held.obligations.keys().next().unwrap();
-    let claim = operation_id(world.epoch, 14);
+    let claim = operation_id(world.epoch, 5);
     let packet_id = OutboundPacketId::new(1).unwrap();
     let operation_command = |recipe| Command {
         recipe: FrozenRecipe::freeze(recipe).unwrap(),
@@ -233,7 +236,7 @@ fn lifecycle_and_independent_responsibilities(mut world: World<impl DurableStore
             .committed_now
     );
     let finish = operation_command(Recipe::FinishDelivery(FinishDelivery {
-        operation: operation_id(world.epoch, 15),
+        operation: operation_id(world.epoch, 6),
         delivery,
         target: world.c,
         target_revision: Revision::new(1),
@@ -252,15 +255,109 @@ fn lifecycle_and_independent_responsibilities(mut world: World<impl DurableStore
         ended,
         "finish_double_released_will_payload"
     );
+    let old = operation_id(world.epoch, 3);
+    let collection = ReceiptCollection {
+        closure: ReceiptClosure {
+            origin: ReceiptOrigin::of(old),
+            through: mqttiumd_contract::ids::OperationSeq::new(6),
+            publication_through: mqttiumd_contract::ids::PublicationSeq::new(3),
+            payload_through: PayloadSeq::new(3),
+        },
+        limit: 128,
+    };
+    assert!(matches!(
+        world.store.collect_receipts(collection).unwrap(),
+        ReceiptCollectionReply::Applied { .. }
+    ));
+    let after_gc = world.store.snapshot().unwrap();
+    assert!(after_gc.operations.is_empty());
+    assert_eq!(
+        world.store.apply(&publish).reply,
+        StoreReply::Outcome(StoreOutcome::RetiredOutcomeUnavailable)
+    );
+    assert_eq!(world.store.snapshot().unwrap(), after_gc);
+    let newer = establish(
+        &mut world.store,
+        world.epoch,
+        7,
+        SessionExpiry::OnDisconnect,
+    );
+    assert!(
+        world
+            .store
+            .apply(&command(
+                operation_id(world.epoch, 8),
+                SessionAction::EndWill {
+                    guard: newer,
+                    expiry: SessionExpiry::OnDisconnect,
+                    observed_at: 0,
+                    publish: true
+                }
+            ))
+            .committed_now
+    );
+    let no_targets = |seq, pubseq, payseq| {
+        let operation = operation_id(world.epoch, seq);
+        Command {
+            recipe: FrozenRecipe::freeze(Recipe::WillPublication(WillPublication {
+                operation,
+                will: newer.opened_by.unwrap(),
+                publication: publication_id(world.epoch, pubseq),
+                route_revision: ended.route_revision,
+                topic: bytes(b"p1/topic"),
+                payload: PayloadRef {
+                    id: PayloadId::new(
+                        operation.incarnation(),
+                        operation.epoch(),
+                        operation.owner(),
+                        PayloadSeq::new(payseq),
+                    ),
+                    length: PayloadBytes::new(7),
+                },
+                costs: Costs {
+                    payload_bytes: PayloadBytes::new(7),
+                    references: References::ZERO,
+                    exchange_slots: ExchangeSlots::ZERO,
+                    receipt_slots: ReceiptSlots::new(1),
+                },
+                targets: BoundedVec::with_capacity(0).unwrap(),
+            }))
+            .unwrap(),
+            payload: Some(bytes(b"offline")),
+        }
+    };
+    assert!(
+        !world.store.apply(&no_targets(9, 3, 9)).committed_now,
+        "collected_publication_identity_reused"
+    );
+    assert!(
+        !world.store.apply(&no_targets(10, 10, 3)).committed_now,
+        "collected_payload_identity_reused"
+    );
+    assert!(
+        world
+            .store
+            .snapshot()
+            .unwrap()
+            .wills
+            .contains_key(&newer.opened_by.unwrap())
+    );
+    assert!(
+        world.store.apply(&no_targets(11, 11, 11)).committed_now,
+        "fresh_will_could_not_progress_after_retirement"
+    );
 }
 #[test]
 fn sqlite_and_memory_will_survive_source_deletion_and_lost_result() {
     let d = Directory::new();
     let db = d.db();
-    lifecycle_and_independent_responsibilities(World::new(&|i, l| {
-        SqliteStore::create(&db, i, l).unwrap()
-    }));
-    lifecycle_and_independent_responsibilities(World::new(&MemoryStore::create));
+    let mut limits = fixture_limits();
+    limits.receipt_slots = ReceiptSlots::new(8192);
+    lifecycle_and_independent_responsibilities(World::with_limits(
+        &|i, l| SqliteStore::create(&db, i, l).unwrap(),
+        limits,
+    ));
+    lifecycle_and_independent_responsibilities(World::with_limits(&MemoryStore::create, limits));
 }
 fn startup_and_normal_cancel(mut world: World<impl DurableStore>) {
     let guard = establish(
@@ -273,8 +370,11 @@ fn startup_and_normal_cancel(mut world: World<impl DurableStore>) {
     let pending = world.store.snapshot().unwrap();
     assert!(!pending.sessions.contains_key(&guard.session));
     assert_eq!(
-        pending.wills[&guard.opened_by.unwrap()].state,
-        WillState::Pending,
+        pending
+            .wills
+            .get(&guard.opened_by.unwrap())
+            .map(|i| i.state),
+        Some(WillState::Pending),
         "will_forgotten_on_restart"
     );
     assert!(
@@ -436,7 +536,7 @@ fn canonical_pressure(mut store: impl DurableStore) {
         );
     }
     let blocked = blocked.expect("real large recipe ceiling reached");
-    assert!(accepted >= 200 && accepted < 300);
+    assert!((200..300).contains(&accepted));
     assert!(
         matches!(
             store.resolve_and_fence(blocked).outcome,
@@ -461,4 +561,81 @@ fn both_stores_reserve_small_fence_progress_when_large_open_receipts_are_full() 
     canonical_pressure(MemoryStore::create(StoreIncarnation::new(1), limits));
     let d = Directory::new();
     canonical_pressure(SqliteStore::create(&d.db(), StoreIncarnation::new(1), limits).unwrap());
+}
+
+#[test]
+fn both_stores_refuse_zero_identity_and_armed_attachment_corruption_before_selection() {
+    for mutation in 0..3 {
+        let mut memory = MemoryStore::create(StoreIncarnation::new(1), fixture_limits());
+        let epoch = open(&mut memory);
+        let guard = establish(&mut memory, epoch, 1, SessionExpiry::Never);
+        let mut damaged = memory.snapshot().unwrap();
+        match mutation {
+            0 => {
+                let mut intent = damaged.wills.remove(&guard.opened_by.unwrap()).unwrap();
+                intent.id = operation_id(epoch, 0);
+                damaged.wills.insert(intent.id, intent);
+            }
+            1 => {
+                damaged
+                    .wills
+                    .get_mut(&guard.opened_by.unwrap())
+                    .unwrap()
+                    .client_id = bytes(b"other-client");
+            }
+            _ => {
+                damaged.sessions.get_mut(&guard.session).unwrap().opened_by = None;
+            }
+        }
+        let memory = MemoryStore::reopen(damaged);
+        assert_eq!(memory.snapshot(), Err(ReadError::InvalidData));
+        assert_eq!(
+            memory.read_wills(None, 4, ReadBudget::PAGE),
+            Err(ReadError::InvalidData)
+        );
+        let d = Directory::new();
+        let db = d.db();
+        let mut sqlite =
+            SqliteStore::create(&db, StoreIncarnation::new(1), fixture_limits()).unwrap();
+        let epoch = open(&mut sqlite);
+        let guard = establish(&mut sqlite, epoch, 1, SessionExpiry::Never);
+        let c = rusqlite::Connection::open(&db).unwrap();
+        match mutation {
+            0 => {
+                c.execute(
+                    "UPDATE wills SET id=?1",
+                    [operation_id(epoch, 0).to_be_bytes().as_slice()],
+                )
+                .unwrap();
+            }
+            1 => {
+                c.execute(
+                    "UPDATE wills SET client_id=?1",
+                    [b"other-client".as_slice()],
+                )
+                .unwrap();
+            }
+            _ => {
+                c.execute(
+                    "UPDATE sessions SET opened_by=NULL WHERE id=?1",
+                    [guard.session.to_be_bytes().as_slice()],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            c.query_row("PRAGMA quick_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(sqlite.snapshot(), Err(ReadError::InvalidData));
+        assert_eq!(
+            sqlite.read_wills(None, 4, ReadBudget::PAGE),
+            Err(ReadError::InvalidData)
+        );
+        assert_eq!(
+            sqlite.has_will_for_client(b"will-source"),
+            Err(ReadError::InvalidData)
+        );
+    }
 }
