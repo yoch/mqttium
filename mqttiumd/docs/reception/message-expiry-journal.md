@@ -139,3 +139,40 @@ in that private worktree. Root must run the corrected full expiry reception,
 including held outcome, certain-unsent control and six compiled mutations,
 before recording its reception. All119finite model configurations are being
 checked separately at d635dffb; no final whole-model verdict is claimed yet.
+
+## Received candidate66361b74; publish and independently receive CI next
+
+Source-pinned `66361b74dbde52c670907586359a5152290071e7` passes the complete new
+reception, including all9normal groups,120live/24offline cells,32valid replays,
+14boundary cases with11own-run signal9/kernel witnesses,6compiled exact controls,
+extracted normal smoke and real Mosquitto retained+expiry demo. Restart reports
+quarantine, separately from same-process physical expiry. All982kept hashes and
+14832strict events in43streams are checked. System archive SHA256
+`9b863620ea6fb4d7ab8770404e7089543b02ab3318bdce1a20f9a175107e509c`;
+normal package`64f457a3cfe45927b6860fe2a2939c8997e167b2811731e84b2821def8dc9519`;
+normal binary`a6ec7ac9596e8a8510468d9074d605d25b3e2a8200b9a8ad46ee11100dc8ebfe`.
+These local artifacts remain `/workspace/message-expiry-66361b74-full*`.
+
+Full root gates on that candidate pass: fmt, both strict Clippy configurations,
+1106normal/1121instrumented Rust tests sequentially, validator16documents with
+unchanged36a15f70 digest,255oracle,171system-pilot tests, corpus577/schema600/
+historical405traces. Both stores now refuse Started on a non-expiring claim:
+RED407dffdf/GREEN66361b74, with9b81f5e9 positively preserving a delayed Started
+result after TTL. This is a presence guard, not a freshness check at commit.
+
+All119finite expected TLC outcomes match at d635dffb:30pass/87invariant/2liveness
+outcomes, no mismatch/timeout; all model inputs are unchanged in66361b74.
+Archive `/workspace/msgexp-all-models-d635.tar.gz`, SHA256
+`e7ecc9dc573a13a319befefdb88f1de139824ac78598db6dc2ffcd9dadf75a20`.
+The earlier145d control6 source-site miss remains FAIL, not detection;
+621a963e/71d76cf7 repairs the catalog and enforces current-source anchor checks.
+See report0017 for the contract, bounds, limitations and reproduction commands.
+
+Remaining delivery actions: recheck remote795d2009 before a protected fast-forward
+push; keep draft/unmerged. Receive the final SHA's CI, download its normal archive,
+verify/extract/run the actual packaged demo without Git/Cargo, compare archived
+source blobs/modes, and independently validate/recompute freshK1/K2b/K3 with
+their own witnesses and reconstruction records. Do not relabel66361b74 as that
+future published SHA's execution. Record final artifact links/hashes and checks
+in the PR description; no further product work is required absent a concrete
+failure. Next functional increment remains non-retained QoS1 Will.
