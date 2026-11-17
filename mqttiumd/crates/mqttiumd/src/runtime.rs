@@ -2756,6 +2756,7 @@ fn consume_control(path: &std::path::Path) -> bool {
 }
 #[cfg(feature = "test-hooks")]
 struct HeldEmission {
+    point: &'static str,
     effect: OwnedEffect,
     since: Instant,
     released: bool,
@@ -2845,7 +2846,7 @@ impl Sink<'_> {
                 self.error = Some(Failure::plain("hook_directory"));
                 return;
             };
-            let release = dir.join("release-consume.emission");
+            let release = dir.join(format!("release-{}", front.point));
             if release.exists() {
                 if std::fs::remove_file(release).is_err() {
                     self.error = Some(Failure::plain("hook_release"));
@@ -2868,6 +2869,7 @@ impl Sink<'_> {
         self.releasing_qos0 = false;
         if let SubmitResult::NotSubmitted { effect, .. } = result {
             self.emission_barriers.push_front(HeldEmission {
+                point: held.point,
                 effect,
                 since: held.since,
                 released: true,
@@ -2975,6 +2977,7 @@ impl EffectSink for Sink<'_> {
                     }
                     if self.events.emit("barrier_hit",json!({"point":"consume.emission","command_kind":"Consume","operation":operation(id_op)})).is_err(){self.error=Some(Failure::plain("events_unavailable"));return refused(effect,SubmitBlock::Closed);}
                     self.emission_barriers.push_back(HeldEmission {
+                        point: "consume.emission",
                         effect,
                         since: Instant::now(),
                         released: false,
@@ -3452,6 +3455,28 @@ impl EffectSink for Sink<'_> {
             } => {
                 let (connection, delivery, packet_id, claim, dup, retain) =
                     (*connection, *delivery, *packet_id, *claim, *dup, *retain);
+                #[cfg(feature = "test-hooks")]
+                if self
+                    .hooks
+                    .pause
+                    .iter()
+                    .any(|point| point == "publish.emission")
+                    && !self.releasing_qos0
+                {
+                    if self.emission_barriers.len() >= IN_FLIGHT {
+                        return refused(effect, SubmitBlock::QueueFull);
+                    }
+                    if self.events.emit("barrier_hit",json!({"point":"publish.emission","command_kind":"Claim","operation":operation(claim),"details":{"delivery":delivery_text(delivery)}})).is_err() {
+                        self.error=Some(Failure::plain("events_unavailable")); return refused(effect, SubmitBlock::Closed);
+                    }
+                    self.emission_barriers.push_back(HeldEmission {
+                        point: "publish.emission",
+                        effect,
+                        since: Instant::now(),
+                        released: false,
+                    });
+                    return SubmitResult::Accepted;
+                }
                 if self
                     .terminal_inputs
                     .len()
