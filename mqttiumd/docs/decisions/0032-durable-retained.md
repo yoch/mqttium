@@ -17,6 +17,10 @@ QoS0 remains volatile. Retained QoS0 uses the common durable live obligations
 All mutations, live responsibilities and receipts commit
 atomically; unknown outcomes retain the exact operation and canonical bytes.
 
+One retained QoS0 operation (at most32768payload bytes and16targets) may be
+held by the owner while uncertain; no second such operation is admitted then.
+Replay uses at most256metadata plans and existing eight-item work pages.
+
 Inventory: 32 exact topics, 1 MiB current retained bytes; existing 4 MiB payload,
 128 reference and 8192 receipt quotas remain in force. Old values still owed to
 recipients remain charged. Net replacement/clear is checked transactionally.

@@ -618,7 +618,8 @@ QoS1/2 retained changes, complete live fanout, reference/account updates and
 receipt are one admission transaction. QoS2 changes at admission before PUBREC;
 PUBREL only releases its inbound marker. Retained QoS0 uses its own durable
 operation without a Packet Identifier, acknowledgement, inbound slot or Receive
-Maximum credit. Ordinary QoS0 remains volatile. Client QoS0 completion alone is
+Maximum credit. At most one such owner flight retains at most32768payload bytes
+and16target descriptors while uncertain; further retained QoS0 inputs wait. Ordinary QoS0 remains volatile. Client QoS0 completion alone is
 not evidence of broker commit; observe the value at another client or after
 restart. Unknown commands keep their exact operation and recipe; historical
 lookup precedes execution and collection preserves non-execution frontiers.

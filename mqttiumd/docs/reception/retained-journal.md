@@ -31,3 +31,13 @@
   source-pinned retained receipt, then record report0016, publish with expected
   remote HEAD protection, receive exact-SHA CI/artifacts, download/extract and
   execute the packaged public demo without rebuilding. Do not merge or undraft.
+
+- Integration follow-ups: preserve legacy snapshot JSON by omitting empty/false/
+  None retained extensions; the original14evidence assertions remain unchanged.
+  The decisive32-value reception grants QoS1: an observed release-build QoS0
+  output-saturation drop was permitted policy, not a failed durability decision.
+- Normal packaged guide was actually extracted and executed from candidate4cde2b6b
+  without compilation: two values before producers end, same-file restart,
+  two fresh replay values, replace/empty-clear and one current value. Its
+  separate build/execution platform fields are checked. Final downloaded CI
+  archive still needs its own extraction/demo witness at the published SHA.
