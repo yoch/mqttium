@@ -1,6 +1,7 @@
 """Independent 0x02 wire discriminants and public API property checks."""
 import copy
 import unittest
+from unittest.mock import patch
 
 from external_message_expiry import MqttiumMessageExpiry, PahoMessageExpiry
 from external_wildcard import Subscription
@@ -9,6 +10,7 @@ from message_expiry_reception import (BUSINESS, physically_drained, one_delivery
                                        original_copies, negative_puback)
 from message_expiry_boundaries import (canonical_timed, canonical_expire, continuous, _positive,
                                        recipe_quarantine_inventory)
+from mqttium.api import PublishReceipt
 from tcp_probe import Frame, FrameDecoder, ReceiptFailure, operation_hex
 from test_external_clients import ScriptedBroker, read_packet
 from test_session_reception import accept
@@ -270,6 +272,33 @@ class IndependentMessageExpiryFrames(unittest.TestCase):
 
 
 class PublicMessageExpiryAPIs(unittest.IsolatedAsyncioTestCase):
+    async def test_resolution_wait_uses_the_original_public_receipt_and_requested_completion_budget(self):
+        observations = []
+        original_wait = PublishReceipt.wait
+        async def observed_wait(receipt, *, timeout=None):
+            observations.append((receipt, timeout))
+            return await original_wait(receipt, timeout=timeout)
+        async def script(reader, writer, _connection):
+            await accept(reader, writer)
+            header, body = await read_packet(reader)
+            publication = decode_publish(Frame(header, body), incoming=True)
+            self.assertEqual((publication.qos, publication.message_expiry_interval), (1, 1))
+            writer.write(b'\x40\x02' + publication.packet_id.to_bytes(2, 'big'))
+            await writer.drain()
+            self.assertEqual(await read_packet(reader), (0xE0, b''))
+        async with ScriptedBroker(script) as broker:
+            source = MqttiumMessageExpiry(('127.0.0.1', broker.port), 'public-resolution-budget')
+            try:
+                await source.open(False)
+                with patch.object(PublishReceipt, 'wait', observed_wait):
+                    identifier = await source.publish('t', b'v', 1, message_expiry=1, completion_timeout=15)
+                self.assertEqual(len({id(receipt) for receipt, _timeout in observations}), 1)
+                self.assertEqual(observations[-1][0].mid, identifier)
+                self.assertTrue(observations[-1][0].is_done())
+                self.assertEqual([timeout for _receipt, timeout in observations if timeout is not None], [15])
+            finally:
+                await source.disconnect()
+
     async def test_capacity_refusal_preserves_the_exact_public_publish_rejected_error(self):
         async def script(reader, writer, _connection):
             await accept(reader, writer)

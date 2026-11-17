@@ -23,7 +23,8 @@ class MqttiumMessageExpiry(MqttiumRetained):
         super().__init__(*args, **kwargs)
         self.unacknowledged = {}
 
-    async def publish(self, topic, payload, qos=1, *, retain=False, message_expiry=None):
+    async def publish(self, topic, payload, qos=1, *, retain=False, message_expiry=None,
+                      completion_timeout=TIMEOUT):
         expiry = interval(message_expiry)
         props = None if expiry is None else Properties({'message_expiry_interval': expiry})
         receipt = await self.client.publish(topic, payload, qos=qos, retain=retain,
