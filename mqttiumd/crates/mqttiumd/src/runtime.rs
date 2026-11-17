@@ -103,7 +103,7 @@ struct Peer {
     connect_expiry: SessionExpiry,
     disconnect_expiry: Option<SessionExpiry>,
     close_observed_at: Option<u64>,
-    handshake_packet: Option<(u8, Vec<u8>)>,
+    handshake_packet: Option<(u8, Vec<u8>, net::FrameObservation)>,
     pending: bool,
     keep_alive: u16,
     max_packet: usize,
@@ -1936,11 +1936,26 @@ impl Runtime<'_> {
         })?;
         Ok(())
     }
+    #[cfg(test)]
     fn packet(
         &mut self,
         generation: ConnectionGeneration,
         first: u8,
         body: Vec<u8>,
+    ) -> Result<(), Failure> {
+        let observed = self.clock.read().map(|reading| MessageTime {
+            domain: reading.domain,
+            tick: reading.tick,
+        });
+        self.packet_at(generation, first, body, observed)
+    }
+
+    fn packet_at(
+        &mut self,
+        generation: ConnectionGeneration,
+        first: u8,
+        body: Vec<u8>,
+        observed: net::FrameObservation,
     ) -> Result<(), Failure> {
         if !self.admit_generation(generation)? {
             return Ok(());
@@ -1986,7 +2001,9 @@ impl Runtime<'_> {
                 mut packet,
                 interval,
             } => {
-                let observed = self.message_now()?;
+                // This may be older than the reactor's latest clock reading:
+                // channel and pending-CONNECT waits consume message lifetime.
+                let observed = observed.map_err(|error| Failure::plain(error.code()))?;
                 let expiry = MessageExpiry { observed, interval };
                 expiry
                     .deadline()
@@ -2005,6 +2022,7 @@ impl Runtime<'_> {
                 self.events.emit("message_expiry_received", json!({"connection":generation.get().to_string(),"details":{
                     "topic":std::str::from_utf8(topic.as_slice()).map_err(|_| Failure::plain("invalid_topic"))?.chars().take(256).collect::<String>(),
                     "qos":qos.to_wire(),"retain":retain,"interval":interval,
+                    "authority":"reader_frame_completion",
                     "domain":hex_domain(observed.domain),"tick":observed.tick.to_string()
                 }})).map_err(event_failure)?;
                 Packet::Core(packet)
@@ -2254,23 +2272,31 @@ impl Runtime<'_> {
                     Some(p) if p.closing.is_some() || p.deferred_publish.is_some() => break,
                     Some(p) if p.pending && p.handshake_packet.is_some() => break,
                     Some(p) => match p.handshake_packet.take() {
-                        Some((first, body)) => Ok(net::Incoming::Packet { first, body }),
+                        Some((first, body, observed)) => Ok(net::Incoming::Packet {
+                            first,
+                            body,
+                            observed,
+                        }),
                         None => p.io.incoming.try_recv(),
                     },
                     None => break,
                 };
                 match incoming {
-                    Ok(net::Incoming::Packet { first, body }) => {
+                    Ok(net::Incoming::Packet {
+                        first,
+                        body,
+                        observed,
+                    }) => {
                         if first >> 4 != 14
                             && self.peers.get(&generation).is_some_and(|p| p.pending)
                         {
                             self.peers
                                 .get_mut(&generation)
                                 .expect("checked peer")
-                                .handshake_packet = Some((first, body));
+                                .handshake_packet = Some((first, body, observed));
                             break;
                         }
-                        self.packet(generation, first, body)?
+                        self.packet_at(generation, first, body, observed)?
                     }
                     Ok(net::Incoming::Closed { code }) => {
                         self.drain_inputs()?;

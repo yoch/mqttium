@@ -1013,7 +1013,11 @@ fn a_new_identifier_after_received_puback_does_not_exceed_receive_maximum() {
         client.write_all(&bytes).unwrap();
         // The real reader has decoded a new identifier after the peer received
         // the old PUBACK. Deliberately process that input before Written.
-        let net::Incoming::Packet { first, body } = runtime.peers[&generation]
+        let net::Incoming::Packet {
+            first,
+            body,
+            observed,
+        } = runtime.peers[&generation]
             .io
             .incoming
             .recv_timeout(Duration::from_secs(1))
@@ -1021,7 +1025,9 @@ fn a_new_identifier_after_received_puback_does_not_exceed_receive_maximum() {
         else {
             panic!("network PUBLISH");
         };
-        runtime.packet(generation, first, body).unwrap();
+        runtime
+            .packet_at(generation, first, body, observed)
+            .unwrap();
         assert!(
             runtime.peers[&generation].closing.is_none(),
             "received PUBACK already returned a flow credit; the new identifier is legal"
@@ -1061,7 +1067,11 @@ fn a_received_puback_can_precede_publication_of_its_network_progress() {
         let mut bytes = vec![0x32, 7];
         bytes.extend_from_slice(&publish_body(9));
         client.write_all(&bytes).unwrap();
-        let net::Incoming::Packet { first, body } = runtime.peers[&generation]
+        let net::Incoming::Packet {
+            first,
+            body,
+            observed,
+        } = runtime.peers[&generation]
             .io
             .incoming
             .recv_timeout(Duration::from_secs(1))
@@ -1069,7 +1079,9 @@ fn a_received_puback_can_precede_publication_of_its_network_progress() {
         else {
             panic!("network PUBLISH");
         };
-        runtime.packet(generation, first, body).unwrap();
+        runtime
+            .packet_at(generation, first, body, observed)
+            .unwrap();
         assert!(
             runtime.peers[&generation].closing.is_none(),
             "a preempted completion publisher is not a Receive Maximum violation"
@@ -1488,6 +1500,111 @@ fn a_regressed_reader_sample_is_not_reclassified_as_message_expiration() {
             mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
         assert!(state.publications.is_empty());
         assert!(state.retained.is_empty());
+    });
+}
+
+#[test]
+fn a_frozen_reader_clock_error_or_domain_change_cannot_refresh_a_timed_publish() {
+    use crate::session_time::{TimeError, testing::FakeClock};
+    for reader_error in [true, false] {
+        let sample = |tick| SessionClockReading {
+            domain: [84; 32],
+            tick,
+        };
+        let clock = Arc::new(FakeClock::new(sample(100)));
+        with_runtime_clock(128, clock.clone(), |runtime, directory| {
+            let (generation, mut client) = peer(runtime);
+            runtime
+                .connect(generation, connect_packet(b"expiry-reader-error"))
+                .unwrap();
+            until(runtime, |r| r.session_requests.is_empty());
+            assert_eq!(read_frame(&mut client).0, 0x20);
+            if reader_error {
+                clock.fail(TimeError::ClockUnavailable);
+            }
+            client
+                .write_all(&[0x31, 10, 0, 1, b't', 5, 2, 0, 0, 0, 1, b'v'])
+                .unwrap();
+            let net::Incoming::Packet {
+                first,
+                body,
+                observed,
+            } = runtime.peers[&generation]
+                .io
+                .incoming
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+            else {
+                panic!("actual framed PUBLISH");
+            };
+            assert_eq!(observed.is_err(), reader_error);
+            if reader_error {
+                clock.set(sample(2_000_000_100));
+            } else {
+                clock.set(SessionClockReading {
+                    domain: [85; 32],
+                    tick: 2_000_000_100,
+                });
+            }
+            let error = runtime
+                .packet_at(generation, first, body, observed)
+                .expect_err("uncertain_reader_observation_was_refreshed");
+            assert_eq!(
+                error.code,
+                if reader_error {
+                    "session_clock_unavailable"
+                } else {
+                    "session_clock_domain_changed"
+                }
+            );
+            let state =
+                mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite"))
+                    .unwrap();
+            assert!(
+                state.retained.is_empty(),
+                "uncertain_reader_observation_created_fresh_retained"
+            );
+            assert!(state.publications.is_empty());
+        });
+    }
+}
+
+#[test]
+fn an_untimed_packet_does_not_acquire_a_reader_clock_dependency() {
+    use crate::session_time::{TimeError, testing::FakeClock};
+    let sample = |tick| SessionClockReading {
+        domain: [86; 32],
+        tick,
+    };
+    let clock = Arc::new(FakeClock::new(sample(100)));
+    with_runtime_clock(128, clock.clone(), |runtime, _| {
+        let (generation, mut client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"untimed-reader-error"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        clock.fail(TimeError::ClockUnavailable);
+        client.write_all(&[0xc0, 0]).unwrap();
+        let net::Incoming::Packet {
+            first,
+            body,
+            observed,
+        } = runtime.peers[&generation]
+            .io
+            .incoming
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+        else {
+            panic!("actual PINGREQ");
+        };
+        assert_eq!(observed, Err(TimeError::ClockUnavailable));
+        clock.set(sample(200));
+        runtime
+            .packet_at(generation, first, body, observed)
+            .unwrap();
+        runtime.drain_inputs().unwrap();
+        assert_eq!(read_frame(&mut client), (0xd0, vec![]));
     });
 }
 

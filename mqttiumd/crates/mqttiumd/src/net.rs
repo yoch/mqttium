@@ -14,7 +14,7 @@ use mqttiumd_contract::message_expiry::{
 };
 
 use crate::codec::{self, ErrorKind};
-use crate::session_time::{SessionClock, SystemClock};
+use crate::session_time::{SessionClock, SystemClock, TimeError};
 
 pub const INPUT_SLOTS: usize = 4;
 pub const OUTPUT_SLOTS: usize = 4;
@@ -33,9 +33,19 @@ const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum Incoming {
-    Packet { first: u8, body: Vec<u8> },
-    Closed { code: &'static str },
+    Packet {
+        first: u8,
+        body: Vec<u8>,
+        /// Frozen when the complete frame leaves the socket reader, before
+        /// bounded channel or pending-CONNECT residence can age it.
+        observed: FrameObservation,
+    },
+    Closed {
+        code: &'static str,
+    },
 }
+
+pub type FrameObservation = Result<MessageTime, TimeError>;
 
 #[derive(Debug)]
 pub struct Write {
@@ -147,10 +157,16 @@ pub fn spawn_with_clock(stream: TcpStream, clock: Arc<dyn SessionClock>) -> io::
         progress_waiting: Arc::new(AtomicBool::new(false)),
     };
     let reader_control = control.clone();
+    let reader_clock = clock.clone();
     let reader = thread::Builder::new()
         .name("mqttiumd-reader".into())
         .spawn(move || {
-            read_packets(input_stream, input_tx, reader_control);
+            read_packets(
+                input_stream,
+                input_tx,
+                reader_control,
+                reader_clock.as_ref(),
+            );
         })?;
     let writer_control = control.clone();
     let writer = match thread::Builder::new()
@@ -279,7 +295,12 @@ fn read_part(
     Ok(())
 }
 
-fn next_packet(stream: &mut TcpStream, control: &Control) -> Result<Incoming, &'static str> {
+fn next_packet(
+    stream: &mut TcpStream,
+    control: &Control,
+    clock: &dyn SessionClock,
+    previous: &mut Option<MessageTime>,
+) -> Result<Incoming, &'static str> {
     let mut prefix = [0; 5];
     let mut length = 0;
     let mut started = None;
@@ -311,15 +332,47 @@ fn next_packet(stream: &mut TcpStream, control: &Control) -> Result<Incoming, &'
         .map_err(|_| "allocation_failed")?;
     body.resize(header.remaining, 0);
     read_part(stream, &mut body, &mut started, control)?;
+    let observed = frame_observation(clock, previous);
     Ok(Incoming::Packet {
         first: header.first,
         body,
+        observed,
     })
 }
 
-fn read_packets(mut stream: TcpStream, sender: SyncSender<Incoming>, control: Control) {
+fn frame_observation(
+    clock: &dyn SessionClock,
+    previous: &mut Option<MessageTime>,
+) -> FrameObservation {
+    let reading = clock.read()?;
+    let observed = MessageTime {
+        domain: reading.domain,
+        tick: reading.tick,
+    };
+    if let Some(last) = *previous {
+        if last.domain != observed.domain {
+            return Err(TimeError::DomainChanged);
+        }
+        if observed.tick < last.tick {
+            return Err(TimeError::ClockRegressed);
+        }
+    }
+    *previous = Some(observed);
+    Ok(observed)
+}
+
+fn read_packets(
+    mut stream: TcpStream,
+    sender: SyncSender<Incoming>,
+    control: Control,
+    clock: &dyn SessionClock,
+) {
+    // One watermark per reader detects a bad sample even if the provider has
+    // recovered before the runtime dequeues this frame. A bad sample never
+    // replaces the last valid observation or becomes evidence of expiration.
+    let mut previous = None;
     let code = loop {
-        let mut incoming = match next_packet(&mut stream, &control) {
+        let mut incoming = match next_packet(&mut stream, &control, clock, &mut previous) {
             Ok(packet) => packet,
             Err(code) => break code,
         };
@@ -671,6 +724,40 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn failed_frame_observations_never_replace_the_last_valid_reader_time() {
+        let clock = FakeClock::new(reading(10));
+        let mut previous = None;
+        assert_eq!(frame_observation(&clock, &mut previous).unwrap().tick, 10);
+        for tick in [5, 8] {
+            clock.set(reading(tick));
+            assert_eq!(
+                frame_observation(&clock, &mut previous),
+                Err(TimeError::ClockRegressed)
+            );
+        }
+        clock.fail(TimeError::ClockUnavailable);
+        assert_eq!(
+            frame_observation(&clock, &mut previous),
+            Err(TimeError::ClockUnavailable)
+        );
+        clock.set(SessionClockReading {
+            domain: [2; 32],
+            tick: 100,
+        });
+        assert_eq!(
+            frame_observation(&clock, &mut previous),
+            Err(TimeError::DomainChanged)
+        );
+        clock.set(reading(9));
+        assert_eq!(
+            frame_observation(&clock, &mut previous),
+            Err(TimeError::ClockRegressed)
+        );
+        clock.set(reading(12));
+        assert_eq!(frame_observation(&clock, &mut previous).unwrap().tick, 12);
+    }
+
     fn incoming(connection: &Connection) -> Incoming {
         connection
             .incoming
@@ -942,7 +1029,7 @@ mod tests {
         assert_eq!(actual, [0xd0, 0, 0xd0, 0]);
         peer.write_all(&[0xc0, 0]).unwrap();
         assert!(
-            matches!(incoming(&connection), Incoming::Packet {first:0xc0, body} if body.is_empty())
+            matches!(incoming(&connection), Incoming::Packet {first:0xc0, body,..} if body.is_empty())
         );
         assert!(!connection.control.is_cancelled());
         connection.close();
@@ -985,7 +1072,9 @@ mod tests {
         assert_eq!(actual, expected);
         assert!(connection.written.try_recv().is_err());
         peer.write_all(&[0x40, 2, 0, 7]).unwrap();
-        assert!(matches!(incoming(&connection), Incoming::Packet {first:0x40,body} if body==[0,7]));
+        assert!(
+            matches!(incoming(&connection), Incoming::Packet {first:0x40,body,..} if body==[0,7])
+        );
         connection.pause_wire_progress(false);
         assert!(
             matches!(connection.written.recv_timeout(Duration::from_millis(600)).unwrap(), Written::Complete {correlation:value,..} if value==correlation(1))
@@ -1003,7 +1092,7 @@ mod tests {
         peer.write_all(&[0, 0xc0, 0, 0xc0, 0]).unwrap();
         for _ in 0..3 {
             assert!(
-                matches!(incoming(&connection), Incoming::Packet { first: 0xc0, body } if body.is_empty())
+                matches!(incoming(&connection), Incoming::Packet { first: 0xc0, body,.. } if body.is_empty())
             );
         }
         connection.close();
