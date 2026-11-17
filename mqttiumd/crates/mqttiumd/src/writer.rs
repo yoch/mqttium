@@ -5,6 +5,7 @@ use mqttiumd_contract::capacity::{ExchangeSlots, PayloadBytes, ReceiptSlots, Ref
 use mqttiumd_contract::command::{Recipe, StartupNonce};
 use mqttiumd_contract::effects::{Effect, OwnedEffect};
 use mqttiumd_contract::ids::{EffectId, OperationId, Revision, SessionId, StoreIncarnation};
+use mqttiumd_contract::message_expiry::MessageTime;
 use mqttiumd_contract::outcome::{
     EpochGrant, EpochOpening, OpeningReply, OpeningStage, StoreReply,
 };
@@ -37,6 +38,9 @@ pub const SESSIONS: usize = 128;
 pub const MAX_CLIENT: usize = 1024;
 pub const MAX_TOPIC: usize = 1024;
 pub const MAX_PAYLOAD: usize = 32768;
+fn hex_domain(domain: [u8; 32]) -> String {
+    domain.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 pub fn limits() -> Limits {
     Limits {
         payload_bytes: PayloadBytes::new(4 * 1024 * 1024),
@@ -58,6 +62,13 @@ pub fn recipe_kind(recipe: &Recipe) -> &'static str {
             SessionAction::Expire { .. } => "SessionExpire",
             SessionAction::Close { .. } => "SessionClose",
         },
+        Recipe::ExpiringPublication(value) => match value.admission {
+            mqttiumd_contract::message_expiry::ExpiringAdmission::Qos12(_) => "Admission",
+            mqttiumd_contract::message_expiry::ExpiringAdmission::Qos0(_) => "RetainedQoS0",
+        },
+        Recipe::TimedReplaySubscriptions(_) => "Subscriptions",
+        Recipe::MarkDeliveryStarted(_) => "DeliveryStarted",
+        Recipe::ExpireDelivery(_) => "MessageExpire",
         Recipe::RetainedPublication(_) | Recipe::AdmitPublication(_) => "Admission",
         Recipe::RetainedQos0(_) => "RetainedQoS0",
         Recipe::ReplaySubscriptions(_) => "Subscriptions",
@@ -119,6 +130,11 @@ pub enum Request {
 }
 /// A reserved lane: maintenance never waits for a network/business slot.
 pub enum ControlRequest {
+    MessageExpiry {
+        now: MessageTime,
+        after: Option<mqttiumd_contract::ids::PublicationId>,
+        limit: u32,
+    },
     ClockCheckpoint {
         expected: SessionClockAnchor,
         reading: SessionClockReading,
@@ -132,6 +148,15 @@ pub enum ControlRequest {
 }
 #[derive(Clone)]
 pub enum ControlResponse {
+    MessageExpiryUnknown {
+        now: MessageTime,
+        after: Option<mqttiumd_contract::ids::PublicationId>,
+    },
+    MessageExpiry {
+        now: MessageTime,
+        after: Option<mqttiumd_contract::ids::PublicationId>,
+        result: Result<Arc<mqttiumd_store_api::MessageExpirySweep>, Failure>,
+    },
     ClockCheckpoint {
         expected: SessionClockAnchor,
         reading: SessionClockReading,
@@ -417,22 +442,15 @@ fn business_response(
                 Effect::Persist { command } => {
                     let id = command.recipe.operation();
                     let kind = recipe_kind(command.recipe.get());
-                    let targets = match command.recipe.get() {
-                        Recipe::RetainedPublication(value) => value
-                            .admission
-                            .targets
-                            .as_slice()
-                            .iter()
-                            .map(|t| t.session)
-                            .collect(),
-                        Recipe::RetainedQos0(value) => {
-                            value.targets.as_slice().iter().map(|t| t.session).collect()
-                        }
-                        Recipe::ReplaySubscriptions(value) => vec![value.update.session],
-                        Recipe::AdmitPublication(a) => {
-                            a.targets.as_slice().iter().map(|t| t.session).collect()
-                        }
-                        _ => Vec::new(),
+                    let recipe = command.recipe.get();
+                    let targets = if let Some(a) = recipe.admission() {
+                        a.targets.as_slice().iter().map(|t| t.session).collect()
+                    } else if let Some(a) = recipe.retained_qos0() {
+                        a.targets.as_slice().iter().map(|t| t.session).collect()
+                    } else if let Some(a) = recipe.replay_subscriptions() {
+                        vec![a.update.session]
+                    } else {
+                        Vec::new()
                     };
                     #[cfg(feature = "test-hooks")]
                     {
@@ -450,6 +468,8 @@ fn business_response(
                             "Subscriptions" => "subscription.prepared",
                             "Claim" => "claim.prepared",
                             "Consume" => "consume.prepared",
+                            "DeliveryStarted" => "delivery.started.prepared",
+                            "MessageExpire" => "message.delivery.expire.prepared",
                             _ => "finish.prepared",
                         };
                         // The hook is inside the actual transaction, after all writes and before COMMIT.
@@ -491,6 +511,8 @@ fn business_response(
                             "Claim" => Some("claim.committed"),
                             "Finish" => Some("finish.committed"),
                             "Consume" => Some("consume.committed"),
+                            "DeliveryStarted" => Some("delivery.started.committed"),
+                            "MessageExpire" => Some("message.delivery.expire.committed"),
                             _ => None,
                         };
                         if applied.committed_now
@@ -519,6 +541,8 @@ fn business_response(
                                 | "SessionClose"
                                 | "SessionDetach"
                                 | "SessionExpire"
+                                | "DeliveryStarted"
+                                | "MessageExpire"
                         )
                         && let Some(dir) = &hooks.directory
                     {
@@ -527,6 +551,10 @@ fn business_response(
                             "SessionClose" => "drop-next-session-close-result".to_owned(),
                             "SessionDetach" => "drop-next-session-detach-result".to_owned(),
                             "SessionExpire" => "drop-next-session-expire-result".to_owned(),
+                            "DeliveryStarted" => "drop-next-delivery-started-result".to_owned(),
+                            "MessageExpire" => {
+                                "drop-next-message-expire-delivery-result".to_owned()
+                            }
                             _ => format!("drop-next-{}-result", kind.to_ascii_lowercase()),
                         };
                         let file = dir.join(file_name);
@@ -849,6 +877,65 @@ fn control_response(
 ) -> ControlResponse {
     let _ = hooks;
     match request {
+        ControlRequest::MessageExpiry { now, after, limit } => {
+            #[cfg(feature = "test-hooks")]
+            {
+                let hc = hooks.clone();
+                let ev = events.clone();
+                let stop = cancel.clone();
+                let hook = Box::new(move |point| {
+                    if point == mqttiumd_store_sqlite::kill_points::KillPoint::CommitPrepared
+                        && hc.barrier_fields("message.expire.prepared", json!({"point":"message.expire.prepared","command_kind":"MessageExpiry","details":{"domain":hex_domain(now.domain),"tick":now.tick.to_string(),"after":format!("{after:?}")}}), &ev, &stop).is_err() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                });
+                if store.set_kill_hook(Some(hook)).is_err() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            let result = store
+                .expire_messages(now, after, limit)
+                .map(Arc::new)
+                .map_err(|error| Failure::read(error, ReadPhase::Maintenance));
+            #[cfg(feature = "test-hooks")]
+            {
+                let _ = store.set_kill_hook(None);
+            }
+            if let Ok(sweep) = &result {
+                #[cfg(feature = "test-hooks")]
+                if (!sweep.removed.is_empty() || sweep.retained_removed > 0)
+                    && hooks.barrier_fields("message.expire.committed", json!({"point":"message.expire.committed","command_kind":"MessageExpiry","details":{"domain":hex_domain(now.domain),"tick":now.tick.to_string(),"after":format!("{after:?}")}}), events, cancel).is_err() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                for removed in sweep.removed.as_slice() {
+                    let publication = removed.delivery.publication;
+                    if events.emit("message_expiry_removed",json!({"details":{
+                        "source":"durable_commit","publication":format!("{}/{}/{}/{}",publication.incarnation().get(),publication.epoch().get(),publication.owner().get(),publication.sequence().get()),
+                        "index":removed.delivery.index,"target":removed.target.get().to_string()
+                    }})).is_err() { return ControlResponse::Failed(Failure::plain("events_unavailable")); }
+                }
+                let removed = sweep.removed.len();
+                if (removed != 0 || sweep.retained_removed > 0 || sweep.quarantined > 0)
+                    && events.emit("message_expiry_sweep", json!({"details":{
+                        "source":"durable_commit","domain":hex_domain(now.domain),"tick":now.tick.to_string(),
+                        "removed":removed,"retained_removed":sweep.retained_removed,
+                        "quarantined":sweep.quarantined,"more":sweep.more
+                    }})).is_err() {
+                    return ControlResponse::Failed(Failure::plain("events_unavailable"));
+                }
+            }
+            #[cfg(feature = "test-hooks")]
+            if result.is_ok()
+                && hooks
+                    .directory
+                    .as_ref()
+                    .is_some_and(|dir| consume_file(&dir.join("drop-next-message-expire-result")))
+            {
+                let _ = events.emit("message_expiry_result_dropped", json!({"details":{"domain":hex_domain(now.domain),"tick":now.tick.to_string(),"after":format!("{after:?}")}}));
+                return ControlResponse::MessageExpiryUnknown { now, after };
+            }
+            ControlResponse::MessageExpiry { now, after, result }
+        }
         ControlRequest::ClockCheckpoint { expected, reading } => {
             let result = store
                 .checkpoint_session_clock(Some(expected), reading)
@@ -1001,21 +1088,23 @@ fn recipe_identity_highwater(recipe: &Recipe) -> Result<(u64, u64), Failure> {
             a.payload.id.sequence().get(),
         ));
     }
-    match recipe {
-        Recipe::RetainedQos0(a) => Ok((
+    if let Some(a) = recipe.retained_qos0() {
+        return Ok((
             a.publication.sequence().get(),
             a.payload.id.sequence().get(),
-        )),
-        Recipe::ReplaySubscriptions(a) => Ok((
+        ));
+    }
+    if let Some(a) = recipe.replay_subscriptions() {
+        return Ok((
             a.first_publication
                 .sequence()
                 .get()
                 .checked_add(mqttiumd_contract::retained::MAX_REPLAYS as u64 - 1)
                 .ok_or_else(|| Failure::plain("receipt_replay_exhausted"))?,
             0,
-        )),
-        _ => Ok((0, 0)),
+        ));
     }
+    Ok((0, 0))
 }
 
 #[cfg(test)]

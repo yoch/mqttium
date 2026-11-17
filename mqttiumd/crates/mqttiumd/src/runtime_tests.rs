@@ -81,6 +81,12 @@ fn with_runtime_clock(
     )
     .unwrap();
     let mut runtime = Runtime {
+        message_expiry_request: None,
+        message_expiry_retry: false,
+        message_expiry_after: None,
+        message_expiry_scan: Instant::now(),
+        message_expiry_input: None,
+        message_last_time: None,
         clock: boot.clock,
         clock_anchor: boot.clock_anchor,
         clock_checkpoint: None,
@@ -216,7 +222,7 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
     runtime.peers.insert(
         generation,
         Peer {
-            io: net::spawn(socket).unwrap(),
+            io: net::spawn_with_clock(socket, runtime.clock.clone()).unwrap(),
             created: Instant::now(),
             last_packet: Instant::now(),
             connected: false,

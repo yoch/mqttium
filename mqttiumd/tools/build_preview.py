@@ -103,7 +103,7 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
         "compiler": command("rustc", "-Vv"), "profile": "release", "features": [],
         "build_options": ["--release", "--locked", "--no-default-features", "-p", "mqttiumd"],
         "build_environment": {key: os.environ.get(key) for key in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_PROFILE_RELEASE_DEBUG", "CARGO_PROFILE_RELEASE_OPT_LEVEL", "CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS")},
-        "sqlite_schema": 8, "instrumented": False,
+        "sqlite_schema": 9, "instrumented": False,
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "runtime_dependencies": runtime.splitlines(),
         "execution_verification": "Separate extraction receipt names this exact archive hash",

@@ -15,8 +15,9 @@ use mqttiumd_contract::effects::{
 };
 use mqttiumd_contract::ids::{
     AccountId, ConnectionGeneration, ConnectionKey, DeadlineToken, EffectId, LogicalDuration,
-    LogicalOwnerId, LogicalTime, OperationId, OutboundPacketId, SessionId,
+    LogicalOwnerId, LogicalTime, OperationId, OutboundPacketId, PublicationId, SessionId,
 };
+use mqttiumd_contract::message_expiry::{MessageExpiry, MessageTime};
 use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome, StoreReply};
 use mqttiumd_contract::packet::{InboundPacket, OutboundFrame};
 use mqttiumd_contract::pubsub::{PubackTarget, Qos0DropReason, Qos0Origin};
@@ -55,7 +56,7 @@ const CLOSING_INPUTS: usize = 2 * CONNECTIONS;
 const FRAMES: usize = CONNECTIONS * (net::OUTPUT_SLOTS + 9);
 // A close can retire every accepted frame while an outbox-sized set of
 // synchronously refused volatile effects also awaits its exact owner fact.
-const TERMINAL_INPUTS: usize = FRAMES + 128;
+const TERMINAL_INPUTS: usize = 2 * FRAMES + 128;
 const BOUNDS: Bounds = Bounds {
     max_packet: 65536,
     max_client_id: 1024,
@@ -147,6 +148,12 @@ struct AppliedSessionChange {
     change: SessionChange,
 }
 struct Runtime<'a> {
+    message_expiry_request: Option<(MessageTime, Option<PublicationId>)>,
+    message_expiry_retry: bool,
+    message_expiry_after: Option<PublicationId>,
+    message_expiry_scan: Instant,
+    message_expiry_input: Option<Input>,
+    message_last_time: Option<MessageTime>,
     clock: Arc<dyn SessionClock>,
     clock_anchor: SessionClockAnchor,
     clock_checkpoint: Option<(SessionClockReading, Instant)>,
@@ -213,6 +220,71 @@ struct Runtime<'a> {
     copied_session_close: Option<SessionCloseObservation>,
 }
 impl Runtime<'_> {
+    fn message_now(&mut self) -> Result<MessageTime, Failure> {
+        let reading = self
+            .clock
+            .read()
+            .map_err(|error| Failure::plain(error.code()))?;
+        let now = MessageTime {
+            domain: reading.domain,
+            tick: reading.tick,
+        };
+        if self
+            .message_last_time
+            .is_some_and(|last| last.domain == now.domain && now.tick < last.tick)
+        {
+            return Err(Failure::plain("message_clock_regressed"));
+        }
+        self.message_last_time = Some(now);
+        Ok(now)
+    }
+
+    /// One bounded scan request; a completed page rearms the next page without
+    /// allocating a historical timer or an operation receipt.
+    fn expire_messages(&mut self) -> Result<(), Failure> {
+        if let Some((now, after)) = self.message_expiry_request {
+            if self.message_expiry_retry {
+                match self
+                    .writer
+                    .control_sender
+                    .try_send(ControlRequest::MessageExpiry {
+                        now,
+                        after,
+                        limit: 4,
+                    }) {
+                    Ok(()) => self.message_expiry_retry = false,
+                    Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Disconnected(_)) => {
+                        return Err(Failure::plain("writer_control_disconnected"));
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if self.message_expiry_input.is_some()
+            || (self.message_expiry_after.is_none()
+                && self.message_expiry_scan.elapsed() < Duration::from_millis(100))
+        {
+            return Ok(());
+        }
+        let now = self.message_now()?;
+        let after = self.message_expiry_after;
+        match self
+            .writer
+            .control_sender
+            .try_send(ControlRequest::MessageExpiry {
+                now,
+                after,
+                limit: 4,
+            }) {
+            Ok(()) => self.message_expiry_request = Some((now, after)),
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(Failure::plain("writer_control_disconnected"));
+            }
+        }
+        Ok(())
+    }
     fn emit_session_clock_anchor(&self) -> Result<(), Failure> {
         let domain: String = self
             .clock_anchor
@@ -360,7 +432,8 @@ impl Runtime<'_> {
             .generation
             .checked_next()
             .map_err(|_| Failure::plain("generation_exhausted"))?;
-        let io = net::spawn(stream).map_err(|_| Failure::plain("socket_spawn"))?;
+        let io = net::spawn_with_clock(stream, self.clock.clone())
+            .map_err(|_| Failure::plain("socket_spawn"))?;
         let sendbuf = io.send_buffer_bytes();
         self.peers.insert(
             self.generation,
@@ -907,6 +980,18 @@ impl Runtime<'_> {
         Ok(())
     }
     fn drain_inputs(&mut self) -> Result<(), Failure> {
+        let now = self.message_now()?;
+        if !matches!(
+            self.owner.step(
+                Input::MessageClock { now },
+                TurnGrant {
+                    work_limit: WorkUnits::new(65536)
+                }
+            ),
+            StepOutcome::Applied { .. }
+        ) {
+            return Err(Failure::plain("message_clock_not_applied"));
+        }
         let mut control_budget = crate::writer::CONTROL_QUEUE;
         let mut closing_budget = self.closing_inputs.len().min(CONNECTIONS);
         let mut terminal_budget = self.terminal_inputs.len().min(CONNECTIONS);
@@ -915,8 +1000,9 @@ impl Runtime<'_> {
             + self.control_inputs.len()
             + closing_budget
             + terminal_budget
-            + expiry_budget)
-            .min(64)
+            + expiry_budget
+            + usize::from(self.message_expiry_input.is_some()))
+        .min(64)
         {
             let control = if control_budget > 0 {
                 self.control_inputs.pop_front()
@@ -949,6 +1035,7 @@ impl Runtime<'_> {
                         None
                     }
                 })
+                .or_else(|| self.message_expiry_input.take())
                 .or_else(|| self.inputs.pop_front())
             else {
                 break;
@@ -1188,6 +1275,9 @@ impl Runtime<'_> {
                 }
                 StepOutcome::NeedCapacity { input, need, .. } => {
                     match input {
+                        expiry @ Input::MessagesExpired { .. } => {
+                            self.message_expiry_input = Some(expiry);
+                        }
                         packet @ Input::Packet { .. }
                             if matches!(
                                 need.resource,
@@ -1420,6 +1510,30 @@ impl Runtime<'_> {
                         });
                     } else {
                         self.events.emit("session_result_ignored", json!({"operation":crate::events::operation(operation),"details":{"effect":effect_text(effect),"code":"stale_lifecycle_result"}})).map_err(event_failure)?;
+                    }
+                }
+                ControlResponse::MessageExpiryUnknown { now, after } => {
+                    if self.message_expiry_request != Some((now, after)) {
+                        return Err(Failure::plain("message_expiry_correlation"));
+                    }
+                    self.message_expiry_retry = true;
+                }
+                ControlResponse::MessageExpiry { now, after, result } => {
+                    if self.message_expiry_request != Some((now, after))
+                        || self.message_expiry_input.is_some()
+                    {
+                        return Err(Failure::plain("message_expiry_correlation"));
+                    }
+                    let sweep = Arc::try_unwrap(result?)
+                        .map_err(|_| Failure::plain("message_expiry_reply_shared"))?;
+                    self.message_expiry_after = sweep.next;
+                    self.message_expiry_scan = Instant::now();
+                    self.message_expiry_request = None;
+                    self.message_expiry_retry = false;
+                    if !sweep.removed.is_empty() {
+                        self.message_expiry_input = Some(Input::MessagesExpired {
+                            deliveries: sweep.removed,
+                        });
                     }
                 }
                 ControlResponse::ClockCheckpoint {
@@ -1771,6 +1885,7 @@ impl Runtime<'_> {
                             && p.io
                                 .outgoing
                                 .try_send(net::Write {
+                                    expiry: None,
                                     correlation: None,
                                     bytes,
                                 })
@@ -1784,6 +1899,36 @@ impl Runtime<'_> {
                 return self.close(generation, "packet_refused");
             }
         };
+        let decoded = match decoded {
+            Packet::TimedPublish {
+                mut packet,
+                interval,
+            } => {
+                let observed = self.message_now()?;
+                let expiry = MessageExpiry { observed, interval };
+                expiry
+                    .deadline()
+                    .map_err(|_| Failure::plain("message_expiry_overflow"))?;
+                let InboundPacket::Publish {
+                    expiry: saved,
+                    topic,
+                    qos,
+                    retain,
+                    ..
+                } = &mut packet
+                else {
+                    return Err(Failure::plain("timed_publish_kind"));
+                };
+                *saved = Some(expiry);
+                self.events.emit("message_expiry_received", json!({"connection":generation.get().to_string(),"details":{
+                    "topic":std::str::from_utf8(topic.as_slice()).map_err(|_| Failure::plain("invalid_topic"))?.chars().take(256).collect::<String>(),
+                    "qos":qos.to_wire(),"retain":retain,"interval":interval,
+                    "domain":hex_domain(observed.domain),"tick":observed.tick.to_string()
+                }})).map_err(event_failure)?;
+                Packet::Core(packet)
+            }
+            other => other,
+        };
         let observed_at = self.session_now()?;
         let p = self
             .peers
@@ -1791,6 +1936,9 @@ impl Runtime<'_> {
             .ok_or_else(|| Failure::plain("generation_missing"))?;
         p.last_packet = Instant::now();
         match decoded {
+            Packet::TimedPublish { .. } => {
+                return Err(Failure::plain("timed_publish_not_anchored"));
+            }
             Packet::Connect(connect) => self.connect(generation, connect),
             Packet::Disconnect { expiry } => {
                 if p.connect_expiry == SessionExpiry::OnDisconnect
@@ -1802,6 +1950,7 @@ impl Runtime<'_> {
                         && p.io
                             .outgoing
                             .try_send(net::Write {
+                                expiry: None,
                                 correlation: None,
                                 bytes,
                             })
@@ -1912,6 +2061,7 @@ impl Runtime<'_> {
                         && p.io
                             .outgoing
                             .try_send(net::Write {
+                                expiry: None,
                                 correlation: None,
                                 bytes,
                             })
@@ -2066,6 +2216,53 @@ impl Runtime<'_> {
                     None => break,
                 };
                 match written {
+                    Ok(net::Written::Started { correlation }) => {
+                        if let Some((effect, connection)) = correlation
+                            && self.frames.get(&effect).is_some_and(|frame| {
+                                frame.connection == connection
+                                    && matches!(frame.kind, "PUBLISH" | "PUBLISH0")
+                            })
+                        {
+                            self.events.emit("message_transmission_started",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"authority":"positive_socket_write"}})).map_err(event_failure)?;
+                            self.queue(Input::FrameResult {
+                                effect,
+                                connection,
+                                progress: FrameProgress::Started,
+                            })?;
+                        }
+                    }
+                    Ok(net::Written::NotStarted {
+                        correlation,
+                        reason,
+                    }) => {
+                        if let Some((effect, connection)) = correlation
+                            && let Some(pending) = self.frames.remove(&effect)
+                        {
+                            if pending.connection != connection {
+                                return Err(Failure::plain("frame_connection_mismatch"));
+                            }
+                            self.outgoing_bindings
+                                .retain(|_, value| value.frame != effect);
+                            self.events.emit("message_transmission_not_started",json!({"connection":connection.generation.get().to_string(),"details":{"effect":effect_text(effect),"reason":format!("{reason:?}"),"authority":"zero_socket_bytes"}})).map_err(event_failure)?;
+                            if pending.kind == "PUBLISH0" {
+                                let reason = match reason {
+                                    mqttiumd_contract::message_expiry::MessageExpiryBlock::Expired => Qos0DropReason::MessageExpired,
+                                    mqttiumd_contract::message_expiry::MessageExpiryBlock::TemporalUncertain => Qos0DropReason::TemporalUncertain,
+                                };
+                                self.queue(Input::Qos0EmitRefused {
+                                    effect,
+                                    connection,
+                                    reason,
+                                })?;
+                            } else {
+                                self.queue(Input::FrameResult {
+                                    effect,
+                                    connection,
+                                    progress: FrameProgress::NotStarted { reason },
+                                })?;
+                            }
+                        }
+                    }
                     Ok(net::Written::Complete { correlation, bytes }) => {
                         if let Some((effect, connection)) = correlation {
                             #[cfg(feature = "test-hooks")]
@@ -2712,6 +2909,7 @@ impl EffectSink for Sink<'_> {
                             .io
                             .outgoing
                             .try_send(net::Write {
+                                expiry: None,
                                 correlation: None,
                                 bytes,
                             })
@@ -2738,6 +2936,7 @@ impl EffectSink for Sink<'_> {
                 SubmitResult::Accepted
             }
             Effect::EmitQos0 {
+                expiry,
                 connection,
                 origin,
                 retain,
@@ -2748,7 +2947,7 @@ impl EffectSink for Sink<'_> {
                 if self
                     .terminal_inputs
                     .len()
-                    .checked_add(self.frames.len())
+                    .checked_add(2 * self.frames.len())
                     .is_none_or(|used| used >= TERMINAL_INPUTS)
                     || self.frames.len() >= FRAMES
                 {
@@ -2777,8 +2976,21 @@ impl EffectSink for Sink<'_> {
                     p.closing.is_none()
                         && self.bindings.get(&connection.session) == Some(&generation)
                 }) {
-                    match codec::encode_qos0_retained(topic, payload, *retain) {
-                        Ok(bytes) if bytes.len() <= peer.max_packet => {
+                    match codec::encode_qos0_expiring(
+                        topic,
+                        payload,
+                        *retain,
+                        expiry.map(|value| value.interval),
+                    ) {
+                        Ok(encoded) if encoded.bytes.len() <= peer.max_packet => {
+                            let write_expiry = (*expiry).zip(encoded.expiry_value_offset).map(
+                                |(expiry, value_offset)| net::WriteExpiry {
+                                    expiry,
+                                    value_offset,
+                                    started: false,
+                                },
+                            );
+                            let bytes = encoded.bytes;
                             #[cfg(feature = "test-hooks")]
                             let duplicate = if MUTANT_REPLAY_QOS0
                                 && matches!(origin, Qos0Origin::Consumed { .. })
@@ -2788,6 +3000,7 @@ impl EffectSink for Sink<'_> {
                                 None
                             };
                             let result = peer.io.outgoing.try_send(net::Write {
+                                expiry: write_expiry,
                                 correlation: Some((id, connection)),
                                 bytes,
                             });
@@ -2796,6 +3009,7 @@ impl EffectSink for Sink<'_> {
                                 && let Some(bytes) = duplicate
                             {
                                 let _ = peer.io.outgoing.try_send(net::Write {
+                                    expiry: None,
                                     correlation: None,
                                     bytes,
                                 });
@@ -2874,6 +3088,7 @@ impl EffectSink for Sink<'_> {
                     && let Ok(bytes) = codec::encode_qos0(&item.topic, &item.payload)
                 {
                     let _ = peer.io.outgoing.try_send(net::Write {
+                        expiry: None,
                         correlation: None,
                         bytes,
                     });
@@ -2907,6 +3122,7 @@ impl EffectSink for Sink<'_> {
                         codec::encode_publish(c.packet_id, &item.topic, &item.payload, false)
                 {
                     let _ = peer.io.outgoing.try_send(net::Write {
+                        expiry: None,
                         correlation: None,
                         bytes,
                     });
@@ -2923,6 +3139,7 @@ impl EffectSink for Sink<'_> {
                     })
                 {
                     let _ = p.io.outgoing.try_send(net::Write {
+                        expiry: None,
                         correlation: None,
                         bytes: codec::encode(OutboundFrame::Pubrec {
                             packet_id: admission.source.packet_id,
@@ -2943,6 +3160,7 @@ impl EffectSink for Sink<'_> {
                     })
                 {
                     let _ = p.io.outgoing.try_send(net::Write {
+                        expiry: None,
                         correlation: None,
                         bytes: codec::encode(OutboundFrame::Puback {
                             packet_id: admission.source.packet_id,
@@ -3026,7 +3244,7 @@ impl EffectSink for Sink<'_> {
                 if self
                     .terminal_inputs
                     .len()
-                    .checked_add(self.frames.len())
+                    .checked_add(2 * self.frames.len())
                     .is_none_or(|used| used >= TERMINAL_INPUTS)
                     || self.frames.len() >= FRAMES
                     || (kind == "CONNACK" && self.inputs.len() + self.deferred_count >= INPUTS)
@@ -3054,6 +3272,7 @@ impl EffectSink for Sink<'_> {
                     }
                 };
                 match peer.io.outgoing.try_send(net::Write {
+                    expiry: None,
                     correlation: Some((id, connection)),
                     bytes,
                 }) {
@@ -3116,6 +3335,7 @@ impl EffectSink for Sink<'_> {
                                 .io
                                 .outgoing
                                 .try_send(net::Write {
+                                    expiry: None,
                                     correlation: None,
                                     bytes,
                                 })
@@ -3209,6 +3429,8 @@ impl EffectSink for Sink<'_> {
                 }
             }
             Effect::EmitPublish {
+                expiry,
+                started,
                 connection,
                 delivery,
                 packet_id,
@@ -3223,7 +3445,7 @@ impl EffectSink for Sink<'_> {
                 if self
                     .terminal_inputs
                     .len()
-                    .checked_add(self.frames.len())
+                    .checked_add(2 * self.frames.len())
                     .is_none_or(|used| used >= TERMINAL_INPUTS)
                     || self.frames.len() >= FRAMES
                 {
@@ -3242,14 +3464,29 @@ impl EffectSink for Sink<'_> {
                     });
                     return SubmitResult::Accepted;
                 };
-                let bytes =
-                    match codec::encode_publish_retained(packet_id, topic, payload, dup, retain) {
-                        Ok(bytes) if bytes.len() <= peer.max_packet => bytes,
-                        _ => {
-                            self.close.push((generation, "outgoing_packet_limit"));
-                            return refused(effect, SubmitBlock::Closed);
-                        }
-                    };
+                let encoded = match codec::encode_publish_expiring(
+                    packet_id,
+                    topic,
+                    payload,
+                    dup,
+                    retain,
+                    expiry.map(|value| value.interval),
+                ) {
+                    Ok(encoded) if encoded.bytes.len() <= peer.max_packet => encoded,
+                    _ => {
+                        self.close.push((generation, "outgoing_packet_limit"));
+                        return refused(effect, SubmitBlock::Closed);
+                    }
+                };
+                let write_expiry =
+                    (*expiry)
+                        .zip(encoded.expiry_value_offset)
+                        .map(|(expiry, value_offset)| net::WriteExpiry {
+                            expiry,
+                            value_offset,
+                            started: *started,
+                        });
+                let bytes = encoded.bytes;
                 let binding_key = (connection, packet_id);
                 let binding = PubackTarget {
                     delivery,
@@ -3267,6 +3504,7 @@ impl EffectSink for Sink<'_> {
                 // A rejected queue submission rolls this precise entry back.
                 self.outgoing_bindings.insert(binding_key, binding);
                 match peer.io.outgoing.try_send(net::Write {
+                    expiry: write_expiry,
                     correlation: Some((id, connection)),
                     bytes,
                 }) {
@@ -3347,6 +3585,9 @@ fn business_connection(input: &Input) -> Option<ConnectionGeneration> {
         _ => None,
     }
 }
+fn hex_domain(domain: [u8; 32]) -> String {
+    domain.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 fn delivery_text(id: mqttiumd_contract::ids::DeliveryId) -> String {
     format!(
         "{}/{}/{}/{}/{}",
@@ -3365,6 +3606,18 @@ fn expiry_json(expiry: SessionExpiry) -> serde_json::Value {
     }
 }
 fn recipe_details(recipe: &Recipe) -> serde_json::Value {
+    if let Recipe::ExpiringPublication(value) = recipe {
+        let (publication, topic) = match &value.admission {
+            mqttiumd_contract::message_expiry::ExpiringAdmission::Qos12(v) => {
+                (v.admission.publication, &v.admission.topic)
+            }
+            mqttiumd_contract::message_expiry::ExpiringAdmission::Qos0(v) => {
+                (v.publication, &v.topic)
+            }
+        };
+        return json!({"publication":format!("{:?}",publication),"topic":String::from_utf8_lossy(topic.as_slice()).chars().take(256).collect::<String>(),
+            "message_expiry_domain":hex_domain(value.expiry.observed.domain),"message_expiry_tick":value.expiry.observed.tick.to_string(),"message_expiry_interval":value.expiry.interval});
+    }
     match recipe {
         Recipe::SessionLifecycle(lifecycle) => match &lifecycle.action {
             SessionAction::Open {
@@ -3594,6 +3847,12 @@ fn run_inner(
         })
         .collect();
     let mut runtime = Runtime {
+        message_expiry_request: None,
+        message_expiry_retry: false,
+        message_expiry_after: None,
+        message_expiry_scan: Instant::now(),
+        message_expiry_input: None,
+        message_last_time: None,
         clock: boot.clock,
         clock_anchor: boot.clock_anchor,
         clock_checkpoint: None,
@@ -3797,6 +4056,13 @@ fn run_inner(
             thread::sleep(Duration::from_millis(1));
         }
         runtime.emit_session_clock_anchor()?;
+        let now = runtime.message_now()?;
+        events.emit("message_expiry_clock", json!({"details":{
+            "domain":hex_domain(now.domain),"tick":now.tick.to_string(),"origin_status":runtime.clock.origin_status(),
+            "policy":"quarantine-on-unknown-origin","time_unit":"nanoseconds","scan_ms":100,"batch":4,
+            "started_proof":"positive-socket-write-then-durable-marker","terminal_input_slots":TERMINAL_INPUTS,
+            "socket_write_receipt_slots":net::WRITTEN_SLOTS
+        }})).map_err(event_failure)?;
         events.emit("receipt_policy",json!({"details":{"receipt_window":1024,"receipt_data_window":mqttiumd_contract::receipts::RECEIPT_DATA_WINDOW,"receipt_control_reserve":512,"receipt_collection_rows":128,"receipt_collection_bytes":mqttiumd_store_api::ReadBudget::COLLECTION.max_bytes,"receipt_collection_trigger":64,"max_receipt_origins":64,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE,"control_input_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
         events.emit("sqlite_configuration",json!({"details":{"journal_mode":sqlite.journal_mode,"synchronous":sqlite.synchronous,"wal_autocheckpoint":sqlite.wal_autocheckpoint,"checkpoint_policy":sqlite.checkpoint_policy,"sqlite_version":sqlite.sqlite_version,"user_version":sqlite.user_version,"page_size":sqlite.page_size,"kill_points":sqlite.kill_points,"hooks_active":false,"install_order":"sqlite-autocheckpoint-before-optional-business-hook"}})).map_err(event_failure)?;
         check_startup_cancel(&cancel)?;
@@ -3809,10 +4075,8 @@ fn run_inner(
             .local_addr()
             .map_err(|_| Failure::plain("listen_address"))?;
         check_startup_cancel(&cancel)?;
-        events.emit("ready",json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":8,"retained_available":true,"retained_topics":32,"retained_bytes":1048576,"max_replay_candidates":256,"profile":"tcp-retained-pubsub-v1"}})).map_err(event_failure)?;
-        println!(
-            "mqttiumd ready {address} (local MQTT 5 hierarchical pub/sub with durable retained)"
-        );
+        events.emit("ready",json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":9,"retained_available":true,"retained_topics":32,"retained_bytes":1048576,"max_replay_candidates":256,"profile":"tcp-message-expiry-pubsub-v1"}})).map_err(event_failure)?;
+        println!("mqttiumd ready {address} (local MQTT 5 retained pub/sub with Message Expiry)");
         while !cancel.load(Ordering::Relaxed) {
             for _ in 0..4 {
                 match listener.accept() {
@@ -3826,6 +4090,7 @@ fn run_inner(
             runtime.writer_results()?;
             runtime.connections()?;
             runtime.discover_work();
+            runtime.expire_messages()?;
             runtime.expire_sessions()?;
             runtime.due_deadlines()?;
             #[cfg(feature = "test-hooks")]
