@@ -735,3 +735,470 @@ mod tests {
         all(&MemoryStore::create);
     }
 }
+
+/// The temporal suite is shared verbatim by the deterministic and SQL writers.
+pub mod expiry {
+    use super::*;
+    use mqttiumd_contract::command::{ClaimDelivery, FinishDelivery};
+    use mqttiumd_contract::ids::OutboundPacketId;
+    use mqttiumd_contract::message_expiry::{
+        ExpireDelivery, ExpiringAdmission, ExpiringPublication, MarkDeliveryStarted, MessageExpiry,
+        MessageTime, NANOS_PER_SECOND, TimedReplaySubscriptions,
+    };
+
+    pub fn at(seconds: u64) -> MessageTime {
+        MessageTime {
+            domain: [7; 32],
+            tick: seconds * NANOS_PER_SECOND,
+        }
+    }
+    fn clock<S: DurableStore>(store: &mut S, observed: MessageTime) {
+        let expected = store.snapshot().unwrap().session_clock;
+        store
+            .checkpoint_session_clock(
+                expected,
+                SessionClockReading {
+                    domain: observed.domain,
+                    tick: observed.tick,
+                },
+            )
+            .unwrap();
+    }
+    pub fn expiring(command: Command, expiry: MessageExpiry) -> Command {
+        let mut canonical = Vec::new();
+        command
+            .recipe
+            .get()
+            .encode_canonical(&mut canonical)
+            .unwrap();
+        let admission = match Recipe::decode_canonical(&canonical, 16, 65535).unwrap() {
+            Recipe::RetainedPublication(value) => ExpiringAdmission::Qos12(value),
+            Recipe::RetainedQos0(value) => ExpiringAdmission::Qos0(value),
+            _ => panic!("expected retained admission"),
+        };
+        Command {
+            recipe: FrozenRecipe::freeze(Recipe::ExpiringPublication(ExpiringPublication {
+                admission,
+                expiry,
+            }))
+            .unwrap(),
+            payload: command.payload,
+        }
+    }
+    fn timed(command: Command, observed: MessageTime) -> Command {
+        let mut canonical = Vec::new();
+        command
+            .recipe
+            .get()
+            .encode_canonical(&mut canonical)
+            .unwrap();
+        let Recipe::ReplaySubscriptions(replay) =
+            Recipe::decode_canonical(&canonical, 16, 65535).unwrap()
+        else {
+            panic!()
+        };
+        frozen(
+            Recipe::TimedReplaySubscriptions(TimedReplaySubscriptions { replay, observed }),
+            None,
+        )
+    }
+    fn lifetime(seconds: u32) -> MessageExpiry {
+        MessageExpiry {
+            observed: at(0),
+            interval: seconds,
+        }
+    }
+    fn claim<S: DurableStore>(
+        w: &mut World<S>,
+        seq: u64,
+        delivery: DeliveryId,
+        target: SessionId,
+        packet: u16,
+    ) -> FinishDelivery {
+        let packet_id = OutboundPacketId::new(packet).unwrap();
+        let operation = operation_id(w.epoch, seq);
+        commit(
+            &mut w.store,
+            &frozen(
+                Recipe::ClaimDelivery(ClaimDelivery {
+                    operation,
+                    delivery,
+                    target,
+                    target_revision: Revision::new(1),
+                    packet_id,
+                }),
+                None,
+            ),
+        );
+        FinishDelivery {
+            operation: operation_id(w.epoch, seq + 1),
+            delivery,
+            target,
+            target_revision: Revision::new(1),
+            packet_id,
+            claim: operation,
+        }
+    }
+
+    pub fn shared_refs_replay_and_source_end<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        let mut w = World::with_limits(make, limits());
+        clock(&mut w.store, at(0));
+        let expiry = lifetime(2);
+        let admitted = expiring(
+            admitted(
+                &w,
+                1,
+                b"expiry/value",
+                b"original",
+                Qos::ExactlyOnce,
+                &[w.b],
+            ),
+            expiry,
+        );
+        let original = commit(&mut w.store, &admitted);
+        let replay = timed(
+            subscribe(&w, 2, w.c, 1000, &[(b"expiry/#", Qos::AtLeastOnce, 0)]),
+            at(1),
+        );
+        commit(&mut w.store, &replay);
+        w.store
+            .admin(AdminCommand::DeleteSession {
+                session: w.producer,
+            })
+            .unwrap();
+        let state = w.store.snapshot().unwrap();
+        assert_eq!(state.accounts.references.get(), 3);
+        assert_eq!(state.accounts.payload_bytes.get(), 8);
+        assert_eq!(state.publications.len(), 2);
+        for target in [w.b, w.c] {
+            assert_eq!(
+                w.store.read_work(target, None, 8).unwrap().items.as_slice()[0].expiry,
+                Some(expiry)
+            );
+        }
+        let sweep = w.store.expire_messages(at(2), None, 4).unwrap();
+        assert_eq!(
+            sweep.removed.len(),
+            2,
+            "expiry_did_not_end_every_unclaimed_copy"
+        );
+        assert_eq!(sweep.retained_removed, 1);
+        let state = w.store.snapshot().unwrap();
+        assert_eq!(state.accounts.references.get(), 0);
+        assert_eq!(state.accounts.payload_bytes.get(), 0);
+        assert!(state.payloads.is_empty());
+        assert!(state.publications.is_empty());
+        assert_eq!(
+            w.store.apply(&admitted).reply,
+            StoreReply::Outcome(StoreOutcome::Committed(original))
+        );
+        assert!(
+            w.store.snapshot().unwrap().retained.is_empty(),
+            "receipt_replay_renewed_lifetime"
+        );
+        let retry = w.store.expire_messages(at(2), None, 4).unwrap();
+        assert!(retry.removed.is_empty());
+        assert_eq!(retry.retained_removed, 0);
+    }
+
+    pub fn claimed_copies_require_exact_never_started_guard<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        let mut w = World::with_limits(make, limits());
+        clock(&mut w.store, at(0));
+        let expiry = lifetime(1);
+        let command = expiring(
+            admitted(
+                &w,
+                1,
+                b"expiry/claimed",
+                b"payload",
+                Qos::AtLeastOnce,
+                &[w.b, w.c],
+            ),
+            expiry,
+        );
+        commit(&mut w.store, &command);
+        let b = w.b;
+        let c = w.c;
+        let b_id = DeliveryId {
+            publication: publication_id(w.epoch, 1),
+            index: 0,
+        };
+        let c_id = DeliveryId {
+            publication: publication_id(w.epoch, 1),
+            index: 1,
+        };
+        let b_finish = claim(&mut w, 2, b_id, b, 1);
+        let mut c_finish = claim(&mut w, 4, c_id, c, 1);
+        commit(
+            &mut w.store,
+            &frozen(
+                Recipe::MarkDeliveryStarted(MarkDeliveryStarted {
+                    operation: operation_id(w.epoch, 6),
+                    delivery: c_id,
+                    target: c,
+                    target_revision: Revision::new(1),
+                    packet_id: c_finish.packet_id,
+                    claim: c_finish.claim,
+                }),
+                None,
+            ),
+        );
+        let sweep = w.store.expire_messages(at(1), None, 4).unwrap();
+        assert!(
+            sweep.removed.is_empty(),
+            "sweep_invented_certain_not_started"
+        );
+        assert_eq!(sweep.retained_removed, 1);
+        let state = w.store.snapshot().unwrap();
+        assert_eq!(state.accounts.references.get(), 2);
+        assert!(!state.outbound[&b_id].started);
+        assert!(state.outbound[&c_id].started);
+        assert!(
+            w.store.read_work(c, None, 8).unwrap().items.as_slice()[0]
+                .claim
+                .unwrap()
+                .started
+        );
+        let mut wrong = b_finish;
+        wrong.operation = operation_id(w.epoch, 7);
+        wrong.claim = c_finish.claim;
+        assert!(matches!(
+            w.store
+                .apply(&frozen(
+                    Recipe::ExpireDelivery(ExpireDelivery {
+                        finish: wrong,
+                        expiry,
+                        observed: at(1)
+                    }),
+                    None
+                ))
+                .reply,
+            StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                RejectReason::PreconditionFailed
+            ))
+        ));
+        commit(
+            &mut w.store,
+            &frozen(
+                Recipe::ExpireDelivery(ExpireDelivery {
+                    finish: b_finish,
+                    expiry,
+                    observed: at(1),
+                }),
+                None,
+            ),
+        );
+        c_finish.operation = operation_id(w.epoch, 8);
+        assert!(matches!(
+            w.store
+                .apply(&frozen(
+                    Recipe::ExpireDelivery(ExpireDelivery {
+                        finish: c_finish,
+                        expiry,
+                        observed: at(1)
+                    }),
+                    None
+                ))
+                .reply,
+            StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                RejectReason::PreconditionFailed
+            ))
+        ));
+        c_finish.operation = operation_id(w.epoch, 9);
+        commit(
+            &mut w.store,
+            &frozen(Recipe::FinishDelivery(c_finish), None),
+        );
+        assert_eq!(w.store.snapshot().unwrap().accounts.references.get(), 0);
+        // A late positive-write observation must never recreate the removed claim.
+        let late = frozen(
+            Recipe::MarkDeliveryStarted(MarkDeliveryStarted {
+                operation: operation_id(w.epoch, 10),
+                delivery: c_id,
+                target: c,
+                target_revision: Revision::new(1),
+                packet_id: c_finish.packet_id,
+                claim: c_finish.claim,
+            }),
+            None,
+        );
+        assert!(matches!(
+            w.store.apply(&late).reply,
+            StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                RejectReason::PreconditionFailed
+            ))
+        ));
+        assert!(w.store.snapshot().unwrap().outbound.is_empty());
+    }
+
+    pub fn zero_replacement_at_capacity_and_qos2_continuation<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        let mut l = limits();
+        l.references = References::new(1);
+        l.payload_bytes = PayloadBytes::new(3);
+        let mut w = World::with_limits(make, l);
+        clock(&mut w.store, at(0));
+        let old = admitted(&w, 1, b"expiry/value", b"old", Qos::AtLeastOnce, &[]);
+        commit(&mut w.store, &old);
+        let zero = expiring(
+            admitted(
+                &w,
+                2,
+                b"expiry/value",
+                b"larger replacement",
+                Qos::ExactlyOnce,
+                &[w.b],
+            ),
+            lifetime(0),
+        );
+        commit(&mut w.store, &zero);
+        let state = w.store.snapshot().unwrap();
+        assert!(state.retained.is_empty());
+        assert!(state.obligations.is_empty());
+        assert!(state.payloads.is_empty());
+        assert_eq!(state.accounts.references.get(), 0);
+        assert_eq!(state.accounts.payload_bytes.get(), 0);
+        assert_eq!(state.inbound.len(), 1, "expiry_ended_qos2_handshake");
+        let release = w.release(3, 2, 2);
+        commit(&mut w.store, &release);
+        assert!(w.store.snapshot().unwrap().publications.is_empty());
+    }
+
+    pub fn temporal_quarantine_and_observation_refusals<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        let mut w = World::with_limits(make, limits());
+        clock(&mut w.store, at(0));
+        let command = expiring(
+            admitted(&w, 1, b"expiry/value", b"held", Qos::AtLeastOnce, &[w.b]),
+            lifetime(1),
+        );
+        commit(&mut w.store, &command);
+        let foreign = MessageTime {
+            domain: [9; 32],
+            tick: 50 * NANOS_PER_SECOND,
+        };
+        clock(&mut w.store, foreign);
+        let before = w.store.snapshot().unwrap();
+        let sweep = w.store.expire_messages(foreign, None, 4).unwrap();
+        assert_eq!(sweep.quarantined, 1);
+        assert!(sweep.removed.is_empty());
+        assert_eq!(sweep.retained_removed, 0);
+        let after = w.store.snapshot().unwrap();
+        assert_eq!(after.accounts, before.accounts);
+        assert_eq!(after.publications, before.publications);
+        let replay = timed(
+            subscribe(&w, 2, w.c, 1000, &[(b"expiry/#", Qos::AtMostOnce, 0)]),
+            foreign,
+        );
+        commit(&mut w.store, &replay);
+        assert!(
+            w.store.read_work(w.c, None, 8).unwrap().items.is_empty(),
+            "unknown_origin_replayed_as_fresh"
+        );
+        let before = w.store.snapshot().unwrap();
+        for bad in [at(100)] {
+            assert_eq!(
+                w.store.expire_messages(bad, None, 4),
+                Err(ReadError::InvalidData)
+            );
+            assert_eq!(w.store.snapshot().unwrap(), before);
+        }
+        let stale = w.store.expire_messages(MessageTime { tick: foreign.tick - 1, ..foreign }, None, 4).unwrap();
+        assert_eq!(stale.quarantined, 1);
+        // Historical tag 12 has no temporal observation and must skip expiring values.
+        let legacy = subscribe(&w, 3, w.c, 2000, &[(b"expiry/#", Qos::AtMostOnce, 0)]);
+        commit(&mut w.store, &legacy);
+        assert!(w.store.read_work(w.c, None, 8).unwrap().items.is_empty());
+    }
+
+    pub fn thirty_two_timed_replays_keep_original_ttl<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        let mut w = World::with_limits(make, limits());
+        clock(&mut w.store, at(0));
+        let expiry = lifetime(10);
+        for n in 1..=32 {
+            let c = expiring(
+                admitted(
+                    &w,
+                    n,
+                    format!("expiry/{n:02}").as_bytes(),
+                    &[n as u8],
+                    Qos::AtLeastOnce,
+                    &[],
+                ),
+                expiry,
+            );
+            commit(&mut w.store, &c);
+        }
+        let sub = timed(
+            subscribe(
+                &w,
+                33,
+                w.b,
+                1000,
+                &[
+                    (b"expiry/#", Qos::AtMostOnce, 0x20),
+                    (b"expiry/#", Qos::AtMostOnce, 0x10),
+                    (b"expiry/#", Qos::AtMostOnce, 0),
+                ],
+            ),
+            at(9),
+        );
+        commit(&mut w.store, &sub);
+        let state = w.store.snapshot().unwrap();
+        assert_eq!(
+            state.obligations.len(),
+            32,
+            "timed_replay_truncated_or_RH_order_lost"
+        );
+        assert_eq!(state.accounts.references.get(), 64);
+        for row in state.publications.values() {
+            assert_eq!(row.expiry, Some(expiry));
+        }
+        let mut cursor = None;
+        let mut removed = 0;
+        let mut retained = 0;
+        loop {
+            let page = w.store.expire_messages(at(10), cursor, 4).unwrap();
+            removed += page.removed.len();
+            retained += page.retained_removed;
+            cursor = page.next;
+            if !page.more {
+                break;
+            }
+            assert!(cursor.is_some());
+        }
+        assert_eq!(removed, 32);
+        assert_eq!(retained, 32);
+        assert_eq!(w.store.snapshot().unwrap().accounts.references.get(), 0);
+        let expired = timed(
+            subscribe(&w, 34, w.c, 2000, &[(b"expiry/#", Qos::AtMostOnce, 0)]),
+            at(10),
+        );
+        commit(&mut w.store, &expired);
+        assert!(w.store.read_work(w.c, None, 8).unwrap().items.is_empty());
+    }
+
+    pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
+        shared_refs_replay_and_source_end(make);
+        claimed_copies_require_exact_never_started_guard(make);
+        zero_replacement_at_capacity_and_qos2_continuation(make);
+        temporal_quarantine_and_observation_refusals(make);
+        thirty_two_timed_replays_keep_original_ttl(make);
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    #[test]
+    fn deterministic_message_expiry_contract() {
+        super::expiry::all(&super::MemoryStore::create);
+    }
+}
