@@ -109,6 +109,9 @@ expiry_run() {
 }
 expiry_run normal normal "$expiry_out/binaries/mqttiumd-normal"
 expiry_run faults faults "$expiry_out/binaries/mqttiumd-hooks"
+expiry_record compiled-negative-controls "$expiry_python" tools/run_expiry_mutants.py "$expiry_out/mutants"
+MQTTIUMD_EXPIRY_MUTANT_TARGET_ROOT="${MQTTIUMD_EXPIRY_MUTANT_TARGET_ROOT:-$expiry_targets/mutants}" \
+    "$expiry_python" tools/run_expiry_mutants.py "$expiry_out/mutants" >"$expiry_out/mutants.log" 2>&1
 "$expiry_python" - "$expiry_out" "$expiry_sha" "${#expiry_trace[@]}" <<'PY'
 from pathlib import Path
 import hashlib,json,sys
@@ -120,7 +123,7 @@ for name,receipt in [('normal',normal),('faults',faults)]:
     if hashlib.sha256(Path(receipt['binary']['path']).read_bytes()).hexdigest()!=receipt['binary']['sha256']:
         raise SystemExit(f'{name} retained and executed binary differs')
 criteria={row['criterion']:row for row in normal['cases']}
-if set(criteria)!={'B','E','F'}: raise SystemExit('public/responsibility/capacity criteria missing')
+if set(criteria)!={'B','E','F','C-corrupt-format'}: raise SystemExit('public/responsibility/capacity criteria missing')
 if criteria['F']['quota']!=128 or criteria['F']['rearms']!=64:
     raise SystemExit('capacity quota or finite rearm budget differs')
 controlled={row['criterion']:row for row in faults['cases']}
@@ -131,15 +134,26 @@ expected={('detach','prepared'),('detach','committed'),('expire','prepared'),('e
 if ({(row['action'],row['phase']) for row in crashes}!=expected
         or not all(row['wait_status']==-9 and row['stop_status']==0 for row in crashes)):
     raise SystemExit('each lifecycle boundary needs its own real SIGKILL and clean restart')
+mutants=json.loads((out/'mutants/result.json').read_text())
+expected_reasons={'expired_open_resumed_without_timer','old_timer_rebound_after_open',
+                  'detach_result_recalculated_deadline','continuous_domain_progress_lost'}
+if (mutants['status']!='PASS' or mutants['source_head']!=sys.argv[2] or not mutants['restored']
+        or len(mutants['mutants'])!=4
+        or {row['reason'] for row in mutants['mutants']}!=expected_reasons
+        or not all(row['detected'] for row in mutants['mutants'])):
+    raise SystemExit('compiled expiry controls need four exact detections and full restoration')
 index={'format':'mqttiumd.finite-expiry-system-reception-index','schema_version':1,
        'status':'PASS','qualification':'system-test-only','source_head':sys.argv[2],
        'scope':['B-public-finite-paths','D-authentic-unknown-and-five-product-cuts',
-                'E-shared-responsibilities','F-full-capacity-and-bounded-rearms'],
+                'E-shared-responsibilities','F-full-capacity-and-bounded-rearms',
+                'C-typed-invalid-deadline-before-anchor','G-four-compiled-controls'],
        'source_pin':json.loads((out/'source-pin.json').read_text()),
        'source_archive':{'path':'source.tar','sha256':hashlib.sha256((out/'source.tar').read_bytes()).hexdigest()},
        'system_witnesses':'same-run-strace' if int(sys.argv[3]) else 'process-status-only',
        'normal':{'receipt':'normal/receipt.json','binary':normal['binary']},
        'faults':{'receipt':'faults/receipt.json','binary':faults['binary']},
+       'negative_controls':{'result':'mutants/result.json','reasons':sorted(expected_reasons),
+                            'restored':True},
        'limitations':['Finite system evidence, not independent-oracle qualification.',
                       'Deterministic clock/domain/mutation/model results are separate receipts.',
                       'Local DISCONNECT completion alone is not a broker detachment fact.',

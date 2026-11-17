@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import re
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -600,12 +601,105 @@ async def connected_crash(binary, case):
             restarted.cleanup()
 
 
+def sqlite_inventory(path):
+    """Bounded byte-sensitive logical inventory of the stopped test image."""
+    connection = sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=2)
+    inventory = {}
+    try:
+        connection.execute('PRAGMA query_only=ON')
+        connection.execute('BEGIN')
+        require(connection.execute('PRAGMA quick_check').fetchmany(2) == [('ok',)],
+                'expiry_corruption_image_not_physically_sound')
+        tables = [row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        require(len(tables) <= 32 and all(re.fullmatch(r'[a-z_]+', table) for table in tables),
+                'expiry_corruption_inventory_schema_budget')
+        remaining = 1024 * 1024
+        for table in tables:
+            count = connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
+            require(count <= 8192, 'expiry_corruption_inventory_row_budget', table)
+            cursor = connection.execute(f'SELECT * FROM "{table}"')
+            columns = [column[0] for column in cursor.description]
+            rows = []
+            for values in cursor:
+                row = {column: value.hex() if isinstance(value, bytes) else value
+                       for column, value in zip(columns, values)}
+                encoded = json.dumps(row, sort_keys=True)
+                remaining -= len(encoded.encode())
+                require(remaining >= 0, 'expiry_corruption_inventory_byte_budget')
+                rows.append(row)
+            inventory[table] = sorted(rows, key=lambda row: json.dumps(row, sort_keys=True))
+        connection.execute('COMMIT')
+    finally:
+        connection.close()
+    return inventory
+
+
+async def invalid_temporal_image(binary, case):
+    """Explicit corruption control, never a supported product mutation."""
+    source = Broker(binary, case / 'source')
+    refused = client = None
+    try:
+        source.ready(); cursor = EventCursor(source)
+        client = MqttiumSession(source.address, 'expiry-corrupt-deadline', expiry=60,
+                                events_path=case / 'client.jsonl')
+        await client.open(False)
+        await client.subscribe('expiry/corruption')
+        await client.disconnect()
+        valid = await detached(source, cursor, client.client_id)
+        detachment(valid)
+        source.stop(); writer_available(source.db)
+        with sqlite3.connect(source.db) as connection:
+            changed = connection.execute('UPDATE sessions SET deadline=zeroblob(8) WHERE id=?',
+                                         (bytes.fromhex(valid['id']),)).rowcount
+            connection.commit()
+            require(changed == 1 and connection.execute('PRAGMA quick_check').fetchone() == ('ok',),
+                    'expiry_corruption_image_not_constructed')
+        before = sqlite_inventory(source.db)
+        before_digest = hashlib.sha256(source.db.read_bytes()).hexdigest()
+        require(before['sessions'][0]['deadline'] == '0000000000000000',
+                'expiry_corruption_injection_not_reached')
+        refused = Broker(binary, case / 'refused', db=source.db)
+        status = refused.process.wait(timeout=8)
+        refused.observations.record('process_wait', pid=refused.process.pid, status=status,
+                                     requested='observed-startup-refusal')
+        events = refused.events()
+        require(status != 0 and not any(event['kind'] == 'ready' for event in events),
+                'invalid_expiry_became_ready')
+        failures = [event for event in events if event['kind'] == 'startup_or_runtime_refused']
+        require(len(failures) == 1 and failures[0].get('cause') == 'InvalidData'
+                and failures[0].get('phase') == 'Snapshot',
+                'invalid_expiry_startup_cause_lost')
+        stopped = [event for event in events if event['kind'] == 'stopped']
+        require(stopped and stopped[-1]['details']['writer_released'],
+                'invalid_expiry_writer_not_released')
+        writer_available(source.db)
+        after = sqlite_inventory(source.db)
+        after_digest = hashlib.sha256(source.db.read_bytes()).hexdigest()
+        require(before == after and before_digest == after_digest,
+                'invalid_expiry_modified_before_refusal')
+        write_json(case / 'corrupt-before.json', before)
+        write_json(case / 'corrupt-after.json', after)
+        return {'criterion': 'C-corrupt-format', 'status': 'PASS',
+                'construction': 'Stopped disposable image: UPDATE sessions SET deadline=zeroblob(8); unsupported corruption control.',
+                'quick_check': 'ok', 'cause': 'InvalidData', 'phase': 'Snapshot',
+                'valid_detachment': valid, 'refusal': failures[0], 'exit_status': status,
+                'writer_released': True, 'before_sha256': before_digest, 'after_sha256': after_digest,
+                'metadata_and_clock_unchanged': True, 'client': client.result}
+    finally:
+        if client is not None and not client.closed:
+            await client.disconnect()
+        source.cleanup()
+        if refused is not None:
+            refused.cleanup()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--binary-source-head', required=True)
-    parser.add_argument('--case', choices=('normal', 'faults', 'B', 'E', 'F', 'unknown', 'crashes'), default='normal')
+    parser.add_argument('--case', choices=('normal', 'faults', 'B', 'E', 'F', 'unknown', 'crashes', 'corruption'), default='normal')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     source = Path(__file__).resolve().parents[3]
@@ -619,9 +713,10 @@ def main():
                           'sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest()}}
     require(head == args.binary_source_head, 'expiry_reception_source_mismatch')
     try:
-        selected = {'normal': ('B', 'E', 'F'), 'faults': ('unknown', 'crashes')}.get(args.case, (args.case,))
+        selected = {'normal': ('B', 'E', 'F', 'corruption'), 'faults': ('unknown', 'crashes')}.get(args.case, (args.case,))
         functions = {'B': public_paths, 'E': shared_responsibilities, 'F': capacity_and_rearming,
-                     'unknown': unknown_results, 'crashes': product_crashes}
+                     'unknown': unknown_results, 'crashes': product_crashes,
+                     'corruption': invalid_temporal_image}
         for name in selected:
             receipt['cases'].append(asyncio.run(functions[name](args.binary.resolve(), args.out / name)))
         receipt['status'] = 'PASS'
