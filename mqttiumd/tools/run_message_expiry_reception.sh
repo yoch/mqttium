@@ -156,7 +156,7 @@ if len(cases['matrix']['cells'])!=120 or len(cases['offline']['cells'])!=24 or c
 if len(cases['late-puback']['cases'])!=2 or len(cases['malformed']['cases'])!=24:
     raise SystemExit('real late PUBACK or malformed-property coverage incomplete')
 required={'transfer-claim','transfer-prepared','transfer-committed','sweep-prepared','sweep-committed',
-          'normal-restart',*(f'recipe-{kind}-{phase}' for kind in ('qos1','qos0','replay')
+          'normal-restart','held-admission',*(f'recipe-{kind}-{phase}' for kind in ('qos1','qos0','replay')
                              for phase in ('prepared','committed'))}
 if {row['criterion'] for row in boundaries['cases']}!=required:
     raise SystemExit('timed admission/replay, claim/start, physical sweep and restart boundaries required')

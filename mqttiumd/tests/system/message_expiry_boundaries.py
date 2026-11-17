@@ -472,13 +472,85 @@ async def recipe_cut(binary, case, value):
         broker.cleanup()
 
 
+async def held_admission(binary, case):
+    """An authentic unknown admission outcome cannot resurrect expired state."""
+    broker = Broker(binary, case, test_control=True)
+    peers = []
+    action = None
+    payload = b'expired-while-the-original-admission-result-was-unknown'
+    hold = broker.control / 'hold-admission-result'
+    try:
+        ready = broker.ready()
+        target, tap = await peer('paho', broker, case, 'held-target', client_id='held-target')
+        await target.subscribe((Subscription('message-expiry/cut/#', 1, retain_handling=2),))
+        await close_peers(((target, tap),))
+        await until_state(broker, lambda state: any(row['client_id'] == b'held-target'.hex() and
+                          row.get('detached_by') is not None for row in state['tables']['sessions']),
+                          'message_expiry_held_target_not_detached')
+        source, source_tap = await peer('mqttium', broker, case, 'held-source', session_expiry=0)
+        peers.append((source, source_tap))
+        hold.touch(exist_ok=False)
+        action = asyncio.create_task(source.publish('message-expiry/cut/value', payload, 1,
+                                                    retain=True, message_expiry=1))
+        held = await asyncio.to_thread(broker.wait_event, 'store_result_held')
+        require(held.get('command_kind') == 'Admission' and held['details'].get('outcome') == 'Committed',
+                'message_expiry_held_admission_not_committed')
+        admitted = snapshot(broker, 'held-admission-committed')
+        require(admitted['counts']['retained'] == admitted['counts']['obligations'] ==
+                admitted['counts']['publications'] == admitted['counts']['payloads'] == 1,
+                'message_expiry_held_admission_inventory_missing')
+        canonical = canonical_timed(admitted, held, 13)
+        require(canonical['interval'] == 1, 'message_expiry_held_original_ttl_changed')
+        require(not action.done(), 'message_expiry_held_result_reached_publisher')
+        expired = await until_state(broker, physically_drained, 'message_expiry_unknown_admission_blocked_physical_expiry')
+        write_json(case / 'held-admission-expired.sql.json', expired)
+        still = canonical_timed(expired, held, 13)
+        require(still == canonical, 'message_expiry_held_recipe_changed_after_physical_expiry')
+        hold.unlink()
+        broker.observations.record('held_admission_result_released', operation=held['operation'])
+        resolved = await asyncio.to_thread(broker.wait_event, 'store_resolved', after=int(held['seq']))
+        require(resolved.get('operation') == held['operation'] and
+                resolved['details'].get('outcome') == 'committed',
+                'message_expiry_held_resolution_changed_original_operation')
+        await asyncio.wait_for(action, timeout=5)
+        action = None
+        target, tap = await peer('paho', broker, case, 'held-resumed-target',
+                                 client_id='held-target', present=True)
+        peers.append((target, tap))
+        await target.no_message(.08)
+        require(not tap.publications(payload), 'message_expiry_resolved_admission_resurrected_expired_work')
+        final = await until_state(broker, physically_drained, 'message_expiry_resolved_admission_recreated_references')
+        fresh = await witness(broker, case, peers, target, tap, 'held-admission')
+        write_json(case / 'held-admission-final.sql.json', final)
+        await close_peers(peers)
+        peers = []
+        broker.stop()
+        writer_available(broker.db)
+        return {'criterion': 'held-admission', 'status': 'PASS', 'ready': ready,
+                'held': held, 'resolved': resolved, 'same_operation': True, 'canonical': canonical,
+                'expired_while_unknown_counts': expired['counts'], 'final_counts': final['counts'],
+                'fresh_timeless_witness': fresh, 'process_status': broker.process.returncode}
+    finally:
+        if hold.exists():
+            hold.unlink()
+        if broker.process.poll() is None and action is not None:
+            broker.cleanup()
+        if action is not None:
+            await settle(action)
+        await close_peers(peers, cleanup=True)
+        if broker.db.is_file():
+            snapshot(broker, 'last-observed')
+        broker.cleanup()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--binary-source-head', required=True)
     parser.add_argument('--case', choices=('all', 'claim', 'started-prepared', 'started-committed',
-                                          'sweep-prepared', 'sweep-committed', 'restart', 'recipes'), default='all')
+                                          'sweep-prepared', 'sweep-committed', 'restart', 'recipes',
+                                          'held-admission'), default='all')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     root = Path(__file__).resolve().parents[3]
@@ -493,7 +565,7 @@ def main():
             'claim': (transfer_cut, 'claim'), 'started-prepared': (transfer_cut, 'prepared'),
             'started-committed': (transfer_cut, 'committed'),
             'sweep-prepared': (sweep_cut, 'prepared'), 'sweep-committed': (sweep_cut, 'committed'),
-            'restart': (restart_offline, None)}
+            'restart': (restart_offline, None), 'held-admission': (held_admission, None)}
         selected = tuple(functions) if args.case == 'all' else (args.case,)
         if args.case in ('all', 'recipes'):
             for kind in ('qos1', 'qos0', 'replay'):
