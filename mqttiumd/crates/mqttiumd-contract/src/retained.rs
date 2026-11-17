@@ -53,6 +53,9 @@ pub(crate) fn check(recipe: &Recipe) -> Result<(), RecipeError> {
         Recipe::RetainedPublication(value) => {
             // Check the legacy-shaped payload without changing its encoding.
             value.admission.check_retained()?;
+            if value.admission.qos == crate::packet::Qos::AtMostOnce {
+                return Err(RecipeError::InvalidField("retained_qos"));
+            }
             if !value.admission.retain {
                 return Err(RecipeError::InvalidField("retained_flag"));
             }
@@ -82,7 +85,8 @@ pub(crate) fn check(recipe: &Recipe) -> Result<(), RecipeError> {
         Recipe::ReplaySubscriptions(value) => {
             value.update.check_retained()?;
             let op = value.update.operation;
-            if value.first_publication.incarnation() != op.incarnation()
+            if value.first_publication.sequence().get() == 0
+                || value.first_publication.incarnation() != op.incarnation()
                 || value.first_publication.epoch() != op.epoch()
                 || value.first_publication.owner() != op.owner()
                 || value

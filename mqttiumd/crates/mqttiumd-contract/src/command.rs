@@ -314,6 +314,16 @@ fn encode_delivery(
 }
 
 impl Recipe {
+    /// The acknowledged admission, including the explicitly versioned retained
+    /// variant. QoS0 deliberately has no exchange-shaped admission.
+    #[must_use]
+    pub fn admission(&self) -> Option<&AdmitPublication> {
+        match self {
+            Self::AdmitPublication(admission) => Some(admission),
+            Self::RetainedPublication(value) => Some(&value.admission),
+            _ => None,
+        }
+    }
     /// The operation this recipe belongs to.
     #[must_use]
     pub fn operation(&self) -> OperationId {
@@ -962,11 +972,19 @@ mod tests {
 
     #[test]
     fn retained_acknowledged_recipe_rejects_qos0() {
-        let Recipe::AdmitPublication(mut admit) = admission(&[]) else { panic!() };
+        let Recipe::AdmitPublication(mut admit) = admission(&[]) else {
+            panic!()
+        };
         admit.retain = true;
         admit.qos = Qos::AtMostOnce;
-        let recipe=Recipe::RetainedPublication(crate::retained::RetainedPublication{admission:admit,retain_targets:0});
-        assert_eq!(recipe.check(),Err(RecipeError::InvalidField("retained_qos")));
+        let recipe = Recipe::RetainedPublication(crate::retained::RetainedPublication {
+            admission: admit,
+            retain_targets: 0,
+        });
+        assert_eq!(
+            recipe.check(),
+            Err(RecipeError::InvalidField("retained_qos"))
+        );
     }
 
     #[test]
