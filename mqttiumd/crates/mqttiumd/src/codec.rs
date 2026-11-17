@@ -990,6 +990,18 @@ fn encode_publication(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn message_expiry_accepts_absent_zero_finite_and_the_maximum_interval() {
+        for interval in [0u32, 1, u32::MAX] {
+            let mut body = b"\0\x01t\x05\x02".to_vec();
+            body.extend_from_slice(&interval.to_be_bytes());
+            body.extend_from_slice(b"payload");
+            let decoded = decode(0x30, &body, BOUNDS);
+            assert!(decoded.is_ok(), "interval {interval}: {decoded:?}");
+        }
+        assert!(decode(0x30, b"\0\x01t\0payload", BOUNDS).is_ok());
+    }
+
+    #[test]
     fn qos0_has_no_mqtt_identifier_ack_or_duplicate_flag() {
         use mqttiumd_contract::packet::{InboundPacket, Qos, SharedBytes};
         assert!(matches!(
