@@ -861,6 +861,9 @@ impl Owner {
         else {
             return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
         };
+        if expiry.is_some_and(|expiry| expiry.deadline().is_err()) {
+            return Err(IMPOSSIBLE);
+        }
         if ingress_order <= self.pubsub.connections.as_slice()[connection].last_qos0_ingress {
             return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
         }
@@ -1411,7 +1414,7 @@ impl Owner {
             route_revision: self.route_revision.ok_or(IMPOSSIBLE)?,
             changes,
         };
-        let recipe = if self.lifecycle_enabled && subscribing {
+        let recipe = if (self.lifecycle_enabled || self.message_now.is_some()) && subscribing {
             let first = draw(
                 &mut draft.counters.publication,
                 PublicationSeq::checked_next,
@@ -2909,12 +2912,14 @@ impl Owner {
                 }
             }
             Change::Written { slot } => {
-                self.pubsub
+                let d = self
+                    .pubsub
                     .deliveries
                     .as_mut_slice()
                     .get_mut(slot)
-                    .ok_or(stale)?
-                    .local_write_completed = true
+                    .ok_or(stale)?;
+                d.local_write_completed = true;
+                d.certain_never_started = false;
             }
         }
         Ok(())
