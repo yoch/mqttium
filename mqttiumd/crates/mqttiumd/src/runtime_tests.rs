@@ -3275,3 +3275,67 @@ fn early_finite_disconnect_keeps_observed_time_when_open_result_is_already_relay
         until(runtime, |r| r.sessions.is_empty());
     });
 }
+
+#[test]
+fn blocked_expiration_keeps_its_reserved_lane_when_ordinary_inputs_are_full() {
+    use crate::session_time::testing::FakeClock;
+    let sample = |tick| SessionClockReading {
+        domain: [45; 32],
+        tick,
+    };
+    let clock = Arc::new(FakeClock::new(sample(0)));
+    with_runtime_clock(128, clock.clone(), |runtime, _| {
+        let (old, mut client) = peer(runtime);
+        let mut connect = connect_packet(b"lane-finite");
+        connect.expiry = SessionExpiry::After(1);
+        runtime.connect(old, connect).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        read_frame(&mut client);
+        let session = runtime.peers[&old].session.unwrap();
+        runtime.close(old, "test_lost").unwrap();
+        until(runtime, |r| {
+            !r.owner.session_status().lifecycle_pending
+                && r.closing_inputs.is_empty()
+                && r.lifecycle_inflight.is_empty()
+        });
+        let (opening, _other) = peer(runtime);
+        runtime
+            .connect(opening, connect_packet(b"held-real-open"))
+            .unwrap();
+        runtime.drain_inputs().unwrap();
+        // A real committed result exists; retain it outside the owner.
+        let held = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            &held,
+            ControlResponse::Lifecycle {
+                reply: StoreReply::Outcome(StoreOutcome::Committed(_)),
+                ..
+            }
+        ));
+        clock.set(sample(1_000_000_000));
+        runtime.expire_sessions().unwrap();
+        assert_eq!(runtime.expiry_inputs.len(), 1);
+        for _ in 0..INPUTS {
+            runtime.queue(Input::WorkAvailable { session }).unwrap();
+        }
+        runtime.drain_inputs().unwrap();
+        assert_eq!(
+            runtime.expiry_inputs.len(),
+            1,
+            "blocked_expiry_escaped_its_reserved_lane"
+        );
+        assert!(
+            !runtime
+                .inputs
+                .iter()
+                .any(|i| matches!(i, Input::ExpireSession { .. })),
+            "blocked_expiry_escaped_its_reserved_lane"
+        );
+        relay_control_reply(runtime, held);
+        until(runtime, |r| !r.sessions.values().any(|s| s.id == session));
+    });
+}
