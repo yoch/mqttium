@@ -935,7 +935,11 @@ impl Runtime<'_> {
                 expiry,
                 detached,
             } => {
-                json!({"action":"Detached","session":session.get().to_string(),"expiry":expiry_json(expiry),"detached_by":operation(detached.operation),"deadline":detached.deadline.map(|n|n.to_string())})
+                let mut details = json!({"action":"Detached","session":session.get().to_string(),"expiry":expiry_json(expiry),"detached_by":operation_text(detached.operation)});
+                if let Some(deadline) = detached.deadline {
+                    details["deadline"] = json!(deadline.to_string());
+                }
+                details
             }
             SessionChange::Closed {
                 session,
