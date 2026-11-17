@@ -100,6 +100,8 @@ struct Peer {
     connected: bool,
     session: Option<SessionId>,
     opened_by: Option<OperationId>,
+    will_managed: bool,
+    will_disconnect: Option<bool>,
     connect_expiry: SessionExpiry,
     disconnect_expiry: Option<SessionExpiry>,
     close_observed_at: Option<u64>,
@@ -125,6 +127,12 @@ struct PendingFrame {
     terminal: Option<Terminal>,
     wire_released: bool,
 }
+struct PendingWillConnect {
+    connect: codec::Connect,
+    previous: Option<ConnectionGeneration>,
+    awaiting: bool,
+    retry_at: Instant,
+}
 struct PendingSession {
     connection: ConnectionGeneration,
     operation: Option<OperationId>,
@@ -135,6 +143,7 @@ struct CloseIntent {
     expiry: SessionExpiry,
     observed_at: u64,
     explicit: bool,
+    will: Option<bool>,
 }
 struct ExpiryTimer {
     guard: SessionGuard,
@@ -173,6 +182,9 @@ struct Runtime<'a> {
     retiring: Vec<net::Connection>,
     sessions: BTreeMap<Vec<u8>, Session>,
     session_requests: BTreeMap<u64, PendingSession>,
+    will_connects: BTreeMap<ConnectionGeneration, PendingWillConnect>,
+    will_reads: Option<EffectId>,
+    last_will_deferred: Option<(OperationId, mqttiumd_core::owner::WillDeferredReason)>,
     next_session_request: u64,
     generation: ConnectionGeneration,
     inputs: VecDeque<Input>,
@@ -358,6 +370,15 @@ impl Runtime<'_> {
             session,
             generation,
         };
+        if let Some(publish) = intent.will {
+            return Some(Input::EndSessionWill {
+                connection,
+                opened_by,
+                expiry: intent.expiry,
+                observed_at: intent.observed_at,
+                publish,
+            });
+        }
         match intent.expiry {
             SessionExpiry::OnDisconnect => Some(Input::EndSession {
                 connection,
@@ -483,6 +504,8 @@ impl Runtime<'_> {
                 connected: false,
                 session: None,
                 opened_by: None,
+                will_managed: false,
+                will_disconnect: None,
                 connect_expiry: SessionExpiry::OnDisconnect,
                 disconnect_expiry: None,
                 close_observed_at: None,
@@ -555,15 +578,21 @@ impl Runtime<'_> {
     fn closing_input(input: &Input) -> bool {
         matches!(
             input,
-            Input::EndSession { .. } | Input::DetachSession { .. } | Input::ConnectionClosed { .. }
+            Input::EndSessionWill { .. }
+                | Input::EndSession { .. }
+                | Input::DetachSession { .. }
+                | Input::ConnectionClosed { .. }
         )
     }
     fn maintenance_input(&self, input: &Input) -> bool {
         matches!(
             input,
-            Input::ReceiptsCollected { .. } | Input::MaintainReceipts
-        ) || matches!(input, Input::StoreResult { operation, .. } if self.owner.lifecycle_operation_is_live(*operation))
-            || matches!(input,Input::Deadline {token,..} if self.owner.collection_deadline_is_live(*token) || self.owner.lifecycle_dispatch().is_some_and(|(_,deadline)| deadline == *token))
+            Input::WillPage { .. }
+                | Input::DiscoverWills
+                | Input::ReceiptsCollected { .. }
+                | Input::MaintainReceipts
+        ) || matches!(input, Input::StoreResult { operation, .. } if self.owner.lifecycle_operation_is_live(*operation) || self.owner.will_operation_is_live(*operation))
+            || matches!(input,Input::Deadline {token,..} if self.owner.collection_deadline_is_live(*token) || self.owner.lifecycle_dispatch().is_some_and(|(_,deadline)| deadline == *token) || self.owner.will_dispatch().is_some_and(|(_,deadline)| deadline == *token))
     }
     fn close(
         &mut self,
@@ -572,6 +601,7 @@ impl Runtime<'_> {
     ) -> Result<(), Failure> {
         if let Some(peer) = self.peers.remove(&generation) {
             self.session_cardinality_dirty = true;
+            self.will_connects.remove(&generation);
             #[cfg(feature = "test-hooks")]
             if let Some(session) = peer.session
                 && self
@@ -599,6 +629,9 @@ impl Runtime<'_> {
                 expiry: peer.disconnect_expiry.unwrap_or(peer.connect_expiry),
                 observed_at,
                 explicit: peer.disconnect_expiry.is_some(),
+                will: peer
+                    .will_managed
+                    .then_some(peer.will_disconnect.unwrap_or(true)),
             };
             for pending in self
                 .session_requests
@@ -813,6 +846,7 @@ impl Runtime<'_> {
                         peer.session = Some(session);
                         peer.opened_by = Some(changed_by);
                         if let Some(intent) = close_intent {
+                            peer.will_disconnect = intent.will;
                             peer.disconnect_expiry = Some(intent.expiry);
                             peer.close_observed_at = Some(intent.observed_at);
                         }
@@ -826,6 +860,7 @@ impl Runtime<'_> {
                                 expiry,
                                 observed_at: 0,
                                 explicit: false,
+                                will: None,
                             })
                         }) && let Some(input) =
                             Self::closure_input(session, generation, Some(changed_by), intent)
@@ -979,9 +1014,9 @@ impl Runtime<'_> {
         let input = self.closing_inputs.pop_front()?;
         let generation = match &input {
             Input::ConnectionClosed { connection } => *connection,
-            Input::EndSession { connection, .. } | Input::DetachSession { connection, .. } => {
-                connection.generation
-            }
+            Input::EndSessionWill { connection, .. }
+            | Input::EndSession { connection, .. }
+            | Input::DetachSession { connection, .. } => connection.generation,
             _ => unreachable!("closing lane classification"),
         };
         if self
@@ -1186,6 +1221,28 @@ impl Runtime<'_> {
                         expiry,
                     }
                 }
+                Input::OpenSessionWillAt {
+                    connection,
+                    client_id,
+                    clean_start,
+                    expiry,
+                    will,
+                    now: _,
+                } => {
+                    if !self.peers.contains_key(&connection) {
+                        self.session_requests
+                            .retain(|_, pending| pending.connection != connection);
+                        continue;
+                    }
+                    Input::OpenSessionWillAt {
+                        connection,
+                        client_id,
+                        clean_start,
+                        expiry,
+                        will,
+                        now: self.session_now()?,
+                    }
+                }
                 Input::OpenSessionAt {
                     connection,
                     client_id,
@@ -1256,9 +1313,9 @@ impl Runtime<'_> {
             };
             let ready_work = self.work_progress_hint(&input);
             let opening = match &input {
-                Input::OpenSession { connection, .. } | Input::OpenSessionAt { connection, .. } => {
-                    Some(*connection)
-                }
+                Input::OpenSessionWillAt { connection, .. }
+                | Input::OpenSession { connection, .. }
+                | Input::OpenSessionAt { connection, .. } => Some(*connection),
                 _ => None,
             };
             let lifecycle_result = match &input {
@@ -1401,6 +1458,19 @@ impl Runtime<'_> {
             }
         }
         self.schedule_maintenance();
+        let deferred = self.owner.will_status().deferred;
+        if deferred != self.last_will_deferred {
+            if let Some((id, reason)) = deferred {
+                let code = match reason {
+                    mqttiumd_core::owner::WillDeferredReason::Fanout => "fanout_capacity",
+                    mqttiumd_core::owner::WillDeferredReason::ReceiptCapacity => "receipt_capacity",
+                    mqttiumd_core::owner::WillDeferredReason::PayloadLimit => "payload_limit",
+                    mqttiumd_core::owner::WillDeferredReason::StoreRefusal => "store_refusal",
+                };
+                self.events.emit("will_deferred",json!({"operation":operation(id),"details":{"code":code,"durable_intention_preserved":true}})).map_err(event_failure)?;
+            }
+            self.last_will_deferred = deferred;
+        }
         self.emit_session_cardinality()?;
         Ok(())
     }
@@ -1436,6 +1506,10 @@ impl Runtime<'_> {
                 || self
                     .owner
                     .lifecycle_dispatch()
+                    .is_some_and(|(_, deadline)| deadline == token)
+                || self
+                    .owner
+                    .will_dispatch()
                     .is_some_and(|(_, deadline)| deadline == token);
             let room = if reserved {
                 self.control_inputs.len() < crate::writer::CONTROL_QUEUE
@@ -1472,6 +1546,8 @@ impl Runtime<'_> {
             inflight: &mut self.inflight,
             lifecycle_inflight: &mut self.lifecycle_inflight,
             lifecycle_operation: self.owner.lifecycle_dispatch().map(|(op, _)| op),
+            will_operation: self.owner.will_dispatch().map(|(op, _)| op),
+            will_reads: &mut self.will_reads,
             work_reads: &mut self.work_reads,
             bindings: &bindings,
             #[cfg(feature = "test-hooks")]
@@ -1516,6 +1592,24 @@ impl Runtime<'_> {
     }
     fn apply_control_response(&mut self, response: ControlResponse) -> Result<(), Failure> {
         match response {
+            ControlResponse::WillBarrier { connection, result } => {
+                let pending = result?;
+                if let Some(waiting) = self.will_connects.get_mut(&connection) {
+                    if !waiting.awaiting {
+                        return Err(Failure::plain("will_barrier_correlation"));
+                    }
+                    waiting.awaiting = false;
+                    if pending {
+                        waiting.retry_at = Instant::now() + Duration::from_millis(100);
+                    } else {
+                        let waiting = self
+                            .will_connects
+                            .remove(&connection)
+                            .expect("checked pending connect");
+                        self.begin_session_open(connection, waiting.connect)?;
+                    }
+                }
+            }
             ControlResponse::Collected {
                 effect,
                 collection,
@@ -1539,6 +1633,18 @@ impl Runtime<'_> {
             } => {
                 if self.lifecycle_inflight.get(&effect) == Some(&operation) {
                     self.lifecycle_inflight.remove(&effect);
+                    if matches!(
+                        reply,
+                        StoreReply::Outcome(StoreOutcome::Committed(
+                            CommitFacts::WillPublished { .. }
+                        ))
+                    ) {
+                        let targets: Vec<_> =
+                            self.sessions.values().map(|session| session.id).collect();
+                        for session in targets {
+                            self.queue_work(session);
+                        }
+                    }
                     if self.control_inputs.len() >= crate::writer::CONTROL_QUEUE {
                         return Err(Failure::plain("core_control_input_budget"));
                     }
@@ -1656,6 +1762,17 @@ impl Runtime<'_> {
                 }
             };
             match response {
+                Response::Wills { effect, result } => {
+                    if self.will_reads.take() != Some(effect) {
+                        return Err(Failure::plain("will_read_correlation"));
+                    }
+                    let page = result.map_err(|e| Failure::read(e, ReadPhase::Work))?;
+                    self.queue(Input::WillPage {
+                        effect,
+                        items: page.items,
+                        next: page.next,
+                    })?;
+                }
                 Response::Store {
                     effect,
                     operation,
@@ -1864,6 +1981,16 @@ impl Runtime<'_> {
         }
     }
     fn discover_work(&mut self) {
+        if self.last_work_scan.elapsed() >= Duration::from_millis(100)
+            && !self
+                .inputs
+                .iter()
+                .any(|input| matches!(input, Input::DiscoverWills))
+        {
+            if self.control_inputs.len() < crate::writer::CONTROL_QUEUE {
+                self.control_inputs.push_back(Input::DiscoverWills);
+            }
+        }
         #[cfg(feature = "test-hooks")]
         if MUTANT_NOTIFICATIONS_ONLY {
             return;
@@ -1926,14 +2053,93 @@ impl Runtime<'_> {
             peer.pending = true;
             peer.connect_expiry = connect.expiry;
         }
-        let now = self.session_now()?;
-        self.queue(Input::OpenSessionAt {
-            now,
+        if let Some(peer) = self.peers.get_mut(&generation) {
+            peer.will_managed = connect.will.is_some();
+        }
+        let old = self
+            .sessions
+            .get(connect.client_id.as_slice())
+            .and_then(|session| self.owner.connection_of(session.id));
+        if let Some(old) = old.filter(|old| *old != generation) {
+            // The old transport closes before the new Will/Open can be accepted.
+            if let Some(peer) = self.peers.get_mut(&old) {
+                let bytes = codec::disconnect_reason(0x8e);
+                if peer
+                    .io
+                    .outgoing
+                    .try_send(net::Write {
+                        expiry: None,
+                        correlation: None,
+                        bytes,
+                    })
+                    .is_ok()
+                {
+                    peer.closing = Some(("session_taken_over", Instant::now()));
+                } else {
+                    self.close(old, "session_taken_over")?;
+                }
+            }
+        }
+        self.will_connects.insert(
+            generation,
+            PendingWillConnect {
+                connect,
+                previous: old.filter(|old| *old != generation),
+                awaiting: false,
+                retry_at: Instant::now(),
+            },
+        );
+        self.pump_will_connects()?;
+        Ok(())
+    }
+    fn begin_session_open(
+        &mut self,
+        generation: ConnectionGeneration,
+        connect: codec::Connect,
+    ) -> Result<(), Failure> {
+        if !self.peers.contains_key(&generation) {
+            return Ok(());
+        }
+        self.queue(Input::OpenSessionWillAt {
+            now: self.session_now()?,
             connection: generation,
             client_id: connect.client_id,
             clean_start: connect.clean_start,
             expiry: connect.expiry,
-        })?;
+            will: connect.will,
+        })
+    }
+    fn pump_will_connects(&mut self) -> Result<(), Failure> {
+        let ready: Vec<_> = self
+            .will_connects
+            .iter()
+            .filter(|(_, pending)| {
+                !pending.awaiting
+                    && pending.retry_at <= Instant::now()
+                    && pending
+                        .previous
+                        .is_none_or(|old| !self.peers.contains_key(&old))
+            })
+            .take(4)
+            .map(|(id, _)| *id)
+            .collect();
+        for connection in ready {
+            let pending = self
+                .will_connects
+                .get_mut(&connection)
+                .expect("selected pending connect");
+            let request = ControlRequest::WillBarrier {
+                connection,
+                client: pending.connect.client_id.clone(),
+            };
+            match self.writer.control_sender.try_send(request) {
+                Ok(()) => pending.awaiting = true,
+                Err(TrySendError::Full(_)) => break,
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(Failure::plain("writer_control_disconnected"));
+                }
+            }
+        }
         Ok(())
     }
     #[cfg(test)]
@@ -2038,7 +2244,10 @@ impl Runtime<'_> {
         match decoded {
             Packet::TimedPublish { .. } => Err(Failure::plain("timed_publish_not_anchored")),
             Packet::Connect(connect) => self.connect(generation, connect),
-            Packet::Disconnect { expiry } => {
+            Packet::Disconnect {
+                expiry,
+                publish_will,
+            } => {
                 if p.connect_expiry == SessionExpiry::OnDisconnect
                     && expiry.is_some_and(|value| value != SessionExpiry::OnDisconnect)
                 {
@@ -2059,6 +2268,7 @@ impl Runtime<'_> {
                     }
                     return self.close(generation, "packet_refused");
                 }
+                p.will_disconnect = Some(publish_will);
                 p.disconnect_expiry = expiry;
                 p.close_observed_at = Some(observed_at);
                 if let Some(pending) = self
@@ -2070,6 +2280,7 @@ impl Runtime<'_> {
                         expiry: expiry.unwrap_or(p.connect_expiry),
                         observed_at,
                         explicit: expiry.is_some(),
+                        will: p.will_managed.then_some(publish_will),
                     });
                 }
                 // Earlier decoded packets precede this close in the TCP stream.
@@ -2263,6 +2474,7 @@ impl Runtime<'_> {
         Ok(false)
     }
     fn connections(&mut self) -> Result<(), Failure> {
+        self.pump_will_connects()?;
         let keys: Vec<_> = self.peers.keys().copied().collect();
         for generation in keys {
             self.wire_progress(generation)?;
@@ -2864,6 +3076,8 @@ struct Sink<'a> {
     inflight: &'a mut BTreeMap<EffectId, OperationId>,
     lifecycle_inflight: &'a mut BTreeMap<EffectId, OperationId>,
     lifecycle_operation: Option<OperationId>,
+    will_operation: Option<OperationId>,
+    will_reads: &'a mut Option<EffectId>,
     work_reads: &'a mut BTreeMap<EffectId, SessionId>,
     bindings: &'a BTreeMap<SessionId, ConnectionGeneration>,
     #[cfg(feature = "test-hooks")]
@@ -3161,7 +3375,10 @@ impl EffectSink for Sink<'_> {
                 SubmitResult::Accepted
             }
             Effect::Persist { command }
-                if matches!(command.recipe.get(), Recipe::SessionLifecycle(_)) =>
+                if matches!(
+                    command.recipe.get(),
+                    Recipe::SessionLifecycle(_) | Recipe::WillPublication(_)
+                ) =>
             {
                 if let Recipe::SessionLifecycle(lifecycle) = command.recipe.get()
                     && let SessionAction::Open {
@@ -3169,6 +3386,10 @@ impl EffectSink for Sink<'_> {
                         ..
                     }
                     | SessionAction::OpenAt {
+                        expected: Some(guard),
+                        ..
+                    }
+                    | SessionAction::OpenWillAt {
                         expected: Some(guard),
                         ..
                     } = &lifecycle.action
@@ -3308,7 +3529,8 @@ impl EffectSink for Sink<'_> {
                 }
             }
             Effect::ResolveAndFence { operation }
-                if self.lifecycle_operation == Some(*operation) =>
+                if self.lifecycle_operation == Some(*operation)
+                    || self.will_operation == Some(*operation) =>
             {
                 self.submit_lifecycle(effect)
             }
@@ -3516,6 +3738,24 @@ impl EffectSink for Sink<'_> {
                 });
                 let _ = effect.into_parts();
                 SubmitResult::Accepted
+            }
+            Effect::LoadWills { .. } => {
+                if self.will_reads.is_some() {
+                    return refused(effect, SubmitBlock::InFlightLimit);
+                }
+                match self.writer.sender.try_send(Request::Effect(effect)) {
+                    Ok(()) => {
+                        *self.will_reads = Some(id);
+                        SubmitResult::Accepted
+                    }
+                    Err(TrySendError::Full(Request::Effect(effect))) => {
+                        refused(effect, SubmitBlock::QueueFull)
+                    }
+                    Err(TrySendError::Disconnected(Request::Effect(effect))) => {
+                        refused(effect, SubmitBlock::Closed)
+                    }
+                    _ => unreachable!(),
+                }
             }
             Effect::LoadWork { session, .. } => {
                 if self.work_reads.len() >= IN_FLIGHT {
@@ -3750,8 +3990,17 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
             "message_expiry_domain":hex_domain(value.expiry.observed.domain),"message_expiry_tick":value.expiry.observed.tick.to_string(),"message_expiry_interval":value.expiry.interval});
     }
     match recipe {
+        Recipe::WillPublication(value) => {
+            json!({"will":operation(value.will),"publication":format!("{:?}",value.publication),"destinations":value.targets.len(),"topic_bytes":value.topic.len(),"payload_bytes":value.payload.length.get()})
+        }
         Recipe::SessionLifecycle(lifecycle) => match &lifecycle.action {
             SessionAction::Open {
+                expected,
+                clean_start,
+                expiry,
+                ..
+            }
+            | SessionAction::OpenWillAt {
                 expected,
                 clean_start,
                 expiry,
@@ -3764,6 +4013,14 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
                 ..
             } => {
                 json!({"action":"Open","clean_start":clean_start,"expiry":expiry_json(*expiry),"expected_session":expected.map(|g|g.session.get().to_string())})
+            }
+            SessionAction::EndWill {
+                guard,
+                expiry,
+                observed_at,
+                publish,
+            } => {
+                json!({"action":"EndWill","session":guard.session.get().to_string(),"opened_by":guard.opened_by.map(operation_text),"expiry":expiry_json(*expiry),"observed_at":observed_at.to_string(),"publish":publish})
             }
             SessionAction::Detach {
                 guard,
@@ -4002,6 +4259,9 @@ fn run_inner(
         retiring: Vec::new(),
         sessions: boot.sessions,
         session_requests: BTreeMap::new(),
+        will_connects: BTreeMap::new(),
+        will_reads: None,
+        last_will_deferred: None,
         next_session_request: 0,
         generation: ConnectionGeneration::new(0),
         inputs: VecDeque::new(),

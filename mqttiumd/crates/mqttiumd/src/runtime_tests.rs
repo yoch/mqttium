@@ -113,6 +113,9 @@ fn with_runtime_clock_hooks(
         retiring: Vec::new(),
         sessions: boot.sessions,
         session_requests: BTreeMap::new(),
+        will_connects: BTreeMap::new(),
+        will_reads: None,
+        last_will_deferred: None,
         next_session_request: 0,
         generation: ConnectionGeneration::new(0),
         inputs: VecDeque::new(),
@@ -238,6 +241,8 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             connected: false,
             session: None,
             opened_by: None,
+            will_managed: false,
+            will_disconnect: None,
             connect_expiry: SessionExpiry::OnDisconnect,
             disconnect_expiry: None,
             close_observed_at: None,
@@ -256,6 +261,7 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
 
 fn connect_packet(client: &[u8]) -> codec::Connect {
     codec::Connect {
+        will: None,
         client_id: SharedBytes::copy_from(client, BOUNDS.max_client_id).unwrap(),
         clean_start: false,
         expiry: SessionExpiry::Never,
@@ -264,6 +270,29 @@ fn connect_packet(client: &[u8]) -> codec::Connect {
         receive_maximum: 8,
         topic_alias_maximum: 0,
         request_problem_information: true,
+    }
+}
+
+// The new Will existence barrier is a real writer read preceding Open.
+// Service this preflight without fabricating, consuming or weakening the
+// authentic lifecycle result that each boundary regression retains.
+fn next_control_reply(runtime: &mut Runtime<'_>) -> ControlResponse {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .expect("control reply budget");
+        let response = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(remaining)
+            .unwrap();
+        if matches!(&response, ControlResponse::WillBarrier { .. }) {
+            runtime.apply_control_response(response).unwrap();
+            runtime.drain_inputs().unwrap();
+        } else {
+            return response;
+        }
     }
 }
 
@@ -1494,13 +1523,14 @@ fn concatenated_subscription_waits_for_connack(known: bool) {
             .write_all(&connect_then_subscribe(client_id))
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !runtime.inputs.iter().any(|input| matches!(input, Input::OpenSession { connection, .. } | Input::OpenSessionAt {connection,..} if *connection == generation))
+        while !runtime.inputs.iter().any(|input| matches!(input, Input::OpenSessionWillAt { connection, .. } | Input::OpenSession { connection, .. } | Input::OpenSessionAt {connection,..} if *connection == generation))
             && Instant::now() < deadline
         {
+            runtime.writer_results().unwrap();
             runtime.connections().unwrap();
             thread::sleep(Duration::from_millis(1));
         }
-        assert!(runtime.inputs.iter().any(|input| matches!(input, Input::OpenSession { connection, .. } | Input::OpenSessionAt {connection,..} if *connection == generation)), "every fresh or known CONNECT reaches the correlated owner lifecycle path");
+        assert!(runtime.inputs.iter().any(|input| matches!(input, Input::OpenSessionWillAt { connection, .. } | Input::OpenSession { connection, .. } | Input::OpenSessionAt {connection,..} if *connection == generation)), "every fresh or known CONNECT reaches the correlated owner lifecycle path");
         assert!(runtime.peers[&generation].pending);
         assert!(
             !runtime.peers[&generation].connected,
@@ -2978,11 +3008,7 @@ fn a_real_duplicated_message_expiry_reply_cannot_reapply_removed_deliveries() {
         clock.set(sample(1_000_000_100));
         runtime.message_expiry_scan = Instant::now() - Duration::from_millis(101);
         runtime.expire_messages().unwrap();
-        let response = runtime
-            .writer
-            .control_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
+        let response = next_control_reply(runtime);
         let ControlResponse::MessageExpiry {
             result: Ok(sweep), ..
         } = &response
@@ -3039,11 +3065,7 @@ fn a_stopped_clock_cannot_reuse_a_completed_message_expiry_header() {
         runtime.message_expiry_scan = Instant::now() - Duration::from_millis(101);
         runtime.expire_messages().unwrap();
         let first_header = runtime.message_expiry_request.unwrap();
-        let first = runtime
-            .writer
-            .control_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
+        let first = next_control_reply(runtime);
         let duplicate = first.clone();
         runtime.apply_control_response(first).unwrap();
         runtime.message_expiry_scan = Instant::now() - Duration::from_millis(101);
@@ -3064,11 +3086,7 @@ fn a_stopped_clock_cannot_reuse_a_completed_message_expiry_header() {
             Some(next_header),
             "stale_expiry_reply_retargeted_to_new_scan"
         );
-        let next = runtime
-            .writer
-            .control_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
+        let next = next_control_reply(runtime);
         runtime.apply_control_response(next).unwrap();
         assert!(runtime.message_expiry_request.is_none());
         let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
@@ -3119,11 +3137,7 @@ fn all_pages_of_a_real_message_expiry_scan_keep_the_first_observation() {
         runtime.message_expiry_scan = Instant::now() - Duration::from_millis(101);
         runtime.expire_messages().unwrap();
         let first_header = runtime.message_expiry_request.unwrap();
-        let first = runtime
-            .writer
-            .control_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
+        let first = next_control_reply(runtime);
         assert!(
             matches!(&first,ControlResponse::MessageExpiry{result:Ok(sweep),..} if sweep.retained_removed==4&&sweep.next.is_some())
         );
@@ -3136,11 +3150,7 @@ fn all_pages_of_a_real_message_expiry_scan_keep_the_first_observation() {
             "message_expiry_page_changed_frozen_time"
         );
         assert_ne!(next_header.1, first_header.1);
-        let second = runtime
-            .writer
-            .control_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap();
+        let second = next_control_reply(runtime);
         assert!(
             matches!(&second,ControlResponse::MessageExpiry{result:Ok(sweep),..} if sweep.retained_removed==1)
         );
@@ -3178,16 +3188,8 @@ fn the_real_writer_duplicate_expiry_hook_is_applied_once() {
         |runtime, directory| {
             runtime.message_expiry_scan = Instant::now() - Duration::from_millis(101);
             runtime.expire_messages().unwrap();
-            let first = runtime
-                .writer
-                .control_receiver
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap();
-            let duplicate = runtime
-                .writer
-                .control_receiver
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap();
+            let first = next_control_reply(runtime);
+            let duplicate = next_control_reply(runtime);
             assert!(
                 matches!((&first,&duplicate),(ControlResponse::MessageExpiry{result:Ok(a),..},ControlResponse::MessageExpiry{result:Ok(b),..}) if Arc::ptr_eq(a,b)),
                 "duplicate_hook_did_not_share_the_authentic_result"
@@ -3230,11 +3232,7 @@ fn a_lost_real_expiry_reply_retries_its_frozen_header_and_observes_empty_success
             runtime.message_expiry_scan = Instant::now() - Duration::from_millis(101);
             runtime.expire_messages().unwrap();
             let frozen = runtime.message_expiry_request.unwrap();
-            let unknown = runtime
-                .writer
-                .control_receiver
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap();
+            let unknown = next_control_reply(runtime);
             assert!(
                 matches!(&unknown,ControlResponse::MessageExpiryUnknown{now,after} if (*now,*after)==frozen)
             );
@@ -3244,11 +3242,7 @@ fn a_lost_real_expiry_reply_retries_its_frozen_header_and_observes_empty_success
             clock.set(sample(1_000_000_100));
             runtime.expire_messages().unwrap();
             assert_eq!(runtime.message_expiry_request, Some(frozen));
-            let reply = runtime
-                .writer
-                .control_receiver
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap();
+            let reply = next_control_reply(runtime);
             assert!(
                 matches!(&reply,ControlResponse::MessageExpiry{now,after,result:Ok(sweep)} if (*now,*after)==frozen&&sweep.removed.is_empty())
             );
@@ -3314,11 +3308,7 @@ fn repeated_real_expiry_reply_loss_stops_at_the_finite_retry_budget() {
                 runtime.expire_messages().unwrap();
                 let header = runtime.message_expiry_request.unwrap();
                 assert_eq!(*frozen.get_or_insert(header), header);
-                let unknown = runtime
-                    .writer
-                    .control_receiver
-                    .recv_timeout(Duration::from_secs(2))
-                    .unwrap();
+                let unknown = next_control_reply(runtime);
                 assert!(
                     matches!(&unknown,ControlResponse::MessageExpiryUnknown{now,after} if (*now,*after)==header)
                 );
@@ -3350,11 +3340,7 @@ fn disconnect_zero_applies_open_already_relayed_during_its_own_drain() {
             .connect(generation, connect_packet(b"draining-end"))
             .unwrap();
         runtime.drain_inputs().unwrap();
-        let response = runtime
-            .writer
-            .control_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        let response = next_control_reply(runtime);
         assert!(
             matches!(
                 &response,
@@ -3405,11 +3391,7 @@ fn disconnect_zero_before_connack_ends_the_exact_committed_infinite_open() {
             .connect(generation, connect_packet(b"early-end"))
             .unwrap();
         runtime.drain_inputs().unwrap();
-        let response = runtime
-            .writer
-            .control_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        let response = next_control_reply(runtime);
         let ControlResponse::Lifecycle {
             operation,
             reply:
@@ -3616,11 +3598,7 @@ fn real_accept_reserves_both_future_close_facts_behind_a_held_lifecycle() {
         });
         runtime.close(confirmed[0], "test_hold_close").unwrap();
         runtime.drain_inputs().unwrap();
-        let committed = runtime
-            .writer
-            .control_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        let committed = next_control_reply(runtime);
         assert!(
             matches!(
                 committed,
@@ -3811,11 +3789,7 @@ fn bounded_shutdown_reports_an_authentic_unknown_open_without_fabricating_reject
             .connect(generation, connect_packet(b"shutdown-unknown"))
             .unwrap();
         runtime.drain_inputs().unwrap();
-        let actual = runtime
-            .writer
-            .control_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        let actual = next_control_reply(runtime);
         let ControlResponse::Lifecycle {
             operation,
             reply:
@@ -4036,11 +4010,7 @@ fn early_finite_disconnect_keeps_observed_time_when_open_result_is_already_relay
             .connect(generation, connect_packet(b"finite-early-end"))
             .unwrap();
         runtime.drain_inputs().unwrap();
-        let response = runtime
-            .writer
-            .control_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        let response = next_control_reply(runtime);
         relay_control_reply(runtime, response);
         clock.set(sample(2_000_000_000));
         runtime
@@ -4093,11 +4063,7 @@ fn blocked_expiration_keeps_its_reserved_lane_when_ordinary_inputs_are_full() {
             .unwrap();
         runtime.drain_inputs().unwrap();
         // A real committed result exists; retain it outside the owner.
-        let held = runtime
-            .writer
-            .control_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        let held = next_control_reply(runtime);
         assert!(matches!(
             &held,
             ControlResponse::Lifecycle {
@@ -4177,11 +4143,7 @@ fn certain_detach_failure_is_observable_instead_of_losing_offline_expiration() {
                 Effect::ResolveAndFence { operation },
             )))
             .unwrap();
-        let response = runtime
-            .writer
-            .control_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        let response = next_control_reply(runtime);
         let ControlResponse::Lifecycle { reply, .. } = response else {
             panic!("actual writer fence result")
         };
@@ -4238,11 +4200,7 @@ fn coalesced_clock_cas_reply_does_not_hide_an_uncheckpointed_interval() {
         runtime.last_clock_checkpoint = Instant::now() - Duration::from_secs(31);
         runtime.expire_sessions().unwrap();
         runtime.expire_sessions().unwrap();
-        let response = runtime
-            .writer
-            .control_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        let response = next_control_reply(runtime);
         assert!(
             matches!(&response,ControlResponse::ClockCheckpoint {result:Ok(anchor),..} if anchor.logical==2_000_000_000)
         );
@@ -4253,11 +4211,7 @@ fn coalesced_clock_cas_reply_does_not_hide_an_uncheckpointed_interval() {
         );
         assert!(runtime.clock_checkpoint.is_none());
         runtime.expire_sessions().unwrap();
-        let response = runtime
-            .writer
-            .control_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        let response = next_control_reply(runtime);
         assert!(
             matches!(&response,ControlResponse::ClockCheckpoint {result:Ok(anchor),..} if anchor.logical==5_000_000_000)
         );
