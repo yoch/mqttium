@@ -223,8 +223,31 @@ pub enum FrameProgress {
 /// It is moved, never copied: a step either consumes it or hands it back.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Input {
+    OpenSessionWillAt {
+        connection: ConnectionGeneration,
+        client_id: SharedBytes,
+        clean_start: bool,
+        expiry: crate::session::SessionExpiry,
+        now: u64,
+        will: Option<crate::will::WillSpec>,
+    },
+    EndSessionWill {
+        connection: ConnectionKey,
+        opened_by: Option<OperationId>,
+        expiry: crate::session::SessionExpiry,
+        observed_at: u64,
+        publish: bool,
+    },
+    DiscoverWills,
+    WillPage {
+        effect: EffectId,
+        items: BoundedVec<crate::will::WillIntent>,
+        next: Option<OperationId>,
+    },
     /// Current domain/tick supplied by the clock adapter, outside the pure core.
-    MessageClock { now: MessageTime },
+    MessageClock {
+        now: MessageTime,
+    },
     /// Absolute identities removed by bounded receiptless writer maintenance.
     MessagesExpired {
         deliveries: BoundedVec<ExpiredDelivery>,
@@ -294,7 +317,9 @@ pub enum Input {
         session_present: bool,
     },
     /// The transport permanently closed this non-reused generation.
-    ConnectionClosed { connection: ConnectionGeneration },
+    ConnectionClosed {
+        connection: ConnectionGeneration,
+    },
     /// A validated packet, its connection and its ingress order.
     Packet {
         connection: ConnectionGeneration,
@@ -325,7 +350,9 @@ pub enum Input {
         progress: FrameProgress,
     },
     /// A wake-up. It carries no authority to create an obligation.
-    WorkAvailable { session: SessionId },
+    WorkAvailable {
+        session: SessionId,
+    },
     /// An armed deadline was reached at this explicit time.
     Deadline {
         token: DeadlineToken,
@@ -359,6 +386,10 @@ pub enum CloseReason {
 /// An effect: a responsibility transferred to an adapter.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Effect {
+    LoadWills {
+        after: Option<OperationId>,
+        limit: u32,
+    },
     /// A known failed session establishment has no invented SessionId.
     /// Reason is a valid MQTT 5 CONNACK failure code; transport then closes.
     SessionRefused {

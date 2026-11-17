@@ -365,6 +365,12 @@ pub struct WorkPage {
     pub next: Option<DeliveryId>,
 }
 
+#[derive(PartialEq, Eq, Debug)]
+pub struct WillPage {
+    pub items: BoundedVec<mqttiumd_contract::will::WillIntent>,
+    pub next: Option<OperationId>,
+}
+
 /// Everything that survives a crash. It is also the snapshot of a store:
 /// two stores in the same durable state compare equal, and every
 /// collection is ordered by its key.
@@ -376,6 +382,8 @@ pub struct RetainedRecord {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DurableState {
+    /// Independent intentions; Pending entries outlive their source session.
+    pub wills: BTreeMap<OperationId, mqttiumd_contract::will::WillIntent>,
     pub ledger: EpochLedger,
     /// Closed epochs up to this one had their receipts collected; zero
     /// when nothing was collected.
@@ -662,6 +670,14 @@ pub trait DurableStore {
     ) -> Result<WorkPage, ReadError> {
         Err(ReadError::Unavailable)
     }
+
+    /// Bounded pending Will inventory. No notification is required for discovery.
+    fn read_wills(
+        &self,
+        after: Option<OperationId>,
+        limit: usize,
+        budget: ReadBudget,
+    ) -> Result<WillPage, ReadError>;
 
     /// The durable state, for inspection.
     fn snapshot(&self) -> Result<DurableState, ReadError> {

@@ -96,6 +96,23 @@ pub enum SessionEndReason {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SessionAction {
+    /// Will-aware Open, new kind8/action5. None explicitly replaces an old Will.
+    OpenWillAt {
+        client_id: SharedBytes,
+        expected: Option<SessionGuard>,
+        clean_start: bool,
+        expiry: SessionExpiry,
+        now: u64,
+        will: Option<crate::will::WillSpec>,
+    },
+    /// Cancel or publish this exact attachment's Will, then apply retention.
+    /// The captured closure observation never moves on retry/Resolve.
+    EndWill {
+        guard: SessionGuard,
+        expiry: SessionExpiry,
+        observed_at: u64,
+        publish: bool,
+    },
     Open {
         client_id: SharedBytes,
         expected: Option<SessionGuard>,
@@ -170,8 +187,9 @@ pub enum SessionChange {
 
 impl SessionLifecycle {
     pub(crate) fn check(&self) -> Result<(), RecipeError> {
-        if let SessionAction::Open { client_id, .. } | SessionAction::OpenAt { client_id, .. } =
-            &self.action
+        if let SessionAction::Open { client_id, .. }
+        | SessionAction::OpenAt { client_id, .. }
+        | SessionAction::OpenWillAt { client_id, .. } = &self.action
             && (client_id.is_empty()
                 || client_id.len() > MAX_SESSION_CLIENT_BYTES
                 || client_id.as_slice().contains(&0)
@@ -179,12 +197,26 @@ impl SessionLifecycle {
         {
             return Err(RecipeError::InvalidField("session_client_id"));
         }
+        if let SessionAction::OpenWillAt {
+            will: Some(will), ..
+        } = &self.action
+        {
+            will.check()?;
+        }
         match &self.action {
             SessionAction::Open {
                 expiry: SessionExpiry::After(_),
                 ..
             } => return Err(RecipeError::InvalidField("legacy_session_expiry")),
-            SessionAction::OpenAt {
+            SessionAction::OpenWillAt {
+                expiry: SessionExpiry::After(value),
+                ..
+            }
+            | SessionAction::EndWill {
+                expiry: SessionExpiry::After(value),
+                ..
+            }
+            | SessionAction::OpenAt {
                 expiry: SessionExpiry::After(value),
                 ..
             }
@@ -195,6 +227,11 @@ impl SessionLifecycle {
                 return Err(RecipeError::InvalidField("session_expiry"));
             }
             SessionAction::Detach {
+                expiry,
+                observed_at,
+                ..
+            }
+            | SessionAction::EndWill {
                 expiry,
                 observed_at,
                 ..
@@ -210,6 +247,41 @@ impl SessionLifecycle {
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.operation.to_be_bytes());
         match &self.action {
+            SessionAction::OpenWillAt {
+                client_id,
+                expected,
+                clean_start,
+                expiry,
+                now,
+                will,
+            } => {
+                out.push(5);
+                out.push(u8::from(*clean_start));
+                encode_expiry(out, *expiry);
+                out.push(u8::from(expected.is_some()));
+                if let Some(guard) = expected {
+                    encode_guard(out, *guard);
+                }
+                out.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+                out.extend_from_slice(client_id.as_slice());
+                out.extend_from_slice(&now.to_be_bytes());
+                out.push(u8::from(will.is_some()));
+                if let Some(spec) = will {
+                    spec.encode(out);
+                }
+            }
+            SessionAction::EndWill {
+                guard,
+                expiry,
+                observed_at,
+                publish,
+            } => {
+                out.push(6);
+                encode_guard(out, *guard);
+                encode_expiry(out, *expiry);
+                out.extend_from_slice(&observed_at.to_be_bytes());
+                out.push(u8::from(*publish));
+            }
             SessionAction::Open {
                 client_id,
                 expected,
@@ -288,6 +360,45 @@ impl SessionLifecycle {
     pub(crate) fn decode(bytes: &mut &[u8]) -> Result<Self, RecipeError> {
         let operation = read_operation(bytes)?;
         let action = match read_byte(bytes)? {
+            5 => {
+                let clean_start = read_bool(bytes)?;
+                let expiry = read_expiry(bytes)?;
+                let expected = if read_bool(bytes)? {
+                    Some(read_guard(bytes)?)
+                } else {
+                    None
+                };
+                let raw = take(bytes, 2)?;
+                let n = usize::from(u16::from_be_bytes([raw[0], raw[1]]));
+                if n > MAX_SESSION_CLIENT_BYTES {
+                    return Err(RecipeError::InvalidField("session_client_id"));
+                }
+                let client_id = SharedBytes::copy_from(take(bytes, n)?, MAX_SESSION_CLIENT_BYTES)
+                    .map_err(|_| RecipeError::AllocationFailed)?;
+                let now = read_u64(bytes)?;
+                let will = if read_bool(bytes)? {
+                    let mut reader = crate::command::Reader { bytes };
+                    let value = crate::will::WillSpec::decode(&mut reader)?;
+                    *bytes = reader.bytes;
+                    Some(value)
+                } else {
+                    None
+                };
+                SessionAction::OpenWillAt {
+                    client_id,
+                    expected,
+                    clean_start,
+                    expiry,
+                    now,
+                    will,
+                }
+            }
+            6 => SessionAction::EndWill {
+                guard: read_guard(bytes)?,
+                expiry: read_expiry(bytes)?,
+                observed_at: read_u64(bytes)?,
+                publish: read_bool(bytes)?,
+            },
             0 => {
                 let clean_start = read_bool(bytes)?;
                 let expiry = match read_byte(bytes)? {

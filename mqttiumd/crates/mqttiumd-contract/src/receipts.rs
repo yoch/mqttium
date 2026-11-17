@@ -126,10 +126,12 @@ impl ReceiptClass {
         match recipe {
             Recipe::SessionLifecycle(change) => match change.action {
                 crate::session::SessionAction::Open { .. }
-                | crate::session::SessionAction::OpenAt { .. } => Self::Business,
+                | crate::session::SessionAction::OpenAt { .. }
+                | crate::session::SessionAction::OpenWillAt { .. } => Self::Business,
                 crate::session::SessionAction::Close { .. }
                 | crate::session::SessionAction::Detach { .. }
-                | crate::session::SessionAction::Expire { .. } => Self::Control,
+                | crate::session::SessionAction::Expire { .. }
+                | crate::session::SessionAction::EndWill { .. } => Self::Control,
             },
             Recipe::ExpiringPublication(_)
             | Recipe::TimedReplaySubscriptions(_)
@@ -139,7 +141,8 @@ impl ReceiptClass {
             | Recipe::AdmitPublication(_)
             | Recipe::ChangeSubscriptions(_)
             | Recipe::UpdateSubscriptions(_) => Self::Business,
-            Recipe::ReleaseInbound(_)
+            Recipe::WillPublication(_)
+            | Recipe::ReleaseInbound(_)
             | Recipe::MarkDeliveryStarted(_)
             | Recipe::ExpireDelivery(_)
             | Recipe::ClaimDelivery(_)

@@ -29,6 +29,7 @@ pub mod pubsub;
 pub mod receipts;
 pub mod session;
 pub mod step;
+pub mod will;
 
 pub mod topic;
 

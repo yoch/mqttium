@@ -266,6 +266,7 @@ impl Eq for UpdateSubscriptions {}
 /// The closed set of durable recipes of the received perimeter.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Recipe {
+    WillPublication(crate::will::WillPublication),
     ExpiringPublication(ExpiringPublication),
     TimedReplaySubscriptions(TimedReplaySubscriptions),
     MarkDeliveryStarted(MarkDeliveryStarted),
@@ -370,6 +371,7 @@ impl Recipe {
     #[must_use]
     pub fn operation(&self) -> OperationId {
         match self {
+            Self::WillPublication(value) => value.operation,
             Self::ExpiringPublication(value) => match &value.admission {
                 ExpiringAdmission::Qos12(value) => value.admission.operation,
                 ExpiringAdmission::Qos0(value) => value.operation,
@@ -394,6 +396,7 @@ impl Recipe {
     /// Checks the internal consistency the canonical layout relies on.
     pub fn check(&self) -> Result<(), RecipeError> {
         match self {
+            Self::WillPublication(value) => value.check(),
             Self::ExpiringPublication(value) => value.check(),
             Self::TimedReplaySubscriptions(value) => value.check(),
             Self::MarkDeliveryStarted(_) => Ok(()),
@@ -441,6 +444,7 @@ impl Recipe {
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
         match self {
+            Self::WillPublication(value) => value.encode(out),
             Self::ExpiringPublication(value) => value.encode(out)?,
             Self::TimedReplaySubscriptions(value) => value.encode(out)?,
             Self::MarkDeliveryStarted(value) => {
@@ -559,6 +563,11 @@ impl Recipe {
             return Err(RecipeError::UnknownFormat(format));
         }
         let recipe = match reader.u8()? {
+            17 => Self::WillPublication(crate::will::WillPublication::decode(
+                &mut reader,
+                max_targets,
+                max_topic_len,
+            )?),
             13 => Self::ExpiringPublication(ExpiringPublication::decode(
                 &mut reader,
                 max_targets,

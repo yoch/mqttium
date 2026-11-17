@@ -15,6 +15,10 @@ use crate::ids::{
 /// The durable facts established by a committed command.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CommitFacts {
+    WillPublished {
+        will: OperationId,
+        publication: PublicationId,
+    },
     RetainedQos0Stored {
         publication: PublicationId,
     },
