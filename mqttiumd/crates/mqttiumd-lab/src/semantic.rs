@@ -1768,7 +1768,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
         &'static [(&'static str, KeyKind)],
         &'static str,
     );
-    const TABLES: [Table; 10] = [
+    const TABLES: [Table; 11] = [
         (
             "/receipt_frontiers",
             &[
@@ -1779,6 +1779,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
             "/origin",
         ),
         ("/sessions", &[("/session", KeyKind::Decimal)], "/session"),
+        ("/retained", &[("/topic_hex", KeyKind::Bytes)], "/topic_hex"),
         (
             "/route_table/routes",
             &[("/topic_hex", KeyKind::Bytes)],
@@ -2115,6 +2116,37 @@ mod tests {
             "{:?}",
             found.intersection(&narrow)
         );
+    }
+
+    #[test]
+    fn retained_inventory_keys_are_sorted_and_never_repeated() {
+        let row = serde_json::json!({
+            "topic_hex": "7a",
+            "publication_id": {"incarnation":"1", "epoch":"1", "owner":"0", "sequence":"1"},
+            "producer_client_id_hex": "70"
+        });
+        let mut document = serde_json::json!({"retained": [row.clone(), row]});
+        let mut diagnostics = Vec::new();
+        store_snapshot(&document, &mut diagnostics);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|problem| problem.code == code::DUPLICATE_NAME
+                    && problem.pointer.starts_with("/retained/1/"))
+        );
+        document["retained"][1]["topic_hex"] = serde_json::json!("61");
+        diagnostics.clear();
+        store_snapshot(&document, &mut diagnostics);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|problem| problem.code == code::ROWS_OUT_OF_ORDER
+                    && problem.pointer.starts_with("/retained/1/"))
+        );
+        document["retained"][0]["topic_hex"] = serde_json::json!("30");
+        diagnostics.clear();
+        store_snapshot(&document, &mut diagnostics);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     /// The recipe of the snapshot example is what the contract crate

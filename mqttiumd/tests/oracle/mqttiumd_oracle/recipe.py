@@ -21,6 +21,11 @@ CONSUME_DELIVERY = 6
 UPDATE_SUBSCRIPTIONS = 7
 SESSION_LIFECYCLE = 8
 SUBSCRIPTION_OPTIONS = 9
+RETAINED_PUBLICATION = 10
+RETAINED_QOS0 = 11
+REPLAY_SUBSCRIPTIONS = 12
+MAX_RETAINED_REPLAYS = 256
+MAX_RETAINED_TARGETS = 16
 MAX_SESSION_CLIENT_BYTES = 1024
 
 
@@ -56,6 +61,38 @@ class Admit:
     targets: tuple
 
     kind = "AdmitPublication"
+
+
+@dataclass(frozen=True)
+class RetainedPublication:
+    admission: Admit
+    retain_targets: int
+
+    kind = "RetainedPublication"
+
+    @property
+    def operation(self) -> tuple:
+        return self.admission.operation
+
+
+@dataclass(frozen=True)
+class RetainedQos0:
+    operation: tuple
+    request: tuple
+    publication: tuple
+    session: int
+    session_revision: int
+    connection: int
+    ingress_order: int
+    route_revision: int
+    topic: bytes
+    payload: tuple
+    payload_length: int
+    costs: tuple
+    targets: tuple
+    retain_targets: int
+
+    kind = "RetainedQos0"
 
 
 @dataclass(frozen=True)
@@ -125,6 +162,22 @@ class GrantedSubscriptionChange:
 @dataclass(frozen=True)
 class UpdateSubscriptions(Subscriptions):
     kind = "UpdateSubscriptions"
+
+
+@dataclass(frozen=True)
+class ReplaySubscriptions:
+    update: UpdateSubscriptions
+    first_publication: tuple
+
+    kind = "ReplaySubscriptions"
+
+    @property
+    def operation(self) -> tuple:
+        return self.update.operation
+
+    @property
+    def last_publication(self) -> tuple:
+        return self.first_publication[:3] + (self.first_publication[3] + MAX_RETAINED_REPLAYS - 1,)
 
 
 @dataclass(frozen=True)
@@ -256,7 +309,31 @@ def _valid_filter(topic: bytes) -> bool:
                for index, level in enumerate(levels))
 
 
-def decode(data: bytes):
+def _valid_topic(topic: bytes) -> bool:
+    if not topic or len(topic) > 65535 or any(byte in topic for byte in (0, 35, 43)):
+        return False
+    try:
+        topic.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _retained_mask(mask: int, count: int) -> None:
+    if count > MAX_RETAINED_TARGETS or mask >> count:
+        raise RecipeError("invalid retain targets")
+
+
+def _nested(reader: _Reader, allowed: tuple[int, ...]):
+    # Inspect the child tag before calling decode: extensions cannot nest and
+    # attacker-controlled recursive headers cannot consume Python stack space.
+    nested = reader.take(reader.number(4))
+    if len(nested) < 7 or nested[6] not in allowed:
+        raise RecipeError("invalid retained nested kind")
+    return decode(nested, _target_limit=MAX_RETAINED_TARGETS)
+
+
+def decode(data: bytes, *, _target_limit: int | None = None):
     """The recipe ``data`` holds, or ``RecipeError``."""
     reader = _Reader(data)
     if reader.take(4) != MAGIC:
@@ -264,7 +341,41 @@ def decode(data: bytes):
     if reader.number(2) != FORMAT:
         raise RecipeError("unknown format")
     kind = reader.number(1)
-    if kind == ADMIT_PUBLICATION:
+    if kind == RETAINED_PUBLICATION:
+        admission = _nested(reader, (ADMIT_PUBLICATION,))
+        mask = reader.number(2)
+        if admission.qos not in (1, 2) or not admission.retain:
+            raise RecipeError("invalid retained admission")
+        _retained_mask(mask, len(admission.targets))
+        if any(target.effective_qos > 2 or target.cause != 1 for target in admission.targets):
+            raise RecipeError("invalid retained target")
+        recipe = RetainedPublication(admission, mask)
+    elif kind == RETAINED_QOS0:
+        operation, request, publication = reader.scoped(), reader.scoped(), reader.scoped()
+        session, revision, connection, order, route_revision = (reader.number(8) for _ in range(5))
+        topic = reader.take(reader.number(2))
+        payload, length = reader.scoped(), reader.number(8)
+        costs = tuple(reader.number(8) for _ in range(4))
+        count = reader.number(1)
+        if count > MAX_RETAINED_TARGETS:
+            raise RecipeError("invalid retained target count")
+        targets = tuple(Target(reader.number(8), reader.number(8), reader.number(4),
+                               reader.number(1), reader.number(1)) for _ in range(count))
+        mask = reader.number(2)
+        _retained_mask(mask, count)
+        if (not _valid_topic(topic)
+                or order == 0 or any(target.effective_qos > 2 or target.cause != 1 for target in targets)):
+            raise RecipeError("invalid retained QoS0 field")
+        recipe = RetainedQos0(operation, request, publication, session, revision, connection,
+                              order, route_revision, topic, payload, length, costs, targets, mask)
+    elif kind == REPLAY_SUBSCRIPTIONS:
+        update = _nested(reader, (UPDATE_SUBSCRIPTIONS, SUBSCRIPTION_OPTIONS))
+        first = reader.scoped()
+        if (first[:3] != update.operation[:3] or first[3] == 0
+                or first[3] + MAX_RETAINED_REPLAYS - 1 > 0xFFFF_FFFF_FFFF_FFFF):
+            raise RecipeError("invalid replay identity range")
+        recipe = ReplaySubscriptions(update, first)
+    elif kind == ADMIT_PUBLICATION:
         operation, request, publication = reader.scoped(), reader.scoped(), reader.scoped()
         session, revision = reader.number(8), reader.number(8)
         packet_id, generation = reader.number(2), reader.number(8)
@@ -273,6 +384,9 @@ def decode(data: bytes):
         topic = reader.take(reader.number(2))
         payload, length = reader.scoped(), reader.number(8)
         costs = tuple(reader.number(8) for _ in range(4))
+        count = reader.number(2)
+        if _target_limit is not None and count > _target_limit:
+            raise RecipeError("invalid retained target count")
         targets = tuple(
             Target(
                 reader.number(8),
@@ -281,7 +395,7 @@ def decode(data: bytes):
                 reader.number(1),
                 reader.number(1),
             )
-            for _ in range(reader.number(2))
+            for _ in range(count)
         )
         if packet_id == 0 or qos > 2 or retain > 1:
             raise RecipeError("invalid field")

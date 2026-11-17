@@ -1015,6 +1015,7 @@ _SNAPSHOT_KEYS = [
     ("/fences", [("/operation_id", "scoped")], "/operation_id"),
     ("/payloads", [("/payload_id", "scoped")], "/payload_id"),
     ("/publications", [("/publication_id", "scoped")], "/publication_id"),
+    ("/retained", [("/topic_hex", "bytes")], "/topic_hex"),
     ("/obligations", [("/publication_id", "scoped"), ("/index", "integer")], ""),
     (
         "/inbound_exchanges",
@@ -1049,7 +1050,7 @@ def _store_snapshot(contracts, document, out):
     _by_schema(contracts, document, out)
     for table, members, suffix in _SNAPSHOT_KEYS:
         previous = None
-        for index, row in enumerate(_get(document, table)):
+        for index, row in enumerate(_get(document, table) or ()):
             try:
                 key = sum((_sort_key(_get(row, member), kind) for member, kind in members), ())
             except ValueError:

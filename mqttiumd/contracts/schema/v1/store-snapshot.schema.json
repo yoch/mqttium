@@ -270,7 +270,8 @@
                             "DeliveryClaimed",
                             "DeliveryFinished",
                             "DeliveryConsumed",
-                            "SessionLifecycle"
+                            "SessionLifecycle",
+                            "RetainedQos0Stored"
                           ]
                         }
                       },
@@ -506,6 +507,34 @@
                               }
                             }
                           }
+                        },
+                        {
+                          "if": {
+                            "required": [
+                              "kind"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "RetainedQos0Stored"
+                              }
+                            }
+                          },
+                          "then": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "kind",
+                              "publication_id"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "RetainedQos0Stored"
+                              },
+                              "publication_id": {
+                                "$ref": "primitives.schema.json#/$defs/publication_id"
+                              }
+                            }
+                          }
                         }
                       ]
                     }
@@ -599,7 +628,7 @@
       "maxItems": 65536
     },
     "payloads": {
-      "description": "Payload objects, by PayloadId. A payload goes when its last obligation ends.",
+      "description": "Immutable payload objects, by PayloadId. A payload disappears when its last recipient or retained reference ends.",
       "type": "array",
       "items": {
         "type": "object",
@@ -622,7 +651,7 @@
           },
           "references": {
             "$ref": "primitives.schema.json#/$defs/u64",
-            "description": "Live obligations that refer to the payload."
+            "description": "Live obligations plus the current retained reference that refer to this immutable payload."
           }
         }
       },
@@ -664,6 +693,17 @@
           },
           "payload_id": {
             "$ref": "primitives.schema.json#/$defs/payload_id"
+          },
+          "retained_version": {
+            "description": "Original immutable retained version for a distinct replay publication. Omitted/null for an ordinary publication.",
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "primitives.schema.json#/$defs/publication_id"
+              }
+            ]
           }
         }
       },
@@ -701,7 +741,8 @@
           },
           "cause": {
             "enum": [
-              "LiveExact"
+              "LiveExact",
+              "RetainedReplay"
             ]
           },
           "effective_qos": {
@@ -711,6 +752,10 @@
             "enum": [
               "Queued"
             ]
+          },
+          "retain": {
+            "description": "Frozen outgoing RETAIN flag; omitted means false in legacy evidence. Never reconstructed from current subscription options.",
+            "type": "boolean"
           }
         }
       },
@@ -872,6 +917,35 @@
       "maxItems": 64,
       "items": {
         "$ref": "primitives.schema.json#/$defs/receipt_closure"
+      }
+    },
+    "retained": {
+      "description": "Current retained references sorted by exact topic bytes. Omitted means the legacy empty retained inventory. Producer ClientID remains meaningful after its session is destroyed.",
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "topic_hex",
+          "publication_id",
+          "producer_client_id_hex"
+        ],
+        "properties": {
+          "topic_hex": {
+            "$ref": "primitives.schema.json#/$defs/hex_bytes",
+            "minLength": 2,
+            "maxLength": 2048
+          },
+          "publication_id": {
+            "$ref": "primitives.schema.json#/$defs/publication_id"
+          },
+          "producer_client_id_hex": {
+            "$ref": "primitives.schema.json#/$defs/hex_bytes",
+            "minLength": 2,
+            "maxLength": 131070
+          }
+        }
       }
     }
   }

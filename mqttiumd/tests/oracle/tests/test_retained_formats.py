@@ -72,6 +72,9 @@ class RetainedCanonicalReader(unittest.TestCase):
         self.assertFalse(hasattr(found, "packet_id"))
         self.assertFalse(hasattr(found, "exchange_generation"))
 
+    def test_published_topic_name_does_not_use_subscription_filter_restrictions(self):
+        self.assertEqual(recipe.decode(qos0(topic=b"$share/literal")).topic, b"$share/literal")
+
     def test_replay_preserves_ordered_steps_and_the_complete_reserved_range(self):
         found = recipe.decode(subscription())
         self.assertEqual(found.kind, "ReplaySubscriptions")

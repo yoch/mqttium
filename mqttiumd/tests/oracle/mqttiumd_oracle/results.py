@@ -168,6 +168,7 @@ FIXTURE_QOS0_SCOPE = (
 FIXTURE_RECEIPT_SCOPE = "the fixture-based qualifier does not cover live receipt retirement"
 FIXTURE_SESSION_SCOPE = "the fixture-based qualifier does not cover product session lifecycle"
 FIXTURE_ROUTING_SCOPE = "the fixture-based qualifier does not cover hierarchical or No Local routing"
+FIXTURE_RETAINED_SCOPE = "the fixture-based qualifier does not cover retained storage or replay"
 
 
 def _product_session(row):
@@ -203,6 +204,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
     unsupported, non_qos2, uncorroborated, qos0_delivery = False, False, False, False
     receipt_retirement = False
     session_lifecycle = False
+    retained = False
     # The independent fixture assertions intentionally retain their exact-topic
     # semantics. New readable route/options evidence must not broaden them.
     hierarchical_routing = any(
@@ -211,6 +213,11 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         for route in getattr(run, "fixture", {}).get("routes", ())
     )
     for _, snapshot in run.snapshots.values():
+        retained |= bool(snapshot.get("retained", ()))
+        retained |= any(row.get("retain", False) or row.get("retained_version") is not None
+                        for row in snapshot.get("publications", ()))
+        retained |= any(row.get("retain", False) or row.get("cause") == "RetainedReplay"
+                        for row in snapshot.get("obligations", ()))
         hierarchical_routing |= any(
             any(byte in bytes.fromhex(route["topic_hex"]) for byte in (35, 43))
             or any(target.get("options", 0) != 0 for target in route.get("targets", ()))
@@ -231,6 +238,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
                 unsupported |= recipe[6] in (3, 4, 5, 7, 9)
                 qos0_delivery |= recipe[6] == 6
                 session_lifecycle |= recipe[6] == 8
+                retained |= recipe[6] in (10, 11, 12)
             try:
                 decoded = recipes.decode(recipe)
             except recipes.RecipeError:
@@ -243,6 +251,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
             }
             qos0_delivery |= facts.get("kind") == "DeliveryConsumed"
             session_lifecycle |= facts.get("kind") == "SessionLifecycle"
+            retained |= facts.get("kind") == "RetainedQos0Stored"
     for record in run.trace.records:
         payload = record.payload
         unsupported |= payload.get("command_kind") in {
@@ -250,6 +259,8 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         }
         qos0_delivery |= payload.get("command_kind") == "ConsumeDelivery"
         session_lifecycle |= payload.get("command_kind") == "SessionLifecycle"
+        retained |= payload.get("command_kind") in {"RetainedPublication", "RetainedQos0", "ReplaySubscriptions"}
+        retained |= record.kind == "ClientBytesReceived" and payload.get("retain", False)
         non_qos2 |= (record.kind == "ClientBytesReceived"
                      and payload.get("packet_kind") == "PUBLISH"
                      and payload.get("qos", 2) != 2)
@@ -294,7 +305,9 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         [FIXTURE_QOS0_SCOPE] if qos0_delivery else []
     ) + ([FIXTURE_RECEIPT_SCOPE] if receipt_retirement else []) + (
         [FIXTURE_SESSION_SCOPE] if session_lifecycle else []
-    ) + ([FIXTURE_ROUTING_SCOPE] if hierarchical_routing else [])
+    ) + ([FIXTURE_ROUTING_SCOPE] if hierarchical_routing else []) + (
+        [FIXTURE_RETAINED_SCOPE] if retained else []
+    )
 
 
 def _broker_unmet(contracts, manifest, trace_path):
