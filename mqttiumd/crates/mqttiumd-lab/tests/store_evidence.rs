@@ -1142,3 +1142,96 @@ fn route_options_survive_snapshot_and_recovery_serialization_without_default_noi
     );
     accepted(&workspace(), &written);
 }
+
+#[test]
+fn legacy_snapshots_omit_default_retained_extension_fields() {
+    let mut world = World::with_limits(&memory, fixture_limits());
+    let command = world.admission(1, 7, b"payload", &[world.b, world.c]);
+    assert!(world.store.apply(&command).committed_now);
+    let written = snapshot(&world.store.snapshot().unwrap(), CONTEXT);
+    assert!(
+        written.get("retained").is_none(),
+        "legacy_retained_defaults_changed"
+    );
+    for publication in written["publications"].as_array().unwrap() {
+        assert!(
+            publication.get("retained_version").is_none(),
+            "legacy_retained_defaults_changed"
+        );
+    }
+    for obligation in written["obligations"].as_array().unwrap() {
+        assert!(
+            obligation.get("retain").is_none(),
+            "legacy_retained_defaults_changed"
+        );
+    }
+}
+
+#[test]
+fn retained_snapshot_preserves_current_ownership_frozen_versions_and_wire_flags() {
+    use mqttiumd_contract::pubsub::SubscriptionOptions;
+    use mqttiumd_contract::retained::{ReplaySubscriptions, RetainedPublication};
+    let mut world = World::with_limits(&memory, fixture_limits());
+    let legacy = world.admission(1, 7, b"retained", &[world.b]);
+    let mut bytes = Vec::new();
+    legacy.recipe.get().encode_canonical(&mut bytes).unwrap();
+    let Recipe::AdmitPublication(mut admission) =
+        Recipe::decode_canonical(&bytes, 16, 256).unwrap()
+    else {
+        panic!()
+    };
+    admission.retain = true;
+    admission.costs.references = References::new(2);
+    let retained = Command {
+        recipe: FrozenRecipe::freeze(Recipe::RetainedPublication(RetainedPublication {
+            admission,
+            retain_targets: 1,
+        }))
+        .unwrap(),
+        payload: legacy.payload,
+    };
+    assert!(world.store.apply(&retained).committed_now);
+    let replay = Command {
+        recipe: FrozenRecipe::freeze(Recipe::ReplaySubscriptions(ReplaySubscriptions {
+            update: UpdateSubscriptions {
+                operation: operation_id(world.epoch, 2),
+                session: world.c,
+                session_revision: Revision::new(1),
+                route_revision: world.route_revision,
+                changes: BoundedVec::from_slice(
+                    &[GrantedSubscriptionChange {
+                        topic: SharedBytes::copy_from(b"p1/#", 256).unwrap(),
+                        granted: Some(Qos::AtLeastOnce),
+                        options: SubscriptionOptions::DEFAULT,
+                    }],
+                    8,
+                )
+                .unwrap(),
+            },
+            first_publication: publication_id(world.epoch, 1000),
+        }))
+        .unwrap(),
+        payload: None,
+    };
+    assert!(world.store.apply(&replay).committed_now);
+    let written = snapshot(&world.store.snapshot().unwrap(), CONTEXT);
+    let retained = written["retained"].as_array().unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0]["topic_hex"], "70312f6578616d706c65");
+    assert_eq!(
+        retained[0]["producer_client_id_hex"],
+        "70312d70726f6475636572"
+    );
+    assert_eq!(retained[0]["publication_id"]["sequence"], "1");
+    let publications = written["publications"].as_array().unwrap();
+    let replay = publications
+        .iter()
+        .find(|p| p["publication_id"]["sequence"] == "1000")
+        .unwrap();
+    assert_eq!(replay["retained_version"]["sequence"], "1");
+    assert_eq!(written["obligations"].as_array().unwrap().len(), 2);
+    for obligation in written["obligations"].as_array().unwrap() {
+        assert_eq!(obligation["retain"], true);
+    }
+    accepted(&workspace(), &written);
+}
