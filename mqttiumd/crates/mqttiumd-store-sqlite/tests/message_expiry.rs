@@ -284,3 +284,8 @@ fn empty_retained_clear_still_creates_its_live_publication() {
 fn timed_replay_cannot_observe_before_the_message_origin() {
     expiry::timed_replay_cannot_observe_before_the_message_origin(&sqlite);
 }
+
+#[test]
+fn maintenance_retry_skips_admissions_after_the_frozen_observation() {
+    expiry::maintenance_retry_skips_admissions_after_the_frozen_observation(&sqlite);
+}

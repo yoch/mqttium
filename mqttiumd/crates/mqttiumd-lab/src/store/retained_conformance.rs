@@ -1317,16 +1317,63 @@ pub mod expiry {
         );
         commit(&mut w.store, &c);
         let before = w.store.snapshot().unwrap();
+        let result = w.store.expire_messages(at(19), None, 4).unwrap();
+        assert_eq!(result.retained_removed, 1);
+        assert_eq!(result.removed.len(), 1);
+        let after = w.store.snapshot().unwrap();
         assert_eq!(
-            w.store.expire_messages(at(19), None, 4),
-            Err(ReadError::InvalidData),
-            "future_origin_was_treated_as_expired"
+            after.publications.get(&publication_id(w.epoch, 3)),
+            before.publications.get(&publication_id(w.epoch, 3)),
+            "maintenance_aged_a_later_admission"
         );
+        assert_eq!(after.accounts.references.get(), 1);
+    }
+
+    pub fn maintenance_retry_skips_admissions_after_the_frozen_observation<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        let mut w = World::with_limits(make, limits());
+        clock(&mut w.store, at(0));
+        let old = expiring(
+            admitted(&w, 1, b"expiry/old", b"old", Qos::AtLeastOnce, &[w.b]),
+            lifetime(1),
+        );
+        commit(&mut w.store, &old);
+        let frozen = at(1);
+        let lost = w.store.expire_messages(frozen, None, 4).unwrap();
+        assert_eq!(lost.removed.len(), 1);
+        assert_eq!(lost.retained_removed, 1);
+        clock(&mut w.store, at(2));
+        let later_expiry = MessageExpiry {
+            observed: at(2),
+            interval: 1,
+        };
+        let new = expiring(
+            admitted(&w, 2, b"expiry/later", b"new", Qos::AtLeastOnce, &[w.b]),
+            later_expiry,
+        );
+        commit(&mut w.store, &new);
+        let before = w.store.snapshot().unwrap();
+        let retry = w
+            .store
+            .expire_messages(frozen, None, 4)
+            .expect("maintenance_retry_mistook_newer_admission_for_clock_regression");
+        assert!(retry.removed.is_empty());
+        assert_eq!(retry.retained_removed, 0);
+        assert_eq!(retry.quarantined, 0);
         assert_eq!(
             w.store.snapshot().unwrap(),
             before,
-            "partial maintenance survived temporal refusal"
+            "maintenance_retry_changed_later_admission"
         );
+        assert_eq!(
+            w.store.read_work(w.b, None, 8).unwrap().items.as_slice()[0].expiry,
+            Some(later_expiry)
+        );
+        let current = w.store.expire_messages(at(3), None, 4).unwrap();
+        assert_eq!(current.removed.len(), 1);
+        assert_eq!(current.retained_removed, 1);
+        assert_eq!(w.store.snapshot().unwrap().accounts.references.get(), 0);
     }
 
     pub fn timed_commands_require_the_current_boot_authority<S: DurableStore>(
@@ -1575,6 +1622,7 @@ pub mod expiry {
     }
 
     pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
+        maintenance_retry_skips_admissions_after_the_frozen_observation(make);
         timed_replay_cannot_observe_before_the_message_origin(make);
         timed_commands_require_the_current_boot_authority(make);
         timed_replay_rejection_reserves_the_full_identity_range(make);
