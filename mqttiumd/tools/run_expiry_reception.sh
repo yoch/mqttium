@@ -78,6 +78,8 @@ expiry_record source-archive git -C "$expiry_repo" archive --format=tar "$expiry
 git -C "$expiry_repo" archive --format=tar "$expiry_sha" >"$expiry_out/source.tar"
 expiry_record pilot-tests "$expiry_python" -m unittest discover -s tests/system -p 'test_expiry_reception.py' -v
 "$expiry_python" -m unittest discover -s tests/system -p 'test_expiry_reception.py' -v >"$expiry_out/pilot-tests.log" 2>&1
+expiry_record product-event-schema-pilot "$expiry_python" -m unittest discover -s tests/system -p 'test_product_events.py' -v
+"$expiry_python" -m unittest discover -s tests/system -p 'test_product_events.py' -v >"$expiry_out/product-event-schema-pilot.log" 2>&1
 cargo tree -p mqttiumd --no-default-features --locked --format '{p} features={f}' >"$expiry_out/normal-features.txt"
 expiry_record normal-build cargo build -p mqttiumd --no-default-features --locked --target-dir "$expiry_targets/normal"
 cargo build -p mqttiumd --no-default-features --locked --target-dir "$expiry_targets/normal" >"$expiry_out/normal-build.log" 2>&1
@@ -109,6 +111,8 @@ expiry_run() {
 }
 expiry_run normal normal "$expiry_out/binaries/mqttiumd-normal"
 expiry_run faults faults "$expiry_out/binaries/mqttiumd-hooks"
+expiry_record product-event-schema-check "$expiry_python" tools/check_product_event_stream.py "$expiry_out/normal" "$expiry_out/faults" --out "$expiry_out/product-event-streams.json"
+"$expiry_python" tools/check_product_event_stream.py "$expiry_out/normal" "$expiry_out/faults" --out "$expiry_out/product-event-streams.json" >"$expiry_out/product-event-streams.log" 2>&1
 expiry_record compiled-negative-controls "$expiry_python" tools/run_expiry_mutants.py "$expiry_out/mutants"
 MQTTIUMD_EXPIRY_MUTANT_TARGET_ROOT="${MQTTIUMD_EXPIRY_MUTANT_TARGET_ROOT:-$expiry_targets/mutants}" \
     "$expiry_python" tools/run_expiry_mutants.py "$expiry_out/mutants" >"$expiry_out/mutants.log" 2>&1
@@ -117,6 +121,10 @@ from pathlib import Path
 import hashlib,json,sys
 out=Path(sys.argv[1]); normal=json.loads((out/'normal/receipt.json').read_text())
 faults=json.loads((out/'faults/receipt.json').read_text())
+product_events=json.loads((out/'product-event-streams.json').read_text())
+if (product_events['status']!='PASS' or product_events['product_events']<1
+        or product_events['scope']!='strict-json-and-schema-only'):
+    raise SystemExit('actual product event streams must pass strict/schema checks')
 for name,receipt in [('normal',normal),('faults',faults)]:
     if receipt['status']!='PASS' or receipt['source_head']!=sys.argv[2] or receipt['harness_source_head']!=sys.argv[2]:
         raise SystemExit(f'{name} expiry source/verdict differs')
@@ -152,6 +160,10 @@ index={'format':'mqttiumd.finite-expiry-system-reception-index','schema_version'
        'system_witnesses':'same-run-strace' if int(sys.argv[3]) else 'process-status-only',
        'normal':{'receipt':'normal/receipt.json','binary':normal['binary']},
        'faults':{'receipt':'faults/receipt.json','binary':faults['binary']},
+       'product_event_schema':{'result':'product-event-streams.json',
+                               'product_events':product_events['product_events'],
+                               'stream_files':len(product_events['files']),
+                               'scope':'strict-json-and-schema-only'},
        'negative_controls':{'result':'mutants/result.json','reasons':sorted(expected_reasons),
                             'restored':True},
        'limitations':['Finite system evidence, not independent-oracle qualification.',
