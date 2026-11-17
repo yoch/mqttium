@@ -76,6 +76,42 @@ def expiry_stamp(publication):
     return {'domain': domain, 'tick': str(int(tick, 16)), 'interval': interval}
 
 
+def original_copies(state, original_id, stamp):
+    values = state['tables']['publications']
+    require(any(row['id'] == original_id for row in values) and all(
+            (row['id'] == original_id or row.get('retained_version') == original_id) and
+            expiry_stamp(row) == stamp for row in values), 'message_expiry_replay_changed_original_stamp')
+    return [row['id'] for row in values]
+
+
+def offline_inventory(state, cells):
+    # ADR0026 keeps effective-QoS0 obligations from durable admissions while
+    # their target is absent. Initially QoS0 non-retained input is volatile.
+    expected = {cell['topic']: cell for cell in cells if cell['published_qos'] != 0 or cell['retain']}
+    publications = {bytes.fromhex(row['topic']).decode(): row for row in state['tables']['publications']}
+    obligations = state['tables']['obligations']
+    payloads = {row['id']: row for row in state['tables']['payloads']}
+    require(set(publications) == set(expected) and len(obligations) == len(payloads) == len(expected),
+            'message_expiry_offline_positive_inventory_missing', repr(state['counts']))
+    by_id = {row['id']: expected[topic] for topic, row in publications.items()}
+    require({row['publication'] for row in obligations} == set(by_id) and all(
+            row['qos'] == min(by_id[row['publication']]['published_qos'], by_id[row['publication']]['granted_qos'])
+            for row in obligations), 'message_expiry_offline_copy_qos_or_identity_wrong')
+    for topic, publication in publications.items():
+        cell = expected[topic]
+        require(expiry_stamp(publication) == {key: cell['ingress']['details'][key]
+                for key in ('domain', 'tick', 'interval')}, 'message_expiry_offline_original_stamp_changed')
+        payload = bytes.fromhex(payloads[publication['payload']]['bytes'])
+        require(hashlib.sha256(payload).hexdigest() == cell['payload_sha256'],
+                'message_expiry_offline_durable_payload_wrong')
+    retained = {bytes.fromhex(row['topic']).decode(): row['publication'] for row in state['tables']['retained']}
+    require(retained == {cell['topic']: publications[cell['topic']]['id'] for cell in cells if cell['retain']},
+            'message_expiry_offline_retained_inventory_wrong')
+    counts = {qos: sum(row['qos'] == qos for row in obligations) for qos in (0, 1)}
+    return {'pending_qos0': counts[0], 'pending_qos1': counts[1], 'retained': len(retained),
+            'publications': len(publications), 'payloads': len(payloads)}
+
+
 async def until_state(broker, predicate, code, timeout=8):
     deadline = time.monotonic() + timeout
     state = None
@@ -247,8 +283,9 @@ async def offline(binary, case):
                                       'granted_qos': granted, 'retain': retain, 'topic': topic,
                                       'payload_sha256': hashlib.sha256(payload).hexdigest(), 'ingress': received})
         admitted = snapshot(broker, 'offline-admitted')
-        require(admitted['counts']['obligations'] == 8 and admitted['counts']['retained'] == 12,
-                'message_expiry_offline_positive_inventory_missing', repr(admitted['counts']))
+        admitted_inventory = offline_inventory(admitted, cells)
+        require(admitted_inventory == {'pending_qos0': 12, 'pending_qos1': 8, 'retained': 12,
+                'publications': 20, 'payloads': 20}, 'message_expiry_offline_positive_inventory_missing')
         require(admitted['counts']['outbound'] == 0, 'message_expiry_offline_work_started_without_recipient')
         final = await until_state(broker, physically_drained, 'message_expiry_offline_references_not_reclaimed')
         write_json(case / 'offline-expired.sql.json', final)
@@ -278,6 +315,7 @@ async def offline(binary, case):
         writer_available(broker.db)
         return {'criterion': 'offline', 'status': 'PASS', 'ready': ready, 'cells': cells,
                 'admitted_counts': admitted['counts'], 'expired_counts': final['counts'],
+                'admitted_inventory': admitted_inventory,
                 'resumed_sessions': resumed, 'process_status': broker.process.returncode}
     finally:
         if broker.db.is_file():
@@ -321,9 +359,7 @@ async def original_ttl(binary, case):
         retained_row = await newcomer.receive(payload, 1, True)
         retained_wire = one_delivery(newcomer_tap, payload, 1, True, 1)
         replayed = snapshot(broker, 'original-after-replays')
-        require(len(replayed['tables']['publications']) == 1 and
-                expiry_stamp(replayed['tables']['publications'][0]) == stamp,
-                'message_expiry_replay_changed_original_stamp')
+        copies = original_copies(replayed, admitted['tables']['publications'][0]['id'], stamp)
         final = await until_state(broker, physically_drained, 'message_expiry_original_deadline_was_reset')
         elapsed = time.monotonic_ns() - started
         require(elapsed < 3_000_000_000, 'message_expiry_original_deadline_was_reset', str(elapsed))
@@ -337,6 +373,7 @@ async def original_ttl(binary, case):
         return {'criterion': 'original-ttl', 'status': 'PASS', 'ready': ready,
                 'original_ttl': 2, 'delay_before_replay_seconds': 1.1, 'elapsed_ns': str(elapsed),
                 'ingress': ingress, 'original_durable_stamp': stamp,
+                'observed_original_and_replay_copies': copies,
                 'offline_delivery': offline_row, 'offline_wire': offline_wire,
                 'retained_delivery': retained_row, 'retained_wire': retained_wire,
                 'expired_counts': final['counts'], 'process_status': broker.process.returncode}
@@ -633,6 +670,70 @@ async def minimal(binary, case):
         broker.cleanup()
 
 
+async def capacity(binary, case):
+    """Thirty-two finite retained values expire and return a real quota slot."""
+    from retained_reception import business_state
+    broker = Broker(binary, case)
+    peers = []
+    try:
+        ready = broker.ready()
+        require(ready['details']['retained_topics'] == 32, 'message_expiry_retained_quota_changed')
+        source, source_tap = await peer('mqttium', broker, case, 'capacity-source', session_expiry=0)
+        peers.append((source, source_tap))
+        started = time.monotonic_ns()
+        for index in range(32):
+            await source.publish(f'message-expiry/capacity/{index:02}', f'expiring-slot:{index:02}'.encode(),
+                                 1, retain=True, message_expiry=2)
+        full = snapshot(broker, 'capacity-full')
+        require(full['counts']['retained'] == full['counts']['publications'] == full['counts']['payloads'] == 32
+                and pending_drained(full) and int(full['tables']['meta'][0]['used_references'], 16) == 32,
+                'message_expiry_capacity_was_not_full', repr(full['counts']))
+        before = business_state(full)
+        refused = await source.publish_rejected('message-expiry/capacity/overflow', b'no-room-before-expiry',
+                                                 reason=0x97, retain=True, message_expiry=2)
+        negative = [frame for frame in source_tap.server_frames() if frame.kind == 0x40 and
+                    frame.ack()[0] == refused['packet_id']]
+        require(len(negative) == 1 and negative[0].ack() == (refused['packet_id'], 0x97),
+                'message_expiry_capacity_negative_puback_not_observed')
+        after_refusal = snapshot(broker, 'capacity-after-refusal')
+        require(business_state(after_refusal) == before, 'message_expiry_capacity_refusal_partially_mutated')
+        expired = await until_state(broker, physically_drained, 'message_expiry_capacity_not_physically_reclaimed')
+        elapsed = time.monotonic_ns() - started
+        require(elapsed >= 1_900_000_000, 'message_expiry_capacity_retired_before_original_ttl')
+        write_json(case / 'capacity-expired.sql.json', expired)
+        payload = b'new-retained-value-fits-after-physical-expiry'
+        await source.publish('message-expiry/capacity/overflow', payload, 1, retain=True)
+        accepted = snapshot(broker, 'capacity-new-accepted')
+        require(accepted['counts']['retained'] == accepted['counts']['publications'] ==
+                accepted['counts']['payloads'] == 1, 'message_expiry_capacity_slot_not_returned')
+        target, tap = await peer('paho', broker, case, 'capacity-target', session_expiry=0)
+        peers.append((target, tap))
+        await target.subscribe((Subscription('message-expiry/capacity/#', 1),))
+        delivered = await target.receive(payload, 1, True)
+        wire = one_delivery(tap, payload, 1, True, None)
+        await target.no_message(.04)
+        await target.unsubscribe(('message-expiry/capacity/#',))
+        await source.publish('message-expiry/capacity/overflow', b'', 1, retain=True)
+        final = await until_state(broker, physically_drained, 'message_expiry_capacity_witness_clear_leaked')
+        write_json(case / 'capacity-final.sql.json', final)
+        await close_peers(peers)
+        peers = []
+        broker.stop()
+        writer_available(broker.db)
+        return {'criterion': 'capacity', 'status': 'PASS', 'ready': ready, 'full_retained_topics': 32,
+                'ttl_seconds': 2, 'elapsed_before_reclamation_ns': str(elapsed),
+                'overflow': refused, 'negative_wire': {'header': negative[0].header,
+                    'body_hex': negative[0].body.hex()}, 'refusal_business_unchanged': True,
+                'full_counts': full['counts'], 'expired_counts': expired['counts'],
+                'new_accepted_counts': accepted['counts'], 'delivery': delivered, 'wire': wire,
+                'final_counts': final['counts'], 'process_status': broker.process.returncode}
+    finally:
+        if broker.db.is_file():
+            snapshot(broker, 'last-observed')
+        await close_peers(peers, cleanup=True)
+        broker.cleanup()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
@@ -640,7 +741,7 @@ def main():
     parser.add_argument('--binary-source-head', required=True)
     functions = {'minimal': minimal, 'matrix': matrix, 'offline': offline,
                  'original-ttl': original_ttl, 'replay32': replay32, 'options': options,
-                 'late-puback': late_puback, 'malformed': malformed}
+                 'late-puback': late_puback, 'malformed': malformed, 'capacity': capacity}
     parser.add_argument('--case', choices=('normal', *functions), default='normal')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)

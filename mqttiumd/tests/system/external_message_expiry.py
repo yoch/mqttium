@@ -44,6 +44,27 @@ class MqttiumMessageExpiry(MqttiumRetained):
                         completion_scope='local-write-only' if qos == 0 else 'MQTT acknowledgement')
         return receipt.mid
 
+    async def publish_rejected(self, topic, payload, *, reason, retain=True, message_expiry=None):
+        """Require the public QoS1 receipt's exact typed MQTT refusal."""
+        from mqttium import PublishRejectedError
+        expiry = interval(message_expiry)
+        props = None if expiry is None else Properties({'message_expiry_interval': expiry})
+        receipt = await self.client.publish(topic, payload, qos=1, retain=retain,
+                                            properties=props, timeout=TIMEOUT)
+        self.log.record('publication_submitted', qos=1, retain=retain, packet_id=receipt.mid,
+                        message_expiry_interval=expiry, payload_sha256=hashlib.sha256(payload).hexdigest())
+        try:
+            await receipt.wait(timeout=TIMEOUT)
+        except PublishRejectedError as error:
+            require(error.reason_code == reason and receipt.is_done() and
+                    isinstance(receipt.exception(), PublishRejectedError),
+                    'message_expiry_capacity_wrong_typed_refusal', str(error.reason_code))
+            row = {'exception': type(error).__name__, 'reason_code': error.reason_code,
+                   'packet_id': receipt.mid, 'qos': 1, 'receipt_done': receipt.is_done()}
+            self.log.record('publication_rejected', **row)
+            return row
+        raise ReceiptFailure('message_expiry_capacity_publication_was_not_rejected')
+
     async def receive(self, payload=None, qos=None, retain=None, *, acknowledge=True):
         if self.reader_error:
             raise self.reader_error

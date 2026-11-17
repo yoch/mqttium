@@ -149,12 +149,15 @@ for name,receipt in [('normal',normal),('normal-restart',restart),('boundaries',
     if hashlib.sha256(Path(receipt['binary']['path']).read_bytes()).hexdigest()!=receipt['binary']['sha256']:
         raise SystemExit(f'{name} executed binary differs')
 cases={row['criterion']:row for row in normal['cases']}
-if set(cases)!={'minimal','matrix','offline','original-ttl','replay32','options','late-puback','malformed'}:
+if set(cases)!={'minimal','matrix','offline','original-ttl','replay32','options','late-puback','malformed','capacity'}:
     raise SystemExit('normal Message Expiry criteria missing')
 if len(cases['matrix']['cells'])!=120 or len(cases['offline']['cells'])!=24 or cases['replay32']['count']!=32:
     raise SystemExit('Message Expiry matrix, offline cells or valid replay incomplete')
 if len(cases['late-puback']['cases'])!=2 or len(cases['malformed']['cases'])!=24:
     raise SystemExit('real late PUBACK or malformed-property coverage incomplete')
+if (cases['capacity']['full_retained_topics']!=32 or cases['capacity']['overflow']['exception']!='PublishRejectedError'
+        or cases['capacity']['overflow']['reason_code']!=0x97 or not cases['capacity']['refusal_business_unchanged']):
+    raise SystemExit('full retained inventory, typed quota refusal and physical capacity recovery required')
 required={'transfer-claim','transfer-prepared','transfer-committed','sweep-prepared','sweep-committed',
           'normal-restart','held-admission',*(f'recipe-{kind}-{phase}' for kind in ('qos1','qos0','replay')
                              for phase in ('prepared','committed'))}
@@ -193,6 +196,7 @@ index={'format':'mqttiumd.message-expiry-system-reception-index','schema_version
                 'retained-and-nonretained','physical-offline-and-retained-reclamation',
                 'original-deadline-and-decremented-wire-property','RH-RAP-NoLocal',
                 '32-valid-retained-values-replayed','real-started-Q1-PUBACK-after-TTL',
+                '32-finite-retained-values-expire-and-return-capacity',
                 'duplicate-and-malformed-property-rejection','own-SIGKILL-boundaries',
                 'normal-preview-archive-and-packaged-public-demo','six-compiled-negative-controls'],
        'source_pin':json.loads((out/'source-pin.json').read_text()),

@@ -4,7 +4,8 @@ import unittest
 from external_message_expiry import MqttiumMessageExpiry, PahoMessageExpiry
 from external_wildcard import Subscription
 from message_expiry_probe import decode_publish, publish_packet
-from message_expiry_reception import BUSINESS, physically_drained, one_delivery, closed_connection
+from message_expiry_reception import (BUSINESS, physically_drained, one_delivery, closed_connection,
+                                       original_copies)
 from message_expiry_boundaries import canonical_timed, continuous, _positive
 from tcp_probe import Frame, FrameDecoder, ReceiptFailure, operation_hex
 from test_external_clients import ScriptedBroker, read_packet
@@ -143,8 +144,39 @@ class IndependentMessageExpiryFrames(unittest.TestCase):
                        'details': {'session': '1'}})
         self.assertIsNone(closed_connection(state, events, 'forever'))
 
+    def test_frozen_replay_copy_preserves_the_original_durable_stamp(self):
+        stamp = {'domain': '61' * 32, 'tick': '123', 'interval': 2}
+        original = {'id': 'origin', 'retained_version': None, 'expiry_domain': stamp['domain'],
+                    'expiry_tick': '000000000000007b', 'expiry_interval': 2}
+        replay = dict(original, id='replay', retained_version='origin')
+        state = {'tables': {'publications': [original, replay]}}
+        self.assertEqual(original_copies(state, 'origin', stamp), ['origin', 'replay'])
+        replay['expiry_tick'] = '000000000000007c'
+        with self.assertRaisesRegex(ReceiptFailure, 'message_expiry_replay_changed_original_stamp'):
+            original_copies(state, 'origin', stamp)
+
 
 class PublicMessageExpiryAPIs(unittest.IsolatedAsyncioTestCase):
+    async def test_capacity_refusal_preserves_the_exact_public_publish_rejected_error(self):
+        async def script(reader, writer, _connection):
+            await accept(reader, writer)
+            header, body = await read_packet(reader)
+            row = decode_publish(Frame(header, body), incoming=True)
+            self.assertEqual((row.qos, row.retain, row.message_expiry_interval), (1, True, 2))
+            writer.write(b'\x40\x04' + row.packet_id.to_bytes(2, 'big') + b'\x97\x00')
+            await writer.drain()
+            self.assertEqual(await read_packet(reader), (0xE0, b''))
+        async with ScriptedBroker(script) as broker:
+            source = MqttiumMessageExpiry(('127.0.0.1', broker.port), 'public-capacity-refusal')
+            try:
+                await source.open(False)
+                result = await source.publish_rejected('t', b'v', reason=0x97, message_expiry=2)
+                self.assertEqual(result['exception'], 'PublishRejectedError')
+                self.assertEqual(result['reason_code'], 0x97)
+                self.assertTrue(result['receipt_done'])
+            finally:
+                await source.disconnect()
+
     async def public_publish(self, constructor):
         async def script(reader, writer, _connection):
             await accept(reader, writer)
