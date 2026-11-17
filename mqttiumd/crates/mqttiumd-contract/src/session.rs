@@ -366,6 +366,16 @@ mod tests {
     }
 
     #[test]
+    fn finite_wire_intervals_are_supported_without_reclassifying_zero_or_infinity() {
+        for value in [1, 2, u32::MAX - 1] {
+            assert!(SessionExpiry::from_wire(value).is_some(), "finite_interval_rejected");
+            assert_eq!(SessionExpiry::from_wire(value).unwrap().to_wire(), value);
+        }
+        assert!(RECEIPT_WINDOW - RECEIPT_DATA_WINDOW >= 128 + 128 + 256,
+            "finite_detach_and_expire_have_insufficient_continuation_reserve");
+    }
+
+    #[test]
     fn only_zero_and_infinity_are_retention_policies() {
         assert_eq!(
             SessionExpiry::from_wire(0),
