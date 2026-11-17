@@ -123,7 +123,7 @@ class WillFormats(unittest.TestCase):
 
     def will_snapshot(self):
         return {**copy.deepcopy(self.snapshot), "wills": [{
-            "will_id": OPERATION, "source_session": "9", "client_id_hex": b"capteur-1".hex(),
+            "will_id": copy.deepcopy(OPERATION), "source_session": "9", "client_id_hex": b"capteur-1".hex(),
             "state": "Pending", "topic_hex": TOPIC.hex(), "payload_hex": PAYLOAD.hex()}]}
 
     def test_intent_survives_an_absent_source_in_the_descriptive_inventory(self):
@@ -161,3 +161,24 @@ class WillFormats(unittest.TestCase):
             holder[member] = "18446744073709551616"
             self.assertEqual([(d.code, d.pointer) for d in self.contracts.check_value(value)],
                              [("u64-out-of-range", pointer)])
+
+    def test_actual_writer_will_events_retain_occurrence_but_never_payload(self):
+        base = {"format": "mqttiumd.product-event", "schema_version": 1,
+                "seq": "1", "pid": 1, "operation": OPERATION, "will": OPERATION}
+        events = [
+            {**base, "kind": "will_installed", "details": {
+                "topic_bytes": len(TOPIC), "payload_bytes": len(PAYLOAD), "authority": "durable_open_commit"}},
+            {**base, "kind": "will_decided", "details": {
+                "publish": True, "session": "9", "authority": "durable_end_commit"}},
+            {**base, "kind": "will_admitted", "details": {
+                "publication": "1/2/3/11", "targets": 1, "authority": "durable_admission_commit"}},
+        ]
+        for event in events:
+            self.assertEqual(self.contracts.check_value(event), [], event["kind"])
+            invalid = copy.deepcopy(event)
+            invalid["details"]["payload"] = "offline"
+            self.assertTrue(self.contracts.check_value(invalid), "will_bytes_in_product_event")
+        invalid = copy.deepcopy(events[0])
+        invalid["will"]["sequence"] = "18446744073709551616"
+        self.assertEqual([(d.code, d.pointer) for d in self.contracts.check_value(invalid)],
+                         [("u64-out-of-range", "/will/sequence")])
