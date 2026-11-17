@@ -1,0 +1,94 @@
+{
+  "module": "MWill.tla",
+  "status": "specification",
+  "summary": "Finite durable Will occurrence: accepted installation, normal cancellation, takeover/loss intention, atomic idempotent admission, retained unknown results, restart discovery and independent target ownership.",
+  "issues": [
+    648
+  ],
+  "tests": [],
+  "configs": [
+    {
+      "config": "MWill-safety.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "ConnackAfterDurableInstall",
+        "NoUnacceptedAdmission",
+        "NoAdmissionAfterCancellation",
+        "NoPublicationOnNormalLiveClose",
+        "AtMostOneAdmission",
+        "AcceptedWillNotLost",
+        "NoStaleClose",
+        "IndependentResponsibility",
+        "NoClosedDestination",
+        "ReferencesExact",
+        "PayloadLifetimeExact",
+        "CapacityBounded"
+      ]
+    },
+    {
+      "config": "MWill-recovery.cfg",
+      "expect": "pass",
+      "invariants": [
+        "TypeOK",
+        "ConnackAfterDurableInstall",
+        "NoUnacceptedAdmission",
+        "NoAdmissionAfterCancellation",
+        "NoPublicationOnNormalLiveClose",
+        "AtMostOneAdmission",
+        "AcceptedWillNotLost",
+        "NoStaleClose",
+        "IndependentResponsibility",
+        "NoClosedDestination",
+        "ReferencesExact",
+        "PayloadLifetimeExact",
+        "CapacityBounded"
+      ]
+    },
+    {
+      "config": "MWill-mut-early-connack.cfg",
+      "expect": "violation",
+      "invariant": "ConnackAfterDurableInstall"
+    },
+    {
+      "config": "MWill-mut-publish-normal.cfg",
+      "expect": "violation",
+      "invariant": "NoAdmissionAfterCancellation"
+    },
+    {
+      "config": "MWill-mut-forget-on-crash.cfg",
+      "expect": "violation",
+      "invariant": "AcceptedWillNotLost"
+    },
+    {
+      "config": "MWill-mut-readmit-lost-result.cfg",
+      "expect": "violation",
+      "invariant": "AtMostOneAdmission"
+    },
+    {
+      "config": "MWill-mut-rebind-old-close.cfg",
+      "expect": "violation",
+      "invariant": "NoStaleClose"
+    },
+    {
+      "config": "MWill-reach-recovery.cfg",
+      "expect": "violation",
+      "invariant": "NoRecoveryWitness"
+    },
+    {
+      "config": "MWill-reach-retired-live.cfg",
+      "expect": "violation",
+      "invariant": "NoRetiredLiveWitness"
+    },
+    {
+      "config": "MWill-reach-takeover.cfg",
+      "expect": "violation",
+      "invariant": "NoTakeoverWitness"
+    },
+    {
+      "config": "MWill-reach-independent-intent.cfg",
+      "expect": "violation",
+      "invariant": "NoIndependentIntentWitness"
+    }
+  ]
+}
