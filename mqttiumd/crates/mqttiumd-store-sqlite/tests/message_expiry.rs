@@ -194,3 +194,75 @@ fn failed_expiry_transaction_preserves_all_shared_ownership() {
     assert_eq!(state.outbound, before.outbound);
     assert_eq!(state.accounts.references.get(), 1);
 }
+
+#[test]
+fn maintenance_does_not_read_past_its_publication_budget() {
+    use mqttiumd_contract::command::{Command, FrozenRecipe, Recipe};
+    use mqttiumd_contract::message_expiry::{
+        ExpiringAdmission, ExpiringPublication, MessageExpiry,
+    };
+    use mqttiumd_contract::retained::RetainedPublication;
+    use mqttiumd_lab::store::conformance::{World, fixture_limits, publication_id};
+    use mqttiumd_store_api::{DurableStore, ReadError, SessionClockReading};
+    let path = std::env::temp_dir().join(format!(
+        "mqttiumd-message-expiry-bound-{}-{}.db",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut l = fixture_limits();
+    l.references = mqttiumd_contract::capacity::References::new(128);
+    l.exchange_slots = mqttiumd_contract::capacity::ExchangeSlots::new(128);
+    let mut w = World::with_limits(&|i, l| SqliteStore::create(&path, i, l).unwrap(), l);
+    let now = expiry::at(0);
+    w.store
+        .checkpoint_session_clock(
+            None,
+            SessionClockReading {
+                domain: now.domain,
+                tick: now.tick,
+            },
+        )
+        .unwrap();
+    for n in 1..=5 {
+        let old = w.admission(n, n as u16, b"state", &[w.b]);
+        let mut raw = Vec::new();
+        old.recipe.get().encode_canonical(&mut raw).unwrap();
+        let Recipe::AdmitPublication(admission) = Recipe::decode_canonical(&raw, 16, 256).unwrap()
+        else {
+            panic!()
+        };
+        let c = Command {
+            recipe: FrozenRecipe::freeze(Recipe::ExpiringPublication(ExpiringPublication {
+                admission: ExpiringAdmission::Qos12(RetainedPublication {
+                    admission,
+                    retain_targets: 0,
+                }),
+                expiry: MessageExpiry {
+                    observed: now,
+                    interval: 1,
+                },
+            }))
+            .unwrap(),
+            payload: old.payload,
+        };
+        assert!(w.store.apply(&c).committed_now);
+    }
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "UPDATE publications SET expiry_tick=x'ffffffffffffffff' WHERE id=?1",
+        [publication_id(w.epoch, 5).to_be_bytes().as_slice()],
+    )
+    .unwrap();
+    let page = w
+        .store
+        .expire_messages(expiry::at(1), None, 4)
+        .expect("sweep_read_past_publication_budget");
+    assert_eq!(page.removed.len(), 4);
+    assert!(page.more);
+    assert_eq!(page.next, Some(publication_id(w.epoch, 4)));
+    assert_eq!(
+        w.store.expire_messages(expiry::at(1), page.next, 4),
+        Err(ReadError::InvalidData),
+        "selected_corrupt_expiry_was_hidden"
+    );
+}
