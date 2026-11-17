@@ -249,6 +249,7 @@ pub struct SessionRecord {
 pub struct RouteTarget {
     pub session: SessionId,
     pub qos: Qos,
+    pub options: mqttiumd_contract::pubsub::SubscriptionOptions,
 }
 
 /// The durable decision about one operation.

@@ -71,6 +71,7 @@ pub enum RecoveredFact {
         target: SessionId,
         target_revision: Revision,
         max_qos: Qos,
+        options: crate::pubsub::SubscriptionOptions,
     },
     /// A persistent session.
     Session {
@@ -2841,6 +2842,7 @@ mod recovery_order_tests {
 
     fn route(topic: &[u8], target: u64) -> RecoveredFact {
         RecoveredFact::Route {
+            options: crate::pubsub::SubscriptionOptions::DEFAULT,
             topic: SharedBytes::copy_from(topic, 16).expect("short topic"),
             target: SessionId::new(target),
             target_revision: Revision::new(1),

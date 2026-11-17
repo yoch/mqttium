@@ -1,4 +1,4 @@
-//! Bounded exact-subscription and outgoing QoS 1 data (ADR 0025).
+//! Bounded subscription and outgoing QoS 1 data (ADR 0025).
 use crate::ids::{
     ConnectionKey, DeliveryId, EffectId, OperationId, OutboundPacketId, Revision, SessionId,
 };
@@ -45,6 +45,7 @@ impl<T: Clone> FilterList<T> {
 pub struct SubscriptionFilter {
     pub filter: SharedBytes,
     pub qos: Qos,
+    pub options: SubscriptionOptions,
 }
 
 /// Ordered packet-specific reason codes, with a fixed bounded representation.
@@ -86,6 +87,7 @@ pub struct SubscriptionChange {
 pub struct GrantedSubscriptionChange {
     pub topic: SharedBytes,
     pub granted: Option<Qos>,
+    pub options: SubscriptionOptions,
 }
 /// A publication occurrence in one live connection, with no MQTT identifier.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -157,4 +159,28 @@ pub struct WorkItem {
     pub topic: SharedBytes,
     pub payload: SharedBytes,
     pub claim: Option<DeliveryClaim>,
+}
+
+/// MQTT 5 subscription options excluding QoS. Retained messages are unsupported,
+/// so RAP/RH are preserved but never cause retained replay or a retained output.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct SubscriptionOptions(u8);
+impl SubscriptionOptions {
+    pub const DEFAULT: Self = Self(0);
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits & 0xc3 != 0 || (bits >> 4) & 3 == 3 {
+            None
+        } else {
+            Some(Self(bits))
+        }
+    }
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+    #[must_use]
+    pub const fn no_local(self) -> bool {
+        self.0 & 4 != 0
+    }
 }

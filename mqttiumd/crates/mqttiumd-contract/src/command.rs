@@ -62,6 +62,7 @@ const KIND_CLAIM_DELIVERY: u8 = 4;
 const KIND_FINISH_DELIVERY: u8 = 5;
 const KIND_CONSUME_DELIVERY: u8 = 6;
 const KIND_UPDATE_SUBSCRIPTIONS: u8 = 7;
+const KIND_SUBSCRIPTION_OPTIONS: u8 = 9;
 
 /// Why an obligation exists. The cause stays inspectable by the oracle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -335,16 +336,13 @@ impl Recipe {
                     if entry.granted == Some(Qos::ExactlyOnce) {
                         return Err(RecipeError::InvalidField("granted_qos"));
                     }
-                    if entry.topic.is_empty()
-                        || entry.topic.len() > usize::from(u16::MAX)
-                        || entry
-                            .topic
-                            .as_slice()
-                            .iter()
-                            .any(|b| matches!(*b, 0 | b'+' | b'#'))
-                        || core::str::from_utf8(entry.topic.as_slice()).is_err()
+                    if !crate::topic::valid_filter(entry.topic.as_slice()) {
+                        return Err(RecipeError::InvalidField("topic_filter"));
+                    }
+                    if entry.granted.is_none()
+                        && entry.options != crate::pubsub::SubscriptionOptions::DEFAULT
                     {
-                        return Err(RecipeError::InvalidField("exact_filter"));
+                        return Err(RecipeError::InvalidField("unsubscribe_options"));
                     }
                 }
                 Ok(())
@@ -422,7 +420,16 @@ impl Recipe {
                 out.extend_from_slice(&consume.target_revision.to_be_bytes());
             }
             Self::UpdateSubscriptions(change) => {
-                out.push(KIND_UPDATE_SUBSCRIPTIONS);
+                let with_options = change
+                    .changes
+                    .as_slice()
+                    .iter()
+                    .any(|c| c.options != crate::pubsub::SubscriptionOptions::DEFAULT);
+                out.push(if with_options {
+                    KIND_SUBSCRIPTION_OPTIONS
+                } else {
+                    KIND_UPDATE_SUBSCRIPTIONS
+                });
                 out.extend_from_slice(&change.operation.to_be_bytes());
                 out.extend_from_slice(&change.session.to_be_bytes());
                 out.extend_from_slice(&change.session_revision.to_be_bytes());
@@ -437,6 +444,9 @@ impl Recipe {
                             return Err(RecipeError::InvalidField("granted_qos"));
                         }
                     });
+                    if with_options {
+                        out.push(entry.options.bits());
+                    }
                     out.extend_from_slice(&(entry.topic.len() as u16).to_be_bytes());
                     out.extend_from_slice(entry.topic.as_slice());
                 }
@@ -555,7 +565,7 @@ impl Recipe {
                     target_revision,
                 })
             }
-            KIND_UPDATE_SUBSCRIPTIONS => {
+            kind @ (KIND_UPDATE_SUBSCRIPTIONS | KIND_SUBSCRIPTION_OPTIONS) => {
                 let operation = reader.operation()?;
                 let session = SessionId::new(reader.u64()?);
                 let session_revision = Revision::new(reader.u64()?);
@@ -573,6 +583,12 @@ impl Recipe {
                         2 => Some(Qos::AtLeastOnce),
                         _ => return Err(RecipeError::InvalidField("granted_qos")),
                     };
+                    let options = if kind == KIND_SUBSCRIPTION_OPTIONS {
+                        crate::pubsub::SubscriptionOptions::from_bits(reader.u8()?)
+                            .ok_or(RecipeError::InvalidField("subscription_options"))?
+                    } else {
+                        crate::pubsub::SubscriptionOptions::DEFAULT
+                    };
                     let len = usize::from(reader.u16()?);
                     if len > max_topic_len {
                         return Err(RecipeError::TopicTooLong(len));
@@ -580,8 +596,22 @@ impl Recipe {
                     let topic = SharedBytes::copy_from(reader.take(len)?, max_topic_len)
                         .map_err(|_| RecipeError::TopicTooLong(len))?;
                     changes
-                        .try_push(GrantedSubscriptionChange { topic, granted })
+                        .try_push(GrantedSubscriptionChange {
+                            topic,
+                            granted,
+                            options,
+                        })
                         .map_err(|_| RecipeError::AllocationFailed)?;
+                }
+                if kind == KIND_SUBSCRIPTION_OPTIONS
+                    && changes
+                        .as_slice()
+                        .iter()
+                        .all(|c| c.options == crate::pubsub::SubscriptionOptions::DEFAULT)
+                {
+                    return Err(RecipeError::InvalidField(
+                        "noncanonical_subscription_options",
+                    ));
                 }
                 Self::UpdateSubscriptions(UpdateSubscriptions {
                     operation,
@@ -1044,6 +1074,7 @@ mod tests {
                 route_revision: Revision::new(1),
                 changes: BoundedVec::from_slice(
                     &[GrantedSubscriptionChange {
+                        options: crate::pubsub::SubscriptionOptions::DEFAULT,
                         topic: SharedBytes::copy_from(b"t", 64).unwrap(),
                         granted,
                     }],
