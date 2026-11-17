@@ -135,7 +135,9 @@ MQTTIUMD_MESSAGE_EXPIRY_MUTANT_TARGET_ROOT="${MQTTIUMD_MESSAGE_EXPIRY_MUTANT_TAR
     "$msgexp_python" tests/system/message_expiry_mutants.py "$msgexp_out/mutants" >"$msgexp_out/mutants.log" 2>&1
 "$msgexp_python" - "$msgexp_out" "$msgexp_sha" "${#msgexp_trace[@]}" <<'PY'
 from pathlib import Path
-import hashlib,json,re,sys
+import hashlib,json,sys
+sys.path.insert(0,str(Path.cwd()/'tests/system'))
+from message_expiry_probe import successful_sigkill_targets
 out=Path(sys.argv[1]);source=sys.argv[2]
 normal=json.loads((out/'normal/receipt.json').read_text())
 boundaries=json.loads((out/'boundaries/receipt.json').read_text())
@@ -169,9 +171,10 @@ if len(kills)!=11 or len({row['killed_pid'] for row in kills})!=11:
 kernel_kills=[]
 if int(sys.argv[3]):
     trace=(out/'boundaries.strace').read_text()
+    successful_kills=successful_sigkill_targets(trace)
     for row in kills:
         pid=row['killed_pid']
-        if re.search(rf'kill\({pid}, SIGKILL\)\s+= 0',trace) is None:
+        if pid not in successful_kills:
             raise SystemExit(f'own SIGKILL for {pid} not present in the same-run kernel witness')
         kernel_kills.append({'criterion':row['criterion'],'pid':pid,'signal':'SIGKILL'})
 if (restart['cases'][0]['criterion']!='normal-restart' or restart['binary']['sha256']!=normal['binary']['sha256']):

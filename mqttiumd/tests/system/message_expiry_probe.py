@@ -19,8 +19,34 @@ MAX_INTERVAL = 0xFFFFFFFF
 
 
 def successful_sigkill_targets(trace: str) -> set[int]:
-    """Targets of successful own SIGKILL syscalls in one retained strace."""
-    return {int(pid) for pid in re.findall(r'kill\((\d+), SIGKILL\)\s+= 0', trace)}
+    """Targets of successful kill(SIGKILL), including exact task-bound resumes.
+
+    Only the observed kill arguments can supply a target. A bare resumed line
+    proves nothing; a pending call belongs to its caller task and syscall.
+    """
+    targets, pending = set(), {}
+    for line in trace.splitlines():
+        found = re.fullmatch(r'\s*(?:(\d+)\s+)?(.*)', line)
+        if found is None:
+            continue
+        caller, body = found.groups()
+        body = body.strip()
+        previous = None
+        if caller is not None and (re.match(r'^\w+\(', body)
+                or body.startswith(('<...', '+++'))):
+            # A new syscall or unmatched/different resumption cannot later
+            # finish a stale pending kill from this same task.
+            previous = pending.pop(caller, None)
+        complete = re.fullmatch(r'kill\((\d+),\s*SIGKILL\)\s*=\s*0', body)
+        if complete:
+            targets.add(int(complete[1]))
+            continue
+        unfinished = re.fullmatch(r'kill\((\d+),\s*SIGKILL\s+<unfinished \.\.\.>', body)
+        if unfinished and caller is not None:
+            pending[caller] = int(unfinished[1])
+        elif previous is not None and re.fullmatch(r'<\.\.\. kill resumed>\)\s*=\s*0', body):
+            targets.add(previous)
+    return targets
 
 
 def interval(value):
