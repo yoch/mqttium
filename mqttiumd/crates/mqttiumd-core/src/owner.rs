@@ -2920,6 +2920,7 @@ mod tests {
     #[derive(PartialEq, Debug)]
     struct Snapshot {
         revision: Revision,
+        message_now: Option<MessageTime>,
         counters: Counters,
         recovery: Option<RecoveryOrder>,
         epoch_recovered: bool,
@@ -3400,6 +3401,7 @@ mod tests {
                     owner.release_continuations_started,
                 ),
                 revision: owner.revision,
+                message_now: owner.message_now,
                 counters: owner.counters,
                 recovery: owner.recovery.clone(),
                 epoch_recovered: owner.epoch_recovered,

@@ -5625,4 +5625,511 @@ mod tests {
         );
         assert!(owner.pubsub.deliveries.is_empty());
     }
+
+    #[test]
+    fn message_expiry_qos12_admission_freezes_origin_and_handshakes_outlive_ttl() {
+        for qos in [Qos::AtLeastOnce, Qos::ExactlyOnce] {
+            for retain in [false, true] {
+                let mut owner = world();
+                owner.lifecycle_enabled = true;
+                message_clock(&mut owner, 10);
+                let packet = InboundPacket::Publish {
+                    topic: bytes(b"topic"),
+                    qos,
+                    retain,
+                    dup: false,
+                    packet_id: Some(InboundPacketId::new(7).unwrap()),
+                    payload: bytes(b"payload"),
+                    expiry: Some(message_expiry()),
+                };
+                let (effect, command) = message_command(apply(
+                    &mut owner,
+                    Input::Packet {
+                        connection: CONNECTION,
+                        ingress_order: 1,
+                        packet,
+                    },
+                ));
+                let Recipe::ExpiringPublication(expiring) = command.recipe.get() else {
+                    panic!("expiry_not_in_canonical_admission");
+                };
+                assert_eq!(expiring.expiry, message_expiry());
+                let crate::contract::command::ExpiringAdmission::Qos12(retained) =
+                    &expiring.admission
+                else {
+                    panic!("qos12_admission_kind");
+                };
+                assert_eq!(retained.admission.retain, retain);
+                assert_eq!(retained.admission.qos, qos);
+                let publication = retained.admission.publication;
+                let exchange = retained.admission.source.exchange;
+                let mut canonical = Vec::new();
+                command
+                    .recipe
+                    .get()
+                    .encode_canonical(&mut canonical)
+                    .unwrap();
+                let operation = command.recipe.operation();
+                apply(
+                    &mut owner,
+                    Input::StoreResult {
+                        effect,
+                        operation,
+                        reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown),
+                    },
+                );
+                message_clock(&mut owner, 20);
+                // A duplicate reception cannot replace the operation's original
+                // canonical timestamp even if the client supplies a new TTL.
+                assert!(
+                    apply(
+                        &mut owner,
+                        Input::Packet {
+                            connection: CONNECTION,
+                            ingress_order: 2,
+                            packet: InboundPacket::Publish {
+                                topic: bytes(b"topic"),
+                                qos,
+                                retain,
+                                dup: true,
+                                packet_id: Some(InboundPacketId::new(7).unwrap()),
+                                payload: bytes(b"payload"),
+                                expiry: Some(MessageExpiry {
+                                    observed: message_time(20),
+                                    interval: 100
+                                })
+                            }
+                        }
+                    )
+                    .is_empty()
+                );
+                let mut repeated = Vec::new();
+                command
+                    .recipe
+                    .get()
+                    .encode_canonical(&mut repeated)
+                    .unwrap();
+                assert_eq!(repeated, canonical);
+                let ack = apply(
+                    &mut owner,
+                    Input::StoreResult {
+                        effect,
+                        operation,
+                        reply: StoreReply::Outcome(StoreOutcome::Committed(
+                            CommitFacts::PublicationAdmitted {
+                                publication,
+                                exchange,
+                            },
+                        )),
+                    },
+                );
+                assert!(
+                    ack.iter().any(|(_, e)| matches!(
+                        e,
+                        Effect::EmitFrame {
+                            frame: OutboundFrame::Puback { .. } | OutboundFrame::Pubrec { .. },
+                            ..
+                        }
+                    )),
+                    "expiry_broke_inbound_acknowledgement"
+                );
+                if qos == Qos::ExactlyOnce {
+                    let (_, release) = message_command(apply(
+                        &mut owner,
+                        Input::Packet {
+                            connection: CONNECTION,
+                            ingress_order: 3,
+                            packet: InboundPacket::Pubrel {
+                                packet_id: InboundPacketId::new(7).unwrap(),
+                            },
+                        },
+                    ));
+                    assert!(
+                        matches!(release.recipe.get(), Recipe::ReleaseInbound(end) if end.exchange == exchange),
+                        "late_pubrel_rematerialized_publication"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn message_expiry_volatile_qos0_drops_expired_work_without_durable_identity_or_mqtt_credit() {
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        owner
+            .routes
+            .try_push(Route {
+                topic: bytes(b"topic"),
+                target: TARGET,
+                target_revision: Revision::new(1),
+                max_qos: Qos::AtMostOnce,
+                options: crate::contract::pubsub::SubscriptionOptions::DEFAULT,
+            })
+            .unwrap();
+        let counters = owner.counters;
+        let credits = owner.leases.account().used();
+        let effects = apply(
+            &mut owner,
+            Input::Packet {
+                connection: CONNECTION,
+                ingress_order: 1,
+                packet: InboundPacket::Publish {
+                    topic: bytes(b"topic"),
+                    qos: Qos::AtMostOnce,
+                    retain: false,
+                    dup: false,
+                    packet_id: None,
+                    payload: bytes(b"payload"),
+                    expiry: Some(message_expiry()),
+                },
+            },
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|(_, e)| matches!(e, Effect::Persist { .. }))
+        );
+        let continuation = effects
+            .iter()
+            .find_map(|(_, e)| match e {
+                Effect::Continue { continuation } => Some(*continuation),
+                _ => None,
+            })
+            .unwrap();
+        message_clock(&mut owner, 12);
+        let effects = apply(
+            &mut owner,
+            Input::Continue {
+                continuation,
+                budget: WorkUnits::new(100_000),
+            },
+        );
+        assert!(effects.iter().any(|(_, e)| matches!(
+            e,
+            Effect::Qos0Dropped {
+                reason: Qos0DropReason::MessageExpired,
+                ..
+            }
+        )));
+        assert!(owner.pubsub.volatile.is_empty());
+        assert_eq!(owner.counters.operation, counters.operation);
+        assert_eq!(owner.counters.publication, counters.publication);
+        assert_eq!(owner.counters.payload, counters.payload);
+        assert_eq!(owner.leases.account().used(), credits);
+    }
+
+    #[test]
+    fn message_expiry_retained_qos0_unknown_result_survives_source_retirement_and_resolves() {
+        let mut owner = world();
+        owner.lifecycle_enabled = true;
+        message_clock(&mut owner, 10);
+        let mut packet = retained_zero(1);
+        let Input::Packet {
+            packet: InboundPacket::Publish { expiry, .. },
+            ..
+        } = &mut packet
+        else {
+            panic!("retained packet");
+        };
+        *expiry = Some(message_expiry());
+        let (effect, command) = message_command(apply(&mut owner, packet));
+        let Recipe::ExpiringPublication(expiring) = command.recipe.get() else {
+            panic!("retained_qos0_expiry_not_canonical");
+        };
+        let crate::contract::command::ExpiringAdmission::Qos0(retained) = &expiring.admission
+        else {
+            panic!("retained_qos0_invented_exchange");
+        };
+        let publication = retained.publication;
+        assert_eq!(retained.costs.exchange_slots, ExchangeSlots::ZERO);
+        let operation = command.recipe.operation();
+        apply(
+            &mut owner,
+            Input::StoreResult {
+                effect,
+                operation,
+                reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown),
+            },
+        );
+        owner.pubsub.retire_session(TARGET);
+        apply(
+            &mut owner,
+            Input::ConnectionClosed {
+                connection: CONNECTION,
+            },
+        );
+        message_clock(&mut owner, 12);
+        let flight = owner.pubsub.retained.unwrap();
+        assert!(flight.retired);
+        let effects = apply(
+            &mut owner,
+            Input::Deadline {
+                token: flight.in_flight.deadline,
+                now: crate::contract::ids::LogicalTime::new(20),
+            },
+        );
+        let resolve = effects
+            .iter()
+            .find_map(|(id, e)| {
+                matches!(e, Effect::ResolveAndFence { operation: op } if *op == operation)
+                    .then_some(*id)
+            })
+            .unwrap();
+        assert!(
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect: resolve,
+                    operation,
+                    reply: StoreReply::Outcome(StoreOutcome::Committed(
+                        CommitFacts::RetainedQos0Stored { publication }
+                    ))
+                }
+            )
+            .is_empty()
+        );
+        assert!(owner.pubsub.retained.is_none());
+        assert!(owner.pubsub.deliveries.is_empty());
+        assert_eq!(owner.leases.account().used().slots, ExchangeSlots::ZERO);
+    }
+
+    #[test]
+    fn message_expiry_start_and_exact_expiry_reserve_effects_before_mutating_claim_or_counters() {
+        for start in [false, true] {
+            let mut owner = world();
+            message_clock(&mut owner, 10);
+            let (effect, connection, _) = message_frame(&mut owner, 0);
+            if !start {
+                message_clock(&mut owner, 12);
+            }
+            let progress = if start {
+                FrameProgress::Started
+            } else {
+                FrameProgress::NotStarted {
+                    reason: MessageExpiryBlock::Expired,
+                }
+            };
+            let counters = owner.counters;
+            let delivery = owner.pubsub.deliveries.as_slice()[0].clone();
+            let held = owner
+                .outbox
+                .reserve(NonZeroUsize::new(owner.outbox.free_slots() - 1).unwrap())
+                .unwrap();
+            let result = owner.step(
+                Input::FrameResult {
+                    effect,
+                    connection,
+                    progress,
+                },
+                TURN,
+            );
+            assert!(
+                matches!(
+                    result,
+                    StepOutcome::NeedCapacity {
+                        need: CapacityNeed {
+                            resource: Resource::EffectSlots,
+                            ..
+                        },
+                        ..
+                    }
+                ),
+                "expiry_transition_did_not_reserve_whole_operation"
+            );
+            assert_eq!(owner.counters, counters);
+            assert_eq!(owner.pubsub.deliveries.as_slice()[0], delivery);
+            owner.outbox.release(held).unwrap();
+            let (_, command) =
+                message_command(message_progress(&mut owner, effect, connection, progress));
+            assert_eq!(
+                command.recipe.operation().sequence(),
+                counters.operation.unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn message_expiry_recovery_inventory_keeps_unmarked_claims_quarantined_and_replays_started() {
+        for started in [false, true] {
+            for unknown in [false, true] {
+                let mut owner = world();
+                let mut now = message_time(12);
+                if unknown {
+                    now.domain = [8; 32];
+                }
+                apply(&mut owner, Input::MessageClock { now });
+                owner.recovery = Some(RecoveryOrder::new());
+                let claim = DeliveryClaim {
+                    operation: OperationId::new(
+                        StoreIncarnation::new(1),
+                        RunEpoch::new(1),
+                        LogicalOwnerId::new(4),
+                        OperationSeq::new(100),
+                    ),
+                    packet_id: OutboundPacketId::new(1).unwrap(),
+                    started,
+                };
+                let fact = RecoveredFact::OutboundDelivery {
+                    delivery: delivery(0),
+                    target: TARGET,
+                    target_revision: Revision::new(1),
+                    qos: Qos::AtLeastOnce,
+                    claim: Some(claim),
+                    expiry: Some(message_expiry()),
+                    started,
+                };
+                apply(
+                    &mut owner,
+                    Input::Recovery {
+                        facts: BoundedVec::from_slice(&[fact], 1).unwrap(),
+                        last: true,
+                    },
+                );
+                let effects = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+                let read = effects
+                    .iter()
+                    .find_map(|(id, e)| matches!(e, Effect::LoadWork { .. }).then_some(*id))
+                    .unwrap();
+                let item = WorkItem {
+                    delivery: delivery(0),
+                    target: TARGET,
+                    target_revision: Revision::new(1),
+                    qos: Qos::AtLeastOnce,
+                    retain: true,
+                    expiry: Some(message_expiry()),
+                    topic: bytes(b"topic"),
+                    payload: bytes(b"payload"),
+                    claim: Some(claim),
+                };
+                apply(
+                    &mut owner,
+                    Input::WorkPage {
+                        effect: read,
+                        session: TARGET,
+                        items: BoundedVec::from_slice(&[item], 1).unwrap(),
+                        next: None,
+                    },
+                );
+                let effects = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+                assert_eq!(effects.iter().any(|(_, e)| matches!(e, Effect::EmitPublish { started: true, packet_id, expiry: Some(expiry), .. } if *packet_id == claim.packet_id && *expiry == message_expiry())), started, "recovery_invented_unsent_or_started_authority");
+                assert!(
+                    !effects
+                        .iter()
+                        .any(|(_, e)| matches!(e, Effect::Persist { .. }))
+                );
+                assert_eq!(owner.pubsub.free_packet_id(TARGET, 1), None);
+                assert!(!owner.pubsub.deliveries.as_slice()[0].certain_never_started);
+            }
+        }
+    }
+
+    #[test]
+    fn message_expiry_receipt_frontier_tracks_tag13_payload_and_tag14_complete_replay_range() {
+        let mut owner = world();
+        owner.lifecycle_enabled = true;
+        message_register_receipts(&mut owner);
+        message_clock(&mut owner, 10);
+        let mut packet = retained_zero(1);
+        let Input::Packet {
+            packet: InboundPacket::Publish { expiry, .. },
+            ..
+        } = &mut packet
+        else {
+            panic!("retained packet");
+        };
+        *expiry = Some(message_expiry());
+        let (effect, command) = message_command(apply(&mut owner, packet));
+        let retained = command.recipe.get().retained_qos0().unwrap();
+        let publication = retained.publication;
+        let payload = retained.payload.id.sequence();
+        apply(
+            &mut owner,
+            Input::StoreResult {
+                effect,
+                operation: command.recipe.operation(),
+                reply: StoreReply::Outcome(StoreOutcome::Committed(
+                    CommitFacts::RetainedQos0Stored { publication },
+                )),
+            },
+        );
+        let (effect, replay) = message_command(apply(&mut owner, product_subscribe()));
+        let Recipe::TimedReplaySubscriptions(timed) = replay.recipe.get() else {
+            panic!("timed replay");
+        };
+        let last = timed.replay.first_publication.sequence().get()
+            + crate::contract::retained::MAX_REPLAYS as u64
+            - 1;
+        apply(
+            &mut owner,
+            Input::StoreResult {
+                effect,
+                operation: replay.recipe.operation(),
+                reply: StoreReply::Outcome(StoreOutcome::Committed(
+                    CommitFacts::SubscriptionsChanged {
+                        session: TARGET,
+                        route_revision: Revision::new(1),
+                    },
+                )),
+            },
+        );
+        owner.receipts.test_request_sweep();
+        let effects = apply(&mut owner, Input::MaintainReceipts);
+        let closure = effects
+            .iter()
+            .find_map(|(_, e)| match e {
+                Effect::CollectReceipts { collection } => Some(collection.closure),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(closure.through, replay.recipe.operation().sequence());
+        assert_eq!(
+            closure.publication_through.get(),
+            last,
+            "tag14_receipt_lost_unused_replay_suffix"
+        );
+        assert_eq!(
+            closure.payload_through, payload,
+            "tag13_receipt_lost_payload_identity"
+        );
+    }
+
+    #[test]
+    fn message_expiry_target_retirement_consumes_started_and_expired_results_without_receipt_holes()
+    {
+        for start in [false, true] {
+            let mut owner = world();
+            message_register_receipts(&mut owner);
+            message_clock(&mut owner, 10);
+            let (frame, key, _) = message_frame(&mut owner, 0);
+            if !start {
+                message_clock(&mut owner, 12);
+            }
+            let progress = if start {
+                FrameProgress::Started
+            } else {
+                FrameProgress::NotStarted {
+                    reason: MessageExpiryBlock::Expired,
+                }
+            };
+            let (effect, command) =
+                message_command(message_progress(&mut owner, frame, key, progress));
+            owner.pubsub.retire_session(TARGET);
+            apply(
+                &mut owner,
+                Input::ConnectionClosed {
+                    connection: CONNECTION,
+                },
+            );
+            assert_eq!(owner.receipt_status().unwrap().2, 1);
+            assert!(known(&mut owner, effect, &command).is_empty());
+            assert!(owner.pubsub.deliveries.is_empty());
+            assert_eq!(
+                owner.receipt_status().unwrap().2,
+                0,
+                "retired_expiry_control_left_receipt_hole"
+            );
+            assert!(known(&mut owner, effect, &command).is_empty());
+        }
+    }
 }
