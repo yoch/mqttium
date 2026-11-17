@@ -96,6 +96,12 @@ impl Owner {
             .as_ref()
             .map(|f| (f.in_flight.operation, f.in_flight.deadline))
     }
+    /// Observe the current correlated lifecycle request without granting
+    /// authority to apply a result or fabricate a retry identity.
+    #[must_use]
+    pub fn lifecycle_action(&self) -> Option<&SessionAction> {
+        self.lifecycle.as_ref().map(|flight| &flight.command.action)
+    }
     #[must_use]
     pub fn lifecycle_operation_is_live(&self, operation: OperationId) -> bool {
         self.lifecycle
@@ -948,7 +954,7 @@ mod tests {
     fn world() -> Owner {
         world_with_outbox(32)
     }
-    fn world_with_outbox(capacity: usize) -> Owner {
+    fn recovering_world_with_outbox(capacity: usize) -> Owner {
         let incarnation = StoreIncarnation::new(1);
         let epoch = RunEpoch::new(2);
         let mut opening = EpochOpening::new(incarnation, StartupNonce::new([7; 16]));
@@ -968,7 +974,7 @@ mod tests {
                 bound(8),
             )
             .unwrap();
-        let mut owner = Owner::new(
+        Owner::new(
             OwnerConfig {
                 max_sessions: bound(1),
                 max_routes: bound(4),
@@ -981,7 +987,12 @@ mod tests {
             },
             outbox,
         )
-        .unwrap();
+        .unwrap()
+    }
+    fn world_with_outbox(capacity: usize) -> Owner {
+        let mut owner = recovering_world_with_outbox(capacity);
+        let incarnation = owner.incarnation;
+        let epoch = owner.epoch;
         let facts = [
             RecoveredFact::Epoch { incarnation, epoch },
             RecoveredFact::Limits {
@@ -2127,5 +2138,67 @@ mod tests {
             "expired_open_resumed_without_timer"
         );
         assert!(owner.sessions.as_slice()[0].detached.is_some());
+    }
+    #[test]
+    fn recovery_refuses_a_finite_deadline_earlier_than_its_minimum_interval() {
+        for seconds in [1, u32::MAX - 1] {
+            let minimum = u64::from(seconds) * 1_000_000_000;
+            for deadline in [0, minimum - 1, minimum, minimum + 1] {
+                let mut owner = recovering_world_with_outbox(32);
+                let operation = OperationId::new(
+                    owner.incarnation,
+                    RunEpoch::new(1),
+                    LogicalOwnerId::new(4),
+                    OperationSeq::new(1),
+                );
+                let facts = [
+                    RecoveredFact::Epoch {
+                        incarnation: owner.incarnation,
+                        epoch: owner.epoch,
+                    },
+                    RecoveredFact::Limits {
+                        max_targets_per_admission: 2,
+                        max_topic_bytes: 128,
+                        max_payload_bytes: PayloadBytes::new(128),
+                    },
+                    RecoveredFact::RouteTable {
+                        revision: Revision::new(0),
+                    },
+                    RecoveredFact::Session {
+                        session: SessionId::new(1),
+                        client_id: bytes(b"finite"),
+                        revision: Revision::new(1),
+                        expiry: SessionExpiry::After(seconds),
+                        opened_by: Some(operation),
+                        detached: Some(SessionDetachment {
+                            operation,
+                            deadline: Some(deadline),
+                        }),
+                    },
+                ];
+                let outcome = owner.step(
+                    Input::Recovery {
+                        facts: BoundedVec::from_slice(&facts, facts.len()).unwrap(),
+                        last: true,
+                    },
+                    TURN,
+                );
+                if deadline < minimum {
+                    assert!(
+                        matches!(outcome, StepOutcome::Fatal(CoreFault::ImpossibleInput)),
+                        "finite_recovery_accepted_impossible_deadline"
+                    );
+                    assert!(owner.is_recovering());
+                    assert!(owner.sessions.is_empty());
+                } else {
+                    assert!(matches!(outcome, StepOutcome::Applied { .. }));
+                    assert!(!owner.is_recovering());
+                    assert_eq!(
+                        owner.sessions.as_slice()[0].detached.unwrap().deadline,
+                        Some(deadline)
+                    );
+                }
+            }
+        }
     }
 }
