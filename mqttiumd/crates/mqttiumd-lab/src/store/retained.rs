@@ -195,6 +195,9 @@ pub(super) fn validate(state: &DurableState, budget: ReadBudget) -> Result<(), R
             .get(&record.publication)
             .ok_or(ReadError::InvalidData)?;
         if let Some(expiry) = publication.expiry {
+            if expiry.observed.domain == [0; 32] {
+                return Err(ReadError::InvalidData);
+            }
             expiry.deadline().map_err(|_| ReadError::InvalidData)?;
         }
         let payload = state

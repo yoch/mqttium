@@ -863,7 +863,7 @@ fn stage_publication(
         return refused(failed);
     }
     let expired = if let Some(expiry) = admit.expiry {
-        message_expiry::check_observation(conn, expiry.observed)?;
+        message_expiry::guard_observation(conn, expiry.observed)?;
         expiry.deadline().map_err(|_| Abort::Refused(failed))?;
         let anchor = sessions::clock(conn)?
             .ok_or(Abort::Refused(failed))?

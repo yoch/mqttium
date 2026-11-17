@@ -279,13 +279,7 @@ pub(super) fn expire(
     command: &ExpireDelivery,
 ) -> Guard<CommitFacts> {
     let failed = RejectReason::PreconditionFailed;
-    message_expiry::check_observation(conn, command.observed)?;
-    if message_expiry::publication(conn, command.finish.delivery.publication)?
-        != Some(command.expiry)
-        || command.expiry.state(command.observed) != Ok(ExpiryState::Expired)
-    {
-        return refused(failed);
-    }
+    message_expiry::guard_observation(conn, command.observed)?;
     let started: Option<i64> = conn
         .prepare_cached("SELECT started FROM outbound WHERE publication=?1 AND idx=?2")?
         .query_row(
@@ -297,6 +291,12 @@ pub(super) fn expire(
         )
         .optional()?;
     if started != Some(0) {
+        return refused(failed);
+    }
+    if message_expiry::publication(conn, command.finish.delivery.publication)?
+        != Some(command.expiry)
+        || command.expiry.state(command.observed) != Ok(ExpiryState::Expired)
+    {
         return refused(failed);
     }
     finish(conn, meta, &command.finish)?;

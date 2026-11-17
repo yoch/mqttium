@@ -72,6 +72,17 @@ pub(super) fn check_observation(conn: &Connection, now: MessageTime) -> Result<(
     Ok(())
 }
 
+/// An inadmissible input domain is a business guard; an unreadable durable
+/// clock remains a typed read failure rather than a fabricated rejection.
+pub(super) fn guard_observation(conn: &Connection, now: MessageTime) -> Guard<()> {
+    let failed = RejectReason::PreconditionFailed;
+    let anchor = sessions::clock(conn)?.ok_or(Abort::Refused(failed))?;
+    if now.domain == [0; 32] || now.domain != anchor.reading.domain {
+        return refused(failed);
+    }
+    Ok(())
+}
+
 /// Preflight metadata before a cursor or QoS filter can hide corruption. No
 /// payload BLOB is selected, and the inspection has a finite row ceiling.
 pub(super) fn validate(conn: &Connection, target: Option<SessionId>) -> Result<(), Fault> {

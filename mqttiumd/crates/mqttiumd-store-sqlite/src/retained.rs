@@ -208,7 +208,7 @@ pub(super) fn snapshot(
     let mut out = BTreeMap::new();
     let mut meter = reader::Meter::new(budget);
     let mut total = 0u64;
-    let mut stmt=conn.prepare("SELECT r.topic,r.publication,r.producer_client_id,p.topic,p.qos,p.retain,p.retained_version,y.length,y.refs,length(y.bytes) FROM retained r LEFT JOIN publications p ON p.id=r.publication LEFT JOIN payloads y ON y.id=p.payload ORDER BY r.topic LIMIT ?1")?;
+    let mut stmt=conn.prepare("SELECT r.topic,r.publication,r.producer_client_id,p.topic,p.qos,p.retain,p.retained_version,y.length,y.refs,length(y.bytes),p.expiry_domain,p.expiry_tick,p.expiry_interval FROM retained r LEFT JOIN publications p ON p.id=r.publication LEFT JOIN payloads y ON y.id=p.payload ORDER BY r.topic LIMIT ?1")?;
     let mut rows =
         stmt.query([i64::try_from(MAX_RETAINED_TOPICS + 1).map_err(|_| Fault::Corrupt)?])?;
     while let Some(row) = rows.next()? {
@@ -244,6 +244,7 @@ pub(super) fn snapshot(
             return Err(Fault::Corrupt);
         }
         code_qos(row.get(4)?)?;
+        message_expiry::decode(row, 10)?;
         let length = blob_u64(reader::borrow_blob(row, 7, 8)?)?;
         if length == 0
             || length > meta.limits.max_payload_bytes as u64
@@ -353,7 +354,7 @@ pub(super) fn subscribe(
 ) -> Guard<CommitFacts> {
     let update = &command.update;
     if let Some(now) = observed {
-        message_expiry::check_observation(conn, now)?;
+        message_expiry::guard_observation(conn, now)?;
     }
     active_session(conn, update.session, update.session_revision)?;
     let first = command.first_publication;
@@ -412,7 +413,7 @@ pub(super) fn subscribe(
                         (Some(expiry), Some(now)) => matches!(
                             expiry
                                 .state(now)
-                                .map_err(|_| Abort::Read(ReadError::InvalidData))?,
+                                .map_err(|_| Abort::Refused(RejectReason::PreconditionFailed))?,
                             ExpiryState::Fresh { .. }
                         ),
                         (Some(_), None) => false,
