@@ -123,6 +123,7 @@ async def public_paths(binary, case):
             before = check_policy(session_row(temporal_snapshot(broker), name), 1)
             started = time.monotonic_ns()
             await asyncio.sleep(1.15)
+            active_elapsed_ms = (time.monotonic_ns() - started) / 1e6
             active = session_row(temporal_snapshot(broker), name)
             require(active['id'] == before['id'] and active.get('detached_by') is None,
                     'active_session_expired')
@@ -134,7 +135,8 @@ async def public_paths(binary, case):
             observed_detachment = detachment(offline)
             await absent(broker, cursor, name)
             paths.append({'case': 'active_past_interval', 'implementation': implementation,
-                          'elapsed_ms': (time.monotonic_ns() - started) / 1e6,
+                          'active_probe_after_ms': active_elapsed_ms,
+                          'total_path_ms': (time.monotonic_ns() - started) / 1e6,
                           'before': before, 'active_after_interval': active,
                           'detached': offline, 'detachment': observed_detachment,
                           'received': received})
