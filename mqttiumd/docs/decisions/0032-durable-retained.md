@@ -12,7 +12,9 @@ An empty retained publication clears the entry and is still distributed live.
 Non-retained publications never mutate it. QoS2 mutates at admission, not PUBREL.
 QoS0 retained uses a durable operation with a volatile origin and no MQTT Packet
 Identifier, acknowledgement, exchange slot or Receive Maximum credit. Ordinary
-QoS0 remains volatile. All mutations, live responsibilities and receipts commit
+QoS0 remains volatile. Retained QoS0 uses the common durable live obligations
+(consumed before one QoS0 emission), including bounded offline responsibilities.
+All mutations, live responsibilities and receipts commit
 atomically; unknown outcomes retain the exact operation and canonical bytes.
 
 Inventory: 32 exact topics, 1 MiB current retained bytes; existing 4 MiB payload,

@@ -37,7 +37,7 @@ def is_stream(path: Path) -> bool:
     # observations and wire transcripts have other names/formats and are not
     # product streams. Explicit file arguments may use any name.
     name = path.name
-    return ".events" in name and (name.endswith(".jsonl") or name.endswith(".jsonl.previous"))
+    return (name in ("events.jsonl", "events.jsonl.previous") or ".events" in name) and (name.endswith(".jsonl") or name.endswith(".jsonl.previous"))
 
 
 def event_files(roots: list[Path], limits: Limits) -> list[Path]:

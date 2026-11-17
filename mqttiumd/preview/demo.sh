@@ -33,12 +33,25 @@ raise SystemExit('broker did not report readiness')
 PY
 }
 stop() { kill -INT "$preview_pid"; wait "$preview_pid"; preview_pid=; }
+mqtt() {
+    python3 - "$preview_data/commands.jsonl" "$@" <<'PYCOMMAND'
+import json, pathlib, sys
+with pathlib.Path(sys.argv[1]).open('a') as stream:
+    stream.write(json.dumps({'argv':sys.argv[2:]})+'\n')
+PYCOMMAND
+    "$@"
+}
 publish() {
-    mosquitto_pub -V mqttv5 -h 127.0.0.1 -p "$preview_port" -i preview-state-source \
-        -q 1 -r -t "$1" -m "$2"
+    if [ -n "$2" ]; then
+        mqtt mosquitto_pub -V mqttv5 -h 127.0.0.1 -p "$preview_port" -i preview-state-source \
+            -q 1 -r -t "$1" -m "$2"
+    else
+        mqtt mosquitto_pub -V mqttv5 -h 127.0.0.1 -p "$preview_port" -i preview-state-source \
+            -q 1 -r -t "$1" -n
+    fi
 }
 read_states() {
-    mosquitto_sub -V mqttv5 -h 127.0.0.1 -p "$preview_port" -i "$1" \
+    mqtt mosquitto_sub -V mqttv5 -h 127.0.0.1 -p "$preview_port" -i "$1" \
         -q 1 -t 'atelier/+/temperature' -C "$2" -W 5 -F '%t|%p|%q|%r'
 }
 preview_pub_help=0

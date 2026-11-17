@@ -709,8 +709,10 @@ fn replay_controls(
             .map_err(|_| Failure::plain("receipt_replay_recipe"))?;
         let mut recipe = Recipe::decode_canonical(&bytes, 16, MAX_TOPIC)
             .map_err(|_| Failure::plain("receipt_replay_recipe"))?;
-        let Recipe::AdmitPublication(ref mut admission) = recipe else {
-            return Err(Failure::plain("receipt_replay_kind"));
+        let admission = match &mut recipe {
+            Recipe::AdmitPublication(a) => a,
+            Recipe::RetainedPublication(a) => &mut a.admission,
+            _ => return Err(Failure::plain("receipt_replay_kind")),
         };
         let old = admission.operation;
         let origin = mqttiumd_contract::receipts::ReceiptOrigin::of(old);
@@ -749,14 +751,14 @@ fn replay_controls(
             // Refresh the unrelated identity above both the compact guard and
             // every retained recipe, even when its business object was freed.
             for record in before.operations.values() {
-                if let Recipe::AdmitPublication(a) =
-                    Recipe::decode_canonical(&record.recipe, 16, MAX_TOPIC)
-                        .map_err(|_| Failure::plain("receipt_replay_recipe"))?
-                    && mqttiumd_contract::receipts::ReceiptOrigin::of(a.operation) == origin
-                {
-                    next_publication = next_publication.max(a.publication.sequence().get());
-                    next_payload = next_payload.max(a.payload.id.sequence().get());
+                let known = Recipe::decode_canonical(&record.recipe, 16, MAX_TOPIC)
+                    .map_err(|_| Failure::plain("receipt_replay_recipe"))?;
+                if mqttiumd_contract::receipts::ReceiptOrigin::of(known.operation()) != origin {
+                    continue;
                 }
+                let (publication, payload) = recipe_identity_highwater(&known)?;
+                next_publication = next_publication.max(publication);
+                next_payload = next_payload.max(payload);
             }
             next_publication = next_publication
                 .checked_add(1)
@@ -991,6 +993,31 @@ fn control_response(
 fn consume_file(path: &Path) -> bool {
     path.exists() && std::fs::remove_file(path).is_ok()
 }
+#[cfg(feature = "test-hooks")]
+fn recipe_identity_highwater(recipe: &Recipe) -> Result<(u64, u64), Failure> {
+    if let Some(a) = recipe.admission() {
+        return Ok((
+            a.publication.sequence().get(),
+            a.payload.id.sequence().get(),
+        ));
+    }
+    match recipe {
+        Recipe::RetainedQos0(a) => Ok((
+            a.publication.sequence().get(),
+            a.payload.id.sequence().get(),
+        )),
+        Recipe::ReplaySubscriptions(a) => Ok((
+            a.first_publication
+                .sequence()
+                .get()
+                .checked_add(mqttiumd_contract::retained::MAX_REPLAYS as u64 - 1)
+                .ok_or_else(|| Failure::plain("receipt_replay_exhausted"))?,
+            0,
+        )),
+        _ => Ok((0, 0)),
+    }
+}
+
 #[cfg(test)]
 fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
     let clock = Arc::new(SystemClock::new().map_err(|error| Failure::plain(error.code()))?);
@@ -1183,6 +1210,40 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::time::Instant;
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn retired_probe_respects_the_entire_reserved_replay_range() {
+        use mqttiumd_contract::ids::{
+            LogicalOwnerId, OperationSeq, PublicationId, PublicationSeq, RunEpoch,
+        };
+        let recipe =
+            Recipe::ReplaySubscriptions(mqttiumd_contract::retained::ReplaySubscriptions {
+                update: mqttiumd_contract::command::UpdateSubscriptions {
+                    operation: OperationId::new(
+                        StoreIncarnation::new(1),
+                        RunEpoch::new(2),
+                        LogicalOwnerId::new(0),
+                        OperationSeq::new(3),
+                    ),
+                    session: SessionId::new(1),
+                    session_revision: Revision::new(1),
+                    route_revision: Revision::new(1),
+                    changes: mqttiumd_contract::capacity::BoundedVec::with_capacity(0).unwrap(),
+                },
+                first_publication: PublicationId::new(
+                    StoreIncarnation::new(1),
+                    RunEpoch::new(2),
+                    LogicalOwnerId::new(0),
+                    PublicationSeq::new(1000),
+                ),
+            });
+        assert_eq!(
+            recipe_identity_highwater(&recipe).unwrap(),
+            (1255, 0),
+            "retired_probe_reused_reserved_replay_identity"
+        );
+    }
+
     #[test]
     fn bootstrap_retains_fixed_deadline_across_process_anchors_and_domain_change() {
         use crate::session_time::testing::FakeClock;

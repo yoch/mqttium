@@ -1,8 +1,8 @@
-# Local MQTT 5 preview with hierarchical pub/sub
+# Local MQTT 5 preview with hierarchical pub/sub and durable retained
 
-The product receives non-retained MQTT 5 QoS 0/1/2 publications and delivers
+The product receives MQTT 5 QoS 0/1/2 publications, including durable retained values, and delivers
 at QoS 0 or 1 to persistent exact and hierarchical subscriptions. Sessions and filters
-are durable. Initially QoS 0 publications use a bounded volatile path;
+are durable. Initially non-retained QoS 0 publications use a bounded volatile path;
 QoS 1/2 admissions atomically create durable recipient obligations. This is
 an experimental subset, not complete MQTT conformance, a Mosquitto replacement,
 or reception of all P1/P2 behavior. Outgoing QoS 2 remains outside it.
@@ -190,19 +190,18 @@ These helpers use the public APIs. The reception command
 `tools/run_session_reception.sh /tmp/mqttiumd-session-reception` additionally
 waits for the broker's known lifecycle result and independent durable cleanup.
 
-The profile accepts non-retained QoS 0/1/2 PUBLISH, PUBREL, hierarchical SUBSCRIBE and
+The profile accepts ordinary and retained QoS 0/1/2 PUBLISH, PUBREL, hierarchical SUBSCRIBE and
 UNSUBSCRIBE, recipient PUBACK, PINGREQ and ordinary DISCONNECT. Completed valid
 packets reset the 1.5-times-Keep-Alive deadline; fragments do not. Keep Alive 0
 disables that MQTT timer, not partial-packet/write deadlines. PINGREQ passes
 through the core and produces PINGRESP.
 
-Will, authentication, retained messages, shared subscriptions,
+Will, authentication, shared subscriptions,
 subscription identifiers, topic aliases, PUBLISH properties and outgoing
 QoS 2 are not implemented. No Local, Retain As Published and valid Retain
 Handling values are accepted and durably preserved per subscription. No Local
-removes only its own matching contribution before aggregation. With no retained
-input or retained store, RAP cannot produce a retained output and RH produces
-no retained replay. Subscription properties remain outside the profile.
+removes only its own matching contribution before aggregation. RAP is combined across eligible live contributions; retained replay always sets
+RETAIN1. RH is evaluated per ordered filter occurrence as described below. Subscription properties remain outside the profile.
 Malformed options are distinguished from well-formed unsupported options.
 
 Necessary CONNECT properties are validated. Peer Maximum Packet Size constrains
@@ -210,7 +209,7 @@ every output. Peer Receive Maximum constrains QoS 1 output in addition to the
 local limit; QoS 0 neither consumes nor returns receive-window credit in either
 direction. Topic Alias Maximum and Request Problem Information are checked;
 no alias or diagnostic string is emitted. CONNACK advertises Receive Maximum 8,
-Maximum Packet Size 65,536, wildcard availability, and no retain, subscription-identifier, shared,
+Maximum Packet Size 65,536, wildcard and retained availability, and no subscription-identifier, shared,
 wildcard or topic-alias support. Maximum QoS is omitted: that property can
 only encode 0 or 1, while this profile accepts incoming QoS 2.
 
@@ -497,7 +496,7 @@ These are finite system tests. Existing K1/K2b/K3 qualifications and proof/model
 limits stay separate; no new path automatically qualifies all P1/P2. ADRs
 0024/0025/0026/0027/0028 retain Proposed status and guard partitions stay incomplete.
 Legacy epoch-zero/session collection, indefinite operation, outgoing QoS 2,
-wildcard/shared/retained delivery, Will/authentication, deployment
+shared delivery, Will/authentication, deployment
 security and performance remain separate. Process SIGKILL is not a power-loss
 or universal storage guarantee.
 
@@ -603,3 +602,58 @@ See proposed [0030](decisions/0030-finite-session-expiry.md),
 [the finite model](../models/session-expiry/README.md). Expiry reception is
 system evidence, separate from the fixture oracle's K1/K2b/K3 qualification.
 Message Expiry, Will and general migration remain separate increments.
+
+
+## Durable retained values (Proposed0032)
+
+The normal preview now stores up to32 exact retained topics and1MiB of current
+retained payload. Each topic owns one reference independently of subscribers
+and producer session lifetime. It records the original producer ClientID for
+No Local. The existing4MiB payload and128 reference quotas also apply; old
+versions still owed to recipients remain charged. Replacing or clearing a value
+releases only the retained-owned reference. Empty RETAIN1 clears and remains a
+normal live publication; RETAIN0 does not mutate the stored value.
+
+QoS1/2 retained changes, complete live fanout, reference/account updates and
+receipt are one admission transaction. QoS2 changes at admission before PUBREC;
+PUBREL only releases its inbound marker. Retained QoS0 uses its own durable
+operation without a Packet Identifier, acknowledgement, inbound slot or Receive
+Maximum credit. Ordinary QoS0 remains volatile. Client QoS0 completion alone is
+not evidence of broker commit; observe the value at another client or after
+restart. Unknown commands keep their exact operation and recipe; historical
+lookup precedes execution and collection preserves non-execution frontiers.
+
+A subscription update transaction considers up to8ordered filter occurrences
+against32retained entries. RH0 always requests replay; RH1 only when that literal
+filter is absent at that step; RH2 never. Repeated filters are evaluated in order,
+including intermediate effects. The final route keeps the last options. Each
+eligible occurrence/topic creates a distinct replay: overlapping requested
+filters can intentionally create several replays, unlike live one/session
+aggregation. No Local excludes the stored producer ClientID's contribution.
+Replay always carries RETAIN1; live delivery uses the OR of RAP on eligible
+contributions and the incoming RETAIN flag.
+
+Replay materialization freezes the publication version, topic, shared immutable
+payload, effective QoS, flag and a fresh causal delivery identity. Up to256
+publication identities are reserved before submission; unused identities are
+burned and covered by receipt closure. Existing reference capacity can refuse a
+whole update with negative SUBACKs; it cannot announce success and truncate the
+replay. Thirty-two topics to one subscriber are supported:16 is the per-live-
+publication destination bound, not a retained inventory bound. Existing paged
+work discovery and claim/Finish or consume-before-QoS0-emission drain the work;
+notifications remain an optimization. A later replace/clear does not rewrite it.
+
+Schema8 adds the retained map, replay version and frozen delivery RETAIN flag.
+Historical SQLite schemas are refused before modification; no migration/reset
+is provided. New canonical tags10/11/12 preserve tags1–9 byte meanings. Readers
+validate bounded inventory, producer fields, QoS, causes, flags and version
+relationships; physical quick_check alone is insufficient.
+
+Run `tools/run_retained_reception.sh /tmp/retained-reception` for source-pinned
+normal/public-client tests, real writer barriers, same-file SIGKILLs, authentic
+lost results, compiled negative controls and a standalone extracted-archive
+demo. These are product system tests, separate from the existing qualifying
+K1/K2b/K3 fixture scope. The package's `demo.sh` executes the short Mosquitto
+publish-before-dashboard, restart, replace and empty-retained-clear guide.
+Message Expiry, Will, TLS/authentication, shared subscriptions, Subscription
+Identifiers, outgoing QoS2, MQTT3.1.1 and general migration remain unsupported.

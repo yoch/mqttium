@@ -83,7 +83,7 @@ removes the literal filter, not its overlaps or already admitted deliveries.
 
 Retained QoS0 is deliberately committed to disk, without an MQTT acknowledgement;
 client-side send completion does not prove that commit. Ordinary non-retained
-QoS0 remains volatile and is dropped for absent destinations. Durable QoS1/2
+QoS0 remains volatile and is dropped for absent destinations. Durable retained QoS0 and QoS1/2
 admissions to QoS0 recipients are consumed before one emission; a crash after
 consumption can lose the delivery. There is no QoS0 replay after that consumption.
 

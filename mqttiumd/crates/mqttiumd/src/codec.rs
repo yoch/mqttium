@@ -1459,10 +1459,10 @@ mod tests {
     #[test]
     fn publish_restrictions_do_not_hide_invalid_fields() {
         assert!(decode(0x30, b"\0\x03a/b\0payload", BOUNDS).is_ok());
-        kind(
+        assert!(matches!(
             decode(0x35, b"\0\x03a/b\0\x07\0payload", BOUNDS),
-            ErrorKind::Unsupported,
-        );
+            Ok(Packet::Core(InboundPacket::Publish { retain: true, .. }))
+        ));
         kind(
             decode(0x35, b"\0\x03a/b\0\0\0payload", BOUNDS),
             ErrorKind::Protocol,
