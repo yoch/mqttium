@@ -26,6 +26,14 @@ class ProductEventStreamTests(unittest.TestCase):
             result = check_streams([path], limits=limits)
             return result, hashlib.sha256(encoded).hexdigest()
 
+    def test_packaged_events_filename_is_included_when_scanning_directories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/"events.jsonl").write_text(json.dumps(self.event())+"\n")
+            result=check_streams([root])
+            self.assertEqual(result["status"],"PASS","packaged_event_stream_was_silently_skipped")
+            self.assertEqual(result["product_events"],1)
+
     def test_a_valid_stream_keeps_its_actual_byte_digest_and_schema_only_scope(self):
         result, digest = self.run_stream([self.event(), self.event(seq="2", kind="connection_closed")])
         self.assertEqual(result["status"], "PASS")
