@@ -238,11 +238,30 @@ async def options(binary, case):
         source.subscribe_options(2, (Subscription('options/+/value', 0),))
         self_replay = source.receive(payload, 0, True).observation()
         source.no_publication(.08)
+        # An excluded No Local contribution cannot contribute its RAP bit or
+        # higher QoS. A subsequent eligible replacement can contribute both.
+        source.subscribe_options(3, (Subscription('options/#', 1, no_local=True,
+            retain_as_published=True, retain_handling=2),))
+        first_live = b'no-local-excluded-rap-and-qos'
+        source.publish(4, topic, first_live, qos=1)
+        excluded = source.receive(first_live, 0, False).observation()
+        other_first = target.receive(first_live, 1, False).observation()
+        source.no_publication(.08); target.no_publication(.08)
+        await until_state(broker, business_drained, 'retained_live_nl_exclusion_not_finished')
+        source.subscribe_options(5, (Subscription('options/#', 1, no_local=False,
+            retain_as_published=True, retain_handling=2),))
+        second_live = b'eligible-overlap-rap-or-and-maximum-qos'
+        source.publish(6, topic, second_live, qos=2)
+        eligible = source.receive(second_live, 1, True).observation()
+        other_second = target.receive(second_live, 1, False).observation()
+        source.no_publication(.08); target.no_publication(.08)
         final = await until_state(broker, business_drained, 'retained_no_local_replay_not_consumed')
         write_json(case / 'durable-final.json', final)
         source.close(); source = None; target.close(); target = None; broker.stop()
         return {'criterion': 'options', 'status': 'PASS', 'ordered_steps': decisions,
                 'producer_name_no_local_after_session_end': True, 'eligible_other_contribution': self_replay,
+                'live_no_local_excludes_rap_and_qos': excluded, 'live_eligible_rap_or': eligible,
+                'other_session_live': [other_first, other_second],
                 'process_status': broker.process.returncode}
     finally:
         if source is not None: source.close()
