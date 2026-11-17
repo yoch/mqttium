@@ -2163,6 +2163,12 @@ impl DurableStore for MemoryStore {
         if !self.receipt_capacity(operation, Some(ReceiptClass::of(recipe))) {
             return settled(StoreOutcome::PendingOrUnknown);
         }
+        if !matches!(
+            will_memory::receipt_capacity(&self.committed, &canonical),
+            Ok(true)
+        ) {
+            return settled(StoreOutcome::PendingOrUnknown);
+        }
         if phase != EpochPhase::Open {
             // Its epoch is not open yet. It must not become executable
             // when that epoch opens: the rejection is recorded.

@@ -2638,7 +2638,7 @@ impl DurableStore for SqliteStore {
         if let LedgerOpening::Opens { ledger } = self.read_ledger()?.open(command)
             && let Txn::ReadFailed(error) = self.transact(|conn, meta| {
                 meta.ledger = ledger;
-                will::recover(conn)?;
+                will::recover(conn, meta)?;
                 sessions::expire(conn, meta)?;
                 Ok::<(), Abort<()>>(())
             })
@@ -2730,6 +2730,9 @@ impl DurableStore for SqliteStore {
             receipts::capacity(&self.conn, &meta, operation, Some(ReceiptClass::of(recipe))),
             Ok(true)
         ) {
+            return unknown;
+        }
+        if !matches!(will::receipt_capacity(&self.conn, &canonical), Ok(true)) {
             return unknown;
         }
         if phase != EpochPhase::Open {

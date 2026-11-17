@@ -198,7 +198,26 @@ pub(super) fn has_client(conn: &Connection, client: &[u8]) -> Result<bool, Fault
     Ok(found)
 }
 
-pub(super) fn recover(conn: &Connection) -> Result<(), Fault> {
+pub(super) fn recover(conn: &Connection, meta: &Meta) -> Result<(), Fault> {
+    let mut statement = conn.prepare_cached(SELECT)?;
+    let mut rows = statement.query([])?;
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    while let Some(row) = rows.next()? {
+        count = count.checked_add(1).ok_or(ReadError::LimitExceeded)?;
+        if count > MAX_WILL_INTENTS {
+            return Err(ReadError::LimitExceeded.into());
+        }
+        metadata(row, meta)?;
+        bytes = bytes
+            .checked_add(reader::borrow_blob(row, 5, MAX_WILL_PAYLOAD_BYTES)?.len() as u64)
+            .ok_or(ReadError::LimitExceeded)?;
+        if bytes > MAX_WILL_BYTES {
+            return Err(ReadError::LimitExceeded.into());
+        }
+    }
+    drop(rows);
+    drop(statement);
     conn.prepare_cached("UPDATE wills SET state=2 WHERE state=1")?
         .execute([])?;
     Ok(())
@@ -224,6 +243,11 @@ pub(super) fn open(
         return refused(RejectReason::PreconditionFailed);
     }
     if let Some(spec) = will {
+        if spec.topic.len() > meta.limits.max_topic_bytes
+            || spec.payload.len() > meta.limits.max_payload_bytes
+        {
+            return refused(RejectReason::PreconditionFailed);
+        }
         let (count, bytes): (i64, i64) = conn.query_row(
             "SELECT count(*),coalesce(sum(length(payload)),0) FROM wills",
             [],
@@ -379,4 +403,31 @@ pub(super) fn publish(
         will: value.will,
         publication: value.publication,
     })
+}
+
+/// Large Open receipts are separately bounded before a new receipt is created.
+/// Exhaustion returns unknown, leaving the small reserved fence path available.
+pub(super) fn receipt_capacity(conn: &Connection, canonical: &[u8]) -> Result<bool, Fault> {
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    let mut bytes = 0u64;
+    let mut rows_count = 0usize;
+    let mut statement = conn.prepare_cached("SELECT length(recipe) FROM operations WHERE substr(recipe,7,1)=x'08' AND substr(recipe,40,1)=x'05' LIMIT 8193")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        rows_count = rows_count.checked_add(1).ok_or(ReadError::LimitExceeded)?;
+        if rows_count > 8192 {
+            return Err(ReadError::LimitExceeded.into());
+        }
+        let length: i64 = row.get(0)?;
+        let length = u64::try_from(length).map_err(|_| Corrupt)?;
+        bytes = bytes.checked_add(length).ok_or(ReadError::LimitExceeded)?;
+        if bytes > MAX_BYTES {
+            return Err(ReadError::LimitExceeded.into());
+        }
+    }
+    let is_open = canonical.get(6) == Some(&8) && canonical.get(39) == Some(&5);
+    Ok(!is_open
+        || bytes
+            .checked_add(canonical.len() as u64)
+            .is_some_and(|n| n <= MAX_BYTES))
 }

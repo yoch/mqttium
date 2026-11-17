@@ -1,11 +1,11 @@
 //! Same bounded intent authority as SQLite; no source-session lifetime dependency.
 use super::*;
 use mqttiumd_contract::will::{
-    MAX_WILL_BYTES, MAX_WILL_INTENTS, MAX_WILL_PAYLOAD_BYTES, MAX_WILL_TOPIC_BYTES, WillIntent,
-    WillPublication, WillState,
+    MAX_WILL_BYTES, MAX_WILL_INTENTS, WillIntent, WillPublication, WillState,
 };
 
 pub(super) fn validate(state: &DurableState) -> Result<(), ReadError> {
+    receipt_capacity(state, &[])?;
     if state.wills.len() > MAX_WILL_INTENTS {
         return Err(ReadError::LimitExceeded);
     }
@@ -97,6 +97,11 @@ pub(super) fn open(state: &mut DurableState, command: &SessionLifecycle) -> Guar
         return Err(failed);
     }
     if let Some(spec) = will {
+        if spec.topic.len() > state.limits.max_topic_bytes
+            || spec.payload.len() > state.limits.max_payload_bytes
+        {
+            return Err(failed);
+        }
         let total = state
             .wills
             .values()
@@ -216,4 +221,22 @@ pub(super) fn publish(
         will: value.will,
         publication: value.publication,
     })
+}
+
+pub(super) fn receipt_capacity(state: &DurableState, canonical: &[u8]) -> Result<bool, ReadError> {
+    let bytes = state
+        .operations
+        .values()
+        .filter(|r| r.recipe.get(6) == Some(&8) && r.recipe.get(39) == Some(&5))
+        .try_fold(0usize, |n, r| n.checked_add(r.recipe.len()))
+        .ok_or(ReadError::LimitExceeded)?;
+    const MAX_BYTES: usize = 8 * 1024 * 1024;
+    if bytes > MAX_BYTES {
+        return Err(ReadError::LimitExceeded);
+    }
+    let is_open = canonical.get(6) == Some(&8) && canonical.get(39) == Some(&5);
+    Ok(!is_open
+        || bytes
+            .checked_add(canonical.len())
+            .is_some_and(|n| n <= MAX_BYTES))
 }
