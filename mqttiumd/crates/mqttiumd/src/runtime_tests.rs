@@ -759,9 +759,9 @@ fn closing_transport_reconciles_late_commit_without_acknowledging_after_disconne
                 .is_some_and(|(_, phase)| phase == ExchangePhase::AdmissionPending)
         );
 
-        // The valid No Local option is outside this product profile. It queues a
+        // A valid Subscription Identifier is outside this profile. It queues a
         // DISCONNECT while the admitted command's response is still withheld.
-        let subscription = vec![0, 9, 0, 0, 1, b't', 6];
+        let subscription = vec![0, 9, 2, 0x0b, 1, 0, 1, b't', 1];
         assert_eq!(
             codec::decode(0x82, &subscription, BOUNDS)
                 .unwrap_err()
@@ -1301,8 +1301,8 @@ fn connect_then_subscribe(client_id: &[u8]) -> Vec<u8> {
     body.extend_from_slice(client_id);
     let mut packets = vec![0x10, u8::try_from(body.len()).unwrap()];
     packets.extend_from_slice(&body);
-    // Valid MQTT 5 No Local option, outside this product's documented profile.
-    packets.extend_from_slice(&[0x82, 7, 0, 9, 0, 0, 1, b't', 6]);
+    // Valid MQTT 5 Subscription Identifier, still outside this profile.
+    packets.extend_from_slice(&[0x82, 9, 0, 9, 2, 0x0b, 1, 0, 1, b't', 1]);
     packets
 }
 
