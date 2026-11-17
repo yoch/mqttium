@@ -40,6 +40,22 @@ pub(super) fn select(
     qos: Qos,
     maximum: u32,
 ) -> Result<Selection, Refusal> {
+    let source = sessions
+        .iter()
+        .find(|session| session.id == source)
+        .map(|session| session.client_id.as_slice());
+    select_client(routes, sessions, source, topic, qos, maximum)
+}
+
+/// A Will retains the producer ClientID independently of the old incarnation.
+pub(super) fn select_client(
+    routes: &[Route],
+    sessions: &[Session],
+    source: Option<&[u8]>,
+    topic: &[u8],
+    qos: Qos,
+    maximum: u32,
+) -> Result<Selection, Refusal> {
     let mut selected = Selection {
         items: [None; MAX_TARGETS],
         count: 0,
@@ -54,15 +70,15 @@ pub(super) fn select(
         if !crate::contract::topic::matches(route.topic.as_slice(), topic) {
             continue;
         }
-        if !sessions
+        let Some(target_session) = sessions
             .iter()
-            .any(|s| s.id == route.target && s.revision == route.target_revision)
-        {
+            .find(|s| s.id == route.target && s.revision == route.target_revision)
+        else {
             return Err(Refusal::Revision);
-        }
+        };
         // No Local removes this contribution before QoS aggregation; another
         // eligible filter on the same session can still contribute.
-        if route.options.no_local() && route.target == source {
+        if route.options.no_local() && source == Some(target_session.client_id.as_slice()) {
             continue;
         }
         let effective = route.max_qos.min(qos).min(Qos::AtLeastOnce);
@@ -159,6 +175,7 @@ mod tests {
             expiry: crate::contract::session::SessionExpiry::Never,
             opened_by: None,
             detached: None,
+            will_managed: false,
         }
     }
     #[test]

@@ -247,6 +247,7 @@ impl Owner {
                 .filter_map(Slot::in_flight)
                 .any(|flight| flight.deadline == token)
             || self.pubsub.deadline_is_live(token)
+            || self.wills.deadline_is_live(token)
             || self
                 .lifecycle
                 .as_ref()

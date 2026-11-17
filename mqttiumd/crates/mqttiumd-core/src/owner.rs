@@ -62,7 +62,9 @@ mod pubsub;
 mod receipts;
 mod routing;
 mod sessions;
+mod will;
 pub use sessions::SessionStatus;
+pub use will::{WillDeferredReason, WillStatus};
 
 /// The largest reservation of effect slots one transition makes. The
 /// constructor of an owner refuses a box that is smaller (ADR 0006,
@@ -241,6 +243,8 @@ struct Session {
     expiry: crate::contract::session::SessionExpiry,
     opened_by: Option<OperationId>,
     detached: Option<crate::contract::session::SessionDetachment>,
+    /// Product closure authority carries an explicit Will disposition.
+    will_managed: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -452,6 +456,7 @@ struct Refusal {
 )]
 enum Change {
     Session(sessions::Change),
+    Will(will::Change),
     Receipts(receipts::Change),
     Pubsub(pubsub::Change),
     /// The input is absorbed: late, repeated, or answered by effects only.
@@ -741,6 +746,7 @@ pub struct Owner {
     resolution_delay: LogicalDuration,
     pubsub: pubsub::State,
     receipts: receipts::State,
+    wills: will::State,
     lifecycle: Option<sessions::Flight>,
     lifecycle_enabled: bool,
     message_now: Option<MessageTime>,
@@ -858,6 +864,7 @@ impl Owner {
             resolution_delay: config.resolution_delay,
             pubsub,
             receipts,
+            wills: will::State::new(),
             lifecycle: None,
             lifecycle_enabled: false,
             message_now: None,
@@ -1075,6 +1082,7 @@ impl Owner {
                     .saturating_add(self.routing_work_bound(input))
                     .saturating_add(self.retained_work_bound(input))
                     .saturating_add(self.receipts.work(input))
+                    .saturating_add(self.will_work_bound(input))
                     .saturating_add(
                         if self.receipts.enabled
                             && matches!(input, Input::MaintainReceipts | Input::Continue { .. })
@@ -1216,6 +1224,42 @@ impl Owner {
             };
         }
         match input {
+            Input::OpenSessionWillAt {
+                connection,
+                client_id,
+                clean_start,
+                expiry,
+                now,
+                will,
+            } => self.plan_session_will_open(
+                *connection,
+                client_id,
+                *clean_start,
+                *expiry,
+                *now,
+                will.as_ref(),
+                draft,
+            ),
+            Input::EndSessionWill {
+                connection,
+                opened_by,
+                expiry,
+                observed_at,
+                publish,
+            } => self.plan_session_will_end(
+                *connection,
+                *opened_by,
+                *expiry,
+                *observed_at,
+                *publish,
+                draft,
+            ),
+            Input::DiscoverWills => self.plan_will_discover(draft),
+            Input::WillPage {
+                effect,
+                items,
+                next,
+            } => self.plan_will_page(*effect, items.as_slice(), *next, draft),
             Input::MessageClock { .. } => Err(IMPOSSIBLE),
             Input::MessagesExpired { deliveries } => {
                 self.plan_messages_expired(deliveries.as_slice())
@@ -1226,7 +1270,15 @@ impl Owner {
                 client_id,
                 clean_start,
                 expiry,
-            } => self.plan_session_open(*connection, client_id, *clean_start, *expiry, None, draft),
+            } => self.plan_session_open(
+                *connection,
+                client_id,
+                *clean_start,
+                *expiry,
+                None,
+                None,
+                draft,
+            ),
             Input::OpenSessionAt {
                 connection,
                 client_id,
@@ -1239,6 +1291,7 @@ impl Owner {
                 *clean_start,
                 *expiry,
                 Some(*now),
+                None,
                 draft,
             ),
             Input::DetachSession {
@@ -1429,6 +1482,7 @@ impl Owner {
                 expiry: crate::contract::session::SessionExpiry::Never,
                 opened_by: None,
                 detached: None,
+                will_managed: false,
             },
         })
     }
@@ -2042,6 +2096,9 @@ impl Owner {
         if let Some(change) = self.plan_session_result(effect, operation, reply, draft)? {
             return Ok(change);
         }
+        if let Some(change) = self.plan_will_result(effect, operation, reply, draft)? {
+            return Ok(change);
+        }
         if let Some(change) = self.plan_pubsub_result(effect, operation, reply, draft)? {
             return Ok(change);
         }
@@ -2253,6 +2310,9 @@ impl Owner {
             return Ok(change);
         }
         if let Some(change) = self.plan_session_deadline(token, draft)? {
+            return Ok(change);
+        }
+        if let Some(change) = self.plan_will_deadline(token, draft)? {
             return Ok(change);
         }
         if let Some(change) = self.plan_pubsub_deadline(token, draft)? {
@@ -2571,6 +2631,7 @@ impl Owner {
             Change::Session(change) => self.apply_session(change)?,
             Change::Receipts(change) => self.receipts.apply(change)?,
             Change::Pubsub(change) => self.apply_pubsub(change, input)?,
+            Change::Will(change) => self.apply_will(change)?,
             Change::Nothing => {}
             Change::MessageClock(now) => {
                 self.message_now = Some(now);
@@ -2813,6 +2874,7 @@ impl Owner {
                     expiry: *expiry,
                     opened_by: *opened_by,
                     detached: *detached,
+                    will_managed: false,
                 };
                 self.sessions.try_push(session).map_err(|_| STALE)?;
             }
@@ -3163,6 +3225,7 @@ mod tests {
             Effect::Persist { .. } => "Persist",
             Effect::ResolveAndFence { .. } => "ResolveAndFence",
             Effect::LoadWork { .. } => "LoadWork",
+            Effect::LoadWills { .. } => "LoadWills",
             Effect::EmitPublish { .. } => "EmitPublish",
             Effect::EmitQos0 { .. } => "EmitQos0",
             Effect::Qos0Dropped { .. } => "Qos0Dropped",
@@ -3326,7 +3389,9 @@ mod tests {
                 | Recipe::ConsumeDelivery(_)
                 | Recipe::ClaimDelivery(_)
                 | Recipe::FinishDelivery(_) => panic!("pubsub command needs its own facts"),
-                Recipe::SessionLifecycle(_) => panic!("lifecycle command needs its own facts"),
+                Recipe::SessionLifecycle(_) | Recipe::WillPublication(_) => {
+                    panic!("lifecycle command needs its own facts")
+                }
                 Recipe::RetainedPublication(_)
                 | Recipe::RetainedQos0(_)
                 | Recipe::ReplaySubscriptions(_) => panic!("retained command needs its own facts"),
@@ -3359,7 +3424,8 @@ mod tests {
         /// for an admission.
         fn refusal_of(&self, flight: &Flight) -> StoreOutcome {
             let reason = match flight.facts {
-                CommitFacts::DeliveryConsumed { .. }
+                CommitFacts::WillPublished { .. }
+                | CommitFacts::DeliveryConsumed { .. }
                 | CommitFacts::SubscriptionsChanged { .. }
                 | CommitFacts::DeliveryStarted { .. }
                 | CommitFacts::DeliveryExpired { .. }

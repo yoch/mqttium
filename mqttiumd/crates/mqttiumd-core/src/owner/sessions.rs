@@ -81,7 +81,9 @@ impl Owner {
         self.lifecycle.as_ref().and_then(|f| {
             matches!(
                 f.command.action,
-                SessionAction::Open { .. } | SessionAction::OpenAt { .. }
+                SessionAction::Open { .. }
+                    | SessionAction::OpenAt { .. }
+                    | SessionAction::OpenWillAt { .. }
             )
             .then_some(f.connection)
         })
@@ -132,6 +134,8 @@ impl Owner {
             input,
             Input::OpenSession { .. }
                 | Input::OpenSessionAt { .. }
+                | Input::OpenSessionWillAt { .. }
+                | Input::EndSessionWill { .. }
                 | Input::EndSession { .. }
                 | Input::DetachSession { .. }
                 | Input::ExpireSession { .. }
@@ -170,6 +174,10 @@ impl Owner {
             in_flight,
         })
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one shared planner retains legacy opening semantics and the explicit Will-aware variant"
+    )]
     pub(super) fn plan_session_open(
         &self,
         connection: ConnectionGeneration,
@@ -177,6 +185,7 @@ impl Owner {
         clean_start: bool,
         expiry: SessionExpiry,
         now: Option<u64>,
+        will: Option<Option<&crate::contract::will::WillSpec>>,
         draft: &mut Draft,
     ) -> Result<super::Change, Stop> {
         if self.closed.iter().any(|g| *g == connection) {
@@ -210,24 +219,109 @@ impl Owner {
             session: s.id,
             opened_by: s.opened_by,
         });
-        let action = match now {
-            Some(now) => SessionAction::OpenAt {
+        let action = match (now, will) {
+            (Some(now), Some(will)) => SessionAction::OpenWillAt {
+                client_id: client_id.clone(),
+                expected,
+                clean_start,
+                expiry,
+                now,
+                will: will.cloned(),
+            },
+            (Some(now), None) => SessionAction::OpenAt {
                 client_id: client_id.clone(),
                 expected,
                 clean_start,
                 expiry,
                 now,
             },
-            None => SessionAction::Open {
+            (None, None) => SessionAction::Open {
                 client_id: client_id.clone(),
                 expected,
                 clean_start,
                 expiry,
             },
+            (None, Some(_)) => return Err(IMPOSSIBLE),
         };
         let flight = self.session_flight(action, client_id.clone(), connection, false, draft)?;
         Ok(changed(Change::Submit(flight)))
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a CONNECT supplies policy, observation and its bounded optional Will"
+    )]
+    pub(super) fn plan_session_will_open(
+        &self,
+        connection: ConnectionGeneration,
+        client_id: &SharedBytes,
+        clean_start: bool,
+        expiry: SessionExpiry,
+        now: u64,
+        will: Option<&crate::contract::will::WillSpec>,
+        draft: &mut Draft,
+    ) -> Result<super::Change, Stop> {
+        self.plan_session_open(
+            connection,
+            client_id,
+            clean_start,
+            expiry,
+            Some(now),
+            Some(will),
+            draft,
+        )
+    }
+
+    pub(super) fn plan_session_will_end(
+        &self,
+        connection: ConnectionKey,
+        opened_by: Option<OperationId>,
+        expiry: SessionExpiry,
+        observed_at: u64,
+        publish: bool,
+        draft: &mut Draft,
+    ) -> Result<super::Change, Stop> {
+        let Some(session) = self
+            .sessions
+            .as_slice()
+            .iter()
+            .find(|s| s.id == connection.session)
+        else {
+            return Ok(super::Change::Nothing);
+        };
+        if opened_by.is_none()
+            || session.opened_by != opened_by
+            || session.detached.is_some()
+            || session
+                .connection
+                .is_some_and(|g| g != connection.generation)
+        {
+            return Ok(super::Change::Nothing);
+        }
+        if expiry.deadline(observed_at).is_none() {
+            return Err(IMPOSSIBLE);
+        }
+        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+            return Err(waiting());
+        }
+        draft.end(connection.generation)?;
+        let flight = self.session_flight(
+            SessionAction::EndWill {
+                guard: SessionGuard {
+                    session: session.id,
+                    opened_by,
+                },
+                expiry,
+                observed_at,
+                publish,
+            },
+            session.client_id.clone(),
+            connection.generation,
+            true,
+            draft,
+        )?;
+        Ok(changed(Change::Submit(flight)))
+    }
+
     pub(super) fn plan_session_end(
         &self,
         connection: ConnectionKey,
@@ -366,7 +460,9 @@ impl Owner {
             f.connection == connection
                 && matches!(
                     f.command.action,
-                    SessionAction::Open { .. } | SessionAction::OpenAt { .. }
+                    SessionAction::Open { .. }
+                        | SessionAction::OpenAt { .. }
+                        | SessionAction::OpenWillAt { .. }
                 )
         }) {
             draft.end(connection)?;
@@ -380,19 +476,19 @@ impl Owner {
         else {
             return Ok(None);
         };
-        if session.expiry != SessionExpiry::OnDisconnect {
+        if session.will_managed || session.expiry != SessionExpiry::OnDisconnect {
             return Ok(None);
         }
         if let Some(flight) = &self.lifecycle {
             let covered = match &flight.command.action {
-                SessionAction::Open { expected, .. } | SessionAction::OpenAt { expected, .. } => {
-                    expected.is_some_and(|g| {
-                        g.session == session.id && g.opened_by == session.opened_by
-                    })
-                }
+                SessionAction::Open { expected, .. }
+                | SessionAction::OpenAt { expected, .. }
+                | SessionAction::OpenWillAt { expected, .. } => expected
+                    .is_some_and(|g| g.session == session.id && g.opened_by == session.opened_by),
                 SessionAction::Close { guard, .. }
                 | SessionAction::Detach { guard, .. }
-                | SessionAction::Expire { guard, .. } => {
+                | SessionAction::Expire { guard, .. }
+                | SessionAction::EndWill { guard, .. } => {
                     guard.session == session.id && guard.opened_by == session.opened_by
                 }
             };
@@ -418,6 +514,11 @@ impl Owner {
         change: SessionChange,
         draft: &mut Draft,
     ) -> Result<Option<Flight>, Stop> {
+        // The runtime captured normal/abnormal intent before any delayed Open
+        // result. Only its EndSessionWill may decide this attachment's Will.
+        if matches!(flight.command.action, SessionAction::OpenWillAt { .. }) {
+            return Ok(None);
+        }
         let SessionChange::Opened {
             session,
             expiry: SessionExpiry::OnDisconnect,
@@ -452,6 +553,9 @@ impl Owner {
         flight: &Flight,
         draft: &mut Draft,
     ) -> Result<Option<Flight>, Stop> {
+        if matches!(flight.command.action, SessionAction::OpenWillAt { .. }) {
+            return Ok(None);
+        }
         let (SessionAction::Open {
             expected: Some(guard),
             ..
@@ -577,7 +681,9 @@ impl Owner {
                 };
                 if matches!(
                     flight.command.action,
-                    SessionAction::Open { .. } | SessionAction::OpenAt { .. }
+                    SessionAction::Open { .. }
+                        | SessionAction::OpenAt { .. }
+                        | SessionAction::OpenWillAt { .. }
                 ) && !flight.connection_closed
                 {
                     draft.emit(Effect::SessionRefused {
@@ -618,6 +724,12 @@ impl Owner {
                     clean_start,
                     expiry,
                     ..
+                }
+                | SessionAction::OpenWillAt {
+                    expected,
+                    clean_start,
+                    expiry,
+                    ..
                 },
                 SessionChange::Opened {
                     session,
@@ -636,7 +748,9 @@ impl Owner {
                         .find(|s| s.id == guard.session && s.opened_by == guard.opened_by)
                 });
                 let now = match flight.command.action {
-                    SessionAction::OpenAt { now, .. } => Some(now),
+                    SessionAction::OpenAt { now, .. } | SessionAction::OpenWillAt { now, .. } => {
+                        Some(now)
+                    }
                     _ => None,
                 };
                 let resumes = old.is_some_and(|s| {
@@ -667,6 +781,12 @@ impl Owner {
                     guard,
                     expiry,
                     observed_at,
+                }
+                | SessionAction::EndWill {
+                    guard,
+                    expiry,
+                    observed_at,
+                    ..
                 },
                 SessionChange::Detached {
                     session,
@@ -675,6 +795,7 @@ impl Owner {
                 },
             ) => {
                 session == guard.session
+                    && *expiry != SessionExpiry::OnDisconnect
                     && reported == *expiry
                     && expiry.deadline(*observed_at) == Some(detached.deadline)
                     && detached.operation == flight.command.operation
@@ -686,7 +807,12 @@ impl Owner {
                     })
             }
             (
-                SessionAction::Close { guard, .. },
+                SessionAction::Close { guard, .. }
+                | SessionAction::EndWill {
+                    guard,
+                    expiry: SessionExpiry::OnDisconnect,
+                    ..
+                },
                 SessionChange::Closed {
                     session,
                     route_revision,
@@ -804,6 +930,10 @@ impl Owner {
                             expiry,
                             opened_by: Some(finished.operation),
                             detached: None,
+                            will_managed: matches!(
+                                flight.command.action,
+                                SessionAction::OpenWillAt { .. }
+                            ),
                         };
                         if let Some(index) = self
                             .sessions
