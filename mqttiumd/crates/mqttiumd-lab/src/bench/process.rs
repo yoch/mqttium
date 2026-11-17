@@ -619,6 +619,7 @@ impl<S: DurableStore> EffectSink for Sink<'_, S> {
             | Effect::SessionRefused { .. }
             | Effect::CollectReceipts { .. }
             | Effect::LoadWork { .. }
+            | Effect::LoadWills { .. }
             | Effect::EmitPublish { .. }
             | Effect::EmitQos0 { .. }
             | Effect::Qos0Dropped { .. }
