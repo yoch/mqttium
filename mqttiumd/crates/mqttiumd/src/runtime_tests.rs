@@ -3418,3 +3418,66 @@ fn certain_detach_failure_is_observable_instead_of_losing_offline_expiration() {
         assert!(durable.sessions[&cached.id].detached.is_none());
     });
 }
+
+#[test]
+fn coalesced_clock_cas_reply_does_not_hide_an_uncheckpointed_interval() {
+    use crate::session_time::testing::FakeClock;
+    let sample = |tick| SessionClockReading {
+        domain: [46; 32],
+        tick,
+    };
+    let clock = Arc::new(FakeClock::new(sample(0)));
+    with_runtime_clock(128, clock.clone(), |runtime, directory| {
+        let (generation, mut client) = peer(runtime);
+        let mut connect = connect_packet(b"coalesced-clock");
+        connect.expiry = SessionExpiry::After(100);
+        runtime.connect(generation, connect).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        read_frame(&mut client);
+        clock.set(sample(2_000_000_000));
+        runtime.close(generation, "test_lost").unwrap();
+        until(runtime, |r| {
+            !r.owner.session_status().lifecycle_pending
+                && r.closing_inputs.is_empty()
+                && r.lifecycle_inflight.is_empty()
+        });
+        assert_eq!(
+            runtime.clock_anchor.logical, 0,
+            "adapter still has the earlier valid projection"
+        );
+        clock.set(sample(5_000_000_000));
+        runtime.last_clock_checkpoint = Instant::now() - Duration::from_secs(31);
+        runtime.expire_sessions().unwrap();
+        runtime.expire_sessions().unwrap();
+        let response = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            matches!(&response,ControlResponse::ClockCheckpoint {result:Ok(anchor),..} if anchor.logical==2_000_000_000)
+        );
+        relay_control_reply(runtime, response);
+        assert!(
+            runtime.last_clock_checkpoint.elapsed() >= Duration::from_secs(30),
+            "stale_clock_cas_reply_hid_uncommitted_progress"
+        );
+        assert!(runtime.clock_checkpoint.is_none());
+        runtime.expire_sessions().unwrap();
+        let response = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            matches!(&response,ControlResponse::ClockCheckpoint {result:Ok(anchor),..} if anchor.logical==5_000_000_000)
+        );
+        relay_control_reply(runtime, response);
+        assert!(runtime.last_clock_checkpoint.elapsed() < Duration::from_secs(1));
+        assert!(!runtime.checkpoint_degraded);
+        let state =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert_eq!(state.session_clock.unwrap().logical, 5_000_000_000);
+        assert_eq!(runtime.expiry_timers.len(), 1);
+    });
+}
