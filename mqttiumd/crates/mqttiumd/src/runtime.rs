@@ -200,6 +200,7 @@ struct Runtime<'a> {
     last_session_cardinality: Option<[usize; 13]>,
     work_reads: BTreeMap<EffectId, SessionId>,
     last_work_scan: Instant,
+    last_will_scan: Instant,
     maintenance_needed: bool,
     #[cfg(feature = "test-hooks")]
     work_cache: BTreeMap<DeliveryId, WorkItem>,
@@ -1312,6 +1313,28 @@ impl Runtime<'_> {
                 _ => None,
             };
             let ready_work = self.work_progress_hint(&input);
+            let will_progress = matches!(
+                &input,
+                Input::StoreResult {
+                    reply: StoreReply::Outcome(StoreOutcome::Committed(
+                        CommitFacts::WillPublished { .. }
+                    )),
+                    ..
+                }
+            ) || matches!(&input, Input::WillPage { next: Some(_), .. })
+                || (matches!(
+                    &input,
+                    Input::StoreResult {
+                        reply: StoreReply::Outcome(StoreOutcome::Committed(
+                            CommitFacts::SessionLifecycle(_)
+                        )),
+                        ..
+                    }
+                ) && matches!(
+                    self.owner.lifecycle_action(),
+                    Some(SessionAction::EndWill { .. })
+                ));
+
             let opening = match &input {
                 Input::OpenSessionWillAt { connection, .. }
                 | Input::OpenSession { connection, .. }
@@ -1452,6 +1475,16 @@ impl Runtime<'_> {
                 if let Some(code) = control_refusal {
                     return Err(Failure::plain(code));
                 }
+            }
+            if applied
+                && will_progress
+                && !self.owner.will_status().admission_pending
+                && !self
+                    .control_inputs
+                    .iter()
+                    .any(|input| matches!(input, Input::DiscoverWills))
+            {
+                self.queue(Input::DiscoverWills)?;
             }
             if applied && let Some((session, initial)) = ready_work {
                 self.rearm_ready_work(session, initial);
@@ -1981,15 +2014,16 @@ impl Runtime<'_> {
         }
     }
     fn discover_work(&mut self) {
-        if self.last_work_scan.elapsed() >= Duration::from_millis(100)
+        if self.last_will_scan.elapsed() >= Duration::from_millis(100)
+            && self.control_inputs.len() < crate::writer::CONTROL_QUEUE
             && !self
-                .inputs
+                .control_inputs
                 .iter()
+                .chain(self.inputs.iter())
                 .any(|input| matches!(input, Input::DiscoverWills))
         {
-            if self.control_inputs.len() < crate::writer::CONTROL_QUEUE {
-                self.control_inputs.push_back(Input::DiscoverWills);
-            }
+            self.last_will_scan = Instant::now();
+            self.control_inputs.push_back(Input::DiscoverWills);
         }
         #[cfg(feature = "test-hooks")]
         if MUTANT_NOTIFICATIONS_ONLY {
@@ -3991,7 +4025,7 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
     }
     match recipe {
         Recipe::WillPublication(value) => {
-            json!({"will":operation(value.will),"publication":format!("{:?}",value.publication),"destinations":value.targets.len(),"topic_bytes":value.topic.len(),"payload_bytes":value.payload.length.get()})
+            json!({"will":operation_text(value.will),"publication":format!("{:?}",value.publication),"destinations":value.targets.len(),"topic_bytes":value.topic.len(),"payload_bytes":value.payload.length.get()})
         }
         Recipe::SessionLifecycle(lifecycle) => match &lifecycle.action {
             SessionAction::Open {
@@ -4277,6 +4311,7 @@ fn run_inner(
         last_session_cardinality: None,
         work_reads: BTreeMap::new(),
         last_work_scan: Instant::now(),
+        last_will_scan: Instant::now(),
         maintenance_needed: false,
         #[cfg(feature = "test-hooks")]
         work_cache: BTreeMap::new(),
@@ -4468,8 +4503,19 @@ fn run_inner(
             .local_addr()
             .map_err(|_| Failure::plain("listen_address"))?;
         check_startup_cancel(&cancel)?;
-        events.emit("ready",json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":9,"retained_available":true,"retained_topics":32,"retained_bytes":1048576,"max_replay_candidates":256,"profile":"tcp-message-expiry-pubsub-v1"}})).map_err(event_failure)?;
-        println!("mqttiumd ready {address} (local MQTT 5 retained pub/sub with Message Expiry)");
+        let mut readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":10,"retained_available":true,"retained_topics":32,"retained_bytes":1048576,"max_replay_candidates":256,"profile":"tcp-will-pubsub-v1"}});
+        readiness["details"]["will"] = json!(true);
+        readiness["details"]["will_qos"] = json!(1);
+        readiness["details"]["will_retain"] = json!(false);
+        readiness["details"]["will_delay_interval"] = json!(0);
+        readiness["details"]["will_message_expiry"] = json!(false);
+        readiness["details"]["max_will_intents"] = json!(256);
+        readiness["details"]["max_will_bytes"] = json!(8388608);
+        readiness["details"]["max_will_receipt_bytes"] = json!(8388608);
+        events.emit("ready", readiness).map_err(event_failure)?;
+        println!(
+            "mqttiumd ready {address} (local MQTT 5 retained pub/sub with Message Expiry and durable Will)"
+        );
         while !cancel.load(Ordering::Relaxed) {
             for _ in 0..4 {
                 match listener.accept() {

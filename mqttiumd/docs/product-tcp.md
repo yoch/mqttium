@@ -1,6 +1,6 @@
-# Local MQTT 5 preview with durable Message Expiry
+# Local MQTT 5 preview with durable Will and Message Expiry
 
-The product receives MQTT 5 QoS 0/1/2 publications, including durable retained values and Message Expiry, and delivers
+The product receives MQTT 5 QoS 0/1/2 publications, including durable retained values, Message Expiry and zero-delay non-retained QoS1 Wills, and delivers
 at QoS 0 or 1 to persistent exact and hierarchical subscriptions. Sessions and filters
 are durable. Initially non-retained QoS 0 publications use a bounded volatile path;
 QoS 1/2 admissions atomically create durable recipient obligations. This is
@@ -41,7 +41,7 @@ matching filters. Exactly 16 is allowed. A seventeenth refuses the complete
 durable admission or explicitly drops the whole volatile occurrence before any
 output. Existing per-literal route limit 16 and total subscription limit 128
 remain in force. [ADR 0031](decisions/0031-hierarchical-subscriptions.md) records
-the decision and versioned canonical options; current schema9 refuses older formats
+the decision and versioned canonical options; current schema10 refuses older formats
 without modification or implicit migration.
 
 ## Launch and external clients
@@ -196,7 +196,7 @@ packets reset the 1.5-times-Keep-Alive deadline; fragments do not. Keep Alive 0
 disables that MQTT timer, not partial-packet/write deadlines. PINGREQ passes
 through the core and produces PINGRESP.
 
-Will, authentication, shared subscriptions,
+authentication, shared subscriptions,
 subscription identifiers, topic aliases, PUBLISH properties and outgoing
 QoS 2 are not implemented. No Local, Retain As Published and valid Retain
 Handling values are accepted and durably preserved per subscription. No Local
@@ -496,7 +496,7 @@ These are finite system tests. Existing K1/K2b/K3 qualifications and proof/model
 limits stay separate; no new path automatically qualifies all P1/P2. ADRs
 0024/0025/0026/0027/0028 retain Proposed status and guard partitions stay incomplete.
 Legacy epoch-zero/session collection, indefinite operation, outgoing QoS 2,
-shared delivery, Will/authentication, deployment
+shared delivery, authentication, deployment
 security and performance remain separate. Process SIGKILL is not a power-loss
 or universal storage guarantee.
 
@@ -601,7 +601,7 @@ See proposed [0030](decisions/0030-finite-session-expiry.md),
 [the continuation journal](reception/finite-expiry-journal.md), and
 [the finite model](../models/session-expiry/README.md). Expiry reception is
 system evidence, separate from the fixture oracle's K1/K2b/K3 qualification.
-Will and general migration remain separate increments.
+Will variants outside the received profile and general migration remain separate increments.
 
 
 ## Durable retained values (Proposed0032)
@@ -656,7 +656,7 @@ lost results, compiled negative controls and a standalone extracted-archive
 demo. These are product system tests, separate from the existing qualifying
 K1/K2b/K3 fixture scope. The package's `demo.sh` executes the short Mosquitto
 publish-before-dashboard, restart, replace and empty-retained-clear guide.
-Will, TLS/authentication, shared subscriptions, Subscription
+TLS/authentication, shared subscriptions, Subscription
 Identifiers, outgoing QoS2, MQTT3.1.1 and general migration remain unsupported.
 
 ## Message Expiry (Proposed0033)
@@ -667,7 +667,7 @@ is unlimited, zero expires at reception and every positive value including
 The original domain/tick/interval is frozen at TCP frame completion before the
 reader channel, pending CONNECT or core input deferral and copied
 unchanged through retained replay and old owed versions. Tags13..16 preserve
-all historical tags1..12. SQLite schema9 refuses old formats before modification.
+all historical tags1..12. SQLite schema10 refuses old formats before modification.
 
 Known same-origin time can establish expiry across process restarts. Unknown
 continuity quarantines expiring state, with bounded references and no fresh
@@ -701,4 +701,55 @@ remain. Correlated lifecycle/receipt controls retain independent lanes.
 Run `tools/run_message_expiry_reception.sh /tmp/message-expiry-reception` from
 this directory. Its new tests are system evidence, not extension of historical
 K1/K2b/K3 independent-oracle qualification. Message Expiry does not implement
-Will, shared subscriptions, outgoingQoS2, authentication or schema migration.
+shared subscriptions, outgoingQoS2, authentication or schema migration.
+
+
+## Zero-delay durable Will (Proposed0034)
+
+The normal preview supports CONNECT Will QoS1, RETAIN=0 and delay absent/zero.
+Use `preview/will-demo.sh /tmp/mqttiumd-sensor-demo` with Mosquitto clients to
+observe retained `online`, a real sensor-process SIGKILL and non-retained
+`offline`. The package guide starts with these commands. The broker binds
+localhost by default; this unauthenticated preview is not a deployment profile.
+
+OpenWillAt installs the exact attachment's immutable Will before known Open
+allows CONNACK. Normal DISCONNECT0 cancels it durably; DISCONNECT4 requests it.
+EOF/RST, transport error, Keep Alive expiry and a protocol close after accepted
+Open make it Pending. Takeover closes the old transport and admits its zero-delay
+Will before opening the replacement, including Clean Start0. Peer.session and
+the original opening OperationId guard delayed closure; ClientID is not an
+attachment identity. A rejected CONNECT installs nothing. A committed Open may
+survive even if the client did not receive CONNACK.
+
+A Pending intention survives source-session cleanup. One kind17 WillPublication
+atomically consumes it, admits the frozen canonical target set and records the
+result. Unknown outcomes keep the original operation/bytes. No Local compares
+the saved producer ClientID; normal output QoS0/1 and durable Finish apply to its
+targets. Offline recipients remain responsible references after source expiry.
+Existing receipt retirement protects kind17 publication/payload identities.
+
+There are at most256 intentions/8MiB of Will payload,32768 payload bytes and1024
+topic bytes each. Large canonical Open receipts have a separate8MiB ceiling;
+pressure returns Unknown without writes, so reserved Resolve/fence capacity can
+establish nonexecution. Existing128 sessions,128 message references/4MiB and8192
+receipts remain unchanged. Full intention storage refuses a new Will CONNECT.
+Fanout or message-capacity pressure retains Pending state and emits a bounded
+`will_deferred` cause; it never truncates the target set. A bounded one-row
+continuation and100ms recovery scan run independently of ordinary notifications.
+No historical intention row remains after cancellation or admission.
+
+Schema10 refuses older formats before modification. Kind8 adds action5/6;
+historical canonical actions0–4 and recipe kinds1–16 remain unchanged. The
+standalone finite model and Will system tests are separate from the historically
+qualified K1/K2b/K3 fixture campaigns. Hex-encoded maximum-capacity Will snapshots
+may exceed the independent document reader's16MiB evidence budget: that reader
+refuses them; product bounded raw readers retain their32MiB limit.
+
+Will Message Expiry, QoS0/2 Will, retained Will, nonzero Will Delay and other Will
+properties are explicitly refused. Cancellation survives a crash only after its
+transaction commits; a parsed normal DISCONNECT followed by an earlier crash
+cannot leave recoverable proof of an uncommitted cancellation. Server shutdown
+or failure may defer Wills until restart. This is not a guarantee of notification
+before a server SIGKILL, power-loss certification, or complete MQTT compliance.
+The next functional increment is a local TLS/authentication deployment profile
+with measured service targets, not an expansion of the Will profile here.

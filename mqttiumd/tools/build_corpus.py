@@ -2613,7 +2613,7 @@ snap_case(
     "schema-violation",
     "",
     "The tables of a snapshot are a closed set.",
-    lambda v: v.update(wills=[]),
+    lambda v: v.update(unknown_future_table=[]),
 )
 snap_case(
     "without-fences",

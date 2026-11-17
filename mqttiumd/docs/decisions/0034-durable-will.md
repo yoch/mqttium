@@ -57,3 +57,11 @@ keeps Pending state, with observable deferral and bounded fair rediscovery.
 One Will read/admission flight uses the existing control receipt reserve.
 Maintenance reads one intention per pass; notifications only accelerate a
 periodic bounded scan. There is no permanent row per historical client.
+
+Canonical Will-aware Open receipts also have a separate8MiB aggregate ceiling.
+Exhausting it returns Unknown before any receipt or session mutation. A small
+Resolve fence can then establish nonexecution without requiring another large
+canonical receipt. This reserve is separate from the8MiB intention payload
+reserve and the unchanged32MiB bounded snapshot reader. Physical pages may be
+reused without shrinking the database file. No general schema migration is
+provided. New receptions do not qualify maximum-capacity hex snapshot documents.

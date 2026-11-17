@@ -108,14 +108,14 @@ This closes the former broker-startup row; it does not accept proposed ADRs.
 | Decision | State |
 | - | - |
 | D1, expiry against uncertain emission | Open; S0 excludes expiry |
-| T1, temporal guarantees of the Will | Open; S0 excludes the Will |
+| T1, temporal guarantees of the Will | Product zero-delay QoS1/non-retained Will received under Proposed0034; nonzero delay and universal timing guarantees remain open |
 | Service targets of the real profiles | Not supplied; needed before G4, useful for the measurement of ADR 0008 |
 
 ## Product TCP: remaining scope
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| Outgoing QoS 2, shared subscriptions, Subscription Identifiers, Will and authentication remain outside the local hierarchical pub/sub preview. Wildcards and No Local are implemented by Proposed0031; the fresh system receipt has its own scope. Report 0010 adds incoming/outgoing QoS 0 and grants 0, preserving the durable QoS 1/2 admission path and separate system-test scope. Incoming QoS 1 retains lawful repeat-admission behavior. This does not extend fixture-oracle qualification or complete P1/P2 | Product follow-up lots | A complete or deployable broker |
+| Outgoing QoS 2, shared subscriptions, Subscription Identifiers and authentication remain outside the local hierarchical pub/sub preview. Wildcards and No Local are implemented by Proposed0031; the fresh system receipt has its own scope. Report 0010 adds incoming/outgoing QoS 0 and grants 0, preserving the durable QoS 1/2 admission path and separate system-test scope. Incoming QoS 1 retains lawful repeat-admission behavior. This does not extend fixture-oracle qualification or complete P1/P2 | Product follow-up lots | A complete or deployable broker |
 | SQLite schema 7 refuses schemas 1..6 before write-affecting pragmas; main/WAL bytes remain unchanged. An explicit migration/export path is not implemented. General multiowner delivery ordering remains outside this single-owner FIFO product | Store/runtime follow-up | Upgrade of existing databases and broader operating profiles |
 | Live receipt retirement removes the cumulative 8,192-command ceiling within the received profile (report0011, proposed0027). Proposed0028/report0012 add protected outgoing QoS 1 PI reuse after known Finish application, with immutable observation targets at runtime reader-channel dequeue. The 8,192 physical receipt slots, 1,024/512 per-origin window, 512 control reserve and 64 origin rows remain finite. Session capacity (128 active incarnations, with explicit zero/infinite lifecycle in proposed0029), active claims, checked causal identities, typed read budgets and storage availability still bound service life. Upstream unobserved bytes and arbitrary identical wire ACKs first observed after reuse are outside the internal-observation correlation guarantee. No indefinite-service or loaded-writer latency/performance guarantee is claimed | Store/runtime follow-up | Broader long-running operation and G4 |
 | A storage syscall can outlive graceful shutdown's deadline; the product reports incomplete shutdown/unknown outcome and process exit releases OS resources. Process-kill evidence is not power-loss evidence | Runtime/storage follow-up | Stronger system/storage failure guarantees |
@@ -134,7 +134,7 @@ only committed progress crosses restart. Unknown downtime is conservatively
 ignored on domain change. Checkpoint target30s includes actual scheduling/commit
 delay and reports degradation after31s; unavailable storage has no unconditional
 time bound. Sessions still active at process loss are first detached at recovery
-observation. Message Expiry uses the separate policy below; Will remains separate. Schema6 has no migration
+observation. Message Expiry uses the separate policy below; Will has the distinct zero-delay profile described below. Schema6 has no migration
 from1..5, and there is no automatic eviction of valid persistent sessions.
 
 ## Hierarchical local preview (Proposed0031)
@@ -160,7 +160,7 @@ topics/1MiB, exact and wildcard replay, ordered RH, live RAP and ClientID No Loc
 Replay is frozen transactionally and drained by existing delivery machines.
 Old owed values remain charged under the existing128-reference/4MiB budgets;
 a complete subscription update may therefore be refused. This does not provide
-an unbounded state archive or format migration. Current schema9 refuses historical schemas. Product system tests do not qualify allP1/P2.
+an unbounded state archive or format migration. Current schema10 refuses historical schemas. Product system tests do not qualify allP1/P2.
 
 
 ## Message lifetime (Proposed0033)
@@ -177,4 +177,19 @@ started QoS1 PI or payload. A known Started claim can finish after its lifetime.
 Physical wire-departure timestamps, arbitrary host scheduling bounds, universal
 MQTT conformance and power-loss guarantees remain outside the local preview.
 The sweep has bounded work and one outstanding request; no expiry timer or row
-accumulates per historic connection/publication. SQLite9 has no general migration.
+accumulates per historic connection/publication. Current SQLite10 has no general migration.
+
+
+## Will product scope (Proposed0034)
+
+Zero-delay non-retained QoS1 Will installation, cancellation, durable pending
+admission, startup recovery and capacity deferral are implemented. Tests cover
+real sensor SIGKILL, normal disconnect suppression, source-session deletion and
+offline recipients. These system tests do not extend independent fixture
+qualification. Delayed/retained/other-QoS Wills and Will properties except delay0
+remain open. An uncommitted cancellation cannot be recovered after a crash;
+server failure can defer notification to restart. Pending intent reserves are
+bounded, so arbitrarily many blocked vanished clients are not promised. Will
+receipt/inventory retention is bounded and old schema formats are refused.
+TLS, authentication and measurable local deployment service targets are the next
+separate increment; no unauthenticated remote deployment is received here.

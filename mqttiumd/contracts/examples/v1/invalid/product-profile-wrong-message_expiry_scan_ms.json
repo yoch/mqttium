@@ -1,7 +1,7 @@
 {
   "format": "mqttiumd.product-profile",
   "schema_version": 1,
-  "id": "tcp-message-expiry-pubsub-v1",
+  "id": "tcp-will-pubsub-v1",
   "mqtt_version": 5,
   "client_id": "explicit",
   "clean_start": [
@@ -18,7 +18,7 @@
     2
   ],
   "retain": true,
-  "will": false,
+  "will": true,
   "authentication": false,
   "subscriptions": true,
   "outgoing_delivery": true,
@@ -82,7 +82,7 @@
   "session_clock_degraded_after_ms": 31000,
   "max_session_expiry_timers": 128,
   "session_expiry_batch": 4,
-  "sqlite_schema_version": 9,
+  "sqlite_schema_version": 10,
   "wildcard_subscriptions": true,
   "no_local": true,
   "shared_subscriptions": false,
@@ -106,5 +106,17 @@
   "message_expiry_scan_ms": "unsupported",
   "message_expiry_batch": 4,
   "message_expiry_policy": "quarantine-on-unknown-origin",
-  "message_expiry_time_unit": "nanoseconds"
+  "message_expiry_time_unit": "nanoseconds",
+  "will_qos": [
+    1
+  ],
+  "will_retain": false,
+  "will_delay_interval": [
+    0
+  ],
+  "will_message_expiry": false,
+  "max_will_intents": 256,
+  "max_will_bytes": 8388608,
+  "max_will_topic_bytes": 1024,
+  "max_will_payload_bytes": 32768
 }

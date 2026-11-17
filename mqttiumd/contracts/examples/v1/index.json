@@ -178,7 +178,19 @@
     "contracts/examples/v1/valid/product-message-hook-message-expire-committed.json",
     "contracts/examples/v1/valid/product-message-hook-publish-emission.json",
     "contracts/examples/v1/valid/product-command-DeliveryStarted.json",
-    "contracts/examples/v1/valid/product-command-MessageExpire.json"
+    "contracts/examples/v1/valid/product-command-MessageExpire.json",
+    "contracts/examples/v1/valid/product-will-transitions.json",
+    "contracts/examples/v1/valid/store-snapshot-will-open.json",
+    "contracts/examples/v1/valid/store-snapshot-will-pending.json",
+    "contracts/examples/v1/valid/store-snapshot-will-source-gone.json",
+    "contracts/examples/v1/valid/store-snapshot-will-published.json",
+    "contracts/examples/v1/valid/product-will-installed.json",
+    "contracts/examples/v1/valid/product-will-decided.json",
+    "contracts/examples/v1/valid/product-will-admitted.json",
+    "contracts/examples/v1/valid/product-hook-will-admission-prepared.json",
+    "contracts/examples/v1/valid/product-hook-will-admission-committed.json",
+    "contracts/examples/v1/valid/product-hook-will-end-prepared.json",
+    "contracts/examples/v1/valid/product-hook-will-end-committed.json"
   ],
   "invalid": [
     {
@@ -2622,6 +2634,120 @@
       "code": "schema-violation",
       "pointer": "/sqlite_schema_version",
       "why": "The profile declares the actual bounded Message Expiry implementation and quarantine policy."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-will-transitions-wrong-decision.json",
+      "code": "schema-violation",
+      "pointer": "/decision",
+      "why": "Will transitions retain their own Proposed0034 decision and system scope."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-will-published-without-will-id.json",
+      "code": "schema-violation",
+      "pointer": "/operations/3/decision/facts",
+      "why": "The terminal Will result retains occurrence and publication identity independently."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-will-published-without-publication-id.json",
+      "code": "schema-violation",
+      "pointer": "/operations/3/decision/facts",
+      "why": "The terminal Will result retains occurrence and publication identity independently."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-will-invalid-state.json",
+      "code": "schema-violation",
+      "pointer": "/wills/0/state",
+      "why": "Will evidence stays bounded, typed and in immutable occurrence order."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-will-payload-over-limit.json",
+      "code": "schema-violation",
+      "pointer": "/wills/0/payload_hex",
+      "why": "Will evidence stays bounded, typed and in immutable occurrence order."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-will-duplicate.json",
+      "code": "duplicate-name",
+      "pointer": "/wills/1/will_id",
+      "why": "Will evidence stays bounded, typed and in immutable occurrence order."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-will-identity-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/wills/0/will_id/sequence",
+      "why": "Will evidence stays bounded, typed and in immutable occurrence order."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-will-installed-with-payload.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "Product Will events carry lengths and identities, never Will bytes."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-will-decided-with-payload.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "Product Will events carry lengths and identities, never Will bytes."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-will-admitted-with-payload.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "Product Will events carry lengths and identities, never Will bytes."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-will.json",
+      "code": "schema-violation",
+      "pointer": "/will",
+      "why": "The profile declares only bounded nonretained QoS1 Will with zero delay and no Message Expiry."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-will_qos.json",
+      "code": "schema-violation",
+      "pointer": "/will_qos",
+      "why": "The profile declares only bounded nonretained QoS1 Will with zero delay and no Message Expiry."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-will_retain.json",
+      "code": "schema-violation",
+      "pointer": "/will_retain",
+      "why": "The profile declares only bounded nonretained QoS1 Will with zero delay and no Message Expiry."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-will_delay_interval.json",
+      "code": "schema-violation",
+      "pointer": "/will_delay_interval",
+      "why": "The profile declares only bounded nonretained QoS1 Will with zero delay and no Message Expiry."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-will_message_expiry.json",
+      "code": "schema-violation",
+      "pointer": "/will_message_expiry",
+      "why": "The profile declares only bounded nonretained QoS1 Will with zero delay and no Message Expiry."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-max_will_intents.json",
+      "code": "schema-violation",
+      "pointer": "/max_will_intents",
+      "why": "The profile declares only bounded nonretained QoS1 Will with zero delay and no Message Expiry."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-max_will_bytes.json",
+      "code": "schema-violation",
+      "pointer": "/max_will_bytes",
+      "why": "The profile declares only bounded nonretained QoS1 Will with zero delay and no Message Expiry."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-max_will_topic_bytes.json",
+      "code": "schema-violation",
+      "pointer": "/max_will_topic_bytes",
+      "why": "The profile declares only bounded nonretained QoS1 Will with zero delay and no Message Expiry."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-max_will_payload_bytes.json",
+      "code": "schema-violation",
+      "pointer": "/max_will_payload_bytes",
+      "why": "The profile declares only bounded nonretained QoS1 Will with zero delay and no Message Expiry."
     }
   ]
 }

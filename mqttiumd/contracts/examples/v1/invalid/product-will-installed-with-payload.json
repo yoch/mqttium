@@ -1,0 +1,25 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "1",
+  "pid": 1,
+  "kind": "will_installed",
+  "operation": {
+    "incarnation": "1",
+    "epoch": "1",
+    "owner": "0",
+    "sequence": "40"
+  },
+  "will": {
+    "incarnation": "1",
+    "epoch": "1",
+    "owner": "0",
+    "sequence": "40"
+  },
+  "details": {
+    "topic_bytes": 24,
+    "payload_bytes": 7,
+    "authority": "durable_open_commit",
+    "payload": "offline"
+  }
+}

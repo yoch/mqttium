@@ -677,7 +677,10 @@ pub trait DurableStore {
         after: Option<OperationId>,
         limit: usize,
         budget: ReadBudget,
-    ) -> Result<WillPage, ReadError>;
+    ) -> Result<WillPage, ReadError> {
+        let _ = (after, limit, budget);
+        Err(ReadError::Unavailable)
+    }
 
     /// The durable state, for inspection.
     fn snapshot(&self) -> Result<DurableState, ReadError> {

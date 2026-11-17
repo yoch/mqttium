@@ -131,6 +131,7 @@ fn with_runtime_clock_hooks(
         last_session_cardinality: None,
         work_reads: BTreeMap::new(),
         last_work_scan: Instant::now(),
+        last_will_scan: Instant::now(),
         maintenance_needed: false,
         #[cfg(feature = "test-hooks")]
         work_cache: BTreeMap::new(),

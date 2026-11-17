@@ -47,3 +47,5 @@ What each record leaves open is tracked in
 | [0032](0032-durable-retained.md) | Proposed | Topic-owned retained references, atomic frozen replay, ordered RH and live RAP | Product |
 
 | [0033](0033-message-expiry.md) | Proposed | Original message lifetime, bounded expiry and temporal quarantine | Product/system reception |
+
+| [0034](0034-durable-will.md) | Proposed | Durable zero-delay QoS1 Will and source-independent intentions | Product and bounded system reception |
