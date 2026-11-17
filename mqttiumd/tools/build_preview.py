@@ -51,7 +51,7 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
     package = out / f"mqttiumd-preview-{source[:8]}-{platform.machine()}-linux"
     package.mkdir()
     shutil.copy2(binary, package / "mqttiumd")
-    for name in ("README.md", "start.sh", "demo.sh", "expiry-demo.sh"):
+    for name in ("README.md", "start.sh", "demo.sh", "expiry-demo.sh", "will-demo.sh"):
         shutil.copy2(root / "preview" / name, package / name)
     (package / "NORMAL-FEATURES.txt").write_text(features)
     runtime = command("ldd", str(binary))
@@ -103,11 +103,13 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
         "compiler": command("rustc", "-Vv"), "profile": "release", "features": [],
         "build_options": ["--release", "--locked", "--no-default-features", "-p", "mqttiumd"],
         "build_environment": {key: os.environ.get(key) for key in ("RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_PROFILE_RELEASE_DEBUG", "CARGO_PROFILE_RELEASE_OPT_LEVEL", "CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS")},
-        "sqlite_schema": 9, "instrumented": False,
+        "sqlite_schema": 10, "instrumented": False,
+        "will_profile": {"qos": 1, "retain": False, "delay_interval": 0,
+                         "message_expiry": False, "intent_slots": 256, "payload_bytes": 8388608},
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "runtime_dependencies": runtime.splitlines(),
         "execution_verification": "Separate extraction receipt names this exact archive hash",
-        "execution_receipt": "See the separately identified archive extraction smoke and Message Expiry/retained receptions.",
+        "execution_receipt": "See the separately identified archive extraction smoke and Will/Message Expiry/retained receptions.",
     }
     (package / "BUILD.json").write_text(json.dumps(build_record, indent=2) + "\n")
     sums = []

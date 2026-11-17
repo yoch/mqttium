@@ -148,23 +148,30 @@ def main(archive: Path, out: Path) -> None:
         require(head == first, "packaged_wrong_packet")
         return body
 
-    def connect(address, name: bytes, present: bool):
+    def connect(address, name: bytes, present: bool, *, will: bytes | None = None,
+                expiry: int = 0xffffffff):
         peer = socket.create_connection(address, timeout=3)
         peer.settimeout(3)
         peers.append(peer)
-        send(peer, 0x10, b"\0\x04MQTT\x05\0\0\x0a\x05\x11\xff\xff\xff\xff" + text(name))
+        flags = 0 if will is None else 0x0c
+        body = (b"\0\x04MQTT\x05" + bytes([flags]) + b"\0\x0a\x05\x11"
+                + expiry.to_bytes(4, "big") + text(name))
+        if will is not None:
+            body += b"\x05\x18\0\0\0\0" + text(b"atelier/capteur-1/status") + text(will)
+        send(peer, 0x10, body)
         connack = receive(peer, 0x20)
         require(connack[:2] == bytes([int(present), 0]), "packaged_session_present_mismatch")
         return peer
 
-    def publish(peer, mid: int, payload: bytes):
-        send(peer, 0x32, text(b"atelier/salle1/temperature") + mid.to_bytes(2, "big") + b"\0" + payload)
+    def publish(peer, mid: int, payload: bytes, *, topic: bytes = b"atelier/salle1/temperature",
+                retain: bool = False):
+        send(peer, 0x32 | int(retain), text(topic) + mid.to_bytes(2, "big") + b"\0" + payload)
         require(receive(peer, 0x40)[:2] == mid.to_bytes(2, "big"), "packaged_publish_not_admitted")
 
-    def message(peer, expected: bytes):
+    def message(peer, expected: bytes, *, topic: bytes = b"atelier/salle1/temperature"):
         body = receive(peer, 0x32)
         length = int.from_bytes(body[:2], "big")
-        require(body[2:2+length] == b"atelier/salle1/temperature", "packaged_wrong_topic")
+        require(body[2:2+length] == topic, "packaged_wrong_topic")
         mid = body[2+length:4+length]
         require(body[4+length:] == b"\0" + expected, "packaged_wrong_payload")
         send(peer, 0x40, mid)
@@ -173,7 +180,9 @@ def main(archive: Path, out: Path) -> None:
         with sqlite3.connect(f"file:{data / 'broker.sqlite'}?mode=ro", uri=True) as db:
             return {"sessions": db.execute("select count(*) from sessions").fetchone()[0],
                     "routes": db.execute("select count(*) from routes").fetchone()[0],
-                    "obligations": db.execute("select count(*) from obligations").fetchone()[0]}
+                    "obligations": db.execute("select count(*) from obligations").fetchone()[0],
+                    "wills": db.execute("select count(*) from wills").fetchone()[0],
+                    "retained": db.execute("select count(*) from retained").fetchone()[0]}
 
     seen_events: set[Path] = set()
     try:
@@ -201,7 +210,32 @@ def main(archive: Path, out: Path) -> None:
         subscriber = connect(address, b"archive-smoke-sub", True)
         message(subscriber, b"archive:2-offline")
         until(lambda: snapshot()["obligations"] == 0, "packaged_recovery_not_finished")
+        # Independent raw frames exercise durable Will installation, EOF,
+        # cancellation and non-retained publication on the extracted binary.
+        # The separate public will-demo.sh owns the real client SIGKILL witness.
+        will_topic = b"atelier/capteur-1/status"
+        sensor = connect(address, b"archive-smoke-sensor", False, will=b"offline", expiry=0)
+        installed = snapshot()
+        require(installed["wills"] == 1, "packaged_will_not_installed_before_connack")
+        publish(sensor, 1, b"online", topic=will_topic, retain=True)
+        message(subscriber, b"online", topic=will_topic)
+        sensor.close()  # An observed transport EOF, not MQTT DISCONNECT.
+        message(subscriber, b"offline", topic=will_topic)
+        until(lambda: snapshot()["wills"] == 0 and snapshot()["obligations"] == 0,
+              "packaged_will_eof_not_finished")
+        normal = connect(address, b"archive-smoke-normal-sensor", False, will=b"false-offline", expiry=0)
+        send(normal, 0xe0, b"")
+        normal.close()
+        until(lambda: snapshot()["wills"] == 0 and snapshot()["sessions"] == 2,
+              "packaged_will_normal_not_cancelled")
+        # A queued false Will would be a PUBLISH here, not the expected PINGRESP.
+        send(subscriber, 0xc0, b"")
+        receive(subscriber, 0xd0)
         final = snapshot()
+        will_receipt = {"installed_before_connack_return": installed,
+                        "after_eof_and_normal_cancel": final,
+                        "normal_cancel_ordered_ping": True,
+                        "trigger": "raw_transport_EOF_not_client_SIGKILL"}
         stop(process)
         process = None
         require(before["sessions"] == final["sessions"] == 2 and final["routes"] == 2,
@@ -212,7 +246,7 @@ def main(archive: Path, out: Path) -> None:
                   **platforms(build),
                   "before_restart": before, "after_restart": final,
                   "same_database": str(data / "broker.sqlite"), "processes": children,
-                  "observations": actions}
+                  "will": will_receipt, "observations": actions}
         (out / "receipt.json").write_text(json.dumps(record, indent=2) + "\n")
     finally:
         for peer in peers:

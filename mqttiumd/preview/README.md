@@ -1,19 +1,95 @@
-# mqttiumd — local MQTT 5 with durable retained and Message Expiry
+# mqttiumd — local MQTT5 sensor disappearance notifications
 
 Extract on compatible Linux x86_64 with glibc (see `BUILD.json` and `RUNTIME.txt`).
-The normal executable needs neither Rust, Git nor the laboratory. Run:
+The normal executable needs neither Rust, Git nor the laboratory. Start on the
+trusted local machine:
 
 ```sh
 ./start.sh ./data
 ```
 
-It listens on `127.0.0.1:1883`. `MQTTIUMD_LISTEN` overrides the address.
-`./data/broker.sqlite` survives every restart; each start creates fresh logs.
-Clock recognition and readiness are recorded in `data/logs/run.*/events.jsonl`.
-**Schema9 only:** historical databases are refused without modification. Keep
-an old installation's data separately; there is no automatic migration or reset.
+It listens on `127.0.0.1:1883`; `MQTTIUMD_LISTEN` overrides the address.
+`./data/broker.sqlite` survives restarts; every start creates fresh logs.
+**Schema10 only:** older databases are refused without modification. Keep an
+old installation's data separately; there is no automatic migration or reset.
+This preview has no TLS or authentication. Keep it on localhost.
 
-## Try Message Expiry first
+## A sensor disappears: online → SIGKILL → offline
+
+Install Python3 and Mosquitto's **client tools**, then run the packaged scenario
+in a new directory (the broker must not already use its default port18887):
+
+```sh
+./will-demo.sh ./will-demo-data
+```
+
+The script waits for the dashboard's real SUBACK and the sensor's successful
+CONNACK and PUBACK. It then kills **only the sensor process**, records its PID
+and wait status`-9`, and checks that the dashboard receives `offline` in QoS1
+with RETAIN0. The durable Will is installed before successful CONNACK. The
+sensor's separate retained`online` state remains available to a new dashboard.
+A normal DISCONNECT cancels the next sensor's Will. Finally a persistent
+subscriber goes offline, a further sensor disappears, and the script restarts
+the same broker database before receiving the Will obligation left due.
+
+`will-demo-data/will-demo.json` records source/binary and Mosquitto identities,
+actual commands, process statuses, client debug observations, durable counts
+and build/execution platforms separately. Other files preserve fresh broker
+logs, the client CONNACK/SUBACK/PUBLISH receipts and QoS/RETAIN fields. No SQL
+cleanup or fixture preparation is performed. A crash before durable recording
+of a normal DISCONNECT cannot recover that volatile cancellation observation.
+
+For a manual run, first launch the broker with `./start.sh ./data`. In a second
+terminal, start the dashboard and wait for its `Received SUBACK` debug message:
+
+```sh
+mosquitto_sub -V mqttv5 -h 127.0.0.1 -p 1883 -i dashboard -c -x 4294967295 \
+  -q 1 -t 'atelier/+/status' -d -F '%t|%p|%q|%r'
+```
+
+In a third terminal, keep the public sensor client's stdin open. The recorded
+PID is `mosquitto_pub` itself, so the later signal does not kill the broker or
+the dashboard:
+
+```sh
+mkfifo sensor-input
+mosquitto_pub -V mqttv5 -h 127.0.0.1 -p 1883 -i capteur-1 -q 1 -r \
+  -t atelier/capteur-1/status -l -d \
+  --will-topic atelier/capteur-1/status --will-payload offline --will-qos 1 \
+  -D will will-delay-interval 0 < sensor-input &
+sensor_pid=$!
+exec 3>sensor-input
+printf 'online\n' >&3
+# Wait for Received CONNACK(0), Received PUBACK and dashboard online.
+kill -KILL "$sensor_pid"
+wait "$sensor_pid"  # reports the sensor's signal termination
+exec 3>&-
+```
+
+The dashboard receives`atelier/capteur-1/status|offline|1|0`. A fresh reader
+still obtains the retained online state:
+
+```sh
+mosquitto_sub -V mqttv5 -h 127.0.0.1 -p 1883 -i fresh-dashboard -q 1 \
+  -t atelier/capteur-1/status -C 1 -W 5 -F '%t|%p|%q|%r'
+```
+
+Expected:`atelier/capteur-1/status|online|1|1`. Closing a sensor's stdin instead
+of killing it lets `mosquitto_pub` send a normal MQTT DISCONNECT and suppresses
+its Will. The automated demo checks this separately. DISCONNECT reason0x04,
+EOF, RST, confirmed Keep Alive loss and protocol closure after accepted CONNECT
+request the Will. Shutdown or broker failure may defer it until the next start.
+Delay0 takeover publishes the old connection's Will before establishing its
+replacement; the new connection installs its own Will or explicitly none.
+
+The Will profile is **QoS1, non retained, delay absent/0, bounded exact topic
+and payload**. QoS0/2 Will, retained Will, nonzero Will Delay and every other
+Will property (including Will Message Expiry) are explicitly refused. A pending
+Will remains durable during insufficient message capacity or excessive fanout;
+it is not silently truncated. Its admission can therefore be delayed. This
+is a trusted-local-machine preview, not a complete Mosquitto replacement.
+
+## Message Expiry
 
 Install Python3 and Mosquitto's **client tools** for the optional demo, then use
 an unused directory:
@@ -141,10 +217,12 @@ retained bytes. At most256 candidate replays are considered transactionally;
 existing reference limits can refuse a whole subscription update, never truncate
 it after success. Packets65536 bytes, topic/ClientID1024, payload32768. Old values
 still owed to recipients remain charged. Replacement/clear can release their
-own retained reference without destroying such deliveries.
+own retained reference without destroying such deliveries. Will intentions have a separate
+reserve of256 slots and8MiB payload bytes (maximum32768 bytes each). No
+per-client historical Will row is kept after cancellation or admission.
 
 This is a trusted-local-machine preview, with **no TLS or authentication**.
-Will, shared subscriptions, Subscription Identifiers, outgoing
+Will variants outside the profile above, shared subscriptions, Subscription Identifiers, outgoing
 QoS2, MQTT3.1.1 and schema migration are unsupported. Finite session expiry uses
 a conservative logical clock when time-domain continuity cannot be established;
 no UTC jump authorizes deletion. Message Expiry instead preserves the original
