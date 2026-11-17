@@ -35,7 +35,29 @@ from tcp_reception import Broker, writer_available
 HISTORICAL_RECEIPT_LIMIT = 8192
 BUSINESS_COMMANDS = 32769
 WINDOW_COMMANDS = 1024
-BUSINESS_WINDOW = 640
+
+
+def receipt_windows() -> tuple[int, int]:
+    """Read this source's effective window without changing the historical quota.
+
+    The source-pinned launcher keeps this contract beside the pilot. A stale
+    numeric copy must not make genuine pressure look like unexplained silence.
+    """
+    path = Path(__file__).resolve().parents[2] / "contracts/v1/product-profile.json"
+    with path.open("rb") as stream:
+        encoded = stream.read(65537)
+    require(len(encoded) <= 65536, "receipt_profile_budget")
+    profile = json.loads(encoded)
+    data, total = profile["receipt_data_window"], profile["receipt_window"]
+    require(type(data) is int and type(total) is int and 0 < data < total,
+            "receipt_profile_window_invalid")
+    require(profile["receipt_control_reserve"] == total - data
+            and profile["receipt_slots"] == HISTORICAL_RECEIPT_LIMIT,
+            "receipt_profile_reserve_or_quota_changed")
+    return data, total
+
+
+BUSINESS_WINDOW, TOTAL_WINDOW = receipt_windows()
 
 
 class BusinessTranscript:
@@ -696,8 +718,8 @@ def unknown_hole(binary: Path, case: Path) -> dict:
     broker = Broker(binary, case, test_control=True)
     held = HeldBusiness(broker, case)
     result = {"criterion": "C-pressure", "status": "PASS", "samples": [],
-              "parameters": {"business_window": BUSINESS_WINDOW, "total_window": 1024,
-                             "attempt_budget": 1025, "result_release_timeout_s": 15,
+              "parameters": {"business_window": BUSINESS_WINDOW, "total_window": TOTAL_WINDOW,
+                             "attempt_budget": TOTAL_WINDOW + 1, "result_release_timeout_s": 15,
                              "control_response_timeout_s": 12}}
     try:
         result["ready"] = broker.ready()
@@ -727,9 +749,9 @@ def unknown_hole(binary: Path, case: Path) -> dict:
                 measured = origin_pressure_state(broker.db, operation)
                 stable = stable_receipt_pressure(event, measured, int(operation["sequence"]))
                 pressure_measurements.append({"event_sequence": event["seq"], "stable": stable, **measured})
-                require(len(pressure_measurements) <= 1024, "pressure_measurement_budget")
+                require(len(pressure_measurements) <= TOTAL_WINDOW, "pressure_measurement_budget")
                 return stable
-            for attempt in range(1, 1026):
+            for attempt in range(1, TOTAL_WINDOW + 2):
                 # An older transient pressure report must not stand in for
                 # this request's response after an intervening prefix commit.
                 latest = max(int(event["seq"]) for event in broker.events())
