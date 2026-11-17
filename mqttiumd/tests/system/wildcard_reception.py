@@ -305,7 +305,8 @@ async def offline_and_expiry(binary,case):
 
 
 def business_state(state):
-    return {name:state['tables'][name] for name in ('publications','payloads','obligations','inbound','outbound')}
+    return {**{name:state['tables'][name] for name in ('publications','payloads','obligations','inbound','outbound')},
+            'accounts':{name:state['tables']['meta'][0][name] for name in ('used_payload_bytes','used_references','used_exchange_slots')}}
 
 
 async def fanout_capacity(binary,case):
@@ -332,13 +333,36 @@ async def fanout_capacity(binary,case):
         dropped=[event for event in broker.events() if int(event['seq'])>mark and event['kind']=='qos0_dropped']
         require(any(event['details']['reason']=='capacity_exceeded' for event in dropped),
                 'wildcard_qos0_overflow_not_observed')
+        source.close();source=None
         rejected=[]
         from tcp_probe import publish_packet
         for identifier,qos in ((11,1),(12,2)):
+            source=PubsubWire(broker.address,broker.observations,f'fanout-overflow-{qos}')
+            source.connect('fanout-source',session_present=True)
+            mark=max(int(event['seq']) for event in broker.events())
             source.send(publish_packet(topic,f'over-limit-qos{qos}'.encode(),identifier,qos=qos))
-            response=source.wait(0x40 if qos==1 else 0x50,identifier)
-            require(response.ack()==(identifier,0x97),'wildcard_overflow_wrong_refusal',str(response.ack()))
-            rejected.append({'qos':qos,'reason':0x97,'wire':packet(response.header,response.body).hex()})
+            disconnect=None
+            try:
+                response=source.poll(2)
+                require(response is not None,'wildcard_overflow_did_not_refuse')
+                require(response.kind==0xe0 and response.body and response.body[0]>=128,
+                        'wildcard_fanout_truncated')
+                disconnect=response.body[0]
+                try:
+                    ended=source.poll(2)
+                    raise ReceiptFailure('wildcard_overflow_did_not_close',str(ended))
+                except ReceiptFailure as error:
+                    require(error.code=='peer_closed','wildcard_overflow_did_not_close',error.code)
+            except ReceiptFailure as error:
+                require(error.code=='peer_closed','wildcard_overflow_did_not_refuse',error.code)
+            closures=[event for event in broker.events() if int(event['seq'])>mark
+                      and event['kind']=='connection_closed' and event['details']['code']=='capacity_exceeded']
+            require(len(closures)==1,'wildcard_capacity_close_cause_missing')
+            rejected.append({'qos':qos,'clean_eof':True,'disconnect_reason':disconnect,
+                             'product_close':closures[0],'positive_publish_ack':False})
+            source.close();source=None
+        source=PubsubWire(broker.address,broker.observations,'fanout-source-accepted')
+        source.connect('fanout-source',session_present=True)
         after=durable(broker.db)
         require(business_state(after)==baseline,'wildcard_fanout_truncated')
         for wire in witnesses:wire.no_publication(.1,code='wildcard_fanout_truncated')
@@ -350,13 +374,20 @@ async def fanout_capacity(binary,case):
         require(len(obligations)==16 and len({row['target'] for row in obligations})==16,
                 'wildcard_sixteen_targets_not_admitted_atomically')
         message=witnesses[0].next_publication();require(message.payload==accepted,'wildcard_fanout_payload_mismatch')
-        witnesses[0].acknowledge(message);witnesses[0].close();witnesses=[]
+        witnesses[0].acknowledge(message)
+        zero_target=session_key(durable(broker.db),'fanout-target-0')
+        await until_state(broker,lambda state:not any(row['target']==zero_target for row in state['tables']['obligations']),
+                          'wildcard_target_finish_not_committed')
+        witnesses[0].close();witnesses=[]
         deliveries=[]
         for index in range(1,16):
             receiver,tap=await peer('mqttium' if index%2 else 'paho',broker,case,f'fanout-drain-{index}',
                                     client_id=f'fanout-target-{index}',present=True)
             peers.append((receiver,tap))
             deliveries.append(await receiver.receive(accepted,1));one_wire_delivery(tap,accepted,1)
+            target_id=session_key(durable(broker.db),receiver.client_id)
+            await until_state(broker,lambda state:not any(row['target']==target_id for row in state['tables']['obligations']),
+                              'wildcard_target_finish_not_committed')
             await close_peers(peers);peers=[]
         await until_state(broker,lambda state:state['counts']['obligations']==0 and state['counts']['outbound']==0,
                           'wildcard_fanout_not_durably_finished')
@@ -395,8 +426,8 @@ async def routing_measure(binary,case):
     from receipt_reception import storage_sample
     from itertools import product
     decisions=[]
-    for size in (1,16,64,128):
-        directory=case/str(size);broker=Broker(binary,directory);target=source=None
+    for mode,size in ((mode,size) for mode in ('exact','wildcard') for size in (1,16,64,128)):
+        directory=case/mode/str(size);broker=Broker(binary,directory);target=source=None
         try:
             ready=broker.ready()
             target=PubsubWire(broker.address,broker.observations,'measure-target')
@@ -404,6 +435,8 @@ async def routing_measure(binary,case):
             levels=('a','b','c','d','e','f','g')
             filters=['measure/'+'/'.join(level if literal else '+' for level,literal in zip(levels,bits))
                      for bits in product((False,True),repeat=7)][:size]
+            if mode=='exact':
+                filters=['measure/'+'/'.join(levels)]+[f'measure/nonmatching-{index}' for index in range(size-1)]
             for index in range(0,len(filters),8):target.subscribe(index//8+1,[(value,1) for value in filters[index:index+8]])
             source=PubsubWire(broker.address,broker.observations,'measure-source')
             source.connect('measure-source',session_present=False)
@@ -421,8 +454,13 @@ async def routing_measure(binary,case):
                               'routing_measure_not_durably_finished')
             target.no_publication(.1,code='routing_measure_duplicate_delivery')
             final=storage_sample(broker)
+            committed=lambda kind:{json.dumps(event['operation'],sort_keys=True) for event in broker.events()
+                if event['kind']=='store_result' and event.get('command_kind')==kind
+                and event['details'].get('committed_now') is True and event['details'].get('outcome')=='Committed'}
+            require(len(committed('Admission'))==16 and len(committed('Finish'))==16,
+                    'routing_measure_commit_or_finish_count')
             values=[int(sample['publisher_ack_ns'])/1e6 for sample in samples]
-            decisions.append({'route_count':size,'distinct_targets':1,'messages_received':16,
+            decisions.append({'mode':mode,'route_count':size,'distinct_targets':1,'messages_received':16,
                               'durably_finished':16,'samples':samples,'publisher_ack_ms':{
                                   'min':min(values),'median':percentile(values,.5),'p95_nearest_rank':percentile(values,.95),'max':max(values)},
                               'initial':initial,'final':final,'ready':ready,'pid':broker.process.pid,
@@ -434,8 +472,57 @@ async def routing_measure(binary,case):
             broker.cleanup()
     write_json(case/'measurements.json',decisions)
     return {'criterion':'routing-measure','status':'PASS','sizes':[1,16,64,128],
-            'samples_per_size':16,'same_binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),
+            'modes':['exact','wildcard'],'samples_per_size':16,'same_binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),
             'measurements':decisions,'qualification':'exploratory-system-measurement'}
+
+
+async def pressure(binary,case):
+    broker=Broker(binary,case)
+    source=slow=independent=None
+    try:
+        ready=broker.ready()
+        require(ready['details']['max_targets']==16 and ready['details']['max_subscriptions']==128
+                and ready['details']['output_slots']==4 and ready['details']['write_ms']==250,
+                'wildcard_pressure_changed_limits')
+        slow=PubsubWire(broker.address,broker.observations,'wildcard-slow',receive_buffer=1024)
+        slow.connect('wildcard-slow',session_present=False)
+        slow.subscribe(1,[('pressure/slow/#',0),('pressure/slow/value',0)],expected=(0,0))
+        independent=PubsubWire(broker.address,broker.observations,'wildcard-independent')
+        independent.connect('wildcard-independent',session_present=False)
+        independent.subscribe(1,[('pressure/control/+',0)],expected=(0,))
+        source=PubsubWire(broker.address,broker.observations,'wildcard-pressure-source')
+        source.connect('wildcard-pressure-source',session_present=False)
+        mark=max(int(event['seq']) for event in broker.events());sent=0
+        for index in range(64):
+            source.publish_qos0('pressure/slow/value',f'{index:08}'.encode()+b's'*(32768-8));sent+=1
+            if any(event['kind']=='qos0_dropped' and event['details']['reason'] in ('output_saturated','write_failed')
+                   for event in broker.events() if int(event['seq'])>mark):break
+        end=time.monotonic()+3;observed=[]
+        while time.monotonic()<end:
+            observed=[event for event in broker.events() if int(event['seq'])>mark and event['kind']=='qos0_dropped'
+                      and event['details']['reason'] in ('output_saturated','write_failed')]
+            if observed:break
+            await asyncio.sleep(.01)
+        require(bool(observed),'wildcard_output_pressure_not_reached')
+        payload=b'independent-number:00000001'
+        source.publish_qos0('pressure/control/value',payload)
+        message=independent.next_publication()
+        require(message.payload==payload and message.qos==0,'wildcard_pressure_blocked_independent_destination')
+        independent.send(b'\xc0\x00');require(independent.wait(0xd0).body==b'','wildcard_pressure_blocked_ping')
+        source.send(b'\xc0\x00');require(source.wait(0xd0).body==b'','wildcard_pressure_blocked_source_control')
+        state=durable(broker.db)
+        require(all(state['counts'][name]==0 for name in ('obligations','outbound','publications','payloads')),
+                'wildcard_volatile_pressure_created_durable_work')
+        for wire in (source,slow,independent):wire.close()
+        source=slow=independent=None;broker.stop()
+        return {'criterion':'pressure','status':'PASS','publications_bounded_at':sent,
+                'payload_bytes':32768,'slow_receive_buffer':1024,'actual_pressure':observed,
+                'independent_message':message.observation(),'independent_ping':True,'profile':ready['details'],
+                'stop_status':broker.process.returncode}
+    finally:
+        for wire in (source,slow,independent):
+            if wire is not None:wire.close()
+        broker.cleanup()
 
 
 def main():
@@ -443,7 +530,7 @@ def main():
     parser.add_argument('--binary',type=Path,required=True)
     parser.add_argument('--out',type=Path,required=True)
     parser.add_argument('--binary-source-head',required=True)
-    parser.add_argument('--case',choices=('normal','demo','matrix','no-local','filter-edges','offline-expiry','fanout','routing-measure'),default='normal')
+    parser.add_argument('--case',choices=('normal','demo','matrix','no-local','filter-edges','offline-expiry','fanout','routing-measure','pressure'),default='normal')
     args=parser.parse_args();args.out.mkdir(parents=True,exist_ok=False)
     source=Path(__file__).resolve().parents[3]
     head=subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD']).decode().strip()
@@ -453,8 +540,8 @@ def main():
              'binary':{'path':str(args.binary.resolve()),'sha256':hashlib.sha256(args.binary.read_bytes()).hexdigest()},'cases':[]}
     try:
         require(head==args.binary_source_head,'wildcard_source_mismatch')
-        selected=('demo','matrix','no-local','filter-edges','offline-expiry','fanout','routing-measure') if args.case=='normal' else (args.case,)
-        functions={'demo':demo,'matrix':matrix,'no-local':no_local,'filter-edges':filter_edges,'offline-expiry':offline_and_expiry,'fanout':fanout_capacity,'routing-measure':routing_measure}
+        selected=('demo','matrix','no-local','filter-edges','offline-expiry','fanout','routing-measure','pressure') if args.case=='normal' else (args.case,)
+        functions={'demo':demo,'matrix':matrix,'no-local':no_local,'filter-edges':filter_edges,'offline-expiry':offline_and_expiry,'fanout':fanout_capacity,'routing-measure':routing_measure,'pressure':pressure}
         for name in selected:
             receipt['cases'].append(asyncio.run(functions[name](args.binary.resolve(),args.out/name)))
         receipt['status']='PASS'
