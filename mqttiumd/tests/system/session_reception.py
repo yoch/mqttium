@@ -429,7 +429,7 @@ async def protocol_matrix(broker, cursor, case):
         await gone(broker, cursor, name)
     for name, properties, reason in (
         ('duplicate_disconnect', b'\x11\0\0\0\0' * 2, 0x82),
-        ('disconnect_with_will', b'', 0x83),
+        ('disconnect_outside_profile_reason', b'', 0x83),
         ('truncated_disconnect', b'\x11\0\0\0', 0x81),
     ):
         wire = SessionWire(broker.address, observations, name)
@@ -437,7 +437,7 @@ async def protocol_matrix(broker, cursor, case):
             wire.session_connect(name, expiry=INFINITE, expected_present=False)
             old = session_row(session_snapshot(broker), name)
             declared = len(properties) + (name == 'truncated_disconnect')
-            wire.send(packet(0xE0, bytes([4 if name == 'disconnect_with_will' else 0, declared]) + properties))
+            wire.send(packet(0xE0, bytes([0x80 if name == 'disconnect_outside_profile_reason' else 0, declared]) + properties))
             observed.append({'case': name, 'response': rejected(wire, 0xE0, reason)})
         finally:
             wire.close()
@@ -450,6 +450,35 @@ async def protocol_matrix(broker, cursor, case):
         finally:
             cleanup.close()
         await gone(broker, cursor, name)
+    # Reason4 is now a supported Will request. With no installed Will it still
+    # closes normally and must not manufacture a publication or end the session.
+    name = 'disconnect04-without-installed-will'
+    wire = SessionWire(broker.address, observations, name)
+    try:
+        wire.session_connect(name, expiry=INFINITE, expected_present=False)
+        previous = session_row(session_snapshot(broker), name)
+        wire.send(packet(0xE0, b'\x04\x00'))
+        try:
+            unexpected = wire.wait(0xE0)
+        except ReceiptFailure as error:
+            require(error.code == 'peer_closed', 'disconnect04_without_will_not_closed', error.code)
+        else:
+            raise ReceiptFailure('disconnect04_without_will_refused', unexpected.body.hex())
+        current = session_snapshot(broker)
+        require(session_row(current, name)['id'] == previous['id'], 'disconnect04_without_will_erased_session')
+        require(current['counts'].get('wills', 0) == 0 and current['counts'].get('publications', 0) == 0,
+                'disconnect04_invented_uninstalled_will')
+        observed.append({'case': 'disconnect04_without_will', 'clean_close': True,
+                         'same_session': True, 'will_publications': 0})
+    finally:
+        wire.close()
+    cleanup = SessionWire(broker.address, observations, name + '-cleanup')
+    try:
+        cleanup.session_connect(name, expiry=INFINITE, expected_present=True)
+        cleanup.session_disconnect(0)
+    finally:
+        cleanup.close()
+    await gone(broker, cursor, name)
     return observed
 
 

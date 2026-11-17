@@ -29,3 +29,21 @@ kill-points workspace suites; validate P1-02; build_corpus/build_traces checks;
 must rerun the exact published content and keep its independent qualification
 scope. Next action: finish clean launcher, publish with expected-head lease,
 check exact-head CI, download/extract final normal archive and run will-demo.
+
+First publication: a90a11e599dc292b5a6df3a65d51e6a51ad7796f, tree
+3ceba3909dfefec19163c34c76b916887715f79d, guarded against A0; connector and
+full fetched tree matched. CI run44184519426 received normal1138 and
+instrumented1153 locally before publication. Its independent stream gates then
+exposed a diagnostic-schema mismatch, not a Will business invariant failure:
+current bounded detached_by text/infinite omitted deadline versus historical
+structured identity/required null. New red/green format tests keep both forms
+readable, preserve checked components and still require finite deadlines.
+The corrected format checker accepts8861 original events without skipping; this
+is diagnostic compatibility checking, not relabeling those runs as new evidence.
+
+The old session protocol matrix also still expected DISCONNECT4 to be unsupported.
+It now tests supported4 without an installed Will (clean closure, same persistent
+session, no invented publication), retaining a separate valid unsupported0x80
+reason refusal. The public normal matrix was actually rerun and passed.
+New digest: sha256:57b2d617cf8369b2c6fe14325f328b6378aafc98155f47a3568da20528448151.
+Final source must run fresh campaigns after this reader identity change.

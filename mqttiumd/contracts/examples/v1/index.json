@@ -190,7 +190,9 @@
     "contracts/examples/v1/valid/product-hook-will-admission-prepared.json",
     "contracts/examples/v1/valid/product-hook-will-admission-committed.json",
     "contracts/examples/v1/valid/product-hook-will-end-prepared.json",
-    "contracts/examples/v1/valid/product-hook-will-end-committed.json"
+    "contracts/examples/v1/valid/product-hook-will-end-committed.json",
+    "contracts/examples/v1/valid/product-will-detached-infinite-diagnostic.json",
+    "contracts/examples/v1/valid/product-will-detached-finite-diagnostic.json"
   ],
   "invalid": [
     {
@@ -2748,6 +2750,18 @@
       "code": "schema-violation",
       "pointer": "/max_will_payload_bytes",
       "why": "The profile declares only bounded nonretained QoS1 Will with zero delay and no Message Expiry."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-will-detached-identity-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/details/detached_by",
+      "why": "A bounded textual identity has four checked canonical u64 components."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-will-detached-infinite-has-deadline.json",
+      "code": "schema-violation",
+      "pointer": "/details/deadline",
+      "why": "Infinite detachment has no finite deadline; legacy null remains readable."
     }
   ]
 }

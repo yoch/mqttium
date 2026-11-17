@@ -229,7 +229,16 @@
           ]
         },
         "detached_by": {
-          "$ref": "primitives.schema.json#/$defs/operation_id"
+          "oneOf": [
+            {
+              "$ref": "primitives.schema.json#/$defs/operation_id"
+            },
+            {
+              "type": "string",
+              "maxLength": 83,
+              "pattern": "^(0|[1-9][0-9]{0,19})/(0|[1-9][0-9]{0,19})/(0|[1-9][0-9]{0,19})/(0|[1-9][0-9]{0,19})$"
+            }
+          ]
         },
         "deadline": {
           "oneOf": [
@@ -424,14 +433,44 @@
                 "then": {
                   "required": [
                     "expiry",
-                    "detached_by",
-                    "deadline"
+                    "detached_by"
                   ],
                   "properties": {
                     "expiry": {
                       "$ref": "primitives.schema.json#/$defs/session_expiry"
                     }
-                  }
+                  },
+                  "allOf": [
+                    {
+                      "if": {
+                        "required": [
+                          "expiry"
+                        ],
+                        "properties": {
+                          "expiry": {
+                            "const": "Never"
+                          }
+                        }
+                      },
+                      "then": {
+                        "properties": {
+                          "deadline": {
+                            "type": "null"
+                          }
+                        }
+                      },
+                      "else": {
+                        "required": [
+                          "deadline"
+                        ],
+                        "properties": {
+                          "deadline": {
+                            "$ref": "primitives.schema.json#/$defs/u64"
+                          }
+                        }
+                      }
+                    }
+                  ]
                 }
               }
             ]

@@ -204,11 +204,32 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
                     }
                 }
                 if let Some(detached) = document.pointer("/details/detached_by") {
-                    decimal_strings(
-                        Some(detached),
-                        "/details/detached_by",
-                        &mut report.diagnostics,
-                    );
+                    if let Some(raw) = detached.as_str() {
+                        for member in raw.split('/') {
+                            if let Err(error) = parse_u64(member) {
+                                let code = if matches!(
+                                    error,
+                                    DecimalError::Overflow | DecimalError::TooLong
+                                ) {
+                                    code::U64_OUT_OF_RANGE
+                                } else {
+                                    code::U64_NOT_CANONICAL
+                                };
+                                report.diagnostics.push(Diagnostic::new(
+                                    code,
+                                    "/details/detached_by",
+                                    "the bounded detachment identity has an invalid component",
+                                ));
+                                break;
+                            }
+                        }
+                    } else {
+                        decimal_strings(
+                            Some(detached),
+                            "/details/detached_by",
+                            &mut report.diagnostics,
+                        );
+                    }
                 }
             }
             if text(document, "kind") == "command_submitted"

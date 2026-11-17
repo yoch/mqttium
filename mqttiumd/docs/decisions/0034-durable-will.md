@@ -65,3 +65,10 @@ canonical receipt. This reserve is separate from the8MiB intention payload
 reserve and the unchanged32MiB bounded snapshot reader. Physical pages may be
 reused without shrinking the database file. No general schema migration is
 provided. New receptions do not qualify maximum-capacity hex snapshot documents.
+
+Current bounded product diagnostics represent a detachment identity as four
+canonical u64 decimal components separated by `/`. The event reader retains the
+historical structured OperationId form. Infinite detachment omits the deadline;
+legacy null is readable. Finite detachment still requires its checked deadline.
+This extends diagnostic representation, not canonical command meaning, the
+40-field record limit, or independent fixture qualification.

@@ -4017,6 +4017,24 @@ for field in ("will", "will_qos", "will_retain", "will_delay_interval", "will_me
         "The profile declares only bounded nonretained QoS1 Will with zero delay and no Message Expiry.",
         {**product_profile, field: "unsupported"})
 
+
+# Current bounded diagnostics retain the existing structured historical form.
+will_detached_diagnostic = env("mqttiumd.product-event", seq="30", pid=1,
+    kind="session_changed", operation=copy.deepcopy(detach_operation), details={
+        "action":"Detached", "session":"4", "expiry":"Never",
+        "detached_by":"/".join(detach_operation[key] for key in ("incarnation","epoch","owner","sequence"))})
+ok("product-will-detached-infinite-diagnostic.json", will_detached_diagnostic)
+current_finite_diagnostic = copy.deepcopy(will_detached_diagnostic)
+current_finite_diagnostic["details"].update(expiry={"After":7},deadline="7000000100")
+ok("product-will-detached-finite-diagnostic.json", current_finite_diagnostic)
+bad("product-will-detached-identity-overflow.json", "u64-out-of-range", "/details/detached_by",
+    "A bounded textual identity has four checked canonical u64 components.",
+    edited(will_detached_diagnostic, lambda value:value["details"].update(detached_by="1/2/0/18446744073709551616")))
+bad("product-will-detached-infinite-has-deadline.json", "schema-violation", "/details/deadline",
+    "Infinite detachment has no finite deadline; legacy null remains readable.",
+    edited(will_detached_diagnostic,lambda value:value["details"].update(deadline="1")))
+
+
 dump(EX / "index.json", env("mqttiumd.example-index", valid=valid, invalid=invalid))
 
 
@@ -4053,6 +4071,7 @@ def main() -> int:
         target.write_text(OUTPUTS[name])
     print(f"{len(OUTPUTS)} derived files, {len(changed)} rewritten, {len(stale)} removed")
     return 0
+
 
 
 if __name__ == "__main__":
