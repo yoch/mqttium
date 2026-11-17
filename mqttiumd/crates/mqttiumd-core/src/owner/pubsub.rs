@@ -3087,6 +3087,18 @@ mod tests {
                 packet_id: c.packet_id,
                 claim: c.claim,
             },
+            Recipe::MarkDeliveryStarted(c) => CommitFacts::DeliveryStarted {
+                delivery: c.delivery,
+                target: c.target,
+                packet_id: c.packet_id,
+                claim: c.claim,
+            },
+            Recipe::ExpireDelivery(c) => CommitFacts::DeliveryExpired {
+                delivery: c.finish.delivery,
+                target: c.finish.target,
+                packet_id: c.finish.packet_id,
+                claim: c.finish.claim,
+            },
             Recipe::ConsumeDelivery(c) => CommitFacts::DeliveryConsumed {
                 delivery: c.delivery,
                 target: c.target,
@@ -4474,5 +4486,617 @@ mod tests {
             "work_page_rewrote_frozen_retain_flag"
         );
         assert!(owner.pubsub.deliveries.as_slice()[0].retain);
+    }
+
+    fn message_time(seconds: u64) -> MessageTime {
+        MessageTime {
+            domain: [9; 32],
+            tick: seconds * crate::contract::message_expiry::NANOS_PER_SECOND,
+        }
+    }
+    fn message_expiry() -> MessageExpiry {
+        MessageExpiry {
+            observed: message_time(10),
+            interval: 2,
+        }
+    }
+    fn message_clock(owner: &mut Owner, seconds: u64) {
+        assert!(
+            apply(
+                owner,
+                Input::MessageClock {
+                    now: message_time(seconds)
+                }
+            )
+            .is_empty()
+        );
+    }
+    fn message_command(effects: Vec<(EffectId, Effect)>) -> (EffectId, Command) {
+        effects
+            .into_iter()
+            .find_map(|(id, effect)| match effect {
+                Effect::Persist { command } => Some((id, command)),
+                _ => None,
+            })
+            .expect("durable command")
+    }
+    fn message_frame(owner: &mut Owner, index: u32) -> (EffectId, ConnectionKey, OutboundPacketId) {
+        queued(owner, index);
+        owner
+            .pubsub
+            .deliveries
+            .as_mut_slice()
+            .last_mut()
+            .unwrap()
+            .expiry = Some(message_expiry());
+        let (effect, command) =
+            message_command(apply(owner, Input::WorkAvailable { session: TARGET }));
+        let emitted = known(owner, effect, &command);
+        let (effect, connection, packet_id) = emitted
+            .into_iter()
+            .find_map(|(id, effect)| match effect {
+                Effect::EmitPublish {
+                    connection,
+                    packet_id,
+                    expiry,
+                    started,
+                    ..
+                } => {
+                    assert_eq!(expiry, Some(message_expiry()));
+                    assert!(!started);
+                    Some((id, connection, packet_id))
+                }
+                _ => None,
+            })
+            .expect("fresh emission");
+        (effect, connection, packet_id)
+    }
+    fn message_progress(
+        owner: &mut Owner,
+        effect: EffectId,
+        connection: ConnectionKey,
+        progress: FrameProgress,
+    ) -> Vec<(EffectId, Effect)> {
+        apply(
+            owner,
+            Input::FrameResult {
+                effect,
+                connection,
+                progress,
+            },
+        )
+    }
+    fn message_puback(
+        owner: &mut Owner,
+        connection: ConnectionKey,
+        packet_id: OutboundPacketId,
+    ) -> Vec<(EffectId, Effect)> {
+        let target = owner.puback_target(connection, packet_id);
+        apply(
+            owner,
+            Input::ObservedPuback {
+                connection,
+                packet_id,
+                reason: 0,
+                target,
+            },
+        )
+    }
+
+    #[test]
+    fn message_expiry_queued_and_unknown_domain_work_never_claims_consumes_or_emits() {
+        for qos in [Qos::AtMostOnce, Qos::AtLeastOnce] {
+            for unknown in [false, true] {
+                let mut owner = world();
+                queued(&mut owner, 0);
+                let d = &mut owner.pubsub.deliveries.as_mut_slice()[0];
+                d.expiry = Some(message_expiry());
+                d.qos = qos;
+                let mut now = message_time(12);
+                if unknown {
+                    now.domain = [7; 32];
+                }
+                apply(&mut owner, Input::MessageClock { now });
+                assert!(!owner.has_ready_work(TARGET), "quarantined_work_busy_loop");
+                let effects = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+                assert!(
+                    !effects.iter().any(|(_, e)| matches!(
+                        e,
+                        Effect::Persist { .. }
+                            | Effect::EmitPublish { .. }
+                            | Effect::EmitQos0 { .. }
+                    )),
+                    "expired_queued_emitted"
+                );
+                assert_eq!(
+                    owner.pubsub.deliveries.len(),
+                    1,
+                    "clock_freed_quarantined_work"
+                );
+                assert_eq!(owner.pubsub.deliveries.as_slice()[0].claim, None);
+            }
+        }
+    }
+
+    #[test]
+    fn message_expiry_every_clocked_product_subscription_freezes_the_observation_and_range() {
+        let mut owner = world();
+        // The product clock, rather than a particular session entry point,
+        // selects the time-aware recipe for every product SUBSCRIBE.
+        message_clock(&mut owner, 10);
+        let first = owner.counters.publication.unwrap();
+        let (effect, command) = message_command(apply(&mut owner, product_subscribe()));
+        let Recipe::TimedReplaySubscriptions(timed) = command.recipe.get() else {
+            panic!("product_subscribe_omitted_message_time");
+        };
+        assert_eq!(timed.observed, message_time(10));
+        assert_eq!(timed.replay.first_publication.sequence(), first);
+        assert_eq!(
+            owner.counters.publication.unwrap().get(),
+            first.get() + crate::contract::retained::MAX_REPLAYS as u64
+        );
+        let operation = command.recipe.operation();
+        message_clock(&mut owner, 11);
+        apply(
+            &mut owner,
+            Input::StoreResult {
+                effect,
+                operation,
+                reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown),
+            },
+        );
+        let deadline = owner.pubsub.control.as_ref().unwrap().in_flight.deadline;
+        let resolutions = apply(
+            &mut owner,
+            Input::Deadline {
+                token: deadline,
+                now: crate::contract::ids::LogicalTime::new(50),
+            },
+        );
+        assert!(resolutions.iter().any(
+            |(_, e)| matches!(e, Effect::ResolveAndFence { operation: op } if *op == operation)
+        ));
+        assert_eq!(
+            timed.observed,
+            message_time(10),
+            "replay_refreshed_expiry_origin"
+        );
+    }
+
+    #[test]
+    fn message_expiry_puback_before_started_is_held_through_unknown_marker_and_expiration() {
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        let (frame, key, pi) = message_frame(&mut owner, 0);
+        let target = owner.puback_target(key, pi).unwrap();
+        assert!(message_puback(&mut owner, key, pi).is_empty());
+        assert!(owner.pubsub.deliveries.as_slice()[0].early_puback);
+        assert!(
+            message_progress(
+                &mut owner,
+                frame,
+                key,
+                FrameProgress::Written {
+                    confirmed: 18,
+                    total: 18
+                }
+            )
+            .is_empty()
+        );
+        assert!(
+            !owner.pubsub.deliveries.as_slice()[0].claim.unwrap().started,
+            "complete_callback_invented_durable_started"
+        );
+        message_clock(&mut owner, 12);
+        let (started_effect, started) = message_command(message_progress(
+            &mut owner,
+            frame,
+            key,
+            FrameProgress::Started,
+        ));
+        assert!(
+            matches!(started.recipe.get(), Recipe::MarkDeliveryStarted(mark) if mark.claim == target.claim && mark.delivery == target.delivery)
+        );
+        let operation = started.recipe.operation();
+        assert!(
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect: started_effect,
+                    operation,
+                    reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown)
+                }
+            )
+            .is_empty()
+        );
+        assert!(message_puback(&mut owner, key, pi).is_empty());
+        assert!(message_progress(&mut owner, frame, key, FrameProgress::Started).is_empty());
+        let deadline = owner.pubsub.deliveries.as_slice()[0]
+            .in_flight()
+            .unwrap()
+            .deadline;
+        let effects = apply(
+            &mut owner,
+            Input::Deadline {
+                token: deadline,
+                now: crate::contract::ids::LogicalTime::new(20),
+            },
+        );
+        let resolve = effects
+            .iter()
+            .find_map(|(id, e)| {
+                matches!(e, Effect::ResolveAndFence { operation: op } if *op == operation)
+                    .then_some(*id)
+            })
+            .unwrap();
+        let finish = known(&mut owner, resolve, &started);
+        let (finish_effect, finish) = message_command(finish);
+        assert!(
+            matches!(finish.recipe.get(), Recipe::FinishDelivery(end) if end.claim == target.claim)
+        );
+        assert!(owner.pubsub.deliveries.as_slice()[0].claim.unwrap().started);
+        assert_eq!(
+            owner.pubsub.free_packet_id(TARGET, 1),
+            None,
+            "marker_result_freed_pi"
+        );
+        assert!(known(&mut owner, finish_effect, &finish).is_empty());
+        assert!(owner.pubsub.deliveries.is_empty());
+        assert!(message_progress(&mut owner, frame, key, FrameProgress::Started).is_empty());
+        assert!(known(&mut owner, started_effect, &started).is_empty());
+    }
+
+    #[test]
+    fn message_expiry_started_claim_replays_past_ttl_and_old_facts_cannot_hit_reused_pi() {
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        let (frame, key, pi) = message_frame(&mut owner, 0);
+        let original = owner.puback_target(key, pi).unwrap();
+        let (start_effect, start) = message_command(message_progress(
+            &mut owner,
+            frame,
+            key,
+            FrameProgress::Started,
+        ));
+        assert!(known(&mut owner, start_effect, &start).is_empty());
+        message_clock(&mut owner, 13);
+        apply(
+            &mut owner,
+            Input::ConnectionClosed {
+                connection: CONNECTION,
+            },
+        );
+        apply(
+            &mut owner,
+            Input::Packet {
+                connection: ConnectionGeneration::new(11),
+                ingress_order: 0,
+                packet: InboundPacket::ConnectResume {
+                    client_id: bytes(b"subscriber"),
+                },
+            },
+        );
+        apply(
+            &mut owner,
+            Input::ConnectionSettings {
+                connection: ConnectionGeneration::new(11),
+                receive_maximum: 8,
+                maximum_packet_size: 65536,
+            },
+        );
+        let replay = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        assert!(replay.iter().any(|(_, e)| matches!(e, Effect::EmitPublish { started: true, expiry: Some(expiry), packet_id, claim, dup: true, .. } if *expiry == message_expiry() && *packet_id == pi && *claim == original.claim)), "known_started_not_replayed_past_ttl");
+        let current = ConnectionKey {
+            session: TARGET,
+            generation: ConnectionGeneration::new(11),
+        };
+        let (end_effect, end) = message_command(message_puback(&mut owner, current, pi));
+        known(&mut owner, end_effect, &end);
+        // Reuse the same small-domain PI for another occurrence.
+        queued(&mut owner, 1);
+        let (claim_effect, claim) =
+            message_command(apply(&mut owner, Input::WorkAvailable { session: TARGET }));
+        known(&mut owner, claim_effect, &claim);
+        let newer = owner.puback_target(current, pi).unwrap();
+        let held = owner.pubsub.deliveries.as_slice()[0].clone();
+        for progress in [
+            FrameProgress::Started,
+            FrameProgress::NotStarted {
+                reason: MessageExpiryBlock::Expired,
+            },
+            FrameProgress::Written {
+                confirmed: 18,
+                total: 18,
+            },
+        ] {
+            assert!(message_progress(&mut owner, frame, key, progress).is_empty());
+        }
+        assert!(known(&mut owner, start_effect, &start).is_empty());
+        assert!(known(&mut owner, end_effect, &end).is_empty());
+        assert_eq!(owner.puback_target(current, pi), Some(newer));
+        assert_eq!(
+            owner.pubsub.deliveries.as_slice()[0],
+            held,
+            "old_fact_changed_reused_pi"
+        );
+    }
+
+    #[test]
+    fn message_expiry_certain_first_not_started_uses_correlated_expiry_and_unknown_resolution() {
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        let (frame, key, _) = message_frame(&mut owner, 0);
+        message_clock(&mut owner, 12);
+        let (expire_effect, expire) = message_command(message_progress(
+            &mut owner,
+            frame,
+            key,
+            FrameProgress::NotStarted {
+                reason: MessageExpiryBlock::Expired,
+            },
+        ));
+        let Recipe::ExpireDelivery(expiry) = expire.recipe.get() else {
+            panic!("certain_unsent_not_expired");
+        };
+        assert_eq!(expiry.expiry, message_expiry());
+        assert_eq!(expiry.observed, message_time(12));
+        let operation = expire.recipe.operation();
+        apply(
+            &mut owner,
+            Input::StoreResult {
+                effect: expire_effect,
+                operation,
+                reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown),
+            },
+        );
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 1), None);
+        assert!(message_progress(&mut owner, frame, key, FrameProgress::Started).is_empty());
+        let deadline = owner.pubsub.deliveries.as_slice()[0]
+            .in_flight()
+            .unwrap()
+            .deadline;
+        let effects = apply(
+            &mut owner,
+            Input::Deadline {
+                token: deadline,
+                now: crate::contract::ids::LogicalTime::new(20),
+            },
+        );
+        let resolve = effects
+            .iter()
+            .find_map(|(id, e)| {
+                matches!(e, Effect::ResolveAndFence { operation: op } if *op == operation)
+                    .then_some(*id)
+            })
+            .unwrap();
+        known(&mut owner, resolve, &expire);
+        assert!(owner.pubsub.deliveries.is_empty());
+        assert!(known(&mut owner, expire_effect, &expire).is_empty());
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 1).unwrap().get(), 1);
+    }
+
+    #[test]
+    fn message_expiry_complete_write_without_started_callback_is_not_certainly_unsent() {
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        let (frame, key, _) = message_frame(&mut owner, 0);
+        message_progress(
+            &mut owner,
+            frame,
+            key,
+            FrameProgress::Written {
+                confirmed: 18,
+                total: 18,
+            },
+        );
+        message_clock(&mut owner, 12);
+        let effects = message_progress(
+            &mut owner,
+            frame,
+            key,
+            FrameProgress::NotStarted {
+                reason: MessageExpiryBlock::Expired,
+            },
+        );
+        assert!(
+            effects.is_empty(),
+            "written_frame_treated_as_certainly_unsent"
+        );
+        assert_eq!(owner.pubsub.deliveries.len(), 1);
+    }
+
+    #[test]
+    fn message_expiry_recovered_or_previously_uncertain_claim_never_becomes_certainly_unsent() {
+        for unknown in [false, true] {
+            let mut owner = world();
+            message_clock(&mut owner, 10);
+            queued(&mut owner, 0);
+            let d = &mut owner.pubsub.deliveries.as_mut_slice()[0];
+            d.expiry = Some(message_expiry());
+            d.claim = Some(DeliveryClaim {
+                operation: operation(100),
+                packet_id: OutboundPacketId::new(1).unwrap(),
+                started: false,
+            });
+            d.phase = Phase::AwaitPuback;
+            d.certain_never_started = false;
+            d.may_have_started = true;
+            let emitted = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+            let (frame, key) = emitted
+                .into_iter()
+                .find_map(|(id, e)| match e {
+                    Effect::EmitPublish { connection, .. } => Some((id, connection)),
+                    _ => None,
+                })
+                .unwrap();
+            let mut now = message_time(12);
+            if unknown {
+                now.domain = [8; 32];
+            }
+            apply(&mut owner, Input::MessageClock { now });
+            let reason = if unknown {
+                MessageExpiryBlock::TemporalUncertain
+            } else {
+                MessageExpiryBlock::Expired
+            };
+            assert!(
+                message_progress(&mut owner, frame, key, FrameProgress::NotStarted { reason })
+                    .is_empty()
+            );
+            let effects = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+            assert!(
+                !effects
+                    .iter()
+                    .any(|(_, e)| matches!(e, Effect::Persist { .. } | Effect::EmitPublish { .. }))
+            );
+            assert_eq!(owner.pubsub.free_packet_id(TARGET, 1), None);
+            assert_eq!(owner.pubsub.deliveries.len(), 1);
+        }
+    }
+
+    #[test]
+    fn message_expiry_property_and_remaining_length_are_counted_at_both_qos_levels() {
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        let settings = &mut owner.pubsub.connections.as_mut_slice()[0];
+        settings.maximum_packet_size = 128;
+        let key = ConnectionKey {
+            session: TARGET,
+            generation: CONNECTION,
+        };
+        let topic = bytes(b"topic");
+        let payload = SharedBytes::copy_from(&[1; 115], 128).unwrap();
+        assert!(owner.qos0_fits(key, &topic, &payload, None));
+        assert!(
+            !owner.qos0_fits(key, &topic, &payload, Some(message_expiry())),
+            "qos0_expiry_property_not_charged"
+        );
+        queued(&mut owner, 0);
+        let d = &mut owner.pubsub.deliveries.as_mut_slice()[0];
+        d.expiry = Some(message_expiry());
+        d.payload = Some(payload);
+        let (effect, command) =
+            message_command(apply(&mut owner, Input::WorkAvailable { session: TARGET }));
+        let effects = known(&mut owner, effect, &command);
+        assert!(
+            effects.iter().any(|(_, e)| matches!(
+                e,
+                Effect::CloseConnection {
+                    reason: CloseReason::CapacityExceeded,
+                    ..
+                }
+            )),
+            "qos1_expiry_property_not_charged"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|(_, e)| matches!(e, Effect::EmitPublish { .. }))
+        );
+        assert_eq!(owner.pubsub.free_packet_id(TARGET, 1), None);
+    }
+
+    #[test]
+    fn message_expiry_sweep_retires_exact_unclaimed_metadata_and_unknown_claim_receipt_once() {
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        queued(&mut owner, 0);
+        let (claim_effect, claim) =
+            message_command(apply(&mut owner, Input::WorkAvailable { session: TARGET }));
+        let before = owner.leases.account().used();
+        let expired = crate::contract::message_expiry::ExpiredDelivery {
+            delivery: delivery(0),
+            target: TARGET,
+        };
+        apply(
+            &mut owner,
+            Input::MessagesExpired {
+                deliveries: BoundedVec::from_slice(&[expired], 1).unwrap(),
+            },
+        );
+        assert!(owner.pubsub.deliveries.as_slice()[0].retired);
+        let operation = claim.recipe.operation();
+        assert!(
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect: claim_effect,
+                    operation,
+                    reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                        RejectReason::PreconditionFailed
+                    ))
+                }
+            )
+            .is_empty()
+        );
+        assert!(owner.pubsub.deliveries.is_empty());
+        for _ in 0..2 {
+            apply(
+                &mut owner,
+                Input::MessagesExpired {
+                    deliveries: BoundedVec::from_slice(&[expired], 1).unwrap(),
+                },
+            );
+        }
+        assert_eq!(
+            owner.leases.account().used(),
+            before,
+            "sweep_fabricated_credit_release"
+        );
+        queued(&mut owner, 1);
+        let (effect, command) =
+            message_command(apply(&mut owner, Input::WorkAvailable { session: TARGET }));
+        known(&mut owner, effect, &command);
+        let newer = owner.pubsub.deliveries.as_slice()[0].clone();
+        apply(
+            &mut owner,
+            Input::MessagesExpired {
+                deliveries: BoundedVec::from_slice(&[expired], 1).unwrap(),
+            },
+        );
+        assert_eq!(owner.pubsub.deliveries.as_slice()[0], newer);
+    }
+
+    #[test]
+    fn message_expiry_invalid_volatile_deadline_is_refused_before_admission() {
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        owner
+            .routes
+            .try_push(Route {
+                topic: bytes(b"topic"),
+                target: TARGET,
+                target_revision: Revision::new(1),
+                max_qos: Qos::AtMostOnce,
+                options: crate::contract::pubsub::SubscriptionOptions::DEFAULT,
+            })
+            .unwrap();
+        let input = Input::Packet {
+            connection: CONNECTION,
+            ingress_order: 1,
+            packet: InboundPacket::Publish {
+                topic: bytes(b"topic"),
+                qos: Qos::AtMostOnce,
+                retain: false,
+                dup: false,
+                packet_id: None,
+                payload: bytes(b"payload"),
+                expiry: Some(MessageExpiry {
+                    observed: MessageTime {
+                        domain: [9; 32],
+                        tick: u64::MAX,
+                    },
+                    interval: 1,
+                }),
+            },
+        };
+        assert!(
+            matches!(
+                owner.step(input, TURN),
+                StepOutcome::Fatal(CoreFault::ImpossibleInput)
+            ),
+            "invalid_qos0_expiry_was_admitted"
+        );
+        assert!(owner.pubsub.volatile.is_empty());
     }
 }
