@@ -3218,8 +3218,8 @@ impl EffectSink for Sink<'_> {
                 dup,
                 retain,
             } => {
-                let (connection, delivery, packet_id, claim, dup) =
-                    (*connection, *delivery, *packet_id, *claim, *dup);
+                let (connection, delivery, packet_id, claim, dup, retain) =
+                    (*connection, *delivery, *packet_id, *claim, *dup, *retain);
                 if self
                     .terminal_inputs
                     .len()
@@ -3243,7 +3243,7 @@ impl EffectSink for Sink<'_> {
                     return SubmitResult::Accepted;
                 };
                 let bytes =
-                    match codec::encode_publish_retained(packet_id, topic, payload, dup, *retain) {
+                    match codec::encode_publish_retained(packet_id, topic, payload, dup, retain) {
                         Ok(bytes) if bytes.len() <= peer.max_packet => bytes,
                         _ => {
                             self.close.push((generation, "outgoing_packet_limit"));

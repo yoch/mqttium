@@ -41,8 +41,19 @@ read_states() {
     mosquitto_sub -V mqttv5 -h 127.0.0.1 -p "$preview_port" -i "$1" \
         -q 1 -t 'atelier/+/temperature' -C "$2" -W 5 -F '%t|%p|%q|%r'
 }
-mosquitto_pub --help >"$preview_data/mosquitto-pub-version.txt"
-mosquitto_sub --help >"$preview_data/mosquitto-sub-version.txt"
+preview_pub_help=0
+preview_sub_help=0
+mosquitto_pub --help >"$preview_data/mosquitto-pub-version.txt" 2>&1 || preview_pub_help=$?
+mosquitto_sub --help >"$preview_data/mosquitto-sub-version.txt" 2>&1 || preview_sub_help=$?
+printf '%s\n' "mosquitto_pub help status=$preview_pub_help" "mosquitto_sub help status=$preview_sub_help" >"$preview_data/client-statuses.txt"
+python3 - "$preview_data" "$preview_pub_help" "$preview_sub_help" <<'PYHELP'
+import pathlib, sys
+root=pathlib.Path(sys.argv[1])
+for name,status in zip(('mosquitto-pub-version.txt','mosquitto-sub-version.txt'),sys.argv[2:]):
+    text=(root/name).read_text()
+    if status not in ('0','1') or 'version' not in text or 'Usage:' not in text:
+        raise SystemExit('unrecognized Mosquitto client help output')
+PYHELP
 start
 publish atelier/salle1/temperature temperature:1
 publish atelier/salle2/temperature temperature:2
