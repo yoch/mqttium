@@ -6,7 +6,7 @@ from external_wildcard import Subscription
 from message_expiry_probe import decode_publish, publish_packet
 from message_expiry_reception import (BUSINESS, physically_drained, one_delivery, closed_connection,
                                        original_copies)
-from message_expiry_boundaries import canonical_timed, continuous, _positive
+from message_expiry_boundaries import canonical_timed, canonical_expire, continuous, _positive
 from tcp_probe import Frame, FrameDecoder, ReceiptFailure, operation_hex
 from test_external_clients import ScriptedBroker, read_packet
 from test_session_reception import accept
@@ -129,6 +129,27 @@ class IndependentMessageExpiryFrames(unittest.TestCase):
             self.assertFalse(_positive(value))
         for value in (1, '1', ['claim'], {'claim': '1'}):
             self.assertTrue(_positive(value))
+
+    def test_tag16_cancellation_correlates_the_exact_claim_and_original_deadline(self):
+        event = {'operation': {'incarnation': '1', 'epoch': '2', 'owner': '3', 'sequence': '4'}}
+        identity = operation_hex(event['operation'])
+        claim = {'publication': '55' * 32, 'idx': 3, 'target': '0000000000000007',
+                 'target_revision': '0000000000000008', 'packet_id': 31, 'claim': '66' * 32}
+        stamp = {'domain': '61' * 32, 'tick': '123', 'interval': 2}
+        raw = (b'MQDR\x00\x01\x10' + bytes.fromhex(identity) + bytes.fromhex(claim['publication']) +
+               claim['idx'].to_bytes(4, 'big') + bytes.fromhex(claim['target']) +
+               bytes.fromhex(claim['target_revision']) + claim['packet_id'].to_bytes(2, 'big') +
+               bytes.fromhex(claim['claim']) + b'a' * 32 + (123).to_bytes(8, 'big') +
+               (2).to_bytes(4, 'big') + b'a' * 32 + (2_000_000_123).to_bytes(8, 'big'))
+        state = {'tables': {'operations': [{'id': identity, 'recipe': raw.hex()}]}}
+        self.assertEqual(canonical_expire(state, event, claim, stamp)['tag'], 16)
+        altered = raw[:93] + b'\xff' + raw[94:]
+        state['tables']['operations'][0]['recipe'] = altered.hex()
+        with self.assertRaisesRegex(ReceiptFailure, 'message_expiry_expire_canonical_claim_changed'):
+            canonical_expire(state, event, claim, stamp)
+        state['tables']['operations'][0]['recipe'] = (raw[:-8] + (122).to_bytes(8, 'big')).hex()
+        with self.assertRaisesRegex(ReceiptFailure, 'message_expiry_expire_canonical_clock_changed'):
+            canonical_expire(state, event, claim, stamp)
 
     def test_infinite_offline_session_uses_its_exact_observed_connection_close(self):
         state = {'tables': {'sessions': [{'id': '0000000000000001', 'client_id': b'forever'.hex(),

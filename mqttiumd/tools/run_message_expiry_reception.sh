@@ -159,7 +159,7 @@ if (cases['capacity']['full_retained_topics']!=32 or cases['capacity']['overflow
         or cases['capacity']['overflow']['reason_code']!=0x97 or not cases['capacity']['refusal_business_unchanged']):
     raise SystemExit('full retained inventory, typed quota refusal and physical capacity recovery required')
 required={'transfer-claim','transfer-prepared','transfer-committed','sweep-prepared','sweep-committed',
-          'normal-restart','held-admission',*(f'recipe-{kind}-{phase}' for kind in ('qos1','qos0','replay')
+          'normal-restart','held-admission','certain-unsent',*(f'recipe-{kind}-{phase}' for kind in ('qos1','qos0','replay')
                              for phase in ('prepared','committed'))}
 if {row['criterion'] for row in boundaries['cases']}!=required:
     raise SystemExit('timed admission/replay, claim/start, physical sweep and restart boundaries required')
@@ -198,6 +198,7 @@ index={'format':'mqttiumd.message-expiry-system-reception-index','schema_version
                 '32-valid-retained-values-replayed','real-started-Q1-PUBACK-after-TTL',
                 '32-finite-retained-values-expire-and-return-capacity',
                 'duplicate-and-malformed-property-rejection','own-SIGKILL-boundaries',
+                'certain-zero-byte-refusal-and-tag16-physical-reclamation',
                 'normal-preview-archive-and-packaged-public-demo','six-compiled-negative-controls'],
        'source_pin':json.loads((out/'source-pin.json').read_text()),
        'source_archive':{'path':'source.tar','sha256':hashlib.sha256((out/'source.tar').read_bytes()).hexdigest()},

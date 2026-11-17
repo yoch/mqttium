@@ -12,7 +12,7 @@ import time
 
 from external_wildcard import Subscription
 from message_expiry_reception import (close_peers, peer, physically_drained, received_ingress,
-                                       snapshot, until_state, one_delivery, until_connection_closed)
+                                       snapshot, until_state, one_delivery, until_connection_closed, expiry_stamp)
 from pubsub_probe import durable
 from tcp_probe import ReceiptFailure, operation_hex, require, write_json
 from tcp_reception import Broker, writer_available
@@ -106,6 +106,27 @@ def canonical_timed(state, event, tag):
             'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest(),
             'domain': tail[:32].hex(), 'tick': str(int.from_bytes(tail[32:40], 'big')),
             'interval': int.from_bytes(tail[40:44], 'big') if tag == 13 else None}
+
+
+def canonical_expire(state, event, claim, stamp):
+    identity = operation_hex(event['operation'])
+    rows = [row for row in state['tables']['operations'] if row['id'] == identity]
+    require(len(rows) == 1, 'message_expiry_expire_receipt_missing')
+    raw = bytes.fromhex(rows[0]['recipe'])
+    require(len(raw) == 209 and raw[:7] == b'MQDR\x00\x01\x10' and raw[7:39].hex() == identity,
+            'message_expiry_expire_canonical_identity_changed')
+    require(raw[39:71].hex() == claim['publication'] and int.from_bytes(raw[71:75], 'big') == claim['idx'] and
+            raw[75:83].hex() == claim['target'] and raw[83:91].hex() == claim['target_revision'] and
+            int.from_bytes(raw[91:93], 'big') == claim['packet_id'] and raw[93:125].hex() == claim['claim'],
+            'message_expiry_expire_canonical_claim_changed')
+    original = {'domain': raw[125:157].hex(), 'tick': str(int.from_bytes(raw[157:165], 'big')),
+                'interval': int.from_bytes(raw[165:169], 'big')}
+    observed = {'domain': raw[169:201].hex(), 'tick': str(int.from_bytes(raw[201:209], 'big'))}
+    require(original == stamp and observed['domain'] == stamp['domain'] and
+            int(observed['tick']) >= int(stamp['tick']) + stamp['interval'] * 1_000_000_000,
+            'message_expiry_expire_canonical_clock_changed')
+    return {'operation': event['operation'], 'tag': 16, 'bytes': len(raw),
+            'sha256': hashlib.sha256(raw).hexdigest(), 'original': original, 'observed': observed}
 
 
 async def settle(task):
@@ -539,6 +560,88 @@ async def held_admission(binary, case):
         broker.cleanup()
 
 
+async def certain_unsent(binary, case):
+    """A real zero-byte net refusal authorizes guarded tag16 reclamation."""
+    point = 'message.delivery.expire.committed'
+    broker = Broker(binary, case, pauses=('publish.emission', point))
+    peers = []
+    fresh_action = None
+    payload = b'claimed-before-ttl-but-certainly-never-started'
+    try:
+        ready = broker.ready()
+        source, source_tap = await peer('mqttium', broker, case, 'unsent-source', session_expiry=0)
+        target, tap = await peer('paho', broker, case, 'unsent-target', session_expiry=0)
+        peers.extend(((source, source_tap), (target, tap)))
+        await target.subscribe((Subscription('message-expiry/cut/#', 1, retain_handling=2),))
+        await source.publish('message-expiry/cut/value', payload, 1, message_expiry=2)
+        emitted = await asyncio.to_thread(broker.wait_event, 'barrier_hit', point='publish.emission')
+        held = snapshot(broker, 'unsent-held')
+        require(held['counts']['outbound'] == held['counts']['obligations'] ==
+                held['counts']['publications'] == held['counts']['payloads'] == 1,
+                'message_expiry_unsent_claim_missing')
+        claim = held['tables']['outbound'][0]
+        stamp = expiry_stamp(held['tables']['publications'][0])
+        require(claim['started'] == 0 and operation_hex(emitted['operation']) == claim['claim'],
+                'message_expiry_unsent_emission_claim_mismatch')
+        await target.no_message(.04)
+        require(not tap.publications(payload), 'message_expiry_unsent_emitted_before_release')
+        await asyncio.sleep(2.15)
+        past_ttl = snapshot(broker, 'unsent-past-ttl')
+        require(past_ttl['counts']['outbound'] == past_ttl['counts']['obligations'] ==
+                past_ttl['counts']['publications'] == past_ttl['counts']['payloads'] == 1,
+                'message_expiry_unsent_freed_before_certain_refusal')
+        broker.release('publish.emission')
+        cancelled = await asyncio.to_thread(broker.wait_event, 'barrier_hit', point=point)
+        require(cancelled.get('command_kind') == 'MessageExpire', 'message_expiry_unsent_wrong_cancellation')
+        committed = snapshot(broker, 'unsent-cancellation-committed')
+        canonical = canonical_expire(committed, cancelled, claim, stamp)
+        require(physically_drained(committed), 'message_expiry_certain_refusal_did_not_physically_reclaim')
+        never_started = [event for event in broker.events() if event['kind'] == 'message_transmission_not_started'
+                         and int(event['seq']) > int(emitted['seq'])]
+        require(len(never_started) == 1 and never_started[0]['details'].get('authority') == 'zero_socket_bytes'
+                and never_started[0]['details'].get('reason') == 'Expired',
+                'message_expiry_unsent_zero_byte_proof_missing')
+        queued = [event for event in broker.events() if event['kind'] == 'frame_queued' and
+                  event['details'].get('packet_kind') == 'PUBLISH' and
+                  event['details'].get('effect') == never_started[0]['details'].get('effect')]
+        claim_bytes = bytes.fromhex(claim['claim'])
+        claim_text = '/'.join(str(int.from_bytes(claim_bytes[offset:offset + 8], 'big'))
+                              for offset in range(0, 32, 8))
+        require(len(queued) == 1 and queued[0]['details'].get('claim') == claim_text and
+                queued[0]['details'].get('packet_id') == claim['packet_id'] and not [event for event in broker.events() if
+                event.get('command_kind') == 'DeliveryStarted'], 'message_expiry_unsent_claim_was_started')
+        await target.no_message(.04)
+        require(not tap.publications(payload), 'message_expiry_unsent_expired_bytes_reached_target')
+        broker.release(point)
+        fresh_action = asyncio.create_task(witness(broker, case, peers, target, tap, 'certain-unsent'))
+        fresh_barrier = await asyncio.to_thread(broker.wait_event, 'barrier_hit', point='publish.emission',
+                                                after=int(cancelled['seq']))
+        broker.release('publish.emission')
+        fresh = await asyncio.wait_for(fresh_action, timeout=5)
+        fresh_action = None
+        final = await until_state(broker, physically_drained, 'message_expiry_unsent_cached_references_not_released')
+        write_json(case / 'unsent-final.sql.json', final)
+        await close_peers(peers)
+        peers = []
+        broker.stop()
+        writer_available(broker.db)
+        return {'criterion': 'certain-unsent', 'status': 'PASS', 'ready': ready,
+                'emission_hold': emitted, 'claim': claim, 'original_stamp': stamp,
+                'pending_past_ttl': past_ttl['counts'], 'zero_byte_refusal': never_started[0],
+                'queued_frame': queued[0], 'cancellation_commit': cancelled, 'canonical': canonical,
+                'reclaimed_counts': committed['counts'], 'fresh_emission_hold': fresh_barrier,
+                'fresh_timeless_witness': fresh, 'final_counts': final['counts'],
+                'process_status': broker.process.returncode}
+    finally:
+        if fresh_action is not None:
+            broker.cleanup()
+            await settle(fresh_action)
+        await close_peers(peers, cleanup=True)
+        if broker.db.is_file():
+            snapshot(broker, 'last-observed')
+        broker.cleanup()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
@@ -546,7 +649,7 @@ def main():
     parser.add_argument('--binary-source-head', required=True)
     parser.add_argument('--case', choices=('all', 'claim', 'started-prepared', 'started-committed',
                                           'sweep-prepared', 'sweep-committed', 'restart', 'recipes',
-                                          'held-admission'), default='all')
+                                          'held-admission', 'certain-unsent'), default='all')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     root = Path(__file__).resolve().parents[3]
@@ -561,7 +664,8 @@ def main():
             'claim': (transfer_cut, 'claim'), 'started-prepared': (transfer_cut, 'prepared'),
             'started-committed': (transfer_cut, 'committed'),
             'sweep-prepared': (sweep_cut, 'prepared'), 'sweep-committed': (sweep_cut, 'committed'),
-            'restart': (restart_offline, None), 'held-admission': (held_admission, None)}
+            'restart': (restart_offline, None), 'held-admission': (held_admission, None),
+            'certain-unsent': (certain_unsent, None)}
         selected = tuple(functions) if args.case == 'all' else (args.case,)
         if args.case in ('all', 'recipes'):
             for kind in ('qos1', 'qos0', 'replay'):
