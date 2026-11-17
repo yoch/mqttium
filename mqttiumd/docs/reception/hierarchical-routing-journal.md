@@ -31,6 +31,19 @@
   then tools/run_wildcard_reception.sh NEW_DIRECTORY. CI installs the pinned
   toolchain, Python requirements and distribution Mosquitto clients independently.
   Normal/instrumented full Rust suites run sequentially in a checkout.
-- Next: finish the clean-source reception and mutants, verify all required gates,
-  publish with the expected remote SHA lease, read back HEAD/content/checks,
-  and attach exact normal-preview and system-artifact links to PR648.
+- Complete local clean candidate4a3ddefb7dfcd102d36bb0c7cf35bfb7c82fc057:
+  tools/run_wildcard_reception.sh /workspace/mqttiumd-wildcard-final-candidate
+  PASS (8 normal groups, 3 genuine writer cuts, 4 exact compiled controls,
+  archive extraction/restart and 8598 strictly validated events). Normal archive
+  SHA77baf7ff3c723b486e7125f73d01adcd091e136a71906d0275f65273b13da9e8;
+  system archive709df44a81f8200a5c10fa6e0c3af32194d7f176d4a3a2e0fd1a0236f93e5d0d.
+  Earlier2abe162e failed strict schema validation for a digit in qos0_dropped;
+  RED030965c9/GREEN3b39cba4 correct it; that older failed receipt is not relabeled.
+- Final digest1889d1d070b3923095f17c6decb7e0cb29d8dfd8662e753b20a50f8c099228c5;
+  validate accepts14 documents. Local995 normal/1010 instrumented Rust, strict
+  Clippy,104 product test-hooks tests,228 oracle and112 pilots pass. Required
+  normal/instrumented whole suites were sequential; no protected proof or
+  French archive changed. New7 model outcomes pass (97 total expected in CI).
+- Next: publish with expected remote365af34d SHA lease, verify remote HEAD/tree,
+  receive the final exact-SHA CI and fresh K1/K2b/K3/archive evidence, and put
+  downloadable normal-preview links and checksums in PR648. Keep draft/unmerged.

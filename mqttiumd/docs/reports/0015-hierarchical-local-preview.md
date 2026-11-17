@@ -52,19 +52,24 @@ typed durable reads retain their separate contracts.
 
 ## Executed reception and source attribution
 
-The source-pinned local functional run at
-`2abe162e180dd0ecc5e3de034aee00fa4def9ce7` must be read using its full SHA in
-`source-head.txt` (the abbreviated2abe162e is the stable reference here).
-Its normal binary is
-`sha256:1adf15a8078748efc3f2d6aa46783a8da8ae886a16d8e14e886edf3be6d9eb44`.
-The normal eight groups, three authentic writer-boundary groups and extracted
-archive smoke passed. Its first strict stream check then exposed a schema bug:
-`qos0_dropped` contained a digit excluded by the event-name pattern. It is **not**
-a full reception PASS. RED030965c9 fails specifically
+The complete source-pinned local candidate is
+`4a3ddefb7dfcd102d36bb0c7cf35bfb7c82fc057`. All eight normal groups, three
+actual-writer groups, four compiled controls, strict product-stream validation
+and extracted-archive smoke pass. Its normal binary is
+`sha256:a721606de921899a1df961db7e80a87075df54bcf5f503bece5ebcc2f5e59be9`;
+its runnable tarball is
+`sha256:77baf7ff3c723b486e7125f73d01adcd091e136a71906d0275f65273b13da9e8`;
+the separate system archive is
+`sha256:709df44a81f8200a5c10fa6e0c3af32194d7f176d4a3a2e0fd1a0236f93e5d0d`.
+The final CI publication rebuilds fresh artifacts at its own source SHA; the PR
+record provides their exact downloadable links and hashes.
+
+An earlier2abe162e run passed the functional groups but failed strict validation:
+`qos0_dropped` contained a digit excluded by the event-name pattern. It remains
+a failed reception. RED030965c9 fails specifically
 `qos0_event_name_rejected_by_schema`; GREEN3b39cba4 permits bounded internal digits
-and still refuses a leading digit. The final command reruns the whole clean pin,
-including stream validation and compiled controls; its receipt and the fresh CI
-artifacts identify their own published source instead of relabeling this run.
+and still refuses a leading digit. The complete4a3ddefb run above verifies the
+correction on8598 actual product events with no skipped records.
 
 | Group | Observation actually exercised |
 | - | - |
@@ -113,8 +118,8 @@ matcher or runtime proof; existing90 configurations are unchanged (total97).
 
 Eight exploratory runs compare exact/wildcard tables of1/16/64/128 routes with
 one destination,16 numbered QoS1 publications and16 known Admission/Finish
-commits per run. The source2abe162e run measured median publisher-ACK latency
-(ms), exact6.253/4.396/6.180/5.756 and wildcard6.238/6.816/6.505/6.482.
+commits per run. The source4a3ddefb run measured median publisher-ACK latency
+(ms), exact6.154/6.145/6.499/6.245 and wildcard6.364/6.556/6.368/6.513.
 It includes TCP, FULL SQLite commits and shared-host scheduling, not isolated
 matcher CPU time or a performance qualification. RSS, database pages/free pages,
 WAL, effective SQLite parameters and all samples are retained. No comparison
@@ -133,8 +138,10 @@ partial, never a complete guard partition.
 
 Starting contract digest:
 `sha256:30874671202259bb8387e30aa427f1067d685e9b195d37ed3ba4a685e249fdb7`.
-The final new digest is recorded by `validate`, every fresh qualifying campaign
-and the PR's publication record. No historical fingerprint is bypassed.
+New contract digest:
+`sha256:1889d1d070b3923095f17c6decb7e0cb29d8dfd8662e753b20a50f8c099228c5`.
+`validate`, every fresh qualifying campaign and the PR publication record check
+this identity. No historical fingerprint is bypassed.
 
 Local integrated checks: formatting, strict workspace Clippy,995 normal Rust
 and1010 instrumented Rust tests (sequential),228 oracle tests,112 system-pilot
