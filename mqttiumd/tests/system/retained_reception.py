@@ -382,13 +382,15 @@ async def capacity(binary, case):
         require(business_state(after_replay_refusal) == baseline, 'retained_replay_capacity_partially_mutated')
         # Thirty-two values replay to one target: the existing 16-destination
         # bound must not accidentally become a retained-value bound.
-        target.subscribe_options(2, (Subscription('capacity/#', 0),))
-        received = [target.receive(qos=0, retain=True).observation() for _ in range(32)]
+        # Use QoS1 and acknowledge in receive order: this case proves complete
+        # durable replay, whereas QoS0 may legitimately drop under pressure.
+        target.subscribe_options(2, (Subscription('capacity/#', 1),))
+        received = [target.receive(qos=1, retain=True).observation() for _ in range(32)]
         require({row['topic'] for row in received} == set(payloads)
                 and all(row['payload_sha256'] == hashlib.sha256(payloads[row['topic']]).hexdigest()
                         for row in received), 'retained_replay_inventory_incomplete')
         target.no_publication(.08, code='retained_replay_inventory_duplicated')
-        await until_state(broker, business_drained, 'retained_capacity_replays_not_consumed')
+        await until_state(broker, business_drained, 'retained_capacity_replays_not_finished')
         target.unsubscribe(3, ['capacity/#'])
         # Clearing one current value returns a real inventory slot; a new exact
         # topic then fits without increasing either quota.
