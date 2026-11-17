@@ -971,6 +971,13 @@ mod tests {
     }
 
     #[test]
+    fn replay_cause_cannot_change_legacy_admission_encoding() {
+        let mut destination=target(2,0);
+        destination.cause=DeliveryCause::RetainedReplay;
+        assert_eq!(admission(&[destination]).check(),Err(RecipeError::InvalidField("admission_cause")));
+    }
+
+    #[test]
     fn retained_qos0_accepts_literal_dollar_share_topic_names() {
         let Recipe::AdmitPublication(a) = admission(&[]) else {
             panic!()
