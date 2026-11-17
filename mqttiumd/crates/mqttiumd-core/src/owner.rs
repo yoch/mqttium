@@ -1204,6 +1204,9 @@ impl Owner {
             {
                 return Err(IMPOSSIBLE);
             }
+            if !self.pubsub.accepts_message_time(*now) {
+                return Err(IMPOSSIBLE);
+            }
             return Ok(Change::MessageClock(*now));
         }
         if self.recovery.is_some() {
@@ -1678,6 +1681,18 @@ impl Owner {
 
     /// A new PUBLISH: identities, hierarchical routing from the recovered
     /// routes, a frozen recipe, `Persist`.
+    fn check_message_expiry(&self, expiry: Option<MessageExpiry>) -> Result<(), Stop> {
+        if expiry.is_some_and(|expiry| {
+            expiry.deadline().is_err()
+                || self
+                    .message_now
+                    .is_some_and(|now| expiry.state(now).is_err())
+        }) {
+            return Err(IMPOSSIBLE);
+        }
+        Ok(())
+    }
+
     fn plan_admission(
         &self,
         session: usize,
@@ -1697,6 +1712,7 @@ impl Owner {
         else {
             return Err(IMPOSSIBLE);
         };
+        self.check_message_expiry(*expiry)?;
         let (qos, packet_id) = (*qos, *packet_id);
         let (connection, _) = publish_origin;
         let (Some(limits), Some(route_revision)) = (self.limits, self.route_revision) else {

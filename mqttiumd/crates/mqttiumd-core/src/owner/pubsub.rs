@@ -297,6 +297,7 @@ pub(super) enum Change {
     },
     Written {
         slot: usize,
+        complete: bool,
     },
     PubackObserved {
         slot: usize,
@@ -485,6 +486,14 @@ impl State {
             sum.checked_add(d.payload.as_ref().map_or(0, |p| p.len() as u64))
         })
     }
+    pub(super) fn accepts_message_time(&self, now: MessageTime) -> bool {
+        self.deliveries
+            .as_slice()
+            .iter()
+            .filter_map(|d| d.expiry)
+            .chain(self.volatile.as_slice().iter().filter_map(|d| d.expiry))
+            .all(|expiry| expiry.state(now).is_ok())
+    }
     pub(super) fn evict_expired_cache(&mut self, now: MessageTime) {
         let mut index = 0;
         while index < self.deliveries.len() {
@@ -580,7 +589,7 @@ fn blocked() -> Stop {
 
 impl Owner {
     pub(super) fn retained_work_bound(&self, input: &Input) -> u64 {
-        if self.lifecycle_enabled
+        if (self.lifecycle_enabled || self.message_now.is_some())
             && matches!(
                 input,
                 Input::Packet {
@@ -680,6 +689,7 @@ impl Owner {
         else {
             return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
         };
+        self.check_message_expiry(*expiry)?;
         if ingress_order <= self.pubsub.connections.as_slice()[connection].last_qos0_ingress {
             return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
         }
@@ -920,9 +930,7 @@ impl Owner {
         else {
             return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
         };
-        if expiry.is_some_and(|expiry| expiry.deadline().is_err()) {
-            return Err(IMPOSSIBLE);
-        }
+        self.check_message_expiry(*expiry)?;
         if ingress_order <= self.pubsub.connections.as_slice()[connection].last_qos0_ingress {
             return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
         }
@@ -1307,7 +1315,10 @@ impl Owner {
                 let (frame, sent) = delivery.frame?;
                 (delivery.target == connection.session
                     && delivery.qos == Qos::AtLeastOnce
-                    && matches!(delivery.phase, Phase::AwaitPuback | Phase::StartPending(_))
+                    && matches!(
+                        delivery.phase,
+                        Phase::AwaitPuback | Phase::StartPending(_) | Phase::StartRetry
+                    )
                     && delivery.window == Some(connection.generation)
                     && sent == connection
                     && claim.packet_id == packet_id)
@@ -1844,7 +1855,7 @@ impl Owner {
                 || item.payload.len() as u64 > limits.max_payload_bytes.get()
                 || item.qos == Qos::ExactlyOnce
                 || (item.claim.is_some() && item.qos != Qos::AtLeastOnce)
-                || item.expiry.is_some_and(|expiry| expiry.deadline().is_err())
+                || self.check_message_expiry(item.expiry).is_err()
                 || item
                     .claim
                     .is_some_and(|claim| claim.started && item.expiry.is_none())
@@ -2524,8 +2535,11 @@ impl Owner {
             FrameProgress::NotStarted { .. } if d.phase == Phase::AwaitPuback => {
                 Change::NotStarted { slot }
             }
-            FrameProgress::Written { confirmed, total } if total > 0 && confirmed == total => {
-                Change::Written { slot }
+            FrameProgress::Written { confirmed, total } if confirmed > 0 && confirmed <= total => {
+                Change::Written {
+                    slot,
+                    complete: confirmed == total,
+                }
             }
             _ => return Ok(None),
         };
@@ -2559,7 +2573,7 @@ impl Owner {
         sessions: &[RecoveredFact],
     ) -> bool {
         let (qos, claim, expiry, started) = kind;
-        if expiry.is_some_and(|expiry| expiry.deadline().is_err())
+        if self.check_message_expiry(expiry).is_err()
             || started != claim.is_some_and(|claim| claim.started)
             || (started && expiry.is_none())
         {
@@ -3041,14 +3055,14 @@ impl Owner {
                     self.pubsub.invalidate_reads(target);
                 }
             }
-            Change::Written { slot } => {
+            Change::Written { slot, complete } => {
                 let d = self
                     .pubsub
                     .deliveries
                     .as_mut_slice()
                     .get_mut(slot)
                     .ok_or(stale)?;
-                d.local_write_completed = true;
+                d.local_write_completed |= complete;
                 d.certain_never_started = false;
             }
         }
