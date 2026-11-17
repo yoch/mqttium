@@ -1372,6 +1372,37 @@ pub mod expiry {
         assert_eq!(before.obligations, after.obligations);
     }
 
+    pub fn timed_replay_cannot_observe_before_the_message_origin<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        let mut w = World::with_limits(make, limits());
+        clock(&mut w.store, at(0));
+        let c = expiring(
+            admitted(&w, 1, b"expiry/future", b"future", Qos::AtLeastOnce, &[]),
+            MessageExpiry {
+                observed: at(20),
+                interval: 1,
+            },
+        );
+        commit(&mut w.store, &c);
+        let before = w.store.snapshot().unwrap();
+        let replay = timed(
+            subscribe(&w, 2, w.b, 1000, &[(b"expiry/#", Qos::AtMostOnce, 0)]),
+            at(19),
+        );
+        assert_eq!(
+            w.store.apply(&replay).reply,
+            StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                RejectReason::PreconditionFailed
+            )),
+            "regressive_replay_observation_was_not_refused"
+        );
+        let after = w.store.snapshot().unwrap();
+        assert_eq!(before.routes, after.routes);
+        assert_eq!(before.obligations, after.obligations);
+        assert_eq!(before.retained, after.retained);
+    }
+
     pub fn timed_replay_rejection_reserves_the_full_identity_range<S: DurableStore>(
         make: &dyn Fn(StoreIncarnation, Limits) -> S,
     ) {
@@ -1544,6 +1575,7 @@ pub mod expiry {
     }
 
     pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
+        timed_replay_cannot_observe_before_the_message_origin(make);
         timed_commands_require_the_current_boot_authority(make);
         timed_replay_rejection_reserves_the_full_identity_range(make);
         empty_retained_clear_still_creates_its_live_publication(make);

@@ -279,3 +279,8 @@ fn timed_replay_rejection_reserves_the_full_identity_range() {
 fn empty_retained_clear_still_creates_its_live_publication() {
     expiry::empty_retained_clear_still_creates_its_live_publication(&sqlite);
 }
+
+#[test]
+fn timed_replay_cannot_observe_before_the_message_origin() {
+    expiry::timed_replay_cannot_observe_before_the_message_origin(&sqlite);
+}
