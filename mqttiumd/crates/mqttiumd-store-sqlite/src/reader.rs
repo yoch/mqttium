@@ -237,7 +237,7 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
             &[(0, 8), (1, 8), (2, 8), (3, 8), (4, 8)],
         ),
         (
-            "SELECT id, operation, source, topic, qos, retain, payload, retained_version FROM publications",
+            "SELECT id, operation, source, topic, qos, retain, payload, retained_version,expiry_domain,expiry_tick,expiry_interval FROM publications",
             &[
                 (0, 32),
                 (1, 32),
@@ -245,6 +245,8 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
                 (3, meta.limits.max_topic_bytes),
                 (6, 32),
                 (7, 32),
+                (8, 32),
+                (9, 8),
             ],
         ),
         (

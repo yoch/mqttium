@@ -523,7 +523,10 @@ fn killed_lifecycle_at(scenario: &str, point: &str, durable: bool) {
     let pid = holder.child.id();
     holder.kill();
     let mut reopened = SqliteStore::open(&path).expect("same file after confirmed SIGKILL");
-    assert_eq!(reopened.effective_settings().user_version, 8);
+    assert_eq!(
+        reopened.effective_settings().user_version,
+        mqttiumd_store_sqlite::SCHEMA_VERSION
+    );
     let found = reopened.snapshot().unwrap();
     assert_eq!(
         found,

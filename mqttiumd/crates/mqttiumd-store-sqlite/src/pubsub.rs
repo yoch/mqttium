@@ -4,6 +4,7 @@ use mqttiumd_contract::command::{
     ChangeSubscriptions, ClaimDelivery, ConsumeDelivery, FinishDelivery, UpdateSubscriptions,
 };
 use mqttiumd_contract::ids::OutboundPacketId;
+use mqttiumd_contract::message_expiry::{ExpireDelivery, MarkDeliveryStarted};
 use mqttiumd_contract::pubsub::{
     DeliveryClaim, MAX_SUBSCRIPTIONS, SubscriptionOptions, WORK_PAGE_LIMIT, WorkItem,
 };
@@ -251,6 +252,62 @@ pub(super) fn finish(
     })
 }
 
+pub(super) fn mark_started(
+    conn: &Connection,
+    meta: &mut Meta,
+    command: &MarkDeliveryStarted,
+) -> Guard<CommitFacts> {
+    let failed = RejectReason::PreconditionFailed;
+    active_session(conn, command.target, command.target_revision)?;
+    let changed = conn.prepare_cached("UPDATE outbound SET started=1 WHERE publication=?1 AND idx=?2 AND target=?3 AND target_revision=?4 AND packet_id=?5 AND claim=?6 AND EXISTS(SELECT 1 FROM obligations o WHERE o.publication=outbound.publication AND o.idx=outbound.idx AND o.target=outbound.target AND o.target_revision=outbound.target_revision AND o.qos=1)")?
+        .execute(params![command.delivery.publication.to_be_bytes().as_slice(), i64::from(command.delivery.index), command.target.to_be_bytes().as_slice(), command.target_revision.to_be_bytes().as_slice(), i64::from(command.packet_id.get()), command.claim.to_be_bytes().as_slice()])?;
+    if changed != 1 {
+        return refused(failed);
+    }
+    charge(meta, Accounts::RECEIPT)?;
+    Ok(CommitFacts::DeliveryStarted {
+        delivery: command.delivery,
+        target: command.target,
+        packet_id: command.packet_id,
+        claim: command.claim,
+    })
+}
+
+pub(super) fn expire(
+    conn: &Connection,
+    meta: &mut Meta,
+    command: &ExpireDelivery,
+) -> Guard<CommitFacts> {
+    let failed = RejectReason::PreconditionFailed;
+    message_expiry::check_observation(conn, command.observed)?;
+    if message_expiry::publication(conn, command.finish.delivery.publication)?
+        != Some(command.expiry)
+        || command.expiry.state(command.observed) != Ok(ExpiryState::Expired)
+    {
+        return refused(failed);
+    }
+    let started: Option<i64> = conn
+        .prepare_cached("SELECT started FROM outbound WHERE publication=?1 AND idx=?2")?
+        .query_row(
+            params![
+                command.finish.delivery.publication.to_be_bytes().as_slice(),
+                i64::from(command.finish.delivery.index)
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if started != Some(0) {
+        return refused(failed);
+    }
+    finish(conn, meta, &command.finish)?;
+    Ok(CommitFacts::DeliveryExpired {
+        delivery: command.finish.delivery,
+        target: command.finish.target,
+        packet_id: command.finish.packet_id,
+        claim: command.finish.claim,
+    })
+}
+
 pub(super) fn consume(
     conn: &Connection,
     meta: &mut Meta,
@@ -336,16 +393,30 @@ pub(super) fn facts_blob(facts: CommitFacts) -> Option<(i64, Vec<u8>)> {
             target,
             packet_id,
             claim,
+        }
+        | CommitFacts::DeliveryStarted {
+            delivery,
+            target,
+            packet_id,
+            claim,
+        }
+        | CommitFacts::DeliveryExpired {
+            delivery,
+            target,
+            packet_id,
+            claim,
         } => {
             bytes.extend_from_slice(&delivery.publication.to_be_bytes());
             bytes.extend_from_slice(&delivery.index.to_be_bytes());
             bytes.extend_from_slice(&target.to_be_bytes());
             bytes.extend_from_slice(&packet_id.get().to_be_bytes());
             bytes.extend_from_slice(&claim.to_be_bytes());
-            if matches!(facts, CommitFacts::DeliveryClaimed { .. }) {
-                5
-            } else {
-                6
+            match facts {
+                CommitFacts::DeliveryClaimed { .. } => 5,
+                CommitFacts::DeliveryFinished { .. } => 6,
+                CommitFacts::DeliveryStarted { .. } => 10,
+                CommitFacts::DeliveryExpired { .. } => 11,
+                _ => return None,
             }
         }
         _ => return None,
@@ -377,7 +448,7 @@ pub(super) fn decode_facts(code: i64, bytes: &[u8]) -> Result<CommitFacts, Corru
             route_revision: Revision::new(blob_u64(&bytes[8..])?),
         });
     }
-    if !matches!(code, 5 | 6) || bytes.len() != 78 {
+    if !matches!(code, 5 | 6 | 10 | 11) || bytes.len() != 78 {
         return Err(Corrupt);
     }
     let delivery = DeliveryId {
@@ -397,8 +468,22 @@ pub(super) fn decode_facts(code: i64, bytes: &[u8]) -> Result<CommitFacts, Corru
             packet_id,
             claim,
         }
-    } else {
+    } else if code == 6 {
         CommitFacts::DeliveryFinished {
+            delivery,
+            target,
+            packet_id,
+            claim,
+        }
+    } else if code == 10 {
+        CommitFacts::DeliveryStarted {
+            delivery,
+            target,
+            packet_id,
+            claim,
+        }
+    } else {
+        CommitFacts::DeliveryExpired {
             delivery,
             target,
             packet_id,
@@ -420,6 +505,7 @@ pub(super) fn work(
     let read = conn.unchecked_transaction()?;
     let meta = read_meta(&read)?;
     sessions::validate_metadata(&read, &meta, Some(session))?;
+    message_expiry::validate(&read, Some(session))?;
     // Check the target's finite metadata domain before either the QoS or
     // cursor selection can turn an invalid obligation into apparent absence.
     // SQL inspects scalars only; no offending value or payload is copied.
@@ -462,7 +548,7 @@ pub(super) fn work(
     if broken {
         return Err(Fault::Corrupt);
     }
-    let sql = "SELECT o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state,o.qos,o.retain FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN payloads y ON y.id=p.payload LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.target=?1 AND o.qos IN (0,1) AND (?2 IS NULL OR o.publication>?2 OR (o.publication=?2 AND o.idx>?3)) ORDER BY o.publication,o.idx LIMIT ?4";
+    let sql = "SELECT o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state,o.qos,o.retain,p.expiry_domain,p.expiry_tick,p.expiry_interval,c.started FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN payloads y ON y.id=p.payload LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.target=?1 AND o.qos IN (0,1) AND (?2 IS NULL OR o.publication>?2 OR (o.publication=?2 AND o.idx>?3)) ORDER BY o.publication,o.idx LIMIT ?4";
     let mut items = BoundedVec::with_capacity(limit).map_err(|_| ReadError::AllocationFailed)?;
     let mut meter = reader::Meter::new(budget);
     let mut more = false;
@@ -524,6 +610,7 @@ pub(super) fn work(
                     Some(DeliveryClaim {
                         operation,
                         packet_id: packet,
+                        started: message_expiry::started(row, 16)?,
                     })
                 }
             };
@@ -533,6 +620,7 @@ pub(super) fn work(
                     target: session,
                     target_revision: revision,
                     qos: code_qos(row.get(11)?)?,
+                    expiry: message_expiry::decode(row, 13)?,
                     retain: match row.get::<_, i64>(12)? {
                         0 => false,
                         1 => true,

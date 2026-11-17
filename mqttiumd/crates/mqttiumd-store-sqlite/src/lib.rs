@@ -46,6 +46,7 @@
 #![forbid(unsafe_code)]
 
 mod codec;
+mod message_expiry;
 mod pubsub;
 mod reader;
 mod receipts;
@@ -73,6 +74,9 @@ use mqttiumd_contract::ids::{
     DeliveryId, InboundPacketId, OperationId, OperationSeq, OutboundPacketId, PayloadId,
     PublicationId, Revision, RunEpoch, SessionId, StoreIncarnation,
 };
+use mqttiumd_contract::message_expiry::{
+    ExpiringAdmission, ExpiryState, MessageExpiry, MessageTime,
+};
 use mqttiumd_contract::outcome::{
     CommitFacts, Knowledge, OpeningOutcome, RejectReason, StoreOutcome, StoreReply, StoreViolation,
 };
@@ -80,9 +84,10 @@ use mqttiumd_contract::packet::{Qos, SharedBytes};
 use mqttiumd_store_api::{
     Accounts, AdminCommand, AdminDone, AdminRefused, Applied, Decision, Durability, DurableState,
     DurableStore, InboundRecord, Limits, MAX_CLIENT_ID_BYTES, MAX_RECOVERY_INVENTORY_ROWS,
-    ObligationRecord, OperationRecord, OutboundRecord, PayloadRecord, PublicationRecord,
-    ReadBudget, ReadError, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved, RetainedRecord,
-    RouteTarget, SessionClockAnchor, SessionClockReading, SessionRecord, SessionState, WorkPage,
+    MessageExpirySweep, ObligationRecord, OperationRecord, OutboundRecord, PayloadRecord,
+    PublicationRecord, ReadBudget, ReadError, RecoveryCursor, RecoveryPage, RecoveryRefused,
+    Resolved, RetainedRecord, RouteTarget, SessionClockAnchor, SessionClockReading, SessionRecord,
+    SessionState, WorkPage,
 };
 
 use mqttiumd_contract::receipts::{
@@ -101,6 +106,7 @@ pub use schema::{FORMAT, SCHEMA_VERSION};
 
 #[derive(Clone, Copy)]
 struct Admission<'a> {
+    expiry: Option<MessageExpiry>,
     operation: OperationId,
     request: mqttiumd_contract::ids::RequestId,
     publication: PublicationId,
@@ -121,6 +127,7 @@ struct Admission<'a> {
 impl<'a> From<&'a AdmitPublication> for Admission<'a> {
     fn from(a: &'a AdmitPublication) -> Self {
         Self {
+            expiry: None,
             operation: a.operation,
             request: a.request,
             publication: a.publication,
@@ -140,6 +147,7 @@ impl<'a> From<&'a AdmitPublication> for Admission<'a> {
 impl<'a> From<&'a mqttiumd_contract::retained::RetainedQos0> for Admission<'a> {
     fn from(a: &'a mqttiumd_contract::retained::RetainedQos0) -> Self {
         Self {
+            expiry: None,
             operation: a.operation,
             request: a.request,
             publication: a.publication,
@@ -616,7 +624,7 @@ impl DecisionColumns {
                 self.reason.ok_or(Corrupt)?,
                 self.resource,
             )?)),
-            4..=9 => Ok(Decision::Committed(pubsub::decode_facts(
+            4..=11 => Ok(Decision::Committed(pubsub::decode_facts(
                 self.decision,
                 self.facts.as_deref().ok_or(Corrupt)?,
             )?)),
@@ -854,6 +862,24 @@ fn stage_publication(
     ) {
         return refused(failed);
     }
+    let expired = if let Some(expiry) = admit.expiry {
+        message_expiry::check_observation(conn, expiry.observed)?;
+        expiry.deadline().map_err(|_| Abort::Refused(failed))?;
+        let anchor = sessions::clock(conn)?
+            .ok_or(Abort::Refused(failed))?
+            .reading;
+        expiry.interval == 0
+            || (anchor.tick >= expiry.observed.tick
+                && matches!(
+                    expiry.state(MessageTime {
+                        domain: anchor.domain,
+                        tick: anchor.tick
+                    }),
+                    Ok(ExpiryState::Expired)
+                ))
+    } else {
+        false
+    };
     let targets = admit.targets;
     if targets.len() > meta.limits.max_targets_per_admission
         || admit.topic.len() > meta.limits.max_topic_bytes
@@ -910,11 +936,17 @@ fn stage_publication(
         return refused(failed);
     }
     if retained_mask.is_some() {
-        retained::prepare_mutation(conn, meta, admit.topic.as_slice(), length)?;
+        retained::prepare_mutation(
+            conn,
+            meta,
+            admit.topic.as_slice(),
+            if expired { 0 } else { length },
+        )?;
     }
+    let reference_count = if expired { 0 } else { reference_count };
     conn.prepare_cached(
-        "INSERT INTO publications (id, operation, source, qos, retain, payload, topic)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO publications (id, operation, source, qos, retain, payload, topic, expiry_domain, expiry_tick, expiry_interval)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?
     .execute(params![
         publication.as_slice(),
@@ -924,6 +956,9 @@ fn stage_publication(
         i64::from(admit.retain),
         payload_id.as_slice(),
         admit.topic.as_slice(),
+        admit.expiry.map(|e| e.observed.domain.to_vec()),
+        admit.expiry.map(|e| u64_blob(e.observed.tick).to_vec()),
+        admit.expiry.map(|e| i64::from(e.interval)),
     ])?;
     // Its bytes are kept while an obligation refers to them, and only then
     // charged. Without a target they are charged and released in this same
@@ -941,6 +976,9 @@ fn stage_publication(
     }
     for (target_index, target) in targets.iter().enumerate() {
         active_session(conn, target.session, target.session_revision)?;
+        if expired {
+            continue;
+        }
         let delivery = target.delivery;
         let key = (
             delivery.publication.to_be_bytes(),
@@ -998,20 +1036,24 @@ fn stage_publication(
     charge(
         meta,
         Accounts {
-            payload_bytes: admit.costs.payload_bytes,
-            references: admit.costs.references,
+            payload_bytes: if expired {
+                PayloadBytes::new(0)
+            } else {
+                admit.costs.payload_bytes
+            },
+            references: References::new(reference_count),
             exchange_slots: admit.costs.exchange_slots,
             receipt_slots: admit.costs.receipt_slots,
         },
     )?;
-    if reference_count == 0 {
+    if reference_count == 0 && !expired {
         meta.accounts.payload_bytes = meta
             .accounts
             .payload_bytes
             .checked_sub(admit.costs.payload_bytes)
             .ok_or(Abort::Refused(failed))?;
     }
-    if retained_mask.is_some() && length > 0 {
+    if retained_mask.is_some() && length > 0 && !expired {
         retained::install(
             conn,
             admit.topic.as_slice(),
@@ -1887,6 +1929,7 @@ impl SqliteStore {
         if orphan {
             return Err(Fault::Corrupt);
         }
+        message_expiry::validate(conn, None)?;
         let mut out = Vec::new();
         out.try_reserve_exact(count)
             .map_err(|_| ReadError::AllocationFailed)?;
@@ -2072,7 +2115,7 @@ impl SqliteStore {
             },
         )?;
         section(
-            "SELECT o.publication,o.idx,o.target,o.target_revision,c.packet_id,c.claim,c.target,c.target_revision,o.qos,s.revision,s.state FROM obligations o LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE ?1=?1 AND ?2=?2 ORDER BY o.publication,o.idx",
+            "SELECT o.publication,o.idx,o.target,o.target_revision,c.packet_id,c.claim,c.target,c.target_revision,o.qos,s.revision,s.state,p.expiry_domain,p.expiry_tick,p.expiry_interval,c.started FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE ?1=?1 AND ?2=?2 ORDER BY o.publication,o.idx",
             &mut out,
             &mut position,
             &mut |row| {
@@ -2107,6 +2150,7 @@ impl SqliteStore {
                         }
                         Some(mqttiumd_contract::pubsub::DeliveryClaim {
                             operation,
+                            started: message_expiry::started(row, 14)?,
                             packet_id: u16::try_from(row.get::<_, i64>(4)?)
                                 .ok()
                                 .and_then(OutboundPacketId::new)
@@ -2119,6 +2163,8 @@ impl SqliteStore {
                     target,
                     target_revision,
                     qos,
+                    expiry: message_expiry::decode(row, 11)?,
+                    started: claim.is_some_and(|c| c.started),
                     claim,
                 }))
             },
@@ -2203,6 +2249,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
     {
         let meta = read_meta(conn)?;
         reader::snapshot(conn, &meta, budget)?;
+        message_expiry::validate(conn, None)?;
         let mut sessions = BTreeMap::new();
         {
             let mut statement = conn.prepare(
@@ -2293,7 +2340,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
         let mut publications = BTreeMap::new();
         {
             let mut statement = conn.prepare(
-                "SELECT id, operation, source, topic, qos, retain, payload, retained_version FROM publications",
+                "SELECT id, operation, source, topic, qos, retain, payload, retained_version, expiry_domain, expiry_tick, expiry_interval FROM publications",
             )?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
@@ -2301,6 +2348,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                     PublicationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
                         .map_err(|_| Fault::Corrupt)?,
                     PublicationRecord {
+                        expiry: message_expiry::decode(row, 8)?,
                         retained_version: reader::optional_blob(row, 7, 32)?
                             .as_deref()
                             .map(PublicationId::from_be_slice)
@@ -2387,7 +2435,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
         let mut outbound = BTreeMap::new();
         {
             let mut statement = conn.prepare(
-                "SELECT publication,idx,target,target_revision,packet_id,claim FROM outbound",
+                "SELECT publication,idx,target,target_revision,packet_id,claim,started FROM outbound",
             )?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
@@ -2406,6 +2454,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                 let claim = OperationId::from_be_slice(reader::borrow_blob(row, 5, 32)?)
                     .map_err(|_| Fault::Corrupt)?;
                 let record = OutboundRecord {
+                    started: message_expiry::started(row, 6)?,
                     target,
                     target_revision,
                     packet_id,
@@ -2486,6 +2535,27 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
 }
 
 impl DurableStore for SqliteStore {
+    fn expire_messages(
+        &mut self,
+        now: MessageTime,
+        after: Option<PublicationId>,
+        limit: u32,
+    ) -> Result<MessageExpirySweep, ReadError> {
+        match self.transact(|conn, meta| {
+            let result = message_expiry::sweep(conn, meta, now, after, limit)
+                .map_err(|fault| Abort::Read(fault.read_error()))?;
+            if result.removed.is_empty() && result.retained_removed == 0 {
+                Err(Abort::Refused(result))
+            } else {
+                Ok(result)
+            }
+        }) {
+            Txn::Committed(result) | Txn::Refused(result) => Ok(result),
+            Txn::ReadFailed(error) => Err(error),
+            Txn::NotWritten => Err(ReadError::Unavailable),
+        }
+    }
+
     fn checkpoint_session_clock(
         &mut self,
         expected: Option<SessionClockAnchor>,
@@ -2665,7 +2735,23 @@ impl DurableStore for SqliteStore {
                     Some(value.retain_targets),
                     payload,
                 )?,
-                Recipe::ReplaySubscriptions(value) => retained::subscribe(conn, meta, value)?,
+                Recipe::ReplaySubscriptions(value) => retained::subscribe(conn, meta, value, None)?,
+                Recipe::TimedReplaySubscriptions(value) => {
+                    retained::subscribe(conn, meta, &value.replay, Some(value.observed))?
+                }
+                Recipe::ExpiringPublication(value) => {
+                    let (mut admit, mask) = match &value.admission {
+                        ExpiringAdmission::Qos12(v) => (
+                            Admission::from(&v.admission),
+                            v.admission.retain.then_some(v.retain_targets),
+                        ),
+                        ExpiringAdmission::Qos0(v) => (Admission::from(v), Some(v.retain_targets)),
+                    };
+                    admit.expiry = Some(value.expiry);
+                    stage_publication(conn, meta, admit, mask, payload)?
+                }
+                Recipe::MarkDeliveryStarted(command) => pubsub::mark_started(conn, meta, command)?,
+                Recipe::ExpireDelivery(command) => pubsub::expire(conn, meta, command)?,
                 Recipe::ReleaseInbound(release) => stage_release(conn, meta, release)?,
                 Recipe::ChangeSubscriptions(command) => pubsub::subscriptions(conn, meta, command)?,
                 Recipe::ClaimDelivery(command) => pubsub::claim(conn, meta, command)?,

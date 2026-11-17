@@ -28,6 +28,9 @@ use mqttiumd_contract::ids::{
     DeliveryId, LogicalOwnerId, OperationId, OperationSeq, PayloadId, PayloadSeq, PublicationId,
     PublicationSeq, Revision, RunEpoch, SessionId, StoreIncarnation,
 };
+use mqttiumd_contract::message_expiry::{
+    ExpireDelivery, ExpiringAdmission, ExpiryState, MarkDeliveryStarted, MessageExpiry, MessageTime,
+};
 use mqttiumd_contract::outcome::{
     CommitFacts, Knowledge, OpeningOutcome, RejectReason, StoreOutcome, StoreReply, StoreViolation,
 };
@@ -57,6 +60,7 @@ pub struct MemoryStore {
 
 #[derive(Clone, Copy)]
 struct Admission<'a> {
+    expiry: Option<MessageExpiry>,
     operation: OperationId,
     request: mqttiumd_contract::ids::RequestId,
     publication: PublicationId,
@@ -77,6 +81,7 @@ struct Admission<'a> {
 impl<'a> From<&'a AdmitPublication> for Admission<'a> {
     fn from(a: &'a AdmitPublication) -> Self {
         Self {
+            expiry: None,
             operation: a.operation,
             request: a.request,
             publication: a.publication,
@@ -96,6 +101,7 @@ impl<'a> From<&'a AdmitPublication> for Admission<'a> {
 impl<'a> From<&'a mqttiumd_contract::retained::RetainedQos0> for Admission<'a> {
     fn from(a: &'a mqttiumd_contract::retained::RetainedQos0) -> Self {
         Self {
+            expiry: None,
             operation: a.operation,
             request: a.request,
             publication: a.publication,
@@ -346,6 +352,12 @@ impl FactRef<'_> {
                     target: record.target,
                     target_revision: record.target_revision,
                     qos: record.qos,
+                    expiry: state
+                        .publications
+                        .get(&delivery.publication)
+                        .ok_or(ReadError::InvalidData)?
+                        .expiry,
+                    started: claim.is_some_and(|c| c.started),
                     claim,
                 }
             }
@@ -384,10 +396,20 @@ fn delivery_claim(
     Ok(Some(DeliveryClaim {
         operation: claim.claim,
         packet_id: claim.packet_id,
+        started: claim.started,
     }))
 }
 
 fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
+    for publication in state.publications.values() {
+        if let Some(expiry) = publication.expiry {
+            if expiry.observed.domain == [0; 32] {
+                return Err(ReadError::InvalidData);
+            }
+            expiry.deadline().map_err(|_| ReadError::InvalidData)?;
+        }
+    }
+
     for row in state.sessions.values() {
         if matches!(row.expiry, SessionExpiry::After(_)) && state.session_clock.is_none() {
             return Err(ReadError::InvalidData);
@@ -491,6 +513,9 @@ fn check_delivery_metadata(
         .publications
         .get(&delivery.publication)
         .ok_or(ReadError::InvalidData)?;
+    if let Some(expiry) = publication.expiry {
+        expiry.deadline().map_err(|_| ReadError::InvalidData)?;
+    }
     if (record.retain && !publication.retain)
         || (record.cause == mqttiumd_contract::command::DeliveryCause::RetainedReplay
             && (!record.retain
@@ -584,11 +609,15 @@ fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadEr
         )?;
     }
     for record in state.publications.values() {
+        if let Some(expiry) = record.expiry {
+            expiry.deadline().map_err(|_| ReadError::InvalidData)?;
+        }
         meter.field(32, 32)?;
         meter.field(record.topic.len(), state.limits.max_topic_bytes)?;
         meter.charge(
             248usize
-                .checked_add(record.topic.len())
+                .checked_add(if record.expiry.is_some() { 44 } else { 0 })
+                .and_then(|n| n.checked_add(record.topic.len()))
                 .ok_or(ReadError::LimitExceeded)?,
         )?;
     }
@@ -651,6 +680,8 @@ trait Staging {
     ) -> Guard<CommitFacts>;
     fn stage_claim(&mut self, command: &ClaimDelivery) -> Guard<CommitFacts>;
     fn stage_finish(&mut self, command: &FinishDelivery) -> Guard<CommitFacts>;
+    fn stage_started(&mut self, command: &MarkDeliveryStarted) -> Guard<CommitFacts>;
+    fn stage_expired(&mut self, command: &ExpireDelivery) -> Guard<CommitFacts>;
     fn stage_consume(&mut self, command: &ConsumeDelivery) -> Guard<CommitFacts>;
     fn discard_completed_publication(&mut self, publication: PublicationId);
     fn end_obligation(&mut self, delivery: DeliveryId) -> Result<(), AdminRefused>;
@@ -778,6 +809,22 @@ impl Staging for DurableState {
         ) {
             return Err(failed);
         }
+        let expired = if let Some(expiry) = admit.expiry {
+            check_message_observation(self, expiry.observed).map_err(|_| failed)?;
+            expiry.deadline().map_err(|_| failed)?;
+            let anchor = self.session_clock.ok_or(failed)?.reading;
+            expiry.interval == 0
+                || (anchor.tick >= expiry.observed.tick
+                    && matches!(
+                        expiry.state(MessageTime {
+                            domain: anchor.domain,
+                            tick: anchor.tick
+                        }),
+                        Ok(ExpiryState::Expired)
+                    ))
+        } else {
+            false
+        };
         let targets = admit.targets;
         if targets.len() > self.limits.max_targets_per_admission
             || admit.topic.len() > self.limits.max_topic_bytes
@@ -816,11 +863,17 @@ impl Staging for DurableState {
             return Err(failed);
         }
         if retained_mask.is_some() {
-            retained_memory::prepare_mutation(self, admit.topic.as_slice(), length)?;
+            retained_memory::prepare_mutation(
+                self,
+                admit.topic.as_slice(),
+                if expired { 0 } else { length },
+            )?;
         }
+        let reference_count = if expired { 0 } else { reference_count };
         self.publications.insert(
             admit.publication,
             PublicationRecord {
+                expiry: admit.expiry,
                 retained_version: None,
                 operation,
                 source: admit.source_session,
@@ -845,6 +898,9 @@ impl Staging for DurableState {
         }
         for (target_index, target) in targets.iter().enumerate() {
             self.active_session(target.session, target.session_revision)?;
+            if expired {
+                continue;
+            }
             let obligation = ObligationRecord {
                 retain: retained_mask.is_some_and(|mask| mask & (1 << target_index) != 0),
                 target: target.session,
@@ -876,19 +932,23 @@ impl Staging for DurableState {
             }
         }
         self.charge(Accounts {
-            payload_bytes: admit.costs.payload_bytes,
-            references: admit.costs.references,
+            payload_bytes: if expired {
+                PayloadBytes::new(0)
+            } else {
+                admit.costs.payload_bytes
+            },
+            references: References::new(reference_count),
             exchange_slots: admit.costs.exchange_slots,
             receipt_slots: admit.costs.receipt_slots,
         })?;
-        if reference_count == 0 {
+        if reference_count == 0 && !expired {
             self.accounts.payload_bytes = self
                 .accounts
                 .payload_bytes
                 .checked_sub(admit.costs.payload_bytes)
                 .ok_or(failed)?;
         }
-        if retained_mask.is_some() && length > 0 {
+        if retained_mask.is_some() && length > 0 && !expired {
             retained_memory::install(
                 self,
                 admit.topic.as_slice(),
@@ -1020,6 +1080,7 @@ impl Staging for DurableState {
         self.outbound.insert(
             command.delivery,
             OutboundRecord {
+                started: false,
                 target: command.target,
                 target_revision: command.target_revision,
                 packet_id: command.packet_id,
@@ -1038,6 +1099,7 @@ impl Staging for DurableState {
         let failed = RejectReason::PreconditionFailed;
         self.active_session(command.target, command.target_revision)?;
         let expected = OutboundRecord {
+            started: self.outbound.get(&command.delivery).ok_or(failed)?.started,
             target: command.target,
             target_revision: command.target_revision,
             packet_id: command.packet_id,
@@ -1053,6 +1115,50 @@ impl Staging for DurableState {
             target: command.target,
             packet_id: command.packet_id,
             claim: command.claim,
+        })
+    }
+
+    fn stage_started(&mut self, command: &MarkDeliveryStarted) -> Guard<CommitFacts> {
+        let failed = RejectReason::PreconditionFailed;
+        self.active_session(command.target, command.target_revision)?;
+        let slot = self.outbound.get_mut(&command.delivery).ok_or(failed)?;
+        if slot.target != command.target
+            || slot.target_revision != command.target_revision
+            || slot.packet_id != command.packet_id
+            || slot.claim != command.claim
+        {
+            return Err(failed);
+        }
+        slot.started = true;
+        self.charge(Accounts::RECEIPT)?;
+        Ok(CommitFacts::DeliveryStarted {
+            delivery: command.delivery,
+            target: command.target,
+            packet_id: command.packet_id,
+            claim: command.claim,
+        })
+    }
+
+    fn stage_expired(&mut self, command: &ExpireDelivery) -> Guard<CommitFacts> {
+        let failed = RejectReason::PreconditionFailed;
+        check_message_observation(self, command.observed).map_err(|_| failed)?;
+        let slot = self.outbound.get(&command.finish.delivery).ok_or(failed)?;
+        let publication = self
+            .publications
+            .get(&command.finish.delivery.publication)
+            .ok_or(failed)?;
+        if slot.started
+            || publication.expiry != Some(command.expiry)
+            || command.expiry.state(command.observed) != Ok(ExpiryState::Expired)
+        {
+            return Err(failed);
+        }
+        self.stage_finish(&command.finish)?;
+        Ok(CommitFacts::DeliveryExpired {
+            delivery: command.finish.delivery,
+            target: command.finish.target,
+            packet_id: command.finish.packet_id,
+            claim: command.finish.claim,
         })
     }
 
@@ -1632,7 +1738,111 @@ fn cancel_session(
     })
 }
 
+fn check_message_observation(state: &DurableState, now: MessageTime) -> Result<(), ReadError> {
+    let anchor = state.session_clock.ok_or(ReadError::InvalidData)?;
+    if now.domain == [0; 32] || now.domain != anchor.reading.domain {
+        return Err(ReadError::InvalidData);
+    }
+    Ok(())
+}
+
 impl DurableStore for MemoryStore {
+    fn expire_messages(
+        &mut self,
+        now: MessageTime,
+        after: Option<PublicationId>,
+        limit: u32,
+    ) -> Result<MessageExpirySweep, ReadError> {
+        if limit == 0 || limit > MESSAGE_EXPIRY_SWEEP_PUBLICATIONS {
+            return Err(ReadError::LimitExceeded);
+        }
+        check_message_observation(&self.committed, now)?;
+        check_snapshot(&self.committed, ReadBudget::SNAPSHOT)?;
+        let mut result = MessageExpirySweep {
+            removed: BoundedVec::with_capacity(MESSAGE_EXPIRY_SWEEP_DELIVERIES)
+                .map_err(|_| ReadError::AllocationFailed)?,
+            ..MessageExpirySweep::default()
+        };
+        let mut candidates = Vec::new();
+        candidates
+            .try_reserve_exact(limit as usize + 1)
+            .map_err(|_| ReadError::AllocationFailed)?;
+        for (id, publication) in self
+            .committed
+            .publications
+            .range((
+                after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+                std::ops::Bound::Unbounded,
+            ))
+            .take(limit as usize + 1)
+        {
+            candidates.push((*id, publication.expiry));
+        }
+        result.more = candidates.len() > limit as usize;
+        candidates.truncate(limit as usize);
+        result.next = result
+            .more
+            .then(|| candidates.last().map(|(id, _)| *id))
+            .flatten();
+        let mut staged = self.committed.clone();
+        for (id, expiry) in candidates {
+            let Some(expiry) = expiry else {
+                continue;
+            };
+            match expiry.state(now).map_err(|_| ReadError::InvalidData)? {
+                ExpiryState::Fresh { .. } => (),
+                ExpiryState::TemporalUncertain => {
+                    result.quarantined += 1;
+                }
+                ExpiryState::Expired => {
+                    if let Some(topic) = staged
+                        .retained
+                        .iter()
+                        .find_map(|(topic, r)| (r.publication == id).then(|| topic.clone()))
+                    {
+                        retained_memory::prepare_mutation(&mut staged, &topic, 0)
+                            .map_err(|_| ReadError::InvalidData)?;
+                        result.retained_removed += 1;
+                    }
+                    let mut deliveries = BoundedVec::with_capacity(MESSAGE_EXPIRY_SWEEP_DELIVERIES)
+                        .map_err(|_| ReadError::AllocationFailed)?;
+                    for (delivery, record) in staged.obligations.range(
+                        DeliveryId {
+                            publication: id,
+                            index: 0,
+                        }..=DeliveryId {
+                            publication: id,
+                            index: u32::MAX,
+                        },
+                    ) {
+                        if !staged.outbound.contains_key(delivery) {
+                            deliveries
+                                .try_push((*delivery, record.target))
+                                .map_err(|_| ReadError::LimitExceeded)?;
+                        }
+                    }
+                    for &(delivery, target) in deliveries.as_slice() {
+                        result
+                            .removed
+                            .try_push(ExpiredDelivery { delivery, target })
+                            .map_err(|_| ReadError::LimitExceeded)?;
+                        staged
+                            .end_obligation(delivery)
+                            .map_err(|_| ReadError::InvalidData)?;
+                    }
+                }
+            }
+        }
+        if result.removed.is_empty() && result.retained_removed == 0 {
+            return Ok(result);
+        }
+        if self.commit(staged) {
+            Ok(result)
+        } else {
+            Err(ReadError::Unavailable)
+        }
+    }
+
     fn checkpoint_session_clock(
         &mut self,
         expected: Option<SessionClockAnchor>,
@@ -1837,7 +2047,25 @@ impl DurableStore for MemoryStore {
                 Some(value.retain_targets),
                 command.payload.as_ref(),
             ),
-            Recipe::ReplaySubscriptions(value) => retained_memory::subscribe(&mut staged, value),
+            Recipe::ReplaySubscriptions(value) => {
+                retained_memory::subscribe(&mut staged, value, None)
+            }
+            Recipe::TimedReplaySubscriptions(value) => {
+                retained_memory::subscribe(&mut staged, &value.replay, Some(value.observed))
+            }
+            Recipe::ExpiringPublication(value) => {
+                let (mut admit, mask) = match &value.admission {
+                    ExpiringAdmission::Qos12(v) => (
+                        Admission::from(&v.admission),
+                        v.admission.retain.then_some(v.retain_targets),
+                    ),
+                    ExpiringAdmission::Qos0(v) => (Admission::from(v), Some(v.retain_targets)),
+                };
+                admit.expiry = Some(value.expiry);
+                staged.stage_publication(admit, mask, command.payload.as_ref())
+            }
+            Recipe::MarkDeliveryStarted(command) => staged.stage_started(command),
+            Recipe::ExpireDelivery(command) => staged.stage_expired(command),
             Recipe::ReleaseInbound(release) => staged.stage_release(release),
             Recipe::ChangeSubscriptions(command) => staged.stage_subscriptions(command),
             Recipe::ClaimDelivery(command) => staged.stage_claim(command),
@@ -2035,6 +2263,7 @@ impl DurableStore for MemoryStore {
                     target_revision: record.target_revision,
                     qos: record.qos,
                     retain: record.retain,
+                    expiry: publication.expiry,
                     topic: SharedBytes::copy_from(&publication.topic, state.limits.max_topic_bytes)
                         .map_err(|_| ReadError::LimitExceeded)?,
                     payload: SharedBytes::copy_from(&payload.bytes, state.limits.max_payload_bytes)

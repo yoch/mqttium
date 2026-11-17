@@ -228,11 +228,24 @@ fn facts(facts: CommitFacts) -> Value {
             target,
             packet_id,
             claim,
+        }
+        | CommitFacts::DeliveryStarted {
+            delivery,
+            target,
+            packet_id,
+            claim,
+        }
+        | CommitFacts::DeliveryExpired {
+            delivery,
+            target,
+            packet_id,
+            claim,
         } => json!({
-            "kind": if matches!(facts, CommitFacts::DeliveryClaimed { .. }) {
-                "DeliveryClaimed"
-            } else {
-                "DeliveryFinished"
+            "kind": match facts {
+                CommitFacts::DeliveryClaimed { .. } => "DeliveryClaimed",
+                CommitFacts::DeliveryStarted { .. } => "DeliveryStarted",
+                CommitFacts::DeliveryExpired { .. } => "DeliveryExpired",
+                _ => "DeliveryFinished",
             },
             "delivery_id": delivery_id(delivery),
             "target_session": session(target),
@@ -369,6 +382,9 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
                 "retain": record.retain,
                 "payload_id": payload_id(record.payload),
             });
+            if let Some(expiry) = record.expiry {
+                row["expiry"] = json!({ "observed": { "domain_hex": hex(&expiry.observed.domain), "tick": decimal(expiry.observed.tick) }, "interval": expiry.interval });
+            }
             if let Some(version) = record.retained_version {
                 row["retained_version"] = publication_id(version);
             }
@@ -417,7 +433,7 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
         .outbound
         .iter()
         .map(|(delivery, record)| {
-            json!({
+            let mut row = json!({
                 "delivery_id": delivery_id(*delivery),
                 "target_session": session(record.target),
                 "target_revision": decimal(record.target_revision.get()),
@@ -425,7 +441,11 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
                 "claim_operation_id": operation_id(record.claim),
                 "phase": "AwaitPuback",
                 "emission": "MayHaveStarted",
-            })
+            });
+            if record.started {
+                row["started"] = json!(true);
+            }
+            row
         })
         .collect();
     let limits = state.limits;
@@ -584,17 +604,29 @@ pub fn recovered_fact(fact: &RecoveredFact) -> Value {
             target_revision,
             qos,
             claim,
-        } => json!({
-            "kind": "OutboundDelivery",
-            "delivery_id": delivery_id(*delivery),
-            "target_session": session(*target),
-            "target_revision": decimal(target_revision.get()),
-            "qos": qos.to_wire(),
-            "claim": claim.map(|claim| json!({
-                "operation_id": operation_id(claim.operation),
-                "packet_id": claim.packet_id.get(),
-            })),
-        }),
+            expiry,
+            started,
+        } => {
+            let mut row = json!({
+                "kind": "OutboundDelivery",
+                "delivery_id": delivery_id(*delivery),
+                "target_session": session(*target),
+                "target_revision": decimal(target_revision.get()),
+                "qos": qos.to_wire(),
+                "claim": claim.map(|claim| {
+                    let mut value = json!({ "operation_id": operation_id(claim.operation), "packet_id": claim.packet_id.get() });
+                    if claim.started { value["started"] = json!(true); }
+                    value
+                }),
+            });
+            if let Some(expiry) = expiry {
+                row["expiry"] = json!({ "observed": { "domain_hex": hex(&expiry.observed.domain), "tick": decimal(expiry.observed.tick) }, "interval": expiry.interval });
+            }
+            if *started {
+                row["started"] = json!(true);
+            }
+            row
+        }
         RecoveredFact::Operation {
             operation,
             knowledge,
@@ -900,7 +932,11 @@ impl<'a> TraceWriter<'a> {
                             "operation_id": operation_id(*operation),
                         }),
                     ),
-                    WorkKind::RetainedPublication
+                    WorkKind::ExpiringPublication
+                    | WorkKind::TimedReplaySubscriptions
+                    | WorkKind::MarkDeliveryStarted
+                    | WorkKind::ExpireDelivery
+                    | WorkKind::RetainedPublication
                     | WorkKind::RetainedQos0
                     | WorkKind::ReplaySubscriptions
                     | WorkKind::AdmitPublication

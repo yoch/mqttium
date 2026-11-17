@@ -1,11 +1,11 @@
-//! The schema of version 8. Every table is `STRICT`; identities and 64-bit
+//! The schema of version 9. Every table is `STRICT`; identities and 64-bit
 //! values are 8-byte big-endian BLOBs (32 bytes for an operation-scoped
 //! identity, 16 for an exchange, 24 for an opening attempt); large BLOBs
 //! come last in their row.
 
 /// `PRAGMA user_version` of the schema below. Any other version is
 /// refused before anything is written.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// The format named in `meta`.
 pub const FORMAT: &str = "mqttiumd-store-sqlite";
@@ -95,7 +95,14 @@ CREATE TABLE publications (
     retain INTEGER NOT NULL CHECK (retain IN (0, 1)),
     payload BLOB NOT NULL CHECK (length(payload) = 32),
     retained_version BLOB CHECK (retained_version IS NULL OR length(retained_version) = 32),
-    topic BLOB NOT NULL
+    expiry_domain BLOB,
+    expiry_tick BLOB,
+    expiry_interval INTEGER,
+    topic BLOB NOT NULL,
+    CHECK ((expiry_domain IS NULL AND expiry_tick IS NULL AND expiry_interval IS NULL) OR
+           (typeof(expiry_domain) = 'blob' AND length(expiry_domain) = 32 AND
+            typeof(expiry_tick) = 'blob' AND length(expiry_tick) = 8 AND
+            typeof(expiry_interval) = 'integer' AND expiry_interval >= 0 AND expiry_interval <= 4294967295))
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX publications_by_payload ON publications (payload);
@@ -134,6 +141,7 @@ CREATE TABLE outbound (
     target_revision BLOB NOT NULL CHECK(length(target_revision)=8),
     packet_id INTEGER NOT NULL CHECK(packet_id>=1 AND packet_id<=65535),
     claim BLOB NOT NULL CHECK(length(claim)=32),
+    started INTEGER NOT NULL DEFAULT 0 CHECK(started IN (0,1)),
     PRIMARY KEY(publication,idx),
     UNIQUE(target,packet_id)
 ) STRICT, WITHOUT ROWID;

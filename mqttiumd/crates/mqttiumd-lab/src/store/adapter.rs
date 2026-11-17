@@ -135,6 +135,10 @@ impl FaultAction {
 /// The kind of work the adapter carries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WorkKind {
+    ExpiringPublication,
+    TimedReplaySubscriptions,
+    MarkDeliveryStarted,
+    ExpireDelivery,
     RetainedPublication,
     RetainedQos0,
     ReplaySubscriptions,
@@ -155,6 +159,10 @@ impl WorkKind {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::ExpiringPublication => "ExpiringPublication",
+            Self::TimedReplaySubscriptions => "TimedReplaySubscriptions",
+            Self::MarkDeliveryStarted => "MarkDeliveryStarted",
+            Self::ExpireDelivery => "ExpireDelivery",
             Self::RetainedPublication => "RetainedPublication",
             Self::RetainedQos0 => "RetainedQos0",
             Self::ReplaySubscriptions => "ReplaySubscriptions",
@@ -468,6 +476,26 @@ pub struct Crashed<S> {
 fn describe(work: &Work) -> (WorkKind, Option<OperationId>, Source) {
     match work {
         Work::Persist(command) => match command.recipe.get() {
+            Recipe::ExpiringPublication(_) => (
+                WorkKind::ExpiringPublication,
+                Some(command.recipe.operation()),
+                command
+                    .recipe
+                    .get()
+                    .admission()
+                    .map(|a| (a.source.session, a.source.packet_id)),
+            ),
+            Recipe::TimedReplaySubscriptions(value) => (
+                WorkKind::TimedReplaySubscriptions,
+                Some(value.replay.update.operation),
+                None,
+            ),
+            Recipe::MarkDeliveryStarted(value) => {
+                (WorkKind::MarkDeliveryStarted, Some(value.operation), None)
+            }
+            Recipe::ExpireDelivery(value) => {
+                (WorkKind::ExpireDelivery, Some(value.finish.operation), None)
+            }
             Recipe::RetainedPublication(value) => (
                 WorkKind::RetainedPublication,
                 Some(value.admission.operation),

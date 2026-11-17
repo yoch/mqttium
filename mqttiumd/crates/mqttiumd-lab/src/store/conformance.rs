@@ -1421,6 +1421,7 @@ pub fn recovery_reads_bounded_pages_of_durable_facts<S: DurableStore>(
                 target_revision,
                 qos: Qos::AtLeastOnce,
                 claim,
+                ..
             } => Some((*delivery, *target, *target_revision, *claim)),
             _ => None,
         })
@@ -2998,6 +2999,7 @@ pub fn outgoing_work_is_bounded_and_independent_of_notifications<S: DurableStore
         index: 0,
     };
     let claim = DeliveryClaim {
+        started: false,
         operation: operation_id(world.epoch, 20),
         packet_id: OutboundPacketId::new(7).unwrap(),
     };
@@ -3090,6 +3092,7 @@ pub fn outgoing_work_is_bounded_and_independent_of_notifications<S: DurableStore
                 target_revision,
                 qos: Qos::AtLeastOnce,
                 claim,
+                ..
             } => Some((*delivery, *target, *target_revision, *claim)),
             _ => None,
         })

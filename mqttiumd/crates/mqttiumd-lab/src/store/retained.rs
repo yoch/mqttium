@@ -19,30 +19,32 @@ pub(super) fn bounds(recipe: &Recipe) -> Result<Option<IdentityBounds>, ReadErro
             payload: Some(payload),
         })
     };
-    Ok(match recipe {
-        Recipe::AdmitPublication(a) => one(a.publication, a.payload.id),
-        Recipe::RetainedPublication(a) => one(a.admission.publication, a.admission.payload.id),
-        Recipe::RetainedQos0(a) => one(a.publication, a.payload.id),
-        Recipe::ReplaySubscriptions(a) => {
-            let first = a.first_publication;
-            Some(IdentityBounds {
-                first,
-                last: PublicationId::new(
-                    first.incarnation(),
-                    first.epoch(),
-                    first.owner(),
-                    PublicationSeq::new(
-                        first
-                            .sequence()
-                            .get()
-                            .checked_add(MAX_REPLAYS as u64 - 1)
-                            .ok_or(ReadError::InvalidData)?,
-                    ),
+    if let Some(a) = recipe.admission() {
+        return Ok(one(a.publication, a.payload.id));
+    }
+    if let Some(a) = recipe.retained_qos0() {
+        return Ok(one(a.publication, a.payload.id));
+    }
+    Ok(if let Some(a) = recipe.replay_subscriptions() {
+        let first = a.first_publication;
+        Some(IdentityBounds {
+            first,
+            last: PublicationId::new(
+                first.incarnation(),
+                first.epoch(),
+                first.owner(),
+                PublicationSeq::new(
+                    first
+                        .sequence()
+                        .get()
+                        .checked_add(MAX_REPLAYS as u64 - 1)
+                        .ok_or(ReadError::InvalidData)?,
                 ),
-                payload: None,
-            })
-        }
-        _ => None,
+            ),
+            payload: None,
+        })
+    } else {
+        None
     })
 }
 pub(super) fn receipt_bounds(
@@ -53,7 +55,9 @@ pub(super) fn receipt_bounds(
     // A subscription burns its entire reserved causal range even when the
     // business decision is refused. Its receipt is the witness until the
     // compact publication frontier covers the range before physical deletion.
-    if matches!(record.decision, Decision::Rejected(_)) && record.recipe.get(6) != Some(&12) {
+    if matches!(record.decision, Decision::Rejected(_))
+        && !matches!(record.recipe.get(6), Some(12 | 14))
+    {
         return Ok(None);
     }
     let recipe = Recipe::decode_canonical(
@@ -75,30 +79,20 @@ pub(super) fn receipt_bounds(
         return Ok(None);
     };
     let valid = match record.decision {
-        Decision::Rejected(_) => matches!(recipe, Recipe::ReplaySubscriptions(_)),
-        Decision::Committed(facts) => match (&recipe, facts) {
-            (
-                Recipe::AdmitPublication(a),
-                CommitFacts::PublicationAdmitted {
-                    publication,
-                    exchange,
-                },
-            ) => a.publication == publication && a.source.exchange == exchange,
-            (
-                Recipe::RetainedPublication(a),
-                CommitFacts::PublicationAdmitted {
-                    publication,
-                    exchange,
-                },
-            ) => a.admission.publication == publication && a.admission.source.exchange == exchange,
-            (Recipe::RetainedQos0(a), CommitFacts::RetainedQos0Stored { publication }) => {
-                a.publication == publication
-            }
-            (Recipe::ReplaySubscriptions(a), CommitFacts::SubscriptionsChanged { session, .. }) => {
-                a.update.session == session
-            }
-            _ => false,
-        },
+        Decision::Rejected(_) => recipe.replay_subscriptions().is_some(),
+        Decision::Committed(CommitFacts::PublicationAdmitted {
+            publication,
+            exchange,
+        }) => recipe
+            .admission()
+            .is_some_and(|a| a.publication == publication && a.source.exchange == exchange),
+        Decision::Committed(CommitFacts::RetainedQos0Stored { publication }) => recipe
+            .retained_qos0()
+            .is_some_and(|a| a.publication == publication),
+        Decision::Committed(CommitFacts::SubscriptionsChanged { session, .. }) => recipe
+            .replay_subscriptions()
+            .is_some_and(|a| a.update.session == session),
+        _ => false,
     };
     let scope = |p: PublicationId| {
         (p.incarnation(), p.epoch(), p.owner())
@@ -200,6 +194,9 @@ pub(super) fn validate(state: &DurableState, budget: ReadBudget) -> Result<(), R
             .publications
             .get(&record.publication)
             .ok_or(ReadError::InvalidData)?;
+        if let Some(expiry) = publication.expiry {
+            expiry.deadline().map_err(|_| ReadError::InvalidData)?;
+        }
         let payload = state
             .payloads
             .get(&publication.payload)
@@ -323,8 +320,12 @@ pub(super) fn install(
 pub(super) fn subscribe(
     state: &mut DurableState,
     command: &ReplaySubscriptions,
+    observed: Option<MessageTime>,
 ) -> Guard<CommitFacts> {
     let update = &command.update;
+    if let Some(now) = observed {
+        check_message_observation(state, now).map_err(|_| RejectReason::PreconditionFailed)?;
+    }
     state.active_session(update.session, update.session_revision)?;
     validate(state, ReadBudget::SNAPSHOT).map_err(|_| RejectReason::PreconditionFailed)?;
     let client = state
@@ -358,7 +359,24 @@ pub(super) fn subscribe(
                 if mqttiumd_contract::topic::matches(change.topic.as_slice(), topic)
                     && !(change.options.no_local() && value.producer_client_id == client)
                 {
-                    plans.push((value.publication, granted));
+                    let expiry = state
+                        .publications
+                        .get(&value.publication)
+                        .ok_or(RejectReason::PreconditionFailed)?
+                        .expiry;
+                    let eligible = match (expiry, observed) {
+                        (None, _) => true,
+                        (Some(expiry), Some(now)) => matches!(
+                            expiry
+                                .state(now)
+                                .map_err(|_| RejectReason::PreconditionFailed)?,
+                            ExpiryState::Fresh { .. }
+                        ),
+                        (Some(_), None) => false,
+                    };
+                    if eligible {
+                        plans.push((value.publication, granted));
+                    }
                 }
             }
         }

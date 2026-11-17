@@ -20,13 +20,17 @@ pub(super) fn bounds(recipe: &Recipe) -> Result<Option<IdentityBounds>, Fault> {
             payload: Some(payload),
         })
     };
-    Ok(match recipe {
-        Recipe::AdmitPublication(a) => one(a.publication, a.payload.id),
-        Recipe::RetainedPublication(a) => one(a.admission.publication, a.admission.payload.id),
-        Recipe::RetainedQos0(a) => one(a.publication, a.payload.id),
-        Recipe::ReplaySubscriptions(a) => {
-            let first = a.first_publication;
-            let last = PublicationId::new(
+    if let Some(a) = recipe.admission() {
+        return Ok(one(a.publication, a.payload.id));
+    }
+    if let Some(a) = recipe.retained_qos0() {
+        return Ok(one(a.publication, a.payload.id));
+    }
+    Ok(if let Some(a) = recipe.replay_subscriptions() {
+        let first = a.first_publication;
+        Some(IdentityBounds {
+            first,
+            last: PublicationId::new(
                 first.incarnation(),
                 first.epoch(),
                 first.owner(),
@@ -37,14 +41,11 @@ pub(super) fn bounds(recipe: &Recipe) -> Result<Option<IdentityBounds>, Fault> {
                         .checked_add(MAX_REPLAYS as u64 - 1)
                         .ok_or(Fault::Corrupt)?,
                 ),
-            );
-            Some(IdentityBounds {
-                first,
-                last,
-                payload: None,
-            })
-        }
-        _ => None,
+            ),
+            payload: None,
+        })
+    } else {
+        None
     })
 }
 
@@ -56,7 +57,9 @@ pub(super) fn receipt_bounds(
     // A subscription burns its entire reserved causal range even when the
     // business decision is refused. Its receipt is the witness until the
     // compact publication frontier covers the range before physical deletion.
-    if matches!(record.decision, Decision::Rejected(_)) && record.recipe.get(6) != Some(&12) {
+    if matches!(record.decision, Decision::Rejected(_))
+        && !matches!(record.recipe.get(6), Some(12 | 14))
+    {
         return Ok(None);
     }
     let recipe = Recipe::decode_canonical(
@@ -80,30 +83,20 @@ pub(super) fn receipt_bounds(
         return Ok(None);
     };
     let valid = match record.decision {
-        Decision::Rejected(_) => matches!(recipe, Recipe::ReplaySubscriptions(_)),
-        Decision::Committed(facts) => match (&recipe, facts) {
-            (
-                Recipe::AdmitPublication(a),
-                CommitFacts::PublicationAdmitted {
-                    publication,
-                    exchange,
-                },
-            ) => a.publication == publication && a.source.exchange == exchange,
-            (
-                Recipe::RetainedPublication(a),
-                CommitFacts::PublicationAdmitted {
-                    publication,
-                    exchange,
-                },
-            ) => a.admission.publication == publication && a.admission.source.exchange == exchange,
-            (Recipe::RetainedQos0(a), CommitFacts::RetainedQos0Stored { publication }) => {
-                a.publication == publication
-            }
-            (Recipe::ReplaySubscriptions(a), CommitFacts::SubscriptionsChanged { session, .. }) => {
-                a.update.session == session
-            }
-            _ => false,
-        },
+        Decision::Rejected(_) => recipe.replay_subscriptions().is_some(),
+        Decision::Committed(CommitFacts::PublicationAdmitted {
+            publication,
+            exchange,
+        }) => recipe
+            .admission()
+            .is_some_and(|a| a.publication == publication && a.source.exchange == exchange),
+        Decision::Committed(CommitFacts::RetainedQos0Stored { publication }) => recipe
+            .retained_qos0()
+            .is_some_and(|a| a.publication == publication),
+        Decision::Committed(CommitFacts::SubscriptionsChanged { session, .. }) => recipe
+            .replay_subscriptions()
+            .is_some_and(|a| a.update.session == session),
+        _ => false,
     };
     let scope = |p: PublicationId| {
         (p.incarnation(), p.epoch(), p.owner())
@@ -276,7 +269,7 @@ pub(super) fn snapshot(
 }
 
 /// Drop one retained-owned reference, never an obligation or another owner's ref.
-fn release(conn: &Connection, meta: &mut Meta, publication: PublicationId) -> Guard<()> {
+pub(super) fn release(conn: &Connection, meta: &mut Meta, publication: PublicationId) -> Guard<()> {
     let row=conn.prepare_cached("SELECT p.payload,y.refs,y.length FROM publications p JOIN payloads y ON y.id=p.payload WHERE p.id=?1")?.query_row([publication.to_be_bytes().as_slice()],|row|Ok((reader::copy_blob(row,0,32)?,reader::copy_blob(row,1,8)?,reader::copy_blob(row,2,8)?)))?;
     let refs = blob_u64(&row.1)?.checked_sub(1).ok_or(Abort::Fault)?;
     meta.accounts.references = meta
@@ -356,8 +349,12 @@ pub(super) fn subscribe(
     conn: &Connection,
     meta: &mut Meta,
     command: &ReplaySubscriptions,
+    observed: Option<MessageTime>,
 ) -> Guard<CommitFacts> {
     let update = &command.update;
+    if let Some(now) = observed {
+        message_expiry::check_observation(conn, now)?;
+    }
     active_session(conn, update.session, update.session_revision)?;
     let first = command.first_publication;
     let last = PublicationId::new(
@@ -409,7 +406,20 @@ pub(super) fn subscribe(
                 if mqttiumd_contract::topic::matches(name, topic)
                     && !(change.options.no_local() && value.producer_client_id == client)
                 {
-                    plans.push((value.publication, granted));
+                    let expiry = message_expiry::publication(conn, value.publication)?;
+                    let eligible = match (expiry, observed) {
+                        (None, _) => true,
+                        (Some(expiry), Some(now)) => matches!(
+                            expiry
+                                .state(now)
+                                .map_err(|_| Abort::Read(ReadError::InvalidData))?,
+                            ExpiryState::Fresh { .. }
+                        ),
+                        (Some(_), None) => false,
+                    };
+                    if eligible {
+                        plans.push((value.publication, granted));
+                    }
                 }
             }
         }
@@ -447,7 +457,7 @@ pub(super) fn subscribe(
                 ))
             })?;
         let qos = code_qos(row.1)?.min(granted).min(Qos::AtLeastOnce);
-        conn.prepare_cached("INSERT INTO publications(id,operation,source,qos,retain,payload,retained_version,topic) VALUES(?1,?2,?3,?4,1,?5,?6,?7)")?.execute(params![publication.to_be_bytes().as_slice(),update.operation.to_be_bytes().as_slice(),row.0,row.1,row.2,version.to_be_bytes().as_slice(),row.3])?;
+        conn.prepare_cached("INSERT INTO publications(id,operation,source,qos,retain,payload,retained_version,expiry_domain,expiry_tick,expiry_interval,topic) SELECT ?1,?2,?3,?4,1,?5,?6,expiry_domain,expiry_tick,expiry_interval,?7 FROM publications WHERE id=?6")?.execute(params![publication.to_be_bytes().as_slice(),update.operation.to_be_bytes().as_slice(),row.0,row.1,row.2,version.to_be_bytes().as_slice(),row.3])?;
         conn.prepare_cached("INSERT INTO obligations(publication,idx,target,target_revision,qos,cause,phase,retain) VALUES(?1,0,?2,?3,?4,2,1,1)")?.execute(params![publication.to_be_bytes().as_slice(),update.session.to_be_bytes().as_slice(),update.session_revision.to_be_bytes().as_slice(),qos_code(qos)])?;
         let refs: Vec<u8> = conn
             .prepare_cached("SELECT refs FROM payloads WHERE id=?1")?
