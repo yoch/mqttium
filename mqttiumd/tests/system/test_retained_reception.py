@@ -34,15 +34,31 @@ class IndependentRetainedFrames(unittest.TestCase):
     def test_actual_wrapped_recipe_layout_correlates_inner_operation(self):
         event = {'operation': {'incarnation': '1', 'epoch': '2', 'owner': '3', 'sequence': '4'}}
         identity = operation_hex(event['operation'])
+        number = lambda value, width=8: value.to_bytes(width, 'big')
+        scoped = lambda sequence: bytes.fromhex(identity)[:24] + number(sequence)
         for tag, inner in ((10, 1), (12, 7), (12, 9)):
             old = b'MQDR\x00\x01' + bytes([inner]) + bytes.fromhex(identity)
-            raw = b'MQDR\x00\x01' + bytes([tag]) + len(old).to_bytes(4, 'big') + old
+            if tag == 10:
+                # Complete kind1: request/publication, source exchange, route,
+                # QoS2+RETAIN, topic, payload, costs and zero live targets.
+                old += (scoped(5) + scoped(6) + number(1) * 2 + number(7, 2)
+                        + number(1) * 2 + b'\x02\x01\x00\x01t'
+                        + scoped(7) + number(1) * 5 + number(0, 2))
+                suffix = number(0, 2)  # Empty live-target RETAIN bitmap.
+            else:
+                # Complete kind7/9 route update; kind9 has nondefault options.
+                old += (number(1) * 3 + b'\x01\x02'
+                        + (b'\x1c' if inner == 9 else b'') + b'\x00\x01t')
+                suffix = scoped(8)  # Reserved replay range, in the same scope.
+            raw = b'MQDR\x00\x01' + bytes([tag]) + number(len(old), 4) + old + suffix
             state = {'tables': {'operations': [{'id': identity, 'recipe': raw.hex()}]}}
             with self.subTest(tag=tag, inner=inner):
                 self.assertEqual(canonical_receipt(state, event, tag)['tag'], tag)
-                altered = raw[:18] + b'\xff' * 32
+                altered = raw[:18] + b'\xff' * 32 + raw[50:]
                 state['tables']['operations'][0]['recipe'] = altered.hex()
-                with self.assertRaisesRegex(ReceiptFailure, 'retained_result_canonical_identity_changed'):
+                code = ('retained_result_canonical_identity_changed' if tag == 10
+                        else 'subscription_options_missing_from_canonical_recipe')
+                with self.assertRaisesRegex(ReceiptFailure, code):
                     canonical_receipt(state, event, tag)
 
 
