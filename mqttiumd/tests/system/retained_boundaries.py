@@ -103,6 +103,17 @@ def crash(binary, case, kind, phase):
         if kind == 'replay':
             require(recovered['tables']['obligations'] == held['tables']['obligations'],
                     'retained_replay_recreated_after_crash')
+        newer = None
+        if kind == 'replay' and committed:
+            # Change the current retained value before reconnecting the target.
+            # The committed replay keeps its original frozen source version;
+            # the new admission independently owes one non-RAP live delivery.
+            source = RetainedWire(restart.address, restart.observations, 'source-after')
+            source.session_connect('retained-cut-source', expected_present=True)
+            newer = b'new-current-after-frozen-replay'
+            source.publish(2, topic, newer, qos=2)
+            frozen = snapshot(restart, 'new-current-old-replay-still-owed')
+            require(frozen['counts']['obligations'] == 2, 'retained_frozen_replay_overwritten_by_new_current')
         target = RetainedWire(restart.address, restart.observations, 'target-after')
         target.session_connect('retained-cut-target' if kind == 'replay' else 'retained-after-cut',
                                expected_present=kind == 'replay')
@@ -110,15 +121,19 @@ def crash(binary, case, kind, phase):
             target.subscribe_options(1, (Subscription('cut/#', 1),))
         expected_delivery = kind == 'replay' or committed
         delivery = target.receive(payload, 1 if kind != 'qos0' else 0, True).observation() if expected_delivery else None
+        newer_delivery = target.receive(newer, 1, False).observation() if newer is not None else None
         target.no_publication(.08, code='retained_replay_resurrected_or_duplicated')
         final = wait_state(restart, lambda state: state['counts']['obligations'] == state['counts']['outbound'] == 0,
                            'retained_crash_delivery_not_finished')
         write_json(case / 'final.sql.json', final)
-        target.close(); target = None; restart.stop(); writer_available(restart.db)
+        target.close(); target = None
+        if source is not None: source.close(); source = None
+        restart.stop(); writer_available(restart.db)
         return {'criterion': f'crash-{kind}-{phase}', 'status': 'PASS', 'barrier': hit,
                 'frame_sent_hex': sent.hex(), 'kill_status': status, 'killed_pid': broker.process.pid,
                 'same_sqlite_inode': inode, 'same_database': str(broker.db), 'expected_committed': committed,
                 'retained_current_after_restart': inventory(recovered), 'delivery': delivery,
+                'new_current_kept_independent': newer_delivery,
                 'restart_status': restart.process.returncode}
     finally:
         if source is not None: source.close()
@@ -133,7 +148,8 @@ def lost_result(binary, case, kind):
     try:
         broker.ready()
         source = RetainedWire(broker.address, broker.observations, 'source')
-        source.session_connect('retained-lost-source', expected_present=False)
+        source.session_connect('retained-lost-source', expiry=0 if kind == 'qos0' else 0xffffffff,
+                               expected_present=False)
         target = RetainedWire(broker.address, broker.observations, 'target')
         target.session_connect('retained-lost-target', expected_present=False)
         if kind == 'replay':
@@ -154,9 +170,23 @@ def lost_result(binary, case, kind):
         committed = snapshot(broker, 'committed-result-lost')
         canonical = canonical_receipt(committed, dropped, {'qos1': 10, 'qos0': 11, 'replay': 12}[kind])
         require(len(inventory(committed)) == 1, 'retained_lost_result_not_committed')
+        source_closed = None
+        if kind == 'qos0':
+            from pubsub_probe import session_key
+            source_id = session_key(committed, 'retained-lost-source')
+            source.session_disconnect(); source = None
+            closed_state = wait_state(broker, lambda state: all(row['id'] != source_id
+                for row in state['tables']['sessions']), 'retained_unknown_qos0_source_not_terminated')
+            require(inventory(closed_state) == inventory(committed), 'retained_unknown_source_close_erased_current')
+            source_closed = broker.wait_event('session_changed', after=int(dropped['seq']))
+            require(source_closed['details'].get('action') == 'Closed'
+                    and source_closed['details'].get('session') == str(int(source_id, 16)),
+                    'retained_unknown_source_close_not_correlated')
         resolved = broker.wait_event('store_resolved', after=int(dropped['seq']), timeout=15)
         require(resolved.get('operation') == dropped['operation'] and resolved['details'].get('outcome') == 'committed',
                 'retained_resolution_changed_operation')
+        if source_closed is not None:
+            require(int(source_closed['seq']) < int(resolved['seq']), 'retained_qos0_source_close_did_not_precede_resolution')
         if kind == 'qos1': require(source.wait(0x40, 2).ack() == (2, 0), 'retained_resolved_puback_missing')
         if kind == 'replay':
             from pubsub_probe import decode_filter_ack
@@ -166,9 +196,11 @@ def lost_result(binary, case, kind):
         final = wait_state(broker, lambda state: state['counts']['obligations'] == state['counts']['outbound'] == 0,
                            'retained_lost_result_not_finished')
         write_json(case / 'final.sql.json', final)
-        source.close(); source = None; target.close(); target = None; broker.stop(); writer_available(broker.db)
+        if source is not None: source.close(); source = None
+        target.close(); target = None; broker.stop(); writer_available(broker.db)
         return {'criterion': f'lost-{kind}', 'status': 'PASS', 'drop': dropped, 'resolve': resolved,
                 'same_operation': True, 'canonical': canonical, 'delivery': delivery,
+                'source_closed_during_unknown': source_closed,
                 'process_status': broker.process.returncode}
     finally:
         if source is not None: source.close()
