@@ -53,6 +53,35 @@ class Broker:
 
 
 class ReceiptControlWaitTests(unittest.TestCase):
+    def test_result_replay_probe_leaves_room_for_both_phases_and_open(self):
+        from receipt_reception import close_result_replay
+        class Control:
+            def __init__(self):
+                self.subscriptions = []
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def connect(self, *args, **kwargs):
+                pass
+            def subscribe(self, identifier, filters):
+                self.subscriptions.append((identifier, filters))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wire = Control()
+            events = iter([{'kind': 'receipt_collection_result_dropped', 'seq': '1'},
+                           {'kind': 'receipt_collection_result_duplicated', 'seq': '2'}])
+            broker = SimpleNamespace(control=root, address=('127.0.0.1', 1), observations=None, ready=lambda: {},
+                                     wait_event=lambda *args, **kwargs: next(events),
+                                     stop=lambda: 0, cleanup=lambda: None, db=root/'unused.sqlite')
+            with patch('receipt_reception.Broker', return_value=broker),                     patch('receipt_reception.PubsubWire', return_value=wire),                     patch('receipt_reception.control_progress'),                     patch('receipt_reception.storage_sample', return_value={'counts': {'operations': 0}}),                     patch('receipt_reception.writer_available'), patch('receipt_reception.write_json'):
+                result = close_result_replay(root/'broker', root)
+            per_phase = result['parameters']['business_budget_per_phase']
+            self.assertEqual(len(wire.subscriptions), 2 * per_phase)
+            self.assertLess(1 + len(wire.subscriptions), BUSINESS_WINDOW,
+                            'receipt_result_probe_filled_business_window')
+            self.assertEqual(len(result['passes']), 2)
+
     def test_current_business_window_matches_its_independent_profile_and_pressure(self):
         profile_path = Path(__file__).resolve().parents[2] / 'contracts/v1/product-profile.json'
         window = json.loads(profile_path.read_text())['receipt_data_window']
