@@ -111,6 +111,15 @@ class MessageExpiryMutationDetectionTests(unittest.TestCase):
                 self.assertNotIn('assert_eq!', control.after)
                 self.assertTrue(control.expected_reason)
 
+    def test_catalog_has_one_current_production_site_per_control(self):
+        root = Path(__file__).resolve().parents[3]
+        for control in CONTROLS:
+            with self.subTest(control=control.name):
+                source = (root / control.source).read_text()
+                self.assertEqual(source.count(control.before), 1,
+                                 'catalog drift must fail before compiled reception')
+                self.assertEqual(source.count(control.after), 0)
+
 
 if __name__ == '__main__':
     unittest.main()
