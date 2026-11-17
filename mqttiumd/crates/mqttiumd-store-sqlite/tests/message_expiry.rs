@@ -294,3 +294,8 @@ fn maintenance_retry_skips_admissions_after_the_frozen_observation() {
 fn started_marker_requires_message_expiry() {
     expiry::started_marker_requires_message_expiry(&sqlite);
 }
+
+#[test]
+fn delayed_started_result_remains_admissible_after_expiry() {
+    expiry::delayed_started_result_remains_admissible_after_expiry(&sqlite);
+}

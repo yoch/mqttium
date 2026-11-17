@@ -898,6 +898,63 @@ pub mod expiry {
         assert!(w.store.snapshot().unwrap().outbound.is_empty());
     }
 
+    pub fn delayed_started_result_remains_admissible_after_expiry<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        let mut w = World::with_limits(make, limits());
+        clock(&mut w.store, at(0));
+        let target = w.b;
+        let expiry = lifetime(1);
+        let publication = expiring(
+            admitted(
+                &w,
+                1,
+                b"expiry/delayed-start",
+                b"sent",
+                Qos::AtLeastOnce,
+                &[target],
+            ),
+            expiry,
+        );
+        commit(&mut w.store, &publication);
+        let delivery = DeliveryId {
+            publication: publication_id(w.epoch, 1),
+            index: 0,
+        };
+        let mut finish = claim(&mut w, 2, delivery, target, 1);
+        clock(&mut w.store, at(2));
+        commit(
+            &mut w.store,
+            &frozen(
+                Recipe::MarkDeliveryStarted(MarkDeliveryStarted {
+                    operation: operation_id(w.epoch, 3),
+                    delivery,
+                    target,
+                    target_revision: finish.target_revision,
+                    packet_id: finish.packet_id,
+                    claim: finish.claim,
+                }),
+                None,
+            ),
+        );
+        let sweep = w.store.expire_messages(at(2), None, 4).unwrap();
+        assert!(
+            sweep.removed.is_empty(),
+            "delayed_positive_write_lost_claim"
+        );
+        assert_eq!(sweep.quarantined, 0);
+        let state = w.store.snapshot().unwrap();
+        assert!(state.outbound[&delivery].started);
+        assert_eq!(
+            state.publications[&delivery.publication].expiry,
+            Some(expiry)
+        );
+        assert_eq!(state.accounts.references.get(), 1);
+        finish.operation = operation_id(w.epoch, 4);
+        commit(&mut w.store, &frozen(Recipe::FinishDelivery(finish), None));
+        assert!(w.store.snapshot().unwrap().outbound.is_empty());
+    }
+
     pub fn shared_refs_replay_and_source_end<S: DurableStore>(
         make: &dyn Fn(StoreIncarnation, Limits) -> S,
     ) {
@@ -1681,6 +1738,7 @@ pub mod expiry {
 
     pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
         started_marker_requires_message_expiry(make);
+        delayed_started_result_remains_admissible_after_expiry(make);
         maintenance_retry_skips_admissions_after_the_frozen_observation(make);
         timed_replay_cannot_observe_before_the_message_origin(make);
         timed_commands_require_the_current_boot_authority(make);
@@ -1699,6 +1757,12 @@ pub mod expiry {
 
 #[cfg(test)]
 mod expiry_tests {
+    #[test]
+    fn delayed_started_result_remains_admissible_after_expiry() {
+        super::expiry::delayed_started_result_remains_admissible_after_expiry(
+            &super::MemoryStore::create,
+        );
+    }
     #[test]
     fn started_marker_requires_message_expiry() {
         super::expiry::started_marker_requires_message_expiry(&super::MemoryStore::create);
