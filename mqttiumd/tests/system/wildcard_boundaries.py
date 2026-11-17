@@ -73,19 +73,63 @@ def receipt_row(state: dict, event: dict) -> dict:
     rows = [row for row in state["tables"]["operations"] if row["id"] == identity]
     require(len(rows) == 1, "subscription_receipt_identity_not_unique")
     raw = bytes.fromhex(rows[0]["recipe"])
-    require(len(raw) >= 39 and raw[:6] == b"MQDR\x00\x01",
-            "subscription_options_missing_from_canonical_recipe")
-    inner = raw
-    if raw[6] == 12:
-        size = int.from_bytes(raw[7:11], "big")
-        require(39 <= size <= 65536 and len(raw) == 11 + size + 32,
-                "subscription_replay_envelope_invalid")
-        inner = raw[11:11 + size]
-    require(inner[:6] == b"MQDR\x00\x01" and inner[6] == 9 and inner[7:39].hex() == identity,
-            "subscription_options_missing_from_canonical_recipe")
+    kinds = subscription_recipe(raw, identity, require_options=True)
     return {"row": rows[0], "canonical_sha256": hashlib.sha256(raw).hexdigest(),
-            "canonical_bytes": len(raw), "canonical_kind": raw[6],
-            "inner_kind": inner[6], "operation_hex": identity}
+            "canonical_bytes": len(raw), **kinds, "operation_hex": identity}
+
+
+def subscription_recipe(raw: bytes, identity: str, *, require_options: bool = False) -> dict:
+    """Read only base7/9, legacy12→7/9, or timed14→12→7/9.
+
+    Tags are checked before each bounded unwrap. The temporal suffix is one
+    domain32/tick8 observation, not another operation or a renewed identity.
+    """
+    magic = b"MQDR\x00\x01"
+    require(len(raw) >= 7 and raw[:6] == magic,
+            "subscription_options_missing_from_canonical_recipe")
+    outer = raw[6]
+    inner = raw
+    if outer == 14:
+        size = int.from_bytes(raw[7:11], "big")
+        require(39 <= size <= 65536 and len(raw) == 11 + size + 40,
+                "subscription_time_envelope_invalid")
+        inner = raw[11:11 + size]
+        require(inner[:6] == magic and inner[6] == 12,
+                "subscription_time_child_invalid")
+    semantic = inner[6]
+    if semantic == 12:
+        size = int.from_bytes(inner[7:11], "big")
+        require(39 <= size <= 65536 and len(inner) == 11 + size + 32,
+                "subscription_replay_envelope_invalid")
+        first = inner[-32:]
+        sequence = int.from_bytes(first[24:], "big")
+        require(first[:24].hex() == identity[:48] and 1 <= sequence <= 2**64 - 256,
+                "subscription_replay_identity_range_invalid")
+        inner = inner[11:11 + size]
+    else:
+        require(outer == 9, "subscription_canonical_kind_invalid")
+    require(len(inner) >= 64 and len(inner) <= 65536 and inner[:6] == magic
+            and inner[6] in ((9,) if require_options else (7, 9))
+            and inner[7:39].hex() == identity,
+            "subscription_options_missing_from_canonical_recipe")
+    count, at, nondefault = inner[63], 64, False
+    require(1 <= count <= 8, "subscription_canonical_filter_count_invalid")
+    for _ in range(count):
+        width = 4 if inner[6] == 9 else 3
+        require(at + width <= len(inner), "subscription_canonical_filter_truncated")
+        granted = inner[at]
+        options = inner[at + 1] if inner[6] == 9 else 0
+        length_at = at + width - 2
+        length = int.from_bytes(inner[length_at:length_at + 2], "big")
+        require(granted in (0, 1, 2) and not options & 0xC3 and (options >> 4) & 3 != 3
+                and (granted != 0 or options == 0) and 1 <= length <= 1024,
+                "subscription_canonical_filter_invalid")
+        at += width + length
+        require(at <= len(inner), "subscription_canonical_filter_truncated")
+        nondefault |= options != 0
+    require(at == len(inner) and (inner[6] != 9 or nondefault),
+            "subscription_canonical_trailing_or_alias")
+    return {"canonical_kind": outer, "semantic_kind": semantic, "inner_kind": inner[6]}
 
 
 def expect_quiet_update(wire: PubsubWire) -> None:

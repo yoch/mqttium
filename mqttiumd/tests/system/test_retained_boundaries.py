@@ -58,6 +58,29 @@ class CanonicalRetainedReceiptTests(unittest.TestCase):
             state["tables"]["operations"][0]["recipe"] = (raw[:17] + bytes([tag]) + raw[18:]).hex()
             with self.assertRaises(ReceiptFailure): canonical_receipt(state, event, 12)
 
+    def test_replay_range_cannot_name_a_foreign_scope_or_overflow(self):
+        for first in (scoped(0), number(9) + scoped(4)[8:], scoped(2**64 - 255)):
+            state, event = self.receipt(timed=True)
+            raw = bytes.fromhex(state["tables"]["operations"][0]["recipe"])
+            state["tables"]["operations"][0]["recipe"] = (raw[:-72] + first + raw[-40:]).hex()
+            with self.assertRaises(ReceiptFailure): canonical_receipt(state, event, 12)
+
+    def test_retained_admission_tags10_and11_keep_their_original_layout(self):
+        operation = dict(zip(("incarnation", "epoch", "owner", "sequence"), ("1", "2", "0", "3")))
+        target = number(2) + number(1) + number(0, 4) + b"\x01\x01"
+        payload = scoped(6) + number(1) + number(1) + number(2) + number(0) + number(1)
+        admission = (header(1) + scoped(3) + scoped(4) + scoped(5)
+            + number(1) * 2 + number(7, 2) + number(1) * 2 + b"\x01\x01\x00\x01t"
+            + payload + number(1, 2) + target)
+        retained = header(10) + number(len(admission), 4) + admission + number(1, 2)
+        qos0 = (header(11) + scoped(3) + scoped(4) + scoped(5) + number(1) * 5
+            + b"\x00\x01t" + payload + b"\x01" + target + number(1, 2))
+        for tag, raw in ((10, retained), (11, qos0)):
+            state = {"tables": {"operations": [{"id": scoped(3).hex(), "recipe": raw.hex()}]}}
+            result = canonical_receipt(state, {"operation": operation}, tag)
+            self.assertEqual((result["tag"], result["semantic_tag"]), (tag, tag))
+            self.assertEqual(result["canonical_bytes"], len(raw))
+
 
 if __name__ == "__main__":
     unittest.main()

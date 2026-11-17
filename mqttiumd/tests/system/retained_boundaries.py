@@ -14,6 +14,7 @@ from pubsub_probe import durable
 from retained_probe import RetainedWire, retained_publish_packet
 from tcp_probe import ReceiptFailure, operation_hex, require, write_json
 from tcp_reception import Broker, writer_available
+from wildcard_boundaries import subscription_recipe
 
 
 def inventory(state):
@@ -42,18 +43,25 @@ def canonical_receipt(state, event, tag):
     rows = [row for row in state['tables']['operations'] if row['id'] == identity]
     require(len(rows) == 1, 'retained_result_receipt_missing')
     raw = bytes.fromhex(rows[0]['recipe'])
-    require(raw[:6] == b'MQDR\x00\x01' and raw[6] == tag, 'retained_result_canonical_tag_changed')
-    if tag in (10, 12):
+    require(len(raw) >= 7 and raw[:6] == b'MQDR\x00\x01'
+            and raw[6] in ((12, 14) if tag == 12 else (tag,)),
+            'retained_result_canonical_tag_changed')
+    if tag == 12:
+        kinds = subscription_recipe(raw, identity)
+        require(kinds['semantic_kind'] == 12, 'retained_result_canonical_inner_invalid')
+        return {'operation': event['operation'], 'tag': raw[6], 'semantic_tag': tag,
+                'canonical_sha256': hashlib.sha256(raw).hexdigest(), 'canonical_bytes': len(raw)}
+    if tag == 10:
         size = int.from_bytes(raw[7:11], 'big')
-        require(39 <= size <= 65536 and 11 + size <= len(raw)
+        require(39 <= size <= 65536 and 11 + size + 2 == len(raw)
                 and raw[11:17] == b'MQDR\x00\x01'
-                and raw[17] in ((1,) if tag == 10 else (7, 9)), 'retained_result_canonical_inner_invalid')
+                and raw[17] == 1, 'retained_result_canonical_inner_invalid')
         offset = 18
     else:
         offset = 7
     require(len(raw) >= offset + 32 and raw[offset:offset + 32].hex() == identity,
             'retained_result_canonical_identity_changed')
-    return {'operation': event['operation'], 'tag': tag, 'canonical_sha256': hashlib.sha256(raw).hexdigest(),
+    return {'operation': event['operation'], 'tag': raw[6], 'semantic_tag': tag, 'canonical_sha256': hashlib.sha256(raw).hexdigest(),
             'canonical_bytes': len(raw)}
 
 
