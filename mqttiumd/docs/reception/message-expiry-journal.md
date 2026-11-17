@@ -176,3 +176,35 @@ their own witnesses and reconstruction records. Do not relabel66361b74 as that
 future published SHA's execution. Record final artifact links/hashes and checks
 in the PR description; no further product work is required absent a concrete
 failure. Next functional increment remains non-retained QoS1 Will.
+
+## First publication9df5979b and concrete CI follow-ups
+
+Protected publication9df5979b8d9a6814b928231eee4a8d34e5091e5f was confirmed by
+the connector and a complete fetched tree match (ade63ba1;2294Git leaves,
+1575daemon leaves). Its CI run44158367529 exposes two separate failures:
+
+- Retained capacity replay:32values ×32768bytes; temporary four-slot output Full
+  closes a healthy QoS1 connection. The policy already existed at795d2009.
+  RED01eb2d5e/GREENe67ea110 retains the same effect for retry, rolls back its
+  provisional ACK binding and preserves the existing250ms writer deadline,
+  disconnection path, control policy and quotas.
+- The new expiry job passes every business case and compiled control, then its
+  single-line syscall regex misses an actual successful split kill4730 from
+  caller4615. RED636e85d8/GREEN7e89db5d adds exact caller/syscall pairing; all35
+  expiry pilots and all11 actual failed-run kill witnesses pass the corrected
+  helper. The failed source-specific receipt remains untouched/incomplete.
+
+Clean production candidatee67ea11044e570858779f796ce828803a40b2102 passes the
+complete old retained and new expiry launchers, normal Rust1107, strict Clippy,
+fmt and validator. Its large healthy replay actually retries8PUBLISH queue-Full
+events and durably finishes all32 deliveries without a non-shutdown close.
+Owner worktree ee0ae904 also passes123normal/131hook product units, both Clippy
+variants, actual pressure, generations and shutdown. Source formats/digest and
+business limits are unchanged. See message-expiry-ci-reception.md for immutable
+failed ZIP identities and both new received archives/hashes.
+
+Republish the coherent follow-up with expected remote9df5979b protection, then
+receive that replacement SHA's own CI, source archives and downloaded normal
+package. The9df archived failures remain diagnostics; only the replacement's
+fresh artifacts can complete delivery. Reports0017 and its earlier candidate
+receipts remain historical. Next feature remains non-retained QoS1 Will.

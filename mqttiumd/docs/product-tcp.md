@@ -679,6 +679,10 @@ refuse or suspend the affected path, not silently expire it.
 The network writer checks every zero-progress write attempt, including queue
 and retry delay, and patches the remaining property before first-byte admission.
 Once positive bytes are written, the frame completes or its transport closes.
+Temporary socket-queue pressure retains a durable QoS1 PUBLISH effect for
+retry with its original identity and lifetime. The provisional ACK binding is
+removed until actual acceptance. The four output slots and250ms write deadline
+remain; disconnection and a blocked socket's deadline still close the transport.
 The exact pre-attempt reading is the local decision boundary; physical departure
 and arbitrary host scheduling are not timestamped or bounded by this preview.
 A separate durable Started marker allows the same QoS1 claim to complete after
