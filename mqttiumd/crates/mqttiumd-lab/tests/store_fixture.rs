@@ -189,13 +189,11 @@ fn the_fixture_reaches_the_store_as_commands_in_its_own_order() {
                 topic: b"p1/example".to_vec(),
                 session: session("b"),
                 qos: Qos::AtLeastOnce,
-                options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
             },
             AdminCommand::AddRoute {
                 topic: b"p1/example".to_vec(),
                 session: session("c"),
                 qos: Qos::AtLeastOnce,
-                options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
             },
         ]
     );
