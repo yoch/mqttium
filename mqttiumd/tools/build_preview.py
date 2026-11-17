@@ -59,7 +59,9 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
         raise ValueError("unresolved runtime dependency")
     (package / "RUNTIME.txt").write_text(runtime + "\n" + command("ldd", "--version"))
     metadata = json.loads(command("cargo", "metadata", "--locked", "--format-version", "1", cwd=root))
-    # Resolve the actual product closure, excluding laboratory/dev-only crates.
+    # Resolve the declared product dependency closure (including target-only
+    # packages), excluding laboratory/dev-only crates. License coverage can
+    # therefore exceed the packages actually compiled on this platform.
     product = next(p for p in metadata["packages"] if p["name"] == "mqttiumd")
     nodes = {n["id"]: n for n in metadata["resolve"]["nodes"]}
     included: set[str] = set()
@@ -75,6 +77,7 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
     licenses = package / "licenses"
     licenses.mkdir()
     shutil.copy2(repo / "LICENSE", licenses / "mqttium-Apache-2.0.txt")
+    shutil.copy2(repo / "NOTICE", licenses / "mqttium-NOTICE.txt")
     license_manifest = []
     for p in metadata["packages"]:
         if p["id"] not in included:
