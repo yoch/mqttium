@@ -19,7 +19,7 @@ from external_mqttium import client_identity
 from external_will import MqttiumWill, PahoWill, PacketTap
 from external_wildcard import Subscription
 from pubsub_probe import durable, session_key
-from tcp_probe import FrameDecoder, Observations, ReceiptFailure, packet, require, write_json
+from tcp_probe import FrameDecoder, Observations, ReceiptFailure, operation_hex, packet, require, write_json
 from tcp_reception import Broker, expect_rejection, writer_available
 from will_probe import WillWire, assert_will_frame, decode_will_connect, will_connect_packet
 
