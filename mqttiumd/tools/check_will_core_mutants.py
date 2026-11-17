@@ -137,7 +137,18 @@ def main() -> int:
         report["tree_status_before_cleanup"] = subprocess.check_output(
             ["git", "status", "--porcelain", "--untracked-files=normal"], cwd=worktree, text=True).strip()
         report["restored"] = not report["tree_status_before_cleanup"]
-        report["passed"] = report["passed"] and report["restored"]
+        # A shared Cargo cache can retain the last mutant executable even when
+        # the restored source files have older mtimes. Invalidate this private
+        # package, then rebuild and identify the exact restored baseline.
+        clean = ["cargo", "clean", "-p", "mqttiumd-core", "--target-dir", str(target)]
+        report["cache_invalidation"] = run(clean, worktree / "mqttiumd", output / "restore-clean.log", args.timeout)
+        restored_log = output / "restored-baseline-build.log"
+        report["restored_baseline_build"] = run(build, worktree / "mqttiumd", restored_log, args.timeout)
+        if report["restored_baseline_build"]["status"] == 0:
+            report["restored_baseline_binary_sha256"] = sha256(executable(restored_log))
+        report["cache_restored"] = (report["cache_invalidation"]["status"] == 0
+                                   and report.get("restored_baseline_binary_sha256") == report.get("baseline_binary_sha256"))
+        report["passed"] = report["passed"] and report["restored"] and report["cache_restored"]
         subprocess.run(["git", "worktree", "remove", "--force", str(worktree)],
                        cwd=root, check=True, stdout=subprocess.DEVNULL)
         (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
