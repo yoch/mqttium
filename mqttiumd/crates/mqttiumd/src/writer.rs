@@ -494,6 +494,7 @@ fn business_response(
                         && matches!(
                             kind,
                             "Claim"
+                                | "Subscriptions"
                                 | "Finish"
                                 | "Consume"
                                 | "SessionOpen"
