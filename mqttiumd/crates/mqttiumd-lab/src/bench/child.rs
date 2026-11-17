@@ -26,6 +26,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -137,18 +138,42 @@ pub(crate) struct KillAttempt {
 /// dropped, whether the child started or not.
 struct SocketDirectory(PathBuf);
 
+// This nonce names only a process-local temporary resource. It is independent
+// of the causal rank/collector counters, which coincide across factories.
+static NEXT_SOCKET_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+const SOCKET_DIRECTORY_ATTEMPTS: usize = 64;
+
+fn socket_directory_nonce(counter: &AtomicU64) -> Result<u64, Stop> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| stop("the child socket directory nonce is exhausted"))
+}
+
 impl SocketDirectory {
-    fn create(rank: u64, records: u64) -> Result<Self, Stop> {
-        let path = std::env::temp_dir().join(format!(
-            "mqttiumd-child-{}-{rank}-{records}",
-            std::process::id(),
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&path)
-            .map_err(|error| stop(format!("{}: {error}", path.display())))?;
+    fn create_at(path: PathBuf) -> std::io::Result<Self> {
+        // mkdir is exclusive: an existing path is never removed or adopted.
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(Self(path))
+    }
+
+    fn create(rank: u64, records: u64) -> Result<Self, Stop> {
+        for _ in 0..SOCKET_DIRECTORY_ATTEMPTS {
+            let nonce = socket_directory_nonce(&NEXT_SOCKET_DIRECTORY)?;
+            let path = std::env::temp_dir().join(format!(
+                "mqttiumd-child-{}-{rank}-{records}-{nonce}",
+                std::process::id(),
+            ));
+            match Self::create_at(path.clone()) {
+                Ok(directory) => return Ok(directory),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(stop(format!("{}: {error}", path.display()))),
+            }
+        }
+        Err(stop(
+            "the child socket directory creation attempt limit was reached",
+        ))
     }
 }
 
@@ -1586,9 +1611,10 @@ mod socket_directory_tests {
 
     #[test]
     fn factories_with_the_same_rank_and_record_count_keep_independent_socket_directories() {
-        // Two factories have the same parent process, rank and initial trace
-        // count even when their Config/campaigns and children are independent.
-        // These are precisely the naming inputs Child::spawn supplies.
+        // Two factories using the same Config/incarnation have the same
+        // parent process, rank and initial trace count. These are precisely
+        // the allocation inputs Child::spawn supplies; Config does not add
+        // any uniqueness to the socket-directory name.
         let first = SocketDirectory::create(0, 1).unwrap();
         let first_socket = first.0.join("broker-core.sock");
         let _first_listener = UnixListener::bind(&first_socket).unwrap();
@@ -1610,5 +1636,32 @@ mod socket_directory_tests {
             !second_path.exists(),
             "owned_socket_directory_was_not_cleaned"
         );
+    }
+    #[test]
+    fn an_existing_socket_directory_is_never_adopted_or_removed() {
+        let parent = SocketDirectory::create(0, 1).unwrap();
+        let existing = parent.0.join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let sentinel = existing.join("other-factory");
+        std::fs::write(&sentinel, b"owned by another allocation").unwrap();
+        let error = SocketDirectory::create_at(existing.clone())
+            .err()
+            .expect("exclusive mkdir refuses an existing directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"owned by another allocation"
+        );
+        assert!(existing.is_dir());
+    }
+
+    #[test]
+    fn a_socket_directory_nonce_exhausts_without_wrapping_or_changing_causal_counters() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(socket_directory_nonce(&counter).unwrap(), u64::MAX - 1);
+        assert!(socket_directory_nonce(&counter).is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert!(socket_directory_nonce(&counter).is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 }
