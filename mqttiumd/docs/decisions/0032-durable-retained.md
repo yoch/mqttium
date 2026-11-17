@@ -1,6 +1,6 @@
 # 0032 — Durable retained values and frozen replay
 
-Status: Proposed
+Status: **Proposed**
 
 ## Decision
 

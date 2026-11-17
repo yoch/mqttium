@@ -86,7 +86,7 @@ PYTHONPATH="$retained_root/tests/system${PYTHONPATH:+:$PYTHONPATH}" "$retained_p
 import json,sys
 from pathlib import Path
 from external_mqttium import client_identity
-from external_retained import mosquitto_identity
+from external_wildcard import mosquitto_identity
 Path(sys.argv[1]).write_text(json.dumps({'mqttium':client_identity(),'mosquitto':mosquitto_identity()},indent=2)+'\n')
 PY
 # The package builder is the sole normal release build. Copy its actual bytes
