@@ -73,10 +73,19 @@ def receipt_row(state: dict, event: dict) -> dict:
     rows = [row for row in state["tables"]["operations"] if row["id"] == identity]
     require(len(rows) == 1, "subscription_receipt_identity_not_unique")
     raw = bytes.fromhex(rows[0]["recipe"])
-    require(len(raw) >= 39 and raw[6] == 9 and raw[7:39].hex() == identity,
+    require(len(raw) >= 39 and raw[:6] == b"MQDR\x00\x01",
+            "subscription_options_missing_from_canonical_recipe")
+    inner = raw
+    if raw[6] == 12:
+        size = int.from_bytes(raw[7:11], "big")
+        require(39 <= size <= 65536 and len(raw) == 11 + size + 32,
+                "subscription_replay_envelope_invalid")
+        inner = raw[11:11 + size]
+    require(inner[:6] == b"MQDR\x00\x01" and inner[6] == 9 and inner[7:39].hex() == identity,
             "subscription_options_missing_from_canonical_recipe")
     return {"row": rows[0], "canonical_sha256": hashlib.sha256(raw).hexdigest(),
-            "canonical_bytes": len(raw), "canonical_kind": raw[6], "operation_hex": identity}
+            "canonical_bytes": len(raw), "canonical_kind": raw[6],
+            "inner_kind": inner[6], "operation_hex": identity}
 
 
 def expect_quiet_update(wire: PubsubWire) -> None:
