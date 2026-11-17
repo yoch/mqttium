@@ -1329,6 +1329,49 @@ pub mod expiry {
         );
     }
 
+    #[cfg(test)]
+    pub fn deterministic_maintenance_respects_the_publication_budget() {
+        let mut w = World::with_limits(&MemoryStore::create, limits());
+        clock(&mut w.store, at(0));
+        for n in 1..=5 {
+            let c = expiring(
+                admitted(
+                    &w,
+                    n,
+                    format!("expiry/{n}").as_bytes(),
+                    b"old",
+                    Qos::AtLeastOnce,
+                    &[w.b],
+                ),
+                lifetime(1),
+            );
+            commit(&mut w.store, &c);
+        }
+        let mut state = w.store.snapshot().unwrap();
+        state
+            .publications
+            .get_mut(&publication_id(w.epoch, 5))
+            .unwrap()
+            .expiry
+            .as_mut()
+            .unwrap()
+            .observed
+            .tick = u64::MAX;
+        w.store = MemoryStore::reopen(state);
+        let result = w
+            .store
+            .expire_messages(at(1), None, 4)
+            .expect("sweep_read_past_publication_budget");
+        assert_eq!(result.removed.len(), 4);
+        assert_eq!(result.retained_removed, 4);
+        assert!(result.more);
+        assert_eq!(result.next, Some(publication_id(w.epoch, 4)));
+        assert_eq!(
+            w.store.expire_messages(at(1), result.next, 4),
+            Err(ReadError::InvalidData)
+        );
+    }
+
     pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
         expired_retained_values_are_skipped_without_maintenance(make);
         offline_expiry_removes_pending_copies(make);
@@ -1346,5 +1389,9 @@ mod expiry_tests {
     #[test]
     fn deterministic_message_expiry_contract() {
         super::expiry::all(&super::MemoryStore::create);
+    }
+    #[test]
+    fn deterministic_maintenance_respects_the_publication_budget() {
+        super::expiry::deterministic_maintenance_respects_the_publication_budget();
     }
 }

@@ -266,30 +266,10 @@ pub(super) fn prepare_mutation(
     {
         return Err(RejectReason::CapacityExceeded(Resource::PayloadBytes));
     }
-    if let Some(old) = state.retained.remove(topic) {
-        let failed = RejectReason::PreconditionFailed;
-        let id = state
-            .publications
-            .get(&old.publication)
-            .ok_or(failed)?
-            .payload;
-        let payload = state.payloads.get_mut(&id).ok_or(failed)?;
-        payload.references = payload.references.checked_sub(1).ok_or(failed)?;
-        state.accounts.references = state
-            .accounts
-            .references
-            .checked_sub(References::new(1))
-            .ok_or(failed)?;
-        if payload.references == 0 {
-            state.accounts.payload_bytes = state
-                .accounts
-                .payload_bytes
-                .checked_sub(PayloadBytes::new(payload.bytes.len() as u64))
-                .ok_or(failed)?;
-            state.payloads.remove(&id);
-        }
-        state.discard_completed_publication(old.publication);
+    if let Some(old) = state.retained.get(topic) {
+        release(state, topic, old.publication)?;
     }
+
     Ok(())
 }
 pub(super) fn install(
@@ -433,4 +413,44 @@ pub(super) fn subscribe(
         }
     }
     Ok(facts)
+}
+
+pub(super) fn release(
+    state: &mut DurableState,
+    topic: &[u8],
+    publication: PublicationId,
+) -> Guard<()> {
+    let failed = RejectReason::PreconditionFailed;
+    if state
+        .retained
+        .get(topic)
+        .is_none_or(|row| row.publication != publication)
+    {
+        return Err(failed);
+    }
+    if let Some(old) = state.retained.remove(topic) {
+        let failed = RejectReason::PreconditionFailed;
+        let id = state
+            .publications
+            .get(&old.publication)
+            .ok_or(failed)?
+            .payload;
+        let payload = state.payloads.get_mut(&id).ok_or(failed)?;
+        payload.references = payload.references.checked_sub(1).ok_or(failed)?;
+        state.accounts.references = state
+            .accounts
+            .references
+            .checked_sub(References::new(1))
+            .ok_or(failed)?;
+        if payload.references == 0 {
+            state.accounts.payload_bytes = state
+                .accounts
+                .payload_bytes
+                .checked_sub(PayloadBytes::new(payload.bytes.len() as u64))
+                .ok_or(failed)?;
+            state.payloads.remove(&id);
+        }
+        state.discard_completed_publication(old.publication);
+    }
+    Ok(())
 }

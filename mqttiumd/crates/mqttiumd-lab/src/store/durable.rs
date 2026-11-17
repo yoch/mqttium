@@ -1738,6 +1738,81 @@ fn cancel_session(
     })
 }
 
+fn check_message_candidate(state: &DurableState, id: PublicationId) -> Result<(), ReadError> {
+    let publication = state.publications.get(&id).ok_or(ReadError::InvalidData)?;
+    if let Some(expiry) = publication.expiry {
+        if expiry.observed.domain == [0; 32] {
+            return Err(ReadError::InvalidData);
+        }
+        expiry.deadline().map_err(|_| ReadError::InvalidData)?;
+    }
+    if publication.topic.is_empty()
+        || publication.topic.len() > state.limits.max_topic_bytes
+        || publication.topic.contains(&0)
+        || publication.topic.iter().any(|b| matches!(b, b'+' | b'#'))
+        || std::str::from_utf8(&publication.topic).is_err()
+    {
+        return Err(ReadError::InvalidData);
+    }
+    let range = DeliveryId {
+        publication: id,
+        index: 0,
+    }..=DeliveryId {
+        publication: id,
+        index: u32::MAX,
+    };
+    let mut references = 0u64;
+    for (delivery, record) in state.obligations.range(range.clone()) {
+        references = references.checked_add(1).ok_or(ReadError::LimitExceeded)?;
+        if references > MESSAGE_EXPIRY_SWEEP_DELIVERIES as u64 {
+            return Err(ReadError::LimitExceeded);
+        }
+        check_delivery_metadata(state, *delivery, record)?;
+        delivery_claim(state, *delivery, record)?;
+    }
+    for (delivery, _) in state.outbound.range(range) {
+        if !state.obligations.contains_key(delivery) {
+            return Err(ReadError::InvalidData);
+        }
+    }
+    if state.retained.len() > mqttiumd_contract::retained::MAX_RETAINED_TOPICS {
+        return Err(ReadError::LimitExceeded);
+    }
+    let mut retained = false;
+    for (topic, value) in &state.retained {
+        if value.publication != id {
+            continue;
+        }
+        if retained
+            || !publication.retain
+            || publication.retained_version.is_some()
+            || *topic != publication.topic
+            || value.producer_client_id.is_empty()
+            || value.producer_client_id.len() > MAX_CLIENT_ID_BYTES
+            || value.producer_client_id.contains(&0)
+            || std::str::from_utf8(&value.producer_client_id).is_err()
+        {
+            return Err(ReadError::InvalidData);
+        }
+        retained = true;
+        references = references.checked_add(1).ok_or(ReadError::LimitExceeded)?;
+    }
+    if references > 0 {
+        let payload = state
+            .payloads
+            .get(&publication.payload)
+            .ok_or(ReadError::InvalidData)?;
+        if payload.references < references
+            || payload.references > state.limits.references.get()
+            || payload.bytes.len() > state.limits.max_payload_bytes
+            || retained && payload.bytes.is_empty()
+        {
+            return Err(ReadError::InvalidData);
+        }
+    }
+    Ok(())
+}
+
 fn check_message_observation(state: &DurableState, now: MessageTime) -> Result<(), ReadError> {
     let anchor = state.session_clock.ok_or(ReadError::InvalidData)?;
     if now.domain == [0; 32] || now.domain != anchor.reading.domain {
@@ -1757,7 +1832,6 @@ impl DurableStore for MemoryStore {
             return Err(ReadError::LimitExceeded);
         }
         check_message_observation(&self.committed, now)?;
-        check_snapshot(&self.committed, ReadBudget::SNAPSHOT)?;
         let mut result = MessageExpirySweep {
             removed: BoundedVec::with_capacity(MESSAGE_EXPIRY_SWEEP_DELIVERIES)
                 .map_err(|_| ReadError::AllocationFailed)?,
@@ -1765,7 +1839,7 @@ impl DurableStore for MemoryStore {
         };
         let mut candidates = Vec::new();
         candidates
-            .try_reserve_exact(limit as usize + 1)
+            .try_reserve_exact(limit as usize)
             .map_err(|_| ReadError::AllocationFailed)?;
         for (id, publication) in self
             .committed
@@ -1774,12 +1848,18 @@ impl DurableStore for MemoryStore {
                 after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
                 std::ops::Bound::Unbounded,
             ))
-            .take(limit as usize + 1)
+            .take(limit as usize)
         {
+            check_message_candidate(&self.committed, *id)?;
             candidates.push((*id, publication.expiry));
         }
-        result.more = candidates.len() > limit as usize;
-        candidates.truncate(limit as usize);
+        result.more = candidates.last().is_some_and(|(last, _)| {
+            self.committed
+                .publications
+                .range((std::ops::Bound::Excluded(*last), std::ops::Bound::Unbounded))
+                .next()
+                .is_some()
+        });
         result.next = result
             .more
             .then(|| candidates.last().map(|(id, _)| *id))
@@ -1795,12 +1875,31 @@ impl DurableStore for MemoryStore {
                     result.quarantined += 1;
                 }
                 ExpiryState::Expired => {
+                    let uncertain = staged
+                        .outbound
+                        .range(
+                            DeliveryId {
+                                publication: id,
+                                index: 0,
+                            }..=DeliveryId {
+                                publication: id,
+                                index: u32::MAX,
+                            },
+                        )
+                        .filter(|(_, record)| !record.started)
+                        .count();
+                    result.quarantined = result
+                        .quarantined
+                        .checked_add(
+                            u32::try_from(uncertain).map_err(|_| ReadError::LimitExceeded)?,
+                        )
+                        .ok_or(ReadError::LimitExceeded)?;
                     if let Some(topic) = staged
                         .retained
                         .iter()
                         .find_map(|(topic, r)| (r.publication == id).then(|| topic.clone()))
                     {
-                        retained_memory::prepare_mutation(&mut staged, &topic, 0)
+                        retained_memory::release(&mut staged, &topic, id)
                             .map_err(|_| ReadError::InvalidData)?;
                         result.retained_removed += 1;
                     }

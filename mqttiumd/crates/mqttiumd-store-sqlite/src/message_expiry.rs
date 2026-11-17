@@ -108,6 +108,143 @@ fn guard_failure(error: Abort<RejectReason>) -> Fault {
     }
 }
 
+/// Inspect one selected publication and its bounded responsibilities before any
+/// freshness filter. The payload remains borrowed by SQLite; only topic keys
+/// needed for a conditional retained deletion are copied.
+fn candidate(
+    conn: &Connection,
+    meta: &Meta,
+    id: PublicationId,
+) -> Result<(Option<MessageExpiry>, Option<Vec<u8>>), Fault> {
+    let mut statement = conn.prepare_cached("SELECT qos,retain,retained_version,topic,payload,expiry_domain,expiry_tick,expiry_interval FROM publications WHERE id=?1")?;
+    let mut rows = statement.query([id.to_be_bytes().as_slice()])?;
+    let row = rows.next()?.ok_or(Fault::Corrupt)?;
+    code_qos(row.get(0)?)?;
+    let retain = match row.get::<_, i64>(1)? {
+        0 => false,
+        1 => true,
+        _ => return Err(Fault::Corrupt),
+    };
+    let version = reader::optional_blob(row, 2, 32)?
+        .as_deref()
+        .map(PublicationId::from_be_slice)
+        .transpose()
+        .map_err(|_| Fault::Corrupt)?;
+    let topic = reader::borrow_blob(row, 3, meta.limits.max_topic_bytes)?;
+    if topic.is_empty()
+        || topic.contains(&0)
+        || topic.iter().any(|b| matches!(b, b'+' | b'#'))
+        || std::str::from_utf8(topic).is_err()
+    {
+        return Err(Fault::Corrupt);
+    }
+    let payload =
+        PayloadId::from_be_slice(reader::borrow_blob(row, 4, 32)?).map_err(|_| Fault::Corrupt)?;
+    let expiry = decode(row, 5)?;
+    let mut retained_topic = None;
+    let mut retained = conn.prepare_cached(
+        "SELECT topic,producer_client_id FROM retained WHERE publication=?1 LIMIT 2",
+    )?;
+    let mut entries = retained.query([id.to_be_bytes().as_slice()])?;
+    if let Some(row) = entries.next()? {
+        let name = reader::borrow_blob(row, 0, meta.limits.max_topic_bytes)?;
+        let client = reader::borrow_blob(row, 1, MAX_CLIENT_ID_BYTES)?;
+        if name != topic
+            || !retain
+            || version.is_some()
+            || client.is_empty()
+            || client.contains(&0)
+            || std::str::from_utf8(client).is_err()
+        {
+            return Err(Fault::Corrupt);
+        }
+        retained_topic = Some(reader::copy_blob(row, 0, meta.limits.max_topic_bytes)?);
+        if entries.next()?.is_some() {
+            return Err(Fault::Corrupt);
+        }
+    }
+    let orphan: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM outbound c LEFT JOIN obligations o ON o.publication=c.publication AND o.idx=c.idx WHERE c.publication=?1 AND o.publication IS NULL LIMIT 1)", [id.to_be_bytes().as_slice()], |row| row.get(0))?;
+    if orphan {
+        return Err(Fault::Corrupt);
+    }
+    let mut obligations = conn.prepare_cached("SELECT o.idx,o.target,o.target_revision,o.qos,o.cause,o.phase,o.retain,c.target,c.target_revision,c.packet_id,c.claim,c.started,s.revision,s.state FROM obligations o LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.publication=?1 ORDER BY o.idx LIMIT ?2")?;
+    let mut obligations = obligations.query(params![
+        id.to_be_bytes().as_slice(),
+        MESSAGE_EXPIRY_SWEEP_DELIVERIES as i64 + 1
+    ])?;
+    let mut count = 0usize;
+    while let Some(row) = obligations.next()? {
+        count += 1;
+        if count > MESSAGE_EXPIRY_SWEEP_DELIVERIES {
+            return Err(ReadError::LimitExceeded.into());
+        }
+        u32::try_from(row.get::<_, i64>(0)?).map_err(|_| Fault::Corrupt)?;
+        let target = SessionId::from_be_slice(reader::borrow_blob(row, 1, 8)?)
+            .map_err(|_| Fault::Corrupt)?;
+        let revision = blob_u64(reader::borrow_blob(row, 2, 8)?)?;
+        let qos = code_qos(row.get(3)?)?;
+        let cause = code_cause(row.get(4)?)?;
+        code_obligation_phase(row.get(5)?)?;
+        let kept_retain = match row.get::<_, i64>(6)? {
+            0 => false,
+            1 => true,
+            _ => return Err(Fault::Corrupt),
+        };
+        if (kept_retain && !retain)
+            || (cause == mqttiumd_contract::command::DeliveryCause::LiveExact && version.is_some())
+            || (cause == mqttiumd_contract::command::DeliveryCause::RetainedReplay
+                && (!kept_retain
+                    || !matches!(qos, Qos::AtMostOnce | Qos::AtLeastOnce)
+                    || version.is_none()
+                    || version == Some(id)))
+            || code_session_state(row.get(13)?)? != SessionState::Active
+            || blob_u64(reader::borrow_blob(row, 12, 8)?)? != revision
+        {
+            return Err(Fault::Corrupt);
+        }
+        if !matches!(row.get_ref(9)?, rusqlite::types::ValueRef::Null) {
+            let packet = u16::try_from(row.get::<_, i64>(9)?)
+                .ok()
+                .and_then(OutboundPacketId::new)
+                .ok_or(Fault::Corrupt)?;
+            let claim = OperationId::from_be_slice(reader::borrow_blob(row, 10, 32)?)
+                .map_err(|_| Fault::Corrupt)?;
+            if qos != Qos::AtLeastOnce
+                || claim.incarnation() != meta.ledger.incarnation()
+                || reader::borrow_blob(row, 7, 8)? != target.to_be_bytes()
+                || blob_u64(reader::borrow_blob(row, 8, 8)?)? != revision
+            {
+                return Err(Fault::Corrupt);
+            }
+            let _ = packet;
+            started(row, 11)?;
+        } else if !matches!(row.get_ref(7)?, rusqlite::types::ValueRef::Null)
+            || !matches!(row.get_ref(8)?, rusqlite::types::ValueRef::Null)
+            || !matches!(row.get_ref(10)?, rusqlite::types::ValueRef::Null)
+            || !matches!(row.get_ref(11)?, rusqlite::types::ValueRef::Null)
+        {
+            return Err(Fault::Corrupt);
+        }
+    }
+    if count != 0 || retained_topic.is_some() {
+        let mut statement =
+            conn.prepare_cached("SELECT refs,length,length(bytes) FROM payloads WHERE id=?1")?;
+        let mut rows = statement.query([payload.to_be_bytes().as_slice()])?;
+        let row = rows.next()?.ok_or(Fault::Corrupt)?;
+        let refs = blob_u64(reader::borrow_blob(row, 0, 8)?)?;
+        let length = blob_u64(reader::borrow_blob(row, 1, 8)?)?;
+        if refs < count as u64 + u64::from(retained_topic.is_some())
+            || refs > meta.limits.references.get()
+            || length > meta.limits.max_payload_bytes as u64
+            || u64::try_from(row.get::<_, i64>(2)?).map_err(|_| Fault::Corrupt)? != length
+            || (retained_topic.is_some() && length == 0)
+        {
+            return Err(Fault::Corrupt);
+        }
+    }
+    Ok((expiry, retained_topic))
+}
+
 pub(super) fn sweep(
     conn: &Connection,
     meta: &mut Meta,
@@ -119,42 +256,43 @@ pub(super) fn sweep(
         return Err(ReadError::LimitExceeded.into());
     }
     check_observation(conn, now)?;
-    validate(conn, None)?;
-    retained::snapshot(conn, meta, ReadBudget::SNAPSHOT)?;
     let mut candidates =
-        BoundedVec::with_capacity(limit as usize + 1).map_err(|_| ReadError::AllocationFailed)?;
+        BoundedVec::with_capacity(limit as usize).map_err(|_| ReadError::AllocationFailed)?;
     {
         let mut statement = conn.prepare_cached(
-            "SELECT id,expiry_domain,expiry_tick,expiry_interval FROM publications WHERE ?1 IS NULL OR id>?1 ORDER BY id LIMIT ?2",
+            "SELECT id FROM publications WHERE ?1 IS NULL OR id>?1 ORDER BY id LIMIT ?2",
         )?;
         let mut rows = statement.query(params![
             after.map(|id| id.to_be_bytes().to_vec()),
-            i64::from(limit) + 1
+            i64::from(limit)
         ])?;
         while let Some(row) = rows.next()? {
             let id = PublicationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
                 .map_err(|_| Fault::Corrupt)?;
+            let (expiry, retained_topic) = candidate(conn, meta, id)?;
             candidates
-                .try_push((id, decode(row, 1)?))
+                .try_push((id, expiry, retained_topic))
                 .map_err(|_| ReadError::LimitExceeded)?;
         }
     }
-    let more = candidates.len() > limit as usize;
+    let last = candidates.as_slice().last().map(|(id, _, _)| *id);
+    let more = if let Some(last) = last {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM publications WHERE id>?1 LIMIT 1)",
+            [last.to_be_bytes().as_slice()],
+            |row| row.get(0),
+        )?
+    } else {
+        false
+    };
     let mut result = MessageExpirySweep {
         removed: BoundedVec::with_capacity(MESSAGE_EXPIRY_SWEEP_DELIVERIES)
             .map_err(|_| ReadError::AllocationFailed)?,
         more,
-        next: if more {
-            candidates
-                .as_slice()
-                .get(limit as usize - 1)
-                .map(|(id, _)| *id)
-        } else {
-            None
-        },
+        next: if more { last } else { None },
         ..MessageExpirySweep::default()
     };
-    for (id, expiry) in candidates.as_slice().iter().take(limit as usize) {
+    for (id, expiry, topic) in candidates.as_slice() {
         let Some(expiry) = expiry else {
             continue;
         };
@@ -164,12 +302,15 @@ pub(super) fn sweep(
                 result.quarantined += 1;
             }
             ExpiryState::Expired => {
-                let topic: Option<Vec<u8>> = conn
-                    .prepare_cached("SELECT topic FROM retained WHERE publication=?1 LIMIT 1")?
-                    .query_row([id.to_be_bytes().as_slice()], |row| {
-                        reader::copy_blob(row, 0, meta.limits.max_topic_bytes)
-                    })
-                    .optional()?;
+                let uncertain: i64 = conn.query_row("SELECT count(*) FROM (SELECT 1 FROM outbound WHERE publication=?1 AND started=0 LIMIT ?2)", params![id.to_be_bytes().as_slice(), MESSAGE_EXPIRY_SWEEP_DELIVERIES as i64 + 1], |row| row.get(0))?;
+                let uncertain = u32::try_from(uncertain).map_err(|_| Fault::Corrupt)?;
+                if uncertain as usize > MESSAGE_EXPIRY_SWEEP_DELIVERIES {
+                    return Err(ReadError::LimitExceeded.into());
+                }
+                result.quarantined = result
+                    .quarantined
+                    .checked_add(uncertain)
+                    .ok_or(ReadError::LimitExceeded)?;
                 if let Some(topic) = topic {
                     // The topic and exact version are checked in this transaction.
                     let removed = conn
