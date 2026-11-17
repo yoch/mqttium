@@ -77,7 +77,7 @@ def main(archive: Path, out: Path) -> None:
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if event["event"] == "ready" and f not in seen_events:
+                    if event["kind"] == "ready" and f not in seen_events:
                         seen_events.add(f)
                         actions.append({"event": "packaged_ready", "run": known,
                                         "details": event["details"], "events": str(f)})
