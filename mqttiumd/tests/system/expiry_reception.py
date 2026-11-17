@@ -272,7 +272,11 @@ async def shared_responsibilities(binary, case):
         await absent(broker, cursor, source.client_id)
         after = durable(broker.db)
         require(after['tables']['obligations'] == expected
-                and after['tables']['payloads'] == admitted['tables']['payloads'],
+                and [{key: value for key, value in row.items() if key != 'refs'}
+                     for row in after['tables']['payloads']] ==
+                    [{key: value for key, value in row.items() if key != 'refs'}
+                     for row in admitted['tables']['payloads']]
+                and all(int(row['refs'], 16) == 1 for row in after['tables']['payloads']),
                 'expiration_cancelled_other_destination')
         require(not any(row['id'] in (source_row['id'], short_row['id'])
                         for row in after['tables']['sessions']), 'expired_source_or_target_survived')
@@ -366,7 +370,7 @@ async def capacity_and_rearming(binary, case):
                 details = inventory[-1]['details']
                 # The product must report the separate session-expiry index;
                 # causal command deadlines are not a substitute for its size.
-                require('finite_timers' in details and 0 <= details['finite_timers'] <= QUOTA,
+                require('finite_timers' in details and 0 <= details['finite_timers'] <= 1,
                         'expiry_timer_history_grew')
                 require(sample['counts']['sessions'] == 2 and sample['terminal_sessions'] == 0
                         and sample['counts']['session_clock'] == 1,
