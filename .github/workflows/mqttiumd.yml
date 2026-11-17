@@ -481,7 +481,7 @@ jobs:
         run: tools/run_wildcard_reception.sh "$RUNNER_TEMP/wildcard-preview"
       - name: Upload system evidence and standalone preview
         if: always()
-        uses: actions/upload-artifact@5cb306393e7043c957a4139e3c378202725ebcf440 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mqttiumd-hierarchical-preview
           path: |
@@ -490,7 +490,7 @@ jobs:
             ${{ runner.temp }}/wildcard-preview.tar.gz.sha256
           if-no-files-found: error
       - name: Upload the normal runnable archive separately
-        uses: actions/upload-artifact@5cb306393e7043c957a4139e3c378202725ebcf440 # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mqttiumd-local-preview-linux-x86_64
           path: |

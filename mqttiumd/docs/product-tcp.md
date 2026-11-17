@@ -1,7 +1,7 @@
-# Experimental exact-topic pub/sub over TCP
+# Local MQTT 5 preview with hierarchical pub/sub
 
 The product receives non-retained MQTT 5 QoS 0/1/2 publications and delivers
-at QoS 0 or 1 to persistent exact-topic subscriptions. Sessions and filters
+at QoS 0 or 1 to persistent exact and hierarchical subscriptions. Sessions and filters
 are durable. Initially QoS 0 publications use a bounded volatile path;
 QoS 1/2 admissions atomically create durable recipient obligations. This is
 an experimental subset, not complete MQTT conformance, a Mosquitto replacement,
@@ -17,6 +17,32 @@ Effective delivery QoS is the minimum of the published and granted QoS:
 
 A request for subscription QoS 2 grants QoS 1. Replacing a filter changes
 future matching decisions, not the QoS of an existing obligation.
+
+## Downloadable local preview
+
+The PR's `mqttiumd-local-preview-linux-x86_64` artifact contains the normal
+standalone archive. Extract it and run `./start.sh ./data`; no laboratory,
+Git or compiler is required. The bundled [quick start](../preview/README.md)
+starts temperature and archive receivers with the Mosquitto MQTT 5 clients.
+Keep the data directory for restart; logs are fresh for every start. The
+artifact's BUILD.json and extraction receipt identify its actual platform.
+
+`atelier/+/temperature` selects one level; `atelier/#` includes the parent and
+all descendants. Empty levels are significant. Leading wildcards exclude `$`
+topics; explicit `$SYS/#` is allowed but creates no metrics service. Matching
+preserves UTF-8 bytes and case. A session with several eligible matching
+filters gets one delivery at their maximum granted QoS, capped by published
+QoS and outgoing QoS 1. No Local is applied separately to each contribution.
+UNSUBSCRIBE removes a literal stored filter only. The destination set is frozen
+at admission; later replacement or removal never reroutes an old obligation.
+
+The 16-destination limit applies to distinct sessions after aggregation, not
+matching filters. Exactly 16 is allowed. A seventeenth refuses the complete
+durable admission or explicitly drops the whole volatile occurrence before any
+output. Existing per-literal route limit 16 and total subscription limit 128
+remain in force. [ADR 0031](decisions/0031-hierarchical-subscriptions.md) records
+the decision and versioned canonical options; schema 7 refuses older formats
+without modification or implicit migration.
 
 ## Launch and external clients
 
@@ -164,17 +190,19 @@ These helpers use the public APIs. The reception command
 `tools/run_session_reception.sh /tmp/mqttiumd-session-reception` additionally
 waits for the broker's known lifecycle result and independent durable cleanup.
 
-The profile accepts non-retained QoS 0/1/2 PUBLISH, PUBREL, exact SUBSCRIBE and
+The profile accepts non-retained QoS 0/1/2 PUBLISH, PUBREL, hierarchical SUBSCRIBE and
 UNSUBSCRIBE, recipient PUBACK, PINGREQ and ordinary DISCONNECT. Completed valid
 packets reset the 1.5-times-Keep-Alive deadline; fragments do not. Keep Alive 0
 disables that MQTT timer, not partial-packet/write deadlines. PINGREQ passes
 through the core and produces PINGRESP.
 
-Will, authentication, retained messages, wildcard/shared subscriptions,
+Will, authentication, retained messages, shared subscriptions,
 subscription identifiers, topic aliases, PUBLISH properties and outgoing
-QoS 2 are not implemented. No Local, Retain As Published and subscription
-properties are explicitly outside the profile. Valid Retain Handling choices
-produce no retained replay because no retained publication is stored.
+QoS 2 are not implemented. No Local, Retain As Published and valid Retain
+Handling values are accepted and durably preserved per subscription. No Local
+removes only its own matching contribution before aggregation. With no retained
+input or retained store, RAP cannot produce a retained output and RH produces
+no retained replay. Subscription properties remain outside the profile.
 Malformed options are distinguished from well-formed unsupported options.
 
 Necessary CONNECT properties are validated. Peer Maximum Packet Size constrains
@@ -182,7 +210,7 @@ every output. Peer Receive Maximum constrains QoS 1 output in addition to the
 local limit; QoS 0 neither consumes nor returns receive-window credit in either
 direction. Topic Alias Maximum and Request Problem Information are checked;
 no alias or diagnostic string is emitted. CONNACK advertises Receive Maximum 8,
-Maximum Packet Size 65,536, and no retain, subscription-identifier, shared,
+Maximum Packet Size 65,536, wildcard availability, and no retain, subscription-identifier, shared,
 wildcard or topic-alias support. Maximum QoS is omitted: that property can
 only encode 0 or 1, while this profile accepts incoming QoS 2.
 
