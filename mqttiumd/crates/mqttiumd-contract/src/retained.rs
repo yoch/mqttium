@@ -62,6 +62,14 @@ pub(crate) fn check(recipe: &Recipe) -> Result<(), RecipeError> {
             check_mask(value.retain_targets, value.admission.targets.len())
         }
         Recipe::RetainedQos0(value) => {
+            if value
+                .targets
+                .as_slice()
+                .iter()
+                .any(|target| target.cause != crate::command::DeliveryCause::LiveExact)
+            {
+                return Err(RecipeError::InvalidField("admission_cause"));
+            }
             if ((value.topic.is_empty()
                 || value.topic.len() > usize::from(u16::MAX)
                 || value.topic.as_slice().contains(&0)
@@ -177,7 +185,7 @@ pub(crate) fn decode(
     use crate::capacity::{ExchangeSlots, PayloadBytes, ReceiptSlots, References};
     use crate::command::{DeliveryCause, Reader};
     use crate::ids::DeliveryId;
-    let mut r = Reader { bytes: *bytes };
+    let mut r = Reader { bytes };
     let recipe = if kind == 10 || kind == 12 {
         let len = r.u32()? as usize;
         let nested = r.take(len)?;

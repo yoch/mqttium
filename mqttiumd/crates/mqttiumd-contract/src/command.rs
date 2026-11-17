@@ -972,9 +972,12 @@ mod tests {
 
     #[test]
     fn replay_cause_cannot_change_legacy_admission_encoding() {
-        let mut destination=target(2,0);
-        destination.cause=DeliveryCause::RetainedReplay;
-        assert_eq!(admission(&[destination]).check(),Err(RecipeError::InvalidField("admission_cause")));
+        let mut destination = target(2, 0);
+        destination.cause = DeliveryCause::RetainedReplay;
+        assert_eq!(
+            admission(&[destination]).check(),
+            Err(RecipeError::InvalidField("admission_cause"))
+        );
     }
 
     #[test]
@@ -1338,6 +1341,14 @@ mod tests {
 
 impl AdmitPublication {
     pub(crate) fn check_retained(&self) -> Result<(), RecipeError> {
+        if self
+            .targets
+            .as_slice()
+            .iter()
+            .any(|target| target.cause != DeliveryCause::LiveExact)
+        {
+            return Err(RecipeError::InvalidField("admission_cause"));
+        }
         if self.source.exchange.session != self.source.session {
             return Err(RecipeError::ForeignExchange);
         }
