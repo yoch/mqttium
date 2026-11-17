@@ -349,6 +349,8 @@ async def capacity_and_rearming(binary, case):
                                   events_path=case / 'newcomer.jsonl')
         clients.append(newcomer); await newcomer.open(False)
         newcomer_row = session_row(temporal_snapshot(broker), newcomer.client_id)
+        require(identity(newcomer_row) > max(identity(row) for row in full['sessions']),
+                'expiry_capacity_reused_session_identity')
         await newcomer.disconnect(); await absent(broker, cursor, newcomer.client_id)
         drained = await state_until(broker, cursor, lambda state: state['active_sessions'] == 1,
                                     reason='expiration_capacity_backlog_not_drained', timeout=45)
