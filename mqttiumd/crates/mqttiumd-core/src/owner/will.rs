@@ -585,18 +585,20 @@ mod tests {
                 now: LogicalTime::new(100),
             },
         );
-        let (
-            resolve,
-            Effect::ResolveAndFence {
-                operation: repeated,
-            },
-        ) = retry[0]
-        else {
-            panic!();
-        };
+        let (resolve, repeated) = retry
+            .iter()
+            .find_map(|(effect, value)| match value {
+                Effect::ResolveAndFence { operation } => Some((*effect, *operation)),
+                _ => None,
+            })
+            .expect("will_resolution_missing_for_unknown_admission");
         assert_eq!(
             repeated, operation,
             "will_resolution_changed_operation_identity"
+        );
+        assert_eq!(
+            retry[0].0, resolve,
+            "will_resolution_deadline_preceded_submission"
         );
         assert!(owner.deadline_is_live(owner.will_dispatch().unwrap().1));
         assert!(
