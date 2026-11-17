@@ -133,7 +133,7 @@ def precise_failure(output: str, status: int, reason: str) -> bool:
     return (status == 101
             and 'could not compile' not in output and 'error[E' not in output
             and 'test result: FAILED. 0 passed; 1 failed;' in output
-            and 'assertion' in output and reason in output
+            and re.search(r'(?m)^(?:assertion[^\n]*failed: )?' + re.escape(reason) + r'$', output) is not None
             and 'called `Result::unwrap()`' not in output
             and 'called `Option::unwrap()`' not in output)
 
@@ -222,13 +222,13 @@ def main() -> int:
                     if row['detected']:
                         row['observed_reason'] = control.expected_reason
                         row['mutant_binary'] = test_binary(mutation.stdout, root)
-                    if not row['detected']:
-                        raise RuntimeError(f'{name}: required property was not detected')
                 finally:
                     # This private tree has no concurrent or user edits.
                     git(root, 'restore', '--', control.source)
-                row['restored'] = (not git(root, 'status', '--porcelain', '--untracked-files=normal')
-                                   and digest(path) == row['source_sha256'])
+                    row['restored'] = (not git(root, 'status', '--porcelain', '--untracked-files=normal')
+                                       and digest(path) == row['source_sha256'])
+                if not row['detected']:
+                    raise RuntimeError(f'{name}: required property was not detected')
                 if not row['restored']:
                     raise RuntimeError(f'{name}: private tree or generated files were not restored')
                 print(f'{name}: detected {control.expected_reason}', flush=True)
@@ -239,6 +239,7 @@ def main() -> int:
             receipt['error'] = error
         finally:
             receipt['tree_status_before_cleanup'] = git(root, 'status', '--porcelain', '--untracked-files=normal')
+            receipt['restored'] = not receipt['tree_status_before_cleanup']
             git(caller, 'worktree', 'remove', '--force', str(root))
     receipt['elapsed_seconds'] = round(time.monotonic() - start, 3)
     document = json.dumps(receipt, indent=2, sort_keys=True) + '\n'
