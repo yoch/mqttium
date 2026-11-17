@@ -1304,6 +1304,23 @@ mod tests {
 
     const EXPIRY: &[u8] = &[0x11, 0xff, 0xff, 0xff, 0xff];
 
+    fn will_connect(properties: &[u8], will_properties: &[u8], flags: u8, topic: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut body=connect(properties,b"will-client"); body[7]=flags;
+        assert!(will_properties.len()<128);
+        body.push(will_properties.len() as u8); body.extend_from_slice(will_properties);
+        for value in [topic,payload] {body.extend_from_slice(&(value.len() as u16).to_be_bytes());body.extend_from_slice(value);}
+        body
+    }
+
+    #[test]
+    fn qos1_nonretained_zero_delay_will_and_explicit_will_disconnect_are_accepted() {
+        for delay in [&[][..], &[0x18,0,0,0,0][..]] {
+            let body=will_connect(EXPIRY,delay,0x0c,b"atelier/capteur/status",b"offline");
+            assert!(matches!(decode(0x10,&body,BOUNDS), Ok(Packet::Connect(_))), "supported Will CONNECT was refused");
+        }
+        assert!(matches!(decode(0xe0,&[4],BOUNDS), Ok(Packet::Disconnect {..})), "DISCONNECT4 must request the Will");
+    }
+
     #[test]
     fn session_connect_matrix_keeps_absent_zero_infinite_and_clean_start_explicit() {
         for clean_start in [false, true] {
