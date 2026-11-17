@@ -307,6 +307,11 @@ pub(super) fn sweep(
         let Some(expiry) = expiry else {
             continue;
         };
+        // This request may be a retry of an earlier frozen observation.
+        // Later admissions are outside its as-of range, not clock regressions.
+        if expiry.observed.domain == now.domain && expiry.observed.tick > now.tick {
+            continue;
+        }
         match expiry.state(now).map_err(|_| Fault::Corrupt)? {
             ExpiryState::Fresh { .. } => (),
             ExpiryState::TemporalUncertain => {
