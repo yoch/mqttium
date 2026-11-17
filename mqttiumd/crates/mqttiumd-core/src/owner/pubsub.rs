@@ -5104,4 +5104,231 @@ mod tests {
         );
         assert!(owner.pubsub.volatile.is_empty());
     }
+
+    fn message_register_receipts(owner: &mut Owner) {
+        let effects = apply(owner, Input::MaintainReceipts);
+        let (effect, collection) = effects
+            .iter()
+            .find_map(|(id, e)| match e {
+                Effect::CollectReceipts { collection } => Some((*id, *collection)),
+                _ => None,
+            })
+            .unwrap();
+        apply(
+            owner,
+            Input::ReceiptsCollected {
+                effect,
+                collection,
+                reply: crate::contract::receipts::ReceiptCollectionReply::Applied {
+                    closure: collection.closure,
+                    removed: 0,
+                    retained: 0,
+                    more: false,
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn message_expiry_full_receipt_window_consumes_started_before_preparing_early_ack_finish() {
+        let mut owner = world();
+        message_register_receipts(&mut owner);
+        message_clock(&mut owner, 10);
+        let (frame, key, pi) = message_frame(&mut owner, 0);
+        message_puback(&mut owner, key, pi);
+        let (start_effect, start) = message_command(message_progress(
+            &mut owner,
+            frame,
+            key,
+            FrameProgress::Started,
+        ));
+        owner.receipts.test_fill_consumed_window();
+        owner.counters.operation = Some(OperationSeq::new(
+            crate::contract::receipts::RECEIPT_WINDOW as u64 + 1,
+        ));
+        let effects = known(&mut owner, start_effect, &start);
+        assert!(
+            effects.is_empty(),
+            "full_window_submitted_unreserved_finish"
+        );
+        assert_eq!(
+            owner.receipt_status().unwrap().2,
+            0,
+            "full_window_did_not_consume_started"
+        );
+        let effects = apply(&mut owner, Input::MaintainReceipts);
+        let (effect, collection) = effects
+            .iter()
+            .find_map(|(id, e)| match e {
+                Effect::CollectReceipts { collection } => Some((*id, *collection)),
+                _ => None,
+            })
+            .expect("collection makes control room");
+        apply(
+            &mut owner,
+            Input::ReceiptsCollected {
+                effect,
+                collection,
+                reply: crate::contract::receipts::ReceiptCollectionReply::Applied {
+                    closure: collection.closure,
+                    removed: collection.limit,
+                    retained: 0,
+                    more: false,
+                },
+            },
+        );
+        let effects = apply(&mut owner, Input::MaintainReceipts);
+        let continuation = effects
+            .iter()
+            .find_map(|(_, e)| match e {
+                Effect::Continue { continuation } => Some(*continuation),
+                _ => None,
+            })
+            .expect("one bounded finish wake");
+        let (finish_effect, finish) = message_command(apply(
+            &mut owner,
+            Input::Continue {
+                continuation,
+                budget: WorkUnits::new(100_000),
+            },
+        ));
+        assert!(matches!(finish.recipe.get(), Recipe::FinishDelivery(_)));
+        known(&mut owner, finish_effect, &finish);
+        assert!(owner.pubsub.deliveries.is_empty());
+    }
+
+    #[test]
+    fn message_expiry_lost_sweep_reply_cannot_pin_cached_expired_unclaimed_work_or_reload_it() {
+        let mut owner = world();
+        message_clock(&mut owner, 10);
+        queued(&mut owner, 0);
+        owner.pubsub.deliveries.as_mut_slice()[0].expiry = Some(message_expiry());
+        let before = owner.leases.account().used();
+        // The store's sweep may already have committed, with its removed-key
+        // notification lost. Evict only the obsolete cache, not a claim.
+        message_clock(&mut owner, 12);
+        assert!(
+            owner.pubsub.deliveries.is_empty(),
+            "lost_sweep_reply_pinned_cached_payload"
+        );
+        let effects = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let read = effects
+            .iter()
+            .find_map(|(id, e)| matches!(e, Effect::LoadWork { .. }).then_some(*id))
+            .unwrap();
+        // A frozen page produced before the sweep also carries its original
+        // expiry. It cannot reacquire cache/payload capacity after the TTL.
+        let stale = WorkItem {
+            delivery: delivery(0),
+            target: TARGET,
+            target_revision: Revision::new(1),
+            qos: Qos::AtLeastOnce,
+            retain: false,
+            expiry: Some(message_expiry()),
+            topic: bytes(b"topic"),
+            payload: bytes(b"payload"),
+            claim: None,
+        };
+        apply(
+            &mut owner,
+            Input::WorkPage {
+                effect: read,
+                session: TARGET,
+                items: BoundedVec::from_slice(&[stale], 1).unwrap(),
+                next: None,
+            },
+        );
+        assert!(
+            owner.pubsub.deliveries.is_empty(),
+            "stale_page_reloaded_expired_cache"
+        );
+        assert_eq!(owner.leases.account().used(), before);
+    }
+
+    #[test]
+    fn message_expiry_lost_sweep_race_certain_claim_refusal_retires_cache_without_closing_connection()
+     {
+        for qos in [Qos::AtMostOnce, Qos::AtLeastOnce] {
+            let mut owner = world();
+            message_clock(&mut owner, 10);
+            queued(&mut owner, 0);
+            let d = &mut owner.pubsub.deliveries.as_mut_slice()[0];
+            d.expiry = Some(message_expiry());
+            d.qos = qos;
+            let (effect, command) =
+                message_command(apply(&mut owner, Input::WorkAvailable { session: TARGET }));
+            message_clock(&mut owner, 12);
+            assert_eq!(
+                owner.pubsub.deliveries.len(),
+                1,
+                "clock_discarded_unknown_command"
+            );
+            let operation = command.recipe.operation();
+            let effects = apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect,
+                    operation,
+                    reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                        RejectReason::PreconditionFailed,
+                    )),
+                },
+            );
+            assert!(effects.is_empty(), "ordinary_expiry_race_closed_connection");
+            assert!(
+                owner.pubsub.deliveries.is_empty(),
+                "rejected_expired_claim_pinned_cache"
+            );
+            assert_eq!(owner.connection_of(TARGET), Some(CONNECTION));
+            assert!(
+                apply(
+                    &mut owner,
+                    Input::StoreResult {
+                        effect,
+                        operation,
+                        reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                            RejectReason::PreconditionFailed
+                        ))
+                    }
+                )
+                .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn message_expiry_clock_authority_is_zero_effect_during_recovery_and_regression_is_explicit() {
+        let mut owner = world();
+        owner.recovery = Some(RecoveryOrder::new());
+        let result = owner.step(
+            Input::MessageClock {
+                now: message_time(10),
+            },
+            TurnGrant {
+                work_limit: WorkUnits::ZERO,
+            },
+        );
+        assert_eq!(
+            result,
+            StepOutcome::Applied {
+                work_used: WorkUnits::ZERO,
+                progress: Progress::Complete
+            }
+        );
+        assert!(owner.is_recovering());
+        assert!(drain(&mut owner).is_empty());
+        let previous = owner.message_now;
+        assert_eq!(
+            owner.step(
+                Input::MessageClock {
+                    now: message_time(9)
+                },
+                TurnGrant {
+                    work_limit: WorkUnits::ZERO
+                }
+            ),
+            StepOutcome::Fatal(CoreFault::ImpossibleInput)
+        );
+        assert_eq!(owner.message_now, previous);
+    }
 }
