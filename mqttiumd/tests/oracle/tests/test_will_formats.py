@@ -162,6 +162,32 @@ class WillFormats(unittest.TestCase):
             self.assertEqual([(d.code, d.pointer) for d in self.contracts.check_value(value)],
                              [("u64-out-of-range", pointer)])
 
+    def test_actual_detachment_diagnostics_are_bounded_and_historical_forms_remain_readable(self):
+        event = {"format": "mqttiumd.product-event", "schema_version": 1,
+                 "seq": "1", "pid": 1, "kind": "session_changed", "operation": OPERATION,
+                 "details": {"action": "Detached", "session": "9", "expiry": "Never",
+                             "detached_by": "1/2/3/8"}}
+        self.assertEqual(self.contracts.check_value(event), [], "actual_infinite_will_detachment_refused")
+        historical = copy.deepcopy(event)
+        historical["details"].update(detached_by=OPERATION, deadline=None)
+        self.assertEqual(self.contracts.check_value(historical), [], "historical_detachment_changed_meaning")
+        finite = copy.deepcopy(event)
+        finite["details"].update(expiry={"After": 1}, deadline="1000000000")
+        self.assertEqual(self.contracts.check_value(finite), [])
+        missing = copy.deepcopy(finite)
+        missing["details"].pop("deadline")
+        self.assertTrue(self.contracts.check_value(missing), "finite_detachment_lost_deadline")
+        missing = copy.deepcopy(event)
+        missing["details"].pop("detached_by")
+        self.assertTrue(self.contracts.check_value(missing), "detachment_lost_occurrence")
+        overflow = copy.deepcopy(event)
+        overflow["details"]["detached_by"] = "1/2/3/18446744073709551616"
+        self.assertEqual([(d.code, d.pointer) for d in self.contracts.check_value(overflow)],
+                         [("u64-out-of-range", "/details/detached_by")])
+        wrong = copy.deepcopy(event)
+        wrong["details"]["deadline"] = "1000000000"
+        self.assertTrue(self.contracts.check_value(wrong), "infinite_detachment_gained_finite_deadline")
+
     def test_actual_writer_will_events_retain_occurrence_but_never_payload(self):
         base = {"format": "mqttiumd.product-event", "schema_version": 1,
                 "seq": "1", "pid": 1, "operation": OPERATION, "will": copy.deepcopy(OPERATION)}
