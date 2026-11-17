@@ -62,7 +62,10 @@ pub(crate) fn check(recipe: &Recipe) -> Result<(), RecipeError> {
             check_mask(value.retain_targets, value.admission.targets.len())
         }
         Recipe::RetainedQos0(value) => {
-            if (!crate::topic::valid_filter(value.topic.as_slice())
+            if ((value.topic.is_empty()
+                || value.topic.len() > usize::from(u16::MAX)
+                || value.topic.as_slice().contains(&0)
+                || core::str::from_utf8(value.topic.as_slice()).is_err())
                 || value
                     .topic
                     .as_slice()
