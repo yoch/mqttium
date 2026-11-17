@@ -55,3 +55,19 @@
   retained and historical campaign artifacts. Pending: publish with E8HEAD
   lease, independently receive exact-head checks/artifacts and execute the
   downloaded packaged guide. Preserve draft/unmerged/Proposed states.
+- First published head a0cf433a4a083d0ca3fb45d9d143b95ad52bfbb5 matched the connector
+  and fetched tree988160b02313e2302db95017c11fe8ddccf3176b. Its hierarchical
+  evidence reader expected legacy tag9 directly and rejected new tag12 with
+  nested9, despite the committed options/correlation being present. Failed CI
+  artifact14332297112 ZIP SHA342554e024a96864acb8eba20d36307af8f5b13589579c2a339465bda0dd8359
+  is retained as a harness failure, not a broker/negative-control detection.
+- RED7d4fa5d7/GREENc883f883 reads the explicit envelope, verifies its exact length,
+  nested options and original operation, keeps legacy9 readable and rejects
+  wrong inner correlation. All132pilot tests pass. All three real writer-boundary
+  cases pass with the downloaded, hash-verified a0cf433a CI hook binary and the
+  new tracked harness, with their distinct source identities recorded.
+- Full source-pinned hierarchical non-regression at c883f8838803e0015967f00508398da94b1e5854
+  passes eight normal groups, three genuine writer boundaries, four compiled
+  controls, extracted archive and schema checks. Broker Rust/contract content
+  is unchanged from received90736706. Publish the reader correction and receive
+  the replacement exact-head CI/artifacts before declaring the delivery complete.
