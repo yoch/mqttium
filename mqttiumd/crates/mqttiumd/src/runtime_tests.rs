@@ -4352,6 +4352,21 @@ fn normal_disconnect_during_real_will_open_result_drain_cancels_exact_intention(
             !events.contains("offline-private"),
             "will_bytes_in_product_diagnostics"
         );
+        let detached = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| {
+                event["kind"] == "session_changed" && event["details"]["action"] == "Detached"
+            })
+            .expect("real durable Will End diagnostic");
+        assert!(
+            detached["details"]["detached_by"].is_string(),
+            "will_detachment_identity_not_bounded_scalar"
+        );
+        assert!(
+            detached["details"].get("deadline").is_none(),
+            "infinite_will_detachment_invented_deadline_field"
+        );
     });
 }
 
