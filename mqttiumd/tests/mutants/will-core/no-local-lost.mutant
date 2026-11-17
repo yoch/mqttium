@@ -1,0 +1,11 @@
+--- a/mqttiumd/crates/mqttiumd-core/src/owner/routing.rs
++++ b/mqttiumd/crates/mqttiumd-core/src/owner/routing.rs
+@@ -78,7 +78,7 @@
+         };
+         // No Local removes this contribution before QoS aggregation; another
+         // eligible filter on the same session can still contribute.
+-        if route.options.no_local() && source == Some(target_session.client_id.as_slice()) {
++        if false && route.options.no_local() && source == Some(target_session.client_id.as_slice()) {
+             continue;
+         }
+         let effective = route.max_qos.min(qos).min(Qos::AtLeastOnce);
