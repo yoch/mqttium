@@ -1,7 +1,8 @@
 //! Hierarchical subscriptions and outgoing QoS 1 under the same owner authority.
 use super::*;
 use crate::contract::command::{
-    ClaimDelivery, ConsumeDelivery, FinishDelivery, UpdateSubscriptions,
+    ClaimDelivery, ConsumeDelivery, ExpireDelivery, FinishDelivery, MarkDeliveryStarted,
+    UpdateSubscriptions,
 };
 use crate::contract::ids::{ContinuationId, OutboundPacketId};
 use crate::contract::pubsub::{
@@ -57,6 +58,8 @@ enum Phase {
     ClaimPending(InFlight),
     AwaitPuback,
     FinishPending(InFlight),
+    StartPending(InFlight),
+    ExpirePending(InFlight),
     ConsumePending(InFlight, ConnectionKey),
     Qos0Writing(Finished),
 }
@@ -68,6 +71,7 @@ pub(super) struct Delivery {
     revision: Revision,
     qos: Qos,
     retain: bool,
+    expiry: Option<MessageExpiry>,
     claim: Option<DeliveryClaim>,
     topic: Option<SharedBytes>,
     payload: Option<SharedBytes>,
@@ -77,16 +81,23 @@ pub(super) struct Delivery {
     frame: Option<(EffectId, ConnectionKey)>,
     local_write_completed: bool,
     may_have_started: bool,
+    /// Only a fresh claim in this process, with no earlier uncertain attempt,
+    /// can turn an exact first-frame NotStarted observation into deletion.
+    certain_never_started: bool,
+    early_puback: bool,
     retired: bool,
 }
 
 impl Delivery {
-    fn waiting_to_send(&self, generation: ConnectionGeneration) -> bool {
-        if self.retired {
+    fn waiting_to_send(&self, generation: ConnectionGeneration, now: Option<MessageTime>) -> bool {
+        if self.retired || !self.expiry_allows_send(now) {
             return false;
         }
         match self.phase {
-            Phase::FinishPending(_) | Phase::Qos0Writing(_) => false,
+            Phase::FinishPending(_)
+            | Phase::StartPending(_)
+            | Phase::ExpirePending(_)
+            | Phase::Qos0Writing(_) => false,
             Phase::AwaitPuback => {
                 self.window != Some(generation)
                     || self
@@ -96,11 +107,19 @@ impl Delivery {
             Phase::Queued | Phase::ClaimPending(_) | Phase::ConsumePending(_, _) => true,
         }
     }
+    fn expiry_allows_send(&self, now: Option<MessageTime>) -> bool {
+        self.claim.is_some_and(|claim| claim.started)
+            || self.expiry.is_none_or(|expiry| {
+                now.is_some_and(|now| matches!(expiry.state(now), Ok(ExpiryState::Fresh { .. })))
+            })
+    }
     fn in_flight(&self) -> Option<InFlight> {
         match self.phase {
-            Phase::ClaimPending(f) | Phase::FinishPending(f) | Phase::ConsumePending(f, _) => {
-                Some(f)
-            }
+            Phase::ClaimPending(f)
+            | Phase::FinishPending(f)
+            | Phase::StartPending(f)
+            | Phase::ExpirePending(f)
+            | Phase::ConsumePending(f, _) => Some(f),
             _ => None,
         }
     }
@@ -117,6 +136,7 @@ impl Delivery {
             revision,
             qos,
             retain: false,
+            expiry: None,
             claim,
             topic: None,
             payload: None,
@@ -130,6 +150,8 @@ impl Delivery {
             frame: None,
             local_write_completed: false,
             may_have_started: claim.is_some(),
+            certain_never_started: claim.is_none(),
+            early_puback: false,
             retired: false,
         }
     }
@@ -142,6 +164,7 @@ pub(super) struct Volatile {
     connection: Option<ConnectionKey>,
     topic: SharedBytes,
     payload: SharedBytes,
+    expiry: Option<MessageExpiry>,
     frame: Option<EffectId>,
 }
 
@@ -251,6 +274,32 @@ pub(super) enum Change {
     Written {
         slot: usize,
     },
+    PubackObserved {
+        slot: usize,
+    },
+    Start {
+        slot: usize,
+        in_flight: InFlight,
+    },
+    Started {
+        slot: usize,
+        finished: Finished,
+        finish: Option<InFlight>,
+    },
+    Expire {
+        slot: usize,
+        in_flight: InFlight,
+    },
+    NotStarted {
+        slot: usize,
+    },
+    MessagesExpired,
+    Restart {
+        slot: usize,
+        finished: Finished,
+        in_flight: InFlight,
+        expiring: bool,
+    },
 }
 
 impl State {
@@ -340,12 +389,19 @@ impl State {
                     ..
                 }
         );
-        if !new && self.connections.is_empty() && self.control.is_none() && self.volatile.is_empty()
+        if !new
+            && self.connections.is_empty()
+            && self.control.is_none()
+            && self.volatile.is_empty()
+            && self.deliveries.is_empty()
         {
             return 0;
         }
         let slots = capacity_of(self.deliveries.capacity());
         let connection_work = capacity_of(self.connections.capacity());
+        if let Input::MessagesExpired { deliveries } = input {
+            return slots.saturating_mul(capacity_of(deliveries.len()).saturating_add(1));
+        }
         if let Input::WorkPage { items, .. } = input {
             let count = capacity_of(items.len());
             return connection_work
@@ -420,6 +476,9 @@ impl State {
         for delivery in self.deliveries.as_mut_slice() {
             if delivery.window == Some(generation) {
                 delivery.window = None;
+                if delivery.frame.is_some() {
+                    delivery.certain_never_started = false;
+                }
             }
         }
     }
@@ -508,7 +567,7 @@ impl Owner {
             .deliveries
             .as_slice()
             .iter()
-            .filter(|d| d.target == session && d.waiting_to_send(generation))
+            .filter(|d| d.target == session && d.waiting_to_send(generation, self.message_now))
             .min_by_key(|d| d.id);
         if let Some(delivery) = next {
             match delivery.phase {
@@ -557,6 +616,7 @@ impl Owner {
             packet_id: None,
             topic,
             payload,
+            expiry,
         } = packet
         else {
             return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
@@ -652,7 +712,7 @@ impl Owner {
                 retain_targets |= 1u16 << index;
             }
         }
-        let recipe = Recipe::RetainedQos0(crate::contract::retained::RetainedQos0 {
+        let retained = crate::contract::retained::RetainedQos0 {
             operation,
             request,
             publication,
@@ -678,7 +738,15 @@ impl Owner {
             },
             targets,
             retain_targets,
-        });
+        };
+        let recipe = if let Some(expiry) = expiry {
+            Recipe::ExpiringPublication(crate::contract::command::ExpiringPublication {
+                admission: crate::contract::command::ExpiringAdmission::Qos0(retained),
+                expiry: *expiry,
+            })
+        } else {
+            Recipe::RetainedQos0(retained)
+        };
         let in_flight = self.plan_submission(operation, recipe, Some(payload.clone()), draft)?;
         Ok(changed(Change::RetainedSubmit {
             connection,
@@ -788,6 +856,7 @@ impl Owner {
             packet_id: None,
             topic,
             payload,
+            expiry,
         } = packet
         else {
             return Self::plan_close(generation, Some(session), CloseReason::ProtocolError, draft);
@@ -872,6 +941,7 @@ impl Owner {
                     connection,
                     topic: topic.clone(),
                     payload: payload.clone(),
+                    expiry: *expiry,
                     frame: None,
                 })
                 .map_err(|_| IMPOSSIBLE)?;
@@ -894,6 +964,7 @@ impl Owner {
         connection: ConnectionKey,
         topic: &SharedBytes,
         payload: &SharedBytes,
+        expiry: Option<MessageExpiry>,
     ) -> bool {
         let Some(settings) = self
             .pubsub
@@ -905,7 +976,7 @@ impl Owner {
         let Some(body) = topic
             .len()
             .checked_add(payload.len())
-            .and_then(|n| n.checked_add(3))
+            .and_then(|n| n.checked_add(3 + usize::from(expiry.is_some()) * 5))
         else {
             return false;
         };
@@ -952,16 +1023,26 @@ impl Owner {
         } else {
             None
         };
-        let reason = match v.connection {
+        let reason = if let Some(expiry) = v.expiry {
+            match self.message_now.map(|now| expiry.state(now)) {
+                Some(Ok(ExpiryState::Fresh { .. })) => None,
+                Some(Ok(ExpiryState::Expired)) => Some(Qos0DropReason::MessageExpired),
+                Some(Err(_)) => return Err(IMPOSSIBLE),
+                _ => Some(Qos0DropReason::TemporalUncertain),
+            }
+        } else {
+            None
+        };
+        let reason = reason.or(match v.connection {
             None => Some(Qos0DropReason::DestinationAbsent),
             Some(key) if self.connection_of(v.target) != Some(key.generation) => {
                 Some(Qos0DropReason::ConnectionClosed)
             }
-            Some(key) if !self.qos0_fits(key, &v.topic, &v.payload) => {
+            Some(key) if !self.qos0_fits(key, &v.topic, &v.payload, v.expiry) => {
                 Some(Qos0DropReason::PacketTooLarge)
             }
             _ => None,
-        };
+        });
         if let Some(reason) = reason {
             draft.emit(Effect::Qos0Dropped {
                 origin: v.origin,
@@ -980,6 +1061,7 @@ impl Owner {
             retain: false,
             topic: v.topic.clone(),
             payload: v.payload.clone(),
+            expiry: v.expiry,
         })?;
         Ok(changed(Change::Qos0Send {
             slot,
@@ -1061,6 +1143,15 @@ impl Owner {
         draft: &mut Draft,
     ) -> Result<Option<super::Change>, Stop> {
         match progress {
+            FrameProgress::NotStarted { reason } => self.plan_qos0_terminal(
+                effect,
+                connection,
+                Some(match reason {
+                    MessageExpiryBlock::Expired => Qos0DropReason::MessageExpired,
+                    MessageExpiryBlock::TemporalUncertain => Qos0DropReason::TemporalUncertain,
+                }),
+                draft,
+            ),
             FrameProgress::Failed => self.plan_qos0_terminal(
                 effect,
                 connection,
@@ -1154,7 +1245,7 @@ impl Owner {
                 let (frame, sent) = delivery.frame?;
                 (delivery.target == connection.session
                     && delivery.qos == Qos::AtLeastOnce
-                    && delivery.phase == Phase::AwaitPuback
+                    && matches!(delivery.phase, Phase::AwaitPuback | Phase::StartPending(_))
                     && delivery.window == Some(connection.generation)
                     && sent == connection
                     && claim.packet_id == packet_id)
@@ -1196,6 +1287,9 @@ impl Owner {
         }
         let slot = self.pubsub.delivery(target.delivery).ok_or(IMPOSSIBLE)?;
         let delivery = &self.pubsub.deliveries.as_slice()[slot];
+        if delivery.expiry.is_some() && !delivery.claim.is_some_and(|claim| claim.started) {
+            return Ok(changed(Change::PubackObserved { slot }));
+        }
         let operation = self.operation(draft)?;
         let recipe = Recipe::FinishDelivery(FinishDelivery {
             operation,
@@ -1328,10 +1422,17 @@ impl Owner {
                     PublicationSeq::checked_next,
                 )?;
             }
-            Recipe::ReplaySubscriptions(crate::contract::retained::ReplaySubscriptions {
+            let replay = crate::contract::retained::ReplaySubscriptions {
                 update,
                 first_publication: PublicationId::new(self.incarnation, self.epoch, self.id, first),
-            })
+            };
+            if let Some(observed) = self.message_now {
+                Recipe::TimedReplaySubscriptions(
+                    crate::contract::command::TimedReplaySubscriptions { replay, observed },
+                )
+            } else {
+                Recipe::ReplaySubscriptions(replay)
+            }
         } else {
             Recipe::UpdateSubscriptions(update)
         };
@@ -1487,7 +1588,7 @@ impl Owner {
             .as_slice()
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.target == session && d.waiting_to_send(generation))
+            .filter(|(_, d)| d.target == session && d.waiting_to_send(generation, self.message_now))
             .min_by_key(|(_, d)| d.id);
         if let Some((_, d)) = next
             && matches!(
@@ -1551,6 +1652,7 @@ impl Owner {
             let claim = DeliveryClaim {
                 operation,
                 packet_id,
+                started: false,
             };
             let recipe = Recipe::ClaimDelivery(ClaimDelivery {
                 operation,
@@ -1632,6 +1734,10 @@ impl Owner {
                 || item.payload.len() as u64 > limits.max_payload_bytes.get()
                 || item.qos == Qos::ExactlyOnce
                 || (item.claim.is_some() && item.qos != Qos::AtLeastOnce)
+                || item.expiry.is_some_and(|expiry| expiry.deadline().is_err())
+                || item
+                    .claim
+                    .is_some_and(|claim| claim.started && item.expiry.is_none())
             {
                 return Err(IMPOSSIBLE);
             }
@@ -1662,6 +1768,7 @@ impl Owner {
                 if known.target != item.target
                     || known.revision != item.target_revision
                     || known.qos != item.qos
+                    || known.expiry != item.expiry
                     || (known.topic.is_some() && known.retain != item.retain)
                     || known
                         .topic
@@ -1674,7 +1781,11 @@ impl Owner {
                 {
                     return Err(IMPOSSIBLE);
                 }
-                if item.claim.is_some() && known.claim != item.claim {
+                if let Some(claim) = item.claim
+                    && known.claim.is_none_or(|held| {
+                        held.operation != claim.operation || held.packet_id != claim.packet_id
+                    })
+                {
                     return Err(IMPOSSIBLE);
                 }
             } else {
@@ -1707,6 +1818,9 @@ impl Owner {
         delivery: &Delivery,
         draft: &mut Draft,
     ) -> Result<Option<(EffectId, ConnectionKey)>, Stop> {
+        if !delivery.expiry_allows_send(self.message_now) {
+            return Ok(None);
+        }
         let Some(generation) = self.connection_of(delivery.target) else {
             return Ok(None);
         };
@@ -1725,7 +1839,7 @@ impl Owner {
         if self.pubsub.deliveries.as_slice().iter().any(|earlier| {
             earlier.target == delivery.target
                 && earlier.id < delivery.id
-                && earlier.waiting_to_send(generation)
+                && earlier.waiting_to_send(generation, self.message_now)
         }) {
             // This also protects a claim result delivered after takeover:
             // restored earlier exchanges are replayed before newer ones.
@@ -1739,7 +1853,7 @@ impl Owner {
         let body = topic
             .len()
             .checked_add(payload.len())
-            .and_then(|n| n.checked_add(5))
+            .and_then(|n| n.checked_add(5 + usize::from(delivery.expiry.is_some()) * 5))
             .ok_or(IMPOSSIBLE)?;
         let remaining = if body < 128 {
             1
@@ -1770,6 +1884,8 @@ impl Owner {
             payload: payload.clone(),
             dup: delivery.may_have_started,
             retain: delivery.retain,
+            expiry: delivery.expiry,
+            started: claim.started,
         })?;
         Ok(Some((effect, connection)))
     }
@@ -1846,6 +1962,49 @@ impl Owner {
                     })));
                 }
                 let (slot, d) = delivery.ok_or(IMPOSSIBLE)?;
+                if matches!(d.phase, Phase::StartPending(_) | Phase::ExpirePending(_)) {
+                    let claim = d.claim.ok_or(IMPOSSIBLE)?;
+                    let expected = if matches!(d.phase, Phase::StartPending(_)) {
+                        CommitFacts::DeliveryStarted {
+                            delivery: d.id,
+                            target: d.target,
+                            packet_id: claim.packet_id,
+                            claim: claim.operation,
+                        }
+                    } else {
+                        CommitFacts::DeliveryExpired {
+                            delivery: d.id,
+                            target: d.target,
+                            packet_id: claim.packet_id,
+                            claim: claim.operation,
+                        }
+                    };
+                    if facts != expected {
+                        return Err(Stop::Fatal(CoreFault::ContradictoryOutcome { operation }));
+                    }
+                    if d.retired || matches!(d.phase, Phase::ExpirePending(_)) {
+                        return Ok(Some(changed(Change::Finished {
+                            slot,
+                            finished: done,
+                        })));
+                    }
+                    let finish = if d.early_puback {
+                        let operation = self.operation(draft)?;
+                        Some(self.plan_submission(
+                            operation,
+                            Recipe::FinishDelivery(self.finish_recipe(d, operation)?),
+                            None,
+                            draft,
+                        )?)
+                    } else {
+                        None
+                    };
+                    return Ok(Some(changed(Change::Started {
+                        slot,
+                        finished: done,
+                        finish,
+                    })));
+                }
                 if d.retired {
                     let expected = match d.phase {
                         Phase::ConsumePending(_, _) => CommitFacts::DeliveryConsumed {
@@ -1906,9 +2065,21 @@ impl Owner {
                         delivery: d.id,
                         operation,
                     };
-                    let reason = if self.connection_of(d.target) != Some(connection.generation) {
+                    let reason = if d.expiry.is_some() && !d.expiry_allows_send(self.message_now) {
+                        Some(
+                            if d.expiry.is_some_and(|expiry| {
+                                self.message_now.is_some_and(|now| {
+                                    expiry.state(now) == Ok(ExpiryState::Expired)
+                                })
+                            }) {
+                                Qos0DropReason::MessageExpired
+                            } else {
+                                Qos0DropReason::TemporalUncertain
+                            },
+                        )
+                    } else if self.connection_of(d.target) != Some(connection.generation) {
                         Some(Qos0DropReason::ConnectionClosed)
-                    } else if !self.qos0_fits(connection, topic, payload) {
+                    } else if !self.qos0_fits(connection, topic, payload, d.expiry) {
                         Some(Qos0DropReason::PacketTooLarge)
                     } else {
                         None
@@ -1928,6 +2099,7 @@ impl Owner {
                                 retain: d.retain,
                                 topic: topic.clone(),
                                 payload: payload.clone(),
+                                expiry: d.expiry,
                             })?,
                             connection,
                         ))
@@ -2003,6 +2175,23 @@ impl Owner {
                     return Ok(Some(changed(Change::Finished {
                         slot,
                         finished: done,
+                    })));
+                }
+                if matches!(d.phase, Phase::StartPending(_) | Phase::ExpirePending(_)) {
+                    if reason != RejectReason::Fenced {
+                        return Err(IMPOSSIBLE);
+                    }
+                    let expiring = matches!(d.phase, Phase::ExpirePending(_));
+                    let in_flight = if expiring {
+                        self.submit_expiry(d, draft)?
+                    } else {
+                        self.submit_start(d, draft)?
+                    };
+                    return Ok(Some(changed(Change::Restart {
+                        slot,
+                        finished: done,
+                        in_flight,
+                        expiring,
                     })));
                 }
                 if let Some(connection) = self.connection_of(d.target)
@@ -2099,26 +2288,139 @@ impl Owner {
         })))
     }
 
+    fn finish_recipe(
+        &self,
+        delivery: &Delivery,
+        operation: OperationId,
+    ) -> Result<FinishDelivery, Stop> {
+        let claim = delivery.claim.ok_or(IMPOSSIBLE)?;
+        Ok(FinishDelivery {
+            operation,
+            delivery: delivery.id,
+            target: delivery.target,
+            target_revision: delivery.revision,
+            packet_id: claim.packet_id,
+            claim: claim.operation,
+        })
+    }
+
+    fn submit_start(&self, delivery: &Delivery, draft: &mut Draft) -> Result<InFlight, Stop> {
+        let operation = self.operation(draft)?;
+        let finish = self.finish_recipe(delivery, operation)?;
+        self.plan_submission(
+            operation,
+            Recipe::MarkDeliveryStarted(MarkDeliveryStarted {
+                operation,
+                delivery: finish.delivery,
+                target: finish.target,
+                target_revision: finish.target_revision,
+                packet_id: finish.packet_id,
+                claim: finish.claim,
+            }),
+            None,
+            draft,
+        )
+    }
+
+    fn submit_expiry(&self, delivery: &Delivery, draft: &mut Draft) -> Result<InFlight, Stop> {
+        let expiry = delivery.expiry.ok_or(IMPOSSIBLE)?;
+        let observed = self.message_now.ok_or(IMPOSSIBLE)?;
+        if expiry.state(observed) != Ok(ExpiryState::Expired) || !delivery.certain_never_started {
+            return Err(IMPOSSIBLE);
+        }
+        let operation = self.operation(draft)?;
+        self.plan_submission(
+            operation,
+            Recipe::ExpireDelivery(ExpireDelivery {
+                finish: self.finish_recipe(delivery, operation)?,
+                expiry,
+                observed,
+            }),
+            None,
+            draft,
+        )
+    }
+
     pub(super) fn plan_pubsub_frame(
         &self,
         effect: EffectId,
         connection: ConnectionKey,
         progress: FrameProgress,
-    ) -> Option<super::Change> {
-        if !matches!(progress,FrameProgress::Written{confirmed,total} if total>0&&confirmed==total)
-        {
-            return None;
-        }
-        self.pubsub
-            .deliveries
-            .as_slice()
-            .iter()
-            .position(|d| {
-                d.frame.is_some_and(|(frame, sent)| {
-                    sent == connection && (frame == effect || MUTANT_STALE_OUTGOING_FRAME_RESULT)
+        draft: &mut Draft,
+    ) -> Result<Option<super::Change>, Stop> {
+        let Some((slot, d)) =
+            self.pubsub
+                .deliveries
+                .as_slice()
+                .iter()
+                .enumerate()
+                .find(|(_, d)| {
+                    !d.retired
+                        && d.frame.is_some_and(|(frame, sent)| {
+                            sent == connection
+                                && (frame == effect || MUTANT_STALE_OUTGOING_FRAME_RESULT)
+                        })
                 })
-            })
-            .map(|slot| changed(Change::Written { slot }))
+        else {
+            return Ok(None);
+        };
+        // A callback for a replaced generation never establishes transmission
+        // authority for the new connection or for another reusable PI.
+        if self.connection_of(d.target) != Some(connection.generation) {
+            return Ok(None);
+        }
+        let change = match progress {
+            FrameProgress::Started
+                if d.expiry.is_some()
+                    && d.phase == Phase::AwaitPuback
+                    && !d.claim.is_some_and(|claim| claim.started) =>
+            {
+                Change::Start {
+                    slot,
+                    in_flight: self.submit_start(d, draft)?,
+                }
+            }
+            FrameProgress::NotStarted {
+                reason: MessageExpiryBlock::Expired,
+            } if d.phase == Phase::AwaitPuback
+                && d.certain_never_started
+                && !d.early_puback
+                && d.expiry.is_some_and(|expiry| {
+                    self.message_now
+                        .is_some_and(|now| expiry.state(now) == Ok(ExpiryState::Expired))
+                }) =>
+            {
+                Change::Expire {
+                    slot,
+                    in_flight: self.submit_expiry(d, draft)?,
+                }
+            }
+            FrameProgress::NotStarted { .. } if d.phase == Phase::AwaitPuback => {
+                Change::NotStarted { slot }
+            }
+            FrameProgress::Written { confirmed, total } if total > 0 && confirmed == total => {
+                Change::Written { slot }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(changed(change)))
+    }
+
+    pub(super) fn plan_messages_expired(
+        &self,
+        deliveries: &[crate::contract::message_expiry::ExpiredDelivery],
+    ) -> Result<super::Change, Stop> {
+        if deliveries.len() > 128 {
+            return Err(IMPOSSIBLE);
+        }
+        if deliveries
+            .iter()
+            .enumerate()
+            .any(|(index, expired)| deliveries[..index].contains(expired))
+        {
+            return Err(IMPOSSIBLE);
+        }
+        Ok(changed(Change::MessagesExpired))
     }
 
     pub(super) fn valid_outbound_fact(
@@ -2126,11 +2428,17 @@ impl Owner {
         delivery: DeliveryId,
         target: SessionId,
         revision: Revision,
-        kind: (Qos, Option<DeliveryClaim>),
+        kind: (Qos, Option<DeliveryClaim>, Option<MessageExpiry>, bool),
         same: &[RecoveredFact],
         sessions: &[RecoveredFact],
     ) -> bool {
-        let (qos, claim) = kind;
+        let (qos, claim, expiry, started) = kind;
+        if expiry.is_some_and(|expiry| expiry.deadline().is_err())
+            || started != claim.is_some_and(|claim| claim.started)
+            || (started && expiry.is_none())
+        {
+            return false;
+        }
         let session_ok=self.sessions.as_slice().iter().any(|s|s.id==target&&s.revision==revision)||sessions.iter().any(|f|matches!(f,RecoveredFact::Session{session,revision:rev,..}if *session==target&&*rev==revision));
         let conflict = |id: DeliveryId, to: SessionId, other: Option<DeliveryClaim>| {
             id == delivery
@@ -2151,12 +2459,14 @@ impl Owner {
         id: DeliveryId,
         target: SessionId,
         revision: Revision,
-        qos: Qos,
-        claim: Option<DeliveryClaim>,
+        kind: (Qos, Option<DeliveryClaim>, Option<MessageExpiry>, bool),
     ) -> Result<(), CoreFault> {
+        let (qos, claim, expiry, _) = kind;
+        let mut delivery = Delivery::metadata(id, target, revision, qos, claim);
+        delivery.expiry = expiry;
         self.pubsub
             .deliveries
-            .try_push(Delivery::metadata(id, target, revision, qos, claim))
+            .try_push(delivery)
             .map_err(|_| CoreFault::StalePlan)
     }
 
@@ -2331,6 +2641,7 @@ impl Owner {
                                 item.qos,
                                 item.claim,
                             );
+                            d.expiry = item.expiry;
                             d.retain = item.retain;
                             d.topic = Some(item.topic.clone());
                             d.payload = Some(item.payload.clone());
@@ -2377,6 +2688,9 @@ impl Owner {
                 d.phase = Phase::AwaitPuback;
                 if let Some((effect, connection)) = emission {
                     d.window = Some(connection.generation);
+                    if d.frame.is_some() {
+                        d.certain_never_started = false;
+                    }
                     d.frame = Some((effect, connection));
                     d.may_have_started = true;
                     d.local_write_completed = false;
@@ -2394,6 +2708,9 @@ impl Owner {
                     .get_mut(slot)
                     .ok_or(stale)?;
                 d.window = Some(connection.generation);
+                if d.frame.is_some() {
+                    d.certain_never_started = false;
+                }
                 d.frame = Some((effect, connection));
                 d.may_have_started = true;
                 d.local_write_completed = false;
@@ -2475,6 +2792,8 @@ impl Owner {
                     match &mut d.phase {
                         Phase::ClaimPending(f)
                         | Phase::FinishPending(f)
+                        | Phase::StartPending(f)
+                        | Phase::ExpirePending(f)
                         | Phase::ConsumePending(f, _) => f,
                         _ => return Err(stale),
                     }
@@ -2483,6 +2802,110 @@ impl Owner {
                 if let Some((deadline, effect)) = resolution {
                     held.deadline = deadline;
                     held.answers = held.answers.with(effect);
+                }
+            }
+            Change::PubackObserved { slot } => {
+                self.pubsub
+                    .deliveries
+                    .as_mut_slice()
+                    .get_mut(slot)
+                    .ok_or(stale)?
+                    .early_puback = true;
+            }
+            Change::Start { slot, in_flight } => {
+                let d = self
+                    .pubsub
+                    .deliveries
+                    .as_mut_slice()
+                    .get_mut(slot)
+                    .ok_or(stale)?;
+                d.certain_never_started = false;
+                d.phase = Phase::StartPending(in_flight);
+            }
+            Change::Started {
+                slot,
+                finished,
+                finish,
+            } => {
+                let d = self
+                    .pubsub
+                    .deliveries
+                    .as_mut_slice()
+                    .get_mut(slot)
+                    .ok_or(stale)?;
+                d.claim.as_mut().ok_or(stale)?.started = true;
+                d.phase = finish.map_or(Phase::AwaitPuback, Phase::FinishPending);
+                remember(&mut self.finished, finished)?;
+            }
+            Change::Expire { slot, in_flight } => {
+                self.pubsub
+                    .deliveries
+                    .as_mut_slice()
+                    .get_mut(slot)
+                    .ok_or(stale)?
+                    .phase = Phase::ExpirePending(in_flight);
+            }
+            Change::Restart {
+                slot,
+                finished,
+                in_flight,
+                expiring,
+            } => {
+                let d = self
+                    .pubsub
+                    .deliveries
+                    .as_mut_slice()
+                    .get_mut(slot)
+                    .ok_or(stale)?;
+                d.phase = if expiring {
+                    Phase::ExpirePending(in_flight)
+                } else {
+                    Phase::StartPending(in_flight)
+                };
+                remember(&mut self.finished, finished)?;
+            }
+            Change::NotStarted { slot } => {
+                let d = self
+                    .pubsub
+                    .deliveries
+                    .as_mut_slice()
+                    .get_mut(slot)
+                    .ok_or(stale)?;
+                d.frame = None;
+                d.window = None;
+                if d.certain_never_started {
+                    d.may_have_started = false;
+                }
+            }
+            Change::MessagesExpired => {
+                let Input::MessagesExpired { deliveries } = input else {
+                    return Err(stale);
+                };
+                for expired in deliveries.as_slice() {
+                    let Some(slot) = self.pubsub.delivery(expired.delivery) else {
+                        continue;
+                    };
+                    let d = &mut self.pubsub.deliveries.as_mut_slice()[slot];
+                    // A stale maintenance answer cannot act on a now-known
+                    // claim. A queued uncertain submission waits for its
+                    // own correlated result and consumes its receipt once.
+                    if d.target != expired.target
+                        || (d.claim.is_some() && !matches!(d.phase, Phase::ClaimPending(_)))
+                    {
+                        continue;
+                    }
+                    let target = d.target;
+                    if d.in_flight().is_some() {
+                        d.retired = true;
+                        d.window = None;
+                        d.topic = None;
+                        d.payload = None;
+                    } else {
+                        let last = self.pubsub.deliveries.len() - 1;
+                        self.pubsub.deliveries.as_mut_slice().swap(slot, last);
+                        let _ = self.pubsub.deliveries.pop();
+                    }
+                    self.pubsub.invalidate_reads(target);
                 }
             }
             Change::Written { slot } => {
@@ -2891,6 +3314,7 @@ mod tests {
         let mut owner = world();
         for raw in 1..=4 {
             let claim = DeliveryClaim {
+                started: false,
                 operation: operation(u64::from(raw)),
                 packet_id: OutboundPacketId::new(raw).unwrap(),
             };
@@ -3558,6 +3982,7 @@ mod tests {
             connection: CONNECTION,
             ingress_order: order,
             packet: InboundPacket::Publish {
+                expiry: None,
                 qos: Qos::AtMostOnce,
                 retain: true,
                 dup: false,
@@ -3968,6 +4393,7 @@ mod tests {
                     })
                     .unwrap();
                 let item = WorkItem {
+                    expiry: None,
                     delivery: delivery(0),
                     target: TARGET,
                     target_revision: Revision::new(1),
@@ -4024,6 +4450,7 @@ mod tests {
             .unwrap();
         let held = &owner.pubsub.deliveries.as_slice()[0];
         let changed = WorkItem {
+            expiry: None,
             delivery: held.id,
             target: held.target,
             target_revision: held.revision,

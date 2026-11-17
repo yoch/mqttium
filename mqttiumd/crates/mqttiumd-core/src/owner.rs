@@ -54,6 +54,10 @@ use crate::contract::step::{CoreFault, Exhaustion, PlanStamp, Progress, StepOutc
 use crate::credits::{Credits, ReleaseOutcome};
 use crate::leases::{LeaseRefused, LeaseTable};
 
+use crate::contract::message_expiry::{
+    ExpiryState, MessageExpiry, MessageExpiryBlock, MessageTime,
+};
+
 mod pubsub;
 mod receipts;
 mod routing;
@@ -452,6 +456,7 @@ enum Change {
     Pubsub(pubsub::Change),
     /// The input is absorbed: late, repeated, or answered by effects only.
     Nothing,
+    MessageClock(MessageTime),
     /// The facts of the recovery page in the input join the state.
     Recover,
     /// The exclusive writer confirmed this durable session after the
@@ -738,6 +743,7 @@ pub struct Owner {
     receipts: receipts::State,
     lifecycle: Option<sessions::Flight>,
     lifecycle_enabled: bool,
+    message_now: Option<MessageTime>,
     release_continuation: Option<ContinuationId>,
     release_continuations_started: bool,
     /// The one box of this owner. A renewal replaces it in place.
@@ -854,6 +860,7 @@ impl Owner {
             receipts,
             lifecycle: None,
             lifecycle_enabled: false,
+            message_now: None,
             release_continuation: None,
             release_continuations_started: false,
             outbox,
@@ -1058,6 +1065,9 @@ impl Owner {
     /// sessions, an exchange with the sessions and the exchanges. The page
     /// that closes the inventory compares every route with every session.
     fn cost(&self, input: &Input) -> WorkUnits {
+        if matches!(input, Input::MessageClock { .. }) {
+            return WorkUnits::ZERO;
+        }
         let Input::Recovery { facts, last } = input else {
             return WorkUnits::new(
                 1u64.saturating_add(self.pubsub.work_bound(input, self.routes.capacity()))
@@ -1187,6 +1197,15 @@ impl Owner {
     }
 
     fn plan_change(&self, input: &Input, draft: &mut Draft) -> Result<Change, Stop> {
+        if let Input::MessageClock { now } = input {
+            if self
+                .message_now
+                .is_some_and(|old| old.domain == now.domain && old.tick > now.tick)
+            {
+                return Err(IMPOSSIBLE);
+            }
+            return Ok(Change::MessageClock(*now));
+        }
         if self.recovery.is_some() {
             return match input {
                 Input::Recovery { facts, last } => self.plan_recovery(facts.as_slice(), *last),
@@ -1194,6 +1213,10 @@ impl Owner {
             };
         }
         match input {
+            Input::MessageClock { .. } => Err(IMPOSSIBLE),
+            Input::MessagesExpired { deliveries } => {
+                self.plan_messages_expired(deliveries.as_slice())
+            }
             Input::MaintainReceipts => self.plan_receipt_maintenance(draft),
             Input::OpenSession {
                 connection,
@@ -1668,6 +1691,7 @@ impl Owner {
             packet_id: Some(packet_id),
             payload,
             retain,
+            expiry,
             ..
         } = packet
         else {
@@ -1803,17 +1827,27 @@ impl Owner {
             },
             targets: list,
         };
-        let recipe = if *retain {
+        let recipe = if *retain || expiry.is_some() {
             let mut retain_targets = 0u16;
-            for (index, selected) in selected.iter().enumerate() {
-                if selected.rap {
-                    retain_targets |= 1u16 << index;
+            if *retain {
+                for (index, selected) in selected.iter().enumerate() {
+                    if selected.rap {
+                        retain_targets |= 1u16 << index;
+                    }
                 }
             }
-            Recipe::RetainedPublication(crate::contract::retained::RetainedPublication {
+            let retained = crate::contract::retained::RetainedPublication {
                 admission,
                 retain_targets,
-            })
+            };
+            if let Some(expiry) = expiry {
+                Recipe::ExpiringPublication(crate::contract::command::ExpiringPublication {
+                    admission: crate::contract::command::ExpiringAdmission::Qos12(retained),
+                    expiry: *expiry,
+                })
+            } else {
+                Recipe::RetainedPublication(retained)
+            }
         } else {
             Recipe::AdmitPublication(admission)
         };
@@ -2250,7 +2284,7 @@ impl Owner {
         if let Some(change) = self.plan_qos0_frame(effect, connection, progress, draft)? {
             return Ok(change);
         }
-        if let Some(change) = self.plan_pubsub_frame(effect, connection, progress) {
+        if let Some(change) = self.plan_pubsub_frame(effect, connection, progress, draft)? {
             return Ok(change);
         }
         let failed = matches!(progress, FrameProgress::Failed);
@@ -2333,11 +2367,13 @@ impl Owner {
                     target_revision,
                     qos,
                     claim,
+                    expiry,
+                    started,
                 } => self.valid_outbound_fact(
                     *delivery,
                     *target,
                     *target_revision,
-                    (*qos, *claim),
+                    (*qos, *claim, *expiry, *started),
                     same,
                     run(facts, &starts, FactRank::Session, position),
                 ),
@@ -2517,6 +2553,7 @@ impl Owner {
             Change::Receipts(change) => self.receipts.apply(change)?,
             Change::Pubsub(change) => self.apply_pubsub(change, input)?,
             Change::Nothing => {}
+            Change::MessageClock(now) => self.message_now = Some(now),
             Change::Recover => {
                 let Input::Recovery { facts, last } = input else {
                     return Err(STALE);
@@ -2701,7 +2738,14 @@ impl Owner {
                 target_revision,
                 qos,
                 claim,
-            } => self.add_outbound_fact(*delivery, *target, *target_revision, *qos, *claim)?,
+                expiry,
+                started,
+            } => self.add_outbound_fact(
+                *delivery,
+                *target,
+                *target_revision,
+                (*qos, *claim, *expiry, *started),
+            )?,
             RecoveredFact::Epoch { .. } => self.epoch_recovered = true,
             RecoveredFact::Limits {
                 max_targets_per_admission,
@@ -3030,6 +3074,7 @@ mod tests {
             connection: ConnectionGeneration::new(connection),
             ingress_order: 0,
             packet: InboundPacket::Publish {
+                expiry: None,
                 topic: bytes(b"p1/example"),
                 qos,
                 retain: false,
@@ -3249,7 +3294,11 @@ mod tests {
             };
             assert_eq!(*after, LogicalDuration::new(5));
             let facts = match command.recipe.get() {
-                Recipe::ChangeSubscriptions(_)
+                Recipe::ExpiringPublication(_)
+                | Recipe::TimedReplaySubscriptions(_)
+                | Recipe::MarkDeliveryStarted(_)
+                | Recipe::ExpireDelivery(_)
+                | Recipe::ChangeSubscriptions(_)
                 | Recipe::UpdateSubscriptions(_)
                 | Recipe::ConsumeDelivery(_)
                 | Recipe::ClaimDelivery(_)
@@ -3289,6 +3338,8 @@ mod tests {
             let reason = match flight.facts {
                 CommitFacts::DeliveryConsumed { .. }
                 | CommitFacts::SubscriptionsChanged { .. }
+                | CommitFacts::DeliveryStarted { .. }
+                | CommitFacts::DeliveryExpired { .. }
                 | CommitFacts::DeliveryClaimed { .. }
                 | CommitFacts::DeliveryFinished { .. } => RejectReason::PreconditionFailed,
                 CommitFacts::SessionLifecycle(_) | CommitFacts::RetainedQos0Stored { .. } => {
@@ -4133,6 +4184,7 @@ mod tests {
             connection: ConnectionGeneration::new(CONN),
             ingress_order: 0,
             packet: InboundPacket::Publish {
+                expiry: None,
                 topic: bytes(b"p1/example"),
                 qos: Qos::ExactlyOnce,
                 retain: true,
@@ -5816,6 +5868,7 @@ mod tests {
             connection: ConnectionGeneration::new(CONN),
             ingress_order: 0,
             packet: InboundPacket::Publish {
+                expiry: None,
                 topic: bytes(b"p1/exampl"),
                 qos: Qos::ExactlyOnce,
                 retain: false,
@@ -5885,6 +5938,7 @@ mod tests {
             connection: ConnectionGeneration::new(CONN),
             ingress_order: 0,
             packet: InboundPacket::Publish {
+                expiry: None,
                 topic: bytes(topic),
                 qos: Qos::ExactlyOnce,
                 retain: false,
@@ -6947,6 +7001,7 @@ mod tests {
 
     fn work_item(index: u32) -> crate::contract::pubsub::WorkItem {
         crate::contract::pubsub::WorkItem {
+            expiry: None,
             retain: false,
             delivery: DeliveryId {
                 publication: PublicationId::new(
@@ -7155,6 +7210,7 @@ mod tests {
             connection: ConnectionGeneration::new(connection),
             ingress_order: order,
             packet: InboundPacket::Publish {
+                expiry: None,
                 qos: Qos::AtMostOnce,
                 dup: false,
                 retain: false,
@@ -7787,6 +7843,7 @@ mod tests {
         let mut world = World::with(product_config, EPOCH, CAPACITY);
         let mut item = work_item(0);
         let claim = crate::contract::pubsub::DeliveryClaim {
+            started: false,
             operation: OperationId::new(
                 StoreIncarnation::new(INCARNATION),
                 RunEpoch::new(EPOCH - 1),
@@ -7798,6 +7855,8 @@ mod tests {
         item.claim = Some(claim);
         let mut inventory = fixture(EPOCH);
         inventory.push(RecoveredFact::OutboundDelivery {
+            expiry: None,
+            started: false,
             delivery: item.delivery,
             target: item.target,
             target_revision: item.target_revision,
@@ -7831,6 +7890,8 @@ mod tests {
         let item = work_item(0);
         let mut inventory = fixture(EPOCH);
         inventory.push(RecoveredFact::OutboundDelivery {
+            expiry: None,
+            started: false,
             delivery: item.delivery,
             target: item.target,
             target_revision: item.target_revision,
@@ -8287,6 +8348,7 @@ mod tests {
             panic!("claim")
         };
         old_item.claim = Some(crate::contract::pubsub::DeliveryClaim {
+            started: false,
             operation: claim,
             packet_id,
         });
@@ -8372,6 +8434,7 @@ mod tests {
         let mut a = work_item(0);
         let mut b = work_item(1);
         let claim = crate::contract::pubsub::DeliveryClaim {
+            started: false,
             operation: OperationId::new(
                 StoreIncarnation::new(INCARNATION),
                 RunEpoch::new(EPOCH - 1),
@@ -9119,6 +9182,7 @@ mod tests {
             connection: ConnectionGeneration::new(CONN),
             ingress_order: 1,
             packet: InboundPacket::Publish {
+                expiry: None,
                 topic: bytes(b"retained/q0"),
                 payload: bytes(b"q0"),
                 qos: Qos::AtMostOnce,

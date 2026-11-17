@@ -464,6 +464,7 @@ mod tests {
             connection: ConnectionGeneration::new(generation),
             ingress_order: order,
             packet: InboundPacket::Publish {
+                expiry: None,
                 qos,
                 topic: bytes(b"a/x"),
                 payload: bytes(b"payload"),
