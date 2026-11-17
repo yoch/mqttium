@@ -1,6 +1,6 @@
-# Local MQTT 5 preview with hierarchical pub/sub and durable retained
+# Local MQTT 5 preview with durable Message Expiry
 
-The product receives MQTT 5 QoS 0/1/2 publications, including durable retained values, and delivers
+The product receives MQTT 5 QoS 0/1/2 publications, including durable retained values and Message Expiry, and delivers
 at QoS 0 or 1 to persistent exact and hierarchical subscriptions. Sessions and filters
 are durable. Initially non-retained QoS 0 publications use a bounded volatile path;
 QoS 1/2 admissions atomically create durable recipient obligations. This is
@@ -20,7 +20,7 @@ future matching decisions, not the QoS of an existing obligation.
 
 ## Downloadable local preview
 
-The PR's `mqttiumd-local-preview-linux-x86_64` artifact contains the normal
+The PR's `mqttiumd-message-expiry-preview-linux-x86_64` artifact contains the normal
 standalone archive. Extract it and run `./start.sh ./data`; no laboratory,
 Git or compiler is required. The bundled [quick start](../preview/README.md)
 starts temperature and archive receivers with the Mosquitto MQTT 5 clients.
@@ -41,7 +41,7 @@ matching filters. Exactly 16 is allowed. A seventeenth refuses the complete
 durable admission or explicitly drops the whole volatile occurrence before any
 output. Existing per-literal route limit 16 and total subscription limit 128
 remain in force. [ADR 0031](decisions/0031-hierarchical-subscriptions.md) records
-the decision and versioned canonical options; schema 7 refuses older formats
+the decision and versioned canonical options; current schema9 refuses older formats
 without modification or implicit migration.
 
 ## Launch and external clients
@@ -601,7 +601,7 @@ See proposed [0030](decisions/0030-finite-session-expiry.md),
 [the continuation journal](reception/finite-expiry-journal.md), and
 [the finite model](../models/session-expiry/README.md). Expiry reception is
 system evidence, separate from the fixture oracle's K1/K2b/K3 qualification.
-Message Expiry, Will and general migration remain separate increments.
+Will and general migration remain separate increments.
 
 
 ## Durable retained values (Proposed0032)
@@ -656,5 +656,44 @@ lost results, compiled negative controls and a standalone extracted-archive
 demo. These are product system tests, separate from the existing qualifying
 K1/K2b/K3 fixture scope. The package's `demo.sh` executes the short Mosquitto
 publish-before-dashboard, restart, replace and empty-retained-clear guide.
-Message Expiry, Will, TLS/authentication, shared subscriptions, Subscription
+Will, TLS/authentication, shared subscriptions, Subscription
 Identifiers, outgoing QoS2, MQTT3.1.1 and general migration remain unsupported.
+
+## Message Expiry (Proposed0033)
+
+Property0x02 is accepted only for PUBLISH, once, as four-byte seconds. Absence
+is unlimited, zero expires at reception and every positive value including
+0xffffffff is finite. Other unsupported properties retain their refusals.
+The original domain/tick/interval is frozen before input deferral and copied
+unchanged through retained replay and old owed versions. Tags13..16 preserve
+all historical tags1..12. SQLite schema9 refuses old formats before modification.
+
+Known same-origin time can establish expiry across process restarts. Unknown
+continuity quarantines expiring state, with bounded references and no fresh
+emission; it never resets a lifetime or infers elapsed time from UTC. The normal
+package demo reports physical expiry separately from quarantine. A new state
+without expiry remains usable. Unreadable/regressive/overflowing observations
+refuse or suspend the affected path, not silently expire it.
+
+The network writer checks every zero-progress write attempt, including queue
+and retry delay, and patches the remaining property before first-byte admission.
+Once positive bytes are written, the frame completes or its transport closes.
+The exact pre-attempt reading is the local decision boundary; physical departure
+and arbitrary host scheduling are not timestamped or bounded by this preview.
+A separate durable Started marker allows the same QoS1 claim to complete after
+expiry, reporting zero remaining on an overdue retry. The crash window before
+that marker is conservative: an expired/uncertain unmarked recovered claim is
+quarantined with its PI/reference, not treated as certainly unsent or fresh.
+
+A receiptless maintenance lane scans four publications per request with a live
+key cursor and one outstanding request. It preserves unknown outcomes and
+potentially started claims; conditional claimed-copy expiry requires an exact
+certain-never-started fact. The existing128references/4MiB,32retained topics/1MiB,
+16destinations,8filters,256replay candidates and8192receipts remain. Start and
+terminal frame facts have544 reserved runtime inputs;208frame registrations
+remain. Correlated lifecycle/receipt controls retain independent lanes.
+
+Run `tools/run_message_expiry_reception.sh /tmp/message-expiry-reception` from
+this directory. Its new tests are system evidence, not extension of historical
+K1/K2b/K3 independent-oracle qualification. Message Expiry does not implement
+Will, shared subscriptions, outgoingQoS2, authentication or schema migration.

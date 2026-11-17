@@ -1,4 +1,4 @@
-# mqttiumd — local MQTT 5 retained preview
+# mqttiumd — local MQTT 5 with durable retained and Message Expiry
 
 Extract on compatible Linux x86_64 with glibc (see `BUILD.json` and `RUNTIME.txt`).
 The normal executable needs neither Rust, Git nor the laboratory. Run:
@@ -10,8 +10,55 @@ The normal executable needs neither Rust, Git nor the laboratory. Run:
 It listens on `127.0.0.1:1883`. `MQTTIUMD_LISTEN` overrides the address.
 `./data/broker.sqlite` survives every restart; each start creates fresh logs.
 Clock recognition and readiness are recorded in `data/logs/run.*/events.jsonl`.
-**Schema8 only:** historical databases are refused without modification. Keep
+**Schema9 only:** historical databases are refused without modification. Keep
 an old installation's data separately; there is no automatic migration or reset.
+
+## Try Message Expiry first
+
+Install Python3 and Mosquitto's **client tools** for the optional demo, then use
+an unused directory:
+
+```sh
+./expiry-demo.sh ./expiry-demo-data
+```
+
+It publishes a retained temperature with a two-second lifetime before any
+subscriber exists, observes its durable admission and physical cleanup, checks
+that a new wildcard dashboard receives no expired value, and verifies a new
+state without expiry. It then repeats with a broker interruption on the same
+file. `expiry-demo-data/expiry-demo.json` identifies the actual restart outcome:
+
+- same recognized clock origin: elapsed BOOTTIME can establish expiry;
+- changed or unrecognized origin: old expiring state is **quarantined**, not
+  offered as fresh and not claimed to have physically expired. Its references
+  remain charged until replacement, clearing or applicable session cleanup.
+
+The managed test environment may report `boottime_namespace_unavailable`.
+A new process then has a new private time domain; UTC or an external elapsed
+measurement does not silently turn this into recognized continuity. Sessions
+have their own retention policy and are not expired by a message's lifetime.
+
+For individual commands on a broker launched with `./start.sh ./data`:
+
+```sh
+mosquitto_pub -V mqttv5 -h 127.0.0.1 -p 1883 -i expiring-source -q 1 -r \
+  -t atelier/salle1/temperature -m 'temporary-state' \
+  -D publish message-expiry-interval 2
+# After the lifetime, a new subscriber must not receive temporary-state:
+mosquitto_sub -V mqttv5 -h 127.0.0.1 -p 1883 -i expiry-dashboard -q 1 \
+  -t 'atelier/+/temperature' -C 1 -W 3 -F '%t|%p|%q|%r'
+# No Message Expiry property means an unlimited message lifetime:
+mosquitto_pub -V mqttv5 -h 127.0.0.1 -p 1883 -i expiring-source -q 1 -r \
+  -t atelier/salle1/temperature -m 'current-state'
+```
+
+The bounded empty subscriber wait reports a timeout; that alone is not evidence
+of physical cleanup. The automated demo also checks the read-only SQLite
+inventory, actual clock events and a succeeding fresh-state delivery.
+`./demo.sh ./demo-data` runs both this expiry demonstration and the retained
+replacement/clearing guide below, retaining each data file and its new logs.
+
+## Retained state without a lifetime
 
 Install Mosquitto's **client tools** from your distribution. Before starting any
 dashboard, publish two retained temperatures (the commands exit their ephemeral
@@ -97,10 +144,18 @@ still owed to recipients remain charged. Replacement/clear can release their
 own retained reference without destroying such deliveries.
 
 This is a trusted-local-machine preview, with **no TLS or authentication**.
-Will, Message Expiry, shared subscriptions, Subscription Identifiers, outgoing
+Will, shared subscriptions, Subscription Identifiers, outgoing
 QoS2, MQTT3.1.1 and schema migration are unsupported. Finite session expiry uses
 a conservative logical clock when time-domain continuity cannot be established;
-no UTC jump authorizes deletion. It is not a complete Mosquitto replacement.
+no UTC jump authorizes deletion. Message Expiry instead preserves the original
+raw time domain/tick/interval and blocks fresh delivery on unknown continuity.
+Absent expiry differs from zero; 0xffffffff is finite, not infinity. Outgoing
+QoS0/1 preserves the property with remaining seconds (whole elapsed seconds
+subtracted). A known-started QoS1 exchange can finish after expiry; an ambiguous
+claimed transmission after a crash can remain in bounded quarantine until its
+session is explicitly ended. This availability limit is not strict cross-domain
+MQTT expiry compliance. The first-byte gate checks a pre-write clock sample;
+it does not timestamp physical network departure or bound host preemption. It is not a complete Mosquitto replacement.
 
 The separate source and system-reception archives identify exact clients,
 platforms, commands, crash witnesses, bounds and validation scope. Success in

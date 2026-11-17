@@ -134,7 +134,7 @@ only committed progress crosses restart. Unknown downtime is conservatively
 ignored on domain change. Checkpoint target30s includes actual scheduling/commit
 delay and reports degradation after31s; unavailable storage has no unconditional
 time bound. Sessions still active at process loss are first detached at recovery
-observation. Message Expiry and Will remain separate. Schema6 has no migration
+observation. Message Expiry uses the separate policy below; Will remains separate. Schema6 has no migration
 from1..5, and there is no automatic eviction of valid persistent sessions.
 
 ## Hierarchical local preview (Proposed0031)
@@ -152,7 +152,7 @@ The normal x86_64 Linux archive is executed after extraction; ARM execution,
 TLS, authentication, packaging for system services and format migration remain
 separate. Valid persistent sessions are never evicted to free capacity. Quotas
 are unchanged, including the existing 16 targets per literal filter. Retained
-messages are the next functional increment; see the integration note below.
+messages and Message Expiry are implemented under their separate decisions below.
 
 
 Retained values are implemented under Proposed0032 and report0016:32current
@@ -160,5 +160,21 @@ topics/1MiB, exact and wildcard replay, ordered RH, live RAP and ClientID No Loc
 Replay is frozen transactionally and drained by existing delivery machines.
 Old owed values remain charged under the existing128-reference/4MiB budgets;
 a complete subscription update may therefore be refused. This does not provide
-Message Expiry, an unbounded state archive or format migration. The SQLite8
-preview refuses historical schemas. Product system tests do not qualify allP1/P2.
+an unbounded state archive or format migration. Current schema9 refuses historical schemas. Product system tests do not qualify allP1/P2.
+
+
+## Message lifetime (Proposed0033)
+
+Message Expiry is implemented for retained and non-retained publications,
+including offline responsibilities and outgoingQoS0/1. Its system reception is
+separate from fixture qualification. Raw-domain continuity is required for fresh
+expiring delivery. Unrecognized continuity quarantines existing expiring values;
+no elapsed time is invented, and no strict cross-domain compliance is claimed.
+Quarantined references remain charged until explicit replacement/clearing or
+session termination releases the corresponding responsibility. An unmarked
+recovered claim can be transmission-uncertain; expiry does not free a possibly
+started QoS1 PI or payload. A known Started claim can finish after its lifetime.
+Physical wire-departure timestamps, arbitrary host scheduling bounds, universal
+MQTT conformance and power-loss guarantees remain outside the local preview.
+The sweep has bounded work and one outstanding request; no expiry timer or row
+accumulates per historic connection/publication. SQLite9 has no general migration.

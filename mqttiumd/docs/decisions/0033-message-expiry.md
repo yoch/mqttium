@@ -52,6 +52,9 @@ the remaining interval immediately before trying the first byte. Remaining
 seconds round upward within the original integer interval; established expiry
 blocks a new transmission. Once positive bytes have been written, that MQTT
 frame completes or its connection closes. Mid-frame expiry cannot truncate it.
+The pre-attempt sample establishes local write eligibility; neither physical
+network departure nor arbitrary host preemption is timestamped or bounded.
+This is an explicit limitation, not a strict real-time wire-deadline claim.
 
 A separately correlated first-positive-write observation may establish a
 durable Started marker for this exact delivery and claim. A known started QoS1
@@ -74,12 +77,22 @@ answers, pages and callbacks cannot act on a new claim or connection generation.
 ## Cleanup, capacity and formats
 
 A receiptless writer-maintenance lane scans at most four publications per
-request, with a live key cursor, one request outstanding and absolute results.
+request, with a live key cursor, one frozen observation per complete scan, one request
+outstanding and absolute results. A stopped clock cannot reuse a completed
+scan header. A lost-result retry preserves its header and has a three-attempt
+budget; stale/duplicated replies are ignored without returning credit twice.
 It removes current retained references and unclaimed expired recipient copies
 conditionally, preserving inbound QoS2 markers and every potentially started
 claim. Removed identities are reconciled with the owner; the timer itself
 grants no credits. Exact, guarded expiry of a certainly unsent claimed copy
 uses the normal correlated operation and unknown-result resolution.
+
+Each delivery has at most one Start/Finish/Expire control flight at a time;
+known results are consumed before allocating a subsequent control identity.
+The existing512 control-window reserve remains shared with inbound releases
+and lifecycle work; resolution and receiptless maintenance need no new receipt.
+Two socket facts per accepted expiring frame require544 terminal input slots,
+while frame registration stays208 and the physical/business quotas stay fixed.
 
 All existing quotas remain:32 retained topics/1MiB,128 references/4MiB shared
 payload,16 live destinations,8 filters,256 replay candidates and8192 receipts.

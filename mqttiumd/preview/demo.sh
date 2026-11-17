@@ -82,3 +82,4 @@ printf '%s\n' 'atelier/salle1/temperature|temperature:3|1|1' >"$preview_data/exp
 cmp "$preview_data/last.txt" "$preview_data/expected-last.txt"
 stop
 printf '%s\n' 'PASS: retained values survived restart; replacement and empty-payload clearing were replayed to new dashboards.'
+"$preview_dir/expiry-demo.sh" "$preview_data/message-expiry"

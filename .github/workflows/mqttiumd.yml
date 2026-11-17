@@ -541,3 +541,47 @@ jobs:
             ${{ runner.temp }}/retained-preview/preview/*.tar.gz
             ${{ runner.temp }}/retained-preview/preview/*.tar.gz.sha256
           if-no-files-found: error
+
+  message-expiry-preview:
+    name: durable Message Expiry and local preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+      - name: Install independent MQTT clients
+        run: |
+          python -m pip install --disable-pip-version-check -r tests/system/requirements.txt
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mosquitto-clients
+          mosquitto_pub --help | head -3
+          mosquitto_sub --help | head -3
+      - name: Message lifetime, quarantine, claims, crashes and extracted preview
+        run: tools/run_message_expiry_reception.sh "$RUNNER_TEMP/message-expiry-preview"
+      - name: Upload system evidence and standalone preview
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-message-expiry-product-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/message-expiry-preview
+            ${{ runner.temp }}/message-expiry-preview.tar.gz
+            ${{ runner.temp }}/message-expiry-preview.tar.gz.sha256
+          if-no-files-found: error
+      - name: Upload the normal runnable archive separately
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-message-expiry-preview-linux-x86_64
+          path: |
+            ${{ runner.temp }}/message-expiry-preview/preview/*.tar.gz
+            ${{ runner.temp }}/message-expiry-preview/preview/*.tar.gz.sha256
+          if-no-files-found: error

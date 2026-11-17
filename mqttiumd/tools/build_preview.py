@@ -51,7 +51,7 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
     package = out / f"mqttiumd-preview-{source[:8]}-{platform.machine()}-linux"
     package.mkdir()
     shutil.copy2(binary, package / "mqttiumd")
-    for name in ("README.md", "start.sh", "demo.sh"):
+    for name in ("README.md", "start.sh", "demo.sh", "expiry-demo.sh"):
         shutil.copy2(root / "preview" / name, package / name)
     (package / "NORMAL-FEATURES.txt").write_text(features)
     runtime = command("ldd", str(binary))
