@@ -6,6 +6,7 @@ accepts only absent Message Expiry or one Four Byte Integer property 0x02.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 import time
 
 from pubsub_probe import MAX_BUFFERED, MAX_PAYLOAD, MAX_TOPIC, Publication
@@ -15,6 +16,11 @@ from external_wildcard import Subscription, subscribe_packet
 from pubsub_probe import decode_filter_ack
 
 MAX_INTERVAL = 0xFFFFFFFF
+
+
+def successful_sigkill_targets(trace: str) -> set[int]:
+    """Targets of successful own SIGKILL syscalls in one retained strace."""
+    return {int(pid) for pid in re.findall(r'kill\((\d+), SIGKILL\)\s+= 0', trace)}
 
 
 def interval(value):

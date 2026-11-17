@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from external_message_expiry import MqttiumMessageExpiry, PahoMessageExpiry
 from external_wildcard import Subscription
-from message_expiry_probe import decode_publish, publish_packet
+from message_expiry_probe import decode_publish, publish_packet, successful_sigkill_targets
 from message_expiry_reception import (BUSINESS, physically_drained, one_delivery, closed_connection,
                                        original_copies, negative_puback)
 from message_expiry_boundaries import (canonical_timed, canonical_expire, continuous, _positive,
@@ -14,6 +14,52 @@ from mqttium.api import PublishReceipt
 from tcp_probe import Frame, FrameDecoder, ReceiptFailure, operation_hex
 from test_external_clients import ScriptedBroker, read_packet
 from test_session_reception import accept
+
+
+class OwnSigkillWitnessTests(unittest.TestCase):
+    # Actual immutable CI artifact14361174676, source9df5979b, boundaries.strace.
+    # The successful syscall was split by strace while another task was read.
+    CI_SPLIT = (
+        '4615  kill(4730, SIGKILL <unfinished ...>\n'
+        '4736  recvfrom(12,  <unfinished ...>\n'
+        '4615  <... kill resumed>)               = 0\n'
+    )
+
+    def test_actual_ci_split_sigkill_is_the_same_successful_own_call(self):
+        self.assertEqual(successful_sigkill_targets(self.CI_SPLIT), {4730})
+
+    def test_complete_successful_calls_remain_readable(self):
+        self.assertEqual(successful_sigkill_targets(
+            '4615  kill(4730, SIGKILL) = 0\nkill(4800, SIGKILL) = 0\n'), {4730, 4800})
+
+    def test_failed_unterminated_unmatched_wrong_caller_and_wrong_syscall_do_not_join(self):
+        prefix = '4615  kill(4730, SIGKILL <unfinished ...>\n'
+        invalid = (
+            prefix,
+            '4615  <... kill resumed>) = 0\n',
+            prefix + '4616  <... kill resumed>) = 0\n',
+            prefix + '4615  <... wait4 resumed>) = 0\n',
+            prefix + '4615  <... kill resumed>) = -1 ESRCH (No such process)\n',
+            prefix + '4615  <... kill resumed>4731, SIGKILL) = 0\n',
+            prefix + '4615  wait4(4900, 0x123, WNOHANG, NULL) = 0\n4615  <... kill resumed>) = 0\n',
+            '4615  kill(4730, SIGKILL) = -1 EPERM (Operation not permitted)\n',
+            '4615  kill(4730, SIGTERM) = 0\n',
+            'kill(4730, SIGKILL <unfinished ...>\n<... kill resumed>) = 0\n',
+        )
+        for trace in invalid:
+            with self.subTest(trace=trace):
+                self.assertEqual(successful_sigkill_targets(trace), set())
+
+    def test_interleaved_callers_and_replaced_pending_pid_stay_separate(self):
+        trace = ('4615  kill(4730, SIGKILL <unfinished ...>\n'
+                 '4616  kill(4800, SIGKILL <unfinished ...>\n'
+                 '4616  <... kill resumed>) = 0\n'
+                 '4615  <... kill resumed>) = 0\n')
+        self.assertEqual(successful_sigkill_targets(trace), {4730, 4800})
+        replaced = ('4615  kill(4730, SIGKILL <unfinished ...>\n'
+                    '4615  kill(4900, SIGKILL <unfinished ...>\n'
+                    '4615  <... kill resumed>) = 0\n')
+        self.assertEqual(successful_sigkill_targets(replaced), {4900})
 
 
 def frozen_quarantine_fixture():
