@@ -9099,4 +9099,19 @@ mod tests {
         let effects = world.drain();
         assert!(effects.iter().any(|(_,effect)| matches!(effect,Effect::Persist {command} if matches!(command.recipe.get(),Recipe::RetainedPublication(value) if value.admission.targets.is_empty() && value.admission.retain))), "retained_publish_did_not_enter_durable_admission");
     }
+    #[test]
+    fn a_retained_qos0_occurrence_has_a_durable_command_without_an_mqtt_identifier() {
+        let mut world=World::connected();
+        world.owner.lifecycle_enabled=true;
+        world.applied(product_settings(CONN,8));
+        let _=world.drain();
+        let input=Input::Packet {connection:ConnectionGeneration::new(CONN),ingress_order:1,packet:InboundPacket::Publish {topic:bytes(b"retained/q0"),payload:bytes(b"q0"),qos:Qos::AtMostOnce,retain:true,dup:false,packet_id:None}};
+        assert!(matches!(world.owner.step(input,TurnGrant {work_limit:WorkUnits::new(100000)}),StepOutcome::Applied {..}));
+        let effects=world.drain();
+        assert!(effects.iter().any(|(_,effect)| matches!(effect,Effect::Persist {command} if matches!(command.recipe.get(),Recipe::RetainedQos0(value) if value.costs.exchange_slots==ExchangeSlots::ZERO))), "retained_qos0_bypassed_durable_mutation_or_invented_exchange");
+        assert!(world.owner.slots.is_empty());
+        assert_eq!(world.owner.leases.held(),0);
+        assert!(!effects.iter().any(|(_,effect)|matches!(effect,Effect::EmitFrame {..}|Effect::EmitQos0 {..}|Effect::EmitPublish {..})));
+    }
+
 }
