@@ -37,7 +37,14 @@ pub struct Connect {
 pub enum Packet {
     Connect(Connect),
     Core(InboundPacket),
-    Disconnect { expiry: Option<SessionExpiry> },
+    /// A validated interval awaiting its receipt-time observation in the runtime.
+    TimedPublish {
+        packet: InboundPacket,
+        interval: u32,
+    },
+    Disconnect {
+        expiry: Option<SessionExpiry>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,6 +411,7 @@ fn property<'a>(id: u32, input: &mut Cursor<'a>) -> Result<Property<'a>, Error> 
 #[derive(Default)]
 struct Properties {
     expiry: Option<u32>,
+    message_expiry: Option<u32>,
     max_packet: Option<u32>,
     receive_maximum: Option<u16>,
     alias_maximum: Option<u16>,
@@ -444,6 +452,7 @@ fn properties(input: &mut Cursor<'_>, context: Context) -> Result<Properties, Er
             }
             (Context::Connect, 0x19, Property::Byte(0)) => (),
             (Context::Disconnect, 0x11, Property::Four(n)) => result.expiry = Some(n),
+            (Context::Publish, 0x02, Property::Four(n)) => result.message_expiry = Some(n),
             (Context::Publish, 0x23, _) => {
                 return Err(Error {
                     reason: 0x94,
@@ -564,14 +573,19 @@ fn publish(first: u8, body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
         .map_err(|_| oversized("TopicTooLarge"))?;
     let payload = SharedBytes::copy_from(payload, bounds.max_payload)
         .map_err(|_| oversized("PayloadTooLarge"))?;
-    Ok(Packet::Core(InboundPacket::Publish {
+    let packet = InboundPacket::Publish {
         topic,
         qos,
         retain: first & 1 != 0,
         dup: first & 8 != 0,
         packet_id,
+        expiry: None,
         payload,
-    }))
+    };
+    Ok(match props.message_expiry {
+        Some(interval) => Packet::TimedPublish { packet, interval },
+        None => Packet::Core(packet),
+    })
 }
 
 fn pubrel(body: &[u8]) -> Result<Packet, Error> {
@@ -906,7 +920,24 @@ pub fn encode_qos0_retained(
     payload: &SharedBytes,
     retain: bool,
 ) -> Result<Vec<u8>, Error> {
-    encode_publication(None, topic, payload, false, retain)
+    encode_qos0_expiring(topic, payload, retain, None).map(|encoded| encoded.bytes)
+}
+
+/// Encoded MQTT publication and the exact fixed-width value the writer may
+/// update before its first positive write. Updating it never changes the size.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EncodedPublish {
+    pub bytes: Vec<u8>,
+    pub expiry_value_offset: Option<usize>,
+}
+
+pub fn encode_qos0_expiring(
+    topic: &SharedBytes,
+    payload: &SharedBytes,
+    retain: bool,
+    remaining: Option<u32>,
+) -> Result<EncodedPublish, Error> {
+    encode_publication(None, topic, payload, false, retain, remaining)
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -925,15 +956,29 @@ pub fn encode_publish_retained(
     dup: bool,
     retain: bool,
 ) -> Result<Vec<u8>, Error> {
-    encode_publication(Some(packet_id), topic_name, payload, dup, retain)
+    encode_publish_expiring(packet_id, topic_name, payload, dup, retain, None)
+        .map(|encoded| encoded.bytes)
 }
+
+pub fn encode_publish_expiring(
+    packet_id: OutboundPacketId,
+    topic_name: &SharedBytes,
+    payload: &SharedBytes,
+    dup: bool,
+    retain: bool,
+    remaining: Option<u32>,
+) -> Result<EncodedPublish, Error> {
+    encode_publication(Some(packet_id), topic_name, payload, dup, retain, remaining)
+}
+
 fn encode_publication(
     packet_id: Option<OutboundPacketId>,
     topic_name: &SharedBytes,
     payload: &SharedBytes,
     dup: bool,
     retain: bool,
-) -> Result<Vec<u8>, Error> {
+    remaining: Option<u32>,
+) -> Result<EncodedPublish, Error> {
     topic(topic_name.as_slice())?;
     if topic_name.len() > 1024 || payload.len() > 32768 {
         return Err(oversized("OutgoingFieldTooLarge"));
@@ -942,6 +987,7 @@ fn encode_publication(
         .len()
         .checked_add(payload.len())
         .and_then(|n| n.checked_add(if packet_id.is_some() { 5 } else { 3 }))
+        .and_then(|n| n.checked_add(if remaining.is_some() { 5 } else { 0 }))
         .ok_or_else(|| oversized("PacketTooLarge"))?;
     let length_bytes = if body < 128 {
         1
@@ -982,9 +1028,20 @@ fn encode_publication(
     if let Some(packet_id) = packet_id {
         bytes.extend_from_slice(&packet_id.get().to_be_bytes());
     }
-    bytes.push(0);
+    let expiry_value_offset = if let Some(remaining) = remaining {
+        bytes.extend_from_slice(&[5, 0x02]);
+        let offset = bytes.len();
+        bytes.extend_from_slice(&remaining.to_be_bytes());
+        Some(offset)
+    } else {
+        bytes.push(0);
+        None
+    };
     bytes.extend_from_slice(payload.as_slice());
-    Ok(bytes)
+    Ok(EncodedPublish {
+        bytes,
+        expiry_value_offset,
+    })
 }
 
 #[cfg(test)]
@@ -1382,6 +1439,7 @@ mod tests {
             dup,
             packet_id,
             payload,
+            expiry: None,
         }) = decode(0x3c, body, BOUNDS).unwrap()
         else {
             panic!("PUBLISH")
@@ -1418,6 +1476,7 @@ mod tests {
                 dup,
                 packet_id,
                 payload,
+                expiry: None,
             }) = decoded.unwrap()
             else {
                 panic!("PUBLISH")

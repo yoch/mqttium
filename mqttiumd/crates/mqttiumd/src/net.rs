@@ -9,12 +9,19 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use mqttiumd_contract::ids::{ConnectionKey, EffectId};
+use mqttiumd_contract::message_expiry::{
+    ExpiryState, MessageExpiry, MessageExpiryBlock, MessageTime,
+};
 
 use crate::codec::{self, ErrorKind};
+use crate::session_time::{SessionClock, SystemClock};
 
 pub const INPUT_SLOTS: usize = 4;
 pub const OUTPUT_SLOTS: usize = 4;
 pub const MAX_PACKET_BYTES: usize = 65_536;
+// A correlated frame can publish Started and one terminal result. This is a
+// receipt bound; it grants no additional outgoing-frame admission capacity.
+pub const WRITTEN_SLOTS: usize = 2 * (OUTPUT_SLOTS + 1) + 8;
 // Four queued writes, one active write and eight terminal receipts. Wire
 // progress is an independent bounded lane, not the core's receipt lane.
 const WIRE_PROGRESS_SLOTS: usize = OUTPUT_SLOTS + 1 + 8;
@@ -34,10 +41,27 @@ pub enum Incoming {
 pub struct Write {
     pub correlation: Option<(EffectId, ConnectionKey)>,
     pub bytes: Vec<u8>,
+    pub expiry: Option<WriteExpiry>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct WriteExpiry {
+    pub expiry: MessageExpiry,
+    /// Offset of the four value bytes supplied by the publication encoder.
+    pub value_offset: usize,
+    /// An existing exchange may finish after its original message lifetime.
+    pub started: bool,
 }
 
 #[derive(Debug)]
 pub enum Written {
+    Started {
+        correlation: Option<(EffectId, ConnectionKey)>,
+    },
+    NotStarted {
+        correlation: Option<(EffectId, ConnectionKey)>,
+        reason: MessageExpiryBlock,
+    },
     Complete {
         correlation: Option<(EffectId, ConnectionKey)>,
         bytes: usize,
@@ -98,6 +122,11 @@ pub struct Connection {
 }
 
 pub fn spawn(stream: TcpStream) -> io::Result<Connection> {
+    let clock = SystemClock::new().map_err(io::Error::other)?;
+    spawn_with_clock(stream, Arc::new(clock))
+}
+
+pub fn spawn_with_clock(stream: TcpStream, clock: Arc<dyn SessionClock>) -> io::Result<Connection> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(POLL))?;
     let socket = socket2::SockRef::from(&stream);
@@ -107,8 +136,7 @@ pub fn spawn(stream: TcpStream) -> io::Result<Connection> {
     let output_stream = stream.try_clone()?;
     let (input_tx, incoming) = mpsc::sync_channel(INPUT_SLOTS);
     let (outgoing, output_rx) = mpsc::sync_channel(OUTPUT_SLOTS);
-    // Four queued writes, one active write, and their terminal receipts fit.
-    let (written_tx, written) = mpsc::sync_channel(8);
+    let (written_tx, written) = mpsc::sync_channel(WRITTEN_SLOTS);
     let (progress_tx, wire_progress) = mpsc::sync_channel(WIRE_PROGRESS_SLOTS);
     let control = Control {
         cancelled: Arc::new(AtomicBool::new(false)),
@@ -134,6 +162,7 @@ pub fn spawn(stream: TcpStream) -> io::Result<Connection> {
                 written_tx,
                 progress_tx,
                 writer_control,
+                clock.as_ref(),
             );
         }) {
         Ok(writer) => writer,
@@ -321,34 +350,127 @@ fn read_packets(mut stream: TcpStream, sender: SyncSender<Incoming>, control: Co
     let _ = sender.try_send(Incoming::Closed { code });
 }
 
-fn write_one(stream: &mut TcpStream, bytes: &[u8], control: &Control) -> Result<(), &'static str> {
+#[derive(Debug, PartialEq, Eq)]
+enum WriteFailure {
+    NotStarted(MessageExpiryBlock),
+    Failed(&'static str),
+}
+
+fn prepare_expiry(
+    bytes: &mut [u8],
+    expiry: WriteExpiry,
+    clock: &dyn SessionClock,
+) -> Result<(), WriteFailure> {
+    let value_end = expiry
+        .value_offset
+        .checked_add(4)
+        .filter(|end| *end <= bytes.len())
+        .ok_or(WriteFailure::Failed("output_expiry_offset"))?;
+    let state = clock
+        .read()
+        .ok()
+        .and_then(|now| {
+            expiry
+                .expiry
+                .state(MessageTime {
+                    domain: now.domain,
+                    tick: now.tick,
+                })
+                .ok()
+        })
+        .unwrap_or(ExpiryState::TemporalUncertain);
+    let remaining = match state {
+        ExpiryState::Fresh { remaining } => remaining,
+        _ if expiry.started => 0,
+        ExpiryState::Expired => {
+            return Err(WriteFailure::NotStarted(MessageExpiryBlock::Expired));
+        }
+        ExpiryState::TemporalUncertain => {
+            return Err(WriteFailure::NotStarted(
+                MessageExpiryBlock::TemporalUncertain,
+            ));
+        }
+    };
+    bytes[expiry.value_offset..value_end].copy_from_slice(&remaining.to_be_bytes());
+    Ok(())
+}
+
+fn write_attempts(
+    bytes: &mut [u8],
+    expiry: Option<WriteExpiry>,
+    control: &Control,
+    clock: &dyn SessionClock,
+    mut write: impl FnMut(&[u8], Duration) -> io::Result<usize>,
+    mut started: impl FnMut() -> bool,
+) -> Result<(), WriteFailure> {
     if bytes.len() > MAX_PACKET_BYTES {
-        return Err("output_packet_too_large");
+        return Err(WriteFailure::Failed("output_packet_too_large"));
     }
     let deadline = Instant::now() + WRITE_TIMEOUT;
     let mut offset = 0;
     while offset < bytes.len() {
         if control.is_cancelled() {
-            return Err("cancelled");
+            return Err(WriteFailure::Failed("cancelled"));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err("write_timeout");
+            return Err(WriteFailure::Failed("write_timeout"));
         }
-        stream
-            .set_write_timeout(Some(remaining.min(POLL)))
-            .map_err(|_| "write_io")?;
-        match stream.write(&bytes[offset..]) {
-            Ok(0) => return Err("write_zero"),
-            Ok(count) => offset += count,
+        // An unsuccessful attempt may consume the rest of the lifetime. Gate
+        // every zero-progress retry, immediately before granting a write.
+        if offset == 0
+            && let Some(expiry) = expiry
+        {
+            prepare_expiry(bytes, expiry, clock)?;
+        }
+        match write(&bytes[offset..], remaining.min(POLL)) {
+            Ok(0) => return Err(WriteFailure::Failed("write_zero")),
+            Ok(count) => {
+                if count > bytes.len() - offset {
+                    return Err(WriteFailure::Failed("invalid_write_progress"));
+                }
+                let first = offset == 0;
+                offset += count;
+                if first && !started() {
+                    return Err(WriteFailure::Failed("write_result_queue_full"));
+                }
+            }
             Err(error) if retryable(&error) => {}
-            Err(_) => return Err("write_io"),
+            Err(_) => return Err(WriteFailure::Failed("write_io")),
         }
     }
     if Instant::now() >= deadline {
-        return Err("write_timeout");
+        return Err(WriteFailure::Failed("write_timeout"));
     }
     Ok(())
+}
+
+fn write_one(
+    stream: &mut TcpStream,
+    frame: &mut Write,
+    control: &Control,
+    clock: &dyn SessionClock,
+    sender: &SyncSender<Written>,
+) -> Result<(), WriteFailure> {
+    write_attempts(
+        &mut frame.bytes,
+        frame.expiry,
+        control,
+        clock,
+        |bytes, timeout| {
+            stream.set_write_timeout(Some(timeout))?;
+            stream.write(bytes)
+        },
+        || {
+            frame.correlation.is_none()
+                || report(
+                    sender,
+                    Written::Started {
+                        correlation: frame.correlation,
+                    },
+                )
+        },
+    )
 }
 
 fn report(sender: &SyncSender<Written>, mut result: Written) -> bool {
@@ -374,22 +496,35 @@ fn write_frames(
     sender: SyncSender<Written>,
     progress: SyncSender<WireProgress>,
     control: Control,
+    clock: &dyn SessionClock,
 ) {
     let code = loop {
         if control.is_cancelled() {
             break "cancelled";
         }
-        let frame = match receiver.recv_timeout(POLL) {
+        let mut frame = match receiver.recv_timeout(POLL) {
             Ok(frame) => frame,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break "output_producer_closed",
         };
-        let result = match write_one(&mut stream, &frame.bytes, &control) {
+        let result = match write_one(&mut stream, &mut frame, &control, clock, &sender) {
             Ok(()) => Written::Complete {
                 correlation: frame.correlation,
                 bytes: frame.bytes.len(),
             },
-            Err(code) => {
+            Err(WriteFailure::NotStarted(reason)) => {
+                if !report(
+                    &sender,
+                    Written::NotStarted {
+                        correlation: frame.correlation,
+                        reason,
+                    },
+                ) {
+                    break "write_result_queue_full";
+                }
+                continue;
+            }
+            Err(WriteFailure::Failed(code)) => {
                 let _ = report(
                     &sender,
                     Written::Failed {
@@ -539,6 +674,7 @@ mod tests {
             .send(Write {
                 correlation: None,
                 bytes: vec![0xd0, 0],
+                expiry: None,
             })
             .unwrap();
         let result = connection
@@ -574,6 +710,7 @@ mod tests {
                 .send(Write {
                     correlation: None,
                     bytes: vec![0; 65_536],
+                    expiry: None,
                 })
                 .unwrap();
         }
@@ -590,6 +727,7 @@ mod tests {
                     break;
                 }
                 Written::Complete { .. } => {}
+                other => panic!("unexpected result: {other:?}"),
             }
         }
         assert!(failed, "test did not reach socket backpressure");
@@ -639,6 +777,7 @@ mod tests {
                 .send(Write {
                     correlation: None,
                     bytes: vec![0; 65_536],
+                    expiry: None,
                 })
                 .unwrap();
         }
