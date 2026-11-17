@@ -1447,6 +1447,51 @@ fn a_framed_publish_waiting_for_connack_keeps_its_reader_expiry_origin() {
 }
 
 #[test]
+fn a_regressed_reader_sample_is_not_reclassified_as_message_expiration() {
+    use crate::session_time::testing::FakeClock;
+    let sample = |tick| SessionClockReading {
+        domain: [87; 32],
+        tick,
+    };
+    let clock = Arc::new(FakeClock::new(sample(10_000_000_000)));
+    with_runtime_clock(128, clock.clone(), |runtime, directory| {
+        let (generation, mut client) = peer(runtime);
+        let mut connect = connect_then_subscribe(b"expiry-reader-regression");
+        connect.truncate(2 + usize::from(connect[1]));
+        client.write_all(&connect).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !runtime.peers[&generation].pending {
+            runtime.connections().unwrap();
+            assert!(Instant::now() < deadline, "reader did not frame CONNECT");
+            thread::sleep(Duration::from_millis(1));
+        }
+        clock.set(sample(5_000_000_000));
+        client
+            .write_all(&[0x31, 10, 0, 1, b't', 5, 2, 0, 0, 0, 1, b'v'])
+            .unwrap();
+        while runtime.peers[&generation].handshake_packet.is_none() {
+            runtime.connections().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "reader did not frame regressed PUBLISH"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        clock.set(sample(12_000_000_000));
+        until(runtime, |r| r.peers[&generation].connected);
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        let error = runtime
+            .connections()
+            .expect_err("regressed_reader_sample_became_message_expiration");
+        assert_eq!(error.code, "session_clock_regressed");
+        let state =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert!(state.publications.is_empty());
+        assert!(state.retained.is_empty());
+    });
+}
+
+#[test]
 fn fresh_connect_pipeline_cannot_send_disconnect_before_core_connack() {
     concatenated_subscription_waits_for_connack(false);
 }
