@@ -50,9 +50,12 @@ pub(super) fn receipt_bounds(
     operation: OperationId,
     record: &OperationRecord,
 ) -> Result<Option<IdentityBounds>, ReadError> {
-    let Decision::Committed(facts) = record.decision else {
+    // A subscription burns its entire reserved causal range even when the
+    // business decision is refused. Its receipt is the witness until the
+    // compact publication frontier covers the range before physical deletion.
+    if matches!(record.decision, Decision::Rejected(_)) && record.recipe.get(6) != Some(&12) {
         return Ok(None);
-    };
+    }
     let recipe = Recipe::decode_canonical(
         &record.recipe,
         state.limits.max_targets_per_admission,
@@ -71,28 +74,31 @@ pub(super) fn receipt_bounds(
     let Some(bounds) = bounds(&recipe)? else {
         return Ok(None);
     };
-    let valid = match (&recipe, facts) {
-        (
-            Recipe::AdmitPublication(a),
-            CommitFacts::PublicationAdmitted {
-                publication,
-                exchange,
-            },
-        ) => a.publication == publication && a.source.exchange == exchange,
-        (
-            Recipe::RetainedPublication(a),
-            CommitFacts::PublicationAdmitted {
-                publication,
-                exchange,
-            },
-        ) => a.admission.publication == publication && a.admission.source.exchange == exchange,
-        (Recipe::RetainedQos0(a), CommitFacts::RetainedQos0Stored { publication }) => {
-            a.publication == publication
-        }
-        (Recipe::ReplaySubscriptions(a), CommitFacts::SubscriptionsChanged { session, .. }) => {
-            a.update.session == session
-        }
-        _ => false,
+    let valid = match record.decision {
+        Decision::Rejected(_) => matches!(recipe, Recipe::ReplaySubscriptions(_)),
+        Decision::Committed(facts) => match (&recipe, facts) {
+            (
+                Recipe::AdmitPublication(a),
+                CommitFacts::PublicationAdmitted {
+                    publication,
+                    exchange,
+                },
+            ) => a.publication == publication && a.source.exchange == exchange,
+            (
+                Recipe::RetainedPublication(a),
+                CommitFacts::PublicationAdmitted {
+                    publication,
+                    exchange,
+                },
+            ) => a.admission.publication == publication && a.admission.source.exchange == exchange,
+            (Recipe::RetainedQos0(a), CommitFacts::RetainedQos0Stored { publication }) => {
+                a.publication == publication
+            }
+            (Recipe::ReplaySubscriptions(a), CommitFacts::SubscriptionsChanged { session, .. }) => {
+                a.update.session == session
+            }
+            _ => false,
+        },
     };
     let scope = |p: PublicationId| {
         (p.incarnation(), p.epoch(), p.owner())
