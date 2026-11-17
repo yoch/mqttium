@@ -115,7 +115,24 @@ This closes the former broker-startup row; it does not accept proposed ADRs.
 
 | Condition | Closed by | Blocks |
 | - | - | - |
-| Outgoing QoS 2, wildcard/shared subscriptions, retained messages, intermediate finite expiry, Will and authentication remain outside the experimental exact-topic pub/sub profile. Report 0010 adds incoming/outgoing QoS 0 and grants 0, preserving the durable QoS 1/2 admission path and separate system-test scope. Incoming QoS 1 retains lawful repeat-admission behavior. This does not extend fixture-oracle qualification or complete P1/P2 | Product follow-up lots | A complete or deployable broker |
+| Outgoing QoS 2, wildcard/shared subscriptions, retained messages, Will and authentication remain outside the experimental exact-topic pub/sub profile. Report 0010 adds incoming/outgoing QoS 0 and grants 0, preserving the durable QoS 1/2 admission path and separate system-test scope. Incoming QoS 1 retains lawful repeat-admission behavior. This does not extend fixture-oracle qualification or complete P1/P2 | Product follow-up lots | A complete or deployable broker |
 | SQLite schema 5 refuses schema 1/2/3/4 before write-affecting pragmas; main/WAL bytes remain unchanged. An explicit migration/export path is not implemented. General multiowner delivery ordering remains outside this single-owner FIFO product | Store/runtime follow-up | Upgrade of existing databases and broader operating profiles |
 | Live receipt retirement removes the cumulative 8,192-command ceiling within the received profile (report0011, proposed0027). Proposed0028/report0012 add protected outgoing QoS 1 PI reuse after known Finish application, with immutable observation targets at runtime reader-channel dequeue. The 8,192 physical receipt slots, 1,024/640 per-origin window, 512 control reserve and 64 origin rows remain finite. Session capacity (128 active incarnations, with explicit zero/infinite lifecycle in proposed0029), active claims, checked causal identities, typed read budgets and storage availability still bound service life. Upstream unobserved bytes and arbitrary identical wire ACKs first observed after reuse are outside the internal-observation correlation guarantee. No indefinite-service or loaded-writer latency/performance guarantee is claimed | Store/runtime follow-up | Broader long-running operation and G4 |
 | A storage syscall can outlive graceful shutdown's deadline; the product reports incomplete shutdown/unknown outcome and process exit releases OS resources. Process-kill evidence is not power-loss evidence | Runtime/storage follow-up | Stronger system/storage failure guarantees |
+
+
+## Finite session expiry (Proposed0030)
+
+The product now implements all Session Expiry Interval values with durable
+fixed detachment deadlines, guarded Open/Expire ordering and one bounded clock
+anchor. This removes the former intermediate-finite-interval profile exclusion;
+it does not accept Proposed ADRs or qualify temporal behavior with the fixture
+oracle. The system receipt and report0014 identify the final tested content.
+
+Remaining temporal limits: clock-origin continuity must be established; otherwise
+only committed progress crosses restart. Unknown downtime is conservatively
+ignored on domain change. Checkpoint target30s includes actual scheduling/commit
+delay and reports degradation after31s; unavailable storage has no unconditional
+time bound. Sessions still active at process loss are first detached at recovery
+observation. Message Expiry and Will remain separate. Schema6 has no migration
+from1..5, and there is no automatic eviction of valid persistent sessions.

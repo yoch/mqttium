@@ -314,6 +314,37 @@ jobs:
             ${{ runner.temp }}/sessions-product.tar.gz.sha256
           if-no-files-found: error
 
+  expiry-product:
+    name: product finite session expiry
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+      - name: Install the independent external MQTT client
+        run: python -m pip install --disable-pip-version-check -r tests/system/requirements.txt
+      - name: Finite expiry, time boundaries, capacity, crashes and exact controls
+        run: tools/run_expiry_reception.sh "$RUNNER_TEMP/expiry-product"
+      - name: Keep each expiry run's own evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mqttiumd-expiry-product-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/expiry-product
+            ${{ runner.temp }}/expiry-product.tar.gz
+            ${{ runner.temp }}/expiry-product.tar.gz.sha256
+          if-no-files-found: error
+
   outgoing-pi-product:
     name: product outgoing QoS 1 identifier reuse
     runs-on: ubuntu-24.04

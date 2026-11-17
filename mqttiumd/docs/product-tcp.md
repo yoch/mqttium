@@ -105,8 +105,8 @@ policy. Sleeping after automatic acknowledgement is not proof of held work.
 ## Accepted profile
 
 CONNECT requires MQTT 5 and an explicit nonempty UTF-8 ClientID. Both Clean
-Start values are supported. Session Expiry Interval may be absent (zero), zero,
-or `0xffffffff`; intermediate finite values are explicitly outside the profile.
+Start values are supported. Session Expiry Interval may be absent (zero) or any u32 value: zero, finite
+1..0xfffffffe, or `0xffffffff` (infinity).
 The existing command-line pub/sub helpers request infinity explicitly.
 
 | Request | Existing session | Public result |
@@ -118,6 +118,9 @@ The existing command-line pub/sub helpers request infinity explicitly.
 | DISCONNECT, expiry zero | Persistent connected | Explicit durable termination |
 | Transport close, infinity | Current binding | Preserve session and outstanding responsibilities |
 | Transport close, zero | Current binding | End incarnation and recover capacity |
+| Transport close, finite | Current binding | Persist original close observation and fixed deadline |
+| Reconnect before finite deadline | Detached current incarnation | Resume state/SP1 and invalidate old deadline |
+| Reconnect at/after finite deadline | Detached current incarnation | Atomically retire it and create fresh incarnation/SP0 |
 
 CONNACK success waits for a correlated known commit applied by the owner. Open,
 replace and close retain one OperationId through unknown outcomes and resolution;
@@ -129,8 +132,8 @@ before Clean Start handling, so Clean Start 0 then creates a new session/SP0.
 DISCONNECT without the property preserves the CONNECT policy; explicit infinity
 is supported only when CONNECT was nonzero. CONNECT zero followed by any
 nonzero DISCONNECT expiry is Protocol Error 0x82. Duplicate properties and
-malformed encodings remain protocol/malformed errors, distinct from supported
-encodings of an unsupported intermediate interval. DISCONNECT has no MQTT ACK:
+malformed encodings remain protocol/malformed errors. Finite overrides are
+supported; they do not reset a deadline when a command result is delayed. DISCONNECT has no MQTT ACK:
 local client completion alone does not establish durable termination.
 
 Proposed [ADR 0029](decisions/0029-explicit-session-lifecycle.md) defines the
@@ -355,11 +358,11 @@ their bytes and meanings; kind 3 remains implicit QoS 1 rather than silently
 being reinterpreted. Proposed [ADR 0026](decisions/0026-qos0-volatile-and-consumed.md)
 specifies the layouts and separate volatile/consumed cycles.
 
-SQLite schema **5** stores compact receipt guards and explicit retention/attachment
-metadata. Schemas 1/2/3/4 and other
+SQLite schema **6** stores compact receipt guards, retention/attachment, durable
+detachment/deadline and one temporal anchor. Schemas 1/2/3/4/5 and other
 incompatible versions are refused with typed InvalidData before write-affecting
 pragmas. There is no implicit migration, checkpoint, reset or empty replacement.
-Fresh and existing schema 5 files are supported; older-format files remain
+Fresh and existing schema 6 files are supported; older-format files remain
 historical inputs until a separate migration is supplied. Invalid/over-budget current files also refuse
 readiness without resetting partial recovery.
 
@@ -387,7 +390,7 @@ timeouts and history eviction cannot. An offline obligation, an active claim
 or an incoming QoS 2 marker can outlast the full admission/claim receipt.
 
 Each origin has at most 1024 issued but not durably confirmed positions. New
-business stops at span 640, leaving 384 positions for inbound, outgoing and
+business stops at span 512, leaving 512 positions for inbound, outgoing and
 session-termination continuations (128 each). Ordinary
 business cannot spend the final 512 of the unchanged 8192 physical receipt
 slots. Resolution uses its original operation identity. Maintenance itself
@@ -466,7 +469,7 @@ These are finite system tests. Existing K1/K2b/K3 qualifications and proof/model
 limits stay separate; no new path automatically qualifies all P1/P2. ADRs
 0024/0025/0026/0027/0028 retain Proposed status and guard partitions stay incomplete.
 Legacy epoch-zero/session collection, indefinite operation, outgoing QoS 2,
-wildcard/shared/retained delivery, Will/authentication, finite expiry, deployment
+wildcard/shared/retained delivery, Will/authentication, deployment
 security and performance remain separate. Process SIGKILL is not a power-loss
 or universal storage guarantee.
 
@@ -519,3 +522,56 @@ receipt, QoS 0/1/2 and pub/sub receptions remain separate regression gates.
 The 128 persistent infinite-expiry session limit remains. The next operational
 increment is an explicit session lifecycle that can release an eligible
 terminal session without evicting an absent session's live responsibilities.
+
+
+## Finite session expiry
+
+Finite retention starts at the first observed transport close, never while the
+connection is active. The original policy, observation and attachment survive
+pending Open and unknown Detach results. A known committed detachment installs
+one fixed logical deadline. Reconnection is ordered with conditional expiration:
+Open itself checks whether the old offline deadline is due; a delayed timer
+cannot cause an expired session to resume. A valid earlier resume invalidates
+the old detachment. All cancellations use target-only cleanup, preserving work
+already owed to other destinations.
+
+```bash
+# Resume/create a session, keep it for five seconds after close:
+python tests/system/external_sessions.py --client mqttium --port 1883 \
+  --client-id demo-finite --clean-start 0 --expiry 5 --expected-session-present 0
+# Paho exposes the supported DISCONNECT expiry override through public APIs:
+python tests/system/external_sessions.py --client paho --port 1883 \
+  --client-id demo-override --clean-start 0 --expiry infinite \
+  --disconnect-expiry 2 --expected-session-present 0
+tools/run_expiry_reception.sh /tmp/mqttiumd-expiry-reception
+```
+
+The mqttium helper uses only public APIs; it does not expose DISCONNECT expiry
+properties, so Paho and the independent TCP probe exercise those overrides.
+Local DISCONNECT completion is not proof of durable detachment or deletion.
+
+Safe Linux CLOCK_BOOTTIME supplies checked nanoseconds outside the core.
+Continuity requires the same boot UUID and proven effective BOOTTIME namespace
+origin; boot UUID alone is insufficient. Missing/unverified namespace evidence
+uses a fresh process domain, reported in `session_clock_anchor`. Same-domain
+process restarts count elapsed BOOTTIME. Changed/unproven domains preserve
+committed progress but count no unknown downtime, so expiry may be delayed.
+No UTC jump authorizes deletion. A session already durably detached never starts
+its TTL again. A finite connection lost in a crash gets one persisted initial
+detachment at the first reliable recovery observation.
+
+A singleton anchor coalesces temporal commits and checkpoints otherwise-idle
+finite offline state every30s. The target includes actual scheduling/commit
+delay; an observed age beyond31s emits `session_clock_degraded` rather than
+claiming the target still holds. At most one checkpoint is in flight and at
+most128 keyed timers/facts exist, with four expiration attempts per reactor
+turn. No historical timer heap, per-tick receipt or terminal-session row grows.
+Unknown lifecycle commands retain their OperationId. A known certain failure
+of Detach/Expire stops with `session_detach_rejected`/`session_expire_rejected`,
+so unavailable continuation is observable instead of silently losing expiry.
+
+See proposed [0030](decisions/0030-finite-session-expiry.md),
+[the continuation journal](reception/finite-expiry-journal.md), and
+[the finite model](../models/session-expiry/README.md). Expiry reception is
+system evidence, separate from the fixture oracle's K1/K2b/K3 qualification.
+Message Expiry, Will and general migration remain separate increments.

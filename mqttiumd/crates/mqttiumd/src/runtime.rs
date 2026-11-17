@@ -711,7 +711,7 @@ impl Runtime<'_> {
                 }
                 self.expiry_timers.remove(&session);
 
-                let mut fields = json!({"operation":operation(changed_by),"details":{"session":session.get().to_string(),"session_present":session_present,"expiry":expiry.to_wire(),"source":"lifecycle_commit"}});
+                let mut fields = json!({"operation":operation(changed_by),"details":{"session":session.get().to_string(),"session_present":session_present,"expiry":expiry_json(expiry),"source":"lifecycle_commit"}});
                 if let Some(generation) = connection {
                     fields["connection"] = json!(generation.get().to_string());
                 }
@@ -762,7 +762,7 @@ impl Runtime<'_> {
                 cancelled,
             } => json!({
                 "action":"Opened","session":session.get().to_string(),"revision":revision.get().to_string(),
-                "session_present":session_present,"expiry":format!("{expiry:?}"),
+                "session_present":session_present,"expiry":expiry_json(expiry),
                 "retired_session":retired.map(|id|id.get().to_string()),"route_revision":route_revision.get().to_string(),
                 "cancelled_inbound":cancelled.inbound,"cancelled_deliveries":cancelled.deliveries,"cancelled_routes":cancelled.routes
             }),
@@ -771,7 +771,7 @@ impl Runtime<'_> {
                 expiry,
                 detached,
             } => {
-                json!({"action":"Detached","session":session.get().to_string(),"expiry":expiry.to_wire(),"detached_by":operation(detached.operation),"deadline":detached.deadline.map(|n|n.to_string())})
+                json!({"action":"Detached","session":session.get().to_string(),"expiry":expiry_json(expiry),"detached_by":operation(detached.operation),"deadline":detached.deadline.map(|n|n.to_string())})
             }
             SessionChange::Closed {
                 session,
@@ -1117,6 +1117,12 @@ impl Runtime<'_> {
                 } if self.owner.lifecycle_operation_is_live(*operation) => Some(*operation),
                 _ => None,
             };
+            let control_refusal =
+                lifecycle_result.and_then(|_| match self.owner.lifecycle_action() {
+                    Some(SessionAction::Detach { .. }) => Some("session_detach_rejected"),
+                    Some(SessionAction::Expire { .. }) => Some("session_expire_rejected"),
+                    _ => None,
+                });
             let previous_lifecycle = self.owner.lifecycle_dispatch().map(|(op, _)| op);
             let mut applied = false;
             match self.owner.step(
@@ -1194,6 +1200,7 @@ impl Runtime<'_> {
                         other if Self::closing_input(&other) => {
                             self.closing_inputs.push_back(other)
                         }
+                        other @ Input::ExpireSession { .. } => self.expiry_inputs.push_back(other),
                         other if self.maintenance_input(&other) => {
                             self.control_inputs.push_back(other)
                         }
@@ -1227,6 +1234,12 @@ impl Runtime<'_> {
             {
                 self.session_requests
                     .retain(|_, pending| pending.operation != Some(operation));
+                // A known no-effect result is not a completed detach/expiry.
+                // Stop observably rather than silently losing the continuation
+                // or manufacturing a second command while its outcome is unknown.
+                if let Some(code) = control_refusal {
+                    return Err(Failure::plain(code));
+                }
             }
             if applied && let Some((session, initial)) = ready_work {
                 self.rearm_ready_work(session, initial);
@@ -1660,7 +1673,7 @@ impl Runtime<'_> {
         generation: ConnectionGeneration,
         connect: codec::Connect,
     ) -> Result<(), Failure> {
-        self.events.emit("connect_validated",json!({"connection":generation.get().to_string(),"details":{"keep_alive":connect.keep_alive,"max_packet_size":connect.max_packet_size,"receive_maximum":connect.receive_maximum,"topic_alias_maximum":connect.topic_alias_maximum,"request_problem_information":connect.request_problem_information,"clean_start":connect.clean_start,"expiry":format!("{:?}",connect.expiry)}})).map_err(event_failure)?;
+        self.events.emit("connect_validated",json!({"connection":generation.get().to_string(),"details":{"keep_alive":connect.keep_alive,"max_packet_size":connect.max_packet_size,"receive_maximum":connect.receive_maximum,"topic_alias_maximum":connect.topic_alias_maximum,"request_problem_information":connect.request_problem_information,"clean_start":connect.clean_start,"expiry":expiry_json(connect.expiry)}})).map_err(event_failure)?;
         if let Some(p) = self.peers.get_mut(&generation) {
             if p.connected || p.pending {
                 return self.close(generation, "second_connect");
@@ -3323,6 +3336,13 @@ fn delivery_text(id: mqttiumd_contract::ids::DeliveryId) -> String {
         id.index
     )
 }
+fn expiry_json(expiry: SessionExpiry) -> serde_json::Value {
+    match expiry {
+        SessionExpiry::OnDisconnect => json!("OnDisconnect"),
+        SessionExpiry::Never => json!("Never"),
+        SessionExpiry::After(seconds) => json!({"After":seconds}),
+    }
+}
 fn recipe_details(recipe: &Recipe) -> serde_json::Value {
     match recipe {
         Recipe::SessionLifecycle(lifecycle) => match &lifecycle.action {
@@ -3338,14 +3358,14 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
                 expiry,
                 ..
             } => {
-                json!({"action":"Open","clean_start":clean_start,"expiry":format!("{expiry:?}"),"expected_session":expected.map(|g|g.session.get().to_string())})
+                json!({"action":"Open","clean_start":clean_start,"expiry":expiry_json(*expiry),"expected_session":expected.map(|g|g.session.get().to_string())})
             }
             SessionAction::Detach {
                 guard,
                 expiry,
                 observed_at,
             } => {
-                json!({"action":"Detach","session":guard.session.get().to_string(),"expiry":expiry.to_wire(),"observed_at":observed_at.to_string()})
+                json!({"action":"Detach","session":guard.session.get().to_string(),"expiry":expiry_json(*expiry),"observed_at":observed_at.to_string()})
             }
             SessionAction::Expire {
                 guard,
@@ -3755,7 +3775,7 @@ fn run_inner(
             runtime.dispatch()?;
             thread::sleep(Duration::from_millis(1));
         }
-        events.emit("receipt_policy",json!({"details":{"receipt_window":1024,"receipt_data_window":640,"receipt_control_reserve":512,"receipt_collection_rows":128,"receipt_collection_bytes":mqttiumd_store_api::ReadBudget::COLLECTION.max_bytes,"receipt_collection_trigger":64,"max_receipt_origins":64,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE,"control_input_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
+        events.emit("receipt_policy",json!({"details":{"receipt_window":1024,"receipt_data_window":mqttiumd_contract::receipts::RECEIPT_DATA_WINDOW,"receipt_control_reserve":512,"receipt_collection_rows":128,"receipt_collection_bytes":mqttiumd_store_api::ReadBudget::COLLECTION.max_bytes,"receipt_collection_trigger":64,"max_receipt_origins":64,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE,"control_input_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
         events.emit("sqlite_configuration",json!({"details":{"journal_mode":sqlite.journal_mode,"synchronous":sqlite.synchronous,"wal_autocheckpoint":sqlite.wal_autocheckpoint,"checkpoint_policy":sqlite.checkpoint_policy,"sqlite_version":sqlite.sqlite_version,"user_version":sqlite.user_version,"page_size":sqlite.page_size,"kill_points":sqlite.kill_points,"hooks_active":false,"install_order":"sqlite-autocheckpoint-before-optional-business-hook"}})).map_err(event_failure)?;
         check_startup_cancel(&cancel)?;
         let listener =
