@@ -164,7 +164,7 @@ class WillFormats(unittest.TestCase):
 
     def test_actual_writer_will_events_retain_occurrence_but_never_payload(self):
         base = {"format": "mqttiumd.product-event", "schema_version": 1,
-                "seq": "1", "pid": 1, "operation": OPERATION, "will": OPERATION}
+                "seq": "1", "pid": 1, "operation": OPERATION, "will": copy.deepcopy(OPERATION)}
         events = [
             {**base, "kind": "will_installed", "details": {
                 "topic_bytes": len(TOPIC), "payload_bytes": len(PAYLOAD), "authority": "durable_open_commit"}},

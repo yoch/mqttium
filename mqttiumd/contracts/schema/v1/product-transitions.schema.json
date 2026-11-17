@@ -30,7 +30,8 @@
         "tcp-session-expiry-v1",
         "tcp-hierarchical-routing-v1",
         "tcp-durable-retained-v1",
-        "tcp-message-expiry-v1"
+        "tcp-message-expiry-v1",
+        "tcp-durable-will-v1"
       ]
     },
     "decision": {
@@ -42,7 +43,8 @@
         "0030",
         "0031",
         "0032",
-        "0033"
+        "0033",
+        "0034"
       ]
     },
     "scope": {
@@ -90,7 +92,8 @@
               "SessionExpiry",
               "Routing",
               "RetainedStore",
-              "MessageExpiry"
+              "MessageExpiry",
+              "Will"
             ]
           },
           "state_class": {
@@ -135,7 +138,10 @@
               "Quarantined",
               "TransmissionPending",
               "Started",
-              "StartPending"
+              "StartPending",
+              "Armed",
+              "WillPending",
+              "AdmitPending"
             ]
           },
           "event_class": {
@@ -188,7 +194,10 @@
               "Quarantined",
               "TransmissionPending",
               "Started",
-              "StartPending"
+              "StartPending",
+              "Armed",
+              "WillPending",
+              "AdmitPending"
             ]
           },
           "required_actions": {
@@ -434,6 +443,22 @@
         "properties": {
           "decision": {
             "const": "0033"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "id": {
+            "const": "tcp-durable-will-v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "const": "0034"
           }
         }
       }

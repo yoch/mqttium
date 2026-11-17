@@ -170,6 +170,7 @@ FIXTURE_SESSION_SCOPE = "the fixture-based qualifier does not cover product sess
 FIXTURE_ROUTING_SCOPE = "the fixture-based qualifier does not cover hierarchical or No Local routing"
 FIXTURE_RETAINED_SCOPE = "the fixture-based qualifier does not cover retained storage or replay"
 FIXTURE_MESSAGE_EXPIRY_SCOPE = "the fixture-based qualifier does not cover message expiry, transmission start or temporal quarantine"
+FIXTURE_WILL_SCOPE = "the fixture-based qualifier does not cover product Will publication"
 
 
 def _product_session(row):
@@ -207,6 +208,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
     session_lifecycle = False
     retained = False
     message_expiry = False
+    will = False
     # The independent fixture assertions intentionally retain their exact-topic
     # semantics. New readable route/options evidence must not broaden them.
     hierarchical_routing = any(
@@ -215,6 +217,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         for route in getattr(run, "fixture", {}).get("routes", ())
     )
     for _, snapshot in run.snapshots.values():
+        will |= bool(snapshot.get("wills", ()))
         retained |= bool(snapshot.get("retained", ()))
         message_expiry |= any(row.get("expiry") is not None for row in snapshot.get("publications", ()))
         message_expiry |= any(row.get("started", False) for row in snapshot.get("outbound", ()))
@@ -244,6 +247,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
                 session_lifecycle |= recipe[6] == 8
                 retained |= recipe[6] in (10, 11, 12)
                 message_expiry |= recipe[6] in (13, 14, 15, 16)
+                will |= recipe[6] == 17 or (recipe[6] == 8 and len(recipe) > 39 and recipe[39] in (5, 6))
             try:
                 decoded = recipes.decode(recipe)
             except recipes.RecipeError:
@@ -258,6 +262,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
             session_lifecycle |= facts.get("kind") == "SessionLifecycle"
             retained |= facts.get("kind") == "RetainedQos0Stored"
             message_expiry |= facts.get("kind") in {"DeliveryStarted", "DeliveryExpired"}
+            will |= facts.get("kind") == "WillPublished"
     for record in run.trace.records:
         payload = record.payload
         unsupported |= payload.get("command_kind") in {
@@ -265,6 +270,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         }
         qos0_delivery |= payload.get("command_kind") == "ConsumeDelivery"
         session_lifecycle |= payload.get("command_kind") == "SessionLifecycle"
+        will |= payload.get("command_kind") == "WillPublication"
         retained |= payload.get("command_kind") in {"RetainedPublication", "RetainedQos0", "ReplaySubscriptions"}
         message_expiry |= payload.get("command_kind") in {
             "ExpiringPublication", "TimedReplaySubscriptions", "MarkDeliveryStarted", "ExpireDelivery",
@@ -323,6 +329,8 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         [FIXTURE_RETAINED_SCOPE] if retained else []
     ) + (
         [FIXTURE_MESSAGE_EXPIRY_SCOPE] if message_expiry else []
+    ) + (
+        [FIXTURE_WILL_SCOPE] if will else []
     )
 
 

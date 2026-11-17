@@ -84,7 +84,15 @@
     "message_expiry_scan_ms",
     "message_expiry_batch",
     "message_expiry_policy",
-    "message_expiry_time_unit"
+    "message_expiry_time_unit",
+    "will_qos",
+    "will_retain",
+    "will_delay_interval",
+    "will_message_expiry",
+    "max_will_intents",
+    "max_will_bytes",
+    "max_will_topic_bytes",
+    "max_will_payload_bytes"
   ],
   "properties": {
     "format": {
@@ -94,7 +102,7 @@
       "const": 1
     },
     "id": {
-      "const": "tcp-message-expiry-pubsub-v1"
+      "const": "tcp-will-pubsub-v1"
     },
     "mqtt_version": {
       "const": 5
@@ -125,7 +133,7 @@
       "const": true
     },
     "will": {
-      "const": false
+      "const": true
     },
     "authentication": {
       "const": false
@@ -301,7 +309,7 @@
       "const": 4
     },
     "sqlite_schema_version": {
-      "const": 9
+      "const": 10
     },
     "wildcard_subscriptions": {
       "const": true
@@ -360,6 +368,34 @@
     },
     "message_expiry_time_unit": {
       "const": "nanoseconds"
+    },
+    "will_qos": {
+      "const": [
+        1
+      ]
+    },
+    "will_retain": {
+      "const": false
+    },
+    "will_delay_interval": {
+      "const": [
+        0
+      ]
+    },
+    "will_message_expiry": {
+      "const": false
+    },
+    "max_will_intents": {
+      "const": 256
+    },
+    "max_will_bytes": {
+      "const": 8388608
+    },
+    "max_will_topic_bytes": {
+      "const": 1024
+    },
+    "max_will_payload_bytes": {
+      "const": 32768
     }
   }
 }

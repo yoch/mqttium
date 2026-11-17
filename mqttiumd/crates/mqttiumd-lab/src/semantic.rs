@@ -141,13 +141,15 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
             if document.get("connection").is_some() {
                 u64_at(document, "/connection", &mut report.diagnostics);
             }
-            if document.get("operation").is_some() {
-                for member in ["incarnation", "epoch", "owner", "sequence"] {
-                    u64_at(
-                        document,
-                        &format!("/operation/{member}"),
-                        &mut report.diagnostics,
-                    );
+            for identity in ["operation", "will"] {
+                if document.get(identity).is_some_and(Value::is_object) {
+                    for member in ["incarnation", "epoch", "owner", "sequence"] {
+                        u64_at(
+                            document,
+                            &format!("/{identity}/{member}"),
+                            &mut report.diagnostics,
+                        );
+                    }
                 }
             }
             if let Some(puback) = document.get("puback") {
@@ -183,6 +185,7 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
             if matches!(
                 text(document, "kind"),
                 "session_changed"
+                    | "will_decided"
                     | "session_clock_checkpoint"
                     | "session_clock_degraded"
                     | "message_expiry_received"
@@ -222,6 +225,7 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
             if matches!(
                 text(document, "kind"),
                 "session_changed"
+                    | "will_decided"
                     | "session_change_copied"
                     | "session_change_replayed"
                     | "session_close_copied"
@@ -1781,7 +1785,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
         &'static [(&'static str, KeyKind)],
         &'static str,
     );
-    const TABLES: [Table; 11] = [
+    const TABLES: [Table; 12] = [
         (
             "/receipt_frontiers",
             &[
@@ -1792,6 +1796,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
             "/origin",
         ),
         ("/sessions", &[("/session", KeyKind::Decimal)], "/session"),
+        ("/wills", &[("/will_id", KeyKind::Scoped)], "/will_id"),
         ("/retained", &[("/topic_hex", KeyKind::Bytes)], "/topic_hex"),
         (
             "/route_table/routes",
@@ -2210,6 +2215,29 @@ mod tests {
                     && problem.pointer.starts_with("/retained/1/"))
         );
         document["retained"][0]["topic_hex"] = serde_json::json!("30");
+        diagnostics.clear();
+        store_snapshot(&document, &mut diagnostics);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn will_intent_keys_keep_scoped_order_and_reject_duplicates() {
+        let row = serde_json::json!({
+            "will_id": {"incarnation":"1", "epoch":"1", "owner":"0", "sequence":"9"},
+            "source_session": "4"
+        });
+        let mut document = serde_json::json!({"wills": [row.clone(), row]});
+        let mut diagnostics = Vec::new();
+        store_snapshot(&document, &mut diagnostics);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, code::DUPLICATE_NAME);
+        assert_eq!(diagnostics[0].pointer, "/wills/1/will_id");
+        document["wills"][1]["will_id"]["sequence"] = serde_json::json!("8");
+        diagnostics.clear();
+        store_snapshot(&document, &mut diagnostics);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, code::ROWS_OUT_OF_ORDER);
+        document["wills"][1]["will_id"]["sequence"] = serde_json::json!("10");
         diagnostics.clear();
         store_snapshot(&document, &mut diagnostics);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");

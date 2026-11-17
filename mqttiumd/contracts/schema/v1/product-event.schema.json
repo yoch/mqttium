@@ -94,7 +94,11 @@
         "message.delivery.expire.committed",
         "message.expire.prepared",
         "message.expire.committed",
-        "publish.emission"
+        "publish.emission",
+        "will.admission.prepared",
+        "will.admission.committed",
+        "will.end.prepared",
+        "will.end.committed"
       ]
     },
     "command_kind": {
@@ -114,7 +118,10 @@
         "RetainedQoS0",
         "DeliveryStarted",
         "MessageExpire",
-        "MessageExpiry"
+        "MessageExpiry",
+        "WillPublication",
+        "WillAdmission",
+        "WillEnd"
       ]
     },
     "cause": {
@@ -247,6 +254,17 @@
     },
     "puback": {
       "$ref": "#/$defs/puback_observation"
+    },
+    "will": {
+      "description": "Immutable installing Open OperationId of the Will occurrence; null only for a Will-aware End without a registered Will. No Will topic or payload bytes are logged.",
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "primitives.schema.json#/$defs/operation_id"
+        }
+      ]
     }
   },
   "allOf": [
@@ -1036,6 +1054,154 @@
           "required": [
             "operation"
           ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "will_installed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operation",
+          "will",
+          "details"
+        ],
+        "properties": {
+          "will": {
+            "$ref": "primitives.schema.json#/$defs/operation_id"
+          },
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "topic_bytes",
+              "payload_bytes",
+              "authority"
+            ],
+            "properties": {
+              "topic_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1024
+              },
+              "payload_bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 32768
+              },
+              "authority": {
+                "const": "durable_open_commit"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "will_decided"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operation",
+          "will",
+          "details"
+        ],
+        "properties": {
+          "will": {
+            "description": "Immutable installing Open OperationId of the Will occurrence; null only for a Will-aware End without a registered Will. No Will topic or payload bytes are logged.",
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "primitives.schema.json#/$defs/operation_id"
+              }
+            ]
+          },
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "publish",
+              "session",
+              "authority"
+            ],
+            "properties": {
+              "publish": {
+                "type": "boolean"
+              },
+              "session": {
+                "$ref": "primitives.schema.json#/$defs/u64"
+              },
+              "authority": {
+                "const": "durable_end_commit"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "will_admitted"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operation",
+          "will",
+          "details"
+        ],
+        "properties": {
+          "will": {
+            "$ref": "primitives.schema.json#/$defs/operation_id"
+          },
+          "details": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "publication",
+              "targets",
+              "authority"
+            ],
+            "properties": {
+              "publication": {
+                "type": "string",
+                "pattern": "^[0-9]+/[0-9]+/[0-9]+/[0-9]+$",
+                "maxLength": 83
+              },
+              "targets": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 16
+              },
+              "authority": {
+                "const": "durable_admission_commit"
+              }
+            }
+          }
         }
       }
     }

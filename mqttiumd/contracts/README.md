@@ -669,3 +669,44 @@ The product profile `tcp-hierarchical-pubsub-v1` advertises wildcard subscriptio
 and No Local, with shared subscriptions and Subscription Identifiers unavailable.
 Six bounded startup capability fields fit within the event details limit40;
 unknown fields remain subject to the existing bounded primitive representation.
+
+### Durable zero-delay Will (Proposed0034)
+
+The product profile `tcp-will-pubsub-v1` supports non-retained QoS1 Will,
+with Will Delay absent or zero. Other Will properties, including Message
+Expiry, are explicitly refused. SQLite schema10 is a new explicit format;
+old formats remain refused without modification or implicit migration.
+The separate reserve is 256 installed/pending intentions and 8 MiB of Will
+bytes; each topic is at most1024 bytes and payload at most32768 bytes.
+
+Canonical format1/kind8 retains action subtags0–4 byte for byte. Action5
+`OpenWillAt` carries clean-start, the existing expiry encoding, optional
+expected session guard, u16-length ClientID, u64 logical observation and
+one Will-presence boolean. A present Will has u16-length topic followed by
+u32-length payload. Action6 `EndWill` carries the exact session guard,
+expiry, original u64 closure observation and publication boolean.
+
+New kind17 `WillPublication` carries OperationId, installing Open OperationId
+(Will occurrence), PublicationId, route revision, u16-length topic, PayloadId,
+u64 payload length, the four u64 costs, then one u8 target count. Each target
+contains SessionId, revision, u32 delivery index, effective QoS and cause.
+There are at most16 targets, strictly increasing by SessionId with consecutive
+indices; only live cause1 and effective QoS0/1 are valid. There is no inbound
+MQTT Packet Identifier or fabricated inbound exchange. Retry and resolution
+preserve all original bytes, including the fixed complete target set.
+
+An optional snapshot `wills` array describes only Armed/Pending intentions,
+in installing OperationId order. Absence means no intention rows. Each row
+preserves its source SessionId, producer ClientID, topic and payload even
+after the source session is removed. Published/cancelled intentions leave no
+terminal Will row. `WillPublished` commit facts retain both `will_id` and
+`publication_id`. Product events carry the immutable `will` identity and
+bounded metadata; their installed/decided/admitted shapes forbid logging
+Will topic or payload bytes. Snapshots remain descriptive evidence and can
+show semantically invalid state; successful decoding is not a business verdict.
+
+The independent reader understands actions5/6, kind17, the optional inventory
+and commit facts. The fixture-based qualifier explicitly excludes Will
+intentions/publications; this format support does not qualify Will semantics.
+Historical K1/K2b/K3 retain their exact profile, reconstruction requirements
+and source/oracle identities.

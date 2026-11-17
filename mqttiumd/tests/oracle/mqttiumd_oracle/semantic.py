@@ -1030,6 +1030,7 @@ _SNAPSHOT_KEYS = [
     ("/receipt_frontiers", [("/origin/incarnation", "decimal"), ("/origin/epoch", "decimal"),
                             ("/origin/owner", "decimal")], "/origin"),
     ("/sessions", [("/session", "decimal")], "/session"),
+    ("/wills", [("/will_id", "scoped")], "/will_id"),
     ("/route_table/routes", [("/topic_hex", "bytes")], "/topic_hex"),
     ("/operations", [("/operation_id", "scoped")], "/operation_id"),
     ("/fences", [("/operation_id", "scoped")], "/operation_id"),
@@ -1102,9 +1103,10 @@ def _product_event(contracts, document, out):
     _u64(document, "/seq", out)
     if "connection" in document:
         _u64(document, "/connection", out)
-    if "operation" in document:
-        for member in ("incarnation", "epoch", "owner", "sequence"):
-            _u64(document, f"/operation/{member}", out)
+    for identity in ("operation", "will"):
+        if isinstance(document.get(identity), dict):
+            for member in ("incarnation", "epoch", "owner", "sequence"):
+                _u64(document, f"/{identity}/{member}", out)
     if "puback" in document:
         _decimal_members(contracts.schemas, "product-event.schema.json",
                          contracts.schemas["product-event.schema.json"]["$defs"]["puback_observation"],
@@ -1134,7 +1136,7 @@ def _product_event(contracts, document, out):
         if "detached_by" in document.get("details", {}):
             for member in ("incarnation", "epoch", "owner", "sequence"):
                 _u64(document, f"/details/detached_by/{member}", out)
-    if document["kind"] in {"session_changed", "session_change_copied", "session_change_replayed",
+    if document["kind"] in {"session_changed", "will_decided", "session_change_copied", "session_change_replayed",
                              "session_close_copied", "session_close_replayed"}:
         for member in ("session", "route_revision", "revision", "retired_session"):
             if member in document.get("details", {}):

@@ -273,7 +273,8 @@
                             "SessionLifecycle",
                             "RetainedQos0Stored",
                             "DeliveryStarted",
-                            "DeliveryExpired"
+                            "DeliveryExpired",
+                            "WillPublished"
                           ]
                         }
                       },
@@ -614,6 +615,38 @@
                               },
                               "claim_operation_id": {
                                 "$ref": "primitives.schema.json#/$defs/operation_id"
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "if": {
+                            "required": [
+                              "kind"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "WillPublished"
+                              }
+                            }
+                          },
+                          "then": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "kind",
+                              "will_id",
+                              "publication_id"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "WillPublished"
+                              },
+                              "will_id": {
+                                "$ref": "primitives.schema.json#/$defs/operation_id"
+                              },
+                              "publication_id": {
+                                "$ref": "primitives.schema.json#/$defs/publication_id"
                               }
                             }
                           }
@@ -1032,6 +1065,61 @@
             "$ref": "primitives.schema.json#/$defs/hex_bytes",
             "minLength": 2,
             "maxLength": 131070
+          }
+        }
+      }
+    },
+    "wills": {
+      "description": "Optional independent Will intentions in immutable installing Open OperationId order. Omission means no Will rows. Pending intentions remain valid after source cleanup; terminal intents are physically removed.",
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "will_id",
+          "source_session",
+          "client_id_hex",
+          "state",
+          "topic_hex",
+          "payload_hex"
+        ],
+        "properties": {
+          "will_id": {
+            "$ref": "primitives.schema.json#/$defs/operation_id"
+          },
+          "source_session": {
+            "$ref": "primitives.schema.json#/$defs/u64"
+          },
+          "client_id_hex": {
+            "allOf": [
+              {
+                "$ref": "primitives.schema.json#/$defs/hex_bytes"
+              }
+            ],
+            "maxLength": 2048
+          },
+          "state": {
+            "enum": [
+              "Armed",
+              "Pending"
+            ]
+          },
+          "topic_hex": {
+            "allOf": [
+              {
+                "$ref": "primitives.schema.json#/$defs/hex_bytes"
+              }
+            ],
+            "maxLength": 2048
+          },
+          "payload_hex": {
+            "allOf": [
+              {
+                "$ref": "primitives.schema.json#/$defs/hex_bytes"
+              }
+            ],
+            "maxLength": 65536
           }
         }
       }

@@ -3804,7 +3804,7 @@ for name, options in (("qos-bits", 1), ("rh3", 48), ("boolean", True)):
         edited(options_snapshot, lambda v, bits=options: v["route_table"]["routes"][0]["targets"][0].update(options=bits)))
 capabilities = env("mqttiumd.product-event", seq="1", kind="ready", pid=1, details={
     "wildcard_subscriptions": True, "no_local": True, "shared_subscriptions": False,
-    "subscription_identifiers": False, "sqlite_schema": 9, "profile": "tcp-message-expiry-pubsub-v1",
+    "subscription_identifiers": False, "sqlite_schema": product_profile["sqlite_schema_version"], "profile": product_profile["id"],
     "retained_available": True, "retained_topics": 32, "retained_bytes": 1048576, "max_replay_candidates": 256,
 })
 ok("product-hierarchical-capabilities.json", capabilities)
@@ -3929,6 +3929,93 @@ for field in ("message_expiry", "message_expiry_interval", "message_expiry_scan_
     invalid_profile[field] = False if field == "message_expiry" else "unsupported"
     bad(f"product-profile-wrong-{field}.json", "schema-violation", f"/{field}",
         "The profile declares the actual bounded Message Expiry implementation and quarantine policy.", invalid_profile)
+
+# Durable Will formats are descriptive and never extend fixture qualification.
+will_transitions = json.loads((V1 / "will.transitions.json").read_text())
+ok("product-will-transitions.json", will_transitions)
+bad("product-will-transitions-wrong-decision.json", "schema-violation", "/decision",
+    "Will transitions retain their own Proposed0034 decision and system scope.",
+    {**will_transitions, "decision": "0033"})
+will_id = {**OP, "sequence": "40"}
+will_end_id = {**OP, "sequence": "41"}
+will_publication_id = {**PUBLICATION, "sequence": "43"}
+will_topic = b"atelier/capteur-1/status"
+will_payload = b"offline"
+will_client = b"capteur-1"
+will_prefix = b"MQDR".hex() + be(1, 2) + be(8, 1)
+will_guard = be(4) + be(1, 1) + scoped(40)
+will_spec = be(len(will_topic), 2) + will_topic.hex() + be(len(will_payload), 4) + will_payload.hex()
+will_open_recipe = (will_prefix + scoped(40) + be(5, 1) + be(0, 1) + be(1, 1)
+    + be(0, 1) + be(len(will_client), 2) + will_client.hex() + be(100) + be(1, 1) + will_spec)
+will_row = {"will_id": will_id, "source_session": "4", "client_id_hex": will_client.hex(),
+    "state": "Armed", "topic_hex": will_topic.hex(), "payload_hex": will_payload.hex()}
+will_open_snapshot = copy.deepcopy(snapshot)
+will_open_snapshot["meta"]["next_session"] = "5"
+will_open_snapshot["sessions"].append({"session": "4", "client_id_hex": will_client.hex(),
+    "revision": "1", "state": "Active", "expiry": "Never", "opened_by": will_id})
+will_open_snapshot["wills"] = [will_row]
+def will_session_operation(sequence, encoded, change):
+    return {"operation_id": {**OP, "sequence": str(sequence)}, "recipe_hex": encoded,
+        "decision": {"kind": "Committed", "facts": {"kind": "SessionLifecycle", "change": change}}}
+
+
+will_open_snapshot["operations"].append(will_session_operation(40, will_open_recipe, {
+    "kind": "Opened", "session": "4", "route_revision": "2", "revision": "1",
+    "session_present": False, "expiry": "Never", "retired": None,
+    "cancelled": {"inbound": 0, "deliveries": 0, "routes": 0}}))
+ok("store-snapshot-will-open.json", will_open_snapshot)
+will_end_recipe = will_prefix + scoped(41) + be(6, 1) + will_guard + be(1, 1) + be(200) + be(1, 1)
+will_pending_snapshot = copy.deepcopy(will_open_snapshot)
+will_pending_snapshot["wills"][0]["state"] = "Pending"
+will_pending_snapshot["operations"].append(will_session_operation(41, will_end_recipe, {
+    "kind": "Detached", "session": "4", "expiry": "Never",
+    "detached": {"operation": will_end_id, "deadline": None}}))
+ok("store-snapshot-will-pending.json", will_pending_snapshot)
+ok("store-snapshot-will-source-gone.json", edited(will_pending_snapshot,
+    lambda v: v.update(sessions=v["sessions"][:-1])))
+# No targets means the normal completed publication need not be archived.
+will_publication_recipe = (b"MQDR".hex() + be(1, 2) + be(17, 1) + scoped(42) + scoped(40)
+    + scoped(43) + be(2) + be(len(will_topic), 2) + will_topic.hex()
+    + scoped(44) + be(len(will_payload)) + be(0) + be(0) + be(0) + be(1) + be(0, 1))
+will_published_snapshot = copy.deepcopy(will_pending_snapshot)
+will_published_snapshot.pop("wills")
+will_published_snapshot["operations"].append({"operation_id": {**OP, "sequence": "42"},
+    "recipe_hex": will_publication_recipe, "decision": {"kind": "Committed", "facts": {
+        "kind": "WillPublished", "will_id": will_id, "publication_id": will_publication_id}}})
+ok("store-snapshot-will-published.json", will_published_snapshot)
+for field in ("will_id", "publication_id"):
+    bad("store-snapshot-will-published-without-" + field.replace("_", "-") + ".json", "schema-violation",
+        "/operations/" + str(len(will_published_snapshot["operations"]) - 1) + "/decision/facts",
+        "The terminal Will result retains occurrence and publication identity independently.",
+        edited(will_published_snapshot, lambda v, field=field: v["operations"][-1]["decision"]["facts"].pop(field)))
+for name, edit, code, pointer in (
+    ("invalid-state", lambda v: v["wills"][0].update(state="Published"), "schema-violation", "/wills/0/state"),
+    ("payload-over-limit", lambda v: v["wills"][0].update(payload_hex="00" * 32769), "schema-violation", "/wills/0/payload_hex"),
+    ("duplicate", lambda v: v["wills"].append(copy.deepcopy(v["wills"][0])), "duplicate-name", "/wills/1/will_id"),
+    ("identity-overflow", lambda v: v["wills"][0]["will_id"].update(sequence=OVER), "u64-out-of-range", "/wills/0/will_id/sequence"),
+):
+    bad("store-snapshot-will-" + name + ".json", code, pointer,
+        "Will evidence stays bounded, typed and in immutable occurrence order.", edited(will_open_snapshot, edit))
+for index, (kind, details) in enumerate((
+    ("will_installed", {"topic_bytes": len(will_topic), "payload_bytes": len(will_payload), "authority": "durable_open_commit"}),
+    ("will_decided", {"publish": True, "session": "4", "authority": "durable_end_commit"}),
+    ("will_admitted", {"publication": "1/1/0/43", "targets": 0, "authority": "durable_admission_commit"}),
+)):
+    event = env("mqttiumd.product-event", seq=str(index + 1), pid=1, kind=kind,
+        operation=will_id, will=will_id, details=details)
+    ok("product-" + kind.replace("_", "-") + ".json", event)
+    bad("product-" + kind.replace("_", "-") + "-with-payload.json", "schema-violation", "/details",
+        "Product Will events carry lengths and identities, never Will bytes.",
+        edited(event, lambda v: v["details"].update(payload="offline")))
+for point in ("will.admission.prepared", "will.admission.committed", "will.end.prepared", "will.end.committed"):
+    ok("product-hook-" + point.replace(".", "-") + ".json", env("mqttiumd.product-event", seq="1", pid=1,
+        kind="barrier_hit", operation=will_id, point=point,
+        command_kind="WillAdmission" if ".admission." in point else "WillEnd"))
+for field in ("will", "will_qos", "will_retain", "will_delay_interval", "will_message_expiry",
+              "max_will_intents", "max_will_bytes", "max_will_topic_bytes", "max_will_payload_bytes"):
+    bad("product-profile-wrong-" + field + ".json", "schema-violation", "/" + field,
+        "The profile declares only bounded nonretained QoS1 Will with zero delay and no Message Expiry.",
+        {**product_profile, field: "unsupported"})
 
 dump(EX / "index.json", env("mqttiumd.example-index", valid=valid, invalid=invalid))
 
