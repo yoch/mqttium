@@ -71,3 +71,21 @@
   controls, extracted archive and schema checks. Broker Rust/contract content
   is unchanged from received90736706. Publish the reader correction and receive
   the replacement exact-head CI/artifacts before declaring the delivery complete.
+- Head11c31f65967da8ceac3d6cd5bb0e8e42f52c2957 produced a passing retained job
+  and normal artifact14334695676 (ZIP b4b782fde88c6373b61f120a1857641ace528ec5c5700c00915885622beb1b66).
+  Its downloaded archive was hash-verified, extracted and the actual Mosquitto
+  guide passed with Git/Cargo absent from PATH. Final retained state is exactly
+  one temperature, one publication/payload/reference and no pending obligation.
+  Build Linux x86_64/glibc2.39 and execution glibc2.41 are separate observations.
+- Its contracts gate then exposed stale mutantM3: an injected exhaustive Recipe
+  match did not cover tags10/11/12 and failed compilation. No M3 campaign or
+  K1/K2b/K3 qualification was produced; this is not an invariant detection.
+- GREENb11f6acd replaces that injected match with the acknowledged-admission
+  accessor, preserving premature PUBREC while excluding QoS0 without a PI.
+  The existing full launchers pass: sim-store5controls; SQLite5controls plus
+  six child-protocol outcomes. M3 is detected precisely by
+  no_positive_ack_before_confirmed_commit (record18). Patch SHA
+  c9afedf16979db2bd029175e17f10c1dcd8e8dabc8beaeb6db71810217da613c.
+  Broker Rust/contracts are unchanged. Publish this repair, regenerate exact-
+  source CI/campaigns/artifacts, then repeat the final download/extraction demo;
+  do not relabel the11c31f65 execution as the replacement source.
