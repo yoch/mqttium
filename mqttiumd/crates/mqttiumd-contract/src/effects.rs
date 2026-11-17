@@ -79,6 +79,7 @@ pub enum RecoveredFact {
         revision: Revision,
         expiry: crate::session::SessionExpiry,
         opened_by: Option<OperationId>,
+        detached: Option<crate::session::SessionDetachment>,
     },
     /// An inbound QoS 2 slot linking a client replay to its publication.
     InboundExchange {
@@ -219,6 +220,24 @@ pub enum Input {
         client_id: SharedBytes,
         clean_start: bool,
         expiry: crate::session::SessionExpiry,
+    },
+    OpenSessionAt {
+        connection: ConnectionGeneration,
+        client_id: SharedBytes,
+        clean_start: bool,
+        expiry: crate::session::SessionExpiry,
+        now: u64,
+    },
+    DetachSession {
+        connection: ConnectionKey,
+        opened_by: Option<OperationId>,
+        expiry: crate::session::SessionExpiry,
+        observed_at: u64,
+    },
+    ExpireSession {
+        guard: crate::session::SessionGuard,
+        detached: crate::session::SessionDetachment,
+        now: u64,
     },
     EndSession {
         connection: ConnectionKey,
@@ -2851,6 +2870,7 @@ mod recovery_order_tests {
                 revision: Revision::new(1),
                 expiry: crate::session::SessionExpiry::Never,
                 opened_by: None,
+                detached: None,
             },
             RecoveredFact::InboundExchange {
                 exchange: ExchangeId {

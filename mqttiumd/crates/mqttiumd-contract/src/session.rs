@@ -16,6 +16,8 @@ pub const MAX_SESSION_CLIENT_BYTES: usize = 1024;
 pub enum SessionExpiry {
     OnDisconnect,
     Never,
+    /// Finite seconds, strictly between zero and infinity.
+    After(u32),
 }
 
 impl SessionExpiry {
@@ -24,7 +26,7 @@ impl SessionExpiry {
         match value {
             0 => Some(Self::OnDisconnect),
             u32::MAX => Some(Self::Never),
-            _ => None,
+            value => Some(Self::After(value)),
         }
     }
 
@@ -33,6 +35,28 @@ impl SessionExpiry {
         match self {
             Self::OnDisconnect => 0,
             Self::Never => u32::MAX,
+            Self::After(value) => value,
+        }
+    }
+}
+
+/// Immutable durable detachment occurrence. A missing deadline retains forever.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SessionDetachment {
+    pub operation: OperationId,
+    pub deadline: Option<u64>,
+}
+
+impl SessionExpiry {
+    /// Logical nanoseconds. Overflow refuses the command, never expires early.
+    pub fn deadline(self, observed_at: u64) -> Option<Option<u64>> {
+        match self {
+            Self::OnDisconnect => Some(Some(observed_at)),
+            Self::Never => Some(None),
+            Self::After(seconds) if seconds > 0 && seconds < u32::MAX => observed_at
+                .checked_add(u64::from(seconds).checked_mul(1_000_000_000)?)
+                .map(Some),
+            Self::After(_) => None,
         }
     }
 }
@@ -60,6 +84,27 @@ pub enum SessionAction {
         expected: Option<SessionGuard>,
         clean_start: bool,
         expiry: SessionExpiry,
+    },
+    /// Time-aware Open. Legacy Open has unchanged canonical bytes and cannot
+    /// establish a finite policy without an admissible logical observation.
+    OpenAt {
+        client_id: SharedBytes,
+        expected: Option<SessionGuard>,
+        clean_start: bool,
+        expiry: SessionExpiry,
+        now: u64,
+    },
+    /// Captured transport closure; retries keep this original observation.
+    Detach {
+        guard: SessionGuard,
+        expiry: SessionExpiry,
+        observed_at: u64,
+    },
+    /// Conditional expiry of exactly one durable offline occurrence.
+    Expire {
+        guard: SessionGuard,
+        detached: SessionDetachment,
+        now: u64,
     },
     /// Terminate only this exact attachment. Persistent transport detachment
     /// without a policy change does not need a durable lifecycle command.
@@ -94,6 +139,11 @@ pub enum SessionChange {
         route_revision: Revision,
         cancelled: SessionCancellations,
     },
+    Detached {
+        session: SessionId,
+        expiry: SessionExpiry,
+        detached: SessionDetachment,
+    },
     Closed {
         session: SessionId,
         route_revision: Revision,
@@ -103,13 +153,38 @@ pub enum SessionChange {
 
 impl SessionLifecycle {
     pub(crate) fn check(&self) -> Result<(), RecipeError> {
-        if let SessionAction::Open { client_id, .. } = &self.action
+        if let SessionAction::Open { client_id, .. } | SessionAction::OpenAt { client_id, .. } =
+            &self.action
             && (client_id.is_empty()
                 || client_id.len() > MAX_SESSION_CLIENT_BYTES
                 || client_id.as_slice().contains(&0)
                 || core::str::from_utf8(client_id.as_slice()).is_err())
         {
             return Err(RecipeError::InvalidField("session_client_id"));
+        }
+        match &self.action {
+            SessionAction::Open {
+                expiry: SessionExpiry::After(_),
+                ..
+            } => return Err(RecipeError::InvalidField("legacy_session_expiry")),
+            SessionAction::OpenAt {
+                expiry: SessionExpiry::After(value),
+                ..
+            }
+            | SessionAction::Detach {
+                expiry: SessionExpiry::After(value),
+                ..
+            } if *value == 0 || *value == u32::MAX => {
+                return Err(RecipeError::InvalidField("session_expiry"));
+            }
+            SessionAction::Detach {
+                expiry,
+                observed_at,
+                ..
+            } if expiry.deadline(*observed_at).is_none() => {
+                return Err(RecipeError::InvalidField("session_deadline"));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -129,6 +204,7 @@ impl SessionLifecycle {
                 out.push(match expiry {
                     SessionExpiry::OnDisconnect => 0,
                     SessionExpiry::Never => 1,
+                    SessionExpiry::After(_) => unreachable!("checked legacy recipe"),
                 });
                 out.push(u8::from(expected.is_some()));
                 if let Some(guard) = expected {
@@ -136,6 +212,48 @@ impl SessionLifecycle {
                 }
                 out.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
                 out.extend_from_slice(client_id.as_slice());
+            }
+            SessionAction::OpenAt {
+                client_id,
+                expected,
+                clean_start,
+                expiry,
+                now,
+            } => {
+                out.push(2);
+                out.push(u8::from(*clean_start));
+                encode_expiry(out, *expiry);
+                out.push(u8::from(expected.is_some()));
+                if let Some(guard) = expected {
+                    encode_guard(out, *guard);
+                }
+                out.extend_from_slice(&(client_id.len() as u16).to_be_bytes());
+                out.extend_from_slice(client_id.as_slice());
+                out.extend_from_slice(&now.to_be_bytes());
+            }
+            SessionAction::Detach {
+                guard,
+                expiry,
+                observed_at,
+            } => {
+                out.push(3);
+                encode_guard(out, *guard);
+                encode_expiry(out, *expiry);
+                out.extend_from_slice(&observed_at.to_be_bytes());
+            }
+            SessionAction::Expire {
+                guard,
+                detached,
+                now,
+            } => {
+                out.push(4);
+                encode_guard(out, *guard);
+                out.extend_from_slice(&detached.operation.to_be_bytes());
+                out.push(u8::from(detached.deadline.is_some()));
+                if let Some(deadline) = detached.deadline {
+                    out.extend_from_slice(&deadline.to_be_bytes());
+                }
+                out.extend_from_slice(&now.to_be_bytes());
             }
             SessionAction::Close { guard, reason } => {
                 out.push(1);
@@ -190,12 +308,100 @@ impl SessionLifecycle {
                 };
                 SessionAction::Close { guard, reason }
             }
+            2 => {
+                let clean_start = read_bool(bytes)?;
+                let expiry = read_expiry(bytes)?;
+                let expected = if read_bool(bytes)? {
+                    Some(read_guard(bytes)?)
+                } else {
+                    None
+                };
+                let raw = take(bytes, 2)?;
+                let len = usize::from(u16::from_be_bytes([raw[0], raw[1]]));
+                if len > MAX_SESSION_CLIENT_BYTES {
+                    return Err(RecipeError::InvalidField("session_client_id"));
+                }
+                let client_id = SharedBytes::copy_from(take(bytes, len)?, MAX_SESSION_CLIENT_BYTES)
+                    .map_err(|_| RecipeError::AllocationFailed)?;
+                let now = read_u64(bytes)?;
+                SessionAction::OpenAt {
+                    client_id,
+                    expected,
+                    clean_start,
+                    expiry,
+                    now,
+                }
+            }
+            3 => {
+                let guard = read_guard(bytes)?;
+                let expiry = read_expiry(bytes)?;
+                let observed_at = read_u64(bytes)?;
+                SessionAction::Detach {
+                    guard,
+                    expiry,
+                    observed_at,
+                }
+            }
+            4 => {
+                let guard = read_guard(bytes)?;
+                let operation = read_operation(bytes)?;
+                let deadline = if read_bool(bytes)? {
+                    Some(read_u64(bytes)?)
+                } else {
+                    None
+                };
+                let now = read_u64(bytes)?;
+                SessionAction::Expire {
+                    guard,
+                    detached: SessionDetachment {
+                        operation,
+                        deadline,
+                    },
+                    now,
+                }
+            }
             _ => return Err(RecipeError::InvalidField("session_action")),
         };
         let result = Self { operation, action };
         result.check()?;
         Ok(result)
     }
+}
+
+fn encode_expiry(out: &mut Vec<u8>, expiry: SessionExpiry) {
+    match expiry {
+        SessionExpiry::OnDisconnect => out.push(0),
+        SessionExpiry::Never => out.push(1),
+        SessionExpiry::After(value) => {
+            out.push(2);
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+}
+fn read_expiry(bytes: &mut &[u8]) -> Result<SessionExpiry, RecipeError> {
+    match read_byte(bytes)? {
+        0 => Ok(SessionExpiry::OnDisconnect),
+        1 => Ok(SessionExpiry::Never),
+        2 => {
+            let value = u32::from_be_bytes(
+                take(bytes, 4)?
+                    .try_into()
+                    .map_err(|_| RecipeError::Truncated)?,
+            );
+            if value == 0 || value == u32::MAX {
+                return Err(RecipeError::InvalidField("session_expiry"));
+            }
+            Ok(SessionExpiry::After(value))
+        }
+        _ => Err(RecipeError::InvalidField("session_expiry")),
+    }
+}
+fn read_u64(bytes: &mut &[u8]) -> Result<u64, RecipeError> {
+    Ok(u64::from_be_bytes(
+        take(bytes, 8)?
+            .try_into()
+            .map_err(|_| RecipeError::Truncated)?,
+    ))
 }
 
 fn encode_guard(out: &mut Vec<u8>, guard: SessionGuard) {
@@ -362,21 +568,26 @@ mod tests {
             },
         });
         assert_eq!(ReceiptClass::of(&open), ReceiptClass::Business);
-        assert_eq!(RECEIPT_WINDOW - RECEIPT_DATA_WINDOW, 128 + 128 + 128);
+        assert_eq!(RECEIPT_WINDOW - RECEIPT_DATA_WINDOW, 128 + 128 + 256);
     }
 
     #[test]
     fn finite_wire_intervals_are_supported_without_reclassifying_zero_or_infinity() {
         for value in [1, 2, u32::MAX - 1] {
-            assert!(SessionExpiry::from_wire(value).is_some(), "finite_interval_rejected");
+            assert!(
+                SessionExpiry::from_wire(value).is_some(),
+                "finite_interval_rejected"
+            );
             assert_eq!(SessionExpiry::from_wire(value).unwrap().to_wire(), value);
         }
-        assert!(RECEIPT_WINDOW - RECEIPT_DATA_WINDOW >= 128 + 128 + 256,
-            "finite_detach_and_expire_have_insufficient_continuation_reserve");
+        assert!(
+            RECEIPT_WINDOW - RECEIPT_DATA_WINDOW >= 128 + 128 + 256,
+            "finite_detach_and_expire_have_insufficient_continuation_reserve"
+        );
     }
 
     #[test]
-    fn only_zero_and_infinity_are_retention_policies() {
+    fn wire_values_have_exact_retention_policies() {
         assert_eq!(
             SessionExpiry::from_wire(0),
             Some(SessionExpiry::OnDisconnect)
@@ -385,7 +596,90 @@ mod tests {
             SessionExpiry::from_wire(u32::MAX),
             Some(SessionExpiry::Never)
         );
-        assert_eq!(SessionExpiry::from_wire(1), None);
-        assert_eq!(SessionExpiry::from_wire(u32::MAX - 1), None);
+        assert_eq!(SessionExpiry::from_wire(1), Some(SessionExpiry::After(1)));
+        assert_eq!(
+            SessionExpiry::from_wire(u32::MAX - 1),
+            Some(SessionExpiry::After(u32::MAX - 1))
+        );
+    }
+
+    #[test]
+    fn timed_actions_preserve_the_original_observation_and_detachment() {
+        let guard = SessionGuard {
+            session: SessionId::new(3),
+            opened_by: Some(operation(2)),
+        };
+        for expiry in [
+            SessionExpiry::OnDisconnect,
+            SessionExpiry::Never,
+            SessionExpiry::After(1),
+            SessionExpiry::After(u32::MAX - 1),
+        ] {
+            roundtrip(SessionAction::OpenAt {
+                client_id: SharedBytes::copy_from(b"timed", 1024).unwrap(),
+                expected: Some(guard),
+                clean_start: false,
+                expiry,
+                now: 1_234_567_890,
+            });
+            roundtrip(SessionAction::Detach {
+                guard,
+                expiry,
+                observed_at: 1_234_567_890,
+            });
+        }
+        for deadline in [None, Some(0), Some(u64::MAX)] {
+            roundtrip(SessionAction::Expire {
+                guard,
+                detached: SessionDetachment {
+                    operation: operation(7),
+                    deadline,
+                },
+                now: u64::MAX,
+            });
+        }
+    }
+
+    #[test]
+    fn finite_deadline_math_refuses_aliases_and_overflow() {
+        assert_eq!(
+            SessionExpiry::After(1).deadline(999_999_999),
+            Some(Some(1_999_999_999))
+        );
+        assert_eq!(
+            SessionExpiry::After(u32::MAX - 1).deadline(0),
+            Some(Some(u64::from(u32::MAX - 1) * 1_000_000_000))
+        );
+        assert_eq!(SessionExpiry::Never.deadline(u64::MAX), Some(None));
+        assert_eq!(SessionExpiry::After(1).deadline(u64::MAX), None);
+        for seconds in [0, u32::MAX] {
+            let recipe = Recipe::SessionLifecycle(SessionLifecycle {
+                operation: operation(8),
+                action: SessionAction::OpenAt {
+                    client_id: SharedBytes::copy_from(b"invalid", 1024).unwrap(),
+                    expected: None,
+                    clean_start: false,
+                    expiry: SessionExpiry::After(seconds),
+                    now: 0,
+                },
+            });
+            assert!(matches!(
+                recipe.encode_canonical(&mut Vec::new()),
+                Err(RecipeError::InvalidField("session_expiry"))
+            ));
+        }
+        let recipe = Recipe::SessionLifecycle(SessionLifecycle {
+            operation: operation(8),
+            action: SessionAction::Open {
+                client_id: SharedBytes::copy_from(b"legacy", 1024).unwrap(),
+                expected: None,
+                clean_start: false,
+                expiry: SessionExpiry::After(1),
+            },
+        });
+        assert!(matches!(
+            recipe.encode_canonical(&mut Vec::new()),
+            Err(RecipeError::InvalidField("legacy_session_expiry"))
+        ));
     }
 }
