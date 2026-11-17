@@ -289,3 +289,8 @@ fn timed_replay_cannot_observe_before_the_message_origin() {
 fn maintenance_retry_skips_admissions_after_the_frozen_observation() {
     expiry::maintenance_retry_skips_admissions_after_the_frozen_observation(&sqlite);
 }
+
+#[test]
+fn started_marker_requires_message_expiry() {
+    expiry::started_marker_requires_message_expiry(&sqlite);
+}

@@ -840,6 +840,64 @@ pub mod expiry {
         }
     }
 
+    pub fn started_marker_requires_message_expiry<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        let mut w = World::with_limits(make, limits());
+        let target = w.b;
+        let ordinary = w.admission(1, 1, b"ordinary", &[target]);
+        commit(&mut w.store, &ordinary);
+        let delivery = DeliveryId {
+            publication: publication_id(w.epoch, 1),
+            index: 0,
+        };
+        let mut finish = claim(&mut w, 2, delivery, target, 1);
+        let before = w.store.snapshot().unwrap();
+        assert_eq!(before.publications[&delivery.publication].expiry, None);
+        assert!(!before.outbound[&delivery].started);
+        let started = frozen(
+            Recipe::MarkDeliveryStarted(MarkDeliveryStarted {
+                operation: operation_id(w.epoch, 3),
+                delivery,
+                target,
+                target_revision: finish.target_revision,
+                packet_id: finish.packet_id,
+                claim: finish.claim,
+            }),
+            None,
+        );
+        let rejected = StoreReply::Outcome(StoreOutcome::RejectedCertain(
+            RejectReason::PreconditionFailed,
+        ));
+        assert_eq!(
+            w.store.apply(&started).reply,
+            rejected,
+            "started_without_expiry_was_committed"
+        );
+        assert_eq!(
+            w.store.apply(&started).reply,
+            rejected,
+            "rejected_start_was_executed_on_retry"
+        );
+        let after = w.store.snapshot().unwrap();
+        assert_eq!(after.publications, before.publications);
+        assert_eq!(after.payloads, before.payloads);
+        assert_eq!(after.obligations, before.obligations);
+        assert_eq!(after.outbound, before.outbound);
+        assert_eq!(after.accounts.references, before.accounts.references);
+        assert_eq!(after.accounts.payload_bytes, before.accounts.payload_bytes);
+        assert_eq!(
+            after.accounts.exchange_slots,
+            before.accounts.exchange_slots
+        );
+        let work = w.store.read_work(target, None, 8).unwrap();
+        assert_eq!(work.items.as_slice()[0].expiry, None);
+        assert!(!work.items.as_slice()[0].claim.unwrap().started);
+        finish.operation = operation_id(w.epoch, 4);
+        commit(&mut w.store, &frozen(Recipe::FinishDelivery(finish), None));
+        assert!(w.store.snapshot().unwrap().outbound.is_empty());
+    }
+
     pub fn shared_refs_replay_and_source_end<S: DurableStore>(
         make: &dyn Fn(StoreIncarnation, Limits) -> S,
     ) {
@@ -1622,6 +1680,7 @@ pub mod expiry {
     }
 
     pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
+        started_marker_requires_message_expiry(make);
         maintenance_retry_skips_admissions_after_the_frozen_observation(make);
         timed_replay_cannot_observe_before_the_message_origin(make);
         timed_commands_require_the_current_boot_authority(make);
@@ -1640,6 +1699,10 @@ pub mod expiry {
 
 #[cfg(test)]
 mod expiry_tests {
+    #[test]
+    fn started_marker_requires_message_expiry() {
+        super::expiry::started_marker_requires_message_expiry(&super::MemoryStore::create);
+    }
     #[test]
     fn deterministic_message_expiry_contract() {
         super::expiry::all(&super::MemoryStore::create);
