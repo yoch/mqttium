@@ -127,6 +127,7 @@ class FiniteSessionFormats(unittest.TestCase):
 
     def test_detached_metadata_and_clock_only_cannot_enlarge_qualification(self):
         def unmet(snapshot):
+            snapshot = {"sessions": [], "outbound": [], "operations": [], **snapshot}
             run = SimpleNamespace(snapshots={"0": (None, snapshot)},
                 trace=SimpleNamespace(records=(), before=lambda _left, _right: True))
             with mock.patch.object(results.judge.Run, "load", return_value=run):
