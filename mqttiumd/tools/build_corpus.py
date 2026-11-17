@@ -3765,6 +3765,41 @@ bad("product-expiry-timer-budget-exceeded.json", "schema-violation", "/details/f
     env("mqttiumd.product-event", seq="22", kind="expiry_inventory", pid=1,
         details={"finite_timers": 129, "checkpoint_inflight": False, "queued": 0, "period_ms": 30000}))
 
+# Hierarchical/options records are descriptive formats, not routing qualification.
+route_options_page = record(15, "store-adapter", 3, "RecoveryPageRead", {
+    "run_epoch": "2", "page": "1", "last": False,
+    "facts": [{**route(b"p1/+/#", 2), "options": 44}],
+})
+ok("trace-record-recovery-page-hierarchical-options.json", route_options_page)
+options_snapshot = copy.deepcopy(snapshot)
+options_snapshot["operations"].append(product_operation(
+    31, 9, be(2) + be(1) + be(2) + be(1, 1) + be(2, 1) + be(44, 1)
+    + be(6, 2) + b"p1/+/#".hex(),
+    {"kind": "SubscriptionsChanged", "session": "2", "route_revision": "3"},
+))
+options_snapshot["route_table"]["revision"] = "3"
+options_snapshot["route_table"]["routes"].insert(0, {
+    "topic_hex": b"p1/+/#".hex(), "targets": [{"session": "2", "qos": 1, "options": 44}],
+})
+options_snapshot["account"]["used"]["receipt_slots"] = "2"
+ok("store-snapshot-subscription-options-receipt.json", options_snapshot)
+for name, options in (("qos-bits", 1), ("rh3", 48), ("boolean", True)):
+    bad("trace-record-route-options-" + name + ".json", "schema-violation", "/payload/facts/0/options",
+        "Subscription options exclude QoS/reserved bits and RH3; booleans are not byte integers.",
+        edited(route_options_page, lambda v, bits=options: v["payload"]["facts"][0].update(options=bits)))
+    bad("store-snapshot-route-options-" + name + ".json", "schema-violation", "/route_table/routes/0/targets/0/options",
+        "Stored nondefault option bytes retain their validated discriminant.",
+        edited(options_snapshot, lambda v, bits=options: v["route_table"]["routes"][0]["targets"][0].update(options=bits)))
+capabilities = env("mqttiumd.product-event", seq="1", kind="ready", pid=1, details={
+    "wildcard_subscriptions": True, "no_local": True, "shared_subscriptions": False,
+    "subscription_identifiers": False, "sqlite_schema": 7, "profile": "tcp-hierarchical-pubsub-v1",
+})
+ok("product-hierarchical-capabilities.json", capabilities)
+bad("product-details-over-budget.json", "schema-violation", "/details",
+    "Product diagnostics remain bounded even with the six new startup capabilities.",
+    env("mqttiumd.product-event", seq="1", kind="starting", pid=1,
+        details={"field" + str(index): 0 for index in range(41)}))
+
 dump(EX / "index.json", env("mqttiumd.example-index", valid=valid, invalid=invalid))
 
 

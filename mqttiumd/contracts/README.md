@@ -640,3 +640,32 @@ These product hooks remain feature-gated and outside the fixture fault catalogue
 A compiled mutation or process witness belongs to its own identified run. The
 partial expiry registry, finite model and system tests do not qualify arbitrary
 session time behavior through the fixture oracle.
+
+
+### Hierarchical routes and options (Proposed0031)
+
+`UpdateSubscriptions` keeps kind7 byte for byte for default options. Kind9 uses
+that same operation type, with one options byte after each granted-QoS byte and
+before the filter length. At least one entry must be nondefault; unsubscribe
+entries must use default options. Legacy kind3 retains its exact-topic format.
+The shared option domain is `{0,4,8,12,16,20,24,28,32,36,40,44}`: No Local,
+Retain As Published and Retain Handling0/1/2, excluding QoS and reserved bits.
+RAP/RH are retained facts in this non-retained profile, not a retained-store claim.
+
+Snapshot route targets and recovered `Route` facts may carry integer `options`.
+Omission means the historical default0. Writers omit0 so existing exact/default
+traces keep their bytes; nondefault values are always explicit. The administrative
+fixture remains default-only and refuses extra option fields. Literal filter
+bytes remain the route key; removing a filter does not remove a different match.
+SQLite schema7 is explicit; older formats are refused without mutation.
+
+The independent Python reader decodes kind9 and validates filter/options grammar.
+This is descriptive format support. Wildcard routes, nondefault options and all
+subscription mutations remain outside the fixture-based qualifier; its historical
+exact/default QoS2 campaigns keep their scope. New system routing receptions do
+not become qualifying through this reader extension.
+
+The product profile `tcp-hierarchical-pubsub-v1` advertises wildcard subscriptions
+and No Local, with shared subscriptions and Subscription Identifiers unavailable.
+Six bounded startup capability fields fit within the event details limit40;
+unknown fields remain subject to the existing bounded primitive representation.

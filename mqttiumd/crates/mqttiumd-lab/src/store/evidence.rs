@@ -24,6 +24,7 @@ use mqttiumd_contract::outcome::{
     CommitFacts, Knowledge, RejectReason, StoreOutcome, StoreReply, StoreViolation,
 };
 use mqttiumd_contract::packet::Qos;
+use mqttiumd_contract::pubsub::SubscriptionOptions;
 use mqttiumd_contract::receipts::ReceiptClosure;
 use mqttiumd_contract::session::{SessionChange, SessionDetachment, SessionExpiry};
 
@@ -312,7 +313,14 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
         .map(|(topic, targets)| {
             let targets: Vec<Value> = targets
                 .iter()
-                .map(|target| json!({"session": session(target.session), "qos": qos(target.qos)}))
+                .map(|target| {
+                    let mut row =
+                        json!({"session": session(target.session), "qos": qos(target.qos)});
+                    if target.options != SubscriptionOptions::DEFAULT {
+                        row["options"] = json!(target.options.bits());
+                    }
+                    row
+                })
                 .collect();
             json!({"topic_hex": hex(topic), "targets": targets})
         })
@@ -505,13 +513,21 @@ pub fn recovered_fact(fact: &RecoveredFact) -> Value {
             target,
             target_revision,
             max_qos,
-        } => json!({
-            "kind": "Route",
-            "topic_hex": hex(topic.as_slice()),
-            "target": session(*target),
-            "target_revision": decimal(target_revision.get()),
-            "max_qos": qos(*max_qos),
-        }),
+            options,
+        } => {
+            let mut row = json!({
+                "kind": "Route",
+                "topic_hex": hex(topic.as_slice()),
+                "target": session(*target),
+                "target_revision": decimal(target_revision.get()),
+                "max_qos": qos(*max_qos),
+            });
+            // Preserve exact legacy trace bytes; zero is the announced default.
+            if *options != SubscriptionOptions::DEFAULT {
+                row["options"] = json!(options.bits());
+            }
+            row
+        }
         RecoveredFact::Session {
             session: id,
             client_id,

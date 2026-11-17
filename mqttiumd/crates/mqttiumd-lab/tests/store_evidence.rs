@@ -258,6 +258,7 @@ fn qos0_grant_snapshot_matches_the_new_canonical_kind_without_changing_old_work(
         &[GrantedSubscriptionChange {
             topic: SharedBytes::copy_from(b"p1/example", 256).unwrap(),
             granted: Some(Qos::AtMostOnce),
+            options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
         }],
         1,
     )
@@ -1102,4 +1103,42 @@ fn a_violation_is_written_as_produced_then_handed_over() {
         serde_json::json!([reference(ready[0])])
     );
     assert!(written.unwritten.is_empty(), "{:#?}", written.unwritten);
+}
+
+/// Format-only synthetic projections: nondefault options are explicit while
+/// historical default records retain their exact representation.
+#[test]
+fn route_options_survive_snapshot_and_recovery_serialization_without_default_noise() {
+    use mqttiumd_contract::pubsub::SubscriptionOptions;
+    let options = SubscriptionOptions::from_bits(44).unwrap();
+    let topic = SharedBytes::copy_from(b"p1/+/#", 256).unwrap();
+    let route = |options| RecoveredFact::Route {
+        topic: topic.clone(),
+        target: SessionId::new(2),
+        target_revision: Revision::new(1),
+        max_qos: Qos::AtLeastOnce,
+        options,
+    };
+    let explicit = recovered_fact(&route(options));
+    assert_eq!(explicit["options"], 44);
+    let legacy = recovered_fact(&route(SubscriptionOptions::DEFAULT));
+    assert!(legacy.get("options").is_none());
+    let mut page = example("trace-record-recovery-page-of-routes-only.json");
+    page["payload"]["facts"][0] = explicit;
+    accepted(&workspace(), &page);
+
+    let world = World::with_limits(&memory, fixture_limits());
+    let mut state = world.store.snapshot().unwrap();
+    state.routes.get_mut(b"p1/example".as_slice()).unwrap()[0].options = options;
+    let written = snapshot(&state, CONTEXT);
+    assert_eq!(
+        written["route_table"]["routes"][0]["targets"][0]["options"],
+        44
+    );
+    assert!(
+        written["route_table"]["routes"][0]["targets"][1]
+            .get("options")
+            .is_none()
+    );
+    accepted(&workspace(), &written);
 }

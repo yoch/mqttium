@@ -167,6 +167,7 @@ FIXTURE_QOS0_SCOPE = (
 )
 FIXTURE_RECEIPT_SCOPE = "the fixture-based qualifier does not cover live receipt retirement"
 FIXTURE_SESSION_SCOPE = "the fixture-based qualifier does not cover product session lifecycle"
+FIXTURE_ROUTING_SCOPE = "the fixture-based qualifier does not cover hierarchical or No Local routing"
 
 
 def _product_session(row):
@@ -202,7 +203,19 @@ def _scope_unmet(contracts, scenario_path, trace_path):
     unsupported, non_qos2, uncorroborated, qos0_delivery = False, False, False, False
     receipt_retirement = False
     session_lifecycle = False
+    # The independent fixture assertions intentionally retain their exact-topic
+    # semantics. New readable route/options evidence must not broaden them.
+    hierarchical_routing = any(
+        "+" in route.get("topic", "") or "#" in route.get("topic", "")
+        or any(target.get("options", 0) != 0 for target in route.get("targets", ()))
+        for route in getattr(run, "fixture", {}).get("routes", ())
+    )
     for _, snapshot in run.snapshots.values():
+        hierarchical_routing |= any(
+            any(byte in bytes.fromhex(route["topic_hex"]) for byte in (35, 43))
+            or any(target.get("options", 0) != 0 for target in route.get("targets", ()))
+            for route in snapshot.get("route_table", {}).get("routes", ())
+        )
         session_lifecycle |= snapshot.get("meta", {}).get("session_clock") is not None
         session_lifecycle |= any(_product_session(row) for row in snapshot.get("sessions", ()))
         # A zero producer registration does not establish collection. A
@@ -215,7 +228,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         for operation in snapshot["operations"]:
             recipe = bytes.fromhex(operation["recipe_hex"])
             if recipe[:6] == b"MQDR\x00\x01" and len(recipe) >= 7:
-                unsupported |= recipe[6] in (3, 4, 5, 7)
+                unsupported |= recipe[6] in (3, 4, 5, 7, 9)
                 qos0_delivery |= recipe[6] == 6
                 session_lifecycle |= recipe[6] == 8
             try:
@@ -247,6 +260,9 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         if record.kind not in {"RecoveryPageRead", "RecoveryPageDelivered"}:
             continue
         for fact in payload["facts"]:
+            if fact["kind"] == "Route":
+                hierarchical_routing |= (fact.get("options", 0) != 0
+                    or any(byte in bytes.fromhex(fact["topic_hex"]) for byte in (35, 43)))
             if fact["kind"] == "Session":
                 session_lifecycle |= _product_session(fact)
             if fact["kind"] == "ReceiptFrontier":
@@ -278,7 +294,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         [FIXTURE_QOS0_SCOPE] if qos0_delivery else []
     ) + ([FIXTURE_RECEIPT_SCOPE] if receipt_retirement else []) + (
         [FIXTURE_SESSION_SCOPE] if session_lifecycle else []
-    )
+    ) + ([FIXTURE_ROUTING_SCOPE] if hierarchical_routing else [])
 
 
 def _broker_unmet(contracts, manifest, trace_path):

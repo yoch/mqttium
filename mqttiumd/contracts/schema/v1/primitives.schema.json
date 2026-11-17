@@ -634,6 +634,24 @@
         }
       },
       "description": "The one overwritable BOOTTIME anchor. A changed/unproven domain preserves committed logical progress and does not invent downtime. UTC is not an expiry authority."
+    },
+    "subscription_options": {
+      "description": "MQTT5 subscription option bits excluding QoS: No Local, RAP and RH0/1/2. Missing on historical route evidence means0; writers omit0.",
+      "type": "integer",
+      "enum": [
+        0,
+        4,
+        8,
+        12,
+        16,
+        20,
+        24,
+        28,
+        32,
+        36,
+        40,
+        44
+      ]
     }
   }
 }

@@ -1849,7 +1849,7 @@
             }
           },
           "then": {
-            "description": "One target of one exact topic. Routes are sorted by the bytes of their topic.",
+            "description": "One destination of one literal subscription filter; ordered by filter bytes. Absent options means the historical default0.",
             "type": "object",
             "additionalProperties": false,
             "required": [
@@ -1874,6 +1874,9 @@
               },
               "max_qos": {
                 "$ref": "primitives.schema.json#/$defs/qos"
+              },
+              "options": {
+                "$ref": "primitives.schema.json#/$defs/subscription_options"
               }
             }
           }

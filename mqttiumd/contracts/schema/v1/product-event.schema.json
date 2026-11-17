@@ -127,7 +127,7 @@
     },
     "details": {
       "type": "object",
-      "maxProperties": 32,
+      "maxProperties": 40,
       "propertyNames": {
         "pattern": "^[a-z][a-z_]{0,47}$"
       },

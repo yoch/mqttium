@@ -146,7 +146,10 @@
     "contracts/examples/v1/valid/product-session-clock-checkpoint.json",
     "contracts/examples/v1/valid/product-session-clock-checkpoint-writer.json",
     "contracts/examples/v1/valid/product-session-clock-degraded.json",
-    "contracts/examples/v1/valid/product-expiry-inventory.json"
+    "contracts/examples/v1/valid/product-expiry-inventory.json",
+    "contracts/examples/v1/valid/trace-record-recovery-page-hierarchical-options.json",
+    "contracts/examples/v1/valid/store-snapshot-subscription-options-receipt.json",
+    "contracts/examples/v1/valid/product-hierarchical-capabilities.json"
   ],
   "invalid": [
     {
@@ -2434,6 +2437,48 @@
       "code": "schema-violation",
       "pointer": "/details/finite_timers",
       "why": "A session has at most one keyed wakeup within the unchanged128-session budget."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-route-options-qos-bits.json",
+      "code": "schema-violation",
+      "pointer": "/payload/facts/0/options",
+      "why": "Subscription options exclude QoS/reserved bits and RH3; booleans are not byte integers."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-route-options-qos-bits.json",
+      "code": "schema-violation",
+      "pointer": "/route_table/routes/0/targets/0/options",
+      "why": "Stored nondefault option bytes retain their validated discriminant."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-route-options-rh3.json",
+      "code": "schema-violation",
+      "pointer": "/payload/facts/0/options",
+      "why": "Subscription options exclude QoS/reserved bits and RH3; booleans are not byte integers."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-route-options-rh3.json",
+      "code": "schema-violation",
+      "pointer": "/route_table/routes/0/targets/0/options",
+      "why": "Stored nondefault option bytes retain their validated discriminant."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-route-options-boolean.json",
+      "code": "schema-violation",
+      "pointer": "/payload/facts/0/options",
+      "why": "Subscription options exclude QoS/reserved bits and RH3; booleans are not byte integers."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-route-options-boolean.json",
+      "code": "schema-violation",
+      "pointer": "/route_table/routes/0/targets/0/options",
+      "why": "Stored nondefault option bytes retain their validated discriminant."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-details-over-budget.json",
+      "code": "schema-violation",
+      "pointer": "/details",
+      "why": "Product diagnostics remain bounded even with the six new startup capabilities."
     }
   ]
 }

@@ -94,11 +94,13 @@ fn the_fixture_is_installed_and_opens_no_epoch() {
         [
             RouteTarget {
                 session: session("b"),
-                qos: Qos::AtLeastOnce
+                qos: Qos::AtLeastOnce,
+                options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
             },
             RouteTarget {
                 session: session("c"),
-                qos: Qos::AtLeastOnce
+                qos: Qos::AtLeastOnce,
+                options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
             },
         ]
     );
@@ -186,12 +188,14 @@ fn the_fixture_reaches_the_store_as_commands_in_its_own_order() {
             AdminCommand::AddRoute {
                 topic: b"p1/example".to_vec(),
                 session: session("b"),
-                qos: Qos::AtLeastOnce
+                qos: Qos::AtLeastOnce,
+                options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
             },
             AdminCommand::AddRoute {
                 topic: b"p1/example".to_vec(),
                 session: session("c"),
-                qos: Qos::AtLeastOnce
+                qos: Qos::AtLeastOnce,
+                options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
             },
         ]
     );

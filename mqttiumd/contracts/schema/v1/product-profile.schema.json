@@ -67,7 +67,13 @@
     "session_clock_degraded_after_ms",
     "max_session_expiry_timers",
     "session_expiry_batch",
-    "sqlite_schema_version"
+    "sqlite_schema_version",
+    "wildcard_subscriptions",
+    "no_local",
+    "shared_subscriptions",
+    "subscription_identifiers",
+    "retain_as_published",
+    "retain_handling"
   ],
   "properties": {
     "format": {
@@ -77,7 +83,7 @@
       "const": 1
     },
     "id": {
-      "const": "tcp-qos0-exact-pubsub-v1"
+      "const": "tcp-hierarchical-pubsub-v1"
     },
     "mqtt_version": {
       "const": 5
@@ -284,7 +290,29 @@
       "const": 4
     },
     "sqlite_schema_version": {
-      "const": 6
+      "const": 7
+    },
+    "wildcard_subscriptions": {
+      "const": true
+    },
+    "no_local": {
+      "const": true
+    },
+    "shared_subscriptions": {
+      "const": false
+    },
+    "subscription_identifiers": {
+      "const": false
+    },
+    "retain_as_published": {
+      "const": true
+    },
+    "retain_handling": {
+      "const": [
+        0,
+        1,
+        2
+      ]
     }
   }
 }

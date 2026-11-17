@@ -157,7 +157,7 @@
           "$ref": "primitives.schema.json#/$defs/u64"
         },
         "routes": {
-          "description": "Exact-topic routes, by topic bytes.",
+          "description": "Literal subscription filters in filter-byte order; wildcard/options semantics remain outside the fixture qualifier.",
           "type": "array",
           "items": {
             "type": "object",
@@ -187,6 +187,9 @@
                     },
                     "qos": {
                       "$ref": "primitives.schema.json#/$defs/qos"
+                    },
+                    "options": {
+                      "$ref": "primitives.schema.json#/$defs/subscription_options"
                     }
                   }
                 }
