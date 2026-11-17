@@ -259,7 +259,7 @@ pub(super) fn mark_started(
 ) -> Guard<CommitFacts> {
     let failed = RejectReason::PreconditionFailed;
     active_session(conn, command.target, command.target_revision)?;
-    let changed = conn.prepare_cached("UPDATE outbound SET started=1 WHERE publication=?1 AND idx=?2 AND target=?3 AND target_revision=?4 AND packet_id=?5 AND claim=?6 AND EXISTS(SELECT 1 FROM obligations o WHERE o.publication=outbound.publication AND o.idx=outbound.idx AND o.target=outbound.target AND o.target_revision=outbound.target_revision AND o.qos=1)")?
+    let changed = conn.prepare_cached("UPDATE outbound SET started=1 WHERE publication=?1 AND idx=?2 AND target=?3 AND target_revision=?4 AND packet_id=?5 AND claim=?6 AND EXISTS(SELECT 1 FROM obligations o JOIN publications p ON p.id=o.publication WHERE o.publication=outbound.publication AND o.idx=outbound.idx AND o.target=outbound.target AND o.target_revision=outbound.target_revision AND o.qos=1 AND p.expiry_domain IS NOT NULL)")?
         .execute(params![command.delivery.publication.to_be_bytes().as_slice(), i64::from(command.delivery.index), command.target.to_be_bytes().as_slice(), command.target_revision.to_be_bytes().as_slice(), i64::from(command.packet_id.get()), command.claim.to_be_bytes().as_slice()])?;
     if changed != 1 {
         return refused(failed);

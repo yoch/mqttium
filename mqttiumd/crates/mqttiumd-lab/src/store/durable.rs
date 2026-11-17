@@ -1121,6 +1121,14 @@ impl Staging for DurableState {
     fn stage_started(&mut self, command: &MarkDeliveryStarted) -> Guard<CommitFacts> {
         let failed = RejectReason::PreconditionFailed;
         self.active_session(command.target, command.target_revision)?;
+        if self
+            .publications
+            .get(&command.delivery.publication)
+            .and_then(|publication| publication.expiry)
+            .is_none()
+        {
+            return Err(failed);
+        }
         let slot = self.outbound.get_mut(&command.delivery).ok_or(failed)?;
         if slot.target != command.target
             || slot.target_revision != command.target_revision
