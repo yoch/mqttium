@@ -1,0 +1,52 @@
+{
+  "format": "mqttiumd.finite-expiry-mutations",
+  "schema_version": 1,
+  "scope": "compiled implementation controls; separate from system reception and oracle qualification",
+  "mutants": [
+    {
+      "name": "late-open-waits-timer",
+      "patch": "late-open-waits-timer.mutant",
+      "package": "mqttiumd-core",
+      "target": [
+        "--lib"
+      ],
+      "test": "owner::sessions::tests::an_expired_open_cannot_claim_session_present_because_the_timer_was_delayed",
+      "reason": "expired_open_resumed_without_timer",
+      "source": "mqttiumd/crates/mqttiumd-core/src/owner/sessions.rs"
+    },
+    {
+      "name": "stale-timer-rebound",
+      "patch": "stale-timer-rebound.mutant",
+      "package": "mqttiumd-core",
+      "target": [
+        "--lib"
+      ],
+      "test": "owner::sessions::tests::time_aware_open_decides_expiry_even_when_the_timer_has_not_run",
+      "reason": "old_timer_rebound_after_open",
+      "source": "mqttiumd/crates/mqttiumd-core/src/owner/sessions.rs"
+    },
+    {
+      "name": "detach-deadline-recomputed",
+      "patch": "detach-deadline-recomputed.mutant",
+      "package": "mqttiumd-core",
+      "target": [
+        "--lib"
+      ],
+      "test": "owner::sessions::tests::a_contradictory_detachment_deadline_cannot_become_durable_knowledge",
+      "reason": "detach_result_recalculated_deadline",
+      "source": "mqttiumd/crates/mqttiumd-core/src/owner/sessions.rs"
+    },
+    {
+      "name": "continuous-domain-progress-lost",
+      "patch": "continuous-domain-progress-lost.mutant",
+      "package": "mqttiumd-store-sqlite",
+      "target": [
+        "--test",
+        "session_lifecycle"
+      ],
+      "test": "continuous_domain_progress_prevents_expired_session_resurrection",
+      "reason": "continuous_domain_progress_lost",
+      "source": "mqttiumd/crates/mqttiumd-store-api/src/lib.rs"
+    }
+  ]
+}
