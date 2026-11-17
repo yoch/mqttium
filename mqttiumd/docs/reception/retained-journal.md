@@ -25,7 +25,7 @@
   control helpers require exact business markers, not build failures/timeouts.
 - Commands: `cargo fmt --check`; workspace Clippy/test; `tools/build_corpus.py
   --check`; `tools/check_schemas.py`; `tests/oracle/build_traces.py --check`;
-  oracle unittest; system unittest; `tools/check_models.py`; and
+  oracle unittest; system unittest; `models/check_models.py`; and
   `tools/run_retained_reception.sh NEW_OUTSIDE_CHECKOUT_DIRECTORY`.
 - Next action: finish clean integrated normal/instrumented gates and the
   source-pinned retained receipt, then record report0016, publish with expected
@@ -41,3 +41,17 @@
   two fresh replay values, replace/empty-clear and one current value. Its
   separate build/execution platform fields are checked. Final downloaded CI
   archive still needs its own extraction/demo witness at the published SHA.
+
+- Clean candidate90736706400e58db97b4da9bd6826d6f4c0b586a completed the full
+  retained launcher:6normal groups,9boundary/unknown cases,5compiled controls,
+  verified extracted normal demo,5921strict product events. Independent audit:
+  2212Git blobs/modes,520kept hashes,6own kill/wait/inode witnesses.
+- Candidate gates passed:1024normal/1039instrumented Rust tests sequentially,
+  108product-hook tests; all corresponding Clippy, fmt and P1validate;
+  240oracle,130pilots,16model-reader tests;534corpus/405traces/556schema docs.
+  New7TLC outcomes were separately executed; CI retains all104expected outcomes.
+- Report0016 records candidate-local source/archives. The delivery commit adds
+  only report/guide/journal text; final CI must regenerate source-specific
+  retained and historical campaign artifacts. Pending: publish with E8HEAD
+  lease, independently receive exact-head checks/artifacts and execute the
+  downloaded packaged guide. Preserve draft/unmerged/Proposed states.
