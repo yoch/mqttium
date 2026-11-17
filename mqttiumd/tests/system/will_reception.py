@@ -317,7 +317,7 @@ async def shared_responsibilities(binary, case):
                 restarted.cleanup()
 
 
-async def takeover(binary, case):
+async def takeover_order(binary, case):
     """Delay0 publishes the old occurrence; its late physical Close cannot fire B."""
     broker = Broker(binary, case)
     clients, wires = [], []
@@ -358,6 +358,173 @@ async def takeover(binary, case):
             await close_peers(clients)
         finally:
             broker.cleanup()
+
+
+async def full_session_replacement(binary, case):
+    """CS1 replaces its own slot128 after the old Delay0 Will is admitted."""
+    broker = Broker(binary, case)
+    wires, source, replacement = [], None, None
+    topic, payload = 'will/lifecycle/full/status', b'old-will-before-full-capacity-replacement'
+    try:
+        broker.ready()
+        source = WillWire(broker.address, broker.observations, 'full-source')
+        wires.append(source)
+        source.will_connect('full-source', topic, payload)
+        source_before = durable(broker.db)
+        source_id = session_key(source_before, 'full-source')
+        old_will = source_before['tables']['wills'][0]['id']
+        for index in range(127):
+            wire = WillWire(broker.address, broker.observations, f'full-offline-{index:03}')
+            wires.append(wire)
+            wire.session_connect(f'full-offline-{index:03}', expected_present=False)
+            if index == 0:
+                wire.subscribe_options(1, (Subscription('will/lifecycle/#', 1),))
+            marker = max(int(row['seq']) for row in broker.events())
+            wire.send(b'\xe0\x00')
+            wire.close()
+            await asyncio.to_thread(broker.wait_event, 'connection_closed', after=marker)
+        full = durable(broker.db)
+        require(full['counts']['sessions'] == 128
+                and int(full['tables']['meta'][0]['max_sessions'], 16) == 128,
+                'will_full_capacity_was_not_reached_with_original_quota')
+        witness_id = session_key(full, 'full-offline-000')
+        overflow = WillWire(broker.address, broker.observations, 'full-overflow')
+        wires.append(overflow)
+        overflow.send(will_connect_packet('full-overflow', topic, b'unaccepted-will'))
+        await asyncio.to_thread(expect_rejection, overflow, before_connect=True)
+        overflow.close()
+        refused = durable(broker.db)
+        require(refused['counts']['sessions'] == 128 and refused['tables']['wills'] == full['tables']['wills']
+                and not refused['tables']['obligations'], 'will_full_refusal_evicted_or_armed_new_identity')
+        marker = max(int(row['seq']) for row in broker.events())
+        replacement = WillWire(broker.address, broker.observations, 'full-replacement')
+        wires.append(replacement)
+        replacement.will_connect('full-source', topic, b'new-will-must-be-cancelled',
+                                 clean_start=True, expected_present=False)
+        changed = durable(broker.db)
+        require(changed['counts']['sessions'] == 128
+                and session_key(changed, 'full-source') != source_id
+                and session_key(changed, 'full-offline-000') == witness_id,
+                'will_clean_start_at_full_capacity_reused_or_evicted_identity')
+        admitted = [row for row in broker.events() if row['kind'] == 'will_admitted'
+                    and operation_hex(row['will']) == old_will]
+        connacks = [row for row in broker.events() if int(row['seq']) > marker
+                    and row['kind'] == 'frame_queued' and row['details'].get('packet_kind') == 'CONNACK']
+        require(len(admitted) == len(connacks) == 1 and int(admitted[0]['seq']) < int(connacks[0]['seq']),
+                'will_replacement_connack_preceded_old_will_admission')
+        require(len(changed['tables']['obligations']) == 1
+                and changed['tables']['obligations'][0]['target'] == witness_id,
+                'will_clean_start_lost_other_session_responsibility')
+        source.close()  # Late old transport cleanup, after the new CONNACK.
+        replacement.send(b'\xe0\x00')
+        replacement.close()
+        await until_state(broker, lambda state: not state['tables']['wills'],
+                          'will_new_full_capacity_attachment_was_not_cancelled')
+        resumed = WillWire(broker.address, broker.observations, 'full-witness-resumed')
+        wires.append(resumed)
+        resumed.session_connect('full-offline-000', expected_present=True)
+        value = resumed.next_publication(timeout=8)
+        received = assert_will_frame(value, topic, payload)
+        resumed.acknowledge(value)
+        resumed.no_publication(.1, code='will_new_attachment_published_after_normal_close')
+        final = await drained(broker)
+        require(final['counts']['sessions'] == 128 and all(final['counts'][name] == 0
+                for name in ('wills', 'publications', 'payloads')), 'will_full_capacity_cleanup_or_eviction_wrong')
+        write_json(case / 'full.sql.json', full)
+        write_json(case / 'replaced.sql.json', changed)
+        write_json(case / 'final.sql.json', final)
+        resumed.send(b'\xe0\x00')
+        resumed.close()
+        broker.stop()
+        return {'criterion': 'clean-start-at-full128', 'status': 'PASS', 'sessions': 128,
+                'old_source_session': source_id, 'new_source_session': session_key(changed, 'full-source'),
+                'witness_session': witness_id, 'old_will': old_will, 'admission': admitted[0],
+                'replacement_connack': connacks[0], 'received': received,
+                'final_counts': final['counts'], 'broker_pid': broker.process.pid,
+                'broker_status': broker.process.returncode}
+    finally:
+        for wire in wires:
+            wire.close()
+        broker.cleanup()
+
+
+async def finite_source(binary, case):
+    """Finite source expiry leaves the admitted Will due to another session."""
+    broker, restart = Broker(binary, case), None
+    wires = []
+    topic, payload = 'will/lifecycle/finite/status', b'will-survives-finite-producer-expiry'
+    try:
+        broker.ready()
+        target = WillWire(broker.address, broker.observations, 'finite-offline')
+        wires.append(target)
+        target.session_connect('finite-offline', expected_present=False)
+        target.subscribe_options(1, (Subscription('will/lifecycle/finite/#', 1),))
+        target.send(b'\xe0\x00')
+        target.close()
+        source = WillWire(broker.address, broker.observations, 'finite-source')
+        wires.append(source)
+        source.will_connect('finite-source', topic, payload, expiry=1)
+        initial = durable(broker.db)
+        source_id = session_key(initial, 'finite-source')
+        target_id = session_key(initial, 'finite-offline')
+        will = initial['tables']['wills'][0]['id']
+        await asyncio.sleep(1.1)
+        source.send(b'\xc0\x00')
+        require(source.wait(0xD0).body == b'', 'will_active_finite_source_expired')
+        active = durable(broker.db)
+        require(session_key(active, 'finite-source') == source_id and not active['tables']['obligations']
+                and len(active['tables']['wills']) == 1 and active['tables']['wills'][0]['state'] == 1,
+                'will_active_finite_source_expired_or_published')
+        source.close()
+        retained = await until_state(broker, lambda state: not any(
+            row['id'] == source_id for row in state['tables']['sessions'])
+            and len(state['tables']['obligations']) == 1 and not state['tables']['wills'],
+            'will_finite_source_expiry_destroyed_other_responsibility', timeout=8)
+        obligation = retained['tables']['obligations'][0]
+        require(obligation['target'] == target_id and len(retained['tables']['payloads']) == 1,
+                'will_finite_source_expiry_released_other_payload')
+        write_json(case / 'source-expired.sql.json', retained)
+        inode = broker.db.stat().st_ino
+        broker.stop(killed=True)
+        writer_available(broker.db)
+        restart = Broker(binary, case, db=broker.db, label='restarted')
+        restart.ready()
+        require(restart.db.stat().st_ino == inode, 'will_finite_database_replaced')
+        resumed = WillWire(restart.address, restart.observations, 'finite-resumed')
+        wires.append(resumed)
+        resumed.session_connect('finite-offline', expected_present=True)
+        value = resumed.next_publication(timeout=8)
+        received = assert_will_frame(value, topic, payload)
+        before_ack = durable(restart.db)
+        require(before_ack['tables']['obligations'] == [obligation],
+                'will_finite_recovery_recreated_other_obligation')
+        resumed.acknowledge(value)
+        final = await drained(restart)
+        require(all(final['counts'][name] == 0 for name in ('wills', 'publications', 'payloads')),
+                'will_finite_last_reference_not_released')
+        resumed.send(b'\xe0\x00')
+        resumed.close()
+        restart.stop()
+        write_json(case / 'final.sql.json', final)
+        return {'criterion': 'finite-source-expiry', 'status': 'PASS', 'source_session': source_id,
+                'target_session': target_id, 'will': will, 'active_beyond_interval': True,
+                'obligation_after_source_expiry': obligation, 'received': received,
+                'final_counts': final['counts'], 'killed_pid': broker.process.pid,
+                'kill_status': broker.process.returncode, 'restarted_pid': restart.process.pid,
+                'restart_status': restart.process.returncode, 'same_file': True}
+    finally:
+        for wire in wires:
+            wire.close()
+        broker.cleanup()
+        if restart:
+            restart.cleanup()
+
+
+async def takeover(binary, case):
+    first = await takeover_order(binary, case / 'same-session-takeover')
+    first['clean_start_at_full_capacity'] = await full_session_replacement(binary, case / 'full-capacity')
+    first['finite_source_expiry'] = await finite_source(binary, case / 'finite-source')
+    return first
 
 
 async def fanout_pressure(binary, case):
