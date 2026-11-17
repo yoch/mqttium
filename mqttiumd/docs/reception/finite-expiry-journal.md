@@ -44,3 +44,23 @@
   pressure-window RED570bd417/GREENaa20896d (profile512/1024, quota8192 unchanged).
   Next action: commit stream-reader/report, run219oracle/currentformat readers,
   publish with lease against6b583782 then receive exact-SHA CI10jobs/artifacts.
+
+- Published31d9731a4bb7123b095a20ae476eeb2a03c95c42, remoteHEAD/tree/eightcritical
+  blobs match; PRdraft/unmerged. Current219oracle/102pilots/538schema docs,
+  strictClippy/99producttests/validate13 pass. CI44034680874 reveals a setup
+  omission: oldproductjobs install only Paho, while newdiscovered stream tests
+  import jsonschema. This ModuleNotFoundError is not a broker/control detection.
+  Add shared pinned schema-reader requirements transitively to system tests;
+  verify a fresh isolated environment, publish the corrected source and receive
+  its own CI. Preserve31d failure artifact/source identities and all earlier runs.
+- Exactpublished31d localreception PASS184.927s, including newstrictstreamgate:
+ 16streams/7658events/0skipped. Archive14653d7c45a33742d785817e764acbfc355f8aff5a712a2c297df50273181881;
+ source0f9f603c6a42a5a8e016a03c9a02eb0e7cd2424600787e53b11dd8570207326d.
+ Normal8cfec8e9df08f29d4556d7225c45a8dc79effb82c35a218a25f5041e59fdb6f2;
+ hooks1d0740aaab597a03806e21761df977cf846c1fe28455549110dcef1285473a89.
+ Audit2135sourceblobs/371hashes/372packedfiles and five ownSIGKILL witnesses pass.
+- The corrected transitive system requirements install into a fresh Python3.13
+  environment; all102pilots pass there. No broker Rust, contract, model or quota
+  changes follow31d. Publish this setup/journal correction, then wait for its
+  exact-head CI and fresh qualifying campaign artifacts; earlier failures remain
+  tooling failures, never negative-control detections.

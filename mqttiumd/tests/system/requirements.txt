@@ -1,2 +1,4 @@
-# Independent external MQTT 5 client for product TCP system reception.
+# Independent MQTT client and the bounded product-event schema reader.
+# The shared schema pins are also needed when unittest discovers all pilots.
 paho-mqtt==2.1.0
+-r ../../tools/requirements.txt
