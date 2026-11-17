@@ -41,6 +41,16 @@ pub const MAX_PAYLOAD: usize = 32768;
 fn hex_domain(domain: [u8; 32]) -> String {
     domain.iter().map(|byte| format!("{byte:02x}")).collect()
 }
+pub fn message_expiry_details(
+    now: MessageTime,
+    after: Option<mqttiumd_contract::ids::PublicationId>,
+) -> serde_json::Value {
+    json!({
+        "domain":hex_domain(now.domain),
+        "tick":now.tick.to_string(),
+        "after":after.map(|id|format!("{}/{}/{}/{}",id.incarnation().get(),id.epoch().get(),id.owner().get(),id.sequence().get())).unwrap_or_default()
+    })
+}
 pub fn limits() -> Limits {
     Limits {
         payload_bytes: PayloadBytes::new(4 * 1024 * 1024),
@@ -350,6 +360,12 @@ impl Writer {
                                 if let ControlResponse::Collected { collection, result:Ok(ReceiptCollectionReply::Applied { .. }),.. } = &reply
                                     && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("duplicate-close-result"))) {
                                     let _ = events.emit("receipt_collection_result_duplicated",json!({"command_kind":"ReceiptCollection","details":collection_details(*collection)}));
+                                    duplicate_control = Some(reply.clone());
+                                }
+                                #[cfg(feature="test-hooks")]
+                                if let ControlResponse::MessageExpiry { now, after, result:Ok(_),.. } = &reply
+                                    && hooks.directory.as_ref().is_some_and(|d| consume_file(&d.join("duplicate-next-message-expire-result"))) {
+                                    let _ = events.emit("message_expiry_result_duplicated",json!({"details":message_expiry_details(*now,*after)}));
                                     duplicate_control = Some(reply.clone());
                                 }
                                 pending_control = Some(reply);
@@ -885,7 +901,7 @@ fn control_response(
                 let stop = cancel.clone();
                 let hook = Box::new(move |point| {
                     if point == mqttiumd_store_sqlite::kill_points::KillPoint::CommitPrepared
-                        && hc.barrier_fields("message.expire.prepared", json!({"point":"message.expire.prepared","command_kind":"MessageExpiry","details":{"domain":hex_domain(now.domain),"tick":now.tick.to_string(),"after":format!("{after:?}")}}), &ev, &stop).is_err() {
+                        && hc.barrier_fields("message.expire.prepared", json!({"point":"message.expire.prepared","command_kind":"MessageExpiry","details":message_expiry_details(now, after)}), &ev, &stop).is_err() {
                         stop.store(true, Ordering::Relaxed);
                     }
                 });
@@ -904,7 +920,7 @@ fn control_response(
             if let Ok(sweep) = &result {
                 #[cfg(feature = "test-hooks")]
                 if (!sweep.removed.is_empty() || sweep.retained_removed > 0)
-                    && hooks.barrier_fields("message.expire.committed", json!({"point":"message.expire.committed","command_kind":"MessageExpiry","details":{"domain":hex_domain(now.domain),"tick":now.tick.to_string(),"after":format!("{after:?}")}}), events, cancel).is_err() {
+                    && hooks.barrier_fields("message.expire.committed", json!({"point":"message.expire.committed","command_kind":"MessageExpiry","details":message_expiry_details(now, after)}), events, cancel).is_err() {
                     cancel.store(true, Ordering::Relaxed);
                 }
                 for removed in sweep.removed.as_slice() {
@@ -931,7 +947,10 @@ fn control_response(
                     .as_ref()
                     .is_some_and(|dir| consume_file(&dir.join("drop-next-message-expire-result")))
             {
-                let _ = events.emit("message_expiry_result_dropped", json!({"details":{"domain":hex_domain(now.domain),"tick":now.tick.to_string(),"after":format!("{after:?}")}}));
+                let _ = events.emit(
+                    "message_expiry_result_dropped",
+                    json!({"details":message_expiry_details(now, after)}),
+                );
                 return ControlResponse::MessageExpiryUnknown { now, after };
             }
             ControlResponse::MessageExpiry { now, after, result }

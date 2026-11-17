@@ -7,7 +7,7 @@ use crate::{
     receiving::Terminal,
     writer::{ControlRequest, ControlResponse, Failure, Hooks, Request, Response, Session, Writer},
 };
-use mqttiumd_contract::capacity::{PayloadBytes, Resource, WakeCondition, WorkUnits};
+use mqttiumd_contract::capacity::{BoundedVec, PayloadBytes, Resource, WakeCondition, WorkUnits};
 use mqttiumd_contract::command::Recipe;
 use mqttiumd_contract::effects::{
     CloseReason, Effect, EffectSink, FrameProgress, Input, OwnedEffect, OwnerAuthority,
@@ -51,6 +51,7 @@ const TIMERS: usize = 512;
 const INPUTS: usize = 128;
 const OUTGOING_BINDINGS: usize = 128;
 const LIFECYCLE_IN_FLIGHT: usize = 1;
+const MESSAGE_EXPIRY_RETRIES: u8 = 3;
 const CLOSING_INPUTS: usize = 2 * CONNECTIONS;
 // Per transport: four queued frames, one active and eight terminal receipts.
 const FRAMES: usize = CONNECTIONS * (net::OUTPUT_SLOTS + 9);
@@ -150,6 +151,8 @@ struct AppliedSessionChange {
 struct Runtime<'a> {
     message_expiry_request: Option<(MessageTime, Option<PublicationId>)>,
     message_expiry_retry: bool,
+    message_expiry_retry_attempts: u8,
+    message_expiry_observation: Option<MessageTime>,
     message_expiry_after: Option<PublicationId>,
     message_expiry_scan: Instant,
     message_expiry_input: Option<Input>,
@@ -244,6 +247,15 @@ impl Runtime<'_> {
     fn expire_messages(&mut self) -> Result<(), Failure> {
         if let Some((now, after)) = self.message_expiry_request {
             if self.message_expiry_retry {
+                if self.message_expiry_retry_attempts >= MESSAGE_EXPIRY_RETRIES {
+                    self.events
+                        .emit(
+                            "message_expiry_retry_exhausted",
+                            json!({"details":crate::writer::message_expiry_details(now, after)}),
+                        )
+                        .map_err(event_failure)?;
+                    return Err(Failure::plain("message_expiry_retry_exhausted"));
+                }
                 match self
                     .writer
                     .control_sender
@@ -252,7 +264,18 @@ impl Runtime<'_> {
                         after,
                         limit: 4,
                     }) {
-                    Ok(()) => self.message_expiry_retry = false,
+                    Ok(()) => {
+                        self.message_expiry_retry = false;
+                        self.message_expiry_retry_attempts = self
+                            .message_expiry_retry_attempts
+                            .checked_add(1)
+                            .ok_or_else(|| Failure::plain("message_expiry_retry_exhausted"))?;
+                        let mut details = crate::writer::message_expiry_details(now, after);
+                        details["attempt"] = json!(self.message_expiry_retry_attempts);
+                        self.events
+                            .emit("message_expiry_retry", json!({"details":details}))
+                            .map_err(event_failure)?;
+                    }
                     Err(TrySendError::Full(_)) => {}
                     Err(TrySendError::Disconnected(_)) => {
                         return Err(Failure::plain("writer_control_disconnected"));
@@ -267,8 +290,20 @@ impl Runtime<'_> {
         {
             return Ok(());
         }
-        let now = self.message_now()?;
         let after = self.message_expiry_after;
+        let now = if after.is_some() {
+            self.message_expiry_observation
+                .ok_or_else(|| Failure::plain("message_expiry_scan_observation"))?
+        } else {
+            let now = self.message_now()?;
+            if self.message_expiry_observation == Some(now) {
+                // Reusing a completed header could give an old duplicated page
+                // authority over a later scan while the provider is stopped.
+                self.message_expiry_scan = Instant::now();
+                return Ok(());
+            }
+            now
+        };
         match self
             .writer
             .control_sender
@@ -277,7 +312,11 @@ impl Runtime<'_> {
                 after,
                 limit: 4,
             }) {
-            Ok(()) => self.message_expiry_request = Some((now, after)),
+            Ok(()) => {
+                self.message_expiry_request = Some((now, after));
+                self.message_expiry_observation = Some(now);
+                self.message_expiry_retry_attempts = 0;
+            }
             Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => {
                 return Err(Failure::plain("writer_control_disconnected"));
@@ -1475,6 +1514,123 @@ impl Runtime<'_> {
         self.emit_session_cardinality()?;
         Ok(())
     }
+    fn apply_control_response(&mut self, response: ControlResponse) -> Result<(), Failure> {
+        match response {
+            ControlResponse::Collected {
+                effect,
+                collection,
+                result,
+            } => {
+                let reply = result?;
+                if self.owner.collection_reply_is_live(effect, collection) {
+                    self.queue(Input::ReceiptsCollected {
+                        effect,
+                        collection,
+                        reply,
+                    })?;
+                } else {
+                    self.events.emit("receipt_collection_result_ignored",json!({"command_kind":"ReceiptCollection","details":crate::writer::collection_details(collection)})).map_err(event_failure)?;
+                }
+            }
+            ControlResponse::Lifecycle {
+                effect,
+                operation,
+                reply,
+            } => {
+                if self.lifecycle_inflight.get(&effect) == Some(&operation) {
+                    self.lifecycle_inflight.remove(&effect);
+                    if self.control_inputs.len() >= crate::writer::CONTROL_QUEUE {
+                        return Err(Failure::plain("core_control_input_budget"));
+                    }
+                    self.control_inputs.push_back(Input::StoreResult {
+                        effect,
+                        operation,
+                        reply,
+                    });
+                } else {
+                    self.events.emit("session_result_ignored", json!({"operation":crate::events::operation(operation),"details":{"effect":effect_text(effect),"code":"stale_lifecycle_result"}})).map_err(event_failure)?;
+                }
+            }
+            ControlResponse::MessageExpiryUnknown { now, after } => {
+                if self.message_expiry_request != Some((now, after)) {
+                    return self.ignore_message_expiry_result(now, after, "stale_unknown");
+                }
+                self.message_expiry_retry = true;
+            }
+            ControlResponse::MessageExpiry { now, after, result } => {
+                if self.message_expiry_request != Some((now, after))
+                    || self.message_expiry_input.is_some()
+                {
+                    return self.ignore_message_expiry_result(now, after, "stale_known");
+                }
+                let sweep = result?;
+                // The worker's cloneable reply may share its immutable result with
+                // a duplicate. Copy only its bounded absolute removal knowledge.
+                if sweep.removed.len() > mqttiumd_store_api::MESSAGE_EXPIRY_SWEEP_DELIVERIES {
+                    return Err(Failure::plain("message_expiry_reply_budget"));
+                }
+                let removed = BoundedVec::from_slice(sweep.removed.as_slice(), sweep.removed.len())
+                    .ok_or_else(|| Failure::plain("message_expiry_reply_budget"))?;
+                if self.message_expiry_retry_attempts != 0 {
+                    let mut details = crate::writer::message_expiry_details(now, after);
+                    details["attempt"] = json!(self.message_expiry_retry_attempts);
+                    details["removed"] = json!(removed.len());
+                    self.events
+                        .emit("message_expiry_retry_applied", json!({"details":details}))
+                        .map_err(event_failure)?;
+                }
+                self.message_expiry_after = sweep.next;
+                self.message_expiry_scan = Instant::now();
+                self.message_expiry_request = None;
+                self.message_expiry_retry = false;
+                self.message_expiry_retry_attempts = 0;
+                if !removed.is_empty() {
+                    self.message_expiry_input = Some(Input::MessagesExpired {
+                        deliveries: removed,
+                    });
+                }
+            }
+            ControlResponse::ClockCheckpoint {
+                expected,
+                reading,
+                result,
+            } => {
+                if self.clock_checkpoint.map(|(r, _)| r) != Some(reading)
+                    || expected != self.clock_anchor
+                {
+                    return Err(Failure::plain("clock_checkpoint_correlation"));
+                }
+                self.clock_anchor = result?;
+                self.clock_checkpoint = None;
+                if self.clock_anchor.reading.domain == reading.domain
+                    && self.clock_anchor.reading.tick >= reading.tick
+                {
+                    self.last_clock_checkpoint = Instant::now();
+                    self.checkpoint_degraded = false;
+                }
+                self.events.emit("session_clock_checkpoint", json!({"details":{"logical":self.clock_anchor.logical.to_string(),"tick":self.clock_anchor.reading.tick.to_string()}})).map_err(event_failure)?;
+            }
+            ControlResponse::Failed(failure) => return Err(failure),
+            ControlResponse::Closed { .. } => {
+                return Err(Failure::plain("unexpected_closed_collection"));
+            }
+        }
+        Ok(())
+    }
+
+    fn ignore_message_expiry_result(
+        &self,
+        now: MessageTime,
+        after: Option<PublicationId>,
+        code: &'static str,
+    ) -> Result<(), Failure> {
+        let mut details = crate::writer::message_expiry_details(now, after);
+        details["code"] = json!(code);
+        self.events
+            .emit("message_expiry_result_ignored", json!({"details":details}))
+            .map_err(event_failure)
+    }
+
     fn writer_results(&mut self) -> Result<(), Failure> {
         // Replies have their own reserved capacity. The owner retains bounded
         // attempt correlation; no adapter history or second retry loop exists.
@@ -1486,91 +1642,7 @@ impl Runtime<'_> {
                     return Err(Failure::plain("writer_control_disconnected"));
                 }
             };
-            match response {
-                ControlResponse::Collected {
-                    effect,
-                    collection,
-                    result,
-                } => {
-                    let reply = result?;
-                    if self.owner.collection_reply_is_live(effect, collection) {
-                        self.queue(Input::ReceiptsCollected {
-                            effect,
-                            collection,
-                            reply,
-                        })?;
-                    } else {
-                        self.events.emit("receipt_collection_result_ignored",json!({"command_kind":"ReceiptCollection","details":crate::writer::collection_details(collection)})).map_err(event_failure)?;
-                    }
-                }
-                ControlResponse::Lifecycle {
-                    effect,
-                    operation,
-                    reply,
-                } => {
-                    if self.lifecycle_inflight.get(&effect) == Some(&operation) {
-                        self.lifecycle_inflight.remove(&effect);
-                        if self.control_inputs.len() >= crate::writer::CONTROL_QUEUE {
-                            return Err(Failure::plain("core_control_input_budget"));
-                        }
-                        self.control_inputs.push_back(Input::StoreResult {
-                            effect,
-                            operation,
-                            reply,
-                        });
-                    } else {
-                        self.events.emit("session_result_ignored", json!({"operation":crate::events::operation(operation),"details":{"effect":effect_text(effect),"code":"stale_lifecycle_result"}})).map_err(event_failure)?;
-                    }
-                }
-                ControlResponse::MessageExpiryUnknown { now, after } => {
-                    if self.message_expiry_request != Some((now, after)) {
-                        return Err(Failure::plain("message_expiry_correlation"));
-                    }
-                    self.message_expiry_retry = true;
-                }
-                ControlResponse::MessageExpiry { now, after, result } => {
-                    if self.message_expiry_request != Some((now, after))
-                        || self.message_expiry_input.is_some()
-                    {
-                        return Err(Failure::plain("message_expiry_correlation"));
-                    }
-                    let sweep = Arc::try_unwrap(result?)
-                        .map_err(|_| Failure::plain("message_expiry_reply_shared"))?;
-                    self.message_expiry_after = sweep.next;
-                    self.message_expiry_scan = Instant::now();
-                    self.message_expiry_request = None;
-                    self.message_expiry_retry = false;
-                    if !sweep.removed.is_empty() {
-                        self.message_expiry_input = Some(Input::MessagesExpired {
-                            deliveries: sweep.removed,
-                        });
-                    }
-                }
-                ControlResponse::ClockCheckpoint {
-                    expected,
-                    reading,
-                    result,
-                } => {
-                    if self.clock_checkpoint.map(|(r, _)| r) != Some(reading)
-                        || expected != self.clock_anchor
-                    {
-                        return Err(Failure::plain("clock_checkpoint_correlation"));
-                    }
-                    self.clock_anchor = result?;
-                    self.clock_checkpoint = None;
-                    if self.clock_anchor.reading.domain == reading.domain
-                        && self.clock_anchor.reading.tick >= reading.tick
-                    {
-                        self.last_clock_checkpoint = Instant::now();
-                        self.checkpoint_degraded = false;
-                    }
-                    self.events.emit("session_clock_checkpoint", json!({"details":{"logical":self.clock_anchor.logical.to_string(),"tick":self.clock_anchor.reading.tick.to_string()}})).map_err(event_failure)?;
-                }
-                ControlResponse::Failed(failure) => return Err(failure),
-                ControlResponse::Closed { .. } => {
-                    return Err(Failure::plain("unexpected_closed_collection"));
-                }
-            }
+            self.apply_control_response(response)?;
         }
         for _ in 0..64 {
             if self.inputs.len() + self.deferred_inputs.len() >= INPUTS {
@@ -1946,9 +2018,7 @@ impl Runtime<'_> {
             .ok_or_else(|| Failure::plain("generation_missing"))?;
         p.last_packet = Instant::now();
         match decoded {
-            Packet::TimedPublish { .. } => {
-                return Err(Failure::plain("timed_publish_not_anchored"));
-            }
+            Packet::TimedPublish { .. } => Err(Failure::plain("timed_publish_not_anchored")),
             Packet::Connect(connect) => self.connect(generation, connect),
             Packet::Disconnect { expiry } => {
                 if p.connect_expiry == SessionExpiry::OnDisconnect
@@ -3884,6 +3954,8 @@ fn run_inner(
     let mut runtime = Runtime {
         message_expiry_request: None,
         message_expiry_retry: false,
+        message_expiry_retry_attempts: 0,
+        message_expiry_observation: None,
         message_expiry_after: None,
         message_expiry_scan: Instant::now(),
         message_expiry_input: None,

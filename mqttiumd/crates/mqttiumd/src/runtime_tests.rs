@@ -42,13 +42,21 @@ fn with_runtime_clock(
     clock: Arc<dyn SessionClock>,
     test: impl FnOnce(&mut Runtime<'_>, &Path),
 ) {
+    with_runtime_clock_hooks(max_exchanges, clock, Hooks::default(), test);
+}
+fn with_runtime_clock_hooks(
+    max_exchanges: u32,
+    clock: Arc<dyn SessionClock>,
+    hooks: Hooks,
+    test: impl FnOnce(&mut Runtime<'_>, &Path),
+) {
     let directory = Directory::new();
     let events = Events::open(&directory.0.join("events.jsonl")).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let mut writer = Writer::spawn_with_clock(
         directory.0.join("store.sqlite"),
         events.clone(),
-        Hooks::default(),
+        hooks.clone(),
         cancel.clone(),
         clock,
     )
@@ -83,6 +91,8 @@ fn with_runtime_clock(
     let mut runtime = Runtime {
         message_expiry_request: None,
         message_expiry_retry: false,
+        message_expiry_retry_attempts: 0,
+        message_expiry_observation: None,
         message_expiry_after: None,
         message_expiry_scan: Instant::now(),
         message_expiry_input: None,
@@ -131,7 +141,7 @@ fn with_runtime_clock(
         #[cfg(feature = "test-hooks")]
         captured: None,
         #[cfg(feature = "test-hooks")]
-        hooks: Hooks::default(),
+        hooks,
         #[cfg(feature = "test-hooks")]
         deferred_ack: None,
         #[cfg(feature = "test-hooks")]
@@ -2606,17 +2616,8 @@ fn a_real_duplicated_message_expiry_reply_cannot_reapply_removed_deliveries() {
         let original = *queued.obligations.keys().next().unwrap();
 
         clock.set(sample(1_000_000_100));
-        let now = runtime.message_now().unwrap();
-        runtime.message_expiry_request = Some((now, None));
-        runtime
-            .writer
-            .control_sender
-            .send(ControlRequest::MessageExpiry {
-                now,
-                after: None,
-                limit: 4,
-            })
-            .unwrap();
+        runtime.message_expiry_scan = Instant::now() - Duration::from_millis(101);
+        runtime.expire_messages().unwrap();
         let response = runtime
             .writer
             .control_receiver
@@ -2664,6 +2665,321 @@ fn a_real_duplicated_message_expiry_reply_cannot_reapply_removed_deliveries() {
         assert_eq!(after.publications, fresh.publications);
         assert_eq!(after.payloads, fresh.payloads);
     });
+}
+
+#[test]
+fn a_stopped_clock_cannot_reuse_a_completed_message_expiry_header() {
+    use crate::session_time::testing::FakeClock;
+    let sample = |tick| SessionClockReading {
+        domain: [78; 32],
+        tick,
+    };
+    let clock = Arc::new(FakeClock::new(sample(100)));
+    with_runtime_clock(128, clock.clone(), |runtime, directory| {
+        runtime.message_expiry_scan = Instant::now() - Duration::from_millis(101);
+        runtime.expire_messages().unwrap();
+        let first_header = runtime.message_expiry_request.unwrap();
+        let first = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let duplicate = first.clone();
+        runtime.apply_control_response(first).unwrap();
+        runtime.message_expiry_scan = Instant::now() - Duration::from_millis(101);
+        runtime.expire_messages().unwrap();
+        assert!(
+            runtime.message_expiry_request.is_none(),
+            "message_expiry_header_reused_with_stopped_clock"
+        );
+
+        clock.set(sample(101));
+        runtime.message_expiry_scan = Instant::now() - Duration::from_millis(101);
+        runtime.expire_messages().unwrap();
+        let next_header = runtime.message_expiry_request.unwrap();
+        assert_ne!(next_header, first_header);
+        runtime.apply_control_response(duplicate).unwrap();
+        assert_eq!(
+            runtime.message_expiry_request,
+            Some(next_header),
+            "stale_expiry_reply_retargeted_to_new_scan"
+        );
+        let next = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        runtime.apply_control_response(next).unwrap();
+        assert!(runtime.message_expiry_request.is_none());
+        let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+        assert!(
+            events
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .any(|event| event["kind"] == "message_expiry_result_ignored"
+                    && event["details"]["code"] == "stale_known")
+        );
+    });
+}
+
+#[test]
+fn all_pages_of_a_real_message_expiry_scan_keep_the_first_observation() {
+    use crate::session_time::testing::FakeClock;
+    let sample = |tick| SessionClockReading {
+        domain: [81; 32],
+        tick,
+    };
+    let clock = Arc::new(FakeClock::new(sample(100)));
+    with_runtime_clock(128, clock.clone(), |runtime, directory| {
+        let (publisher, mut sender) = peer(runtime);
+        runtime
+            .connect(publisher, connect_packet(b"expiry-pages"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut sender).0, 0x20);
+        for suffix in b'0'..=b'4' {
+            runtime
+                .packet(
+                    publisher,
+                    0x31,
+                    vec![0, 2, b't', suffix, 5, 2, 0, 0, 0, 1, b'v'],
+                )
+                .unwrap();
+            until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        }
+        let path = directory.join("store.sqlite");
+        assert_eq!(
+            mqttiumd_store_sqlite::SqliteStore::inspect(&path)
+                .unwrap()
+                .retained
+                .len(),
+            5
+        );
+        clock.set(sample(1_000_000_100));
+        runtime.message_expiry_scan = Instant::now() - Duration::from_millis(101);
+        runtime.expire_messages().unwrap();
+        let first_header = runtime.message_expiry_request.unwrap();
+        let first = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            matches!(&first,ControlResponse::MessageExpiry{result:Ok(sweep),..} if sweep.retained_removed==4&&sweep.next.is_some())
+        );
+        runtime.apply_control_response(first).unwrap();
+        clock.set(sample(2_000_000_100));
+        runtime.expire_messages().unwrap();
+        let next_header = runtime.message_expiry_request.unwrap();
+        assert_eq!(
+            next_header.0, first_header.0,
+            "message_expiry_page_changed_frozen_time"
+        );
+        assert_ne!(next_header.1, first_header.1);
+        let second = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            matches!(&second,ControlResponse::MessageExpiry{result:Ok(sweep),..} if sweep.retained_removed==1)
+        );
+        runtime.apply_control_response(second).unwrap();
+        assert!(
+            mqttiumd_store_sqlite::SqliteStore::inspect(&path)
+                .unwrap()
+                .retained
+                .is_empty()
+        );
+    });
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn the_real_writer_duplicate_expiry_hook_is_applied_once() {
+    use crate::session_time::testing::FakeClock;
+    let controls = Directory::new();
+    std::fs::write(
+        controls.0.join("duplicate-next-message-expire-result"),
+        b"duplicate",
+    )
+    .unwrap();
+    let clock = Arc::new(FakeClock::new(SessionClockReading {
+        domain: [82; 32],
+        tick: 100,
+    }));
+    with_runtime_clock_hooks(
+        128,
+        clock,
+        Hooks {
+            directory: Some(controls.0.clone()),
+            pause: vec![],
+        },
+        |runtime, directory| {
+            runtime.message_expiry_scan = Instant::now() - Duration::from_millis(101);
+            runtime.expire_messages().unwrap();
+            let first = runtime
+                .writer
+                .control_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            let duplicate = runtime
+                .writer
+                .control_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            assert!(
+                matches!((&first,&duplicate),(ControlResponse::MessageExpiry{result:Ok(a),..},ControlResponse::MessageExpiry{result:Ok(b),..}) if Arc::ptr_eq(a,b)),
+                "duplicate_hook_did_not_share_the_authentic_result"
+            );
+            runtime.apply_control_response(first).unwrap();
+            runtime.apply_control_response(duplicate).unwrap();
+            assert!(runtime.message_expiry_request.is_none());
+            assert!(runtime.message_expiry_input.is_none());
+            let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+            assert!(
+                events
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .any(|event| event["kind"] == "message_expiry_result_duplicated")
+            );
+        },
+    );
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_lost_real_expiry_reply_retries_its_frozen_header_and_observes_empty_success() {
+    use crate::session_time::testing::FakeClock;
+    let controls = Directory::new();
+    let drop = controls.0.join("drop-next-message-expire-result");
+    std::fs::write(&drop, b"drop").unwrap();
+    let sample = |tick| SessionClockReading {
+        domain: [79; 32],
+        tick,
+    };
+    let clock = Arc::new(FakeClock::new(sample(100)));
+    with_runtime_clock_hooks(
+        128,
+        clock.clone(),
+        Hooks {
+            directory: Some(controls.0.clone()),
+            pause: vec![],
+        },
+        |runtime, directory| {
+            runtime.message_expiry_scan = Instant::now() - Duration::from_millis(101);
+            runtime.expire_messages().unwrap();
+            let frozen = runtime.message_expiry_request.unwrap();
+            let unknown = runtime
+                .writer
+                .control_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            assert!(
+                matches!(&unknown,ControlResponse::MessageExpiryUnknown{now,after} if (*now,*after)==frozen)
+            );
+            let stale_unknown = unknown.clone();
+            runtime.apply_control_response(unknown).unwrap();
+            assert!(runtime.message_expiry_retry);
+            clock.set(sample(1_000_000_100));
+            runtime.expire_messages().unwrap();
+            assert_eq!(runtime.message_expiry_request, Some(frozen));
+            let reply = runtime
+                .writer
+                .control_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            assert!(
+                matches!(&reply,ControlResponse::MessageExpiry{now,after,result:Ok(sweep)} if (*now,*after)==frozen&&sweep.removed.is_empty())
+            );
+            runtime.apply_control_response(reply).unwrap();
+            runtime.apply_control_response(stale_unknown).unwrap();
+            assert!(runtime.message_expiry_request.is_none());
+            assert!(!runtime.message_expiry_retry);
+            assert_eq!(runtime.message_expiry_retry_attempts, 0);
+            let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+            let events: Vec<serde_json::Value> = events
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let retry = events
+                .iter()
+                .find(|event| event["kind"] == "message_expiry_retry")
+                .unwrap();
+            let applied = events
+                .iter()
+                .find(|event| event["kind"] == "message_expiry_retry_applied")
+                .expect("empty_retry_success_not_observed");
+            for field in ["domain", "tick", "after"] {
+                assert_eq!(
+                    retry["details"][field], applied["details"][field],
+                    "retry_header_changed"
+                );
+            }
+            assert_eq!(applied["details"]["tick"], "100");
+            assert_eq!(applied["details"]["after"], "");
+            assert_eq!(applied["details"]["removed"], 0);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["kind"] == "message_expiry_result_ignored"
+                        && event["details"]["code"] == "stale_unknown")
+            );
+        },
+    );
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn repeated_real_expiry_reply_loss_stops_at_the_finite_retry_budget() {
+    use crate::session_time::testing::FakeClock;
+    let controls = Directory::new();
+    let clock = Arc::new(FakeClock::new(SessionClockReading {
+        domain: [80; 32],
+        tick: 100,
+    }));
+    with_runtime_clock_hooks(
+        128,
+        clock,
+        Hooks {
+            directory: Some(controls.0.clone()),
+            pause: vec![],
+        },
+        |runtime, directory| {
+            runtime.message_expiry_scan = Instant::now() - Duration::from_millis(101);
+            let mut frozen = None;
+            for attempt in 0..=MESSAGE_EXPIRY_RETRIES {
+                std::fs::write(controls.0.join("drop-next-message-expire-result"), b"drop")
+                    .unwrap();
+                runtime.expire_messages().unwrap();
+                let header = runtime.message_expiry_request.unwrap();
+                assert_eq!(*frozen.get_or_insert(header), header);
+                let unknown = runtime
+                    .writer
+                    .control_receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap();
+                assert!(
+                    matches!(&unknown,ControlResponse::MessageExpiryUnknown{now,after} if (*now,*after)==header)
+                );
+                runtime.apply_control_response(unknown).unwrap();
+                assert_eq!(runtime.message_expiry_retry_attempts, attempt);
+            }
+            assert_eq!(
+                runtime.expire_messages().unwrap_err().code,
+                "message_expiry_retry_exhausted"
+            );
+            let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+            assert_eq!(
+                events
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .filter(|event| event["kind"] == "message_expiry_retry")
+                    .count(),
+                usize::from(MESSAGE_EXPIRY_RETRIES)
+            );
+        },
+    );
 }
 
 #[test]
