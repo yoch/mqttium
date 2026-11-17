@@ -840,4 +840,240 @@ mod tests {
             "old_close_affected_new_will_attachment"
         );
     }
+    #[test]
+    fn will_admission_reserves_all_effects_before_drawing_any_identity_or_losing_the_page() {
+        let mut owner = world();
+        let read = apply(&mut owner, Input::DiscoverWills)[0].0;
+        let value = intent(9);
+        let input = Input::WillPage {
+            effect: read,
+            items: BoundedVec::from_slice(&[value], 1).unwrap(),
+            next: None,
+        };
+        let counters = owner.counters;
+        let revision = owner.revision;
+        let status = owner.will_status();
+        let reserved = owner
+            .outbox
+            .reserve(NonZeroUsize::new(owner.outbox.free_slots() - 1).unwrap())
+            .unwrap();
+        let outcome = owner.step(input, TURN);
+        let StepOutcome::NeedCapacity { input, need, .. } = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(need.resource, Resource::EffectSlots);
+        assert_eq!(
+            owner.counters, counters,
+            "will_reservation_refusal_burned_identity"
+        );
+        assert_eq!(owner.revision, revision);
+        assert_eq!(
+            owner.will_status(),
+            status,
+            "will_reservation_refusal_lost_pending_read"
+        );
+        owner.outbox.release(reserved).unwrap();
+        let effects = apply(&mut owner, input);
+        assert!(matches!(
+            effects.as_slice(),
+            [(_, Effect::Persist { .. }), (_, Effect::ArmDeadline { .. })]
+        ));
+    }
+    #[test]
+    fn will_receipt_hole_blocks_retirement_and_known_result_closes_its_identity_spaces() {
+        use crate::contract::receipts::ReceiptCollectionReply;
+        let mut owner = world();
+        let registration = apply(&mut owner, Input::MaintainReceipts);
+        let (registration_effect, Effect::CollectReceipts { collection }) = registration[0] else {
+            panic!();
+        };
+        let _ = apply(
+            &mut owner,
+            Input::ReceiptsCollected {
+                effect: registration_effect,
+                collection,
+                reply: ReceiptCollectionReply::Applied {
+                    closure: collection.closure,
+                    removed: 0,
+                    retained: 0,
+                    more: false,
+                },
+            },
+        );
+        let effects = page(&mut owner, &intent(9));
+        let (effect, operation, facts) = submitted(&effects);
+        let (_, span, holes) = owner.receipt_status().unwrap();
+        assert_eq!(
+            (span, holes),
+            (1, 1),
+            "unknown_will_result_was_prematurely_consumed"
+        );
+        owner.receipts.test_request_sweep();
+        let maintenance = apply(&mut owner, Input::MaintainReceipts);
+        let (maintenance_effect, Effect::CollectReceipts { collection }) = maintenance[0] else {
+            panic!();
+        };
+        assert_eq!(
+            collection.closure.through,
+            OperationSeq::new(0),
+            "closure_crossed_unknown_will"
+        );
+        let _ = apply(
+            &mut owner,
+            Input::ReceiptsCollected {
+                effect: maintenance_effect,
+                collection,
+                reply: ReceiptCollectionReply::Applied {
+                    closure: collection.closure,
+                    removed: 0,
+                    retained: 1,
+                    more: false,
+                },
+            },
+        );
+        let _ = apply(
+            &mut owner,
+            Input::StoreResult {
+                effect,
+                operation,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(facts)),
+            },
+        );
+        assert_eq!(owner.receipt_status().unwrap().2, 0);
+        owner.receipts.test_request_sweep();
+        let maintenance = apply(&mut owner, Input::MaintainReceipts);
+        let (_, Effect::CollectReceipts { collection }) = maintenance[0] else {
+            panic!();
+        };
+        assert_eq!(collection.closure.through, operation.sequence());
+        assert_eq!(
+            collection.closure.publication_through,
+            PublicationSeq::new(1),
+            "will_publication_identity_not_protected_after_collection"
+        );
+        assert_eq!(
+            collection.closure.payload_through,
+            PayloadSeq::new(1),
+            "will_payload_identity_not_protected_after_collection"
+        );
+    }
+    struct ControlsOnly {
+        taken: Vec<(EffectId, Effect)>,
+        refuse_persist: bool,
+    }
+    impl EffectSink for ControlsOnly {
+        fn try_submit(&mut self, effect: OwnedEffect) -> SubmitResult {
+            if matches!(effect.effect(), Effect::EmitFrame { .. })
+                || (self.refuse_persist && matches!(effect.effect(), Effect::Persist { .. }))
+            {
+                SubmitResult::NotSubmitted {
+                    effect,
+                    reason: crate::contract::effects::SubmitBlock::QueueFull,
+                }
+            } else {
+                self.taken.push(effect.into_parts());
+                SubmitResult::Accepted
+            }
+        }
+    }
+    fn block_network_head(owner: &mut Owner) -> EffectId {
+        let id = EffectId {
+            epoch: owner.epoch,
+            owner: owner.id,
+            sequence: draw(&mut owner.counters.effect, EffectSeq::checked_next).unwrap(),
+        };
+        let reservation = owner.outbox.reserve(NonZeroUsize::new(1).unwrap()).unwrap();
+        owner
+            .outbox
+            .publish(
+                reservation,
+                OwnedEffect::new(
+                    id,
+                    Effect::EmitFrame {
+                        connection: ConnectionKey {
+                            session: SessionId::new(1),
+                            generation: ConnectionGeneration::new(60),
+                        },
+                        frame: OutboundFrame::Pingresp,
+                        publish_order: None,
+                    },
+                ),
+            )
+            .unwrap();
+        id
+    }
+    #[test]
+    fn will_query_admission_and_resolution_bypass_a_retained_network_head_without_reordering_their_deadline()
+     {
+        let mut owner = world();
+        let blocked = block_network_head(&mut owner);
+        let mut sink = ControlsOnly {
+            taken: Vec::new(),
+            refuse_persist: false,
+        };
+        assert!(matches!(
+            owner.step(Input::DiscoverWills, TURN),
+            StepOutcome::Applied { .. }
+        ));
+        let report = owner.dispatch(&mut sink);
+        assert_eq!(
+            report.accepted, 1,
+            "blocked_network_pinned_durable_will_discovery"
+        );
+        let (read, Effect::LoadWills { .. }) = sink.taken.pop().unwrap() else {
+            panic!();
+        };
+        assert!(matches!(
+            owner.step(
+                Input::WillPage {
+                    effect: read,
+                    items: BoundedVec::from_slice(&[intent(9)], 1).unwrap(),
+                    next: None
+                },
+                TURN
+            ),
+            StepOutcome::Applied { .. }
+        ));
+        sink.refuse_persist = true;
+        let report = owner.dispatch(&mut sink);
+        assert_eq!(report.accepted, 0);
+        assert!(
+            sink.taken.is_empty(),
+            "will_deadline_armed_before_persist_acceptance"
+        );
+        sink.refuse_persist = false;
+        let report = owner.dispatch(&mut sink);
+        assert_eq!(report.accepted, 2, "blocked_network_pinned_will_admission");
+        assert!(matches!(
+            sink.taken.as_slice(),
+            [(_, Effect::Persist { .. }), (_, Effect::ArmDeadline { .. })]
+        ));
+        let (operation, deadline) = owner.will_dispatch().unwrap();
+        sink.taken.clear();
+        assert!(matches!(
+            owner.step(
+                Input::Deadline {
+                    token: deadline,
+                    now: LogicalTime::new(100)
+                },
+                TURN
+            ),
+            StepOutcome::Applied { .. }
+        ));
+        let report = owner.dispatch(&mut sink);
+        assert_eq!(
+            report.accepted, 2,
+            "blocked_network_pinned_unknown_will_resolution"
+        );
+        assert!(
+            matches!(sink.taken.as_slice(), [(_, Effect::ResolveAndFence { operation: resolved }), (_, Effect::ArmDeadline { .. })] if *resolved == operation)
+        );
+        assert_eq!(owner.outbox.len(), 1);
+        let mut all = Taking(Vec::new());
+        owner.dispatch(&mut all);
+        assert_eq!(
+            all.0[0].0, blocked,
+            "will_control_scan_lost_or_replaced_retained_network_effect"
+        );
+    }
 }
