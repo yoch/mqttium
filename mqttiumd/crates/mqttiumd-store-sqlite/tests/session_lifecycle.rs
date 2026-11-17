@@ -1364,3 +1364,164 @@ fn the_largest_finite_interval_and_clock_overflow_have_checked_boundaries() {
         before.sessions[&session].detached
     );
 }
+
+#[test]
+fn impossible_finite_deadline_is_refused_before_sqlite_startup_can_erase_it() {
+    let directory = Directory::new();
+    let path = directory.database();
+    let mut store = sqlite(&path);
+    let epoch = open(&mut store);
+    store
+        .checkpoint_session_clock(
+            None,
+            mqttiumd_store_api::SessionClockReading {
+                domain: [31; 32],
+                tick: 0,
+            },
+        )
+        .unwrap();
+    let opening = operation_id(epoch, 1);
+    let (session, _) =
+        expect_open(store.apply(&finite_open(opening, b"impossible-deadline", None, 1, 0)));
+    store.apply(&lifecycle(
+        operation_id(epoch, 2),
+        SessionAction::Detach {
+            guard: SessionGuard {
+                session,
+                opened_by: Some(opening),
+            },
+            expiry: SessionExpiry::After(1),
+            observed_at: 0,
+        },
+    ));
+    let foreign = rusqlite::Connection::open(&path).unwrap();
+    foreign
+        .execute("UPDATE sessions SET deadline=zeroblob(8)", [])
+        .unwrap();
+    assert_eq!(
+        foreign
+            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert!(
+        matches!(store.snapshot(), Err(ReadError::InvalidData)),
+        "impossible_deadline_was_interpreted_as_expired"
+    );
+    assert_eq!(
+        store.recover(None, 8),
+        Err(RecoveryRefused::Read(ReadError::InvalidData))
+    );
+    assert_eq!(
+        store.read_work(session, None, 8),
+        Err(ReadError::InvalidData)
+    );
+    let before = store.ledger().unwrap();
+    let attempt = opening_command(&store);
+    assert_eq!(store.open_epoch(&attempt), Err(ReadError::InvalidData));
+    assert_eq!(
+        store.ledger().unwrap(),
+        before,
+        "invalid temporal metadata cannot advance startup"
+    );
+    assert_eq!(
+        foreign
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE id=?1",
+                [session.to_be_bytes().as_slice()],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "startup must leave the invalid row untouched"
+    );
+}
+
+#[test]
+fn impossible_finite_deadline_is_refused_before_memory_startup_can_erase_it() {
+    let mut store = MemoryStore::create(StoreIncarnation::new(1), fixture_limits());
+    let epoch = open(&mut store);
+    store
+        .checkpoint_session_clock(
+            None,
+            mqttiumd_store_api::SessionClockReading {
+                domain: [32; 32],
+                tick: 0,
+            },
+        )
+        .unwrap();
+    let opening = operation_id(epoch, 1);
+    let (session, _) =
+        expect_open(store.apply(&finite_open(opening, b"impossible-deadline", None, 1, 0)));
+    store.apply(&lifecycle(
+        operation_id(epoch, 2),
+        SessionAction::Detach {
+            guard: SessionGuard {
+                session,
+                opened_by: Some(opening),
+            },
+            expiry: SessionExpiry::After(1),
+            observed_at: 0,
+        },
+    ));
+    let mut corrupt = store.snapshot().unwrap();
+    corrupt
+        .sessions
+        .get_mut(&session)
+        .unwrap()
+        .detached
+        .as_mut()
+        .unwrap()
+        .deadline = Some(0);
+    let mut store = MemoryStore::reopen(corrupt);
+    assert!(
+        matches!(store.snapshot(), Err(ReadError::InvalidData)),
+        "impossible_deadline_was_interpreted_as_expired"
+    );
+    assert_eq!(
+        store.recover(None, 8),
+        Err(RecoveryRefused::Read(ReadError::InvalidData))
+    );
+    assert_eq!(
+        store.read_work(session, None, 8),
+        Err(ReadError::InvalidData)
+    );
+    let before = store.ledger().unwrap();
+    let attempt = opening_command(&store);
+    assert_eq!(store.open_epoch(&attempt), Err(ReadError::InvalidData));
+    assert_eq!(
+        store.ledger().unwrap(),
+        before,
+        "invalid temporal metadata cannot advance startup"
+    );
+}
+
+#[test]
+fn continuous_domain_progress_prevents_expired_session_resurrection() {
+    let mut p = Pair::new();
+    checkpoint(&mut p, 33, 0);
+    let epoch = p.mem.epoch;
+    let operation = operation_id(epoch, 1);
+    let (session, _) =
+        expect_open(p.apply(&finite_open(operation, b"continuous-domain", None, 3, 0)));
+    p.apply(&lifecycle(
+        operation_id(epoch, 2),
+        SessionAction::Detach {
+            guard: SessionGuard {
+                session,
+                opened_by: Some(operation),
+            },
+            expiry: SessionExpiry::After(3),
+            observed_at: 0,
+        },
+    ));
+    for tick in [1_000_000_000, 2_000_000_000, 4_000_000_000] {
+        checkpoint(&mut p, 33, tick);
+        p = p.reopen();
+        p.open_epoch();
+    }
+    assert!(
+        !p.state().sessions.contains_key(&session),
+        "continuous_domain_progress_lost"
+    );
+}
