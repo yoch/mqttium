@@ -17,6 +17,11 @@ from pubsub_probe import durable
 from tcp_probe import ReceiptFailure, operation_hex, require, write_json
 from tcp_reception import Broker, writer_available
 
+# The normal product resolves ordinary unknown commands after 10000 ms.
+# Keep this case's original receipt alive across that actual deadline.
+HELD_ADMISSION_COMPLETION_TIMEOUT = 15
+HELD_ADMISSION_RESOLUTION_TIMEOUT = 12
+
 
 def startup_clock(broker):
     values = [event for event in broker.events() if event['kind'] == 'session_clock_anchor']
@@ -578,7 +583,7 @@ async def held_admission(binary, case):
         peers.append((source, source_tap))
         hold.touch(exist_ok=False)
         action = asyncio.create_task(source.publish('message-expiry/cut/value', payload, 1,
-                                                    retain=True, message_expiry=1))
+            retain=True, message_expiry=1, completion_timeout=HELD_ADMISSION_COMPLETION_TIMEOUT))
         held = await asyncio.to_thread(broker.wait_event, 'store_result_held')
         require(held.get('command_kind') == 'Admission' and held['details'].get('outcome') == 'Committed',
                 'message_expiry_held_admission_not_committed')
@@ -595,12 +600,21 @@ async def held_admission(binary, case):
         require(still == canonical, 'message_expiry_held_recipe_changed_after_physical_expiry')
         hold.unlink()
         broker.observations.record('held_admission_result_released', operation=held['operation'])
-        resolved = await asyncio.to_thread(broker.wait_event, 'store_resolved', after=int(held['seq']))
+        resolved = await asyncio.to_thread(broker.wait_event, 'store_resolved', after=int(held['seq']),
+                                           timeout=HELD_ADMISSION_RESOLUTION_TIMEOUT)
         require(resolved.get('operation') == held['operation'] and
                 resolved['details'].get('outcome') == 'committed',
                 'message_expiry_held_resolution_changed_original_operation')
-        await asyncio.wait_for(action, timeout=5)
+        original_packet_id = await asyncio.wait_for(action, timeout=5)
         action = None
+        submissions = [event for event in source.log.events if event['kind'] == 'publication_submitted']
+        completions = [event for event in source.log.events if event['kind'] == 'publication_completed']
+        original_ack = [frame for frame in source_tap.server_frames() if frame.kind == 0x40 and
+                        frame.ack()[0] == original_packet_id]
+        require(len(submissions) == len(completions) == len(original_ack) == 1 and
+                submissions[0]['packet_id'] == completions[0]['packet_id'] == original_packet_id and
+                original_ack[0].ack() == (original_packet_id, 0),
+                'message_expiry_held_original_publication_not_completed_once')
         target, tap = await peer('paho', broker, case, 'held-resumed-target',
                                  client_id='held-target', present=True)
         peers.append((target, tap))
@@ -615,6 +629,10 @@ async def held_admission(binary, case):
         writer_available(broker.db)
         return {'criterion': 'held-admission', 'status': 'PASS', 'ready': ready,
                 'held': held, 'resolved': resolved, 'same_operation': True, 'canonical': canonical,
+                'receipt_completion_timeout_seconds': HELD_ADMISSION_COMPLETION_TIMEOUT,
+                'resolution_wait_timeout_seconds': HELD_ADMISSION_RESOLUTION_TIMEOUT,
+                'original_packet_id': original_packet_id, 'original_puback_body_hex': original_ack[0].body.hex(),
+                'public_publication_submissions': len(submissions), 'public_publication_completions': len(completions),
                 'expired_while_unknown_counts': expired['counts'], 'final_counts': final['counts'],
                 'fresh_timeless_witness': fresh, 'process_status': broker.process.returncode}
     finally:

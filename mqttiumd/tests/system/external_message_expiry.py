@@ -33,7 +33,7 @@ class MqttiumMessageExpiry(MqttiumRetained):
                         message_expiry_interval=expiry, packet_id=receipt.mid if qos else None,
                         client_receipt_id=receipt.mid, payload_sha256=hashlib.sha256(payload).hexdigest())
         try:
-            await receipt.wait(timeout=TIMEOUT)
+            await receipt.wait(timeout=completion_timeout)
         except Exception as error:
             self.log.record('publication_failed', exception=type(error).__name__,
                             reason_code=getattr(error, 'reason_code', None))
