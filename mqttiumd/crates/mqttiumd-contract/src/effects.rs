@@ -489,6 +489,10 @@ pub enum SubmitBlock {
 /// Result of a non-blocking submission.
 #[must_use]
 #[derive(PartialEq, Eq, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a refused effect is returned intact without a heap allocation"
+)]
 pub enum SubmitResult {
     /// Ownership moved to the adapter, which tracks the effect until an
     /// outcome or a defined resolution. Afterwards a cancellation, a timeout
