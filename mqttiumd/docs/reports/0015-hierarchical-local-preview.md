@@ -144,8 +144,8 @@ New contract digest:
 this identity. No historical fingerprint is bypassed.
 
 Local integrated checks: formatting, strict workspace Clippy,995 normal Rust
-and1010 instrumented Rust tests (sequential),228 oracle tests,114 system-pilot
-tests after the event-name and fresh-Cargo-cache regressions, corpus/trace regeneration and both schema
+and1010 instrumented Rust tests (sequential),228 oracle tests,116 system-pilot
+tests after the event-name, fresh-Cargo-cache and terminal-observer regressions, corpus/trace regeneration and both schema
 readers. Boundary purity checks pass and proof-protected/French-archive files are
 unchanged. Final CI repeats its full gates, K1/K2b/K3 qualifying campaigns,
 receipt/PI/pubsub/session/expiry receptions and all97 model outcomes on its exact
@@ -173,3 +173,15 @@ Cargo download progress on stderr was merged into metadata JSON stdout. The
 subprocess regression requires valid JSON despite progress and keeps diagnostics
 on failure; the fix separates the streams. That tool failure is not counted
 as a negative control. Fresh publication artifacts identify their corrected SHA.
+
+The cf737c59 CI preview, models, contracts, PI, TCP, QoS0, pub/sub, sessions,
+expiry and proof gates pass. Its old receipt identity mutation revealed a test
+collector race: the event scan preceded a committed invalid replay and process
+exit, while the following poll saw exit2 and masked that terminal fact.
+RED56a0b163/GREEN9039779f makes a final bounded event scan after observed death
+and checks a known wrong terminal outcome before later SQL reads. The actual
+archived old-publication binary now fails precisely `retired_publication_reused`;
+a separately built old-payload mutation fails `retired_payload_reused`; the
+unmodified archived hooks binary passes the same four-replay case. No generic
+exit is counted as detection. No broker/store behavior was changed for this fix.
+The corrected final head reruns all gates and produces its own artifacts.

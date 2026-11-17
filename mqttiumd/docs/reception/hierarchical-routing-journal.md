@@ -54,3 +54,21 @@
   metadata stdout. The failed artifact14315990899 belongs to22425, not a
   routing-invariant detection. A subprocess RED/GREEN separates stderr from
   machine-readable JSON and retains failure diagnostics; final CI reruns fresh.
+
+- CF737c59 preview CI and10/11 mqttiumd gates passed. Receipt mutation had
+  already committed the prohibited old publication at event1966, then a
+  mutation-only Consume operation collision produced RecipeMismatch/exit2.
+  The collector missed the terminal event between its first scan and poll.
+  RED56a0b163/GREEN9039779f final-scan after death preserves it; wrong known
+  outcome is asserted before later reads.116 pilots pass. Actual archived
+  old-publication now fails retired_publication_reused; separately built
+  old-payload fails retired_payload_reused; archived unmutated hooks passes.
+  /workspace/mqttiumd-wildcard-collector-receive/result.json records distinct
+  broker/harness identities and mutation patch; its private source is restored.
+- DownloadedCF preview/source audit verifies2183 Git blobs,509 retained hashes
+  and566 packed members. API ZIP hashes and inner archive identities are
+  retained separately; a new local run of that CI binary has two exit0 statuses.
+  CI preview logs and local extra logs were explicitly schema-checked as
+  separate runs (140 events each), beyond the filename-selected main streams.
+- Next: publish collector-only correction with the CF737c59 lease and receive
+  the complete fresh exact-head CI, preview/campaign hashes and PR download links.
