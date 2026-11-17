@@ -37,7 +37,7 @@ BUSINESS_COMMANDS = 32769
 WINDOW_COMMANDS = 1024
 
 
-def receipt_windows() -> tuple[int, int]:
+def receipt_windows() -> tuple[int, int, int]:
     """Read this source's effective window without changing the historical quota.
 
     The source-pinned launcher keeps this contract beside the pilot. A stale
@@ -54,10 +54,21 @@ def receipt_windows() -> tuple[int, int]:
     require(profile["receipt_control_reserve"] == total - data
             and profile["receipt_slots"] == HISTORICAL_RECEIPT_LIMIT,
             "receipt_profile_reserve_or_quota_changed")
-    return data, total
+    trigger = profile["receipt_collection_trigger"]
+    require(type(trigger) is int and 0 < trigger < data, "receipt_profile_trigger_invalid")
+    return data, total, trigger
 
 
-BUSINESS_WINDOW, TOTAL_WINDOW = receipt_windows()
+BUSINESS_WINDOW, TOTAL_WINDOW, COLLECTION_TRIGGER = receipt_windows()
+
+
+def result_replay_phase_budget() -> int:
+    # Both phases can run before a dropped maintenance reply reaches its
+    # resolution deadline. Leave space for CONNECT's receipted Open as well;
+    # actual full-window pressure is exercised separately by criterion C.
+    budget = max(COLLECTION_TRIGGER, BUSINESS_WINDOW // 4)
+    require(1 + 2 * budget < BUSINESS_WINDOW, "receipt_result_probe_budget_invalid")
+    return budget
 
 
 class BusinessTranscript:
@@ -975,8 +986,12 @@ def close_crash(binary: Path, case: Path, *, committed: bool, limit_one: bool = 
 
 def close_result_replay(binary: Path, case: Path) -> dict:
     broker = Broker(binary, case, test_control=True)
+    phase_budget = result_replay_phase_budget()
     result = {"criterion": "F-results", "status": "PASS", "passes": [],
-              "parameters": {"business_budget_per_phase": 256}}
+              "parameters": {"business_budget_per_phase": phase_budget,
+                             "business_window": BUSINESS_WINDOW,
+                             "collection_trigger": COLLECTION_TRIGGER,
+                             "opening_commands": 1}}
     try:
         result["ready"] = broker.ready()
         with PubsubWire(broker.address, broker.observations, "closure-result-controls") as control:
@@ -985,7 +1000,7 @@ def close_result_replay(binary: Path, case: Path) -> dict:
             for file, event_name in (("drop-next-close-result", "receipt_collection_result_dropped"),
                                      ("duplicate-close-result", "receipt_collection_result_duplicated")):
                 (broker.control / file).touch(exist_ok=False)
-                for identifier in range(1, 257):
+                for identifier in range(1, phase_budget + 1):
                     control.subscribe(identifier, [("reception/receipt-close-results", identifier % 2)])
                 observed = broker.wait_event(event_name, after=last, timeout=15)
                 control_progress(control)
