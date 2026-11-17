@@ -1234,6 +1234,147 @@ fn a_peer_reuses_qos1_identifier_before_the_old_internal_written_receipt() {
 }
 
 #[test]
+fn a_temporarily_full_output_retries_the_same_durable_publish_without_closing() {
+    with_runtime(128, |runtime, directory| {
+        let (target, mut receiver) = peer(runtime);
+        runtime
+            .connect(target, connect_packet(b"publish-output-full-target"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut receiver).0, 0x20);
+        runtime
+            .packet(target, 0x82, vec![0, 1, 0, 0, 1, b't', 1])
+            .unwrap();
+        until(runtime, |r| {
+            r.inflight.is_empty() && r.inputs.is_empty() && r.frames.is_empty()
+        });
+        assert_eq!(read_frame(&mut receiver).0, 0x90);
+
+        let (source, mut publisher) = peer(runtime);
+        runtime
+            .connect(source, connect_packet(b"publish-output-full-source"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut publisher).0, 0x20);
+        let (blocked, queued) = std::sync::mpsc::sync_channel(net::OUTPUT_SLOTS);
+        for _ in 0..net::OUTPUT_SLOTS {
+            blocked
+                .try_send(net::Write {
+                    expiry: None,
+                    correlation: None,
+                    bytes: vec![0xd0, 0],
+                })
+                .unwrap();
+        }
+        let original = std::mem::replace(
+            &mut runtime.peers.get_mut(&target).unwrap().io.outgoing,
+            blocked,
+        );
+        runtime.packet(source, 0x32, publish_body(1)).unwrap();
+        until(runtime, |r| {
+            !r.peers.contains_key(&target)||r.owner.outbox().unwrap().pending().any(|effect|matches!(effect.effect(),Effect::EmitPublish{connection,..}if connection.generation==target))
+        });
+        assert!(
+            runtime.peers.contains_key(&target),
+            "temporary_publish_queue_full_closed_generation"
+        );
+        assert!(runtime.peers[&target].closing.is_none());
+        let retained:Vec<_>=runtime.owner.outbox().unwrap().pending().filter(|effect|matches!(effect.effect(),Effect::EmitPublish{connection,..}if connection.generation==target)).map(|effect|(effect.id(),effect.effect().clone())).collect();
+        assert_eq!(retained.len(), 1);
+        let (effect, publication) = &retained[0];
+        let Effect::EmitPublish {
+            connection,
+            delivery,
+            packet_id,
+            claim,
+            ..
+        } = publication
+        else {
+            panic!("actual committed outgoing claim");
+        };
+        let path = directory.join("store.sqlite");
+        let before = mqttiumd_store_sqlite::SqliteStore::inspect(&path).unwrap();
+        assert_eq!(before.outbound[delivery].claim, *claim);
+        assert!(
+            !runtime
+                .outgoing_bindings
+                .contains_key(&(*connection, *packet_id)),
+            "full_publish_left_a_provisional_binding"
+        );
+        assert!(!runtime.frames.contains_key(effect));
+
+        runtime.dispatch().unwrap();
+        assert!(
+            runtime.peers.contains_key(&target),
+            "repeated_publish_pressure_closed_generation"
+        );
+        let pending = runtime
+            .owner
+            .outbox()
+            .unwrap()
+            .pending()
+            .find(|pending| pending.id() == *effect)
+            .unwrap();
+        assert_eq!(
+            pending.effect(),
+            publication,
+            "publish_retry_changed_the_owned_effect"
+        );
+        assert!(
+            !runtime
+                .outgoing_bindings
+                .contains_key(&(*connection, *packet_id))
+        );
+        let blocked_state = mqttiumd_store_sqlite::SqliteStore::inspect(&path).unwrap();
+        assert_eq!(blocked_state.outbound, before.outbound);
+        assert_eq!(blocked_state.obligations, before.obligations);
+        assert_eq!(queued.try_iter().count(), net::OUTPUT_SLOTS);
+        runtime.peers.get_mut(&target).unwrap().io.outgoing = original;
+        runtime.dispatch().unwrap();
+        assert!(
+            !runtime
+                .owner
+                .outbox()
+                .unwrap()
+                .pending()
+                .any(|pending| pending.id() == *effect)
+        );
+        let expected = PubackTarget {
+            delivery: *delivery,
+            claim: *claim,
+            frame: *effect,
+        };
+        assert_eq!(
+            runtime.outgoing_bindings.get(&(*connection, *packet_id)),
+            Some(&expected)
+        );
+        assert!(runtime.peers.contains_key(&target));
+        let (first, body) = read_frame(&mut receiver);
+        assert_eq!(first, 0x32);
+        assert_eq!(&body[3..5], &packet_id.get().to_be_bytes());
+        assert_eq!(body.last(), Some(&b'v'));
+        assert_eq!(read_frame(&mut publisher).0, 0x40);
+        let ack = dequeue_puback(runtime, target, &mut receiver, packet_id.get());
+        assert!(matches!(&ack,Input::ObservedPuback{target:Some(target),..}if *target==expected));
+        runtime.queue(ack).unwrap();
+        until(runtime, |r| r.inflight.is_empty() && r.inputs.is_empty());
+        let final_state = mqttiumd_store_sqlite::SqliteStore::inspect(&path).unwrap();
+        assert!(final_state.outbound.is_empty());
+        assert!(final_state.obligations.is_empty());
+        assert!(runtime.peers.contains_key(&target));
+        let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+        assert!(
+            events
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .any(|event| event["kind"] == "effect_retained"
+                    && event["details"]["packet_kind"] == "PUBLISH"
+                    && event["details"]["effect"] == effect_text(*effect))
+        );
+    });
+}
+
+#[test]
 fn a_saturated_four_slot_output_retains_the_committed_puback_until_terminal_failure() {
     with_runtime(4, |runtime, directory| {
         let (generation, mut client) = peer(runtime);
