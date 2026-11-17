@@ -268,7 +268,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         retained |= payload.get("command_kind") in {"RetainedPublication", "RetainedQos0", "ReplaySubscriptions"}
         message_expiry |= payload.get("command_kind") in {
             "ExpiringPublication", "TimedReplaySubscriptions", "MarkDeliveryStarted", "ExpireDelivery",
-            "DeliveryStarted", "MessageExpire"}
+            "DeliveryStarted", "MessageExpire", "MessageExpiry"}
         message_expiry |= payload.get("expiry") is not None or payload.get("message_expiry_interval") is not None
         if record.kind in {"PeerPacketSent", "ClientBytesReceived"}:
             message_expiry |= _wire_message_expiry(payload.get("bytes_hex", ""))

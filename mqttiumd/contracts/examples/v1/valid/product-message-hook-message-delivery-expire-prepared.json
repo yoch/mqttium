@@ -1,0 +1,20 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "10",
+  "pid": 1,
+  "kind": "barrier_hit",
+  "point": "message.delivery.expire.prepared",
+  "command_kind": "MessageExpire",
+  "details": {
+    "domain": "abababababababababababababababababababababababababababababababab",
+    "tick": "100",
+    "after": "Some(PublicationId { incarnation: StoreIncarnation(1), epoch: RunEpoch(1), owner: LogicalOwnerId(0), sequence: PublicationSeq(1) })"
+  },
+  "operation": {
+    "incarnation": "1",
+    "epoch": "1",
+    "owner": "0",
+    "sequence": "1"
+  }
+}

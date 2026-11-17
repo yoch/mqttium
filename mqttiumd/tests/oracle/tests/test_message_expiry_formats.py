@@ -178,6 +178,56 @@ class MessageExpiryFormatsAndScope(unittest.TestCase):
         for key, value in expected.items():
             self.assertEqual(profile[key], value)
 
+    def test_receiptless_barrier_and_lost_reply_keep_scalar_clock_cursor_correlation(self):
+        directory = ROOT / "contracts/examples/v1/valid"
+        barrier = json.loads((directory / "product-message-expiry-maintenance-barrier.json").read_text())
+        dropped = json.loads((directory / "product-message-expiry-result-dropped.json").read_text())
+        self.assertEqual(self.contracts.check_value(barrier), [])
+        self.assertEqual(self.contracts.check_value(dropped), [])
+        self.assertEqual(barrier["command_kind"], "MessageExpiry")
+        self.assertNotIn("operation", barrier)
+        self.assertNotIn("operation", dropped)
+        for key in ("domain", "tick", "after"):
+            self.assertIsInstance(dropped["details"][key], str)
+            self.assertEqual(barrier["details"][key], dropped["details"][key])
+        self.assertLessEqual(len(dropped["details"]["after"]), 256)
+        invalid = deepcopy(barrier)
+        invalid["operation"] = self.base["operations"][0]["operation_id"]
+        self.assertTrue(self.contracts.check_value(invalid))
+        invalid = deepcopy(dropped)
+        invalid["details"]["after"] = "x" * 257
+        self.assertTrue(self.contracts.check_value(invalid))
+        record = SimpleNamespace(kind="CommandSubmitted", payload={"command_kind": "MessageExpiry"})
+        self.assertIn(results.FIXTURE_MESSAGE_EXPIRY_SCOPE, self.unmet(records=[record]))
+
+    def test_removed_identity_and_separate_startup_capabilities_keep_detail_bounds(self):
+        directory = ROOT / "contracts/examples/v1/valid"
+        removed = json.loads((directory / "product-message-expiry-removed.json").read_text())
+        clock = json.loads((directory / "product-message-expiry-clock.json").read_text())
+        sweep = json.loads((directory / "product-message-expiry-sweep.json").read_text())
+        for value in (removed, clock, sweep):
+            self.assertEqual(self.contracts.check_value(value), [])
+            self.assertLessEqual(len(value["details"]), 40)
+            self.assertTrue(all(isinstance(v, (str, int, bool)) for v in value["details"].values()))
+        self.assertEqual(removed["details"], {"source": "durable_commit", "publication": "1/1/0/1", "index": 0, "target": "2"})
+        self.assertIsInstance(sweep["details"]["removed"], int)
+        self.assertEqual(clock["details"]["policy"], "quarantine-on-unknown-origin")
+        self.assertEqual(clock["details"]["time_unit"], "nanoseconds")
+        self.assertEqual(clock["details"]["terminal_input_slots"], 544)
+        self.assertEqual(clock["details"]["socket_write_receipt_slots"], 18)
+        invalid = deepcopy(removed)
+        invalid["details"]["publication"] = {"incarnation": "1"}
+        self.assertTrue(self.contracts.check_value(invalid))
+
+    def test_declared_product_hooks_are_readable_without_extending_fixture_injection_points(self):
+        registry = json.loads((ROOT / "contracts/v1/message-expiry.transitions.json").read_text())
+        points = {entry["point"] for entry in json.loads((ROOT / "contracts/v1/fault-points.json").read_text())["points"]}
+        for point in registry["hooks"]:
+            name = "product-message-hook-" + point.replace(".", "-") + ".json"
+            value = json.loads((ROOT / "contracts/examples/v1/valid" / name).read_text())
+            self.assertEqual(self.contracts.check_value(value), [], point)
+            self.assertNotIn(point, points)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3880,11 +3880,46 @@ ok("trace-record-message-expiry-recovered-started.json", message_recovery)
 bad("trace-record-message-expiry-start-contradiction.json", "schema-violation", "/payload/facts/0/claim/started",
     "Recovered start facts and their exact claim cannot disagree.",
     edited(message_recovery, lambda v: v["payload"]["facts"][0]["claim"].update(started=False)))
+message_cursor = "Some(PublicationId { incarnation: StoreIncarnation(1), epoch: RunEpoch(1), owner: LogicalOwnerId(0), sequence: PublicationSeq(1) })"
+message_details = {
+    "message_expiry_clock": {
+        "policy": "quarantine-on-unknown-origin", "time_unit": "nanoseconds",
+        "origin_status": "boottime_namespace_unavailable", "domain": "ab" * 32, "tick": "100",
+        "scan_ms": 100, "batch": 4, "started_proof": "positive-socket-write-then-durable-marker",
+        "terminal_input_slots": 544, "socket_write_receipt_slots": 18,
+    },
+    "message_expiry_sweep": {
+        "source": "durable_commit", "domain": "ab" * 32, "tick": "100",
+        "removed": 1, "retained_removed": 1, "quarantined": 0, "more": False,
+    },
+    "message_expiry_result_dropped": {"domain": "ab" * 32, "tick": "100", "after": message_cursor},
+    "message_expiry_removed": {"source": "durable_commit", "publication": "1/1/0/1", "index": 0, "target": "2"},
+}
 for index, kind in enumerate(("message_expiry_received", "message_expiry_sweep", "message_expiry_clock",
         "message_transmission_started", "message_transmission_not_started", "message_expiry_quarantined", "message_expiry_applied",
-        "message_expiry_result_dropped")):
+        "message_expiry_result_dropped", "message_expiry_removed")):
     ok(f"product-{kind.replace('_', '-')}.json", env("mqttiumd.product-event", seq=str(index + 1), pid=1, kind=kind,
-        details={"tick": "100", "code": "format_example"}))
+        details=message_details.get(kind, {"tick": "100", "code": "format_example"})))
+message_barrier = env("mqttiumd.product-event", seq="10", pid=1, kind="barrier_hit",
+    point="message.expire.prepared", command_kind="MessageExpiry",
+    details=copy.deepcopy(message_details["message_expiry_result_dropped"]))
+ok("product-message-expiry-maintenance-barrier.json", message_barrier)
+for point in message_transitions["hooks"]:
+    hook = copy.deepcopy(message_barrier)
+    hook["point"] = point
+    if point.startswith("delivery.started."):
+        hook.update(command_kind="DeliveryStarted", operation=OP)
+    elif point.startswith("message.delivery.expire."):
+        hook.update(command_kind="MessageExpire", operation=OP)
+    elif point == "publish.emission":
+        hook.pop("command_kind")
+    ok(f"product-message-hook-{point.replace('.', '-')}.json", hook)
+bad("product-message-expiry-maintenance-operation.json", "schema-violation", "",
+    "Receiptless maintenance has a clock/cursor correlation, never an invented OperationId.",
+    {**message_barrier, "operation": OP})
+bad("product-message-expiry-cursor-over-budget.json", "schema-violation", "/details/after",
+    "The opaque debug cursor remains bounded by the ordinary scalar diagnostic budget.",
+    edited(message_barrier, lambda v: v["details"].update(after="x" * 257)))
 for index, command in enumerate(("DeliveryStarted", "MessageExpire")):
     ok(f"product-command-{command}.json", env("mqttiumd.product-event", seq=str(index + 1), pid=1,
         kind="command_submitted", operation=OP, command_kind=command, details={}))

@@ -1,0 +1,13 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "9",
+  "pid": 1,
+  "kind": "message_expiry_removed",
+  "details": {
+    "source": "durable_commit",
+    "publication": "1/1/0/1",
+    "index": 0,
+    "target": "2"
+  }
+}

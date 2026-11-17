@@ -87,7 +87,14 @@
         "session.expire.committed",
         "retained.prepared",
         "retained.committed",
-        "subscription.committed"
+        "subscription.committed",
+        "delivery.started.prepared",
+        "delivery.started.committed",
+        "message.delivery.expire.prepared",
+        "message.delivery.expire.committed",
+        "message.expire.prepared",
+        "message.expire.committed",
+        "publish.emission"
       ]
     },
     "command_kind": {
@@ -106,7 +113,8 @@
         "SessionLifecycle",
         "RetainedQoS0",
         "DeliveryStarted",
-        "MessageExpire"
+        "MessageExpire",
+        "MessageExpiry"
       ]
     },
     "cause": {
@@ -1009,6 +1017,25 @@
               }
             }
           }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "command_kind"
+        ],
+        "properties": {
+          "command_kind": {
+            "const": "MessageExpiry"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "operation"
+          ]
         }
       }
     }

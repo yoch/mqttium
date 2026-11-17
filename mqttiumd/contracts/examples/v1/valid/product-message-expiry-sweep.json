@@ -5,7 +5,12 @@
   "pid": 1,
   "kind": "message_expiry_sweep",
   "details": {
+    "source": "durable_commit",
+    "domain": "abababababababababababababababababababababababababababababababab",
     "tick": "100",
-    "code": "format_example"
+    "removed": 1,
+    "retained_removed": 1,
+    "quarantined": 0,
+    "more": false
   }
 }

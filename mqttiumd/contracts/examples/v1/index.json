@@ -168,6 +168,15 @@
     "contracts/examples/v1/valid/product-message-expiry-quarantined.json",
     "contracts/examples/v1/valid/product-message-expiry-applied.json",
     "contracts/examples/v1/valid/product-message-expiry-result-dropped.json",
+    "contracts/examples/v1/valid/product-message-expiry-removed.json",
+    "contracts/examples/v1/valid/product-message-expiry-maintenance-barrier.json",
+    "contracts/examples/v1/valid/product-message-hook-delivery-started-prepared.json",
+    "contracts/examples/v1/valid/product-message-hook-delivery-started-committed.json",
+    "contracts/examples/v1/valid/product-message-hook-message-delivery-expire-prepared.json",
+    "contracts/examples/v1/valid/product-message-hook-message-delivery-expire-committed.json",
+    "contracts/examples/v1/valid/product-message-hook-message-expire-prepared.json",
+    "contracts/examples/v1/valid/product-message-hook-message-expire-committed.json",
+    "contracts/examples/v1/valid/product-message-hook-publish-emission.json",
     "contracts/examples/v1/valid/product-command-DeliveryStarted.json",
     "contracts/examples/v1/valid/product-command-MessageExpire.json"
   ],
@@ -2559,6 +2568,18 @@
       "code": "schema-violation",
       "pointer": "/payload/facts/0/claim/started",
       "why": "Recovered start facts and their exact claim cannot disagree."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-message-expiry-maintenance-operation.json",
+      "code": "schema-violation",
+      "pointer": "",
+      "why": "Receiptless maintenance has a clock/cursor correlation, never an invented OperationId."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-message-expiry-cursor-over-budget.json",
+      "code": "schema-violation",
+      "pointer": "/details/after",
+      "why": "The opaque debug cursor remains bounded by the ordinary scalar diagnostic budget."
     },
     {
       "file": "contracts/examples/v1/invalid/product-profile-wrong-message_expiry.json",
