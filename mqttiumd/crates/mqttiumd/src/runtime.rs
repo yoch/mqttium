@@ -478,12 +478,11 @@ impl Runtime<'_> {
                     pending.close_intent = Some(intent);
                 }
             }
-            if let Some(session) = peer.session {
-                if let Some(input) =
+            if let Some(session) = peer.session
+                && let Some(input) =
                     Self::closure_input(session, generation, peer.opened_by, intent)
-                {
-                    self.queue(input)?;
-                }
+            {
+                self.queue(input)?;
             }
             self.session_requests.retain(|_, pending| {
                 pending.connection != generation || pending.operation.is_some()
@@ -697,12 +696,10 @@ impl Runtime<'_> {
                                 observed_at: 0,
                                 explicit: false,
                             })
-                        }) {
-                            if let Some(input) =
-                                Self::closure_input(session, generation, Some(changed_by), intent)
-                            {
-                                self.queue(input)?;
-                            }
+                        }) && let Some(input) =
+                            Self::closure_input(session, generation, Some(changed_by), intent)
+                        {
+                            self.queue(input)?;
                         }
                         self.queue(Input::ConnectionClosed {
                             connection: generation,
