@@ -47,7 +47,7 @@ def canonical_receipt(state, event, tag):
         size = int.from_bytes(raw[7:11], 'big')
         require(39 <= size <= 65536 and 11 + size <= len(raw)
                 and raw[11:17] == b'MQDR\x00\x01'
-                and raw[17] == (1 if tag == 10 else 9), 'retained_result_canonical_inner_invalid')
+                and raw[17] in ((1,) if tag == 10 else (7, 9)), 'retained_result_canonical_inner_invalid')
         offset = 18
     else:
         offset = 7

@@ -34,11 +34,11 @@ class IndependentRetainedFrames(unittest.TestCase):
     def test_actual_wrapped_recipe_layout_correlates_inner_operation(self):
         event = {'operation': {'incarnation': '1', 'epoch': '2', 'owner': '3', 'sequence': '4'}}
         identity = operation_hex(event['operation'])
-        for tag, inner in ((10, 1), (12, 9)):
+        for tag, inner in ((10, 1), (12, 7), (12, 9)):
             old = b'MQDR\x00\x01' + bytes([inner]) + bytes.fromhex(identity)
             raw = b'MQDR\x00\x01' + bytes([tag]) + len(old).to_bytes(4, 'big') + old
             state = {'tables': {'operations': [{'id': identity, 'recipe': raw.hex()}]}}
-            with self.subTest(tag=tag):
+            with self.subTest(tag=tag, inner=inner):
                 self.assertEqual(canonical_receipt(state, event, tag)['tag'], tag)
                 altered = raw[:18] + b'\xff' * 32
                 state['tables']['operations'][0]['recipe'] = altered.hex()
