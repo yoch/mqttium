@@ -1,9 +1,10 @@
-//! The bounded MQTT 5 codec of the experimental incoming QoS 1/2 profile.
+//! Bounded MQTT5 framing and validation for the documented product profile.
 
 use mqttiumd_contract::ids::{InboundPacketId, OutboundPacketId};
 use mqttiumd_contract::packet::{AckReason, InboundPacket, OutboundFrame, Qos, SharedBytes};
 use mqttiumd_contract::pubsub::{FilterList, MAX_FILTERS, SubscriptionFilter, SubscriptionOptions};
 use mqttiumd_contract::session::SessionExpiry;
+use mqttiumd_contract::will::{MAX_WILL_PAYLOAD_BYTES, MAX_WILL_TOPIC_BYTES, WillSpec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bounds {
@@ -23,6 +24,7 @@ pub struct Header {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Connect {
+    pub will: Option<WillSpec>,
     pub client_id: SharedBytes,
     pub clean_start: bool,
     pub expiry: SessionExpiry,
@@ -44,6 +46,7 @@ pub enum Packet {
     },
     Disconnect {
         expiry: Option<SessionExpiry>,
+        publish_will: bool,
     },
 }
 
@@ -412,6 +415,7 @@ fn property<'a>(id: u32, input: &mut Cursor<'a>) -> Result<Property<'a>, Error> 
 struct Properties {
     expiry: Option<u32>,
     message_expiry: Option<u32>,
+    will_delay: Option<u32>,
     max_packet: Option<u32>,
     receive_maximum: Option<u16>,
     alias_maximum: Option<u16>,
@@ -453,6 +457,7 @@ fn properties(input: &mut Cursor<'_>, context: Context) -> Result<Properties, Er
             (Context::Connect, 0x19, Property::Byte(0)) => (),
             (Context::Disconnect, 0x11, Property::Four(n)) => result.expiry = Some(n),
             (Context::Publish, 0x02, Property::Four(n)) => result.message_expiry = Some(n),
+            (Context::Will, 0x18, Property::Four(n)) => result.will_delay = Some(n),
             (Context::Publish, 0x23, _) => {
                 return Err(Error {
                     reason: 0x94,
@@ -498,11 +503,15 @@ fn client_connect(body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
     let keep_alive = input.u16()?;
     let props = properties(&mut input, Context::Connect)?;
     let client_id = input.string()?;
-    if will {
-        properties(&mut input, Context::Will)?;
-        topic(input.string()?)?;
-        input.binary()?;
-    }
+    let will_fields = if will {
+        let will_properties = properties(&mut input, Context::Will)?;
+        let will_topic = input.string()?;
+        topic(will_topic)?;
+        let will_payload = input.binary()?;
+        Some((will_topic, will_payload, will_properties))
+    } else {
+        None
+    };
     if flags & 0x80 != 0 {
         input.string()?;
     }
@@ -521,17 +530,62 @@ fn client_connect(body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
         });
     }
     let expiry = SessionExpiry::from_wire(props.expiry.unwrap_or(0));
-    if flags & !2 != 0 || expiry.is_none() || props.unsupported {
+    let will_outside_profile = will_fields.as_ref().is_some_and(|(_, _, properties)| {
+        ((flags >> 3) & 3) != 1
+            || flags & 0x20 != 0
+            || properties.will_delay.is_some_and(|delay| delay != 0)
+            || properties.unsupported
+    });
+    if flags & !(2 | 0x0c) != 0 || expiry.is_none() || props.unsupported || will_outside_profile {
         return Err(Error {
             peer_maximum,
             ..unsupported("ConnectOutsideProfile")
+        });
+    }
+    // Validate every owned field against both its negotiated/product budget
+    // and the durable Will format before copying any Will bytes.
+    if will_fields
+        .as_ref()
+        .is_some_and(|(topic, _, _)| topic.len() > bounds.max_topic.min(MAX_WILL_TOPIC_BYTES))
+    {
+        return Err(Error {
+            peer_maximum,
+            ..oversized("WillTopicTooLarge")
+        });
+    }
+    if will_fields.as_ref().is_some_and(|(_, payload, _)| {
+        payload.len() > bounds.max_payload.min(MAX_WILL_PAYLOAD_BYTES)
+    }) {
+        return Err(Error {
+            peer_maximum,
+            ..oversized("WillPayloadTooLarge")
         });
     }
     let client_id = SharedBytes::copy_from(client_id, bounds.max_client_id).map_err(|_| Error {
         peer_maximum,
         ..oversized("ClientIdTooLarge")
     })?;
+    let will = will_fields
+        .map(|(topic, payload, _)| {
+            Ok(WillSpec {
+                topic: SharedBytes::copy_from(topic, bounds.max_topic.min(MAX_WILL_TOPIC_BYTES))
+                    .map_err(|_| Error {
+                        peer_maximum,
+                        ..oversized("WillTopicTooLarge")
+                    })?,
+                payload: SharedBytes::copy_from(
+                    payload,
+                    bounds.max_payload.min(MAX_WILL_PAYLOAD_BYTES),
+                )
+                .map_err(|_| Error {
+                    peer_maximum,
+                    ..oversized("WillPayloadTooLarge")
+                })?,
+            })
+        })
+        .transpose()?;
     Ok(Packet::Connect(Connect {
+        will,
         client_id,
         clean_start: flags & 2 != 0,
         expiry: expiry.ok_or_else(|| unsupported("SessionExpiryOutsideProfile"))?,
@@ -622,7 +676,7 @@ fn disconnect(body: &[u8]) -> Result<Packet, Error> {
         properties(&mut input, Context::Disconnect)?
     };
     input.end()?;
-    if reason != 0
+    if !matches!(reason, 0 | 4)
         || props.unsupported
         || props
             .expiry
@@ -635,6 +689,7 @@ fn disconnect(body: &[u8]) -> Result<Packet, Error> {
     }
     Ok(Packet::Disconnect {
         expiry: props.expiry.and_then(SessionExpiry::from_wire),
+        publish_will: reason == 4,
     })
 }
 
@@ -1304,21 +1359,211 @@ mod tests {
 
     const EXPIRY: &[u8] = &[0x11, 0xff, 0xff, 0xff, 0xff];
 
-    fn will_connect(properties: &[u8], will_properties: &[u8], flags: u8, topic: &[u8], payload: &[u8]) -> Vec<u8> {
-        let mut body=connect(properties,b"will-client"); body[7]=flags;
-        assert!(will_properties.len()<128);
-        body.push(will_properties.len() as u8); body.extend_from_slice(will_properties);
-        for value in [topic,payload] {body.extend_from_slice(&(value.len() as u16).to_be_bytes());body.extend_from_slice(value);}
+    fn will_connect(
+        properties: &[u8],
+        will_properties: &[u8],
+        flags: u8,
+        topic: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut body = connect(properties, b"will-client");
+        body[7] = flags;
+        assert!(will_properties.len() < 128);
+        body.push(will_properties.len() as u8);
+        body.extend_from_slice(will_properties);
+        for value in [topic, payload] {
+            body.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            body.extend_from_slice(value);
+        }
         body
     }
 
     #[test]
     fn qos1_nonretained_zero_delay_will_and_explicit_will_disconnect_are_accepted() {
-        for delay in [&[][..], &[0x18,0,0,0,0][..]] {
-            let body=will_connect(EXPIRY,delay,0x0c,b"atelier/capteur/status",b"offline");
-            assert!(matches!(decode(0x10,&body,BOUNDS), Ok(Packet::Connect(_))), "supported Will CONNECT was refused");
+        for delay in [&[][..], &[0x18, 0, 0, 0, 0][..]] {
+            let body = will_connect(EXPIRY, delay, 0x0c, b"atelier/capteur/status", b"offline");
+            assert!(
+                matches!(decode(0x10, &body, BOUNDS), Ok(Packet::Connect(_))),
+                "supported Will CONNECT was refused"
+            );
         }
-        assert!(matches!(decode(0xe0,&[4],BOUNDS), Ok(Packet::Disconnect {..})), "DISCONNECT4 must request the Will");
+        assert!(
+            matches!(decode(0xe0, &[4], BOUNDS), Ok(Packet::Disconnect { .. })),
+            "DISCONNECT4 must request the Will"
+        );
+    }
+
+    #[test]
+    fn supported_will_preserves_owned_bytes_and_redacts_debug() {
+        let payload = b"sensitive-offline\0\xff";
+        let Packet::Connect(value) = decode(
+            0x10,
+            &will_connect(
+                EXPIRY,
+                &[0x18, 0, 0, 0, 0],
+                0x0e,
+                b"atelier/sensor/status",
+                payload,
+            ),
+            BOUNDS,
+        )
+        .unwrap() else {
+            panic!("CONNECT")
+        };
+        let will = value.will.unwrap();
+        assert_eq!(will.topic.as_slice(), b"atelier/sensor/status");
+        assert_eq!(will.payload.as_slice(), payload);
+        let diagnostic = format!("{will:?}");
+        assert!(!diagnostic.contains("sensitive"));
+        assert!(!diagnostic.contains("atelier"));
+        assert!(matches!(
+            decode(0x10, &connect(EXPIRY, b"plain"), BOUNDS),
+            Ok(Packet::Connect(Connect { will: None, .. }))
+        ));
+    }
+
+    #[test]
+    fn will_profile_refusals_do_not_accept_ignored_properties() {
+        for flags in [0x04, 0x14, 0x2c] {
+            kind(
+                decode(
+                    0x10,
+                    &will_connect(EXPIRY, &[], flags, b"a/b", b"offline"),
+                    BOUNDS,
+                ),
+                ErrorKind::Unsupported,
+            );
+        }
+        for properties in [
+            &[0x18, 0, 0, 0, 1][..],             // nonzero delay
+            &[0x02, 0, 0, 0, 1][..], // Message Expiry is explicitly out of this Will profile
+            &[0x01, 0][..],          // Payload Format Indicator
+            &[0x03, 0, 1, b'x'][..], // Content Type
+            &[0x08, 0, 1, b'x'][..], // Response Topic
+            &[0x09, 0, 1, b'x'][..], // Correlation Data
+            &[0x26, 0, 1, b'k', 0, 1, b'v'][..], // User Property
+        ] {
+            let error = decode(
+                0x10,
+                &will_connect(EXPIRY, properties, 0x0c, b"a/b", b"offline"),
+                BOUNDS,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unsupported);
+            assert_eq!(error.peer_maximum(), Some(u32::MAX));
+        }
+    }
+
+    #[test]
+    fn will_malformed_and_duplicate_properties_keep_their_protocol_causes() {
+        for properties in [
+            &[0x18, 0, 0, 0, 0, 0x18, 0, 0, 0, 0][..],
+            &[0x02, 0, 0, 0, 1, 0x02, 0, 0, 0, 2][..],
+        ] {
+            assert_eq!(
+                decode(
+                    0x10,
+                    &will_connect(EXPIRY, properties, 0x0c, b"a/b", b"offline"),
+                    BOUNDS
+                )
+                .unwrap_err()
+                .code(),
+                "DuplicateProperty"
+            );
+        }
+        kind(
+            decode(
+                0x10,
+                &will_connect(EXPIRY, &[0x18, 0], 0x0c, b"a/b", b"offline"),
+                BOUNDS,
+            ),
+            ErrorKind::Malformed,
+        );
+        kind(
+            decode(
+                0x10,
+                &will_connect(EXPIRY, &[0x11, 0, 0, 0, 0], 0x0c, b"a/b", b"offline"),
+                BOUNDS,
+            ),
+            ErrorKind::Protocol,
+        );
+        for name in [b"".as_slice(), b"a/+", b"a/#"] {
+            assert_eq!(
+                decode(
+                    0x10,
+                    &will_connect(EXPIRY, &[], 0x0c, name, b"offline"),
+                    BOUNDS
+                )
+                .unwrap_err()
+                .code(),
+                "InvalidTopicName"
+            );
+        }
+        for flags in [0x10, 0x20, 0x1c] {
+            assert_eq!(
+                decode(
+                    0x10,
+                    &will_connect(EXPIRY, &[], flags, b"a/b", b"offline"),
+                    BOUNDS
+                )
+                .unwrap_err()
+                .code(),
+                "InvalidWillFlags"
+            );
+        }
+    }
+
+    #[test]
+    fn will_boundaries_are_checked_before_owned_field_copy() {
+        let topic = vec![b't'; BOUNDS.max_topic];
+        let payload = vec![b'p'; BOUNDS.max_payload];
+        assert!(
+            decode(
+                0x10,
+                &will_connect(EXPIRY, &[], 0x0c, &topic, &payload),
+                BOUNDS
+            )
+            .is_ok()
+        );
+        for (name, body) in [
+            (
+                "WillTopicTooLarge",
+                will_connect(EXPIRY, &[], 0x0c, &vec![b't'; BOUNDS.max_topic + 1], b"p"),
+            ),
+            (
+                "WillPayloadTooLarge",
+                will_connect(EXPIRY, &[], 0x0c, b"t", &vec![b'p'; BOUNDS.max_payload + 1]),
+            ),
+        ] {
+            let error = decode(0x10, &body, BOUNDS).unwrap_err();
+            assert_eq!(error.code(), name);
+            assert_eq!(error.kind(), ErrorKind::Oversized);
+        }
+    }
+
+    #[test]
+    fn disconnect_will_disposition_and_session_policy_are_independent() {
+        assert_eq!(
+            decode(0xe0, &[4], BOUNDS).unwrap(),
+            Packet::Disconnect {
+                expiry: None,
+                publish_will: true
+            }
+        );
+        assert_eq!(
+            decode(0xe0, &[4, 5, 0x11, 0, 0, 0, 0], BOUNDS).unwrap(),
+            Packet::Disconnect {
+                expiry: Some(SessionExpiry::OnDisconnect),
+                publish_will: true
+            }
+        );
+        assert_eq!(
+            decode(0xe0, &[0, 5, 0x11, 0, 0, 0, 5], BOUNDS).unwrap(),
+            Packet::Disconnect {
+                expiry: Some(SessionExpiry::After(5)),
+                publish_will: false
+            }
+        );
     }
 
     #[test]
@@ -1349,24 +1594,30 @@ mod tests {
     fn disconnect_retains_override_and_checks_its_domain_before_runtime_policy() {
         assert_eq!(
             decode(0xe0, &[], BOUNDS).unwrap(),
-            Packet::Disconnect { expiry: None }
+            Packet::Disconnect {
+                expiry: None,
+                publish_will: false
+            }
         );
         assert_eq!(
             decode(0xe0, &[0, 5, 0x11, 0, 0, 0, 0], BOUNDS).unwrap(),
             Packet::Disconnect {
-                expiry: Some(SessionExpiry::OnDisconnect)
+                expiry: Some(SessionExpiry::OnDisconnect),
+                publish_will: false
             }
         );
         assert_eq!(
             decode(0xe0, &[0, 5, 0x11, 255, 255, 255, 255], BOUNDS).unwrap(),
             Packet::Disconnect {
-                expiry: Some(SessionExpiry::Never)
+                expiry: Some(SessionExpiry::Never),
+                publish_will: false
             }
         );
         assert_eq!(
             decode(0xe0, &[0, 5, 0x11, 0, 0, 0, 7], BOUNDS).unwrap(),
             Packet::Disconnect {
-                expiry: Some(SessionExpiry::After(7))
+                expiry: Some(SessionExpiry::After(7)),
+                publish_will: false
             }
         );
         assert_eq!(
@@ -1391,7 +1642,7 @@ mod tests {
 
     #[test]
     fn zero_connect_context_rejects_any_nonzero_disconnect_before_profile_refusal() {
-        let error = decode(0xe0, &[4, 5, 0x11, 0, 0, 0, 7], BOUNDS).unwrap_err();
+        let error = decode(0xe0, &[0x80, 5, 0x11, 0, 0, 0, 7], BOUNDS).unwrap_err();
         assert_eq!(
             error.in_session(SessionExpiry::OnDisconnect).code(),
             "SessionExpiryIncreaseForbidden"
@@ -1722,7 +1973,10 @@ mod tests {
         );
         assert_eq!(
             decode(0xe0, &[], BOUNDS).unwrap(),
-            Packet::Disconnect { expiry: None }
+            Packet::Disconnect {
+                expiry: None,
+                publish_will: false
+            }
         );
         kind(decode(0xc0, &[0], BOUNDS), ErrorKind::Malformed);
         kind(decode(0x60, &[0, 7], BOUNDS), ErrorKind::Malformed);
