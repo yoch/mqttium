@@ -646,7 +646,79 @@ pub fn collected_retained_identities_never_execute_again<S: DurableStore>(
     }
 }
 
+pub fn rejected_replay_ranges_remain_reserved<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    let mut limit = limits();
+    limit.references = References::new(1);
+    let mut w = World::with_limits(make, limit);
+    let a = admitted(&w, 1, b"range/x", b"old", Qos::AtLeastOnce, &[]);
+    commit(&mut w.store, &a);
+    let sub = subscribe(&w, 2, w.b, 1000, &[(b"range/#", Qos::AtMostOnce, 0)]);
+    assert!(matches!(
+        w.store.apply(&sub).reply,
+        StoreReply::Outcome(StoreOutcome::RejectedCertain(
+            RejectReason::CapacityExceeded(_)
+        ))
+    ));
+    let collision = with_ids(
+        &admitted(&w, 3, b"range/x", b"new", Qos::AtLeastOnce, &[]),
+        Some(publication_id(w.epoch, 1255)),
+        None,
+        false,
+    );
+    assert_eq!(
+        w.store.apply(&collision).reply,
+        StoreReply::Outcome(StoreOutcome::RejectedCertain(
+            RejectReason::PreconditionFailed
+        )),
+        "rejected_replay_range_was_reused"
+    );
+    let closure = ReceiptClosure {
+        origin: ReceiptOrigin::of(operation_id(w.epoch, 1)),
+        through: operation_id(w.epoch, 3).sequence(),
+        publication_through: publication_id(w.epoch, 1254).sequence(),
+        payload_through: PayloadSeq::new(3),
+    };
+    assert!(
+        matches!(
+            w.store
+                .collect_receipts(ReceiptCollection {
+                    closure,
+                    limit: 128
+                })
+                .unwrap(),
+            ReceiptCollectionReply::Refused(_)
+        ),
+        "rejected_replay_range_not_closed"
+    );
+    let closure = ReceiptClosure {
+        publication_through: publication_id(w.epoch, 1255).sequence(),
+        ..closure
+    };
+    assert!(matches!(
+        w.store
+            .collect_receipts(ReceiptCollection {
+                closure,
+                limit: 128
+            })
+            .unwrap(),
+        ReceiptCollectionReply::Applied { .. }
+    ));
+    assert_eq!(
+        w.store.apply(&sub).reply,
+        StoreReply::Outcome(StoreOutcome::RetiredOutcomeUnavailable)
+    );
+    let state = w.store.snapshot().unwrap();
+    assert_eq!(
+        state.retained[b"range/x".as_slice()].publication,
+        publication_id(w.epoch, 1)
+    );
+    assert_eq!(state.accounts.references.get(), 1);
+}
+
 pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
+    rejected_replay_ranges_remain_reserved(make);
     collected_retained_identities_never_execute_again(make);
     retained_topic_names_are_not_subscription_filters(make);
     retained_survives_without_targets_and_producer(make);

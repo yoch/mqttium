@@ -178,3 +178,8 @@ fn retained_topic_names_are_not_subscription_filters() {
 fn collected_retained_identities_never_execute_again() {
     retained_conformance::collected_retained_identities_never_execute_again(&sqlite);
 }
+
+#[test]
+fn rejected_replay_ranges_remain_reserved() {
+    retained_conformance::rejected_replay_ranges_remain_reserved(&sqlite);
+}
