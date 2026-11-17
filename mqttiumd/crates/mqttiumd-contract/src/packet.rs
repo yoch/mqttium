@@ -102,6 +102,8 @@ pub enum InboundPacket {
         retain: bool,
         dup: bool,
         packet_id: Option<InboundPacketId>,
+        /// Original receipt observation, anchored by the clock adapter.
+        expiry: Option<crate::message_expiry::MessageExpiry>,
         payload: SharedBytes,
     },
     /// PUBREL of an inbound QoS 2 exchange.

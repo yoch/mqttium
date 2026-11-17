@@ -21,6 +21,7 @@ use crate::ids::{
     ExchangeId, InboundPacketId, LogicalDuration, LogicalOwnerId, LogicalTime, OperationId,
     OutboundPacketId, OutboxSerial, PublicationId, Revision, RunEpoch, SessionId, StoreIncarnation,
 };
+use crate::message_expiry::{ExpiredDelivery, MessageExpiry, MessageExpiryBlock, MessageTime};
 use crate::outcome::{EpochGrant, Knowledge, StoreReply};
 use crate::packet::{InboundPacket, OutboundFrame, Qos, SharedBytes};
 use crate::pubsub::{DeliveryClaim, PubackTarget, Qos0DropReason, Qos0Origin, WorkItem};
@@ -47,6 +48,8 @@ pub enum RecoveredFact {
         target_revision: Revision,
         qos: Qos,
         claim: Option<DeliveryClaim>,
+        expiry: Option<MessageExpiry>,
+        started: bool,
     },
     /// The data set and the run epoch opened for this run.
     Epoch {
@@ -205,6 +208,10 @@ impl RecoveryOrder {
 /// peer received a complete packet.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FrameProgress {
+    /// At least one byte was accepted for this exact frame and connection.
+    Started,
+    /// This exact frame certainly wrote no bytes; generic failure says less.
+    NotStarted { reason: MessageExpiryBlock },
     /// This many bytes of the frame are confirmed written, out of `total`.
     Written { confirmed: u64, total: u64 },
     /// The write failed; the connection is unusable.
@@ -216,6 +223,12 @@ pub enum FrameProgress {
 /// It is moved, never copied: a step either consumes it or hands it back.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Input {
+    /// Current domain/tick supplied by the clock adapter, outside the pure core.
+    MessageClock { now: MessageTime },
+    /// Absolute identities removed by bounded receiptless writer maintenance.
+    MessagesExpired {
+        deliveries: BoundedVec<ExpiredDelivery>,
+    },
     OpenSession {
         connection: ConnectionGeneration,
         client_id: SharedBytes,
@@ -369,6 +382,7 @@ pub enum Effect {
         connection: ConnectionKey,
         origin: Qos0Origin,
         retain: bool,
+        expiry: Option<MessageExpiry>,
         topic: SharedBytes,
         payload: SharedBytes,
     },
@@ -398,6 +412,8 @@ pub enum Effect {
         payload: SharedBytes,
         dup: bool,
         retain: bool,
+        expiry: Option<MessageExpiry>,
+        started: bool,
     },
     /// Emit one precise frame on one connection generation.
     EmitFrame {

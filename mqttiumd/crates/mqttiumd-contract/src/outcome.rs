@@ -39,6 +39,18 @@ pub enum CommitFacts {
         packet_id: OutboundPacketId,
         claim: OperationId,
     },
+    DeliveryStarted {
+        delivery: DeliveryId,
+        target: SessionId,
+        packet_id: OutboundPacketId,
+        claim: OperationId,
+    },
+    DeliveryExpired {
+        delivery: DeliveryId,
+        target: SessionId,
+        packet_id: OutboundPacketId,
+        claim: OperationId,
+    },
     /// Publication, obligations, inbound QoS 2 state, accounts and receipt
     /// were committed together.
     PublicationAdmitted {

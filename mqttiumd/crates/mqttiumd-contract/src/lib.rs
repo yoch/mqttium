@@ -21,6 +21,7 @@ pub mod command;
 pub mod decimal;
 pub mod effects;
 pub mod ids;
+pub mod message_expiry;
 pub mod opening;
 pub mod outcome;
 pub mod packet;

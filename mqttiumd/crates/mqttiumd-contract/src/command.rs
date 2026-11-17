@@ -37,6 +37,15 @@
 //!   operation:32 publication:32 delivery_index:u32 target:8 target_revision:8
 //! kind 7, UpdateSubscriptions:
 //!   kind-3 header; each action is 0(remove), 1(grant0), 2(grant1), then topic
+//! kind 13, ExpiringPublication:
+//!   nested_len:u32 nested_legacy_recipe (kind 1, 10 or 11)
+//!   received.domain:32 received.tick:8 interval_seconds:u32
+//! kind 14, TimedReplaySubscriptions:
+//!   nested_len:u32 nested_legacy_recipe (kind 12) observed.domain:32 observed.tick:8
+//! kind 15, MarkDeliveryStarted: the kind-5 fields
+//! kind 16, ExpireDelivery:
+//!   the kind-5 fields, received.domain:32 received.tick:8 interval_seconds:u32
+//!   observed.domain:32 observed.tick:8
 //! ```
 
 use alloc::sync::Arc;
@@ -46,6 +55,10 @@ use crate::capacity::{BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, Ref
 use crate::ids::{
     DeliveryId, ExchangeGeneration, ExchangeId, InboundPacketId, OperationId, OutboundPacketId,
     PayloadId, PublicationId, RequestId, Revision, SessionId,
+};
+pub use crate::message_expiry::{
+    ExpireDelivery, ExpiringAdmission, ExpiringPublication, MarkDeliveryStarted,
+    TimedReplaySubscriptions,
 };
 use crate::packet::{Qos, SharedBytes};
 use crate::pubsub::{GrantedSubscriptionChange, MAX_FILTERS, SubscriptionChange};
@@ -253,6 +266,10 @@ impl Eq for UpdateSubscriptions {}
 /// The closed set of durable recipes of the received perimeter.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Recipe {
+    ExpiringPublication(ExpiringPublication),
+    TimedReplaySubscriptions(TimedReplaySubscriptions),
+    MarkDeliveryStarted(MarkDeliveryStarted),
+    ExpireDelivery(ExpireDelivery),
     RetainedPublication(crate::retained::RetainedPublication),
     RetainedQos0(crate::retained::RetainedQos0),
     ReplaySubscriptions(crate::retained::ReplaySubscriptions),
@@ -321,6 +338,31 @@ impl Recipe {
         match self {
             Self::AdmitPublication(admission) => Some(admission),
             Self::RetainedPublication(value) => Some(&value.admission),
+            Self::ExpiringPublication(ExpiringPublication {
+                admission: ExpiringAdmission::Qos12(value),
+                ..
+            }) => Some(&value.admission),
+            _ => None,
+        }
+    }
+    /// A QoS0 retained admission, including its timed envelope.
+    #[must_use]
+    pub fn retained_qos0(&self) -> Option<&crate::retained::RetainedQos0> {
+        match self {
+            Self::RetainedQos0(value) => Some(value),
+            Self::ExpiringPublication(ExpiringPublication {
+                admission: ExpiringAdmission::Qos0(value),
+                ..
+            }) => Some(value),
+            _ => None,
+        }
+    }
+    /// Subscription plus frozen replay, including its timed envelope.
+    #[must_use]
+    pub fn replay_subscriptions(&self) -> Option<&crate::retained::ReplaySubscriptions> {
+        match self {
+            Self::ReplaySubscriptions(value) => Some(value),
+            Self::TimedReplaySubscriptions(value) => Some(&value.replay),
             _ => None,
         }
     }
@@ -328,6 +370,13 @@ impl Recipe {
     #[must_use]
     pub fn operation(&self) -> OperationId {
         match self {
+            Self::ExpiringPublication(value) => match &value.admission {
+                ExpiringAdmission::Qos12(value) => value.admission.operation,
+                ExpiringAdmission::Qos0(value) => value.operation,
+            },
+            Self::TimedReplaySubscriptions(value) => value.replay.update.operation,
+            Self::MarkDeliveryStarted(value) => value.operation,
+            Self::ExpireDelivery(value) => value.finish.operation,
             Self::RetainedPublication(value) => value.admission.operation,
             Self::RetainedQos0(value) => value.operation,
             Self::ReplaySubscriptions(value) => value.update.operation,
@@ -345,6 +394,10 @@ impl Recipe {
     /// Checks the internal consistency the canonical layout relies on.
     pub fn check(&self) -> Result<(), RecipeError> {
         match self {
+            Self::ExpiringPublication(value) => value.check(),
+            Self::TimedReplaySubscriptions(value) => value.check(),
+            Self::MarkDeliveryStarted(_) => Ok(()),
+            Self::ExpireDelivery(value) => value.check(),
             Self::RetainedPublication(_) | Self::RetainedQos0(_) | Self::ReplaySubscriptions(_) => {
                 crate::retained::check(self)
             }
@@ -388,6 +441,35 @@ impl Recipe {
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
         match self {
+            Self::ExpiringPublication(value) => value.encode(out)?,
+            Self::TimedReplaySubscriptions(value) => value.encode(out)?,
+            Self::MarkDeliveryStarted(value) => {
+                out.push(15);
+                encode_delivery(
+                    out,
+                    value.operation,
+                    value.delivery,
+                    value.target,
+                    value.target_revision,
+                    value.packet_id,
+                );
+                out.extend_from_slice(&value.claim.to_be_bytes());
+            }
+            Self::ExpireDelivery(value) => {
+                out.push(16);
+                let finish = value.finish;
+                encode_delivery(
+                    out,
+                    finish.operation,
+                    finish.delivery,
+                    finish.target,
+                    finish.target_revision,
+                    finish.packet_id,
+                );
+                out.extend_from_slice(&finish.claim.to_be_bytes());
+                value.expiry.encode(out);
+                value.observed.encode(out);
+            }
             Self::RetainedPublication(_) | Self::RetainedQos0(_) | Self::ReplaySubscriptions(_) => {
                 crate::retained::encode(self, out)?
             }
@@ -477,6 +559,45 @@ impl Recipe {
             return Err(RecipeError::UnknownFormat(format));
         }
         let recipe = match reader.u8()? {
+            13 => Self::ExpiringPublication(ExpiringPublication::decode(
+                &mut reader,
+                max_targets,
+                max_topic_len,
+            )?),
+            14 => Self::TimedReplaySubscriptions(TimedReplaySubscriptions::decode(
+                &mut reader,
+                max_targets,
+                max_topic_len,
+            )?),
+            15 => {
+                let (operation, delivery, target, target_revision, packet_id) =
+                    reader.delivery()?;
+                Self::MarkDeliveryStarted(MarkDeliveryStarted {
+                    operation,
+                    delivery,
+                    target,
+                    target_revision,
+                    packet_id,
+                    claim: reader.operation()?,
+                })
+            }
+            16 => {
+                let (operation, delivery, target, target_revision, packet_id) =
+                    reader.delivery()?;
+                let finish = FinishDelivery {
+                    operation,
+                    delivery,
+                    target,
+                    target_revision,
+                    packet_id,
+                    claim: reader.operation()?,
+                };
+                Self::ExpireDelivery(ExpireDelivery {
+                    finish,
+                    expiry: crate::message_expiry::MessageExpiry::decode(&mut reader)?,
+                    observed: crate::message_expiry::MessageTime::decode(&mut reader)?,
+                })
+            }
             kind @ (10..=12) => {
                 crate::retained::decode(kind, &mut reader.bytes, max_targets, max_topic_len)?
             }

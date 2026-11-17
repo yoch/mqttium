@@ -131,13 +131,17 @@ impl ReceiptClass {
                 | crate::session::SessionAction::Detach { .. }
                 | crate::session::SessionAction::Expire { .. } => Self::Control,
             },
-            Recipe::RetainedPublication(_)
+            Recipe::ExpiringPublication(_)
+            | Recipe::TimedReplaySubscriptions(_)
+            | Recipe::RetainedPublication(_)
             | Recipe::RetainedQos0(_)
             | Recipe::ReplaySubscriptions(_)
             | Recipe::AdmitPublication(_)
             | Recipe::ChangeSubscriptions(_)
             | Recipe::UpdateSubscriptions(_) => Self::Business,
             Recipe::ReleaseInbound(_)
+            | Recipe::MarkDeliveryStarted(_)
+            | Recipe::ExpireDelivery(_)
             | Recipe::ClaimDelivery(_)
             | Recipe::FinishDelivery(_)
             | Recipe::ConsumeDelivery(_) => Self::Control,

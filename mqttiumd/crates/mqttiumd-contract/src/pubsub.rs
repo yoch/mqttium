@@ -107,6 +107,8 @@ pub enum Qos0Origin {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Qos0DropReason {
+    MessageExpired,
+    TemporalUncertain,
     NoSubscribers,
     DestinationAbsent,
     CapacityExceeded,
@@ -118,6 +120,8 @@ pub enum Qos0DropReason {
 impl Qos0DropReason {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::MessageExpired => "message_expired",
+            Self::TemporalUncertain => "temporal_uncertain",
             Self::NoSubscribers => "no_subscribers",
             Self::DestinationAbsent => "destination_absent",
             Self::CapacityExceeded => "capacity_exceeded",
@@ -135,6 +139,8 @@ impl Qos0DropReason {
 pub struct DeliveryClaim {
     pub operation: OperationId,
     pub packet_id: OutboundPacketId,
+    /// A durable positive-byte observation; false after recovery is uncertain.
+    pub started: bool,
 }
 
 /// An immutable association of a validated PUBACK observation with one
@@ -157,6 +163,7 @@ pub struct WorkItem {
     pub target_revision: Revision,
     pub qos: Qos,
     pub retain: bool,
+    pub expiry: Option<crate::message_expiry::MessageExpiry>,
     pub topic: SharedBytes,
     pub payload: SharedBytes,
     pub claim: Option<DeliveryClaim>,

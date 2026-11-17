@@ -50,67 +50,9 @@ pub struct ReplaySubscriptions {
 
 pub(crate) fn check(recipe: &Recipe) -> Result<(), RecipeError> {
     match recipe {
-        Recipe::RetainedPublication(value) => {
-            // Check the legacy-shaped payload without changing its encoding.
-            value.admission.check_retained()?;
-            if value.admission.qos == crate::packet::Qos::AtMostOnce {
-                return Err(RecipeError::InvalidField("retained_qos"));
-            }
-            if !value.admission.retain {
-                return Err(RecipeError::InvalidField("retained_flag"));
-            }
-            check_mask(value.retain_targets, value.admission.targets.len())
-        }
-        Recipe::RetainedQos0(value) => {
-            if value
-                .targets
-                .as_slice()
-                .iter()
-                .any(|target| target.cause != crate::command::DeliveryCause::LiveExact)
-            {
-                return Err(RecipeError::InvalidField("admission_cause"));
-            }
-            if ((value.topic.is_empty()
-                || value.topic.len() > usize::from(u16::MAX)
-                || value.topic.as_slice().contains(&0)
-                || core::str::from_utf8(value.topic.as_slice()).is_err())
-                || value
-                    .topic
-                    .as_slice()
-                    .iter()
-                    .any(|b| matches!(*b, b'+' | b'#')))
-                || value.ingress_order == 0
-            {
-                return Err(RecipeError::InvalidField("retained_qos0_source"));
-            }
-            if value
-                .targets
-                .as_slice()
-                .iter()
-                .any(|t| t.delivery.publication != value.publication)
-            {
-                return Err(RecipeError::ForeignDelivery);
-            }
-            check_mask(value.retain_targets, value.targets.len())
-        }
-        Recipe::ReplaySubscriptions(value) => {
-            value.update.check_retained()?;
-            let op = value.update.operation;
-            if value.first_publication.sequence().get() == 0
-                || value.first_publication.incarnation() != op.incarnation()
-                || value.first_publication.epoch() != op.epoch()
-                || value.first_publication.owner() != op.owner()
-                || value
-                    .first_publication
-                    .sequence()
-                    .get()
-                    .checked_add(MAX_REPLAYS as u64 - 1)
-                    .is_none()
-            {
-                return Err(RecipeError::InvalidField("replay_identity_range"));
-            }
-            Ok(())
-        }
+        Recipe::RetainedPublication(value) => value.check_retained(),
+        Recipe::RetainedQos0(value) => value.check_retained(),
+        Recipe::ReplaySubscriptions(value) => value.check_retained(),
         _ => Err(RecipeError::InvalidField("retained_recipe")),
     }
 }
@@ -123,54 +65,9 @@ fn check_mask(mask: u16, len: usize) -> Result<(), RecipeError> {
 
 pub(crate) fn encode(recipe: &Recipe, out: &mut Vec<u8>) -> Result<(), RecipeError> {
     match recipe {
-        Recipe::RetainedPublication(value) => {
-            out.push(10);
-            let mut nested = Vec::new();
-            value.admission.encode_retained(&mut nested)?;
-            out.extend_from_slice(&(nested.len() as u32).to_be_bytes());
-            out.extend_from_slice(&nested);
-            out.extend_from_slice(&value.retain_targets.to_be_bytes());
-        }
-        Recipe::ReplaySubscriptions(value) => {
-            out.push(12);
-            let mut nested = Vec::new();
-            value.update.encode_retained(&mut nested)?;
-            out.extend_from_slice(&(nested.len() as u32).to_be_bytes());
-            out.extend_from_slice(&nested);
-            out.extend_from_slice(&value.first_publication.to_be_bytes());
-        }
-        Recipe::RetainedQos0(value) => {
-            out.push(11);
-            out.extend_from_slice(&value.operation.to_be_bytes());
-            out.extend_from_slice(&value.request.to_be_bytes());
-            out.extend_from_slice(&value.publication.to_be_bytes());
-            out.extend_from_slice(&value.session.to_be_bytes());
-            out.extend_from_slice(&value.session_revision.to_be_bytes());
-            out.extend_from_slice(&value.connection.to_be_bytes());
-            out.extend_from_slice(&value.ingress_order.to_be_bytes());
-            out.extend_from_slice(&value.route_revision.to_be_bytes());
-            out.extend_from_slice(&(value.topic.len() as u16).to_be_bytes());
-            out.extend_from_slice(value.topic.as_slice());
-            out.extend_from_slice(&value.payload.id.to_be_bytes());
-            out.extend_from_slice(&value.payload.length.get().to_be_bytes());
-            for n in [
-                value.costs.payload_bytes.get(),
-                value.costs.references.get(),
-                value.costs.exchange_slots.get(),
-                value.costs.receipt_slots.get(),
-            ] {
-                out.extend_from_slice(&n.to_be_bytes());
-            }
-            out.push(value.targets.len() as u8);
-            for target in value.targets.as_slice() {
-                out.extend_from_slice(&target.session.to_be_bytes());
-                out.extend_from_slice(&target.session_revision.to_be_bytes());
-                out.extend_from_slice(&target.delivery.index.to_be_bytes());
-                out.push(target.effective_qos.to_wire());
-                out.push(target.cause as u8);
-            }
-            out.extend_from_slice(&value.retain_targets.to_be_bytes());
-        }
+        Recipe::RetainedPublication(value) => value.encode_retained(out)?,
+        Recipe::ReplaySubscriptions(value) => value.encode_retained(out)?,
+        Recipe::RetainedQos0(value) => value.encode_retained(out)?,
         _ => return Err(RecipeError::InvalidField("retained_recipe")),
     }
     Ok(())
@@ -303,3 +200,136 @@ impl PartialEq for RetainedQos0 {
     }
 }
 impl Eq for RetainedQos0 {}
+
+impl RetainedPublication {
+    pub(crate) fn check_retained(&self) -> Result<(), RecipeError> {
+        // Check the legacy-shaped payload without changing its encoding.
+        self.admission.check_retained()?;
+        if self.admission.qos == crate::packet::Qos::AtMostOnce {
+            return Err(RecipeError::InvalidField("retained_qos"));
+        }
+        if !self.admission.retain {
+            return Err(RecipeError::InvalidField("retained_flag"));
+        }
+        check_mask(self.retain_targets, self.admission.targets.len())
+    }
+}
+
+impl RetainedQos0 {
+    pub(crate) fn check_retained(&self) -> Result<(), RecipeError> {
+        if self
+            .targets
+            .as_slice()
+            .iter()
+            .any(|target| target.cause != crate::command::DeliveryCause::LiveExact)
+        {
+            return Err(RecipeError::InvalidField("admission_cause"));
+        }
+        if ((self.topic.is_empty()
+            || self.topic.len() > usize::from(u16::MAX)
+            || self.topic.as_slice().contains(&0)
+            || core::str::from_utf8(self.topic.as_slice()).is_err())
+            || self
+                .topic
+                .as_slice()
+                .iter()
+                .any(|b| matches!(*b, b'+' | b'#')))
+            || self.ingress_order == 0
+        {
+            return Err(RecipeError::InvalidField("retained_qos0_source"));
+        }
+        if self
+            .targets
+            .as_slice()
+            .iter()
+            .any(|t| t.delivery.publication != self.publication)
+        {
+            return Err(RecipeError::ForeignDelivery);
+        }
+        check_mask(self.retain_targets, self.targets.len())
+    }
+}
+
+impl ReplaySubscriptions {
+    pub(crate) fn check_retained(&self) -> Result<(), RecipeError> {
+        self.update.check_retained()?;
+        let op = self.update.operation;
+        if self.first_publication.sequence().get() == 0
+            || self.first_publication.incarnation() != op.incarnation()
+            || self.first_publication.epoch() != op.epoch()
+            || self.first_publication.owner() != op.owner()
+            || self
+                .first_publication
+                .sequence()
+                .get()
+                .checked_add(MAX_REPLAYS as u64 - 1)
+                .is_none()
+        {
+            return Err(RecipeError::InvalidField("replay_identity_range"));
+        }
+        Ok(())
+    }
+}
+
+impl RetainedPublication {
+    pub(crate) fn encode_retained(&self, out: &mut Vec<u8>) -> Result<(), RecipeError> {
+        out.push(10);
+        let mut nested = Vec::new();
+        self.admission.encode_retained(&mut nested)?;
+        out.extend_from_slice(&(nested.len() as u32).to_be_bytes());
+        out.extend_from_slice(&nested);
+        out.extend_from_slice(&self.retain_targets.to_be_bytes());
+
+        Ok(())
+    }
+}
+
+impl RetainedQos0 {
+    pub(crate) fn encode_retained(&self, out: &mut Vec<u8>) -> Result<(), RecipeError> {
+        out.push(11);
+        out.extend_from_slice(&self.operation.to_be_bytes());
+        out.extend_from_slice(&self.request.to_be_bytes());
+        out.extend_from_slice(&self.publication.to_be_bytes());
+        out.extend_from_slice(&self.session.to_be_bytes());
+        out.extend_from_slice(&self.session_revision.to_be_bytes());
+        out.extend_from_slice(&self.connection.to_be_bytes());
+        out.extend_from_slice(&self.ingress_order.to_be_bytes());
+        out.extend_from_slice(&self.route_revision.to_be_bytes());
+        out.extend_from_slice(&(self.topic.len() as u16).to_be_bytes());
+        out.extend_from_slice(self.topic.as_slice());
+        out.extend_from_slice(&self.payload.id.to_be_bytes());
+        out.extend_from_slice(&self.payload.length.get().to_be_bytes());
+        for n in [
+            self.costs.payload_bytes.get(),
+            self.costs.references.get(),
+            self.costs.exchange_slots.get(),
+            self.costs.receipt_slots.get(),
+        ] {
+            out.extend_from_slice(&n.to_be_bytes());
+        }
+        out.push(self.targets.len() as u8);
+        for target in self.targets.as_slice() {
+            out.extend_from_slice(&target.session.to_be_bytes());
+            out.extend_from_slice(&target.session_revision.to_be_bytes());
+            out.extend_from_slice(&target.delivery.index.to_be_bytes());
+            out.push(target.effective_qos.to_wire());
+            out.push(target.cause as u8);
+        }
+        out.extend_from_slice(&self.retain_targets.to_be_bytes());
+
+        Ok(())
+    }
+}
+
+impl ReplaySubscriptions {
+    pub(crate) fn encode_retained(&self, out: &mut Vec<u8>) -> Result<(), RecipeError> {
+        out.push(12);
+        let mut nested = Vec::new();
+        self.update.encode_retained(&mut nested)?;
+        out.extend_from_slice(&(nested.len() as u32).to_be_bytes());
+        out.extend_from_slice(&nested);
+        out.extend_from_slice(&self.first_publication.to_be_bytes());
+
+        Ok(())
+    }
+}

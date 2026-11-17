@@ -21,6 +21,8 @@ use mqttiumd_contract::ids::{
     DeliveryId, ExchangeId, InboundPacketId, OperationId, OutboundPacketId, PayloadId,
     PublicationId, Revision, RunEpoch, SessionId,
 };
+pub use mqttiumd_contract::message_expiry::ExpiredDelivery;
+use mqttiumd_contract::message_expiry::{MessageExpiry, MessageTime};
 use mqttiumd_contract::outcome::{
     CommitFacts, OpeningOutcome, RejectReason, StoreOutcome, StoreReply,
 };
@@ -39,6 +41,35 @@ pub const MAX_CLIENT_ID_BYTES: usize = 65_535;
 /// Finite S0 ceiling for a recovery inventory, including its fixed facts.
 /// Positional cursors can scan a prefix; they never enumerate an unbounded one.
 pub const MAX_RECOVERY_INVENTORY_ROWS: usize = 65_536;
+
+/// A sweep visits at most four publications and returns at most 128 deliveries.
+pub const MESSAGE_EXPIRY_SWEEP_PUBLICATIONS: u32 = 4;
+pub const MESSAGE_EXPIRY_SWEEP_DELIVERIES: usize = 128;
+
+/// Absolute receiptless maintenance knowledge. A lost response can be retried
+/// with the same observation and key cursor without granting credits twice.
+#[derive(PartialEq, Eq, Debug)]
+pub struct MessageExpirySweep {
+    pub removed: BoundedVec<ExpiredDelivery>,
+    pub retained_removed: u32,
+    pub quarantined: u32,
+    pub more: bool,
+    pub next: Option<PublicationId>,
+}
+
+impl Default for MessageExpirySweep {
+    fn default() -> Self {
+        Self {
+            // This default is an empty result and allocates no backing storage.
+            // Writers reserve the bounded result they need fallibly instead.
+            removed: BoundedVec::with_capacity(0).expect("zero capacity does not allocate"),
+            retained_removed: 0,
+            quarantined: 0,
+            more: false,
+            next: None,
+        }
+    }
+}
 
 /// Stable causes of a failed durable read. A failure establishes neither
 /// absence nor a rejection and never authorises executing an uncertain command.
@@ -277,6 +308,7 @@ pub struct PublicationRecord {
     pub topic: Vec<u8>,
     pub qos: Qos,
     pub retain: bool,
+    pub expiry: Option<MessageExpiry>,
     pub payload: PayloadId,
 }
 
@@ -320,6 +352,8 @@ pub struct OutboundRecord {
     pub target_revision: Revision,
     pub packet_id: OutboundPacketId,
     pub claim: OperationId,
+    /// A durable positive-byte observation; an unmarked claim is uncertain.
+    pub started: bool,
 }
 
 /// One coherent live key page, ordered by DeliveryId, with the admitted QoS
@@ -510,6 +544,21 @@ impl RecoveryRefused {
 /// The writer of a store. Each method is one step in the single order
 /// of authority; a method either commits entirely or changes nothing.
 pub trait DurableStore {
+    /// Visit a bounded key range, removing only unclaimed expired copies.
+    /// Any outbound claim preserves its copy. Unknown message domains are
+    /// quarantined, never assigned an invented elapsed time or deleted here.
+    /// Limits are 1..=MESSAGE_EXPIRY_SWEEP_PUBLICATIONS; result identities fit
+    /// MESSAGE_EXPIRY_SWEEP_DELIVERIES. The caller advances `after` only after
+    /// receiving the absolute result; no historical cursor table is stored.
+    fn expire_messages(
+        &mut self,
+        _now: MessageTime,
+        _after: Option<PublicationId>,
+        _limit: u32,
+    ) -> Result<MessageExpirySweep, ReadError> {
+        Err(ReadError::Unavailable)
+    }
+
     /// Compare-and-set the singleton clock anchor without creating a receipt.
     /// A repeated/lost reply is reconciled by its absolute returned anchor.
     /// A stale expectation returns the current anchor and performs no update.
