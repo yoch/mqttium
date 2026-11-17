@@ -8,7 +8,8 @@ Status: **Proposed**. This extends the implemented profile without accepting
 Message Expiry is separate from Session Expiry. Absence means no lifetime;
 present zero expires at reception; every positive u32, including 0xffffffff,
 is a finite number of seconds. Reception freezes an immutable domain, raw
-CLOCK_BOOTTIME tick and interval before ingress deferral. Deadline arithmetic
+CLOCK_BOOTTIME tick and interval when the complete TCP frame is read, before
+the reader channel, pending CONNECT queue or core ingress deferral. Deadline arithmetic
 is checked. Retry, Resolve, retained replay, replacement and PUBREL never
 renew this origin. Replay copies the original metadata into its own occurrence.
 

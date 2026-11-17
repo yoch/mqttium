@@ -664,7 +664,8 @@ Identifiers, outgoing QoS2, MQTT3.1.1 and general migration remain unsupported.
 Property0x02 is accepted only for PUBLISH, once, as four-byte seconds. Absence
 is unlimited, zero expires at reception and every positive value including
 0xffffffff is finite. Other unsupported properties retain their refusals.
-The original domain/tick/interval is frozen before input deferral and copied
+The original domain/tick/interval is frozen at TCP frame completion before the
+reader channel, pending CONNECT or core input deferral and copied
 unchanged through retained replay and old owed versions. Tags13..16 preserve
 all historical tags1..12. SQLite schema9 refuses old formats before modification.
 

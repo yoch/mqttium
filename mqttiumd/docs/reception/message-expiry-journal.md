@@ -82,3 +82,28 @@ The PR remains draft/unmerged; ADRs remain Proposed. Unknown-origin quarantine,
 ambiguous claimed-transmission availability and physical-departure/preemption
 limits must stay visible. No migration, Will, TLS/authentication, shared
 subscriptions, outgoingQoS2 or general performance/conformance claim is added.
+
+
+## First full-gate findings and targeted fixes
+
+Source-pinned fc8ae1e9 passes the extracted normal public retained+expiry demo:
+its observed restart outcome is temporal quarantine, not proven expiry. Its
+full system run correctly refuses the capacity harness, which counted historical
+PUBACKs sharing the legitimately reused PI1; d1d45b1f scopes the reader to a
+pre-publication frame cursor. The actual negative000197 remains in the untouched
+failed capture; it is not a broker defect or a mutation detection.
+
+The full Rust gate exposes an old child-directory collision, unchanged since795:
+two factories with the same parent/rank/count removed each other's live sockets.
+RED482dbe05/GREEN9a39cb5c uses checked per-spawn nonces, exclusive creation and
+owned cleanup. All17 actual child/control tests and both concurrent typed-read
+receptions pass; signal/wait/drain behavior is unchanged.
+
+Independent flow review confirms a new TTL-origin defect before this delivery:
+framed packets could wait unstamped in the reader or pending-CONNECT queue.
+REDcc9774bf/3d9235cc, GREEN34296671 freezes the same clock's result at full-frame
+completion and carries errors/observations unchanged. One reader watermark
+refuses regression/domain changes without comparing an old queued observation
+to a newer global watermark. Its122 normal/130hook product tests and both
+Clippy configurations pass in its private worktree. Final source-pinned whole
+reception and workspace gates must now be regenerated on the corrected content.
