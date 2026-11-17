@@ -204,7 +204,7 @@ impl SessionLifecycle {
                 out.push(match expiry {
                     SessionExpiry::OnDisconnect => 0,
                     SessionExpiry::Never => 1,
-                    SessionExpiry::After(_) => unreachable!("checked legacy recipe"),
+                    SessionExpiry::After(_) => panic!("checked legacy recipe"),
                 });
                 out.push(u8::from(expected.is_some()));
                 if let Some(guard) = expected {
