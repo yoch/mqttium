@@ -37,8 +37,8 @@ use mqttiumd_contract::receipts::{
     ReceiptCollection, ReceiptCollectionRefusal, ReceiptCollectionReply, ReceiptOrigin,
 };
 use mqttiumd_contract::session::{
-    SessionAction, SessionCancellations, SessionChange, SessionEndReason, SessionExpiry,
-    SessionGuard, SessionLifecycle,
+    SessionAction, SessionCancellations, SessionChange, SessionDetachment, SessionEndReason,
+    SessionExpiry, SessionGuard, SessionLifecycle,
 };
 
 pub use mqttiumd_store_api::*;
@@ -66,6 +66,7 @@ impl MemoryStore {
                 limits,
                 accounts: Accounts::default(),
                 next_session: SessionId::new(1),
+                session_clock: None,
                 route_revision: Revision::new(0),
                 sessions: BTreeMap::new(),
                 routes: BTreeMap::new(),
@@ -315,6 +316,7 @@ impl FactRef<'_> {
                     revision: record.revision,
                     expiry: record.expiry,
                     opened_by: record.opened_by,
+                    detached: record.detached,
                 }
             }
             Self::Inbound(packet_id, marker) => {
@@ -387,6 +389,26 @@ fn delivery_claim(
 
 fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
     for row in state.sessions.values() {
+        if matches!(row.expiry, SessionExpiry::After(_)) && state.session_clock.is_none() {
+            return Err(ReadError::InvalidData);
+        }
+        if let SessionExpiry::After(seconds) = row.expiry
+            && (seconds == 0 || seconds == u32::MAX)
+        {
+            return Err(ReadError::InvalidData);
+        }
+        if let Some(detached) = row.detached
+            && (row.opened_by.is_none()
+                || detached.operation.incarnation() != state.ledger.incarnation()
+                || detached.operation.epoch().get() == 0
+                || detached.operation.epoch() > state.ledger.last_opened()
+                || !matches!(
+                    (row.expiry, detached.deadline),
+                    (SessionExpiry::After(_), Some(_)) | (SessionExpiry::Never, None)
+                ))
+        {
+            return Err(ReadError::InvalidData);
+        }
         if row.opened_by.is_some_and(|id| {
             id.incarnation() != state.ledger.incarnation()
                 || id.epoch().get() == 0
@@ -461,11 +483,16 @@ fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadEr
         budget.check_field(24)?;
     }
     meter.charge(256)?;
+    if state.session_clock.is_some() {
+        budget.check_field(32)?;
+        meter.charge(176)?;
+    }
     for record in state.sessions.values() {
         meter.field(record.client_id.len(), MAX_CLIENT_ID_BYTES)?;
         meter.charge(
             160usize
-                .checked_add(if record.opened_by.is_some() { 32 } else { 0 })
+                .checked_add(if record.detached.is_some() { 40 } else { 0 })
+                .and_then(|n| n.checked_add(if record.opened_by.is_some() { 32 } else { 0 }))
                 .and_then(|n| n.checked_add(record.client_id.len()))
                 .ok_or(ReadError::LimitExceeded)?,
         )?;
@@ -1069,6 +1096,7 @@ impl Staging for DurableState {
                         state: SessionState::Active,
                         expiry: SessionExpiry::Never,
                         opened_by: None,
+                        detached: None,
                     },
                 );
                 Ok(AdminDone::SessionCreated { session, revision })
@@ -1146,7 +1174,17 @@ impl Staging for DurableState {
                 expected,
                 clean_start,
                 expiry,
+            }
+            | SessionAction::OpenAt {
+                client_id,
+                expected,
+                clean_start,
+                expiry,
+                ..
             } => {
+                if matches!(expiry, SessionExpiry::After(_)) && self.session_clock.is_none() {
+                    return Err(failed);
+                }
                 let mut found = self.sessions.iter().filter(|(_, r)| {
                     r.state == SessionState::Active && r.client_id == client_id.as_slice()
                 });
@@ -1159,9 +1197,25 @@ impl Staging for DurableState {
                 {
                     return Err(failed);
                 }
-                let replace = current
-                    .as_ref()
-                    .is_some_and(|(_, r)| *clean_start || r.expiry == SessionExpiry::OnDisconnect);
+                let now = match command.action {
+                    SessionAction::OpenAt { now, .. } => Some(now),
+                    _ => None,
+                };
+                if now.is_none()
+                    && current
+                        .as_ref()
+                        .is_some_and(|(_, row)| row.detached.and_then(|d| d.deadline).is_some())
+                {
+                    return Err(failed);
+                }
+                let replace = current.as_ref().is_some_and(|(_, r)| {
+                    *clean_start
+                        || r.expiry == SessionExpiry::OnDisconnect
+                        || r.detached
+                            .and_then(|d| d.deadline)
+                            .zip(now)
+                            .is_some_and(|(deadline, now)| deadline <= now)
+                });
                 let mut cancelled = SessionCancellations::default();
                 let retired = if replace {
                     let id = current.as_ref().ok_or(failed)?.0;
@@ -1175,6 +1229,7 @@ impl Staging for DurableState {
                         let row = self.sessions.get_mut(&id).ok_or(failed)?;
                         row.expiry = *expiry;
                         row.opened_by = Some(command.operation);
+                        row.detached = None;
                         (id, record.revision, true)
                     } else {
                         if self
@@ -1202,6 +1257,7 @@ impl Staging for DurableState {
                                 state: SessionState::Active,
                                 expiry: *expiry,
                                 opened_by: Some(command.operation),
+                                detached: None,
                             },
                         );
                         (session, revision, false)
@@ -1212,6 +1268,72 @@ impl Staging for DurableState {
                     session_present,
                     expiry: *expiry,
                     retired,
+                    route_revision: self.route_revision,
+                    cancelled,
+                }
+            }
+            SessionAction::Detach {
+                guard,
+                expiry,
+                observed_at,
+            } => {
+                if matches!(expiry, SessionExpiry::After(_)) && self.session_clock.is_none() {
+                    return Err(failed);
+                }
+                let row = self
+                    .sessions
+                    .get(&guard.session)
+                    .filter(|r| r.state == SessionState::Active)
+                    .ok_or(failed)?;
+                if row.opened_by.is_none()
+                    || row.opened_by != guard.opened_by
+                    || row.detached.is_some()
+                {
+                    return Err(failed);
+                }
+                let deadline = expiry.deadline(*observed_at).ok_or(failed)?;
+                if *expiry == SessionExpiry::OnDisconnect {
+                    let cancelled = cancel_session(self, guard.session).map_err(|_| failed)?;
+                    SessionChange::Closed {
+                        session: guard.session,
+                        route_revision: self.route_revision,
+                        cancelled,
+                    }
+                } else {
+                    let detached = SessionDetachment {
+                        operation: command.operation,
+                        deadline,
+                    };
+                    let row = self.sessions.get_mut(&guard.session).ok_or(failed)?;
+                    row.expiry = *expiry;
+                    row.detached = Some(detached);
+                    SessionChange::Detached {
+                        session: guard.session,
+                        expiry: *expiry,
+                        detached,
+                    }
+                }
+            }
+            SessionAction::Expire {
+                guard,
+                detached,
+                now,
+            } => {
+                let row = self
+                    .sessions
+                    .get(&guard.session)
+                    .filter(|r| r.state == SessionState::Active)
+                    .ok_or(failed)?;
+                if row.opened_by != guard.opened_by
+                    || row.detached != Some(*detached)
+                    || !matches!(row.expiry, SessionExpiry::After(_))
+                    || !detached.deadline.is_some_and(|deadline| *now >= deadline)
+                {
+                    return Err(failed);
+                }
+                let cancelled = cancel_session(self, guard.session).map_err(|_| failed)?;
+                SessionChange::Closed {
+                    session: guard.session,
                     route_revision: self.route_revision,
                     cancelled,
                 }
@@ -1238,6 +1360,18 @@ impl Staging for DurableState {
                 }
             }
         };
+        let observed = match command.action {
+            SessionAction::OpenAt { now, .. } | SessionAction::Expire { now, .. } => Some(now),
+            SessionAction::Detach { observed_at, .. } => Some(observed_at),
+            _ => None,
+        };
+        if let (Some(now), Some(anchor)) = (observed, self.session_clock.as_mut())
+            && now > anchor.logical
+        {
+            let delta = now.checked_sub(anchor.logical).ok_or(failed)?;
+            anchor.reading.tick = anchor.reading.tick.checked_add(delta).ok_or(failed)?;
+            anchor.logical = now;
+        }
         self.charge(Accounts::RECEIPT)?;
         Ok(CommitFacts::SessionLifecycle(change))
     }
@@ -1401,6 +1535,24 @@ fn cancel_session(
 }
 
 impl DurableStore for MemoryStore {
+    fn checkpoint_session_clock(
+        &mut self,
+        expected: Option<SessionClockAnchor>,
+        reading: SessionClockReading,
+    ) -> Result<SessionClockAnchor, ReadError> {
+        let current = self.committed.session_clock;
+        if current != expected {
+            return current.ok_or(ReadError::InvalidData);
+        }
+        let next = SessionClockAnchor::advance(current, reading)?;
+        let mut staged = self.committed.clone();
+        staged.session_clock = Some(next);
+        if !self.commit(staged) {
+            return Err(ReadError::Unavailable);
+        }
+        Ok(next)
+    }
+
     fn collect_receipts(
         &mut self,
         collection: ReceiptCollection,
@@ -1433,31 +1585,43 @@ impl DurableStore for MemoryStore {
         if let LedgerOpening::Opens { ledger } = self.committed.ledger.open(command) {
             let mut staged = self.committed.clone();
             staged.ledger = ledger;
-            // All transports of the previous process are gone. Expiry is part
-            // of this actual opening, never a repeated AlreadyOpened lookup.
-            let count = staged
-                .sessions
-                .values()
-                .filter(|r| {
-                    r.state == SessionState::Active && r.expiry == SessionExpiry::OnDisconnect
-                })
-                .count();
-            if count > staged.limits.max_sessions || count > MAX_RECOVERY_INVENTORY_ROWS {
+            // Previous transports are gone. Already-detached deadlines never
+            // restart; attached finite sessions get the first reliable startup
+            // observation exactly once in this new-epoch transaction.
+            if staged.sessions.len() > staged.limits.max_sessions
+                || staged.sessions.len() > MAX_RECOVERY_INVENTORY_ROWS
+            {
                 return Err(ReadError::LimitExceeded);
             }
+            let now = staged.session_clock.map(|anchor| anchor.logical);
             let mut expired = Vec::new();
             expired
-                .try_reserve_exact(count)
+                .try_reserve_exact(staged.sessions.len())
                 .map_err(|_| ReadError::AllocationFailed)?;
-            expired.extend(
-                staged
-                    .sessions
-                    .iter()
-                    .filter(|(_, r)| {
-                        r.state == SessionState::Active && r.expiry == SessionExpiry::OnDisconnect
-                    })
-                    .map(|(id, _)| *id),
-            );
+            for (id, row) in &mut staged.sessions {
+                match row.expiry {
+                    SessionExpiry::OnDisconnect => expired.push(*id),
+                    SessionExpiry::Never => {}
+                    SessionExpiry::After(_) => {
+                        let now = now.ok_or(ReadError::InvalidData)?;
+                        if let Some(detached) = row.detached {
+                            if detached.deadline.is_some_and(|deadline| deadline <= now) {
+                                expired.push(*id)
+                            }
+                        } else {
+                            row.detached = Some(SessionDetachment {
+                                operation: row.opened_by.ok_or(ReadError::InvalidData)?,
+                                deadline: Some(
+                                    row.expiry
+                                        .deadline(now)
+                                        .flatten()
+                                        .ok_or(ReadError::InvalidData)?,
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
             for session in expired {
                 cancel_session(&mut staged, session).map_err(|_| ReadError::InvalidData)?;
             }

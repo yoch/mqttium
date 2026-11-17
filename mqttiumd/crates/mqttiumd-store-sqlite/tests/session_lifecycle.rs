@@ -423,7 +423,28 @@ fn replacement_at_the_full_session_quota_reuses_only_its_own_slot() {
 
 #[test]
 fn loaded_termination_cancels_only_its_target_and_keeps_shared_payloads() {
+    loaded_termination(false);
+}
+
+#[test]
+fn finite_expiration_cancels_only_its_target_and_keeps_shared_payloads() {
+    loaded_termination(true);
+}
+
+fn loaded_termination(finite: bool) {
     let mut p = Pair::new();
+    let attachment = operation_id(p.mem.epoch, 20);
+    if finite {
+        checkpoint(&mut p, 8, 0);
+        let previous = SessionGuard {
+            session: p.mem.b,
+            opened_by: None,
+        };
+        let (same, present) =
+            expect_open(p.apply(&finite_open(attachment, b"p1-b", Some(previous), 1, 0)));
+        assert_eq!(same, p.mem.b);
+        assert!(present);
+    }
     let first = p.mem.admission(1, 7, b"shared", &[p.mem.b, p.mem.c]);
     assert!(p.apply(&first).committed_now);
     let delivery = DeliveryId {
@@ -446,14 +467,39 @@ fn loaded_termination_cancels_only_its_target_and_keeps_shared_payloads() {
         },
     );
     assert!(p.apply(&produced_by_b).committed_now);
-    let close = closing(
-        operation_id(p.mem.epoch, 4),
-        SessionGuard {
+    let close = if finite {
+        let guard = SessionGuard {
             session: p.mem.b,
-            opened_by: None,
-        },
-        SessionEndReason::Disconnect,
-    );
+            opened_by: Some(attachment),
+        };
+        let detach = lifecycle(
+            operation_id(p.mem.epoch, 21),
+            SessionAction::Detach {
+                guard,
+                expiry: SessionExpiry::After(1),
+                observed_at: 0,
+            },
+        );
+        assert!(p.apply(&detach).committed_now);
+        let detached = p.state().sessions[&p.mem.b].detached.unwrap();
+        lifecycle(
+            operation_id(p.mem.epoch, 4),
+            SessionAction::Expire {
+                guard,
+                detached,
+                now: 1_000_000_000,
+            },
+        )
+    } else {
+        closing(
+            operation_id(p.mem.epoch, 4),
+            SessionGuard {
+                session: p.mem.b,
+                opened_by: None,
+            },
+            SessionEndReason::Disconnect,
+        )
+    };
     let closed = p.sql.store.apply(&close);
     assert_eq!(closed, p.mem.store.apply(&close));
     assert_eq!(
@@ -632,7 +678,7 @@ fn invalid_policy_is_reported_before_empty_work_or_recovery_can_hide_it() {
     };
     open(&mut store);
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute("UPDATE sessions SET expiry=99", []).unwrap();
+    conn.execute("UPDATE sessions SET expiry=-1", []).unwrap();
     assert_eq!(
         conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
             .unwrap(),
@@ -745,25 +791,576 @@ fn receipted_ephemeral_cycles_collect_without_reusing_session_or_attachment_iden
 }
 
 #[test]
-fn schema_four_is_refused_without_modifying_the_existing_database() {
+fn schemas_four_and_five_are_refused_without_modifying_the_existing_database() {
+    for version in [4, 5] {
+        let directory = Directory::new();
+        let path = directory.database();
+        drop(sqlite(&path));
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            matches!(SqliteStore::open(&path),Err(OpenError::SchemaVersion(actual)) if actual==version)
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "unsupported format is never reset or silently migrated"
+        );
+    }
+}
+
+// Finite time tests compare the complete deterministic/SQLite state. The
+// injected domain and nanosecond observations never alter the host clock.
+fn checkpoint(p: &mut Pair, domain: u8, tick: u64) -> mqttiumd_store_api::SessionClockAnchor {
+    let expected = p.state().session_clock;
+    let reading = mqttiumd_store_api::SessionClockReading {
+        domain: [domain; 32],
+        tick,
+    };
+    let actual = p
+        .sql
+        .store
+        .checkpoint_session_clock(expected, reading)
+        .unwrap();
+    assert_eq!(
+        actual,
+        p.mem
+            .store
+            .checkpoint_session_clock(expected, reading)
+            .unwrap()
+    );
+    p.state();
+    actual
+}
+
+fn finite_open(
+    operation: OperationId,
+    name: &[u8],
+    expected: Option<SessionGuard>,
+    seconds: u32,
+    now: u64,
+) -> Command {
+    lifecycle(
+        operation,
+        SessionAction::OpenAt {
+            client_id: SharedBytes::copy_from(name, 1024).unwrap(),
+            expected,
+            clean_start: false,
+            expiry: SessionExpiry::After(seconds),
+            now,
+        },
+    )
+}
+
+#[test]
+fn finite_detach_keeps_the_captured_deadline_and_expire_checks_the_exact_occurrence() {
+    use mqttiumd_contract::session::SessionDetachment;
+    let mut p = Pair::new();
+    checkpoint(&mut p, 7, 100);
+    let epoch = p.mem.epoch;
+    let opening = operation_id(epoch, 1);
+    let (session, _) = expect_open(p.apply(&finite_open(opening, b"finite", None, 1, 0)));
+    let guard = SessionGuard {
+        session,
+        opened_by: Some(opening),
+    };
+    let detaching = operation_id(epoch, 2);
+    let detach = lifecycle(
+        detaching,
+        SessionAction::Detach {
+            guard,
+            expiry: SessionExpiry::After(1),
+            observed_at: 10,
+        },
+    );
+    // The command's observation precedes its eventual commit. Advancing the
+    // global checkpoint in between must not move this captured deadline.
+    checkpoint(&mut p, 7, 800_000_100);
+    let applied = p.apply(&detach);
+    let detached = SessionDetachment {
+        operation: detaching,
+        deadline: Some(1_000_000_010),
+    };
+    assert_eq!(
+        applied.reply,
+        StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+            SessionChange::Detached {
+                session,
+                expiry: SessionExpiry::After(1),
+                detached
+            }
+        )))
+    );
+    checkpoint(&mut p, 7, 900_000_100);
+    assert_eq!(
+        p.apply(&detach).reply,
+        applied.reply,
+        "same-operation resolve cannot rearm at commit or result time"
+    );
+    rejected(
+        p.apply(&lifecycle(
+            operation_id(epoch, 3),
+            SessionAction::Detach {
+                guard,
+                expiry: SessionExpiry::After(1),
+                observed_at: 900_000_000,
+            },
+        )),
+        RejectReason::PreconditionFailed,
+    );
+    rejected(
+        p.apply(&lifecycle(
+            operation_id(epoch, 4),
+            SessionAction::Expire {
+                guard,
+                detached,
+                now: 1_000_000_009,
+            },
+        )),
+        RejectReason::PreconditionFailed,
+    );
+    let expired = p.apply(&lifecycle(
+        operation_id(epoch, 5),
+        SessionAction::Expire {
+            guard,
+            detached,
+            now: 1_000_000_010,
+        },
+    ));
+    assert!(
+        matches!(expired.reply,StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(SessionChange::Closed {session:ended,..}))) if ended==session)
+    );
+    assert!(!p.state().sessions.contains_key(&session));
+}
+
+#[test]
+fn open_at_the_deadline_does_not_depend_on_a_timer_pass() {
+    let mut p = Pair::new();
+    checkpoint(&mut p, 2, 0);
+    let epoch = p.mem.epoch;
+    let first = operation_id(epoch, 1);
+    let (session, _) = expect_open(p.apply(&finite_open(first, b"deadline-open", None, 2, 0)));
+    let guard = SessionGuard {
+        session,
+        opened_by: Some(first),
+    };
+    p.apply(&lifecycle(
+        operation_id(epoch, 2),
+        SessionAction::Detach {
+            guard,
+            expiry: SessionExpiry::After(2),
+            observed_at: 1,
+        },
+    ));
+    let resume = operation_id(epoch, 3);
+    let (resumed, present) = expect_open(p.apply(&finite_open(
+        resume,
+        b"deadline-open",
+        Some(guard),
+        2,
+        2_000_000_000,
+    )));
+    assert!(present);
+    assert_eq!(resumed, session);
+    let nextguard = SessionGuard {
+        session,
+        opened_by: Some(resume),
+    };
+    let detaching = operation_id(epoch, 4);
+    p.apply(&lifecycle(
+        detaching,
+        SessionAction::Detach {
+            guard: nextguard,
+            expiry: SessionExpiry::After(2),
+            observed_at: 2_000_000_000,
+        },
+    ));
+    let old = p.state().sessions[&session].detached.unwrap();
+    let (new, present) = expect_open(p.apply(&finite_open(
+        operation_id(epoch, 5),
+        b"deadline-open",
+        Some(nextguard),
+        2,
+        4_000_000_000,
+    )));
+    assert!(!present);
+    assert_ne!(new, session);
+    rejected(
+        p.apply(&lifecycle(
+            operation_id(epoch, 6),
+            SessionAction::Expire {
+                guard: nextguard,
+                detached: old,
+                now: 5_000_000_000,
+            },
+        )),
+        RejectReason::PreconditionFailed,
+    );
+    assert!(
+        p.state().sessions.contains_key(&new),
+        "old timer cannot delete a ClientID's new incarnation"
+    );
+}
+
+#[test]
+fn a_single_clock_anchor_preserves_same_domain_progress_and_reanchors_conservatively() {
+    let mut p = Pair::new();
+    let initial = checkpoint(&mut p, 1, 100);
+    assert_eq!(initial.logical, 0);
+    let advanced = checkpoint(&mut p, 1, 900);
+    assert_eq!(advanced.logical, 800);
+    let before = p.state();
+    let reading = mqttiumd_store_api::SessionClockReading {
+        domain: [1; 32],
+        tick: 500,
+    };
+    assert_eq!(
+        p.sql
+            .store
+            .checkpoint_session_clock(Some(advanced), reading),
+        Err(ReadError::InvalidData)
+    );
+    assert_eq!(
+        p.mem
+            .store
+            .checkpoint_session_clock(Some(advanced), reading),
+        Err(ReadError::InvalidData)
+    );
+    assert_eq!(
+        p.state(),
+        before,
+        "a backward clock cannot write or immediately expire"
+    );
+    let reading = mqttiumd_store_api::SessionClockReading {
+        domain: [1; 32],
+        tick: 950,
+    };
+    assert_eq!(
+        p.sql.store.checkpoint_session_clock(Some(initial), reading),
+        Ok(advanced)
+    );
+    assert_eq!(
+        p.mem.store.checkpoint_session_clock(Some(initial), reading),
+        Ok(advanced)
+    );
+    assert_eq!(
+        p.state(),
+        before,
+        "stale or lost checkpoint replies cannot advance twice"
+    );
+    let changed = checkpoint(&mut p, 2, 1);
+    assert_eq!(
+        changed.logical, 800,
+        "unknown downtime is not invented from a new origin"
+    );
+    let p = p.reopen();
+    let mut p = p;
+    assert_eq!(checkpoint(&mut p, 2, 101).logical, 900);
+    assert_eq!(
+        p.state().accounts.receipt_slots,
+        before.accounts.receipt_slots,
+        "clock maintenance has no receipt chain"
+    );
+}
+
+#[test]
+fn startup_detaches_attached_finite_once_but_never_rearms_an_existing_deadline() {
+    let mut p = Pair::new();
+    checkpoint(&mut p, 3, 0);
+    let epoch = p.mem.epoch;
+    let op = operation_id(epoch, 1);
+    let (session, _) = expect_open(p.apply(&finite_open(op, b"attached-crash", None, 3, 0)));
+    checkpoint(&mut p, 3, 1_000_000_000);
+    let mut p = p.reopen();
+    p.open_epoch();
+    let first = p.state().sessions[&session].detached.unwrap();
+    assert_eq!(first.deadline, Some(4_000_000_000));
+    assert_eq!(
+        first.operation, op,
+        "startup detachment retains the unique lost attachment"
+    );
+    checkpoint(&mut p, 3, 2_000_000_000);
+    let mut p = p.reopen();
+    p.open_epoch();
+    assert_eq!(p.state().sessions[&session].detached, Some(first));
+    checkpoint(&mut p, 3, 4_000_000_000);
+    let mut p = p.reopen();
+    p.open_epoch();
+    assert!(
+        !p.state().sessions.contains_key(&session),
+        "continuous boot time expires across repeated process lifetimes"
+    );
+}
+
+#[test]
+fn old_detachment_results_and_timers_cannot_rebind_a_resumed_attachment() {
+    let mut p = Pair::new();
+    checkpoint(&mut p, 4, 0);
+    let epoch = p.mem.epoch;
+    let first = operation_id(epoch, 1);
+    let (session, _) = expect_open(p.apply(&finite_open(first, b"old-detachment", None, 1, 0)));
+    let original = SessionGuard {
+        session,
+        opened_by: Some(first),
+    };
+    let detaching = operation_id(epoch, 2);
+    let command = lifecycle(
+        detaching,
+        SessionAction::Detach {
+            guard: original,
+            expiry: SessionExpiry::After(1),
+            observed_at: 10,
+        },
+    );
+    let old_reply = p.apply(&command).reply;
+    let old = p.state().sessions[&session].detached.unwrap();
+    let resumed = operation_id(epoch, 3);
+    let (same, present) = expect_open(p.apply(&finite_open(
+        resumed,
+        b"old-detachment",
+        Some(original),
+        1,
+        20,
+    )));
+    assert!(present);
+    assert_eq!(same, session);
+    let before = p.state();
+    assert_eq!(
+        p.apply(&command).reply,
+        old_reply,
+        "a historical reply keeps its original detachment identity"
+    );
+    assert_eq!(
+        p.state(),
+        before,
+        "idempotent old commands cannot detach the new attachment"
+    );
+    rejected(
+        p.apply(&lifecycle(
+            operation_id(epoch, 4),
+            SessionAction::Expire {
+                guard: original,
+                detached: old,
+                now: 2_000_000_000,
+            },
+        )),
+        RejectReason::PreconditionFailed,
+    );
+    let latest = SessionGuard {
+        session,
+        opened_by: Some(resumed),
+    };
+    p.apply(&lifecycle(
+        operation_id(epoch, 5),
+        SessionAction::Detach {
+            guard: latest,
+            expiry: SessionExpiry::Never,
+            observed_at: 30,
+        },
+    ));
+    let never = p.state().sessions[&session].detached.unwrap();
+    assert_eq!(never.deadline, None);
+    rejected(
+        p.apply(&lifecycle(
+            operation_id(epoch, 6),
+            SessionAction::Expire {
+                guard: latest,
+                detached: never,
+                now: u64::MAX,
+            },
+        )),
+        RejectReason::PreconditionFailed,
+    );
+    assert_eq!(p.state().sessions[&session].expiry, SessionExpiry::Never);
+    // Legacy fixture sessions have no confirmed transport attachment. They
+    // must first pass through Open before a product detachment is meaningful.
+    rejected(
+        p.apply(&lifecycle(
+            operation_id(epoch, 7),
+            SessionAction::Detach {
+                guard: SessionGuard {
+                    session: p.mem.b,
+                    opened_by: None,
+                },
+                expiry: SessionExpiry::After(1),
+                observed_at: 0,
+            },
+        )),
+        RejectReason::PreconditionFailed,
+    );
+}
+
+#[test]
+fn inconsistent_durable_detachment_is_typed_even_when_sqlite_is_physically_healthy() {
     let directory = Directory::new();
     let path = directory.database();
-    drop(sqlite(&path));
-    {
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        connection.pragma_update(None, "user_version", 4).unwrap();
-        connection
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-            .unwrap();
-    }
-    let before = std::fs::read(&path).unwrap();
-    assert!(matches!(
-        SqliteStore::open(&path),
-        Err(OpenError::SchemaVersion(4))
+    let mut store = sqlite(&path);
+    let epoch = open(&mut store);
+    let anchor = store
+        .checkpoint_session_clock(
+            None,
+            mqttiumd_store_api::SessionClockReading {
+                domain: [9; 32],
+                tick: 0,
+            },
+        )
+        .unwrap();
+    assert_eq!(anchor.logical, 0);
+    let operation = operation_id(epoch, 1);
+    let (session, _) =
+        expect_open(store.apply(&finite_open(operation, b"bad-detached", None, 1, 0)));
+    let guard = SessionGuard {
+        session,
+        opened_by: Some(operation),
+    };
+    store.apply(&lifecycle(
+        operation_id(epoch, 2),
+        SessionAction::Detach {
+            guard,
+            expiry: SessionExpiry::After(1),
+            observed_at: 0,
+        },
+    ));
+    let foreign = rusqlite::Connection::open(&path).unwrap();
+    foreign
+        .execute("UPDATE sessions SET deadline=NULL", [])
+        .unwrap();
+    assert_eq!(
+        foreign
+            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    assert_eq!(store.snapshot(), Err(ReadError::InvalidData));
+    assert_eq!(
+        store.recover(None, 8),
+        Err(RecoveryRefused::Read(ReadError::InvalidData))
+    );
+    assert_eq!(
+        store.read_work(session, None, 8),
+        Err(ReadError::InvalidData)
+    );
+}
+
+#[test]
+fn a_detachment_commit_preserves_observed_progress_even_before_the_periodic_checkpoint() {
+    let mut p = Pair::new();
+    checkpoint(&mut p, 5, 100);
+    let epoch = p.mem.epoch;
+    let op = operation_id(epoch, 1);
+    let (session, _) = expect_open(p.apply(&finite_open(op, b"coalesced-time", None, 5, 0)));
+    p.apply(&lifecycle(
+        operation_id(epoch, 2),
+        SessionAction::Detach {
+            guard: SessionGuard {
+                session,
+                opened_by: Some(op),
+            },
+            expiry: SessionExpiry::After(5),
+            observed_at: 2_000_000_000,
+        },
+    ));
+    let before = p.state();
+    assert_eq!(
+        before.session_clock.unwrap().logical,
+        2_000_000_000,
+        "engaged_temporal_progress_was_lost"
+    );
+    assert_eq!(before.session_clock.unwrap().reading.tick, 2_000_000_100);
+    let original_deadline = before.sessions[&session].detached.unwrap();
+    let changed = checkpoint(&mut p, 6, 1);
+    assert_eq!(
+        changed.logical, 2_000_000_000,
+        "changed domain retains progress already proved by Detach"
+    );
+    assert_eq!(
+        p.state().sessions[&session].detached,
+        Some(original_deadline)
+    );
+    assert_eq!(checkpoint(&mut p, 6, 1_000_000_001).logical, 3_000_000_000);
+}
+
+#[test]
+fn the_largest_finite_interval_and_clock_overflow_have_checked_boundaries() {
+    let mut p = Pair::new();
+    checkpoint(&mut p, 10, 0);
+    let epoch = p.mem.epoch;
+    let operation = operation_id(epoch, 1);
+    let (session, _) = expect_open(p.apply(&finite_open(
+        operation,
+        b"largest-finite",
+        None,
+        u32::MAX - 1,
+        0,
+    )));
+    let guard = SessionGuard {
+        session,
+        opened_by: Some(operation),
+    };
+    p.apply(&lifecycle(
+        operation_id(epoch, 2),
+        SessionAction::Detach {
+            guard,
+            expiry: SessionExpiry::After(u32::MAX - 1),
+            observed_at: 1,
+        },
     ));
     assert_eq!(
-        std::fs::read(&path).unwrap(),
-        before,
-        "an unsupported format is never reset or silently migrated"
+        p.state().sessions[&session].detached.unwrap().deadline,
+        Some(4_294_967_294_000_000_001)
+    );
+    let advanced = checkpoint(&mut p, 11, 1);
+    assert_eq!(advanced.logical, 1);
+    let before = p.state();
+    let impossible = mqttiumd_store_api::SessionClockReading {
+        domain: [11; 32],
+        tick: u64::MAX,
+    };
+    // logical1 + (MAX - tick1) exactly fits MAX; the next same-domain reading
+    // cannot move backwards or invent a wrapped logical deadline.
+    let last = p
+        .sql
+        .store
+        .checkpoint_session_clock(Some(advanced), impossible)
+        .unwrap();
+    assert_eq!(
+        last,
+        p.mem
+            .store
+            .checkpoint_session_clock(Some(advanced), impossible)
+            .unwrap()
+    );
+    assert_eq!(last.logical, u64::MAX);
+    let changed = checkpoint(&mut p, 12, 0);
+    assert_eq!(changed.logical, u64::MAX);
+    let impossible = mqttiumd_store_api::SessionClockReading {
+        domain: [12; 32],
+        tick: 1,
+    };
+    let stable = p.state();
+    assert_eq!(
+        p.sql
+            .store
+            .checkpoint_session_clock(Some(changed), impossible),
+        Err(ReadError::InvalidData)
+    );
+    assert_eq!(
+        p.mem
+            .store
+            .checkpoint_session_clock(Some(changed), impossible),
+        Err(ReadError::InvalidData)
+    );
+    assert_eq!(p.state(), stable);
+    assert_eq!(
+        p.state().sessions[&session].detached,
+        before.sessions[&session].detached
     );
 }

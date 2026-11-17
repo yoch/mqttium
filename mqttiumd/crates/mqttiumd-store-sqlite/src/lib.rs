@@ -81,7 +81,7 @@ use mqttiumd_store_api::{
     DurableStore, InboundRecord, Limits, MAX_CLIENT_ID_BYTES, MAX_RECOVERY_INVENTORY_ROWS,
     ObligationRecord, OperationRecord, OutboundRecord, PayloadRecord, PublicationRecord,
     ReadBudget, ReadError, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved, RouteTarget,
-    SessionRecord, SessionState, WorkPage,
+    SessionClockAnchor, SessionClockReading, SessionRecord, SessionState, WorkPage,
 };
 
 use mqttiumd_contract::receipts::{
@@ -682,7 +682,7 @@ fn session_row(
     session: SessionId,
 ) -> Result<Option<(Revision, SessionState)>, Fault> {
     let row = conn
-        .prepare_cached("SELECT revision, state, expiry, opened_by FROM sessions WHERE id = ?1")?
+        .prepare_cached("SELECT revision, state, expiry, opened_by, detached_by, deadline FROM sessions WHERE id = ?1")?
         .query_row([session.to_be_bytes().as_slice()], |row| {
             let binding = reader::optional_blob(row, 3, 32)?;
             Ok((
@@ -690,13 +690,32 @@ fn session_row(
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 binding,
+                reader::optional_blob(row,4,32)?,
+                reader::optional_blob(row,5,8)?,
             ))
         })
         .optional()?;
     match row {
         None => Ok(None),
-        Some((revision, state, expiry, binding)) => {
-            sessions::decode_expiry(expiry)?;
+        Some((revision, state, expiry, binding, detached, deadline)) => {
+            let policy = sessions::decode_expiry(expiry)?;
+            if detached.is_none() && deadline.is_some()
+                || detached.is_some()
+                    && (binding.is_none()
+                        || !matches!(
+                            (policy, deadline.is_some()),
+                            (mqttiumd_contract::session::SessionExpiry::After(_), true)
+                                | (mqttiumd_contract::session::SessionExpiry::Never, false)
+                        ))
+            {
+                return Err(Fault::Corrupt);
+            }
+            if let Some(bytes) = detached {
+                OperationId::from_be_slice(&bytes).map_err(|_| Corrupt)?;
+            }
+            if let Some(bytes) = deadline {
+                blob_u64(&bytes)?;
+            }
             if let Some(bytes) = binding {
                 OperationId::from_be_slice(&bytes).map_err(|_| Corrupt)?;
             }
@@ -1969,7 +1988,7 @@ impl SqliteStore {
             },
         )?;
         section(
-            "SELECT id, client_id, revision, state, expiry, opened_by FROM sessions
+            "SELECT id, client_id, revision, state, expiry, opened_by, detached_by, deadline FROM sessions
               WHERE (state = ?1 OR state NOT IN (1, 2)) AND ?2 = ?2 ORDER BY id",
             &mut out,
             &mut position,
@@ -1999,6 +2018,7 @@ impl SqliteStore {
                         reader::optional_blob(row, 5, 32)?.as_deref(),
                         meta,
                     )?,
+                    detached: sessions::detachment(row, 6, 7, sessions::decode_expiry(row.get(4)?)?, sessions::attachment(reader::optional_blob(row, 5, 32)?.as_deref(),meta)?, meta)?,
                 }))
             },
         )?;
@@ -2159,7 +2179,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
         let mut sessions = BTreeMap::new();
         {
             let mut statement = conn.prepare(
-                "SELECT id, client_id, revision, state, expiry, opened_by FROM sessions",
+                "SELECT id, client_id, revision, state, expiry, opened_by, detached_by, deadline FROM sessions",
             )?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
@@ -2173,6 +2193,17 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                         expiry: sessions::decode_expiry(row.get(4)?)?,
                         opened_by: sessions::attachment(
                             reader::optional_blob(row, 5, 32)?.as_deref(),
+                            &meta,
+                        )?,
+                        detached: sessions::detachment(
+                            row,
+                            6,
+                            7,
+                            sessions::decode_expiry(row.get(4)?)?,
+                            sessions::attachment(
+                                reader::optional_blob(row, 5, 32)?.as_deref(),
+                                &meta,
+                            )?,
                             &meta,
                         )?,
                     },
@@ -2353,6 +2384,17 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                 );
             }
         }
+        let session_clock = sessions::clock(conn)?;
+        if session_clock.is_none()
+            && sessions.values().any(|row| {
+                matches!(
+                    row.expiry,
+                    mqttiumd_contract::session::SessionExpiry::After(_)
+                )
+            })
+        {
+            return Err(Fault::Corrupt);
+        }
         Ok(DurableState {
             ledger: meta.ledger,
             collected_through: meta.collected_through,
@@ -2360,6 +2402,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
             limits: meta.limits,
             accounts: meta.accounts,
             next_session: meta.next_session,
+            session_clock,
             route_revision: meta.route_revision,
             sessions,
             routes,
@@ -2376,6 +2419,37 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
 }
 
 impl DurableStore for SqliteStore {
+    fn checkpoint_session_clock(
+        &mut self,
+        expected: Option<SessionClockAnchor>,
+        reading: SessionClockReading,
+    ) -> Result<SessionClockAnchor, ReadError> {
+        match self.transact(|conn, _meta| {
+            let current = sessions::clock(conn)?;
+            if current != expected {
+                return Err(Abort::Refused(
+                    current.ok_or(Abort::Read(ReadError::InvalidData))?,
+                ));
+            }
+            let next = SessionClockAnchor::advance(current, reading)?;
+            conn.prepare_cached(
+                "INSERT INTO session_clock(one,domain,tick,logical) VALUES(1,?1,?2,?3)
+                 ON CONFLICT(one) DO UPDATE SET domain=excluded.domain,
+                   tick=excluded.tick,logical=excluded.logical",
+            )?
+            .execute(params![
+                reading.domain.as_slice(),
+                u64_blob(reading.tick).as_slice(),
+                u64_blob(next.logical).as_slice()
+            ])?;
+            Ok::<_, Abort<SessionClockAnchor>>(next)
+        }) {
+            Txn::Committed(anchor) | Txn::Refused(anchor) => Ok(anchor),
+            Txn::ReadFailed(error) => Err(error),
+            Txn::NotWritten => Err(ReadError::Unavailable),
+        }
+    }
+
     fn collect_receipts(
         &mut self,
         collection: ReceiptCollection,

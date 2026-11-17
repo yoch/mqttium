@@ -201,10 +201,21 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
         budget.check_field(24)?;
     }
     meter.charge(256)?;
-    let tables: [(&str, &[(usize, usize)]); 10] = [
+    let tables: [(&str, &[(usize, usize)]); 11] = [
         (
-            "SELECT id, client_id, revision, state, expiry, opened_by FROM sessions",
-            &[(0, 8), (1, MAX_CLIENT_ID_BYTES), (2, 8), (5, 32)],
+            "SELECT id, client_id, revision, state, expiry, opened_by, detached_by, deadline FROM sessions",
+            &[
+                (0, 8),
+                (1, MAX_CLIENT_ID_BYTES),
+                (2, 8),
+                (5, 32),
+                (6, 32),
+                (7, 8),
+            ],
+        ),
+        (
+            "SELECT domain,tick,logical FROM session_clock",
+            &[(0, 32), (1, 8), (2, 8)],
         ),
         (
             "SELECT topic, session, qos FROM routes",

@@ -145,6 +145,49 @@ impl ReadBudget {
     }
 }
 
+/// One observation in an explicitly identified monotonic boot-clock domain.
+/// Ticks and logical progress are checked nanoseconds, never UTC or Instant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SessionClockReading {
+    pub domain: [u8; 32],
+    pub tick: u64,
+}
+
+/// The one durable anchor. Checkpoints overwrite it, never append history.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SessionClockAnchor {
+    pub reading: SessionClockReading,
+    pub logical: u64,
+}
+
+impl SessionClockAnchor {
+    /// Only a recognized identical domain may account uncommitted elapsed time.
+    pub fn observe(self, reading: SessionClockReading) -> Result<u64, ReadError> {
+        if reading.domain != self.reading.domain {
+            return Err(ReadError::Unavailable);
+        }
+        let elapsed = reading
+            .tick
+            .checked_sub(self.reading.tick)
+            .ok_or(ReadError::InvalidData)?;
+        self.logical
+            .checked_add(elapsed)
+            .ok_or(ReadError::InvalidData)
+    }
+
+    pub fn advance(
+        previous: Option<Self>,
+        reading: SessionClockReading,
+    ) -> Result<Self, ReadError> {
+        let logical = match previous {
+            Some(anchor) if anchor.reading.domain == reading.domain => anchor.observe(reading)?,
+            Some(anchor) => anchor.logical,
+            None => 0,
+        };
+        Ok(Self { reading, logical })
+    }
+}
+
 /// The durable limits of a data set, fixed when it is created.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Limits {
@@ -199,6 +242,7 @@ pub struct SessionRecord {
     pub state: SessionState,
     pub expiry: mqttiumd_contract::session::SessionExpiry,
     pub opened_by: Option<OperationId>,
+    pub detached: Option<mqttiumd_contract::session::SessionDetachment>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -298,6 +342,7 @@ pub struct DurableState {
     pub limits: Limits,
     pub accounts: Accounts,
     pub next_session: SessionId,
+    pub session_clock: Option<SessionClockAnchor>,
     pub route_revision: Revision,
     pub sessions: BTreeMap<SessionId, SessionRecord>,
     pub routes: BTreeMap<Vec<u8>, Vec<RouteTarget>>,
@@ -454,6 +499,17 @@ impl RecoveryRefused {
 /// The writer of a store. Each method is one step in the single order
 /// of authority; a method either commits entirely or changes nothing.
 pub trait DurableStore {
+    /// Compare-and-set the singleton clock anchor without creating a receipt.
+    /// A repeated/lost reply is reconciled by its absolute returned anchor.
+    /// A stale expectation returns the current anchor and performs no update.
+    fn checkpoint_session_clock(
+        &mut self,
+        _expected: Option<SessionClockAnchor>,
+        _reading: SessionClockReading,
+    ) -> Result<SessionClockAnchor, ReadError> {
+        Err(ReadError::Unavailable)
+    }
+
     /// Confirm an origin's contiguous consumed prefix and sweep at most limit
     /// physical receipt/fence rows atomically. No receipt is created. A retry
     /// reports absolute durable knowledge, never a second credit grant.
