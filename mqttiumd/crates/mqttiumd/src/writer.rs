@@ -1699,7 +1699,7 @@ mod tests {
                         length: PayloadBytes::new(intent.spec.payload.len() as u64),
                     },
                     costs: mqttiumd_contract::command::Costs {
-                        payload_bytes: PayloadBytes::new(0),
+                        payload_bytes: PayloadBytes::new(intent.spec.payload.len() as u64),
                         references: References::new(0),
                         exchange_slots: ExchangeSlots::new(0),
                         receipt_slots: ReceiptSlots::new(1),
