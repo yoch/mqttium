@@ -179,7 +179,10 @@ pub(super) fn validate(state: &DurableState, budget: ReadBudget) -> Result<(), R
     let mut total = 0u64;
     let mut meter = ReadMeter::new(budget);
     for (topic, record) in &state.retained {
-        meter.field(topic.len(), state.limits.max_topic_bytes)?;
+        meter.field(
+            topic.len(),
+            state.limits.max_topic_bytes.min(usize::from(u16::MAX)),
+        )?;
         meter.field(record.producer_client_id.len(), MAX_CLIENT_ID_BYTES)?;
         meter.charge(
             256usize
@@ -196,7 +199,8 @@ pub(super) fn validate(state: &DurableState, budget: ReadBudget) -> Result<(), R
             .get(&publication.payload)
             .ok_or(ReadError::InvalidData)?;
         if topic.is_empty()
-            || !mqttiumd_contract::topic::valid_filter(topic)
+            || topic.contains(&0)
+            || std::str::from_utf8(topic).is_err()
             || topic.iter().any(|b| matches!(*b, b'+' | b'#'))
             || record.producer_client_id.is_empty()
             || record.producer_client_id.contains(&0)

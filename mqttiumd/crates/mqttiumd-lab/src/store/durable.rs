@@ -482,6 +482,29 @@ fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
     Ok(())
 }
 
+fn check_delivery_metadata(
+    state: &DurableState,
+    delivery: DeliveryId,
+    record: &ObligationRecord,
+) -> Result<(), ReadError> {
+    let publication = state
+        .publications
+        .get(&delivery.publication)
+        .ok_or(ReadError::InvalidData)?;
+    if (record.retain && !publication.retain)
+        || (record.cause == mqttiumd_contract::command::DeliveryCause::RetainedReplay
+            && (!record.retain
+                || !matches!(record.qos, Qos::AtMostOnce | Qos::AtLeastOnce)
+                || publication.retained_version.is_none()
+                || publication.retained_version == Some(delivery.publication)))
+        || (record.cause == mqttiumd_contract::command::DeliveryCause::LiveExact
+            && publication.retained_version.is_some())
+    {
+        return Err(ReadError::InvalidData);
+    }
+    Ok(())
+}
+
 fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadError> {
     check_inventory_bound(state)?;
     retained_memory::validate(state, budget)?;
@@ -579,17 +602,7 @@ fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadEr
         )?;
     }
     for (delivery, record) in &state.obligations {
-        let publication = state
-            .publications
-            .get(&delivery.publication)
-            .ok_or(ReadError::InvalidData)?;
-        if record.cause == mqttiumd_contract::command::DeliveryCause::RetainedReplay
-            && (!record.retain || publication.retained_version.is_none())
-            || record.cause == mqttiumd_contract::command::DeliveryCause::LiveExact
-                && publication.retained_version.is_some()
-        {
-            return Err(ReadError::InvalidData);
-        }
+        check_delivery_metadata(state, *delivery, record)?;
         meter.field(32, 32)?;
         meter.charge(208)?;
     }
@@ -1977,6 +1990,11 @@ impl DurableStore for MemoryStore {
         }
         let state = &self.committed;
         check_inventory_bound(state)?;
+        for (delivery, record) in &state.obligations {
+            if record.target == session {
+                check_delivery_metadata(state, *delivery, record)?;
+            }
+        }
         let mut meter = ReadMeter::new(budget);
         let mut items =
             BoundedVec::with_capacity(limit).map_err(|_| ReadError::AllocationFailed)?;
@@ -2008,13 +2026,7 @@ impl DurableStore for MemoryStore {
                     .and_then(|n| n.checked_add(payload.bytes.len()))
                     .ok_or(ReadError::LimitExceeded)?,
             )?;
-            if record.cause == mqttiumd_contract::command::DeliveryCause::RetainedReplay
-                && (!record.retain || publication.retained_version.is_none())
-                || record.cause == mqttiumd_contract::command::DeliveryCause::LiveExact
-                    && publication.retained_version.is_some()
-            {
-                return Err(ReadError::InvalidData);
-            }
+            check_delivery_metadata(state, *delivery, record)?;
             let claim = delivery_claim(state, *delivery, record)?;
             items
                 .try_push(WorkItem {

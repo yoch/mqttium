@@ -219,7 +219,10 @@ pub(super) fn snapshot(
         let topic = reader::borrow_blob(
             row,
             0,
-            meta.limits.max_topic_bytes.min(budget.max_field_bytes),
+            meta.limits
+                .max_topic_bytes
+                .min(budget.max_field_bytes)
+                .min(usize::from(u16::MAX)),
         )?;
         let client = reader::borrow_blob(row, 2, MAX_CLIENT_ID_BYTES.min(budget.max_field_bytes))?;
         meter.charge(
@@ -229,7 +232,8 @@ pub(super) fn snapshot(
                 .ok_or(ReadError::LimitExceeded)?,
         )?;
         if topic.is_empty()
-            || !mqttiumd_contract::topic::valid_filter(topic)
+            || topic.contains(&0)
+            || std::str::from_utf8(topic).is_err()
             || topic.iter().any(|b| matches!(*b, b'+' | b'#'))
             || client.is_empty()
             || client.contains(&0)
@@ -391,16 +395,15 @@ pub(super) fn subscribe(
             .iter()
             .rfind(|c| c.topic == change.topic)
             .map_or(exists, |c| c.granted.is_some());
-        if let Some(granted) = change.granted {
-            if change.options.retain_handling() == 0
-                || change.options.retain_handling() == 1 && !existed
-            {
-                for (topic, value) in &inventory {
-                    if mqttiumd_contract::topic::matches(name, topic)
-                        && !(change.options.no_local() && value.producer_client_id == client)
-                    {
-                        plans.push((value.publication, granted));
-                    }
+        if let Some(granted) = change.granted
+            && (change.options.retain_handling() == 0
+                || change.options.retain_handling() == 1 && !existed)
+        {
+            for (topic, value) in &inventory {
+                if mqttiumd_contract::topic::matches(name, topic)
+                    && !(change.options.no_local() && value.producer_client_id == client)
+                {
+                    plans.push((value.publication, granted));
                 }
             }
         }

@@ -505,7 +505,149 @@ pub fn retained_topic_names_are_not_subscription_filters<S: DurableStore>(
     }
 }
 
+fn with_ids(
+    command: &Command,
+    publication: Option<mqttiumd_contract::ids::PublicationId>,
+    payload: Option<PayloadId>,
+    different: bool,
+) -> Command {
+    let mut bytes = Vec::new();
+    command.recipe.get().encode_canonical(&mut bytes).unwrap();
+    let mut recipe = Recipe::decode_canonical(&bytes, 16, 65535).unwrap();
+    match &mut recipe {
+        Recipe::RetainedPublication(v) => {
+            if let Some(id) = publication {
+                v.admission.publication = id;
+            }
+            if let Some(id) = payload {
+                v.admission.payload.id = id;
+            }
+            if different {
+                v.admission.topic = super::retained_conformance::bytes(b"different");
+            }
+        }
+        Recipe::RetainedQos0(v) => {
+            if let Some(id) = publication {
+                v.publication = id;
+            }
+            if let Some(id) = payload {
+                v.payload.id = id;
+            }
+            if different {
+                v.topic = super::retained_conformance::bytes(b"different");
+            }
+        }
+        _ => panic!(),
+    }
+    Command {
+        recipe: FrozenRecipe::freeze(recipe).unwrap(),
+        payload: command.payload.clone(),
+    }
+}
+
+pub fn collected_retained_identities_never_execute_again<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    for qos in [Qos::AtMostOnce, Qos::AtLeastOnce] {
+        let mut w = World::with_limits(make, limits());
+        let a = admitted(&w, 1, b"retired", b"old", qos, &[]);
+        let original = commit(&mut w.store, &a);
+        let clear = admitted(&w, 2, b"retired", b"", qos, &[]);
+        commit(&mut w.store, &clear);
+        assert_eq!(
+            w.store.apply(&a).reply,
+            StoreReply::Outcome(StoreOutcome::Committed(original))
+        );
+        let state = w.store.snapshot().unwrap();
+        assert!(state.retained.is_empty());
+        assert!(state.publications.is_empty());
+        assert!(state.payloads.is_empty());
+        let same_pub = with_ids(
+            &admitted(&w, 3, b"bad-pub", b"new", qos, &[]),
+            Some(publication_id(w.epoch, 1)),
+            None,
+            false,
+        );
+        let old_payload = PayloadId::new(
+            INCARNATION,
+            w.epoch,
+            LogicalOwnerId::new(0),
+            PayloadSeq::new(1),
+        );
+        let same_payload = with_ids(
+            &admitted(&w, 4, b"bad-payload", b"new", qos, &[]),
+            None,
+            Some(old_payload),
+            false,
+        );
+        for command in [&same_pub, &same_payload] {
+            assert_eq!(
+                w.store.apply(command).reply,
+                StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                    RejectReason::PreconditionFailed
+                )),
+                "retained_identity_reused_before_collection"
+            );
+        }
+        let closure = ReceiptClosure {
+            origin: ReceiptOrigin::of(operation_id(w.epoch, 1)),
+            through: operation_id(w.epoch, 4).sequence(),
+            publication_through: publication_id(w.epoch, 4).sequence(),
+            payload_through: PayloadSeq::new(4),
+        };
+        assert!(matches!(
+            w.store
+                .collect_receipts(ReceiptCollection {
+                    closure,
+                    limit: 128
+                })
+                .unwrap(),
+            ReceiptCollectionReply::Applied { .. }
+        ));
+        for old in [&a, &with_ids(&a, None, None, true)] {
+            assert_eq!(
+                w.store.apply(old).reply,
+                StoreReply::Outcome(StoreOutcome::RetiredOutcomeUnavailable),
+                "retired_retained_operation_reexecuted"
+            );
+        }
+        let same_pub = with_ids(
+            &admitted(&w, 5, b"bad-pub", b"new", qos, &[]),
+            Some(publication_id(w.epoch, 1)),
+            None,
+            false,
+        );
+        let same_payload = with_ids(
+            &admitted(&w, 6, b"bad-payload", b"new", qos, &[]),
+            Some(publication_id(w.epoch, 100)),
+            Some(old_payload),
+            false,
+        );
+        for command in [&same_pub, &same_payload] {
+            assert_eq!(
+                w.store.apply(command).reply,
+                StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                    RejectReason::PreconditionFailed
+                )),
+                "retained_identity_reused_after_collection"
+            );
+        }
+        let fresh = with_ids(
+            &admitted(&w, 7, b"fresh", b"new", qos, &[]),
+            Some(publication_id(w.epoch, 101)),
+            None,
+            false,
+        );
+        commit(&mut w.store, &fresh);
+        let state = w.store.snapshot().unwrap();
+        assert_eq!(state.retained.len(), 1);
+        assert_eq!(state.accounts.references.get(), 1);
+        assert_eq!(state.accounts.payload_bytes.get(), 3);
+    }
+}
+
 pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
+    collected_retained_identities_never_execute_again(make);
     retained_topic_names_are_not_subscription_filters(make);
     retained_survives_without_targets_and_producer(make);
     retained_replacement_clear_and_replay_freeze(make);

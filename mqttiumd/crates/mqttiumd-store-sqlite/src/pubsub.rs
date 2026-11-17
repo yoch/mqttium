@@ -435,7 +435,7 @@ pub(super) fn work(
         return Err(Fault::Read(ReadError::LimitExceeded));
     }
     let invalid: bool = read.query_row(
-        "SELECT EXISTS(SELECT 1 FROM obligations o LEFT JOIN publications p ON p.id=o.publication WHERE o.target=?1 AND (typeof(o.qos)!='integer' OR o.qos NOT IN (0,1,2) OR typeof(o.cause)!='integer' OR o.cause NOT IN (1,2) OR typeof(o.retain)!='integer' OR o.retain NOT IN (0,1) OR typeof(o.phase)!='integer' OR o.phase!=1 OR (o.cause=2 AND (o.retain!=1 OR p.retained_version IS NULL)) OR (o.cause=1 AND p.retained_version IS NOT NULL)) LIMIT 1)",
+        "SELECT EXISTS(SELECT 1 FROM obligations o LEFT JOIN publications p ON p.id=o.publication WHERE o.target=?1 AND (typeof(o.qos)!='integer' OR o.qos NOT IN (0,1,2) OR typeof(o.cause)!='integer' OR o.cause NOT IN (1,2) OR typeof(o.retain)!='integer' OR o.retain NOT IN (0,1) OR typeof(o.phase)!='integer' OR o.phase!=1 OR p.id IS NULL OR typeof(p.qos)!='integer' OR p.qos NOT IN (0,1,2) OR (o.retain=1 AND p.retain!=1) OR (o.cause=2 AND (o.qos NOT IN (0,1) OR o.retain!=1 OR p.retained_version IS NULL OR p.retained_version=p.id)) OR (o.cause=1 AND p.retained_version IS NOT NULL)) LIMIT 1)",
         [session.to_be_bytes().as_slice()],
         |row| row.get(0),
     )?;

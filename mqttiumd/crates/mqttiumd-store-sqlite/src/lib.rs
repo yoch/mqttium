@@ -2368,6 +2368,22 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                 );
             }
         }
+        for (delivery, record) in &obligations {
+            let publication = publications
+                .get(&delivery.publication)
+                .ok_or(Fault::Corrupt)?;
+            if (record.retain && !publication.retain)
+                || (record.cause == mqttiumd_contract::command::DeliveryCause::RetainedReplay
+                    && (!record.retain
+                        || !matches!(record.qos, Qos::AtMostOnce | Qos::AtLeastOnce)
+                        || publication.retained_version.is_none()
+                        || publication.retained_version == Some(delivery.publication)))
+                || (record.cause == mqttiumd_contract::command::DeliveryCause::LiveExact
+                    && publication.retained_version.is_some())
+            {
+                return Err(Fault::Corrupt);
+            }
+        }
         let mut outbound = BTreeMap::new();
         {
             let mut statement = conn.prepare(
