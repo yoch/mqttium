@@ -164,6 +164,16 @@ class RetainedSnapshotAndScope(unittest.TestCase):
         value = {"outbound": [], "operations": [], "obligations": [{"cause": "RetainedReplay"}]}
         self.assertIn(results.FIXTURE_RETAINED_SCOPE, self.unmet(value))
 
+    def test_qos0_commit_fact_has_no_invented_exchange(self):
+        contracts = Contracts.open(ROOT)
+        value = self.snapshot()
+        value["operations"][0]["recipe_hex"] = qos0().hex()
+        value["operations"][0]["decision"] = {"kind": "Committed", "facts": {
+            "kind": "RetainedQos0Stored", "publication_id": value["publications"][0]["publication_id"]}}
+        self.assertEqual(contracts.check_value(value), [])
+        value["operations"][0]["decision"]["facts"]["exchange"] = {"session": "1", "generation": "1"}
+        self.assertTrue(contracts.check_value(value))
+
     def test_terminal_qos0_fact_remains_outside_scope_after_payload_disappears(self):
         value = {"outbound": [], "operations": [{"recipe_hex": "", "decision": {
             "facts": {"kind": "RetainedQos0Stored", "publication_id": {}}}}]}
