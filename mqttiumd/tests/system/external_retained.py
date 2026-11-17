@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from pathlib import Path
 
 from external_sessions import message_row
 from external_wildcard import MqttiumPeer, PahoPeer, PacketTap as PlainTap, TIMEOUT
@@ -73,3 +74,28 @@ class PahoRetained(PahoPeer):
                     'paho_retained_ack_submission')
             self.log.record('puback_submitted', packet_id=row['packet_id'])
         return row
+
+
+async def mosquitto_retained_publish(address, client_id, topic, payload, qos, case):
+    """Execute the identified CLI; -r is its public retained-publication option."""
+    from external_wildcard import INFINITE, mosquitto_identity
+    identity = mosquitto_identity()['mosquitto_pub']
+    path = Path(case) / 'mosquitto-retained-payload.bin'
+    path.write_bytes(payload)
+    command = [identity['path'], '-V', 'mqttv5', '-h', address[0], '-p', str(address[1]),
+               '-i', client_id, '-c', '-x', str(INFINITE), '-q', str(qos),
+               '-t', topic, '-f', str(path), '-r']
+    process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE,
+                                                  stderr=asyncio.subprocess.PIPE)
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=8)
+    except BaseException:
+        if process.returncode is None:
+            process.kill(); await process.wait()
+        raise
+    require(len(stdout) + len(stderr) <= 65536, 'mosquitto_retained_publisher_output_budget')
+    require(process.returncode == 0, 'mosquitto_retained_publisher_failed', stderr.decode(errors='replace')[-256:])
+    return {'client': 'mosquitto_pub', 'identity': identity, 'command': command,
+            'pid': process.pid, 'status': process.returncode, 'retain_requested': True,
+            'payload_sha256': hashlib.sha256(payload).hexdigest(),
+            'completion_scope': 'local-write-only' if qos == 0 else 'MQTT acknowledgement'}

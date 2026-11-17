@@ -12,11 +12,12 @@ import subprocess
 import time
 
 from external_mqttium import client_identity
-from external_retained import MqttiumRetained, PahoRetained, PacketTap
+from external_retained import MqttiumRetained, PahoRetained, PacketTap, mosquitto_retained_publish
 from external_sessions import INFINITE
 from external_wildcard import Subscription, MosquittoReceiver, mosquitto_identity
 from pubsub_probe import durable, session_key
 from retained_probe import RetainedWire
+from retained_probe import retained_publish_packet
 from tcp_probe import Observations, ReceiptFailure, require, write_json
 from tcp_reception import Broker, writer_available
 
@@ -113,6 +114,46 @@ async def minimal(binary, case):
         await close_peers(peers)
         if restart is not None: restart.cleanup()
         broker.cleanup()
+
+
+async def demo(binary, case):
+    broker = Broker(binary, case); peers = []; cli = None; cli_tap = None
+    try:
+        ready = broker.ready()
+        source, source_tap = await peer('mqttium', broker, case, 'retained-demo-mqttium')
+        peers.append((source, source_tap))
+        first = b'mqttium-retained-before-mosquitto-subscribes'
+        await source.publish('demo/room/value', first, 1)
+        cli_tap = PacketTap(broker.address, Observations(case / 'mosquitto.wire.jsonl'))
+        cli = MosquittoReceiver(cli_tap.address, 'retained-demo-mosquitto-sub',
+                                 ('demo/+/value',), qos=1, count=1, case=case)
+        cli_result = await cli.finish()
+        require(cli_result['messages'][0]['payload'] == first.decode()
+                and cli_result['messages'][0]['qos'] == 1 and bool(cli_result['messages'][0]['retain']),
+                'mosquitto_retained_replay_not_received')
+        cli_wire = one_delivery(cli_tap, first, 1, True)
+        cli_tap.close(); cli_tap = None
+        target, target_tap = await peer('paho', broker, case, 'retained-demo-paho')
+        peers.append((target, target_tap))
+        await target.subscribe((Subscription('demo/mosquitto/#', 1, retain_as_published=True,
+                                            retain_handling=2),))
+        second = b'mosquitto-retained-live-to-paho'
+        cli_publisher = await mosquitto_retained_publish(broker.address, 'retained-demo-mosquitto-pub',
+            'demo/mosquitto/value', second, 2, case)
+        observed = await target.receive(second, 1, True)
+        second_wire = one_delivery(target_tap, second, 1, True)
+        await until_state(broker, business_drained, 'retained_demo_not_finished')
+        await close_peers(peers); peers = []
+        state = durable(broker.db); write_json(case / 'durable-final.json', state)
+        broker.stop(); writer_available(broker.db)
+        return {'criterion': 'demo', 'status': 'PASS', 'ready': ready,
+                'clients': [source.result, target.result, cli_result, cli_publisher],
+                'messages': [cli_result['messages'][0], observed], 'wire': [cli_wire, second_wire],
+                'process_status': broker.process.returncode}
+    finally:
+        if cli is not None: cli.close()
+        if cli_tap is not None: cli_tap.close()
+        await close_peers(peers); broker.cleanup()
 
 
 async def matrix(binary, case):
@@ -259,12 +300,100 @@ async def replacement(binary, case):
         await close_peers(peers); broker.cleanup()
 
 
+def business_state(state):
+    names = ('retained', 'routes', 'publications', 'payloads', 'obligations', 'outbound', 'inbound')
+    return {name: state['tables'][name] for name in names}
+
+
+async def capacity(binary, case):
+    broker = Broker(binary, case); source = target = None
+    try:
+        ready = broker.ready()
+        source = RetainedWire(broker.address, broker.observations, 'capacity-source')
+        source.session_connect('retained-capacity-source', expected_present=False)
+        payloads = {f'capacity/{index:02}': f'{index:08}'.encode() + b'v' * (32768 - 8) for index in range(32)}
+        for identifier, (topic, payload) in enumerate(payloads.items(), 1):
+            source.publish(identifier, topic, payload, qos=1)
+        full = durable(broker.db)
+        require(len(retained_rows(full)) == 32 and full['counts']['publications'] == 32
+                and full['counts']['payloads'] == 32, 'retained_inventory_did_not_reach_exact_budget')
+        meta = full['tables']['meta'][0]
+        require(int(meta['used_references'], 16) == 32 and int(meta['used_payload_bytes'], 16) == 1024 * 1024,
+                'retained_inventory_accounting_wrong')
+        # Replacing at the full budget uses its net cost, not a transient 33rd
+        # reference or double byte charge.
+        replacement_value = b'new:0000' + b'n' * (32768 - 8)
+        source.publish(33, 'capacity/00', replacement_value, qos=1)
+        payloads['capacity/00'] = replacement_value
+        full = durable(broker.db)
+        require(len(retained_rows(full)) == 32 and int(full['tables']['meta'][0]['used_references'], 16) == 32,
+                'retained_net_replacement_refused_or_leaked')
+        baseline = business_state(full); refusals = []
+        for identifier, qos in ((34, 1), (35, 2)):
+            source.send(retained_publish_packet('capacity/overflow', b'no-partial-admission', identifier, qos=qos))
+            reply = source.wait(0x40 if qos == 1 else 0x50, identifier)
+            require(reply.ack() == (identifier, 0x97), 'retained_inventory_overflow_positive_or_wrong_reason')
+            after = durable(broker.db)
+            require(business_state(after) == baseline, 'retained_inventory_overflow_partially_mutated')
+            refusals.append({'qos': qos, 'reason': reply.ack()[1], 'frame_header': reply.header,
+                             'body_hex': reply.body.hex(), 'business_unchanged': True})
+        marker = max(int(event['seq']) for event in broker.events())
+        source.send(retained_publish_packet('capacity/overflow', b'no-qos0-partial-admission', qos=0))
+        source.send(b'\xc0\x00'); source.wait(0xd0)
+        deadline = time.monotonic() + 3
+        qos0_drop = []
+        while time.monotonic() < deadline:
+            qos0_drop = [event for event in broker.events() if int(event['seq']) > marker
+                         and event['kind'] == 'qos0_dropped'
+                         and event['details'].get('reason') == 'capacity_exceeded']
+            if qos0_drop: break
+            await asyncio.sleep(.01)
+        require(len(qos0_drop) == 1 and business_state(durable(broker.db)) == baseline,
+                'retained_qos0_capacity_refusal_not_observed_or_partial')
+        target = RetainedWire(broker.address, broker.observations, 'capacity-replay-target')
+        target.session_connect('retained-capacity-target', expected_present=False)
+        target.subscribe_options(1, (Subscription('capacity/#', 1),) * 8, expected=(0x97,) * 8)
+        target.no_publication(.1, code='retained_replay_capacity_truncated')
+        after_replay_refusal = durable(broker.db)
+        require(business_state(after_replay_refusal) == baseline, 'retained_replay_capacity_partially_mutated')
+        # Thirty-two values replay to one target: the existing 16-destination
+        # bound must not accidentally become a retained-value bound.
+        target.subscribe_options(2, (Subscription('capacity/#', 0),))
+        received = [target.receive(qos=0, retain=True).observation() for _ in range(32)]
+        require({row['topic'] for row in received} == set(payloads)
+                and all(row['payload_sha256'] == hashlib.sha256(payloads[row['topic']]).hexdigest()
+                        for row in received), 'retained_replay_inventory_incomplete')
+        target.no_publication(.08, code='retained_replay_inventory_duplicated')
+        await until_state(broker, business_drained, 'retained_capacity_replays_not_consumed')
+        target.unsubscribe(3, ['capacity/#'])
+        # Clearing one current value returns a real inventory slot; a new exact
+        # topic then fits without increasing either quota.
+        source.publish(36, 'capacity/01', b'', qos=1)
+        source.publish(37, 'capacity/overflow', b'now-fits', qos=1)
+        final = durable(broker.db)
+        require(len(retained_rows(final)) == 32 and final['counts']['payloads'] == 32,
+                'retained_clear_did_not_return_inventory_capacity')
+        for label, state in (('full', full), ('replay-refused', after_replay_refusal), ('final', final)):
+            write_json(case / f'{label}.sql.json', state)
+        source.close(); source = None; target.close(); target = None; broker.stop()
+        return {'criterion': 'capacity', 'status': 'PASS', 'ready': ready,
+                'current_topics': 32, 'current_payload_bytes_at_full': 1024 * 1024,
+                'inventory_refusals': refusals, 'replay_refusal_codes': [0x97] * 8,
+                'qos0_capacity_drop': qos0_drop[0], 'independent_ping': True,
+                'replayed_values_one_target': received, 'net_replacement': True,
+                'clear_recovered_capacity': True, 'process_status': broker.process.returncode}
+    finally:
+        if source is not None: source.close()
+        if target is not None: target.close()
+        broker.cleanup()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--binary-source-head', required=True)
-    parser.add_argument('--case', choices=('normal', 'minimal', 'matrix', 'options', 'replacement'), default='normal')
+    parser.add_argument('--case', choices=('normal', 'minimal', 'demo', 'matrix', 'options', 'replacement', 'capacity'), default='normal')
     args = parser.parse_args(); args.out.mkdir(parents=True, exist_ok=False)
     root = Path(__file__).resolve().parents[3]
     head = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD']).decode().strip()
@@ -275,7 +404,8 @@ def main():
                'cases': []}
     try:
         require(head == args.binary_source_head, 'retained_source_mismatch')
-        functions = {'minimal': minimal, 'matrix': matrix, 'options': options, 'replacement': replacement}
+        functions = {'minimal': minimal, 'demo': demo, 'matrix': matrix, 'options': options,
+                     'replacement': replacement, 'capacity': capacity}
         selected = tuple(functions) if args.case == 'normal' else (args.case,)
         for name in selected:
             receipt['cases'].append(asyncio.run(functions[name](args.binary.resolve(), args.out / name)))
