@@ -190,6 +190,9 @@ fn facts(facts: CommitFacts) -> Value {
             };
             json!({"kind": "SessionLifecycle", "change": change})
         }
+        CommitFacts::RetainedQos0Stored { publication } => {
+            json!({"kind":"RetainedQos0Stored","publication_id":publication_id(publication)})
+        }
         CommitFacts::DeliveryConsumed { delivery, target } => json!({
             "kind": "DeliveryConsumed", "delivery_id": delivery_id(delivery),
             "target_session": session(target),
@@ -365,6 +368,7 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
                 "qos": qos(record.qos),
                 "retain": record.retain,
                 "payload_id": payload_id(record.payload),
+                "retained_version": record.retained_version.map(publication_id),
             })
         })
         .collect();
@@ -379,8 +383,10 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
                 "target_revision": decimal(record.target_revision.get()),
                 "cause": match record.cause {
                     DeliveryCause::LiveExact => "LiveExact",
+                    DeliveryCause::RetainedReplay=>"RetainedReplay",
                 },
                 "effective_qos": qos(record.qos),
+                "retain":record.retain,
                 "phase": match record.phase {
                     ObligationPhase::Pending => "Queued",
                 },
@@ -443,6 +449,7 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
         "fences": fences,
         "payloads": payloads,
         "publications": publications,
+        "retained":state.retained.iter().map(|(topic,record)|json!({"topic_hex":hex(topic),"publication_id":publication_id(record.publication),"producer_client_id_hex":hex(&record.producer_client_id)})).collect::<Vec<_>>(),
         "obligations": obligations,
         "inbound_exchanges": inbound,
         "outbound": outbound,
@@ -885,7 +892,10 @@ impl<'a> TraceWriter<'a> {
                             "operation_id": operation_id(*operation),
                         }),
                     ),
-                    WorkKind::AdmitPublication
+                    WorkKind::RetainedPublication
+                    | WorkKind::RetainedQos0
+                    | WorkKind::ReplaySubscriptions
+                    | WorkKind::AdmitPublication
                     | WorkKind::ReleaseInbound
                     | WorkKind::ChangeSubscriptions
                     | WorkKind::ClaimDelivery

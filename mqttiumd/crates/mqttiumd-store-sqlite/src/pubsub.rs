@@ -307,6 +307,10 @@ pub(super) fn facts_blob(facts: CommitFacts) -> Option<(i64, Vec<u8>)> {
     let mut bytes = Vec::new();
     let code = match facts {
         CommitFacts::SessionLifecycle(change) => return Some((8, sessions::encode(change))),
+        CommitFacts::RetainedQos0Stored { publication } => {
+            bytes.extend_from_slice(&publication.to_be_bytes());
+            9
+        }
         CommitFacts::DeliveryConsumed { delivery, target } => {
             bytes.extend_from_slice(&delivery.publication.to_be_bytes());
             bytes.extend_from_slice(&delivery.index.to_be_bytes());
@@ -350,6 +354,11 @@ pub(super) fn facts_blob(facts: CommitFacts) -> Option<(i64, Vec<u8>)> {
 }
 
 pub(super) fn decode_facts(code: i64, bytes: &[u8]) -> Result<CommitFacts, Corrupt> {
+    if code == 9 {
+        return Ok(CommitFacts::RetainedQos0Stored {
+            publication: PublicationId::from_be_slice(bytes).map_err(|_| Corrupt)?,
+        });
+    }
     if code == 8 {
         return sessions::decode(bytes);
     }
@@ -426,7 +435,7 @@ pub(super) fn work(
         return Err(Fault::Read(ReadError::LimitExceeded));
     }
     let invalid: bool = read.query_row(
-        "SELECT EXISTS(SELECT 1 FROM obligations WHERE target=?1 AND (typeof(qos)!='integer' OR qos NOT IN (0,1,2) OR typeof(cause)!='integer' OR cause!=1 OR typeof(phase)!='integer' OR phase!=1) LIMIT 1)",
+        "SELECT EXISTS(SELECT 1 FROM obligations o LEFT JOIN publications p ON p.id=o.publication WHERE o.target=?1 AND (typeof(o.qos)!='integer' OR o.qos NOT IN (0,1,2) OR typeof(o.cause)!='integer' OR o.cause NOT IN (1,2) OR typeof(o.retain)!='integer' OR o.retain NOT IN (0,1) OR typeof(o.phase)!='integer' OR o.phase!=1 OR (o.cause=2 AND (o.retain!=1 OR p.retained_version IS NULL)) OR (o.cause=1 AND p.retained_version IS NOT NULL)) LIMIT 1)",
         [session.to_be_bytes().as_slice()],
         |row| row.get(0),
     )?;
@@ -453,7 +462,7 @@ pub(super) fn work(
     if broken {
         return Err(Fault::Corrupt);
     }
-    let sql = "SELECT o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state,o.qos FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN payloads y ON y.id=p.payload LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.target=?1 AND o.qos IN (0,1) AND (?2 IS NULL OR o.publication>?2 OR (o.publication=?2 AND o.idx>?3)) ORDER BY o.publication,o.idx LIMIT ?4";
+    let sql = "SELECT o.publication,o.idx,o.target_revision,p.topic,y.bytes,c.packet_id,c.claim,c.target,c.target_revision,s.revision,s.state,o.qos,o.retain FROM obligations o LEFT JOIN publications p ON p.id=o.publication LEFT JOIN payloads y ON y.id=p.payload LEFT JOIN outbound c ON c.publication=o.publication AND c.idx=o.idx LEFT JOIN sessions s ON s.id=o.target WHERE o.target=?1 AND o.qos IN (0,1) AND (?2 IS NULL OR o.publication>?2 OR (o.publication=?2 AND o.idx>?3)) ORDER BY o.publication,o.idx LIMIT ?4";
     let mut items = BoundedVec::with_capacity(limit).map_err(|_| ReadError::AllocationFailed)?;
     let mut meter = reader::Meter::new(budget);
     let mut more = false;
@@ -524,6 +533,11 @@ pub(super) fn work(
                     target: session,
                     target_revision: revision,
                     qos: code_qos(row.get(11)?)?,
+                    retain: match row.get::<_, i64>(12)? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(Fault::Corrupt),
+                    },
                     topic: SharedBytes::copy_from(topic, meta.limits.max_topic_bytes)
                         .map_err(|_| ReadError::LimitExceeded)?,
                     payload: SharedBytes::copy_from(payload, meta.limits.max_payload_bytes)

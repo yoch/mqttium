@@ -135,6 +135,9 @@ impl FaultAction {
 /// The kind of work the adapter carries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WorkKind {
+    RetainedPublication,
+    RetainedQos0,
+    ReplaySubscriptions,
     AdmitPublication,
     ReleaseInbound,
     ChangeSubscriptions,
@@ -152,6 +155,9 @@ impl WorkKind {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::RetainedPublication => "RetainedPublication",
+            Self::RetainedQos0 => "RetainedQos0",
+            Self::ReplaySubscriptions => "ReplaySubscriptions",
             Self::AdmitPublication => "AdmitPublication",
             Self::ReleaseInbound => "ReleaseInbound",
             Self::ChangeSubscriptions => "ChangeSubscriptions",
@@ -462,6 +468,20 @@ pub struct Crashed<S> {
 fn describe(work: &Work) -> (WorkKind, Option<OperationId>, Source) {
     match work {
         Work::Persist(command) => match command.recipe.get() {
+            Recipe::RetainedPublication(value) => (
+                WorkKind::RetainedPublication,
+                Some(value.admission.operation),
+                Some((
+                    value.admission.source.session,
+                    value.admission.source.packet_id,
+                )),
+            ),
+            Recipe::RetainedQos0(value) => (WorkKind::RetainedQos0, Some(value.operation), None),
+            Recipe::ReplaySubscriptions(value) => (
+                WorkKind::ReplaySubscriptions,
+                Some(value.update.operation),
+                None,
+            ),
             Recipe::AdmitPublication(admit) => (
                 WorkKind::AdmitPublication,
                 Some(admit.operation),

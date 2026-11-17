@@ -792,7 +792,7 @@ fn receipted_ephemeral_cycles_collect_without_reusing_session_or_attachment_iden
 
 #[test]
 fn schemas_four_five_and_six_are_refused_without_modifying_the_existing_database() {
-    for version in [4, 5, 6] {
+    for version in [4, 5, 6, 7] {
         let directory = Directory::new();
         let path = directory.database();
         drop(sqlite(&path));

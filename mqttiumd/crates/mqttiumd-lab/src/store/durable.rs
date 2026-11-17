@@ -12,6 +12,8 @@
 //! subset of an admission is ever admitted (ADM-002).
 
 use std::collections::{BTreeMap, BTreeSet};
+#[path = "retained.rs"]
+mod retained_memory;
 
 use mqttiumd_contract::capacity::{
     BoundedVec, ExchangeSlots, PayloadBytes, ReceiptSlots, References, Resource,
@@ -53,6 +55,64 @@ pub struct MemoryStore {
     durability: Durability,
 }
 
+#[derive(Clone, Copy)]
+struct Admission<'a> {
+    operation: OperationId,
+    request: mqttiumd_contract::ids::RequestId,
+    publication: PublicationId,
+    source_session: SessionId,
+    source_revision: Revision,
+    inbound: Option<(
+        mqttiumd_contract::ids::InboundPacketId,
+        mqttiumd_contract::ids::ExchangeId,
+    )>,
+    route_revision: Revision,
+    qos: Qos,
+    retain: bool,
+    topic: &'a SharedBytes,
+    payload: mqttiumd_contract::command::PayloadRef,
+    costs: mqttiumd_contract::command::Costs,
+    targets: &'a [mqttiumd_contract::command::Target],
+}
+impl<'a> From<&'a AdmitPublication> for Admission<'a> {
+    fn from(a: &'a AdmitPublication) -> Self {
+        Self {
+            operation: a.operation,
+            request: a.request,
+            publication: a.publication,
+            source_session: a.source.session,
+            source_revision: a.source.session_revision,
+            inbound: Some((a.source.packet_id, a.source.exchange)),
+            route_revision: a.route_revision,
+            qos: a.qos,
+            retain: a.retain,
+            topic: &a.topic,
+            payload: a.payload,
+            costs: a.costs,
+            targets: a.targets.as_slice(),
+        }
+    }
+}
+impl<'a> From<&'a mqttiumd_contract::retained::RetainedQos0> for Admission<'a> {
+    fn from(a: &'a mqttiumd_contract::retained::RetainedQos0) -> Self {
+        Self {
+            operation: a.operation,
+            request: a.request,
+            publication: a.publication,
+            source_session: a.session,
+            source_revision: a.session_revision,
+            inbound: None,
+            route_revision: a.route_revision,
+            qos: Qos::AtMostOnce,
+            retain: true,
+            topic: &a.topic,
+            payload: a.payload,
+            costs: a.costs,
+            targets: a.targets.as_slice(),
+        }
+    }
+}
+
 /// A guard failed while a command was being prepared.
 type Guard<T> = Result<T, RejectReason>;
 
@@ -75,6 +135,7 @@ impl MemoryStore {
                 operations: BTreeMap::new(),
                 fences: BTreeSet::new(),
                 receipt_frontiers: BTreeMap::new(),
+                retained: BTreeMap::new(),
                 publications: BTreeMap::new(),
                 payloads: BTreeMap::new(),
                 obligations: BTreeMap::new(),
@@ -103,70 +164,6 @@ impl MemoryStore {
     /// Completed metadata is collectible, but the exact admission receipt
     /// remains an identity witness until its epoch is closed and collected.
     /// Check the whole relevant scope before treating an identity as unused.
-    fn admission_identity_was_used(&self, admit: &AdmitPublication) -> Result<bool, ReadError> {
-        let operation = admit.operation;
-        if self
-            .committed
-            .receipt_frontiers
-            .get(&ReceiptOrigin::of(operation))
-            .is_some_and(|closure| {
-                admit.publication.sequence() <= closure.publication_through
-                    || admit.payload.id.sequence() <= closure.payload_through
-            })
-        {
-            return Ok(true);
-        }
-        let bound = |sequence| {
-            OperationId::new(
-                operation.incarnation(),
-                operation.epoch(),
-                operation.owner(),
-                OperationSeq::new(sequence),
-            )
-        };
-        let mut meter = ReadMeter::new(ReadBudget::SNAPSHOT);
-        for (id, record) in self.committed.operations.range(bound(0)..=bound(u64::MAX)) {
-            meter.field(record.recipe.len(), ReadBudget::SNAPSHOT.max_field_bytes)?;
-            meter.charge(
-                256usize
-                    .checked_add(record.recipe.len())
-                    .ok_or(ReadError::LimitExceeded)?,
-            )?;
-            if let Decision::Committed(CommitFacts::PublicationAdmitted {
-                publication,
-                exchange,
-            }) = record.decision
-            {
-                let stored = Recipe::decode_canonical(
-                    &record.recipe,
-                    self.committed.limits.max_targets_per_admission,
-                    self.committed.limits.max_topic_bytes,
-                )
-                .map_err(|error| match error {
-                    RecipeError::AllocationFailed => ReadError::AllocationFailed,
-                    RecipeError::TooManyTargets { .. } | RecipeError::TopicTooLong(_) => {
-                        ReadError::LimitExceeded
-                    }
-                    _ => ReadError::InvalidData,
-                })?;
-                let Recipe::AdmitPublication(stored) = stored else {
-                    return Err(ReadError::InvalidData);
-                };
-                if stored.operation != *id
-                    || stored.publication != publication
-                    || stored.source.exchange != exchange
-                {
-                    return Err(ReadError::InvalidData);
-                }
-                if stored.publication == admit.publication || stored.payload.id == admit.payload.id
-                {
-                    return Ok(true);
-                }
-            }
-        }
-        Ok(false)
-    }
-
     /// Commits a staged copy: it becomes the committed state, one
     /// revision later, or nothing changes.
     fn commit(&mut self, mut staged: DurableState) -> bool {
@@ -487,6 +484,7 @@ fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
 
 fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadError> {
     check_inventory_bound(state)?;
+    retained_memory::validate(state, budget)?;
     let mut meter = ReadMeter::new(budget);
     budget.check_field(8)?;
     if state.ledger.opened_by().is_some() {
@@ -552,6 +550,16 @@ fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadEr
             return Err(ReadError::InvalidData);
         }
     }
+    for (topic, record) in &state.retained {
+        meter.field(topic.len(), state.limits.max_topic_bytes)?;
+        meter.field(record.producer_client_id.len(), MAX_CLIENT_ID_BYTES)?;
+        meter.charge(
+            256usize
+                .checked_add(topic.len())
+                .and_then(|n| n.checked_add(record.producer_client_id.len()))
+                .ok_or(ReadError::LimitExceeded)?,
+        )?;
+    }
     for record in state.publications.values() {
         meter.field(32, 32)?;
         meter.field(record.topic.len(), state.limits.max_topic_bytes)?;
@@ -570,7 +578,18 @@ fn check_snapshot(state: &DurableState, budget: ReadBudget) -> Result<(), ReadEr
                 .ok_or(ReadError::LimitExceeded)?,
         )?;
     }
-    for _ in state.obligations.values() {
+    for (delivery, record) in &state.obligations {
+        let publication = state
+            .publications
+            .get(&delivery.publication)
+            .ok_or(ReadError::InvalidData)?;
+        if record.cause == mqttiumd_contract::command::DeliveryCause::RetainedReplay
+            && (!record.retain || publication.retained_version.is_none())
+            || record.cause == mqttiumd_contract::command::DeliveryCause::LiveExact
+                && publication.retained_version.is_some()
+        {
+            return Err(ReadError::InvalidData);
+        }
         meter.field(32, 32)?;
         meter.charge(208)?;
     }
@@ -599,6 +618,12 @@ trait Staging {
     fn stage_admission(
         &mut self,
         admit: &AdmitPublication,
+        payload: Option<&SharedBytes>,
+    ) -> Guard<CommitFacts>;
+    fn stage_publication(
+        &mut self,
+        admit: Admission<'_>,
+        retained_mask: Option<u16>,
         payload: Option<&SharedBytes>,
     ) -> Guard<CommitFacts>;
     fn stage_release(&mut self, release: &ReleaseInbound) -> Guard<CommitFacts>;
@@ -710,6 +735,14 @@ impl Staging for DurableState {
         admit: &AdmitPublication,
         payload: Option<&SharedBytes>,
     ) -> Guard<CommitFacts> {
+        self.stage_publication(Admission::from(admit), None, payload)
+    }
+    fn stage_publication(
+        &mut self,
+        admit: Admission<'_>,
+        retained_mask: Option<u16>,
+        payload: Option<&SharedBytes>,
+    ) -> Guard<CommitFacts> {
         let failed = RejectReason::PreconditionFailed;
         let operation = admit.operation;
         let same_scope = |incarnation, epoch, owner| {
@@ -732,7 +765,7 @@ impl Staging for DurableState {
         ) {
             return Err(failed);
         }
-        let targets = admit.targets.as_slice();
+        let targets = admit.targets;
         if targets.len() > self.limits.max_targets_per_admission
             || admit.topic.len() > self.limits.max_topic_bytes
             || admit.route_revision != self.route_revision
@@ -748,7 +781,8 @@ impl Staging for DurableState {
         // costs of what the recipe admits: the store releases exactly
         // what it charged, row by row.
         let exactly_once = admit.qos == Qos::ExactlyOnce;
-        let reference_count = u64::try_from(targets.len()).map_err(|_| failed)?;
+        let reference_count = u64::try_from(targets.len()).map_err(|_| failed)?
+            + u64::from(retained_mask.is_some() && length > 0);
         if admit.costs.payload_bytes != admit.payload.length
             || admit.costs.references.get() != reference_count
             || admit.costs.exchange_slots.get() != u64::from(exactly_once)
@@ -756,7 +790,7 @@ impl Staging for DurableState {
         {
             return Err(failed);
         }
-        self.active_session(admit.source.session, admit.source.session_revision)?;
+        self.active_session(admit.source_session, admit.source_revision)?;
 
         // A payload identity names one payload, kept or not.
         if self.publications.contains_key(&admit.publication)
@@ -768,11 +802,15 @@ impl Staging for DurableState {
         {
             return Err(failed);
         }
+        if retained_mask.is_some() {
+            retained_memory::prepare_mutation(self, admit.topic.as_slice(), length)?;
+        }
         self.publications.insert(
             admit.publication,
             PublicationRecord {
+                retained_version: None,
                 operation,
-                source: admit.source.session,
+                source: admit.source_session,
                 topic: admit.topic.as_slice().to_vec(),
                 qos: admit.qos,
                 retain: admit.retain,
@@ -792,9 +830,10 @@ impl Staging for DurableState {
                 },
             );
         }
-        for target in targets {
+        for (target_index, target) in targets.iter().enumerate() {
             self.active_session(target.session, target.session_revision)?;
             let obligation = ObligationRecord {
+                retain: retained_mask.is_some_and(|mask| mask & (1 << target_index) != 0),
                 target: target.session,
                 target_revision: target.session_revision,
                 qos: target.effective_qos,
@@ -810,9 +849,10 @@ impl Staging for DurableState {
             }
         }
         if exactly_once {
-            let slot = (admit.source.session, admit.source.packet_id);
+            let (packet_id, exchange) = admit.inbound.ok_or(failed)?;
+            let slot = (admit.source_session, packet_id);
             let marker = InboundRecord {
-                exchange: admit.source.exchange,
+                exchange,
                 publication: admit.publication,
                 phase: InboundPhase::AwaitPubrel,
             };
@@ -835,10 +875,23 @@ impl Staging for DurableState {
                 .checked_sub(admit.costs.payload_bytes)
                 .ok_or(failed)?;
         }
+        if retained_mask.is_some() && length > 0 {
+            retained_memory::install(
+                self,
+                admit.topic.as_slice(),
+                admit.publication,
+                admit.source_session,
+            )?;
+        }
         self.discard_completed_publication(admit.publication);
-        Ok(CommitFacts::PublicationAdmitted {
-            publication: admit.publication,
-            exchange: admit.source.exchange,
+        Ok(match admit.inbound {
+            Some((_, exchange)) => CommitFacts::PublicationAdmitted {
+                publication: admit.publication,
+                exchange,
+            },
+            None => CommitFacts::RetainedQos0Stored {
+                publication: admit.publication,
+            },
         })
     }
 
@@ -1046,6 +1099,10 @@ impl Staging for DurableState {
                 .obligations
                 .keys()
                 .any(|delivery| delivery.publication == publication)
+            && !self
+                .retained
+                .values()
+                .any(|entry| entry.publication == publication)
         {
             self.publications.remove(&publication);
         }
@@ -1693,11 +1750,23 @@ impl DurableStore for MemoryStore {
         // 1. Recognise an operation that was already decided.
         if let Some(record) = self.committed.operations.get(&operation) {
             let same_payload = match (recipe, &command.payload, record.decision) {
-                (Recipe::AdmitPublication(admit), Some(bytes), Decision::Committed(_)) => self
-                    .committed
-                    .payloads
-                    .get(&admit.payload.id)
-                    .is_none_or(|stored| stored.bytes == bytes.as_slice()),
+                (recipe, Some(bytes), Decision::Committed(_))
+                    if retained_memory::bounds(recipe)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|b| b.payload.is_some()) =>
+                {
+                    self.committed
+                        .payloads
+                        .get(
+                            &retained_memory::bounds(recipe)
+                                .ok()
+                                .flatten()
+                                .and_then(|b| b.payload)
+                                .expect("guarded publication payload"),
+                        )
+                        .is_none_or(|stored| stored.bytes == bytes.as_slice())
+                }
                 _ => true,
             };
             if record.recipe != canonical || !same_payload {
@@ -1725,8 +1794,8 @@ impl DurableStore for MemoryStore {
             ));
         }
 
-        if let Recipe::AdmitPublication(admit) = recipe {
-            match self.admission_identity_was_used(admit) {
+        {
+            match retained_memory::identity_was_used(&self.committed, recipe) {
                 Ok(false) => {}
                 Ok(true) => {
                     return rejected(self.commit_rejection(
@@ -1745,6 +1814,17 @@ impl DurableStore for MemoryStore {
             Recipe::AdmitPublication(admit) => {
                 staged.stage_admission(admit, command.payload.as_ref())
             }
+            Recipe::RetainedPublication(value) => staged.stage_publication(
+                Admission::from(&value.admission),
+                Some(value.retain_targets),
+                command.payload.as_ref(),
+            ),
+            Recipe::RetainedQos0(value) => staged.stage_publication(
+                Admission::from(value),
+                Some(value.retain_targets),
+                command.payload.as_ref(),
+            ),
+            Recipe::ReplaySubscriptions(value) => retained_memory::subscribe(&mut staged, value),
             Recipe::ReleaseInbound(release) => staged.stage_release(release),
             Recipe::ChangeSubscriptions(command) => staged.stage_subscriptions(command),
             Recipe::ClaimDelivery(command) => staged.stage_claim(command),
@@ -1928,6 +2008,13 @@ impl DurableStore for MemoryStore {
                     .and_then(|n| n.checked_add(payload.bytes.len()))
                     .ok_or(ReadError::LimitExceeded)?,
             )?;
+            if record.cause == mqttiumd_contract::command::DeliveryCause::RetainedReplay
+                && (!record.retain || publication.retained_version.is_none())
+                || record.cause == mqttiumd_contract::command::DeliveryCause::LiveExact
+                    && publication.retained_version.is_some()
+            {
+                return Err(ReadError::InvalidData);
+            }
             let claim = delivery_claim(state, *delivery, record)?;
             items
                 .try_push(WorkItem {
@@ -1935,6 +2022,7 @@ impl DurableStore for MemoryStore {
                     target: record.target,
                     target_revision: record.target_revision,
                     qos: record.qos,
+                    retain: record.retain,
                     topic: SharedBytes::copy_from(&publication.topic, state.limits.max_topic_bytes)
                         .map_err(|_| ReadError::LimitExceeded)?,
                     payload: SharedBytes::copy_from(&payload.bytes, state.limits.max_payload_bytes)
@@ -2023,62 +2111,15 @@ impl MemoryStore {
                     .checked_add(record.recipe.len())
                     .ok_or(ReadError::LimitExceeded)?,
             )?;
-            if let Some(admit) = self.admission_receipt(*operation, record)?
-                && (admit.publication.sequence().get() == 0
-                    || admit.payload.id.sequence().get() == 0)
+            if let Some(admit) =
+                retained_memory::receipt_bounds(&self.committed, *operation, record)?
+                && (admit.first.sequence().get() == 0
+                    || admit.payload.is_some_and(|p| p.sequence().get() == 0))
             {
                 return Ok(false);
             }
         }
         Ok(true)
-    }
-
-    fn admission_receipt(
-        &self,
-        operation: OperationId,
-        record: &OperationRecord,
-    ) -> Result<Option<AdmitPublication>, ReadError> {
-        let Decision::Committed(CommitFacts::PublicationAdmitted {
-            publication,
-            exchange,
-        }) = record.decision
-        else {
-            return Ok(None);
-        };
-        let recipe = Recipe::decode_canonical(
-            &record.recipe,
-            self.committed.limits.max_targets_per_admission,
-            self.committed.limits.max_topic_bytes,
-        )
-        .map_err(|error| match error {
-            RecipeError::AllocationFailed => ReadError::AllocationFailed,
-            RecipeError::TooManyTargets { .. } | RecipeError::TopicTooLong(_) => {
-                ReadError::LimitExceeded
-            }
-            _ => ReadError::InvalidData,
-        })?;
-        let Recipe::AdmitPublication(admit) = recipe else {
-            return Err(ReadError::InvalidData);
-        };
-        if admit.operation != operation
-            || admit.publication != publication
-            || admit.source.exchange != exchange
-            || ReceiptOrigin::of(operation)
-                != (ReceiptOrigin {
-                    incarnation: admit.publication.incarnation(),
-                    epoch: admit.publication.epoch(),
-                    owner: admit.publication.owner(),
-                })
-            || ReceiptOrigin::of(operation)
-                != (ReceiptOrigin {
-                    incarnation: admit.payload.id.incarnation(),
-                    epoch: admit.payload.id.epoch(),
-                    owner: admit.payload.id.owner(),
-                })
-        {
-            return Err(ReadError::InvalidData);
-        }
-        Ok(Some(admit))
     }
 
     fn collect_receipts_inner(
@@ -2157,9 +2198,12 @@ impl MemoryStore {
                         .checked_add(record.recipe.len())
                         .ok_or(ReadError::LimitExceeded)?,
                 )?;
-                if let Some(admit) = self.admission_receipt(operation, record)?
-                    && (admit.publication.sequence() > request.publication_through
-                        || admit.payload.id.sequence() > request.payload_through)
+                if let Some(admit) =
+                    retained_memory::receipt_bounds(&self.committed, operation, record)?
+                    && (admit.last.sequence() > request.publication_through
+                        || admit
+                            .payload
+                            .is_some_and(|p| p.sequence() > request.payload_through))
                 {
                     return refused(ReceiptCollectionRefusal::InvalidFrontier);
                 }

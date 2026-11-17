@@ -201,7 +201,7 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
         budget.check_field(24)?;
     }
     meter.charge(256)?;
-    let tables: [(&str, &[(usize, usize)]); 11] = [
+    let tables: [(&str, &[(usize, usize)]); 12] = [
         (
             "SELECT id, client_id, revision, state, expiry, opened_by, detached_by, deadline FROM sessions",
             &[
@@ -237,13 +237,22 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
             &[(0, 8), (1, 8), (2, 8), (3, 8), (4, 8)],
         ),
         (
-            "SELECT id, operation, source, topic, qos, retain, payload FROM publications",
+            "SELECT id, operation, source, topic, qos, retain, payload, retained_version FROM publications",
             &[
                 (0, 32),
                 (1, 32),
                 (2, 8),
                 (3, meta.limits.max_topic_bytes),
                 (6, 32),
+                (7, 32),
+            ],
+        ),
+        (
+            "SELECT topic,publication,producer_client_id FROM retained",
+            &[
+                (0, meta.limits.max_topic_bytes),
+                (1, 32),
+                (2, MAX_CLIENT_ID_BYTES),
             ],
         ),
         (
@@ -251,7 +260,7 @@ pub(crate) fn snapshot(conn: &Connection, meta: &Meta, budget: ReadBudget) -> Re
             &[(0, 32), (1, meta.limits.max_payload_bytes), (2, 8)],
         ),
         (
-            "SELECT publication, idx, target, target_revision, qos, cause, phase FROM obligations",
+            "SELECT publication, idx, target, target_revision, qos, cause, phase, retain FROM obligations",
             &[(0, 32), (2, 8), (3, 8)],
         ),
         (

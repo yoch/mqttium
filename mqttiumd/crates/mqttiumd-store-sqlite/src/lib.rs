@@ -49,6 +49,7 @@ mod codec;
 mod pubsub;
 mod reader;
 mod receipts;
+mod retained;
 mod schema;
 mod sessions;
 
@@ -80,8 +81,8 @@ use mqttiumd_store_api::{
     Accounts, AdminCommand, AdminDone, AdminRefused, Applied, Decision, Durability, DurableState,
     DurableStore, InboundRecord, Limits, MAX_CLIENT_ID_BYTES, MAX_RECOVERY_INVENTORY_ROWS,
     ObligationRecord, OperationRecord, OutboundRecord, PayloadRecord, PublicationRecord,
-    ReadBudget, ReadError, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved, RouteTarget,
-    SessionClockAnchor, SessionClockReading, SessionRecord, SessionState, WorkPage,
+    ReadBudget, ReadError, RecoveryCursor, RecoveryPage, RecoveryRefused, Resolved, RetainedRecord,
+    RouteTarget, SessionClockAnchor, SessionClockReading, SessionRecord, SessionState, WorkPage,
 };
 
 use mqttiumd_contract::receipts::{
@@ -97,6 +98,64 @@ use codec::{
 };
 
 pub use schema::{FORMAT, SCHEMA_VERSION};
+
+#[derive(Clone, Copy)]
+struct Admission<'a> {
+    operation: OperationId,
+    request: mqttiumd_contract::ids::RequestId,
+    publication: PublicationId,
+    source_session: SessionId,
+    source_revision: Revision,
+    inbound: Option<(
+        mqttiumd_contract::ids::InboundPacketId,
+        mqttiumd_contract::ids::ExchangeId,
+    )>,
+    route_revision: Revision,
+    qos: Qos,
+    retain: bool,
+    topic: &'a SharedBytes,
+    payload: mqttiumd_contract::command::PayloadRef,
+    costs: mqttiumd_contract::command::Costs,
+    targets: &'a [mqttiumd_contract::command::Target],
+}
+impl<'a> From<&'a AdmitPublication> for Admission<'a> {
+    fn from(a: &'a AdmitPublication) -> Self {
+        Self {
+            operation: a.operation,
+            request: a.request,
+            publication: a.publication,
+            source_session: a.source.session,
+            source_revision: a.source.session_revision,
+            inbound: Some((a.source.packet_id, a.source.exchange)),
+            route_revision: a.route_revision,
+            qos: a.qos,
+            retain: a.retain,
+            topic: &a.topic,
+            payload: a.payload,
+            costs: a.costs,
+            targets: a.targets.as_slice(),
+        }
+    }
+}
+impl<'a> From<&'a mqttiumd_contract::retained::RetainedQos0> for Admission<'a> {
+    fn from(a: &'a mqttiumd_contract::retained::RetainedQos0) -> Self {
+        Self {
+            operation: a.operation,
+            request: a.request,
+            publication: a.publication,
+            source_session: a.session,
+            source_revision: a.session_revision,
+            inbound: None,
+            route_revision: a.route_revision,
+            qos: Qos::AtMostOnce,
+            retain: true,
+            topic: &a.topic,
+            payload: a.payload,
+            costs: a.costs,
+            targets: a.targets.as_slice(),
+        }
+    }
+}
 
 /// Whether this compiled store carries test-only transaction kill points.
 /// The bench checks this before writing a campaign, including when Cargo
@@ -557,7 +616,7 @@ impl DecisionColumns {
                 self.reason.ok_or(Corrupt)?,
                 self.resource,
             )?)),
-            4..=8 => Ok(Decision::Committed(pubsub::decode_facts(
+            4..=9 => Ok(Decision::Committed(pubsub::decode_facts(
                 self.decision,
                 self.facts.as_deref().ok_or(Corrupt)?,
             )?)),
@@ -745,87 +804,14 @@ fn exists(conn: &Connection, sql: &str, key: &[u8]) -> Result<bool, Fault> {
 /// A completed publication can lose its metadata while its admission receipt
 /// remains an exact identity witness. Only this operation's scope can contain
 /// either incoming identity; collected scopes can never execute again.
-fn admission_identity_was_used(
-    conn: &Connection,
-    meta: &Meta,
-    admit: &AdmitPublication,
-) -> Result<bool, Fault> {
-    let operation = admit.operation;
-    if let Some(closure) = receipts::frontier(conn, meta, ReceiptOrigin::of(operation))?
-        && ((!receipts::MUTANT_ALLOW_OLD_PUBLICATION
-            && admit.publication.sequence() <= closure.publication_through)
-            || (!receipts::MUTANT_ALLOW_OLD_PAYLOAD
-                && admit.payload.id.sequence() <= closure.payload_through))
-    {
-        return Ok(true);
-    }
-    let bound = |sequence| {
-        OperationId::new(
-            operation.incarnation(),
-            operation.epoch(),
-            operation.owner(),
-            OperationSeq::new(sequence),
-        )
-        .to_be_bytes()
-    };
-    let mut statement = conn.prepare_cached(
-        "SELECT id, recipe, decision, publication, exchange, reason, resource, facts
-           FROM operations WHERE id >= ?1 AND id <= ?2 ORDER BY id",
-    )?;
-    let mut rows = statement.query(params![bound(0).as_slice(), bound(u64::MAX).as_slice()])?;
-    let mut meter = reader::Meter::new(ReadBudget::SNAPSHOT);
-    while let Some(row) = rows.next()? {
-        let recipe = reader::borrow_blob(row, 1, ReadBudget::SNAPSHOT.max_field_bytes)?;
-        meter.charge(
-            256usize
-                .checked_add(recipe.len())
-                .ok_or(ReadError::LimitExceeded)?,
-        )?;
-        let id =
-            OperationId::from_be_slice(reader::borrow_blob(row, 0, 32)?).map_err(|_| Corrupt)?;
-        if let Decision::Committed(CommitFacts::PublicationAdmitted {
-            publication,
-            exchange,
-        }) = decision_of(row, 2)?.decode()?
-        {
-            let stored = Recipe::decode_canonical(
-                recipe,
-                meta.limits.max_targets_per_admission,
-                meta.limits.max_topic_bytes,
-            )
-            .map_err(|error| {
-                Fault::Read(match error {
-                    RecipeError::AllocationFailed => ReadError::AllocationFailed,
-                    RecipeError::TooManyTargets { .. } | RecipeError::TopicTooLong(_) => {
-                        ReadError::LimitExceeded
-                    }
-                    _ => ReadError::InvalidData,
-                })
-            })?;
-            let Recipe::AdmitPublication(stored) = stored else {
-                return Err(Fault::Corrupt);
-            };
-            if stored.operation != id
-                || stored.publication != publication
-                || stored.source.exchange != exchange
-            {
-                return Err(Fault::Corrupt);
-            }
-            if stored.publication == admit.publication || stored.payload.id == admit.payload.id {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
 /// Metadata is live while either the inbound exchange or an obligation needs
 /// it. Payload bytes are released separately with their final obligation.
 fn discard_completed_publication(conn: &Connection, publication: &[u8]) -> Result<(), Fault> {
     conn.prepare_cached(
         "DELETE FROM publications WHERE id = ?1
            AND NOT EXISTS (SELECT 1 FROM inbound WHERE publication = ?1)
-           AND NOT EXISTS (SELECT 1 FROM obligations WHERE publication = ?1)",
+           AND NOT EXISTS (SELECT 1 FROM obligations WHERE publication = ?1)
+           AND NOT EXISTS (SELECT 1 FROM retained WHERE publication = ?1)",
     )?
     .execute([publication])?;
     Ok(())
@@ -835,6 +821,15 @@ fn stage_admission(
     conn: &Connection,
     meta: &mut Meta,
     admit: &AdmitPublication,
+    payload: Option<&SharedBytes>,
+) -> Guard<CommitFacts> {
+    stage_publication(conn, meta, Admission::from(admit), None, payload)
+}
+fn stage_publication(
+    conn: &Connection,
+    meta: &mut Meta,
+    admit: Admission<'_>,
+    retained_mask: Option<u16>,
     payload: Option<&SharedBytes>,
 ) -> Guard<CommitFacts> {
     let failed = RejectReason::PreconditionFailed;
@@ -859,7 +854,7 @@ fn stage_admission(
     ) {
         return refused(failed);
     }
-    let targets = admit.targets.as_slice();
+    let targets = admit.targets;
     if targets.len() > meta.limits.max_targets_per_admission
         || admit.topic.len() > meta.limits.max_topic_bytes
         || admit.route_revision != meta.route_revision
@@ -876,7 +871,8 @@ fn stage_admission(
     // The costs are part of the frozen recipe and must be the costs of
     // what it admits: the store releases exactly what it charged.
     let exactly_once = admit.qos == Qos::ExactlyOnce;
-    let reference_count = u64::try_from(targets.len()).map_err(|_| Abort::Refused(failed))?;
+    let reference_count = u64::try_from(targets.len()).map_err(|_| Abort::Refused(failed))?
+        + u64::from(retained_mask.is_some() && length > 0);
     if admit.costs.payload_bytes != admit.payload.length
         || admit.costs.references.get() != reference_count
         || admit.costs.exchange_slots.get() != u64::from(exactly_once)
@@ -884,9 +880,16 @@ fn stage_admission(
     {
         return refused(failed);
     }
-    active_session(conn, admit.source.session, admit.source.session_revision)?;
+    active_session(conn, admit.source_session, admit.source_revision)?;
 
-    if admission_identity_was_used(conn, meta, admit)? {
+    if retained::identity_was_used(
+        conn,
+        meta,
+        admit.operation,
+        admit.publication,
+        admit.publication,
+        Some(admit.payload.id),
+    )? {
         return refused(failed);
     }
 
@@ -906,6 +909,9 @@ fn stage_admission(
     {
         return refused(failed);
     }
+    if retained_mask.is_some() {
+        retained::prepare_mutation(conn, meta, admit.topic.as_slice(), length)?;
+    }
     conn.prepare_cached(
         "INSERT INTO publications (id, operation, source, qos, retain, payload, topic)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -913,7 +919,7 @@ fn stage_admission(
     .execute(params![
         publication.as_slice(),
         operation.to_be_bytes().as_slice(),
-        admit.source.session.to_be_bytes().as_slice(),
+        admit.source_session.to_be_bytes().as_slice(),
         qos_code(admit.qos),
         i64::from(admit.retain),
         payload_id.as_slice(),
@@ -933,7 +939,7 @@ fn stage_admission(
             bytes.as_slice(),
         ])?;
     }
-    for target in targets {
+    for (target_index, target) in targets.iter().enumerate() {
         active_session(conn, target.session, target.session_revision)?;
         let delivery = target.delivery;
         let key = (
@@ -949,8 +955,8 @@ fn stage_admission(
             return refused(failed);
         }
         conn.prepare_cached(
-            "INSERT INTO obligations (publication, idx, target, target_revision, qos, cause, phase)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO obligations (publication, idx, target, target_revision, qos, cause, phase, retain)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?
         .execute(params![
             key.0.as_slice(),
@@ -960,13 +966,15 @@ fn stage_admission(
             qos_code(target.effective_qos),
             cause_code(target.cause),
             obligation_phase_code(mqttiumd_store_api::ObligationPhase::Pending),
+            i64::from(retained_mask.is_some_and(|mask| mask & (1 << target_index) != 0)),
         ])?;
     }
     if exactly_once {
         // One admission per inbound exchange: an occupied slot is never
         // taken over, whatever generation the newcomer claims.
-        let session = admit.source.session.to_be_bytes();
-        let packet = i64::from(admit.source.packet_id.get());
+        let (packet_id, exchange) = admit.inbound.ok_or(Abort::Refused(failed))?;
+        let session = admit.source_session.to_be_bytes();
+        let packet = i64::from(packet_id.get());
         let taken = conn
             .prepare_cached("SELECT 1 FROM inbound WHERE session = ?1 AND packet_id = ?2")?
             .query_row(params![session.as_slice(), packet], |_| Ok(()))
@@ -982,7 +990,7 @@ fn stage_admission(
         .execute(params![
             session.as_slice(),
             packet,
-            exchange_blob(admit.source.exchange).as_slice(),
+            exchange_blob(exchange).as_slice(),
             publication.as_slice(),
             inbound_phase_code(InboundPhase::AwaitPubrel),
         ])?;
@@ -1003,10 +1011,23 @@ fn stage_admission(
             .checked_sub(admit.costs.payload_bytes)
             .ok_or(Abort::Refused(failed))?;
     }
+    if retained_mask.is_some() && length > 0 {
+        retained::install(
+            conn,
+            admit.topic.as_slice(),
+            admit.publication,
+            admit.source_session,
+        )?;
+    }
     discard_completed_publication(conn, &publication)?;
-    Ok(CommitFacts::PublicationAdmitted {
-        publication: admit.publication,
-        exchange: admit.source.exchange,
+    Ok(match admit.inbound {
+        Some((_, exchange)) => CommitFacts::PublicationAdmitted {
+            publication: admit.publication,
+            exchange,
+        },
+        None => CommitFacts::RetainedQos0Stored {
+            publication: admit.publication,
+        },
     })
 }
 
@@ -2272,7 +2293,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
         let mut publications = BTreeMap::new();
         {
             let mut statement = conn.prepare(
-                "SELECT id, operation, source, topic, qos, retain, payload FROM publications",
+                "SELECT id, operation, source, topic, qos, retain, payload, retained_version FROM publications",
             )?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
@@ -2280,13 +2301,22 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                     PublicationId::from_be_slice(reader::borrow_blob(row, 0, 32)?)
                         .map_err(|_| Fault::Corrupt)?,
                     PublicationRecord {
+                        retained_version: reader::optional_blob(row, 7, 32)?
+                            .as_deref()
+                            .map(PublicationId::from_be_slice)
+                            .transpose()
+                            .map_err(|_| Fault::Corrupt)?,
                         operation: OperationId::from_be_slice(reader::borrow_blob(row, 1, 32)?)
                             .map_err(|_| Fault::Corrupt)?,
                         source: SessionId::from_be_slice(reader::borrow_blob(row, 2, 8)?)
                             .map_err(|_| Fault::Corrupt)?,
                         topic: reader::copy_blob(row, 3, budget.max_field_bytes)?,
                         qos: code_qos(row.get(4)?)?,
-                        retain: row.get::<_, i64>(5)? == 1,
+                        retain: match row.get::<_, i64>(5)? {
+                            0 => false,
+                            1 => true,
+                            _ => return Err(Fault::Corrupt),
+                        },
                         payload: PayloadId::from_be_slice(reader::borrow_blob(row, 6, 32)?)
                             .map_err(|_| Fault::Corrupt)?,
                     },
@@ -2311,7 +2341,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
         let mut obligations = BTreeMap::new();
         {
             let mut statement = conn.prepare(
-                "SELECT publication, idx, target, target_revision, qos, cause, phase FROM obligations",
+                "SELECT publication, idx, target, target_revision, qos, cause, phase, retain FROM obligations",
             )?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
@@ -2323,6 +2353,11 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                         index: u32::try_from(index).map_err(|_| Fault::Corrupt)?,
                     },
                     ObligationRecord {
+                        retain: match row.get::<_, i64>(7)? {
+                            0 => false,
+                            1 => true,
+                            _ => return Err(Fault::Corrupt),
+                        },
                         target: SessionId::from_be_slice(reader::borrow_blob(row, 2, 8)?)
                             .map_err(|_| Fault::Corrupt)?,
                         target_revision: Revision::new(blob_u64(reader::borrow_blob(row, 3, 8)?)?),
@@ -2424,6 +2459,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
             operations,
             fences,
             receipt_frontiers: receipts::all_frontiers(conn, &meta, budget)?,
+            retained: retained::snapshot(conn, &meta, budget)?,
             publications,
             payloads,
             obligations,
@@ -2541,15 +2577,23 @@ impl DurableStore for SqliteStore {
         };
         if let Some(record) = record {
             let same_payload = match (recipe, &command.payload, record.decision) {
-                (Recipe::AdmitPublication(admit), Some(bytes), Decision::Committed(_)) => {
+                (recipe, Some(bytes), Decision::Committed(_))
+                    if retained::bounds(recipe)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|b| b.payload.is_some()) =>
+                {
+                    let payload_id = retained::bounds(recipe)
+                        .ok()
+                        .flatten()
+                        .and_then(|b| b.payload)
+                        .expect("guarded publication payload");
                     let stored: Result<Option<Vec<u8>>, _> = self
                         .conn
                         .prepare_cached("SELECT bytes FROM payloads WHERE id = ?1")
                         .and_then(|mut statement| {
                             statement
-                                .query_row([admit.payload.id.to_be_bytes().as_slice()], |row| {
-                                    row.get(0)
-                                })
+                                .query_row([payload_id.to_be_bytes().as_slice()], |row| row.get(0))
                                 .optional()
                         });
                     match stored {
@@ -2591,6 +2635,21 @@ impl DurableStore for SqliteStore {
         let written = self.transact(|conn, meta| {
             let facts = match recipe {
                 Recipe::AdmitPublication(admit) => stage_admission(conn, meta, admit, payload)?,
+                Recipe::RetainedPublication(value) => stage_publication(
+                    conn,
+                    meta,
+                    Admission::from(&value.admission),
+                    Some(value.retain_targets),
+                    payload,
+                )?,
+                Recipe::RetainedQos0(value) => stage_publication(
+                    conn,
+                    meta,
+                    Admission::from(value),
+                    Some(value.retain_targets),
+                    payload,
+                )?,
+                Recipe::ReplaySubscriptions(value) => retained::subscribe(conn, meta, value)?,
                 Recipe::ReleaseInbound(release) => stage_release(conn, meta, release)?,
                 Recipe::ChangeSubscriptions(command) => pubsub::subscriptions(conn, meta, command)?,
                 Recipe::ClaimDelivery(command) => pubsub::claim(conn, meta, command)?,

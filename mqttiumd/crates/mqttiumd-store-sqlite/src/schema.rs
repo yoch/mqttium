@@ -1,11 +1,11 @@
-//! The schema of version 7. Every table is `STRICT`; identities and 64-bit
+//! The schema of version 8. Every table is `STRICT`; identities and 64-bit
 //! values are 8-byte big-endian BLOBs (32 bytes for an operation-scoped
 //! identity, 16 for an exchange, 24 for an opening attempt); large BLOBs
 //! come last in their row.
 
 /// `PRAGMA user_version` of the schema below. Any other version is
 /// refused before anything is written.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// The format named in `meta`.
 pub const FORMAT: &str = "mqttiumd-store-sqlite";
@@ -94,10 +94,17 @@ CREATE TABLE publications (
     qos INTEGER NOT NULL,
     retain INTEGER NOT NULL CHECK (retain IN (0, 1)),
     payload BLOB NOT NULL CHECK (length(payload) = 32),
+    retained_version BLOB CHECK (retained_version IS NULL OR length(retained_version) = 32),
     topic BLOB NOT NULL
 ) STRICT, WITHOUT ROWID;
 
 CREATE INDEX publications_by_payload ON publications (payload);
+
+CREATE TABLE retained (
+    topic BLOB PRIMARY KEY,
+    publication BLOB NOT NULL CHECK(length(publication)=32),
+    producer_client_id BLOB NOT NULL
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE payloads (
     id BLOB PRIMARY KEY CHECK (length(id) = 32),
@@ -113,6 +120,7 @@ CREATE TABLE obligations (
     target_revision BLOB NOT NULL CHECK (length(target_revision) = 8),
     qos INTEGER NOT NULL,
     cause INTEGER NOT NULL,
+    retain INTEGER NOT NULL DEFAULT 0,
     phase INTEGER NOT NULL,
     PRIMARY KEY (publication, idx)
 ) STRICT, WITHOUT ROWID;

@@ -17,3 +17,5 @@ pub mod conformance;
 pub mod durable;
 pub mod evidence;
 pub mod fixture;
+
+pub mod retained_conformance;

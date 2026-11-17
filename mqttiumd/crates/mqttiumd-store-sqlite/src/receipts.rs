@@ -126,62 +126,6 @@ pub(crate) fn capacity(
     Ok(true)
 }
 
-fn admission_receipt(
-    meta: &Meta,
-    operation: OperationId,
-    record: &OperationRecord,
-) -> Result<Option<AdmitPublication>, Fault> {
-    let Decision::Committed(CommitFacts::PublicationAdmitted {
-        publication,
-        exchange,
-    }) = record.decision
-    else {
-        return Ok(None);
-    };
-    let recipe = Recipe::decode_canonical(
-        &record.recipe,
-        meta.limits.max_targets_per_admission,
-        meta.limits.max_topic_bytes,
-    )
-    .map_err(|error| {
-        Fault::Read(match error {
-            RecipeError::AllocationFailed => ReadError::AllocationFailed,
-            RecipeError::TooManyTargets { .. } | RecipeError::TopicTooLong(_) => {
-                ReadError::LimitExceeded
-            }
-            _ => ReadError::InvalidData,
-        })
-    })?;
-    let Recipe::AdmitPublication(admit) = recipe else {
-        return Err(Fault::Corrupt);
-    };
-    if admit.operation != operation
-        || admit.publication != publication
-        || admit.source.exchange != exchange
-        || (
-            admit.publication.incarnation(),
-            admit.publication.epoch(),
-            admit.publication.owner(),
-        ) != (
-            operation.incarnation(),
-            operation.epoch(),
-            operation.owner(),
-        )
-        || (
-            admit.payload.id.incarnation(),
-            admit.payload.id.epoch(),
-            admit.payload.id.owner(),
-        ) != (
-            operation.incarnation(),
-            operation.epoch(),
-            operation.owner(),
-        )
-    {
-        return Err(Fault::Corrupt);
-    }
-    Ok(Some(admit))
-}
-
 fn initial_compatible(
     conn: &Connection,
     meta: &Meta,
@@ -220,8 +164,9 @@ fn initial_compatible(
             recipe: reader::copy_blob(row, 1, ReadBudget::SNAPSHOT.max_field_bytes)?,
             decision: decision_of(row, 2)?.decode()?,
         };
-        if let Some(admit) = admission_receipt(meta, operation, &record)?
-            && (admit.publication.sequence().get() == 0 || admit.payload.id.sequence().get() == 0)
+        if let Some(admit) = retained::receipt_bounds(meta, operation, &record)?
+            && (admit.first.sequence().get() == 0
+                || admit.payload.is_some_and(|p| p.sequence().get() == 0))
         {
             return Ok(false);
         }
@@ -368,9 +313,11 @@ pub(crate) fn prepare(
                 meter.charge(32)?;
                 continue;
             };
-            if let Some(admit) = admission_receipt(meta, operation, &record)?
-                && (admit.publication.sequence() > request.publication_through
-                    || admit.payload.id.sequence() > request.payload_through)
+            if let Some(admit) = retained::receipt_bounds(meta, operation, &record)?
+                && (admit.last.sequence() > request.publication_through
+                    || admit
+                        .payload
+                        .is_some_and(|p| p.sequence() > request.payload_through))
             {
                 return refused(ReceiptCollectionRefusal::InvalidFrontier);
             }

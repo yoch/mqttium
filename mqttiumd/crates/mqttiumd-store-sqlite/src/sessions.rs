@@ -295,7 +295,7 @@ pub(super) fn erase(
             code_qos(row.get(1)?)?;
         }
     }
-    conn.prepare_cached("DELETE FROM publications WHERE id IN (SELECT publication FROM inbound WHERE session=?1) AND NOT EXISTS (SELECT 1 FROM obligations WHERE publication=publications.id) AND NOT EXISTS (SELECT 1 FROM inbound WHERE publication=publications.id AND session!=?1)")?.execute([key.as_slice()])?;
+    conn.prepare_cached("DELETE FROM publications WHERE id IN (SELECT publication FROM inbound WHERE session=?1) AND NOT EXISTS (SELECT 1 FROM obligations WHERE publication=publications.id) AND NOT EXISTS (SELECT 1 FROM retained WHERE publication=publications.id) AND NOT EXISTS (SELECT 1 FROM inbound WHERE publication=publications.id AND session!=?1)")?.execute([key.as_slice()])?;
     let removed = conn
         .prepare_cached("DELETE FROM inbound WHERE session=?1")?
         .execute([key.as_slice()])?;

@@ -95,12 +95,14 @@ pub const fn code_session_state(code: i64) -> Result<SessionState, Corrupt> {
 pub const fn cause_code(cause: DeliveryCause) -> i64 {
     match cause {
         DeliveryCause::LiveExact => 1,
+        DeliveryCause::RetainedReplay => 2,
     }
 }
 
 pub const fn code_cause(code: i64) -> Result<DeliveryCause, Corrupt> {
     match code {
         1 => Ok(DeliveryCause::LiveExact),
+        2 => Ok(DeliveryCause::RetainedReplay),
         _ => Err(Corrupt),
     }
 }
