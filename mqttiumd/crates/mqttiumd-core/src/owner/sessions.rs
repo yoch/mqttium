@@ -2,7 +2,8 @@
 
 use super::*;
 use crate::contract::session::{
-    SessionAction, SessionChange, SessionEndReason, SessionExpiry, SessionGuard, SessionLifecycle,
+    SessionAction, SessionChange, SessionDetachment, SessionEndReason, SessionExpiry, SessionGuard,
+    SessionLifecycle,
 };
 
 /// Bounded facts about owner-held state; no transport/cache authority is inferred.
@@ -58,12 +59,35 @@ fn waiting() -> Stop {
 }
 
 impl Owner {
+    pub(super) fn session_metadata_valid(
+        &self,
+        expiry: SessionExpiry,
+        detached: Option<SessionDetachment>,
+    ) -> bool {
+        if matches!(expiry, SessionExpiry::After(0 | u32::MAX)) {
+            return false;
+        }
+        detached.is_none_or(|d| {
+            d.operation.incarnation() == self.incarnation
+                && d.operation.epoch().get() > 0
+                && d.operation.epoch() <= self.epoch
+                && match expiry {
+                    SessionExpiry::OnDisconnect => false,
+                    SessionExpiry::Never => d.deadline.is_none(),
+                    SessionExpiry::After(_) => d.deadline.is_some(),
+                }
+        })
+    }
     /// The one accepted opening request, including a transport already closed.
     /// This is an observation for bounded adapter follow-up, not a session grant.
     #[must_use]
     pub fn opening_connection(&self) -> Option<ConnectionGeneration> {
         self.lifecycle.as_ref().and_then(|f| {
-            matches!(f.command.action, SessionAction::Open { .. }).then_some(f.connection)
+            matches!(
+                f.command.action,
+                SessionAction::Open { .. } | SessionAction::OpenAt { .. }
+            )
+            .then_some(f.connection)
         })
     }
     #[must_use]
@@ -102,8 +126,14 @@ impl Owner {
         }
     }
     pub(super) fn session_work_bound(&self, input: &Input) -> u64 {
-        if !matches!(input, Input::OpenSession { .. } | Input::EndSession { .. })
-            && !self.lifecycle_enabled
+        if !matches!(
+            input,
+            Input::OpenSession { .. }
+                | Input::OpenSessionAt { .. }
+                | Input::EndSession { .. }
+                | Input::DetachSession { .. }
+                | Input::ExpireSession { .. }
+        ) && !self.lifecycle_enabled
         {
             return 0;
         }
@@ -144,6 +174,7 @@ impl Owner {
         client_id: &SharedBytes,
         clean_start: bool,
         expiry: SessionExpiry,
+        now: Option<u64>,
         draft: &mut Draft,
     ) -> Result<super::Change, Stop> {
         if self.closed.iter().any(|g| *g == connection) {
@@ -165,6 +196,11 @@ impl Owner {
             .as_slice()
             .iter()
             .find(|s| s.client_id == *client_id);
+        if now.is_none() && known.is_some_and(|s| matches!(s.expiry, SessionExpiry::After(_))) {
+            // An old untimed interface cannot turn an unobserved expiry into
+            // a resume, even when the requested replacement policy is Never.
+            return Err(IMPOSSIBLE);
+        }
         if let Some(previous) = known.and_then(|s| s.connection) {
             draft.close(previous, CloseReason::SessionTakenOver)?;
         }
@@ -172,18 +208,22 @@ impl Owner {
             session: s.id,
             opened_by: s.opened_by,
         });
-        let flight = self.session_flight(
-            SessionAction::Open {
+        let action = match now {
+            Some(now) => SessionAction::OpenAt {
+                client_id: client_id.clone(),
+                expected,
+                clean_start,
+                expiry,
+                now,
+            },
+            None => SessionAction::Open {
                 client_id: client_id.clone(),
                 expected,
                 clean_start,
                 expiry,
             },
-            client_id.clone(),
-            connection,
-            false,
-            draft,
-        )?;
+        };
+        let flight = self.session_flight(action, client_id.clone(), connection, false, draft)?;
         Ok(changed(Change::Submit(flight)))
     }
     pub(super) fn plan_session_end(
@@ -227,13 +267,104 @@ impl Owner {
         )?;
         Ok(changed(Change::Submit(flight)))
     }
+    pub(super) fn plan_session_detach(
+        &self,
+        connection: ConnectionKey,
+        opened_by: Option<OperationId>,
+        expiry: SessionExpiry,
+        observed_at: u64,
+        draft: &mut Draft,
+    ) -> Result<super::Change, Stop> {
+        let Some(session) = self
+            .sessions
+            .as_slice()
+            .iter()
+            .find(|s| s.id == connection.session)
+        else {
+            return Ok(super::Change::Nothing);
+        };
+        if session.opened_by != opened_by
+            || session.detached.is_some()
+            || session
+                .connection
+                .is_some_and(|g| g != connection.generation)
+        {
+            return Ok(super::Change::Nothing);
+        }
+        if expiry == SessionExpiry::OnDisconnect || expiry.deadline(observed_at).is_none() {
+            return Err(IMPOSSIBLE);
+        }
+        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+            return Err(waiting());
+        }
+        draft.end(connection.generation)?;
+        let flight = self.session_flight(
+            SessionAction::Detach {
+                guard: SessionGuard {
+                    session: session.id,
+                    opened_by,
+                },
+                expiry,
+                observed_at,
+            },
+            session.client_id.clone(),
+            connection.generation,
+            true,
+            draft,
+        )?;
+        Ok(changed(Change::Submit(flight)))
+    }
+    pub(super) fn plan_session_expire(
+        &self,
+        guard: SessionGuard,
+        detached: SessionDetachment,
+        now: u64,
+        draft: &mut Draft,
+    ) -> Result<super::Change, Stop> {
+        let Some(session) = self
+            .sessions
+            .as_slice()
+            .iter()
+            .find(|s| s.id == guard.session)
+        else {
+            return Ok(super::Change::Nothing);
+        };
+        if session.opened_by != guard.opened_by
+            || session.connection.is_some()
+            || session.detached != Some(detached)
+            || !detached.deadline.is_some_and(|deadline| now >= deadline)
+        {
+            return Ok(super::Change::Nothing);
+        }
+        if self.lifecycle.is_some() || self.pubsub.control_pending() {
+            return Err(waiting());
+        }
+        // This transportless flight never emits a frame/close or exposes the
+        // placeholder generation; its SessionChanged effect carries None.
+        let flight = self.session_flight(
+            SessionAction::Expire {
+                guard,
+                detached,
+                now,
+            },
+            session.client_id.clone(),
+            ConnectionGeneration::new(0),
+            true,
+            draft,
+        )?;
+        Ok(changed(Change::Submit(flight)))
+    }
     pub(super) fn plan_session_transport_closed(
         &self,
         connection: ConnectionGeneration,
         draft: &mut Draft,
     ) -> Result<Option<super::Change>, Stop> {
         if self.lifecycle.as_ref().is_some_and(|f| {
-            f.connection == connection && matches!(f.command.action, SessionAction::Open { .. })
+            f.connection == connection
+                && matches!(
+                    f.command.action,
+                    SessionAction::Open { .. } | SessionAction::OpenAt { .. }
+                )
         }) {
             draft.end(connection)?;
             return Ok(Some(changed(Change::TransportClosed)));
@@ -251,9 +382,14 @@ impl Owner {
         }
         if let Some(flight) = &self.lifecycle {
             let covered = match &flight.command.action {
-                SessionAction::Open { expected, .. } => expected
-                    .is_some_and(|g| g.session == session.id && g.opened_by == session.opened_by),
-                SessionAction::Close { guard, .. } => {
+                SessionAction::Open { expected, .. } | SessionAction::OpenAt { expected, .. } => {
+                    expected.is_some_and(|g| {
+                        g.session == session.id && g.opened_by == session.opened_by
+                    })
+                }
+                SessionAction::Close { guard, .. }
+                | SessionAction::Detach { guard, .. }
+                | SessionAction::Expire { guard, .. } => {
                     guard.session == session.id && guard.opened_by == session.opened_by
                 }
             };
@@ -313,10 +449,14 @@ impl Owner {
         flight: &Flight,
         draft: &mut Draft,
     ) -> Result<Option<Flight>, Stop> {
-        let SessionAction::Open {
+        let (SessionAction::Open {
             expected: Some(guard),
             ..
-        } = flight.command.action
+        }
+        | SessionAction::OpenAt {
+            expected: Some(guard),
+            ..
+        }) = flight.command.action
         else {
             return Ok(None);
         };
@@ -390,7 +530,11 @@ impl Owner {
                 };
                 draft.emit(Effect::SessionChanged {
                     operation,
-                    connection: Some(flight.connection),
+                    connection: if matches!(flight.command.action, SessionAction::Expire { .. }) {
+                        None
+                    } else {
+                        Some(flight.connection)
+                    },
                     client_id: flight.client_id.clone(),
                     change,
                 })?;
@@ -428,8 +572,10 @@ impl Owner {
                     phase: CommandPhase::RejectedCertain,
                     facts: None,
                 };
-                if matches!(flight.command.action, SessionAction::Open { .. })
-                    && !flight.connection_closed
+                if matches!(
+                    flight.command.action,
+                    SessionAction::Open { .. } | SessionAction::OpenAt { .. }
+                ) && !flight.connection_closed
                 {
                     draft.emit(Effect::SessionRefused {
                         connection: flight.connection,
@@ -463,6 +609,12 @@ impl Owner {
                     clean_start,
                     expiry,
                     ..
+                }
+                | SessionAction::OpenAt {
+                    expected,
+                    clean_start,
+                    expiry,
+                    ..
                 },
                 SessionChange::Opened {
                     session,
@@ -480,8 +632,18 @@ impl Owner {
                         .iter()
                         .find(|s| s.id == guard.session && s.opened_by == guard.opened_by)
                 });
-                let resumes =
-                    old.is_some_and(|s| !*clean_start && s.expiry == SessionExpiry::Never);
+                let now = match flight.command.action {
+                    SessionAction::OpenAt { now, .. } => Some(now),
+                    _ => None,
+                };
+                let resumes = old.is_some_and(|s| {
+                    !*clean_start
+                        && s.expiry != SessionExpiry::OnDisconnect
+                        && !s
+                            .detached
+                            .and_then(|d| d.deadline)
+                            .is_some_and(|deadline| now.is_some_and(|now| now >= deadline))
+                });
                 (expected.is_none() || old.is_some())
                     && reported == *expiry
                     && session_present == resumes
@@ -498,6 +660,29 @@ impl Owner {
                     }
             }
             (
+                SessionAction::Detach {
+                    guard,
+                    expiry,
+                    observed_at,
+                },
+                SessionChange::Detached {
+                    session,
+                    expiry: reported,
+                    detached,
+                },
+            ) => {
+                session == guard.session
+                    && reported == *expiry
+                    && expiry.deadline(*observed_at) == Some(detached.deadline)
+                    && detached.operation == flight.command.operation
+                    && self.sessions.as_slice().iter().any(|s| {
+                        s.id == guard.session
+                            && s.opened_by == guard.opened_by
+                            && s.detached.is_none()
+                            && s.connection.is_none_or(|g| g == flight.connection)
+                    })
+            }
+            (
                 SessionAction::Close { guard, .. },
                 SessionChange::Closed {
                     session,
@@ -512,6 +697,28 @@ impl Owner {
                         .as_slice()
                         .iter()
                         .any(|s| s.id == guard.session && s.opened_by == guard.opened_by)
+            }
+            (
+                SessionAction::Expire {
+                    guard,
+                    detached,
+                    now,
+                },
+                SessionChange::Closed {
+                    session,
+                    route_revision,
+                    ..
+                },
+            ) => {
+                session == guard.session
+                    && route_revision >= current_revision
+                    && self.sessions.as_slice().iter().any(|s| {
+                        s.id == guard.session
+                            && s.opened_by == guard.opened_by
+                            && s.connection.is_none()
+                            && s.detached == Some(*detached)
+                            && detached.deadline.is_some_and(|deadline| *now >= deadline)
+                    })
             }
             _ => false,
         }
@@ -593,6 +800,7 @@ impl Owner {
                             connection,
                             expiry,
                             opened_by: Some(finished.operation),
+                            detached: None,
                         };
                         if let Some(index) = self
                             .sessions
@@ -607,6 +815,21 @@ impl Owner {
                                 .map_err(|_| CoreFault::StalePlan)?;
                         }
                         self.route_revision = Some(route_revision);
+                    }
+                    SessionChange::Detached {
+                        session,
+                        expiry,
+                        detached,
+                    } => {
+                        let held = self
+                            .sessions
+                            .as_mut_slice()
+                            .iter_mut()
+                            .find(|s| s.id == session)
+                            .ok_or(CoreFault::StalePlan)?;
+                        held.connection = None;
+                        held.expiry = expiry;
+                        held.detached = Some(detached);
                     }
                     SessionChange::Closed {
                         session,
@@ -687,8 +910,8 @@ mod tests {
         EpochOpened, EpochOpening, OpeningOutcome, OpeningReply, StartupNonce,
     };
     use crate::contract::session::{
-        SessionAction, SessionCancellations, SessionChange, SessionEndReason, SessionExpiry,
-        SessionLifecycle,
+        SessionAction, SessionCancellations, SessionChange, SessionDetachment, SessionEndReason,
+        SessionExpiry, SessionGuard, SessionLifecycle,
     };
     use alloc::string::ToString;
     use alloc::vec::Vec;
@@ -1335,5 +1558,536 @@ mod tests {
             "terminal_session_owner_history_retained"
         );
         assert!(owner.slots.is_empty());
+    }
+    fn submit_at(
+        owner: &mut Owner,
+        generation: u64,
+        name: &[u8],
+        expiry: SessionExpiry,
+        now: u64,
+    ) -> Vec<(EffectId, Effect)> {
+        apply(
+            owner,
+            Input::OpenSessionAt {
+                connection: ConnectionGeneration::new(generation),
+                client_id: bytes(name),
+                clean_start: false,
+                expiry,
+                now,
+            },
+        )
+    }
+    fn detach_at(
+        owner: &mut Owner,
+        generation: u64,
+        opened_by: OperationId,
+        expiry: SessionExpiry,
+        observed_at: u64,
+    ) -> SessionDetachment {
+        let effects = apply(
+            owner,
+            Input::DetachSession {
+                connection: ConnectionKey {
+                    session: SessionId::new(1),
+                    generation: ConnectionGeneration::new(generation),
+                },
+                opened_by: Some(opened_by),
+                expiry,
+                observed_at,
+            },
+        );
+        let detached = SessionDetachment {
+            operation: owner.lifecycle.as_ref().unwrap().command.operation,
+            deadline: expiry.deadline(observed_at).unwrap(),
+        };
+        let (_, emitted) = known(
+            owner,
+            &effects,
+            SessionChange::Detached {
+                session: SessionId::new(1),
+                expiry,
+                detached,
+            },
+        );
+        assert!(
+            emitted
+                .iter()
+                .all(|(_, e)| matches!(e, Effect::SessionChanged { .. }))
+        );
+        detached
+    }
+    #[test]
+    fn finite_open_retains_the_admissible_time_in_its_canonical_recipe() {
+        let mut owner = world();
+        let effects = submit_at(&mut owner, 1, b"finite", SessionExpiry::After(7), 42);
+        assert!(effects.iter().any(|(_, e)| matches!(e, Effect::Persist { command } if matches!(command.recipe.get(), Recipe::SessionLifecycle(SessionLifecycle { action: SessionAction::OpenAt { expiry: SessionExpiry::After(7), now: 42, .. }, .. })))), "finite_open_lost_authoritative_observation");
+        known(&mut owner, &effects, opened(1, SessionExpiry::After(7)));
+        assert_eq!(
+            owner.connection_of(SessionId::new(1)),
+            Some(ConnectionGeneration::new(1))
+        );
+    }
+    #[test]
+    fn finite_detachment_unknown_result_keeps_the_original_deadline_and_operation() {
+        let mut owner = world();
+        let first = submit_at(&mut owner, 1, b"finite", SessionExpiry::After(1), 9);
+        let (opened_by, _) = known(&mut owner, &first, opened(1, SessionExpiry::After(1)));
+        apply(
+            &mut owner,
+            Input::DetachSession {
+                connection: ConnectionKey {
+                    session: SessionId::new(1),
+                    generation: ConnectionGeneration::new(1),
+                },
+                opened_by: Some(opened_by),
+                expiry: SessionExpiry::After(1),
+                observed_at: 123,
+            },
+        );
+        let original = owner.lifecycle.as_ref().unwrap().clone();
+        assert!(matches!(
+            original.command.action,
+            SessionAction::Detach {
+                observed_at: 123,
+                ..
+            }
+        ));
+        answer(&mut owner, StoreOutcome::PendingOrUnknown);
+        assert!(owner.sessions.as_slice()[0].detached.is_none());
+        assert_eq!(
+            owner.sessions.len(),
+            1,
+            "detach_unknown_freed_session_capacity"
+        );
+        let resolution = apply(
+            &mut owner,
+            Input::Deadline {
+                token: original.in_flight.deadline,
+                now: LogicalTime::new(10_000),
+            },
+        );
+        let (effect, operation) = resolution
+            .iter()
+            .find_map(|(id, e)| match e {
+                Effect::ResolveAndFence { operation } => Some((*id, *operation)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(operation, original.command.operation);
+        assert_eq!(owner.lifecycle.as_ref().unwrap().command, original.command);
+        let detached = SessionDetachment {
+            operation,
+            deadline: Some(1_000_000_123),
+        };
+        apply(
+            &mut owner,
+            Input::StoreResult {
+                effect,
+                operation,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                    SessionChange::Detached {
+                        session: SessionId::new(1),
+                        expiry: SessionExpiry::After(1),
+                        detached,
+                    },
+                ))),
+            },
+        );
+        assert_eq!(owner.sessions.as_slice()[0].detached, Some(detached));
+        assert!(
+            apply(
+                &mut owner,
+                Input::ExpireSession {
+                    guard: SessionGuard {
+                        session: SessionId::new(1),
+                        opened_by: Some(opened_by)
+                    },
+                    detached,
+                    now: 1_000_000_122
+                }
+            )
+            .is_empty()
+        );
+        let expiry = apply(
+            &mut owner,
+            Input::ExpireSession {
+                guard: SessionGuard {
+                    session: SessionId::new(1),
+                    opened_by: Some(opened_by),
+                },
+                detached,
+                now: 1_000_000_123,
+            },
+        );
+        let (_, emitted) = known(&mut owner, &expiry, closed(1));
+        assert!(
+            matches!(
+                emitted.as_slice(),
+                [(
+                    _,
+                    Effect::SessionChanged {
+                        connection: None,
+                        ..
+                    }
+                )]
+            ),
+            "transportless_expiry_exposed_a_phantom_generation"
+        );
+        assert!(owner.sessions.is_empty());
+    }
+    #[test]
+    fn time_aware_open_decides_expiry_even_when_the_timer_has_not_run() {
+        for now in [999_999_999, 1_000_000_000, 1_000_000_001] {
+            let mut owner = world();
+            let first = submit_at(&mut owner, 1, b"finite", SessionExpiry::After(1), 0);
+            let (opened_by, _) = known(&mut owner, &first, opened(1, SessionExpiry::After(1)));
+            let detached = detach_at(&mut owner, 1, opened_by, SessionExpiry::After(1), 0);
+            let next = submit_at(&mut owner, 2, b"finite", SessionExpiry::After(1), now);
+            let resumes = now < 1_000_000_000;
+            let mut change = opened(if resumes { 1 } else { 2 }, SessionExpiry::After(1));
+            if let SessionChange::Opened {
+                session_present,
+                retired,
+                ..
+            } = &mut change
+            {
+                *session_present = resumes;
+                *retired = (!resumes).then_some(SessionId::new(1));
+            }
+            let (_, frames) = known(&mut owner, &next, change);
+            assert!(frames.iter().any(|(_, e)| matches!(e, Effect::EmitFrame { frame: OutboundFrame::Connack { session_present }, .. } if *session_present == resumes)), "resume_after_deadline_depended_on_timer_delivery");
+            assert!(owner.sessions.as_slice()[0].detached.is_none());
+            assert!(
+                apply(
+                    &mut owner,
+                    Input::ExpireSession {
+                        guard: SessionGuard {
+                            session: SessionId::new(1),
+                            opened_by: Some(opened_by)
+                        },
+                        detached,
+                        now: u64::MAX
+                    }
+                )
+                .is_empty(),
+                "old_timer_rebound_after_open"
+            );
+            assert_eq!(owner.sessions.len(), 1);
+            assert_eq!(
+                owner.sessions.as_slice()[0].connection,
+                Some(ConnectionGeneration::new(2))
+            );
+        }
+    }
+    #[test]
+    fn a_detachment_and_timer_cannot_rearm_or_terminate_a_new_occurrence() {
+        let mut owner = world();
+        let first = submit_at(&mut owner, 1, b"finite", SessionExpiry::After(1), 0);
+        let (old_open, _) = known(&mut owner, &first, opened(1, SessionExpiry::After(1)));
+        let old_detached = detach_at(&mut owner, 1, old_open, SessionExpiry::After(1), 0);
+        assert!(
+            apply(
+                &mut owner,
+                Input::DetachSession {
+                    connection: ConnectionKey {
+                        session: SessionId::new(1),
+                        generation: ConnectionGeneration::new(1)
+                    },
+                    opened_by: Some(old_open),
+                    expiry: SessionExpiry::After(7),
+                    observed_at: 17
+                }
+            )
+            .is_empty(),
+            "duplicate_detachment_rearmed_deadline"
+        );
+        let resume = submit_at(&mut owner, 2, b"finite", SessionExpiry::After(1), 1);
+        let mut resumed = opened(1, SessionExpiry::After(1));
+        if let SessionChange::Opened {
+            session_present, ..
+        } = &mut resumed
+        {
+            *session_present = true;
+        }
+        let (new_open, _) = known(&mut owner, &resume, resumed);
+        let current_detached = detach_at(&mut owner, 2, new_open, SessionExpiry::After(1), 100);
+        assert_ne!(old_detached.operation, current_detached.operation);
+        assert!(
+            apply(
+                &mut owner,
+                Input::ExpireSession {
+                    guard: SessionGuard {
+                        session: SessionId::new(1),
+                        opened_by: Some(old_open)
+                    },
+                    detached: old_detached,
+                    now: u64::MAX
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            owner.sessions.as_slice()[0].detached,
+            Some(current_detached)
+        );
+        let expiry = apply(
+            &mut owner,
+            Input::ExpireSession {
+                guard: SessionGuard {
+                    session: SessionId::new(1),
+                    opened_by: Some(new_open),
+                },
+                detached: current_detached,
+                now: 1_000_000_100,
+            },
+        );
+        known(&mut owner, &expiry, closed(1));
+        assert!(owner.sessions.is_empty());
+    }
+    #[test]
+    fn finite_open_on_a_lost_transport_never_invents_a_later_close_instant() {
+        let mut owner = world();
+        let first = submit_at(&mut owner, 1, b"finite", SessionExpiry::After(1), 0);
+        apply(
+            &mut owner,
+            Input::ConnectionClosed {
+                connection: ConnectionGeneration::new(1),
+            },
+        );
+        answer(&mut owner, StoreOutcome::PendingOrUnknown);
+        let (opened_by, effects) = known(&mut owner, &first, opened(1, SessionExpiry::After(1)));
+        assert!(
+            effects
+                .iter()
+                .all(|(_, e)| matches!(e, Effect::SessionChanged { .. })),
+            "closed_open_recomputed_a_detachment_instant"
+        );
+        assert!(owner.connection_of(SessionId::new(1)).is_none());
+        assert!(owner.sessions.as_slice()[0].detached.is_none());
+        let detached = detach_at(&mut owner, 1, opened_by, SessionExpiry::After(1), 123);
+        assert_eq!(detached.deadline, Some(1_000_000_123));
+    }
+    #[test]
+    fn an_active_finite_session_cannot_be_expired_and_never_override_has_no_deadline() {
+        let mut owner = world();
+        let first = submit_at(&mut owner, 1, b"finite", SessionExpiry::After(1), 0);
+        let (opened_by, _) = known(&mut owner, &first, opened(1, SessionExpiry::After(1)));
+        let invented = SessionDetachment {
+            operation: opened_by,
+            deadline: Some(1),
+        };
+        assert!(
+            apply(
+                &mut owner,
+                Input::ExpireSession {
+                    guard: SessionGuard {
+                        session: SessionId::new(1),
+                        opened_by: Some(opened_by)
+                    },
+                    detached: invented,
+                    now: u64::MAX
+                }
+            )
+            .is_empty(),
+            "active_session_expired"
+        );
+        let detached = detach_at(&mut owner, 1, opened_by, SessionExpiry::Never, 3);
+        assert_eq!(detached.deadline, None);
+        assert!(
+            apply(
+                &mut owner,
+                Input::ExpireSession {
+                    guard: SessionGuard {
+                        session: SessionId::new(1),
+                        opened_by: Some(opened_by)
+                    },
+                    detached,
+                    now: u64::MAX
+                }
+            )
+            .is_empty()
+        );
+        let next = submit_at(&mut owner, 2, b"finite", SessionExpiry::Never, u64::MAX);
+        let mut resumed = opened(1, SessionExpiry::Never);
+        if let SessionChange::Opened {
+            session_present, ..
+        } = &mut resumed
+        {
+            *session_present = true;
+        }
+        known(&mut owner, &next, resumed);
+        assert!(owner.sessions.as_slice()[0].detached.is_none());
+        assert_eq!(owner.sessions.as_slice()[0].expiry, SessionExpiry::Never);
+    }
+    #[test]
+    fn repeated_finite_rearms_keep_only_the_live_session_and_bounded_rings() {
+        let mut owner = world();
+        let first = submit_at(&mut owner, 1, b"finite", SessionExpiry::After(1), 0);
+        let (mut token, _) = known(&mut owner, &first, opened(1, SessionExpiry::After(1)));
+        for generation in 1..=64 {
+            let detached = detach_at(
+                &mut owner,
+                generation,
+                token,
+                SessionExpiry::After(1),
+                generation,
+            );
+            let next = submit_at(
+                &mut owner,
+                generation + 1,
+                b"finite",
+                SessionExpiry::After(1),
+                generation + 1,
+            );
+            let mut resumed = opened(1, SessionExpiry::After(1));
+            if let SessionChange::Opened {
+                session_present, ..
+            } = &mut resumed
+            {
+                *session_present = true;
+            }
+            let (new_token, _) = known(&mut owner, &next, resumed);
+            assert!(
+                apply(
+                    &mut owner,
+                    Input::ExpireSession {
+                        guard: SessionGuard {
+                            session: SessionId::new(1),
+                            opened_by: Some(token)
+                        },
+                        detached,
+                        now: u64::MAX
+                    }
+                )
+                .is_empty()
+            );
+            token = new_token;
+            assert_eq!(owner.sessions.len(), 1);
+            assert!(owner.finished.len() <= 16);
+            assert!(owner.closed.len() <= 4);
+            assert!(!owner.session_status().lifecycle_pending);
+        }
+    }
+
+    #[test]
+    fn a_contradictory_detachment_deadline_cannot_become_durable_knowledge() {
+        let mut owner = world();
+        let first = submit_at(&mut owner, 1, b"finite", SessionExpiry::After(1), 0);
+        let (opened_by, _) = known(&mut owner, &first, opened(1, SessionExpiry::After(1)));
+        apply(
+            &mut owner,
+            Input::DetachSession {
+                connection: ConnectionKey {
+                    session: SessionId::new(1),
+                    generation: ConnectionGeneration::new(1),
+                },
+                opened_by: Some(opened_by),
+                expiry: SessionExpiry::After(1),
+                observed_at: 123,
+            },
+        );
+        let flight = owner.lifecycle.as_ref().unwrap().clone();
+        let outcome = owner.step(
+            Input::StoreResult {
+                effect: flight.in_flight.answers.persist,
+                operation: flight.command.operation,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                    SessionChange::Detached {
+                        session: SessionId::new(1),
+                        expiry: SessionExpiry::After(1),
+                        detached: SessionDetachment {
+                            operation: flight.command.operation,
+                            deadline: Some(1_000_000_124),
+                        },
+                    },
+                ))),
+            },
+            TURN,
+        );
+        assert!(
+            matches!(outcome, StepOutcome::Fatal(CoreFault::ContradictoryOutcome { operation }) if operation == flight.command.operation),
+            "detach_result_recalculated_deadline"
+        );
+        assert!(owner.sessions.as_slice()[0].detached.is_none());
+        assert_eq!(owner.lifecycle.as_ref().unwrap().command, flight.command);
+    }
+
+    #[test]
+    fn expiry_unknown_result_keeps_capacity_until_the_original_operation_resolves() {
+        let mut owner = world();
+        let first = submit_at(&mut owner, 1, b"finite", SessionExpiry::After(1), 0);
+        let (opened_by, _) = known(&mut owner, &first, opened(1, SessionExpiry::After(1)));
+        let detached = detach_at(&mut owner, 1, opened_by, SessionExpiry::After(1), 0);
+        apply(
+            &mut owner,
+            Input::ExpireSession {
+                guard: SessionGuard {
+                    session: SessionId::new(1),
+                    opened_by: Some(opened_by),
+                },
+                detached,
+                now: 1_000_000_000,
+            },
+        );
+        let flight = owner.lifecycle.as_ref().unwrap().clone();
+        answer(&mut owner, StoreOutcome::PendingOrUnknown);
+        assert_eq!(
+            owner.sessions.len(),
+            1,
+            "expiry_unknown_freed_session_capacity"
+        );
+        assert_eq!(owner.sessions.as_slice()[0].detached, Some(detached));
+        let resolution = apply(
+            &mut owner,
+            Input::Deadline {
+                token: flight.in_flight.deadline,
+                now: LogicalTime::new(10_000),
+            },
+        );
+        let (effect, operation) = resolution
+            .iter()
+            .find_map(|(effect, e)| match e {
+                Effect::ResolveAndFence { operation } => Some((*effect, *operation)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(operation, flight.command.operation);
+        apply(
+            &mut owner,
+            Input::StoreResult {
+                effect,
+                operation,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                    closed(1),
+                ))),
+            },
+        );
+        assert!(owner.sessions.is_empty());
+        let next = submit_at(
+            &mut owner,
+            2,
+            b"replacement",
+            SessionExpiry::Never,
+            2_000_000_000,
+        );
+        known(&mut owner, &next, opened(2, SessionExpiry::Never));
+        assert!(
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect,
+                    operation,
+                    reply: StoreReply::Outcome(StoreOutcome::Committed(
+                        CommitFacts::SessionLifecycle(closed(1))
+                    ))
+                }
+            )
+            .is_empty(),
+            "old_expiry_result_ended_a_new_incarnation"
+        );
+        assert_eq!(
+            owner.connection_of(SessionId::new(2)),
+            Some(ConnectionGeneration::new(2))
+        );
     }
 }

@@ -2251,6 +2251,7 @@ mod tests {
                 revision: Revision::new(1),
                 expiry: crate::contract::session::SessionExpiry::Never,
                 opened_by: None,
+                detached: None,
             },
             RecoveredFact::Session {
                 session: SessionId::new(2),
@@ -2258,6 +2259,7 @@ mod tests {
                 revision: Revision::new(1),
                 expiry: crate::contract::session::SessionExpiry::Never,
                 opened_by: None,
+                detached: None,
             },
         ];
         assert!(

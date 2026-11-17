@@ -580,8 +580,9 @@ mod tests {
             );
             assert_eq!(SessionExpiry::from_wire(value).unwrap().to_wire(), value);
         }
-        assert!(
-            RECEIPT_WINDOW - RECEIPT_DATA_WINDOW >= 128 + 128 + 256,
+        assert_eq!(
+            RECEIPT_WINDOW - RECEIPT_DATA_WINDOW,
+            128 + 128 + 256,
             "finite_detach_and_expire_have_insufficient_continuation_reserve"
         );
     }

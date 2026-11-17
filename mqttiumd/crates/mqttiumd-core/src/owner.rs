@@ -235,6 +235,7 @@ struct Session {
     connection: Option<ConnectionGeneration>,
     expiry: crate::contract::session::SessionExpiry,
     opened_by: Option<OperationId>,
+    detached: Option<crate::contract::session::SessionDetachment>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -439,6 +440,10 @@ struct Refusal {
 /// The change of state of a transition. Indices name entries of the
 /// tables at the revision the plan was computed against.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "bounded plans retain lifecycle flights inline; heap allocation would add a failure after reservation"
+)]
 enum Change {
     Session(sessions::Change),
     Receipts(receipts::Change),
@@ -1191,7 +1196,32 @@ impl Owner {
                 client_id,
                 clean_start,
                 expiry,
-            } => self.plan_session_open(*connection, client_id, *clean_start, *expiry, draft),
+            } => self.plan_session_open(*connection, client_id, *clean_start, *expiry, None, draft),
+            Input::OpenSessionAt {
+                connection,
+                client_id,
+                clean_start,
+                expiry,
+                now,
+            } => self.plan_session_open(
+                *connection,
+                client_id,
+                *clean_start,
+                *expiry,
+                Some(*now),
+                draft,
+            ),
+            Input::DetachSession {
+                connection,
+                opened_by,
+                expiry,
+                observed_at,
+            } => self.plan_session_detach(*connection, *opened_by, *expiry, *observed_at, draft),
+            Input::ExpireSession {
+                guard,
+                detached,
+                now,
+            } => self.plan_session_expire(*guard, *detached, *now, draft),
             Input::EndSession {
                 connection,
                 opened_by,
@@ -1368,6 +1398,7 @@ impl Owner {
                 connection,
                 expiry: crate::contract::session::SessionExpiry::Never,
                 opened_by: None,
+                detached: None,
             },
         })
     }
@@ -2302,8 +2333,13 @@ impl Owner {
                         })
                 }
                 RecoveredFact::Session {
-                    session, client_id, ..
-                } => self.sessions.len() + same.len() < self.sessions.capacity()
+                    session,
+                    client_id,
+                    expiry,
+                    detached,
+                    ..
+                } => self.session_metadata_valid(*expiry, *detached)
+                    && self.sessions.len() + same.len() < self.sessions.capacity()
                     && !self
                         .sessions
                         .as_slice()
@@ -2662,6 +2698,7 @@ impl Owner {
                 revision,
                 expiry,
                 opened_by,
+                detached,
             } => {
                 let session = Session {
                     id: *session,
@@ -2670,6 +2707,7 @@ impl Owner {
                     connection: None,
                     expiry: *expiry,
                     opened_by: *opened_by,
+                    detached: *detached,
                 };
                 self.sessions.try_push(session).map_err(|_| STALE)?;
             }
@@ -2886,6 +2924,7 @@ mod tests {
             revision: Revision::new(session + 10),
             expiry: crate::contract::session::SessionExpiry::Never,
             opened_by: None,
+            detached: None,
         }
     }
 
