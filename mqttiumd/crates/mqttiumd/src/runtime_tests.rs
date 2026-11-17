@@ -1390,6 +1390,63 @@ fn concatenated_subscription_waits_for_connack(known: bool) {
 }
 
 #[test]
+fn a_framed_publish_waiting_for_connack_keeps_its_reader_expiry_origin() {
+    use crate::session_time::testing::FakeClock;
+    let sample = |tick| SessionClockReading {
+        domain: [83; 32],
+        tick,
+    };
+    let clock = Arc::new(FakeClock::new(sample(100)));
+    with_runtime_clock(128, clock.clone(), |runtime, directory| {
+        let (generation, mut client) = peer(runtime);
+        let mut frames = connect_then_subscribe(b"expiry-reader-handshake");
+        frames.truncate(2 + usize::from(frames[1]));
+        frames.extend_from_slice(&[0x31, 10, 0, 1, b't', 5, 2, 0, 0, 0, 1, b'v']);
+        client.write_all(&frames).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.peers[&generation].handshake_packet.is_none() {
+            runtime.connections().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "reader never framed the held PUBLISH"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(runtime.peers[&generation].pending);
+        assert!(!runtime.peers[&generation].connected);
+        clock.set(sample(2_000_000_100));
+        runtime.drain_inputs().unwrap();
+        until(runtime, |r| {
+            r.session_requests.is_empty()
+                && r.peers[&generation].handshake_packet.is_none()
+                && r.inputs.is_empty()
+                && r.inflight.is_empty()
+        });
+        assert_eq!(read_frame(&mut client).0, 0x20);
+        let state =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert!(
+            state.retained.is_empty(),
+            "reader_queue_delay_reset_message_expiry"
+        );
+        assert!(state.publications.is_empty());
+        assert!(state.payloads.is_empty());
+        assert_eq!(state.accounts.references.get(), 0);
+        let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+        let ingress = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["kind"] == "message_expiry_received")
+            .unwrap();
+        assert_eq!(
+            ingress["details"]["tick"], "100",
+            "queued_expiry_origin_was_refreshed"
+        );
+        assert_eq!(ingress["details"]["authority"], "reader_frame_completion");
+    });
+}
+
+#[test]
 fn fresh_connect_pipeline_cannot_send_disconnect_before_core_connack() {
     concatenated_subscription_waits_for_connack(false);
 }
