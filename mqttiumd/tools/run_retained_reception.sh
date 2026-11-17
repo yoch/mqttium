@@ -165,8 +165,11 @@ if (smoke['status']!='PASS' or smoke['source_sha']!=source
     raise SystemExit('archive smoke and retained reception must execute identical normal bytes')
 if streams['status']!='PASS' or streams['product_events']<1 or streams['skipped_records']!=0:
     raise SystemExit('actual product streams must pass strict/schema validation')
+expected={'retained_publish_did_not_enter_durable_admission','replay_reread_current_retained',
+          'clear_released_owed_payload','old_retained_operation_remutated','no_local_forgot_producer_client_id'}
 if (mutants['status']!='PASS' or mutants['source_head']!=source or not mutants['restored']
-        or not mutants['controls'] or not all(row['detected'] and row['positive_status']==0
+        or len(mutants['controls'])!=5 or {row['expected_reason'] for row in mutants['controls']}!=expected
+        or not all(row['detected'] and row['positive_status']==0
             and row['mutant_status']==101 and row['observed_reason']==row['expected_reason']
             for row in mutants['controls'])):
     raise SystemExit('compiled controls must detect their stated properties and restore source')

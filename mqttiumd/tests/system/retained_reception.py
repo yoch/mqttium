@@ -126,7 +126,7 @@ async def demo(binary, case):
         await source.publish('demo/room/value', first, 1)
         cli_tap = PacketTap(broker.address, Observations(case / 'mosquitto.wire.jsonl'))
         cli = MosquittoReceiver(cli_tap.address, 'retained-demo-mosquitto-sub',
-                                 ('demo/+/value',), qos=1, count=1, case=case)
+                                 ('demo/room/#',), qos=1, count=1, case=case)
         cli_result = await cli.finish()
         require(cli_result['messages'][0]['payload'] == first.decode()
                 and cli_result['messages'][0]['qos'] == 1 and bool(cli_result['messages'][0]['retain']),
