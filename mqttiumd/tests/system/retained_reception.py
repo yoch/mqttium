@@ -185,7 +185,7 @@ async def matrix(binary, case):
                                 'retained_replay_wire_missing')
                         await until_state(broker, business_drained, 'retained_matrix_replay_not_finished')
                         await target.unsubscribe((topic,))
-                        await source.publish(topic, b'', 1)
+                        await source.publish(topic, b'', qos)
                         await until_state(broker, lambda state: not retained_rows(state), 'retained_clear_failed')
                         cells.append({'publisher': publisher_kind, 'receiver': target_kind, 'published_qos': qos,
                                       'granted_qos': granted, 'rap': rap, 'effective_qos': min(qos, granted),
