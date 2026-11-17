@@ -1,5 +1,6 @@
 //! Exclusive SQLite worker. A closed socket never cancels an accepted command.
 use crate::events::{Events, operation};
+use crate::session_time::{SessionClock, SystemClock};
 use mqttiumd_contract::capacity::{ExchangeSlots, PayloadBytes, ReceiptSlots, References};
 use mqttiumd_contract::command::{Recipe, StartupNonce};
 use mqttiumd_contract::effects::{Effect, OwnedEffect};
@@ -11,10 +12,10 @@ use mqttiumd_contract::packet::SharedBytes;
 use mqttiumd_contract::receipts::{
     ClosedReceiptCollection, ClosedReceiptReply, ReceiptCollection, ReceiptCollectionReply,
 };
-use mqttiumd_contract::session::{SessionAction, SessionExpiry};
+use mqttiumd_contract::session::{SessionAction, SessionDetachment, SessionExpiry};
 use mqttiumd_store_api::{
     AdminCommand, AdminDone, DurableStore, Limits, ReadError, ReadPhase, RecoveryCursor,
-    RecoveryPage, RecoveryRefused, SessionState, WorkPage,
+    RecoveryPage, RecoveryRefused, SessionClockAnchor, SessionClockReading, SessionState, WorkPage,
 };
 use mqttiumd_store_sqlite::SqliteStore;
 use serde_json::json;
@@ -52,7 +53,9 @@ pub fn limits() -> Limits {
 pub fn recipe_kind(recipe: &Recipe) -> &'static str {
     match recipe {
         Recipe::SessionLifecycle(change) => match change.action {
-            SessionAction::Open { .. } => "SessionOpen",
+            SessionAction::Open { .. } | SessionAction::OpenAt { .. } => "SessionOpen",
+            SessionAction::Detach { .. } => "SessionDetach",
+            SessionAction::Expire { .. } => "SessionExpire",
             SessionAction::Close { .. } => "SessionClose",
         },
         Recipe::AdmitPublication(_) => "Admission",
@@ -96,12 +99,15 @@ pub struct Session {
     pub present: bool,
     pub expiry: SessionExpiry,
     pub opened_by: Option<OperationId>,
+    pub detached: Option<SessionDetachment>,
 }
 pub struct Boot {
     pub grant: EpochGrant,
     pub sessions: BTreeMap<Vec<u8>, Session>,
     pub collect_closed: bool,
     pub sqlite: mqttiumd_store_sqlite::Settings,
+    pub clock: Arc<dyn SessionClock>,
+    pub clock_anchor: SessionClockAnchor,
 }
 pub enum Request {
     Recovery(Option<RecoveryCursor>),
@@ -111,6 +117,10 @@ pub enum Request {
 }
 /// A reserved lane: maintenance never waits for a network/business slot.
 pub enum ControlRequest {
+    ClockCheckpoint {
+        expected: SessionClockAnchor,
+        reading: SessionClockReading,
+    },
     Lifecycle(OwnedEffect),
     Collect {
         effect: EffectId,
@@ -120,6 +130,11 @@ pub enum ControlRequest {
 }
 #[derive(Clone)]
 pub enum ControlResponse {
+    ClockCheckpoint {
+        expected: SessionClockAnchor,
+        reading: SessionClockReading,
+        result: Result<SessionClockAnchor, Failure>,
+    },
     Lifecycle {
         effect: EffectId,
         operation: OperationId,
@@ -242,6 +257,17 @@ impl Writer {
         hooks: Hooks,
         cancel: Arc<AtomicBool>,
     ) -> Result<Self, Failure> {
+        let clock = Arc::new(SystemClock::new().map_err(|error| Failure::plain(error.code()))?);
+        Self::spawn_with_clock(path, events, hooks, cancel, clock)
+    }
+
+    pub fn spawn_with_clock(
+        path: PathBuf,
+        events: Events,
+        hooks: Hooks,
+        cancel: Arc<AtomicBool>,
+        clock: Arc<dyn SessionClock>,
+    ) -> Result<Self, Failure> {
         let _ = &hooks;
         let (tx, rx) = mpsc::sync_channel(QUEUE);
         let (rtx, rrx) = mpsc::sync_channel(64);
@@ -251,7 +277,7 @@ impl Writer {
         let handle = thread::Builder::new()
             .name("sqlite-writer".into())
             .spawn(move || {
-                let (mut store, boot) = match bootstrap(&path) {
+                let (mut store, boot) = match bootstrap_with_clock(&path, clock) {
                     Ok(value) => value,
                     Err(error) => {
                         let _ = btx.send(Err(error));
@@ -355,6 +381,10 @@ struct BusinessState {
     #[cfg(feature = "test-hooks")]
     held_session_close: Option<OperationId>,
     #[cfg(feature = "test-hooks")]
+    held_session_detach: Option<OperationId>,
+    #[cfg(feature = "test-hooks")]
+    held_session_expire: Option<OperationId>,
+    #[cfg(feature = "test-hooks")]
     held_admission: Option<OperationId>,
     #[cfg(feature = "test-hooks")]
     held_claim: Option<OperationId>,
@@ -399,6 +429,8 @@ fn business_response(
                         let point = match kind {
                             "SessionOpen" => "session.open.prepared",
                             "SessionClose" => "session.close.prepared",
+                            "SessionDetach" => "session.detach.prepared",
+                            "SessionExpire" => "session.expire.prepared",
                             "Admission" => "admission.prepared",
                             "Release" => "release.prepared",
                             "Subscriptions" => "subscription.prepared",
@@ -437,6 +469,8 @@ fn business_response(
                         let point = match kind {
                             "SessionOpen" => Some("session.open.committed"),
                             "SessionClose" => Some("session.close.committed"),
+                            "SessionDetach" => Some("session.detach.committed"),
+                            "SessionExpire" => Some("session.expire.committed"),
                             "Admission" => Some("admission.committed"),
                             "Claim" => Some("claim.committed"),
                             "Finish" => Some("finish.committed"),
@@ -459,13 +493,21 @@ fn business_response(
                     if applied.committed_now
                         && matches!(
                             kind,
-                            "Claim" | "Finish" | "Consume" | "SessionOpen" | "SessionClose"
+                            "Claim"
+                                | "Finish"
+                                | "Consume"
+                                | "SessionOpen"
+                                | "SessionClose"
+                                | "SessionDetach"
+                                | "SessionExpire"
                         )
                         && let Some(dir) = &hooks.directory
                     {
                         let file_name = match kind {
                             "SessionOpen" => "drop-next-session-open-result".to_owned(),
                             "SessionClose" => "drop-next-session-close-result".to_owned(),
+                            "SessionDetach" => "drop-next-session-detach-result".to_owned(),
+                            "SessionExpire" => "drop-next-session-expire-result".to_owned(),
                             _ => format!("drop-next-{}-result", kind.to_ascii_lowercase()),
                         };
                         let file = dir.join(file_name);
@@ -538,6 +580,16 @@ fn hold_business_reply(
             "SessionClose",
             "hold-session-close-result",
             &mut state.held_session_close,
+        ),
+        (
+            "SessionDetach",
+            "hold-session-detach-result",
+            &mut state.held_session_detach,
+        ),
+        (
+            "SessionExpire",
+            "hold-session-expire-result",
+            &mut state.held_session_expire,
         ),
         ("Claim", "hold-claim-result", &mut state.held_claim),
         ("Finish", "hold-finish-result", &mut state.held_finish),
@@ -776,6 +828,23 @@ fn control_response(
 ) -> ControlResponse {
     let _ = hooks;
     match request {
+        ControlRequest::ClockCheckpoint { expected, reading } => {
+            let result = store
+                .checkpoint_session_clock(Some(expected), reading)
+                .map_err(|error| Failure::read(error, ReadPhase::Maintenance));
+            if let Ok(anchor) = result {
+                let _ = events.emit("session_clock_checkpoint", json!({"details": {
+                    "logical": anchor.logical.to_string(), "tick": anchor.reading.tick.to_string(),
+                    "same_domain": expected.reading.domain == anchor.reading.domain,
+                    "source": "maintenance_commit"
+                }}));
+            }
+            ControlResponse::ClockCheckpoint {
+                expected,
+                reading,
+                result,
+            }
+        }
         ControlRequest::Lifecycle(effect) => {
             match business_response(store, Request::Effect(effect), events, hooks, cancel, state) {
                 Response::Store {
@@ -903,7 +972,16 @@ fn control_response(
 fn consume_file(path: &Path) -> bool {
     path.exists() && std::fs::remove_file(path).is_ok()
 }
+#[cfg(test)]
 fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
+    let clock = Arc::new(SystemClock::new().map_err(|error| Failure::plain(error.code()))?);
+    bootstrap_with_clock(path, clock)
+}
+
+fn bootstrap_with_clock(
+    path: &Path,
+    clock: Arc<dyn SessionClock>,
+) -> Result<(SqliteStore, Boot), Failure> {
     // Existing files, including empty/truncated files, are never silently initialised.
     let mut store = if path
         .try_exists()
@@ -942,6 +1020,16 @@ fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
             .any(|o| o.qos == mqttiumd_contract::packet::Qos::ExactlyOnce)
     {
         return Err(Failure::plain("durable_profile_mismatch"));
+    }
+    // Establish the logical domain before new-epoch cleanup derives any
+    // deadline. A new domain keeps only committed progress; existing detached
+    // deadlines remain immutable. Typed snapshot validation above precedes it.
+    let reading = clock.read().map_err(|error| Failure::plain(error.code()))?;
+    let clock_anchor = store
+        .checkpoint_session_clock(state.session_clock, reading)
+        .map_err(|error| Failure::read(error, ReadPhase::Maintenance))?;
+    if clock_anchor.reading != reading {
+        return Err(Failure::plain("session_clock_startup_cas"));
     }
     let ledger = store
         .ledger()
@@ -989,6 +1077,7 @@ fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
                 present: true,
                 expiry: s.expiry,
                 opened_by: s.opened_by,
+                detached: s.detached,
             },
         );
     }
@@ -1002,6 +1091,8 @@ fn bootstrap(path: &Path) -> Result<(SqliteStore, Boot), Failure> {
             sessions,
             collect_closed,
             sqlite,
+            clock,
+            clock_anchor,
         },
     ))
 }
@@ -1021,6 +1112,7 @@ fn session(store: &mut SqliteStore, client: SharedBytes) -> Result<Session, Fail
             present: true,
             expiry: s.expiry,
             opened_by: s.opened_by,
+            detached: s.detached,
         });
     }
     match store.admin(AdminCommand::CreateSession {
@@ -1033,6 +1125,7 @@ fn session(store: &mut SqliteStore, client: SharedBytes) -> Result<Session, Fail
             present: false,
             expiry: SessionExpiry::Never,
             opened_by: None,
+            detached: None,
         }),
         // WriteFailed has an unknown outcome. No retry and no success acknowledgement.
         Err(mqttiumd_store_api::AdminRefused::WriteFailed) => {
@@ -1071,6 +1164,123 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::time::Instant;
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    #[test]
+    fn bootstrap_retains_fixed_deadline_across_process_anchors_and_domain_change() {
+        use crate::session_time::testing::FakeClock;
+        use mqttiumd_contract::command::{Command, FrozenRecipe};
+        use mqttiumd_contract::ids::OperationSeq;
+        use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome};
+        use mqttiumd_contract::session::{SessionChange, SessionGuard, SessionLifecycle};
+        const SECOND: u64 = 1_000_000_000;
+        let path = std::env::temp_dir().join(format!(
+            "mqttiumd-clock-bootstrap-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let db = path.join("store.sqlite");
+        let reading = |domain, tick| SessionClockReading {
+            domain: [domain; 32],
+            tick,
+        };
+        let clock = Arc::new(FakeClock::new(reading(1, 100)));
+        let (mut store, boot) = bootstrap_with_clock(&db, clock.clone()).unwrap();
+        assert_eq!(boot.clock_anchor.logical, 0);
+        assert_eq!(
+            store.snapshot().unwrap().session_clock,
+            Some(boot.clock_anchor)
+        );
+        let operation = |sequence| {
+            OperationId::new(
+                boot.grant.incarnation(),
+                boot.grant.epoch(),
+                LogicalOwnerId::new(0),
+                OperationSeq::new(sequence),
+            )
+        };
+        let apply = |store: &mut SqliteStore, sequence, action| {
+            store
+                .apply(&Command {
+                    recipe: FrozenRecipe::freeze(Recipe::SessionLifecycle(SessionLifecycle {
+                        operation: operation(sequence),
+                        action,
+                    }))
+                    .unwrap(),
+                    payload: None,
+                })
+                .reply
+        };
+        let open = operation(1);
+        let reply = apply(
+            &mut store,
+            1,
+            SessionAction::OpenAt {
+                client_id: SharedBytes::copy_from(b"fixed-deadline", MAX_CLIENT).unwrap(),
+                expected: None,
+                clean_start: false,
+                expiry: SessionExpiry::After(10),
+                now: 0,
+            },
+        );
+        let StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+            SessionChange::Opened { session, .. },
+        ))) = reply
+        else {
+            panic!("real finite Open commit: {reply:?}")
+        };
+        let guard = SessionGuard {
+            session,
+            opened_by: Some(open),
+        };
+        clock.set(reading(1, 100 + 2 * SECOND));
+        let reply = apply(
+            &mut store,
+            2,
+            SessionAction::Detach {
+                guard,
+                expiry: SessionExpiry::After(10),
+                observed_at: 2 * SECOND,
+            },
+        );
+        let StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+            SessionChange::Detached { detached, .. },
+        ))) = reply
+        else {
+            panic!("real Detach commit: {reply:?}")
+        };
+        assert_eq!(detached.deadline, Some(12 * SECOND));
+        drop(store);
+        for seconds in [4, 8] {
+            clock.set(reading(1, 100 + seconds * SECOND));
+            let (store, boot) = bootstrap_with_clock(&db, clock.clone()).unwrap();
+            assert_eq!(boot.clock_anchor.logical, seconds * SECOND);
+            assert_eq!(
+                store.snapshot().unwrap().sessions[&session].detached,
+                Some(detached),
+                "same-domain restart must not rearm the TTL"
+            );
+        }
+        // UTC is deliberately absent from this input. A different boot/origin
+        // retains committed eight seconds, even with a much larger raw tick.
+        clock.set(reading(2, 100 * SECOND));
+        let (store, boot) = bootstrap_with_clock(&db, clock.clone()).unwrap();
+        assert_eq!(boot.clock_anchor.logical, 8 * SECOND);
+        assert_eq!(
+            store.snapshot().unwrap().sessions[&session].detached,
+            Some(detached)
+        );
+        drop(store);
+        clock.set(reading(2, 104 * SECOND));
+        let (store, boot) = bootstrap_with_clock(&db, clock).unwrap();
+        assert_eq!(boot.clock_anchor.logical, 12 * SECOND);
+        assert!(
+            store.snapshot().unwrap().sessions.is_empty(),
+            "exact deadline at startup must expire the durable offline occurrence"
+        );
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     #[test]
     fn reserved_collection_and_lifecycle_progress_while_ordinary_replies_are_unread() {
         let path = std::env::temp_dir().join(format!(
@@ -1130,6 +1340,15 @@ mod tests {
             .send(ControlRequest::Collect { effect, collection })
             .unwrap();
         let reply = writer.control_receiver.recv_timeout(Duration::from_secs(2));
+        let clock_reading = boot.clock.read().unwrap();
+        writer
+            .control_sender
+            .send(ControlRequest::ClockCheckpoint {
+                expected: boot.clock_anchor,
+                reading: clock_reading,
+            })
+            .unwrap();
+        let checkpoint_reply = writer.control_receiver.recv_timeout(Duration::from_secs(2));
         let operation = OperationId::new(
             origin.incarnation,
             origin.epoch,
@@ -1240,6 +1459,11 @@ mod tests {
         assert!(
             matches!(reply,Ok(ControlResponse::Collected { effect:e,collection:c,result:Ok(ReceiptCollectionReply::Applied { removed:0,.. }) }) if e==effect && c==collection),
             "reserved maintenance must reply even when the ordinary result lane is demonstrably full"
+        );
+        assert!(
+            matches!(checkpoint_reply, Ok(ControlResponse::ClockCheckpoint { expected, reading, result: Ok(anchor) })
+                if expected == boot.clock_anchor && reading == clock_reading && anchor.reading == clock_reading),
+            "one correlated clock checkpoint must progress despite a full ordinary reply lane"
         );
         assert!(
             lifecycle_visible,

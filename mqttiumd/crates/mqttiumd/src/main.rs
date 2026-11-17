@@ -42,6 +42,10 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
                         "session.open.committed",
                         "session.close.prepared",
                         "session.close.committed",
+                        "session.detach.prepared",
+                        "session.detach.committed",
+                        "session.expire.prepared",
+                        "session.expire.committed",
                     ]
                     .contains(&point)
                     {
@@ -99,6 +103,10 @@ mod tests {
             "session.open.committed",
             "session.close.prepared",
             "session.close.committed",
+            "session.detach.prepared",
+            "session.detach.committed",
+            "session.expire.prepared",
+            "session.expire.committed",
         ];
         let arguments = |value: String| {
             [
