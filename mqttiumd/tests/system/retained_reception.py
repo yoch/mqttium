@@ -321,7 +321,12 @@ async def replacement(binary, case):
 
 def business_state(state):
     names = ('retained', 'routes', 'publications', 'payloads', 'obligations', 'outbound', 'inbound')
-    return {name: state['tables'][name] for name in names}
+    result = {name: state['tables'][name] for name in names}
+    # Negative outcomes and connection setup legitimately consume receipts;
+    # publication/reference/exchange accounts must remain exactly unchanged.
+    result['accounts'] = {name: state['tables']['meta'][0][name]
+                          for name in ('used_payload_bytes', 'used_exchange_slots', 'used_references')}
+    return result
 
 
 async def capacity(binary, case):
