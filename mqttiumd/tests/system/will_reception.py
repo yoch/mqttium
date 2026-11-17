@@ -470,11 +470,11 @@ async def no_local(binary, case):
         for overlap in (False, True):
             label = 'scope' if overlap else 'excluded'
             client_id = 'will-options-' + label
-            topic, payload = 'will/options/' + label, ('offline-' + label).encode()
+            topic, payload = 'will/options/' + label + '/status', ('offline-' + label).encode()
             source = WillWire(broker.address, broker.observations, client_id)
             wires.append(source)
             source.will_connect(client_id, topic, payload)
-            values = [Subscription('will/options/#', 1, no_local=True)]
+            values = [Subscription('will/options/' + label + '/#', 1, no_local=True)]
             if overlap:
                 values.append(Subscription(topic, 0, no_local=False))
             source.subscribe_options(1, tuple(values))
