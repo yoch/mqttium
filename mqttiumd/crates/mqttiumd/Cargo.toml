@@ -16,6 +16,7 @@ serde_json = "1"
 socket2 = "=0.6.0"
 ctrlc = { version = "=3.4.7", features = ["termination"] }
 getrandom = "=0.3.4"
+nix = { version = "=0.30.1", features = ["time"] }
 
 [features]
 default = []

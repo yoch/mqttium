@@ -396,6 +396,7 @@ dependencies = [
  "mqttiumd-core",
  "mqttiumd-store-api",
  "mqttiumd-store-sqlite",
+ "nix",
  "serde_json",
  "socket2",
 ]
