@@ -253,6 +253,12 @@ pub fn retained_replacement_clear_and_replay_freeze<S: DurableStore>(
     );
     let release = w.release(4, 1, 1);
     commit(&mut w.store, &release);
+    let state = w.store.snapshot().unwrap();
+    assert_eq!(
+        state.retained[b"atelier/x".as_slice()].publication,
+        publication_id(w.epoch, 3),
+        "old_retained_operation_remutated"
+    );
     let page = w.store.read_work(w.b, None, 8).unwrap();
     assert_eq!(
         page.items.as_slice()[0].payload.as_slice(),
@@ -483,7 +489,24 @@ pub fn quota_full_replacement_and_no_local_client_identity<S: DurableStore>(
     );
 }
 
+pub fn retained_topic_names_are_not_subscription_filters<S: DurableStore>(
+    make: &dyn Fn(StoreIncarnation, Limits) -> S,
+) {
+    for qos in [Qos::AtMostOnce, Qos::AtLeastOnce, Qos::ExactlyOnce] {
+        let mut w = World::with_limits(make, limits());
+        let command = admitted(&w, 1, b"$share/literal", b"state", qos, &[]);
+        commit(&mut w.store, &command);
+        let snapshot = w.store.snapshot();
+        assert!(
+            snapshot.is_ok(),
+            "retained_topic_name_confused_with_shared_filter: {snapshot:?}"
+        );
+        assert_eq!(snapshot.unwrap().retained.len(), 1);
+    }
+}
+
 pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
+    retained_topic_names_are_not_subscription_filters(make);
     retained_survives_without_targets_and_producer(make);
     retained_replacement_clear_and_replay_freeze(make);
     thirty_two_topics_and_ordered_options(make);
