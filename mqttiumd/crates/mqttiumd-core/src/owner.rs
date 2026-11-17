@@ -9145,4 +9145,121 @@ mod tests {
             Effect::EmitFrame { .. } | Effect::EmitQos0 { .. } | Effect::EmitPublish { .. }
         )));
     }
+    #[test]
+    fn retained_qos2_pubrel_never_remutates_a_newer_retained_version() {
+        let mut world = World::connected();
+        world.owner.lifecycle_enabled = true;
+        let turn = TurnGrant {
+            work_limit: WorkUnits::new(100000),
+        };
+        let mut first = publish_with(CONN, 7, Qos::ExactlyOnce, b"A");
+        if let Input::Packet {
+            packet: InboundPacket::Publish { topic, retain, .. },
+            ..
+        } = &mut first
+        {
+            *topic = bytes(b"retained/new");
+            *retain = true;
+        }
+        assert!(matches!(
+            world.owner.step(first, turn),
+            StepOutcome::Applied { .. }
+        ));
+        let effects = world.drain();
+        let (effect, operation, facts, first_publication) = effects
+            .iter()
+            .find_map(|(effect, item)| match item {
+                Effect::Persist { command } => match command.recipe.get() {
+                    Recipe::RetainedPublication(value) => Some((
+                        *effect,
+                        command.recipe.operation(),
+                        CommitFacts::PublicationAdmitted {
+                            publication: value.admission.publication,
+                            exchange: value.admission.source.exchange,
+                        },
+                        value.admission.publication,
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap();
+        world.applied(Input::StoreResult {
+            effect,
+            operation,
+            reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown),
+        });
+        assert!(world.drain().is_empty());
+        world.applied(Input::StoreResult {
+            effect,
+            operation,
+            reply: StoreReply::Outcome(StoreOutcome::Committed(facts)),
+        });
+        assert_eq!(kinds(&world.drain()), ["EmitPubrec"]);
+        let mut next = publish_with(CONN, 8, Qos::AtLeastOnce, b"B");
+        if let Input::Packet {
+            packet: InboundPacket::Publish { topic, retain, .. },
+            ..
+        } = &mut next
+        {
+            *topic = bytes(b"retained/new");
+            *retain = true;
+        }
+        assert!(matches!(
+            world.owner.step(next, turn),
+            StepOutcome::Applied { .. }
+        ));
+        let effects = world.drain();
+        let (effect, operation, facts) = effects
+            .iter()
+            .find_map(|(effect, item)| match item {
+                Effect::Persist { command } => match command.recipe.get() {
+                    Recipe::RetainedPublication(value) => {
+                        assert_ne!(value.admission.publication, first_publication);
+                        Some((
+                            *effect,
+                            command.recipe.operation(),
+                            CommitFacts::PublicationAdmitted {
+                                publication: value.admission.publication,
+                                exchange: value.admission.source.exchange,
+                            },
+                        ))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap();
+        world.applied(Input::StoreResult {
+            effect,
+            operation,
+            reply: StoreReply::Outcome(StoreOutcome::Committed(facts)),
+        });
+        assert_eq!(kinds(&world.drain()), ["EmitPuback"]);
+        world.applied(pubrel(7));
+        let effects = world.drain();
+        let (effect, operation, exchange) = effects
+            .iter()
+            .find_map(|(effect, item)| match item {
+                Effect::Persist { command } => match command.recipe.get() {
+                    Recipe::ReleaseInbound(release) => {
+                        Some((*effect, command.recipe.operation(), release.exchange))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("late_pubrel_remutated_retained_version");
+        assert!(!effects.iter().any(|(_,item)|matches!(item,Effect::Persist {command} if matches!(command.recipe.get(),Recipe::RetainedPublication(_)|Recipe::RetainedQos0(_)))),"late_pubrel_remutated_retained_version");
+        world.applied(Input::StoreResult {
+            effect,
+            operation,
+            reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::InboundReleased {
+                exchange,
+            })),
+        });
+        assert_eq!(kinds(&world.drain()), ["EmitPubcomp"]);
+        world.applied(pubrel(7));
+        assert_eq!(kinds(&world.drain()), ["EmitPubcompNotFound"]);
+    }
 }

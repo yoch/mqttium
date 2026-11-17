@@ -3553,4 +3553,499 @@ mod tests {
             "occupied_unknown_pi_reused"
         );
     }
+    fn retained_zero(order: u64) -> Input {
+        Input::Packet {
+            connection: CONNECTION,
+            ingress_order: order,
+            packet: InboundPacket::Publish {
+                qos: Qos::AtMostOnce,
+                retain: true,
+                dup: false,
+                packet_id: None,
+                topic: bytes(b"retained/value"),
+                payload: bytes(b"value"),
+            },
+        }
+    }
+    fn pending_retained(owner: &mut Owner) -> (EffectId, Command, RetainedFlight) {
+        owner.lifecycle_enabled = true;
+        let effects = apply(owner, retained_zero(1));
+        let (effect, command) = effects
+            .into_iter()
+            .find_map(|(effect, item)| match item {
+                Effect::Persist { command } => Some((effect, command)),
+                _ => None,
+            })
+            .unwrap();
+        let flight = owner.pubsub.retained.unwrap();
+        (effect, command, flight)
+    }
+    #[test]
+    fn retained_qos0_unknown_survives_source_termination_and_resolves_without_an_ack() {
+        use crate::contract::session::{SessionCancellations, SessionChange, SessionEndReason};
+        let mut owner = world();
+        let (effect, command, flight) = pending_retained(&mut owner);
+        let operation = command.recipe.operation();
+        let Recipe::RetainedQos0(value) = command.recipe.get() else {
+            panic!("retained QoS0")
+        };
+        assert_eq!(value.costs.exchange_slots, ExchangeSlots::ZERO);
+        assert_eq!(value.costs.references, References::new(1));
+        assert!(owner.slots.is_empty());
+        assert_eq!(owner.leases.held(), 0);
+        assert!(
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect,
+                    operation,
+                    reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown)
+                }
+            )
+            .is_empty()
+        );
+        assert!(matches!(
+            owner.step(retained_zero(2), TURN),
+            StepOutcome::NeedCapacity {
+                need: CapacityNeed {
+                    resource: Resource::ResultSlots,
+                    ..
+                },
+                ..
+            }
+        ));
+        apply(
+            &mut owner,
+            Input::ConnectionClosed {
+                connection: CONNECTION,
+            },
+        );
+        let close = apply(
+            &mut owner,
+            Input::EndSession {
+                connection: ConnectionKey {
+                    session: TARGET,
+                    generation: CONNECTION,
+                },
+                opened_by: None,
+                reason: SessionEndReason::Disconnect,
+            },
+        );
+        let (close_effect, close_operation) = close
+            .iter()
+            .find_map(|(effect, item)| match item {
+                Effect::Persist { command } => Some((*effect, command.recipe.operation())),
+                _ => None,
+            })
+            .unwrap();
+        apply(
+            &mut owner,
+            Input::StoreResult {
+                effect: close_effect,
+                operation: close_operation,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                    SessionChange::Closed {
+                        session: TARGET,
+                        route_revision: Revision::new(0),
+                        cancelled: SessionCancellations::default(),
+                    },
+                ))),
+            },
+        );
+        assert!(
+            owner.pubsub.retained.unwrap().retired,
+            "source_termination_lost_unknown_retained_qos0"
+        );
+        assert_eq!(owner.pubsub.retired_flights(), 1);
+        let resolution = apply(
+            &mut owner,
+            Input::Deadline {
+                token: flight.in_flight.deadline,
+                now: crate::contract::ids::LogicalTime::new(10000),
+            },
+        );
+        let (resolved, actual) = resolution
+            .iter()
+            .find_map(|(effect, item)| match item {
+                Effect::ResolveAndFence { operation } => Some((*effect, *operation)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            actual, operation,
+            "retained_qos0_resolution_changed_operation"
+        );
+        assert!(
+            !resolution
+                .iter()
+                .any(|(_, item)| matches!(item, Effect::Persist { .. } | Effect::EmitFrame { .. }))
+        );
+        let done = StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::RetainedQos0Stored {
+            publication: flight.publication,
+        }));
+        assert!(
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect: resolved,
+                    operation,
+                    reply: done
+                }
+            )
+            .is_empty()
+        );
+        assert!(owner.pubsub.retained.is_none());
+        assert_eq!(owner.pubsub.retired_flights(), 0);
+        assert!(owner.slots.is_empty());
+        assert_eq!(owner.leases.held(), 0);
+        apply(
+            &mut owner,
+            Input::Packet {
+                connection: ConnectionGeneration::new(11),
+                ingress_order: 0,
+                packet: InboundPacket::ConnectResume {
+                    client_id: bytes(b"other"),
+                },
+            },
+        );
+        apply(
+            &mut owner,
+            Input::ConnectionSettings {
+                connection: ConnectionGeneration::new(11),
+                receive_maximum: 8,
+                maximum_packet_size: 65536,
+            },
+        );
+        let mut next = retained_zero(1);
+        if let Input::Packet { connection, .. } = &mut next {
+            *connection = ConnectionGeneration::new(11);
+        }
+        apply(&mut owner, next);
+        let current = owner.pubsub.retained.unwrap();
+        assert_ne!(current.in_flight.operation, operation);
+        assert!(
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect,
+                    operation,
+                    reply: done
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            owner.pubsub.retained,
+            Some(current),
+            "old_retained_qos0_result_rebound"
+        );
+        apply(
+            &mut owner,
+            Input::StoreResult {
+                effect: current.in_flight.answers.persist,
+                operation: current.in_flight.operation,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(
+                    CommitFacts::RetainedQos0Stored {
+                        publication: current.publication,
+                    },
+                )),
+            },
+        );
+        assert!(owner.pubsub.retained.is_none());
+    }
+    #[test]
+    fn retained_qos0_certain_capacity_refusal_is_an_explicit_drop_without_mqtt_credit() {
+        let mut owner = world();
+        let (effect, command, _) = pending_retained(&mut owner);
+        let effects = apply(
+            &mut owner,
+            Input::StoreResult {
+                effect,
+                operation: command.recipe.operation(),
+                reply: StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                    RejectReason::CapacityExceeded(Resource::References),
+                )),
+            },
+        );
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [(
+                    _,
+                    Effect::Qos0Dropped {
+                        reason: Qos0DropReason::CapacityExceeded,
+                        ..
+                    }
+                )]
+            ),
+            "retained_qos0_refusal_became_success_or_silent_loss"
+        );
+        assert!(owner.pubsub.retained.is_none());
+        assert!(owner.slots.is_empty());
+        assert_eq!(owner.leases.held(), 0);
+        apply(&mut owner, retained_zero(2));
+        assert!(owner.pubsub.retained.is_some());
+    }
+    fn product_subscribe() -> Input {
+        Input::Packet {
+            connection: CONNECTION,
+            ingress_order: 1,
+            packet: InboundPacket::Subscribe {
+                packet_id: InboundPacketId::new(3).unwrap(),
+                filters: crate::contract::pubsub::FilterList::copy_from(&[
+                    crate::contract::pubsub::SubscriptionFilter {
+                        filter: bytes(b"retained/#"),
+                        qos: Qos::AtLeastOnce,
+                        options: crate::contract::pubsub::SubscriptionOptions::DEFAULT,
+                    },
+                ])
+                .unwrap(),
+            },
+        }
+    }
+    #[test]
+    fn subscription_replay_reserves_the_whole_range_before_submission_and_confirmation() {
+        use crate::contract::receipts::ReceiptCollectionReply;
+        let mut owner = world();
+        owner.lifecycle_enabled = true;
+        let collection = apply(&mut owner, Input::MaintainReceipts);
+        let (effect, request) = collection
+            .iter()
+            .find_map(|(effect, item)| match item {
+                Effect::CollectReceipts { collection } => Some((*effect, *collection)),
+                _ => None,
+            })
+            .unwrap();
+        apply(
+            &mut owner,
+            Input::ReceiptsCollected {
+                effect,
+                collection: request,
+                reply: ReceiptCollectionReply::Applied {
+                    closure: request.closure,
+                    removed: 0,
+                    retained: 0,
+                    more: false,
+                },
+            },
+        );
+        let effects = apply(&mut owner, product_subscribe());
+        let (effect, command) = effects
+            .iter()
+            .find_map(|(effect, item)| match item {
+                Effect::Persist { command } => Some((*effect, command)),
+                _ => None,
+            })
+            .unwrap();
+        let Recipe::ReplaySubscriptions(value) = command.recipe.get() else {
+            panic!("product_subscription_did_not_reserve_replay");
+        };
+        let first = value.first_publication.sequence().get();
+        assert_eq!(
+            owner.counters.publication.unwrap().get(),
+            first + crate::contract::retained::MAX_REPLAYS as u64,
+            "replay_range_not_burned_before_submission"
+        );
+        let operation = command.recipe.operation();
+        apply(
+            &mut owner,
+            Input::StoreResult {
+                effect,
+                operation,
+                reply: StoreReply::Outcome(StoreOutcome::PendingOrUnknown),
+            },
+        );
+        assert!(owner.routes.is_empty());
+        apply(
+            &mut owner,
+            Input::StoreResult {
+                effect,
+                operation,
+                reply: StoreReply::Outcome(StoreOutcome::Committed(
+                    CommitFacts::SubscriptionsChanged {
+                        session: TARGET,
+                        route_revision: Revision::new(1),
+                    },
+                )),
+            },
+        );
+        assert_eq!(owner.routes.len(), 1);
+        // Result consumption is separate from the replay obligations' lifetime.
+        let status = owner.receipt_status().unwrap();
+        assert_eq!((status.1, status.2), (1, 0));
+        for revision in 2..=64 {
+            let effects = apply(&mut owner, product_subscribe());
+            let (effect, operation) = effects
+                .iter()
+                .find_map(|(effect, item)| match item {
+                    Effect::Persist { command } => Some((*effect, command.recipe.operation())),
+                    _ => None,
+                })
+                .unwrap();
+            apply(
+                &mut owner,
+                Input::StoreResult {
+                    effect,
+                    operation,
+                    reply: StoreReply::Outcome(StoreOutcome::Committed(
+                        CommitFacts::SubscriptionsChanged {
+                            session: TARGET,
+                            route_revision: Revision::new(revision),
+                        },
+                    )),
+                },
+            );
+        }
+        let maintenance = apply(&mut owner, Input::MaintainReceipts);
+        let closure = maintenance
+            .iter()
+            .find_map(|(_, item)| match item {
+                Effect::CollectReceipts { collection } => Some(collection.closure),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            closure.publication_through.get(),
+            first + 64 * crate::contract::retained::MAX_REPLAYS as u64 - 1,
+            "receipt_closure_lost_burned_replay_suffix"
+        );
+        // The issue record itself proves the entire range belongs to this op;
+        // a later mutation starts after it, never in an unused replay suffix.
+        let later = apply(&mut owner, retained_zero(2));
+        let Recipe::RetainedQos0(next) = later
+            .iter()
+            .find_map(|(_, item)| match item {
+                Effect::Persist { command } => Some(command.recipe.get()),
+                _ => None,
+            })
+            .unwrap()
+        else {
+            panic!("retained QoS0")
+        };
+        assert_eq!(
+            next.publication.sequence().get(),
+            first + 64 * crate::contract::retained::MAX_REPLAYS as u64
+        );
+    }
+    #[test]
+    fn replay_range_exhaustion_refuses_before_any_counter_projection_or_effect_mutation() {
+        let mut owner = world();
+        owner.lifecycle_enabled = true;
+        owner.counters.publication = Some(PublicationSeq::new(u64::MAX - 254));
+        let before = owner.counters;
+        let result = owner.step(product_subscribe(), TURN);
+        assert!(
+            matches!(result, StepOutcome::Exhausted { .. }),
+            "replay_reservation_wrapped_or_submitted_a_partial_range"
+        );
+        assert_eq!(owner.counters, before);
+        assert!(owner.pubsub.control.is_none() && owner.routes.is_empty());
+        assert!(drain(&mut owner).is_empty());
+    }
+    #[test]
+    fn loaded_retained_delivery_flags_survive_claim_and_consume_knowledge() {
+        for qos in [Qos::AtMostOnce, Qos::AtLeastOnce] {
+            for recovered_metadata in [false, true] {
+                let mut owner = world();
+                if recovered_metadata {
+                    owner
+                        .pubsub
+                        .deliveries
+                        .try_push(Delivery::metadata(
+                            delivery(0),
+                            TARGET,
+                            Revision::new(1),
+                            qos,
+                            None,
+                        ))
+                        .unwrap();
+                }
+                let effects = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+                let effect = effects
+                    .iter()
+                    .find_map(|(effect, item)| {
+                        matches!(item, Effect::LoadWork { .. }).then_some(*effect)
+                    })
+                    .unwrap();
+                let item = WorkItem {
+                    delivery: delivery(0),
+                    target: TARGET,
+                    target_revision: Revision::new(1),
+                    qos,
+                    retain: true,
+                    topic: bytes(b"retained/replay"),
+                    payload: bytes(b"frozen-version"),
+                    claim: None,
+                };
+                apply(
+                    &mut owner,
+                    Input::WorkPage {
+                        effect,
+                        session: TARGET,
+                        items: BoundedVec::from_slice(core::slice::from_ref(&item), 1).unwrap(),
+                        next: None,
+                    },
+                );
+                assert!(owner.pubsub.deliveries.as_slice()[0].retain);
+                let effects = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+                let (effect, command) = effects
+                    .iter()
+                    .find_map(|(effect, item)| match item {
+                        Effect::Persist { command } => Some((*effect, command)),
+                        _ => None,
+                    })
+                    .unwrap();
+                let emitted = known(&mut owner, effect, command);
+                assert!(
+                    emitted.iter().any(|(_, item)| matches!(
+                        item,
+                        Effect::EmitPublish { retain: true, .. }
+                            | Effect::EmitQos0 { retain: true, .. }
+                    )),
+                    "loaded_retain_flag_was_not_frozen_for_outgoing_delivery"
+                );
+            }
+        }
+    }
+    #[test]
+    fn a_later_work_page_cannot_rewrite_an_already_loaded_retain_flag() {
+        let mut owner = world();
+        queued(&mut owner, 0);
+        owner.pubsub.deliveries.as_mut_slice()[0].retain = true;
+        let claim = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let Effect::Persist { command } = &claim[0].1 else {
+            panic!("claim")
+        };
+        known(&mut owner, claim[0].0, command);
+        let read = apply(&mut owner, Input::WorkAvailable { session: TARGET });
+        let effect = read
+            .iter()
+            .find_map(|(effect, item)| matches!(item, Effect::LoadWork { .. }).then_some(*effect))
+            .unwrap();
+        let held = &owner.pubsub.deliveries.as_slice()[0];
+        let changed = WorkItem {
+            delivery: held.id,
+            target: held.target,
+            target_revision: held.revision,
+            qos: held.qos,
+            retain: false,
+            topic: held.topic.clone().unwrap(),
+            payload: held.payload.clone().unwrap(),
+            claim: held.claim,
+        };
+        let result = owner.step(
+            Input::WorkPage {
+                effect,
+                session: TARGET,
+                items: BoundedVec::from_slice(&[changed], 1).unwrap(),
+                next: None,
+            },
+            TURN,
+        );
+        assert!(
+            matches!(result, StepOutcome::Fatal(CoreFault::ImpossibleInput)),
+            "work_page_rewrote_frozen_retain_flag"
+        );
+        assert!(owner.pubsub.deliveries.as_slice()[0].retain);
+    }
 }

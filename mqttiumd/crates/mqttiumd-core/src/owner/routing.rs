@@ -857,4 +857,46 @@ mod tests {
             routes.rotate_left(1);
         }
     }
+    #[test]
+    fn live_rap_is_or_of_eligible_contributions_only() {
+        let sessions = [session(1)];
+        let mut excluded = route(b"a/#", 1, Qos::AtLeastOnce, true);
+        excluded.options = SubscriptionOptions::from_bits(12).unwrap();
+        let eligible = route(b"a/+", 1, Qos::AtMostOnce, false);
+        for routes in [
+            [excluded.clone(), eligible.clone()],
+            [eligible.clone(), excluded],
+        ] {
+            let selected = select(
+                &routes,
+                &sessions,
+                SessionId::new(1),
+                b"a/x",
+                Qos::ExactlyOnce,
+                16,
+            )
+            .unwrap();
+            assert!(
+                !selected.iter().next().unwrap().rap,
+                "excluded_no_local_contribution_preserved_retain_flag"
+            );
+        }
+        let mut rap = eligible.clone();
+        rap.options = SubscriptionOptions::from_bits(8).unwrap();
+        let ordinary = route(b"a/#", 1, Qos::AtLeastOnce, false);
+        for routes in [[rap.clone(), ordinary.clone()], [ordinary, rap]] {
+            let selected = select(
+                &routes,
+                &sessions,
+                SessionId::new(2),
+                b"a/x",
+                Qos::ExactlyOnce,
+                16,
+            )
+            .unwrap();
+            let selected = selected.iter().next().unwrap();
+            assert!(selected.rap, "live_overlap_lost_retain_as_published");
+            assert_eq!(selected.qos, Qos::AtLeastOnce);
+        }
+    }
 }
