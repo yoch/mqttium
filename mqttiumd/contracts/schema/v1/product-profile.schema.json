@@ -73,7 +73,12 @@
     "shared_subscriptions",
     "subscription_identifiers",
     "retain_as_published",
-    "retain_handling"
+    "retain_handling",
+    "max_retained_topics",
+    "max_retained_bytes",
+    "max_replay_candidates",
+    "live_overlap_policy",
+    "retained_replay_overlap_policy"
   ],
   "properties": {
     "format": {
@@ -83,7 +88,7 @@
       "const": 1
     },
     "id": {
-      "const": "tcp-hierarchical-pubsub-v1"
+      "const": "tcp-retained-pubsub-v1"
     },
     "mqtt_version": {
       "const": 5
@@ -111,7 +116,7 @@
       ]
     },
     "retain": {
-      "const": false
+      "const": true
     },
     "will": {
       "const": false
@@ -290,7 +295,7 @@
       "const": 4
     },
     "sqlite_schema_version": {
-      "const": 7
+      "const": 8
     },
     "wildcard_subscriptions": {
       "const": true
@@ -313,6 +318,21 @@
         1,
         2
       ]
+    },
+    "max_retained_topics": {
+      "const": 32
+    },
+    "max_retained_bytes": {
+      "const": 1048576
+    },
+    "max_replay_candidates": {
+      "const": 256
+    },
+    "live_overlap_policy": {
+      "const": "one-per-session"
+    },
+    "retained_replay_overlap_policy": {
+      "const": "one-per-filter-occurrence-and-topic"
     }
   }
 }

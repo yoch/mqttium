@@ -28,7 +28,8 @@
         "tcp-outgoing-pi-reuse-v1",
         "tcp-session-lifecycle-v1",
         "tcp-session-expiry-v1",
-        "tcp-hierarchical-routing-v1"
+        "tcp-hierarchical-routing-v1",
+        "tcp-durable-retained-v1"
       ]
     },
     "decision": {
@@ -38,7 +39,8 @@
         "0028",
         "0029",
         "0030",
-        "0031"
+        "0031",
+        "0032"
       ]
     },
     "scope": {
@@ -84,7 +86,8 @@
               "OutgoingPacketIdentifier",
               "SessionLifecycle",
               "SessionExpiry",
-              "Routing"
+              "Routing",
+              "RetainedStore"
             ]
           },
           "state_class": {
@@ -322,6 +325,25 @@
         "properties": {
           "decision": {
             "const": "0031"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "const": "tcp-durable-retained-v1"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "decision": {
+            "const": "0032"
           }
         }
       }

@@ -1504,6 +1504,8 @@ impl Runtime<'_> {
                         reply,
                         StoreReply::Outcome(StoreOutcome::Committed(
                             CommitFacts::PublicationAdmitted { .. }
+                                | CommitFacts::RetainedQos0Stored { .. }
+                                | CommitFacts::SubscriptionsChanged { .. }
                         ))
                     ) {
                         for target in targets {
@@ -2738,6 +2740,7 @@ impl EffectSink for Sink<'_> {
             Effect::EmitQos0 {
                 connection,
                 origin,
+                retain,
                 topic,
                 payload,
             } => {
@@ -2774,7 +2777,7 @@ impl EffectSink for Sink<'_> {
                     p.closing.is_none()
                         && self.bindings.get(&connection.session) == Some(&generation)
                 }) {
-                    match codec::encode_qos0(topic, payload) {
+                    match codec::encode_qos0_retained(topic, payload, *retain) {
                         Ok(bytes) if bytes.len() <= peer.max_packet => {
                             #[cfg(feature = "test-hooks")]
                             let duplicate = if MUTANT_REPLAY_QOS0
@@ -3213,6 +3216,7 @@ impl EffectSink for Sink<'_> {
                 topic,
                 payload,
                 dup,
+                retain,
             } => {
                 let (connection, delivery, packet_id, claim, dup) =
                     (*connection, *delivery, *packet_id, *claim, *dup);
@@ -3238,13 +3242,14 @@ impl EffectSink for Sink<'_> {
                     });
                     return SubmitResult::Accepted;
                 };
-                let bytes = match codec::encode_publish(packet_id, topic, payload, dup) {
-                    Ok(bytes) if bytes.len() <= peer.max_packet => bytes,
-                    _ => {
-                        self.close.push((generation, "outgoing_packet_limit"));
-                        return refused(effect, SubmitBlock::Closed);
-                    }
-                };
+                let bytes =
+                    match codec::encode_publish_retained(packet_id, topic, payload, dup, *retain) {
+                        Ok(bytes) if bytes.len() <= peer.max_packet => bytes,
+                        _ => {
+                            self.close.push((generation, "outgoing_packet_limit"));
+                            return refused(effect, SubmitBlock::Closed);
+                        }
+                    };
                 let binding_key = (connection, packet_id);
                 let binding = PubackTarget {
                     delivery,
@@ -3278,7 +3283,7 @@ impl EffectSink for Sink<'_> {
                             },
                         );
                         let _ = effect.into_parts();
-                        if self.events.emit("frame_queued",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","effect":effect_text(id),"delivery":delivery_text(delivery),"target":connection.session.get().to_string(),"packet_id":packet_id.get(),"claim":operation_text(claim),"dup":dup}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
+                        if self.events.emit("frame_queued",json!({"connection":generation.get().to_string(),"details":{"packet_kind":"PUBLISH","effect":effect_text(id),"delivery":delivery_text(delivery),"target":connection.session.get().to_string(),"packet_id":packet_id.get(),"claim":operation_text(claim),"dup":dup,"retain":retain}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         SubmitResult::Accepted
                     }
                     Err(TrySendError::Full(_)) => {
@@ -3804,8 +3809,10 @@ fn run_inner(
             .local_addr()
             .map_err(|_| Failure::plain("listen_address"))?;
         check_startup_cancel(&cancel)?;
-        events.emit("ready",json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":7,"profile":"tcp-hierarchical-pubsub-v1"}})).map_err(event_failure)?;
-        println!("mqttiumd ready {address} (experimental exact pub/sub)");
+        events.emit("ready",json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":8,"retained_available":true,"retained_topics":32,"retained_bytes":1048576,"max_replay_candidates":256,"profile":"tcp-retained-pubsub-v1"}})).map_err(event_failure)?;
+        println!(
+            "mqttiumd ready {address} (local MQTT 5 hierarchical pub/sub with durable retained)"
+        );
         while !cancel.load(Ordering::Relaxed) {
             for _ in 0..4 {
                 match listener.accept() {

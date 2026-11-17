@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import signal
 import socket
@@ -12,6 +13,12 @@ import sqlite3
 import subprocess
 import tarfile
 import time
+
+
+def platforms(build: dict) -> dict:
+    return {"build_platform": build["platform"], "build_machine": build["machine"],
+            "execution_platform": platform.platform(), "execution_machine": platform.machine(),
+            "execution_python": platform.python_version()}
 
 
 def require(ok: bool, code: str) -> None:
@@ -201,7 +208,8 @@ def main(archive: Path, out: Path) -> None:
                 "packaged_database_was_replaced")
         record = {"status": "PASS", "source_sha": build["source_sha"],
                   "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
-                  "binary_sha256": build["binary_sha256"], "platform": build["platform"],
+                  "binary_sha256": build["binary_sha256"],
+                  **platforms(build),
                   "before_restart": before, "after_restart": final,
                   "same_database": str(data / "broker.sqlite"), "processes": children,
                   "observations": actions}

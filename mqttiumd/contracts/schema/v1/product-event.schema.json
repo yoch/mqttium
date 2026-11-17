@@ -84,7 +84,10 @@
         "session.detach.prepared",
         "session.detach.committed",
         "session.expire.prepared",
-        "session.expire.committed"
+        "session.expire.committed",
+        "retained.prepared",
+        "retained.committed",
+        "subscription.committed"
       ]
     },
     "command_kind": {
@@ -100,7 +103,8 @@
         "SessionClose",
         "SessionDetach",
         "SessionExpire",
-        "SessionLifecycle"
+        "SessionLifecycle",
+        "RetainedQoS0"
       ]
     },
     "cause": {

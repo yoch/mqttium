@@ -25,6 +25,9 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
                 for point in value.split(',') {
                     if ![
                         "admission.prepared",
+                        "retained.prepared",
+                        "retained.committed",
+                        "subscription.committed",
                         "release.prepared",
                         "admission.committed",
                         "ack.receipt",

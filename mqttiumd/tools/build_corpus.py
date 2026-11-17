@@ -3456,6 +3456,7 @@ for field, expected in (("closing_input_slots", 32), ("terminal_input_slots", 33
     bad(f"product-profile-wrong-{field}.json", "schema-violation", f"/{field}",
         "The configured bound matches the declared runtime queue rather than historical traffic.",
         {**product_profile, field: expected + 1})
+ok("product-retained-transitions.json", json.loads((V1 / "retained.transitions.json").read_text()))
 hierarchical_transitions = json.loads((V1 / "hierarchical.transitions.json").read_text())
 ok("product-hierarchical-transitions.json", hierarchical_transitions)
 bad("product-hierarchical-transitions-wrong-decision.json", "schema-violation", "/decision",
@@ -3803,7 +3804,8 @@ for name, options in (("qos-bits", 1), ("rh3", 48), ("boolean", True)):
         edited(options_snapshot, lambda v, bits=options: v["route_table"]["routes"][0]["targets"][0].update(options=bits)))
 capabilities = env("mqttiumd.product-event", seq="1", kind="ready", pid=1, details={
     "wildcard_subscriptions": True, "no_local": True, "shared_subscriptions": False,
-    "subscription_identifiers": False, "sqlite_schema": 7, "profile": "tcp-hierarchical-pubsub-v1",
+    "subscription_identifiers": False, "sqlite_schema": 8, "profile": "tcp-retained-pubsub-v1",
+    "retained_available": True, "retained_topics": 32, "retained_bytes": 1048576, "max_replay_candidates": 256,
 })
 ok("product-hierarchical-capabilities.json", capabilities)
 bad("product-details-over-budget.json", "schema-violation", "/details",

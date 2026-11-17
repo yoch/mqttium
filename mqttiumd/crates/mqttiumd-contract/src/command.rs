@@ -839,6 +839,133 @@ pub use crate::opening::{
     OpeningRejection, OpeningTicket, StartupNonce,
 };
 
+impl AdmitPublication {
+    pub(crate) fn check_retained(&self) -> Result<(), RecipeError> {
+        if self
+            .targets
+            .as_slice()
+            .iter()
+            .any(|target| target.cause != DeliveryCause::LiveExact)
+        {
+            return Err(RecipeError::InvalidField("admission_cause"));
+        }
+        if self.source.exchange.session != self.source.session {
+            return Err(RecipeError::ForeignExchange);
+        }
+        if self.topic.len() > usize::from(u16::MAX) {
+            return Err(RecipeError::TopicTooLong(self.topic.len()));
+        }
+        if self.targets.len() > usize::from(u16::MAX) {
+            return Err(RecipeError::TooManyTargets {
+                count: self.targets.len(),
+                max: usize::from(u16::MAX),
+            });
+        }
+        if self
+            .targets
+            .as_slice()
+            .iter()
+            .any(|target| target.delivery.publication != self.publication)
+        {
+            return Err(RecipeError::ForeignDelivery);
+        }
+        Ok(())
+    }
+}
+impl AdmitPublication {
+    pub(crate) fn encode_retained(&self, out: &mut Vec<u8>) -> Result<(), RecipeError> {
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
+        out.push(KIND_ADMIT_PUBLICATION);
+        out.extend_from_slice(&self.operation.to_be_bytes());
+        out.extend_from_slice(&self.request.to_be_bytes());
+        out.extend_from_slice(&self.publication.to_be_bytes());
+        out.extend_from_slice(&self.source.session.to_be_bytes());
+        out.extend_from_slice(&self.source.session_revision.to_be_bytes());
+        out.extend_from_slice(&self.source.packet_id.get().to_be_bytes());
+        put_exchange_generation(out, self.source.exchange);
+        out.extend_from_slice(&self.route_revision.to_be_bytes());
+        out.push(self.qos.to_wire());
+        out.push(u8::from(self.retain));
+        // Both lengths were bounded by `check` above.
+        out.extend_from_slice(&(self.topic.len() as u16).to_be_bytes());
+        out.extend_from_slice(self.topic.as_slice());
+        out.extend_from_slice(&self.payload.id.to_be_bytes());
+        out.extend_from_slice(&self.payload.length.get().to_be_bytes());
+        out.extend_from_slice(&self.costs.payload_bytes.get().to_be_bytes());
+        out.extend_from_slice(&self.costs.references.get().to_be_bytes());
+        out.extend_from_slice(&self.costs.exchange_slots.get().to_be_bytes());
+        out.extend_from_slice(&self.costs.receipt_slots.get().to_be_bytes());
+        out.extend_from_slice(&(self.targets.len() as u16).to_be_bytes());
+        for target in self.targets.as_slice() {
+            out.extend_from_slice(&target.session.to_be_bytes());
+            out.extend_from_slice(&target.session_revision.to_be_bytes());
+            out.extend_from_slice(&target.delivery.index.to_be_bytes());
+            out.push(target.effective_qos.to_wire());
+            out.push(target.cause as u8);
+        }
+        Ok(())
+    }
+}
+impl UpdateSubscriptions {
+    pub(crate) fn check_retained(&self) -> Result<(), RecipeError> {
+        if self.changes.is_empty() || self.changes.len() > MAX_FILTERS {
+            return Err(RecipeError::InvalidField("subscription_count"));
+        }
+        for entry in self.changes.as_slice() {
+            if entry.granted == Some(Qos::ExactlyOnce) {
+                return Err(RecipeError::InvalidField("granted_qos"));
+            }
+            if !crate::topic::valid_filter(entry.topic.as_slice()) {
+                return Err(RecipeError::InvalidField("topic_filter"));
+            }
+            if entry.granted.is_none()
+                && entry.options != crate::pubsub::SubscriptionOptions::DEFAULT
+            {
+                return Err(RecipeError::InvalidField("unsubscribe_options"));
+            }
+        }
+        Ok(())
+    }
+}
+impl UpdateSubscriptions {
+    pub(crate) fn encode_retained(&self, out: &mut Vec<u8>) -> Result<(), RecipeError> {
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
+        let with_options = self
+            .changes
+            .as_slice()
+            .iter()
+            .any(|c| c.options != crate::pubsub::SubscriptionOptions::DEFAULT);
+        out.push(if with_options {
+            KIND_SUBSCRIPTION_OPTIONS
+        } else {
+            KIND_UPDATE_SUBSCRIPTIONS
+        });
+        out.extend_from_slice(&self.operation.to_be_bytes());
+        out.extend_from_slice(&self.session.to_be_bytes());
+        out.extend_from_slice(&self.session_revision.to_be_bytes());
+        out.extend_from_slice(&self.route_revision.to_be_bytes());
+        out.push(self.changes.len() as u8);
+        for entry in self.changes.as_slice() {
+            out.push(match entry.granted {
+                None => 0,
+                Some(Qos::AtMostOnce) => 1,
+                Some(Qos::AtLeastOnce) => 2,
+                Some(Qos::ExactlyOnce) => {
+                    return Err(RecipeError::InvalidField("granted_qos"));
+                }
+            });
+            if with_options {
+                out.push(entry.options.bits());
+            }
+            out.extend_from_slice(&(entry.topic.len() as u16).to_be_bytes());
+            out.extend_from_slice(entry.topic.as_slice());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1336,132 +1463,5 @@ mod tests {
         assert_eq!(kept, frozen);
         assert_eq!(kept.operation(), frozen.get().operation());
         assert_eq!(encode(kept.get()), encode(frozen.get()));
-    }
-}
-
-impl AdmitPublication {
-    pub(crate) fn check_retained(&self) -> Result<(), RecipeError> {
-        if self
-            .targets
-            .as_slice()
-            .iter()
-            .any(|target| target.cause != DeliveryCause::LiveExact)
-        {
-            return Err(RecipeError::InvalidField("admission_cause"));
-        }
-        if self.source.exchange.session != self.source.session {
-            return Err(RecipeError::ForeignExchange);
-        }
-        if self.topic.len() > usize::from(u16::MAX) {
-            return Err(RecipeError::TopicTooLong(self.topic.len()));
-        }
-        if self.targets.len() > usize::from(u16::MAX) {
-            return Err(RecipeError::TooManyTargets {
-                count: self.targets.len(),
-                max: usize::from(u16::MAX),
-            });
-        }
-        if self
-            .targets
-            .as_slice()
-            .iter()
-            .any(|target| target.delivery.publication != self.publication)
-        {
-            return Err(RecipeError::ForeignDelivery);
-        }
-        Ok(())
-    }
-}
-impl AdmitPublication {
-    pub(crate) fn encode_retained(&self, out: &mut Vec<u8>) -> Result<(), RecipeError> {
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
-        out.push(KIND_ADMIT_PUBLICATION);
-        out.extend_from_slice(&self.operation.to_be_bytes());
-        out.extend_from_slice(&self.request.to_be_bytes());
-        out.extend_from_slice(&self.publication.to_be_bytes());
-        out.extend_from_slice(&self.source.session.to_be_bytes());
-        out.extend_from_slice(&self.source.session_revision.to_be_bytes());
-        out.extend_from_slice(&self.source.packet_id.get().to_be_bytes());
-        put_exchange_generation(out, self.source.exchange);
-        out.extend_from_slice(&self.route_revision.to_be_bytes());
-        out.push(self.qos.to_wire());
-        out.push(u8::from(self.retain));
-        // Both lengths were bounded by `check` above.
-        out.extend_from_slice(&(self.topic.len() as u16).to_be_bytes());
-        out.extend_from_slice(self.topic.as_slice());
-        out.extend_from_slice(&self.payload.id.to_be_bytes());
-        out.extend_from_slice(&self.payload.length.get().to_be_bytes());
-        out.extend_from_slice(&self.costs.payload_bytes.get().to_be_bytes());
-        out.extend_from_slice(&self.costs.references.get().to_be_bytes());
-        out.extend_from_slice(&self.costs.exchange_slots.get().to_be_bytes());
-        out.extend_from_slice(&self.costs.receipt_slots.get().to_be_bytes());
-        out.extend_from_slice(&(self.targets.len() as u16).to_be_bytes());
-        for target in self.targets.as_slice() {
-            out.extend_from_slice(&target.session.to_be_bytes());
-            out.extend_from_slice(&target.session_revision.to_be_bytes());
-            out.extend_from_slice(&target.delivery.index.to_be_bytes());
-            out.push(target.effective_qos.to_wire());
-            out.push(target.cause as u8);
-        }
-        Ok(())
-    }
-}
-impl UpdateSubscriptions {
-    pub(crate) fn check_retained(&self) -> Result<(), RecipeError> {
-        if self.changes.is_empty() || self.changes.len() > MAX_FILTERS {
-            return Err(RecipeError::InvalidField("subscription_count"));
-        }
-        for entry in self.changes.as_slice() {
-            if entry.granted == Some(Qos::ExactlyOnce) {
-                return Err(RecipeError::InvalidField("granted_qos"));
-            }
-            if !crate::topic::valid_filter(entry.topic.as_slice()) {
-                return Err(RecipeError::InvalidField("topic_filter"));
-            }
-            if entry.granted.is_none()
-                && entry.options != crate::pubsub::SubscriptionOptions::DEFAULT
-            {
-                return Err(RecipeError::InvalidField("unsubscribe_options"));
-            }
-        }
-        Ok(())
-    }
-}
-impl UpdateSubscriptions {
-    pub(crate) fn encode_retained(&self, out: &mut Vec<u8>) -> Result<(), RecipeError> {
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
-        let with_options = self
-            .changes
-            .as_slice()
-            .iter()
-            .any(|c| c.options != crate::pubsub::SubscriptionOptions::DEFAULT);
-        out.push(if with_options {
-            KIND_SUBSCRIPTION_OPTIONS
-        } else {
-            KIND_UPDATE_SUBSCRIPTIONS
-        });
-        out.extend_from_slice(&self.operation.to_be_bytes());
-        out.extend_from_slice(&self.session.to_be_bytes());
-        out.extend_from_slice(&self.session_revision.to_be_bytes());
-        out.extend_from_slice(&self.route_revision.to_be_bytes());
-        out.push(self.changes.len() as u8);
-        for entry in self.changes.as_slice() {
-            out.push(match entry.granted {
-                None => 0,
-                Some(Qos::AtMostOnce) => 1,
-                Some(Qos::AtLeastOnce) => 2,
-                Some(Qos::ExactlyOnce) => {
-                    return Err(RecipeError::InvalidField("granted_qos"));
-                }
-            });
-            if with_options {
-                out.push(entry.options.bits());
-            }
-            out.extend_from_slice(&(entry.topic.len() as u16).to_be_bytes());
-            out.extend_from_slice(entry.topic.as_slice());
-        }
-        Ok(())
     }
 }

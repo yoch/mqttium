@@ -1,0 +1,134 @@
+{
+  "format": "mqttiumd.product-transition-registry",
+  "schema_version": 1,
+  "id": "tcp-durable-retained-v1",
+  "decision": "0032",
+  "scope": "product-system-tests",
+  "partition_complete": false,
+  "description": "Bounded retained ownership and frozen replay subset. Existing delivery, lifecycle and receipt machines remain separate; no complete guard partition or automatic oracle qualification.",
+  "rules": [
+    {
+      "id": "retained.admission.atomic",
+      "machine": "RetainedStore",
+      "state_class": "Idle",
+      "event_class": "RetainedPublish",
+      "guard": "All guards, complete live fanout and net retained/reference budgets fit; one transaction establishes mutation, obligations, accounts and receipt.",
+      "next_state_class": "Committed",
+      "required_actions": [
+        "CommitRetainedReference",
+        "FreezeLiveRetainFlags",
+        "CommitLiveObligations"
+      ],
+      "forbidden_actions": [
+        "DependOnSubscriberPresence",
+        "PartialAdmission"
+      ],
+      "reception_groups": [
+        "A",
+        "B",
+        "F"
+      ]
+    },
+    {
+      "id": "retained.replace.references",
+      "machine": "RetainedStore",
+      "state_class": "Committed",
+      "event_class": "ReplaceOrClear",
+      "guard": "Release only the old retained reference; payloads and immutable versions still owed by deliveries remain charged. Empty payload clears and is still distributed live.",
+      "next_state_class": "Committed",
+      "required_actions": [
+        "ReleaseOwnedReferenceOnly"
+      ],
+      "forbidden_actions": [
+        "FreeOwedPayload",
+        "RewriteAdmittedReplay"
+      ],
+      "reception_groups": [
+        "B",
+        "E",
+        "F"
+      ]
+    },
+    {
+      "id": "retained.unknown.wait",
+      "machine": "RetainedStore",
+      "state_class": "ChangePending",
+      "event_class": "PendingOrUnknown",
+      "guard": "The exact submitted operation and canonical bytes remain live until a correlated terminal answer. Historical lookup precedes every attempted execution.",
+      "next_state_class": "ChangePending",
+      "required_actions": [
+        "ResolveSameOperation"
+      ],
+      "forbidden_actions": [
+        "RemutateAfterNewerValue",
+        "AcknowledgeUncommittedAdmission"
+      ],
+      "reception_groups": [
+        "D",
+        "E"
+      ]
+    },
+    {
+      "id": "retained.replay.ordered",
+      "machine": "RetainedStore",
+      "state_class": "Idle",
+      "event_class": "Subscribe",
+      "guard": "Treat each filter occurrence in order: RH0 always, RH1 only when absent at this step, RH2 never; No Local compares retained producer and target ClientIDs. At most256 candidates.",
+      "next_state_class": "ChangePending",
+      "required_actions": [
+        "ReserveReplayIdentityRange",
+        "FreezeVersionAndRetain",
+        "MaterializeCompleteReplay"
+      ],
+      "forbidden_actions": [
+        "TruncateReplay",
+        "RereadCurrentValueAtEmission"
+      ],
+      "reception_groups": [
+        "A",
+        "C",
+        "F",
+        "G"
+      ]
+    },
+    {
+      "id": "retained.subscription.commit",
+      "machine": "RetainedStore",
+      "state_class": "ChangePending",
+      "event_class": "KnownCommit",
+      "guard": "All route changes and replay responsibilities committed atomically. Install the final projection before making positive SUBACK eligible.",
+      "next_state_class": "Committed",
+      "required_actions": [
+        "InstallRouteProjection",
+        "EligibleSubscriptionAck"
+      ],
+      "forbidden_actions": [
+        "UseUnconfirmedProjection"
+      ],
+      "reception_groups": [
+        "C",
+        "D",
+        "G"
+      ]
+    },
+    {
+      "id": "retained.replay.qos0",
+      "machine": "RetainedStore",
+      "state_class": "ConsumePending",
+      "event_class": "KnownCommit",
+      "guard": "The frozen replay RETAIN flag survives known consumption and authorizes only one emission on the captured connection.",
+      "next_state_class": "EmissionPending",
+      "required_actions": [
+        "EmitFrozenRetain"
+      ],
+      "forbidden_actions": [
+        "ReconstructConsumedPermission"
+      ],
+      "reception_groups": [
+        "A",
+        "D",
+        "E"
+      ]
+    }
+  ]
+}

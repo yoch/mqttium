@@ -43,3 +43,5 @@ its source; a test fails when the register and the records drift apart.
 
 What each record leaves open is tracked in
 [`../reception/open-conditions.md`](../reception/open-conditions.md).
+
+| [0032](0032-durable-retained.md) | Proposed | Topic-owned retained references, atomic frozen replay, ordered RH and live RAP | Product |

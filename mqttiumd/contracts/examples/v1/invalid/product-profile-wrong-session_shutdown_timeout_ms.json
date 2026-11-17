@@ -1,7 +1,7 @@
 {
   "format": "mqttiumd.product-profile",
   "schema_version": 1,
-  "id": "tcp-hierarchical-pubsub-v1",
+  "id": "tcp-retained-pubsub-v1",
   "mqtt_version": 5,
   "client_id": "explicit",
   "clean_start": [
@@ -17,7 +17,7 @@
     1,
     2
   ],
-  "retain": false,
+  "retain": true,
   "will": false,
   "authentication": false,
   "subscriptions": true,
@@ -82,7 +82,7 @@
   "session_clock_degraded_after_ms": 31000,
   "max_session_expiry_timers": 128,
   "session_expiry_batch": 4,
-  "sqlite_schema_version": 7,
+  "sqlite_schema_version": 8,
   "wildcard_subscriptions": true,
   "no_local": true,
   "shared_subscriptions": false,
@@ -92,5 +92,10 @@
     0,
     1,
     2
-  ]
+  ],
+  "max_retained_topics": 32,
+  "max_retained_bytes": 1048576,
+  "max_replay_candidates": 256,
+  "live_overlap_policy": "one-per-session",
+  "retained_replay_overlap_policy": "one-per-filter-occurrence-and-topic"
 }

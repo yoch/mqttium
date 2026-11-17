@@ -553,12 +553,6 @@ fn publish(first: u8, body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
     if props.unsupported {
         return Err(unsupported("PublishPropertiesOutsideProfile"));
     }
-    if first & 1 != 0 {
-        return Err(Error {
-            reason: 0x9a,
-            ..unsupported("RetainNotSupported")
-        });
-    }
     // Check every field before making either application-owned copy.
     if topic_bytes.len() > bounds.max_topic {
         return Err(oversized("TopicTooLarge"));
@@ -573,7 +567,7 @@ fn publish(first: u8, body: &[u8], bounds: Bounds) -> Result<Packet, Error> {
     Ok(Packet::Core(InboundPacket::Publish {
         topic,
         qos,
-        retain: false,
+        retain: first & 1 != 0,
         dup: first & 8 != 0,
         packet_id,
         payload,
@@ -858,7 +852,7 @@ pub fn encode(frame: OutboundFrame) -> Result<Vec<u8>, Error> {
             0,
             0,
             0x25,
-            0,
+            1,
             0x22,
             0,
             0,
@@ -901,24 +895,44 @@ pub fn refusal(error: Error, before_connack: bool) -> Vec<u8> {
     }
 }
 
-/// Encode the core-authorized non-retained outgoing QoS 1 publication.
+/// Encode the core-authorized outgoing publication, preserving frozen RETAIN.
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn encode_qos0(topic: &SharedBytes, payload: &SharedBytes) -> Result<Vec<u8>, Error> {
-    encode_publication(None, topic, payload, false)
+    encode_qos0_retained(topic, payload, false)
 }
 
+pub fn encode_qos0_retained(
+    topic: &SharedBytes,
+    payload: &SharedBytes,
+    retain: bool,
+) -> Result<Vec<u8>, Error> {
+    encode_publication(None, topic, payload, false, retain)
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn encode_publish(
     packet_id: OutboundPacketId,
     topic_name: &SharedBytes,
     payload: &SharedBytes,
     dup: bool,
 ) -> Result<Vec<u8>, Error> {
-    encode_publication(Some(packet_id), topic_name, payload, dup)
+    encode_publish_retained(packet_id, topic_name, payload, dup, false)
+}
+pub fn encode_publish_retained(
+    packet_id: OutboundPacketId,
+    topic_name: &SharedBytes,
+    payload: &SharedBytes,
+    dup: bool,
+    retain: bool,
+) -> Result<Vec<u8>, Error> {
+    encode_publication(Some(packet_id), topic_name, payload, dup, retain)
 }
 fn encode_publication(
     packet_id: Option<OutboundPacketId>,
     topic_name: &SharedBytes,
     payload: &SharedBytes,
     dup: bool,
+    retain: bool,
 ) -> Result<Vec<u8>, Error> {
     topic(topic_name.as_slice())?;
     if topic_name.len() > 1024 || payload.len() > 32768 {
@@ -944,11 +958,13 @@ fn encode_publication(
     bytes
         .try_reserve_exact(total)
         .map_err(|_| protocol("OutgoingAllocationFailed"))?;
-    bytes.push(if packet_id.is_some() {
-        0x32 | if dup { 8 } else { 0 }
-    } else {
-        0x30
-    });
+    bytes.push(
+        (if packet_id.is_some() {
+            0x32 | if dup { 8 } else { 0 }
+        } else {
+            0x30
+        }) | u8::from(retain),
+    );
     let mut left = body;
     for _ in 0..4 {
         let mut part = (left % 128) as u8;
@@ -1305,6 +1321,46 @@ mod tests {
     }
 
     #[test]
+    fn retained_flags_are_encoded_without_inventing_qos0_identifiers() {
+        let topic = SharedBytes::copy_from(b"a/b", 1024).unwrap();
+        let payload = SharedBytes::copy_from(b"state", 32768).unwrap();
+        let qos0 = encode_qos0_retained(&topic, &payload, true).unwrap();
+        assert_eq!(qos0[0], 0x31);
+        let Packet::Core(InboundPacket::Publish {
+            qos,
+            retain,
+            packet_id,
+            ..
+        }) = decode(qos0[0], &qos0[2..], BOUNDS).unwrap()
+        else {
+            panic!("publish")
+        };
+        assert_eq!(qos, Qos::AtMostOnce);
+        assert!(retain);
+        assert_eq!(packet_id, None);
+        let qos1 = encode_publish_retained(
+            OutboundPacketId::new(7).unwrap(),
+            &topic,
+            &payload,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(qos1[0], 0x33);
+        assert_eq!(
+            encode_publish_retained(
+                OutboundPacketId::new(7).unwrap(),
+                &topic,
+                &payload,
+                true,
+                false
+            )
+            .unwrap()[0],
+            0x3a
+        );
+    }
+
+    #[test]
     fn qos2_publish_and_pubrel_enter_the_existing_core() {
         let body = b"\0\x03a/b\0\x07\0payload";
         let Packet::Core(InboundPacket::Publish {
@@ -1474,7 +1530,7 @@ mod tests {
         assert_eq!(
             &packet[5..],
             &[
-                0x21, 0, 8, 0x27, 0, 1, 0, 0, 0x25, 0, 0x22, 0, 0, 0x28, 1, 0x29, 0, 0x2a, 0
+                0x21, 0, 8, 0x27, 0, 1, 0, 0, 0x25, 1, 0x22, 0, 0, 0x28, 1, 0x29, 0, 0x2a, 0
             ]
         );
         assert_eq!(encode(OutboundFrame::Pingresp).unwrap(), [0xd0, 0]);

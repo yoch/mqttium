@@ -1,99 +1,108 @@
-# mqttiumd local MQTT 5 preview
+# mqttiumd — local MQTT 5 retained preview
 
-Extract the archive on the Linux platform named in `BUILD.json`, then run:
+Extract on compatible Linux x86_64 with glibc (see `BUILD.json` and `RUNTIME.txt`).
+The normal executable needs neither Rust, Git nor the laboratory. Run:
 
 ```sh
 ./start.sh ./data
 ```
 
-The default listener is `127.0.0.1:1883`. Set `MQTTIUMD_LISTEN` to change it.
-The database is preserved in `./data/broker.sqlite`. Every start makes a new
-log directory; readiness and clock-origin recognition are in its `events.jsonl`.
-A schema refusal stops startup and never replaces the database.
+It listens on `127.0.0.1:1883`. `MQTTIUMD_LISTEN` overrides the address.
+`./data/broker.sqlite` survives every restart; each start creates fresh logs.
+Clock recognition and readiness are recorded in `data/logs/run.*/events.jsonl`.
+**Schema8 only:** historical databases are refused without modification. Keep
+an old installation's data separately; there is no automatic migration or reset.
 
-Install the Mosquitto **client tools** using your distribution's package manager.
-In a second terminal, start the temperature dashboard:
-
-```sh
-mosquitto_sub -d -V mqttv5 -c -i preview-dashboard \
-  -D CONNECT session-expiry-interval 4294967295 \
-  -h 127.0.0.1 -p 1883 -q 1 -t 'atelier/+/temperature' -v
-```
-
-In a third terminal, start the archive receiver (it prints messages; the broker
-is a delivery service, not a permanent publication archive):
+Install Mosquitto's **client tools** from your distribution. Before starting any
+dashboard, publish two retained temperatures (the commands exit their ephemeral
+producer sessions after receiving PUBACK):
 
 ```sh
-mosquitto_sub -d -V mqttv5 -c -i preview-archive \
-  -D CONNECT session-expiry-interval 4294967295 \
-  -h 127.0.0.1 -p 1883 -q 1 -t 'atelier/#' -v
+mosquitto_pub -V mqttv5 -h 127.0.0.1 -p 1883 -i state-source \
+  -q 1 -r -t atelier/salle1/temperature -m 'temperature:1'
+mosquitto_pub -V mqttv5 -h 127.0.0.1 -p 1883 -i state-source \
+  -q 1 -r -t atelier/salle2/temperature -m 'temperature:2'
 ```
 
-After the subscribers report their subscription when run with `-d`, publish:
+Stop the broker with Ctrl-C, then run `./start.sh ./data` again. A **new**
+dashboard receives both retained values:
 
 ```sh
-mosquitto_pub -V mqttv5 -c -i preview-source \
-  -D CONNECT session-expiry-interval 4294967295 \
-  -h 127.0.0.1 -p 1883 -q 1 -t atelier/salle1/temperature -m 'temperature:1'
-mosquitto_pub -V mqttv5 -c -i preview-source \
-  -D CONNECT session-expiry-interval 4294967295 \
-  -h 127.0.0.1 -p 1883 -q 2 -t atelier/salle2/temperature -m 'temperature:2'
-mosquitto_pub -V mqttv5 -c -i preview-source \
-  -D CONNECT session-expiry-interval 4294967295 \
-  -h 127.0.0.1 -p 1883 -q 1 -t atelier/salle1/command -m 'command:3'
+mosquitto_sub -V mqttv5 -h 127.0.0.1 -p 1883 -i dashboard-first \
+  -q 1 -t 'atelier/+/temperature' -C 2 -W 5 -F '%t|%p|%q|%r'
 ```
 
-The dashboard receives the two temperatures; the archive receiver also gets
-the command. `+` matches one level (including an empty one); `#` matches zero
-or more levels. Leading wildcards exclude `$` topics. Overlapping subscriptions
-produce one delivery per session with the highest eligible granted QoS, capped
-by the publication's QoS and outgoing QoS 1. No Local excludes only that filter's
-local contribution. Unsubscribe removes the literal filter, not other overlaps.
+Expected (order may differ):
 
-Stop the archive receiver, publish another QoS 1 message, stop the broker with
-Ctrl-C, then restart `./start.sh ./data` and reconnect that receiver with the
-same identity and flags. Its persistent session and pending delivery survive.
-To replace the archive receiver's wildcard with a single room temperature,
-stop its old process and reconnect the same session with a literal unsubscribe:
+```text
+atelier/salle1/temperature|temperature:1|1|1
+atelier/salle2/temperature|temperature:2|1|1
+```
+
+The final two fields are QoS and RETAIN. Replace one state and clear the other
+with an **empty retained publication**, then query with another new dashboard:
 
 ```sh
-mosquitto_sub -d -V mqttv5 -c -i preview-archive \
-  -D CONNECT session-expiry-interval 4294967295 \
-  -h 127.0.0.1 -p 1883 -q 1 \
-  -t atelier/salle1/temperature -U 'atelier/#' -v
+mosquitto_pub -V mqttv5 -h 127.0.0.1 -p 1883 -i state-source \
+  -q 1 -r -t atelier/salle1/temperature -m 'temperature:3'
+mosquitto_pub -V mqttv5 -h 127.0.0.1 -p 1883 -i state-source \
+  -q 1 -r -t atelier/salle2/temperature -n
+mosquitto_sub -V mqttv5 -h 127.0.0.1 -p 1883 -i dashboard-new \
+  -q 1 -t 'atelier/#' -C 1 -W 5 -F '%t|%p|%q|%r'
 ```
 
-Wait for its SUBACK and UNSUBACK before publishing the next sample. Previously
-admitted offline work remains due; future room2 messages no longer match it.
+It receives `atelier/salle1/temperature|temperature:3|1|1`. A normal publication
+without `-r` leaves the stored value intact. Retained is last-state storage, not
+a history archive. Existing deliveries keep their own frozen value through a
+replacement or clearing.
 
-Initially QoS 0 publications are volatile and are dropped for offline receivers.
-Deliveries at QoS 0 originating from durable QoS 1/2 admissions are consumed
-before a single emission; a crash after consumption can lose that delivery.
+For the complete executed sequence, including broker stop/restart, use a **new**
+directory (Python3 and the Mosquitto client tools are needed only by this demo):
 
-## Profile and limits
+```sh
+./demo.sh ./retained-demo-data
+```
 
-MQTT 5 only, explicit ClientID, Clean Start 0/1, zero/finite/infinite Session
-Expiry, non-retained publications, exact and hierarchical filters, No Local,
-SUBSCRIBE/UNSUBSCRIBE, PING and Keep Alive. QoS 2 subscription requests grant 1.
-Valid RAP and Retain Handling options are accepted and preserved; retained
-messages are not supported. A leading `$` rule does not create a `$SYS` service.
+It uses localhost port18884 by default (`MQTTIUMD_DEMO_PORT` overrides it), keeps
+its SQLite file, command output and comparisons, and never removes a database.
 
-128 sessions, 128 subscriptions, 8 filters/request, 16 distinct destinations per
-publication, 8192 durable receipt slots with live retirement; packet size 65536,
-topic/client ID 1024 bytes, payload 32768 bytes. Exceeding the destination budget
-refuses a whole durable admission or explicitly drops a volatile occurrence.
-This is a small local preview. Use it on a trusted machine: no TLS or
-credentials. Wildcards do not imply shared subscriptions or Subscription
-Identifiers. Retained, Will, outgoing QoS 2, MQTT 3.1.1 and format migration are
-not supported. Older SQLite schemas are refused, never silently reset.
+## Subscriptions and profile
 
-Finite-session time uses a conservative logical clock. Same-domain BOOTTIME
-continuity is used only when positively recognized; otherwise already committed
-progress is retained and unproven downtime delays expiry. Do not infer a real
-wall-clock expiry guarantee from this preview's fallback environments.
+MQTT5; explicit ClientID; Clean Start0/1; zero, finite or infinite session expiry;
+input QoS0/1/2; output QoS0/1; exact, `+` and `#` filters; No Local; SUBSCRIBE,
+UNSUBSCRIBE, PING and Keep Alive. Requests for subscription QoS2 grant1. `a/#`
+includes `a`; empty levels matter; leading wildcards exclude `$` topics.
 
-See `BUILD.json`, `RUNTIME.txt`, `SHA256SUMS` and `licenses/` for source identity,
-normal-build features, the tested platform and runtime dependencies. No Git,
-Rust toolchain or laboratory is needed to run this archive. The separate system
-reception records mqttium, Paho and Mosquitto interoperability; it is not a
-complete MQTT conformance certificate or a Mosquitto replacement.
+Live overlaps produce one delivery/session at the highest eligible QoS. RAP is
+combined across eligible contributions; No Local removes only its own
+contribution. Replay always sets RETAIN1. RH0 replays, RH1 replays only when the
+literal filter is new at that ordered step, RH2 does not replay. Each eligible
+filter occurrence can create its own replay, so overlapping filters or repeated
+RH0 filters can intentionally return the same value more than once. Unsubscribe
+removes the literal filter, not its overlaps or already admitted deliveries.
+
+Retained QoS0 is deliberately committed to disk, without an MQTT acknowledgement;
+client-side send completion does not prove that commit. Ordinary non-retained
+QoS0 remains volatile and is dropped for absent destinations. Durable QoS1/2
+admissions to QoS0 recipients are consumed before one emission; a crash after
+consumption can lose the delivery. There is no QoS0 replay after that consumption.
+
+Limits: 128 sessions, 128 subscriptions, 8 filters/request, 16 distinct live
+destinations/publication, 8192 receipt slots with live retirement, 128 payload
+references, 4MiB shared payload bytes. Retained adds 32 topics and 1MiB current
+retained bytes. At most256 candidate replays are considered transactionally;
+existing reference limits can refuse a whole subscription update, never truncate
+it after success. Packets65536 bytes, topic/ClientID1024, payload32768. Old values
+still owed to recipients remain charged. Replacement/clear can release their
+own retained reference without destroying such deliveries.
+
+This is a trusted-local-machine preview, with **no TLS or authentication**.
+Will, Message Expiry, shared subscriptions, Subscription Identifiers, outgoing
+QoS2, MQTT3.1.1 and schema migration are unsupported. Finite session expiry uses
+a conservative logical clock when time-domain continuity cannot be established;
+no UTC jump authorizes deletion. It is not a complete Mosquitto replacement.
+
+The separate source and system-reception archives identify exact clients,
+platforms, commands, crash witnesses, bounds and validation scope. Success in
+this demo is a product system test, not general MQTT certification or a
+power-loss guarantee.

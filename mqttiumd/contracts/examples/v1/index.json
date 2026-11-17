@@ -103,6 +103,7 @@
     "contracts/examples/v1/valid/toy.transitions.seed-with-hole.json",
     "contracts/examples/v1/valid/wide.catalog.json",
     "contracts/examples/v1/valid/product-profile.json",
+    "contracts/examples/v1/valid/product-retained-transitions.json",
     "contracts/examples/v1/valid/product-hierarchical-transitions.json",
     "contracts/examples/v1/valid/product-pubsub-transitions.json",
     "contracts/examples/v1/valid/product-receipt-transitions.json",

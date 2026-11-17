@@ -58,7 +58,9 @@ pub fn recipe_kind(recipe: &Recipe) -> &'static str {
             SessionAction::Expire { .. } => "SessionExpire",
             SessionAction::Close { .. } => "SessionClose",
         },
-        Recipe::AdmitPublication(_) => "Admission",
+        Recipe::RetainedPublication(_) | Recipe::AdmitPublication(_) => "Admission",
+        Recipe::RetainedQos0(_) => "RetainedQoS0",
+        Recipe::ReplaySubscriptions(_) => "Subscriptions",
         Recipe::ReleaseInbound(_) => "Release",
         Recipe::ChangeSubscriptions(_) => "Subscriptions",
         Recipe::ClaimDelivery(_) => "Claim",
@@ -416,6 +418,17 @@ fn business_response(
                     let id = command.recipe.operation();
                     let kind = recipe_kind(command.recipe.get());
                     let targets = match command.recipe.get() {
+                        Recipe::RetainedPublication(value) => value
+                            .admission
+                            .targets
+                            .as_slice()
+                            .iter()
+                            .map(|t| t.session)
+                            .collect(),
+                        Recipe::RetainedQos0(value) => {
+                            value.targets.as_slice().iter().map(|t| t.session).collect()
+                        }
+                        Recipe::ReplaySubscriptions(value) => vec![value.update.session],
                         Recipe::AdmitPublication(a) => {
                             a.targets.as_slice().iter().map(|t| t.session).collect()
                         }
@@ -432,6 +445,7 @@ fn business_response(
                             "SessionDetach" => "session.detach.prepared",
                             "SessionExpire" => "session.expire.prepared",
                             "Admission" => "admission.prepared",
+                            "RetainedQoS0" => "retained.prepared",
                             "Release" => "release.prepared",
                             "Subscriptions" => "subscription.prepared",
                             "Claim" => "claim.prepared",
@@ -458,7 +472,7 @@ fn business_response(
                             .is_some_and(|d| consume_file(&d.join("capture-next-admission")))
                     {
                         state.captured = Some(command.clone());
-                        if let Recipe::AdmitPublication(a) = command.recipe.get() {
+                        if let Some(a) = command.recipe.get().admission() {
                             let _ = events.emit("receipt_replay_captured",json!({"command_kind":"Admission","operation":operation(id),"details":{"publication":identity_text(a.publication.incarnation().get(),a.publication.epoch().get(),a.publication.owner().get(),a.publication.sequence().get()),"payload":identity_text(a.payload.id.incarnation().get(),a.payload.id.epoch().get(),a.payload.id.owner().get(),a.payload.id.sequence().get())}}));
                         }
                     }
@@ -472,6 +486,8 @@ fn business_response(
                             "SessionDetach" => Some("session.detach.committed"),
                             "SessionExpire" => Some("session.expire.committed"),
                             "Admission" => Some("admission.committed"),
+                            "RetainedQoS0" => Some("retained.committed"),
+                            "Subscriptions" => Some("subscription.committed"),
                             "Claim" => Some("claim.committed"),
                             "Finish" => Some("finish.committed"),
                             "Consume" => Some("consume.committed"),
@@ -494,6 +510,8 @@ fn business_response(
                         && matches!(
                             kind,
                             "Claim"
+                                | "Admission"
+                                | "RetainedQoS0"
                                 | "Subscriptions"
                                 | "Finish"
                                 | "Consume"
