@@ -1,0 +1,13 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "1",
+  "kind": "session_clock_anchor",
+  "pid": 1,
+  "details": {
+    "domain": "abababababababababababababababababababababababababababababababab",
+    "tick": "100",
+    "logical": "100",
+    "origin_status": "boottime_origin_recognized"
+  }
+}

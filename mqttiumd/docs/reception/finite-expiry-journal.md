@@ -64,3 +64,20 @@
   changes follow31d. Publish this setup/journal correction, then wait for its
   exact-head CI and fresh qualifying campaign artifacts; earlier failures remain
   tooling failures, never negative-control detections.
+
+- CI71df expiry/pubsub/QoS0/TCP/lifecycle pass. LiveGC failure is isolated to
+  F-results:2x256+Open fills the new512business window before a lostGCresult's
+  10s resolution. RED07258753 fails direct receipt_result_probe_filled_business_window;
+  GREENdfbd749c uses128perphase (257includingOpen), unchangedquota/timeouts.
+  Actual71dfhooks/newharness replay passes sameclosure64 retry/duplicateignore,
+  frontier257, twoPINGRESP andexit0. Dedicatedpressure and32769run alreadypass.
+- Added simultaneous8-session deadline test:4facts/turn,dedup,knowncommit before
+  release and independentPING pass. Startup domain was durable but missing its
+  documented event: RED8f434daa actual71dfbinary fails expiry_clock_anchor_not_observed.
+  Emit session_clock_anchor once beforeReady with exactdurable domain/tick/logical
+  and providerorigin_status; receptharness compares it toSQLite beforetraffic.
+- Origin GREEN executes /workspace/mqttiumd-expiry-origin-green-normal and
+  requires the exact startup event/SQLite match; savedtrackedmodification makes
+  this a diagnostic until the clean final publication. Final event contract
+  digest30874671202259bb8387e30aa427f1067d685e9b195d37ed3ba4a685e249fdb7,
+  corpus519. No temporal-decision/store change accompanies this observation.

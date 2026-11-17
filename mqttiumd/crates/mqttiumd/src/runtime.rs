@@ -213,6 +213,25 @@ struct Runtime<'a> {
     copied_session_close: Option<SessionCloseObservation>,
 }
 impl Runtime<'_> {
+    fn emit_session_clock_anchor(&self) -> Result<(), Failure> {
+        let domain: String = self
+            .clock_anchor
+            .reading
+            .domain
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        self.events
+            .emit(
+                "session_clock_anchor",
+                json!({"details":{
+                    "domain":domain,"tick":self.clock_anchor.reading.tick.to_string(),
+                    "logical":self.clock_anchor.logical.to_string(),
+                    "origin_status":self.clock.origin_status()
+                }}),
+            )
+            .map_err(event_failure)
+    }
     fn session_now(&self) -> Result<u64, Failure> {
         let reading = self.clock.read().map_err(|e| Failure::plain(e.code()))?;
         logical_now(self.clock_anchor, reading).map_err(|e| Failure::plain(e.code()))
@@ -3772,6 +3791,7 @@ fn run_inner(
             runtime.dispatch()?;
             thread::sleep(Duration::from_millis(1));
         }
+        runtime.emit_session_clock_anchor()?;
         events.emit("receipt_policy",json!({"details":{"receipt_window":1024,"receipt_data_window":mqttiumd_contract::receipts::RECEIPT_DATA_WINDOW,"receipt_control_reserve":512,"receipt_collection_rows":128,"receipt_collection_bytes":mqttiumd_store_api::ReadBudget::COLLECTION.max_bytes,"receipt_collection_trigger":64,"max_receipt_origins":64,"startup_origins_trigger":32,"startup_receipts_trigger":4096,"startup_closed_collection":collect_closed,"control_request_slots":crate::writer::CONTROL_QUEUE,"control_reply_slots":crate::writer::CONTROL_QUEUE,"control_input_slots":crate::writer::CONTROL_QUEUE}})).map_err(event_failure)?;
         events.emit("sqlite_configuration",json!({"details":{"journal_mode":sqlite.journal_mode,"synchronous":sqlite.synchronous,"wal_autocheckpoint":sqlite.wal_autocheckpoint,"checkpoint_policy":sqlite.checkpoint_policy,"sqlite_version":sqlite.sqlite_version,"user_version":sqlite.user_version,"page_size":sqlite.page_size,"kill_points":sqlite.kill_points,"hooks_active":false,"install_order":"sqlite-autocheckpoint-before-optional-business-hook"}})).map_err(event_failure)?;
         check_startup_cancel(&cancel)?;

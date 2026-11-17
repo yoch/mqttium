@@ -970,6 +970,41 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "session_clock_anchor"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "details"
+        ],
+        "properties": {
+          "details": {
+            "required": [
+              "domain",
+              "tick",
+              "logical",
+              "origin_status"
+            ],
+            "properties": {
+              "domain": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "origin_status": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              }
+            }
+          }
+        }
+      }
     }
   ],
   "$defs": {

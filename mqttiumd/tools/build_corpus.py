@@ -3736,6 +3736,8 @@ bad("store-snapshot-session-clock-invalid-domain.json", "schema-violation", "/me
 finite_recovery = copy.deepcopy(PAGE_READ)
 finite_recovery["payload"]["facts"][1].update(expiry={"After": 7}, opened_by=finite_operation, detached=detached)
 ok("trace-record-session-finite-recovery.json", finite_recovery)
+ok("product-session-clock-anchor.json", env("mqttiumd.product-event", seq="1", kind="session_clock_anchor", pid=1,
+    details={"domain":"ab"*32,"tick":"100","logical":"100","origin_status":"boottime_origin_recognized"}))
 finite_changed = env("mqttiumd.product-event", seq="20", kind="session_changed", pid=1,
     operation=detach_operation, connection="1", details={
         "action": "Detached", "session": "4", "expiry": {"After": 7},

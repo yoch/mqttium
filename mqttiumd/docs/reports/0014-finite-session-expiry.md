@@ -167,3 +167,37 @@ valid offline infinite sessions are never evicted. Schema1..5 migration is not
 provided. Message Expiry, Will, authentication, retained and outgoingQoS2 remain
 separate. The next functional increment is bounded wildcard subscription
 matching for `+` and `#`, using the existing durable subscription cut.
+
+## Publication continuation
+
+The complete local launcher also passes on the published31d9731a source,
+including16 strict/schema streams and7658 events. Its archive is
+`14653d7c45a33742d785817e764acbfc355f8aff5a712a2c297df50273181881`;
+source archive `0f9f603c6a42a5a8e016a03c9a02eb0e7cd2424600787e53b11dd8570207326d`.
+The2135 archived source blobs,371 retained hashes/372 files and all five own
+process witnesses verify. This remains source31d evidence.
+
+CI71df separately passes the new expiry reception and the existing TCP/QoS0,
+pubsub and explicit-session jobs. Its live-receipt replay test accidentally
+fills the newly reserved business window: Open+2x256 reaches513 against512
+before an intentionally lost result's10s resolution. The separate real-pressure
+and32769-command tests pass. The replay-only test now derives128 commands per
+phase from the effective profile, leaving257 positions including Open; quotas
+and timeouts are unchanged. The genuine lost/duplicate result is still detected
+and reconciled with the same closure64, two PINGRESPs and frontier257. This
+repaired test passes on the unchanged71df hooks binary. An earlier jsonschema
+import failure was fixed by pinned transitive system-test dependencies, verified
+with102 pilots in a fresh Python environment; neither failure is an invariant
+mutation detection.
+
+The final observation contract additionally emits session_clock_anchor once
+before Ready, including exact committed domain/tick/logical progress and stable
+provider origin_status. A real71df executable lacks that documented event and
+fails expiry_clock_anchor_not_observed; the new executable passes and its event
+matches SQLite. This observation does not change temporal decisions. The final
+contract digest after adding its bounded schema/example is
+`sha256:30874671202259bb8387e30aa427f1067d685e9b195d37ed3ba4a685e249fdb7`.
+A simultaneous-eight-expiration regression confirms four facts per turn,
+deduplication, no release before known commit and independent PING progression.
+The final publication and its own fresh CI artifacts are identified on PR648;
+earlier archives remain unchanged and retain their original scope.

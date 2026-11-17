@@ -139,6 +139,7 @@
     "contracts/examples/v1/valid/store-snapshot-session-finite-detached.json",
     "contracts/examples/v1/valid/store-snapshot-session-finite-expired.json",
     "contracts/examples/v1/valid/trace-record-session-finite-recovery.json",
+    "contracts/examples/v1/valid/product-session-clock-anchor.json",
     "contracts/examples/v1/valid/product-lifecycle-submitted-finite.json",
     "contracts/examples/v1/valid/product-session-detached.json",
     "contracts/examples/v1/valid/product-session-opened-finite.json",

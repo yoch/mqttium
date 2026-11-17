@@ -3481,3 +3481,65 @@ fn coalesced_clock_cas_reply_does_not_hide_an_uncheckpointed_interval() {
         assert_eq!(runtime.expiry_timers.len(), 1);
     });
 }
+
+#[test]
+fn simultaneous_expiration_is_batched_while_an_independent_connection_pings() {
+    use crate::session_time::testing::FakeClock;
+    let sample = |tick| SessionClockReading {
+        domain: [47; 32],
+        tick,
+    };
+    let clock = Arc::new(FakeClock::new(sample(0)));
+    with_runtime_clock(128, clock.clone(), |runtime, directory| {
+        let (witness, mut client) = peer(runtime);
+        runtime
+            .connect(witness, connect_packet(b"infinite-witness"))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        read_frame(&mut client);
+        let retained = runtime.peers[&witness].session.unwrap();
+        for n in 0..8 {
+            let (generation, mut finite_client) = peer(runtime);
+            let mut connect = connect_packet(format!("simultaneous-{n}").as_bytes());
+            connect.expiry = SessionExpiry::After(1);
+            runtime.connect(generation, connect).unwrap();
+            until(runtime, |r| r.session_requests.is_empty());
+            read_frame(&mut finite_client);
+            runtime.close(generation, "test_lost").unwrap();
+            until(runtime, |r| {
+                !r.owner.session_status().lifecycle_pending
+                    && r.closing_inputs.is_empty()
+                    && r.lifecycle_inflight.is_empty()
+            });
+        }
+        assert_eq!(runtime.expiry_timers.len(), 8);
+        clock.set(sample(1_000_000_000));
+        runtime.expire_sessions().unwrap();
+        assert_eq!(runtime.expiry_inputs.len(), 4, "expiry_turn_exceeded_four");
+        runtime.expire_sessions().unwrap();
+        assert_eq!(runtime.expiry_inputs.len(), 8);
+        runtime.expire_sessions().unwrap();
+        assert_eq!(runtime.expiry_inputs.len(), 8, "duplicate_expiry_wakeups");
+        assert_eq!(
+            runtime.sessions.len(),
+            9,
+            "capacity_released_before_known_expiry"
+        );
+        runtime.packet(witness, 0xc0, vec![]).unwrap();
+        runtime.drain_inputs().unwrap();
+        assert_eq!(
+            read_frame(&mut client),
+            (0xd0, vec![]),
+            "expiry_batch_starved_control"
+        );
+        until(runtime, |r| {
+            r.sessions.len() == 1 && r.expiry_inputs.is_empty() && r.lifecycle_inflight.is_empty()
+        });
+        assert!(runtime.expiry_timers.is_empty());
+        assert_eq!(runtime.peers[&witness].session, Some(retained));
+        let state =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert_eq!(state.sessions.len(), 1);
+        assert!(state.sessions.contains_key(&retained));
+    });
+}
