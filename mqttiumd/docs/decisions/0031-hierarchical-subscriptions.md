@@ -13,6 +13,9 @@ UTF-8 bytes, case and empty levels and allocates no matcher state.
 
 Each matching subscription contributes its granted QoS unless No Local excludes
 that contribution because source and destination have the same durable SessionId.
+At the routing cut, a source is the current session and lifecycle guards permit
+one active incarnation per ClientID. Comparing SessionIds therefore implements
+No Local without rebinding historical facts through the reusable name cache.
 Contributions are aggregated by destination SessionId. The highest eligible
 QoS, capped by published QoS and outgoing QoS 1, wins. Targets are ordered by
 SessionId, independently of insertion order. A revision conflict is invalid

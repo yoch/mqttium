@@ -65,6 +65,8 @@ import json, os, shutil, sys
 if version('paho-mqtt') != '2.1.0': raise SystemExit('paho-mqtt2.1.0 required')
 out=Path(sys.argv[1]); quota=Path('/sys/fs/cgroup/cpu.max')
 (out/'environment.json').write_text(json.dumps({'CARGO_BUILD_JOBS':os.environ['CARGO_BUILD_JOBS'],
+    'MQTTIUMD_MOSQUITTO_BIN_DIR':os.environ.get('MQTTIUMD_MOSQUITTO_BIN_DIR'),
+    'LD_LIBRARY_PATH':os.environ.get('LD_LIBRARY_PATH'),
     'cpu_max':quota.read_text().strip() if quota.exists() else None,
     'free_bytes_at_start':shutil.disk_usage(out).free,
     'session_quota':128,'receipt_slots':8192,'route_sizes':[1,16,64,128],
