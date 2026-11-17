@@ -360,7 +360,7 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
         .publications
         .iter()
         .map(|(id, record)| {
-            json!({
+            let mut row = json!({
                 "publication_id": publication_id(*id),
                 "operation_id": operation_id(record.operation),
                 "source_session": session(record.source),
@@ -368,15 +368,18 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
                 "qos": qos(record.qos),
                 "retain": record.retain,
                 "payload_id": payload_id(record.payload),
-                "retained_version": record.retained_version.map(publication_id),
-            })
+            });
+            if let Some(version) = record.retained_version {
+                row["retained_version"] = publication_id(version);
+            }
+            row
         })
         .collect();
     let obligations: Vec<Value> = state
         .obligations
         .iter()
         .map(|(delivery, record)| {
-            json!({
+            let mut row = json!({
                 "publication_id": publication_id(delivery.publication),
                 "index": delivery.index,
                 "session": session(record.target),
@@ -386,11 +389,14 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
                     DeliveryCause::RetainedReplay=>"RetainedReplay",
                 },
                 "effective_qos": qos(record.qos),
-                "retain":record.retain,
                 "phase": match record.phase {
                     ObligationPhase::Pending => "Queued",
                 },
-            })
+            });
+            if record.retain {
+                row["retain"] = json!(true);
+            }
+            row
         })
         .collect();
     let inbound: Vec<Value> = state
@@ -449,7 +455,6 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
         "fences": fences,
         "payloads": payloads,
         "publications": publications,
-        "retained":state.retained.iter().map(|(topic,record)|json!({"topic_hex":hex(topic),"publication_id":publication_id(record.publication),"producer_client_id_hex":hex(&record.producer_client_id)})).collect::<Vec<_>>(),
         "obligations": obligations,
         "inbound_exchanges": inbound,
         "outbound": outbound,
@@ -473,6 +478,9 @@ pub fn snapshot(state: &DurableState, context: SnapshotContext<'_>) -> Value {
             },
         },
     });
+    if !state.retained.is_empty() {
+        document["retained"]=json!(state.retained.iter().map(|(topic,record)|json!({"topic_hex":hex(topic),"publication_id":publication_id(record.publication),"producer_client_id_hex":hex(&record.producer_client_id)})).collect::<Vec<_>>());
+    }
     if let Some(anchor) = state.session_clock {
         document["meta"]["session_clock"] = json!({
             "reading": {
