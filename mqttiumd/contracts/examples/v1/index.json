@@ -103,6 +103,7 @@
     "contracts/examples/v1/valid/toy.transitions.seed-with-hole.json",
     "contracts/examples/v1/valid/wide.catalog.json",
     "contracts/examples/v1/valid/product-profile.json",
+    "contracts/examples/v1/valid/product-hierarchical-transitions.json",
     "contracts/examples/v1/valid/product-pubsub-transitions.json",
     "contracts/examples/v1/valid/product-receipt-transitions.json",
     "contracts/examples/v1/valid/product-pi-transitions.json",
@@ -1993,6 +1994,12 @@
       "code": "schema-violation",
       "pointer": "/session_shutdown_timeout_ms",
       "why": "The configured bound matches the declared runtime queue rather than historical traffic."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-hierarchical-transitions-wrong-decision.json",
+      "code": "schema-violation",
+      "pointer": "/decision",
+      "why": "Hierarchical routing is a descriptive Proposed0031 subset, not a retroactive qualification."
     },
     {
       "file": "contracts/examples/v1/invalid/product-session-transitions-wrong-decision.json",

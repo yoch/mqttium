@@ -496,5 +496,4 @@ jobs:
           path: |
             ${{ runner.temp }}/wildcard-preview/preview/*.tar.gz
             ${{ runner.temp }}/wildcard-preview/preview/*.tar.gz.sha256
-            ${{ runner.temp }}/wildcard-preview/preview-smoke/receipt.json
           if-no-files-found: error

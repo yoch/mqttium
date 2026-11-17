@@ -3456,6 +3456,11 @@ for field, expected in (("closing_input_slots", 32), ("terminal_input_slots", 33
     bad(f"product-profile-wrong-{field}.json", "schema-violation", f"/{field}",
         "The configured bound matches the declared runtime queue rather than historical traffic.",
         {**product_profile, field: expected + 1})
+hierarchical_transitions = json.loads((V1 / "hierarchical.transitions.json").read_text())
+ok("product-hierarchical-transitions.json", hierarchical_transitions)
+bad("product-hierarchical-transitions-wrong-decision.json", "schema-violation", "/decision",
+    "Hierarchical routing is a descriptive Proposed0031 subset, not a retroactive qualification.",
+    {**hierarchical_transitions, "decision": "0030"})
 product_transitions = json.loads((V1 / "pubsub.transitions.json").read_text())
 ok("product-pubsub-transitions.json", product_transitions)
 receipt_transitions = json.loads((V1 / "receipts.transitions.json").read_text())

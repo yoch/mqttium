@@ -23,6 +23,8 @@ output. Durable overflow refuses the complete admission. Volatile overflow
 produces one explicit capacity drop before any attempt. Existing offline and
 output policies then apply to each selected destination. An admitted recipe's
 target set is immutable; resolution and later routing updates never recalculate it.
+The historical LiveExact cause/tag 1 denotes this live routing cut for both exact
+and hierarchical selection; its existing bytes and identity semantics remain.
 
 ## Durable options and ordering
 

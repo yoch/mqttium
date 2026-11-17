@@ -1,0 +1,130 @@
+{
+  "format": "mqttiumd.product-transition-registry",
+  "schema_version": 1,
+  "id": "tcp-hierarchical-routing-v1",
+  "decision": "0031",
+  "scope": "product-system-tests",
+  "partition_complete": false,
+  "description": "Descriptive bounded hierarchical selection and update cut. Existing obligation, volatile emission, lifecycle and receipt machines retain their separate registries; this is not a complete guard partition or fixture-oracle qualification.",
+  "rules": [
+    {
+      "id": "routing.pending.wait",
+      "machine": "Routing",
+      "state_class": "ChangePending",
+      "event_class": "Publish",
+      "guard": "An unresolved subscription mutation holds the routing cut for volatile and durable publications.",
+      "next_state_class": "ChangePending",
+      "required_actions": [
+        "RetainInput"
+      ],
+      "forbidden_actions": [
+        "UseUnconfirmedProjection"
+      ],
+      "reception_groups": [
+        "D",
+        "G"
+      ]
+    },
+    {
+      "id": "routing.durable.selected",
+      "machine": "Routing",
+      "state_class": "Idle",
+      "event_class": "Publish",
+      "guard": "Validated filters; exclude each local No Local contribution, aggregate maximum eligible QoS per current SessionId, canonical order and complete distinct-target budget.",
+      "next_state_class": "Committed",
+      "required_actions": [
+        "FreezeCanonicalTargets",
+        "PersistAdmission"
+      ],
+      "forbidden_actions": [
+        "DuplicateDestination",
+        "RerouteAdmission"
+      ],
+      "reception_groups": [
+        "A",
+        "F",
+        "G"
+      ]
+    },
+    {
+      "id": "routing.durable.overflow",
+      "machine": "Routing",
+      "state_class": "Idle",
+      "event_class": "Publish",
+      "guard": "More than 16 distinct eligible destinations after aggregation; no publication, reference or target subset is admitted.",
+      "next_state_class": "Dropped",
+      "required_actions": [
+        "RefuseCompleteAdmission"
+      ],
+      "forbidden_actions": [
+        "PartialAdmission",
+        "PositivePublicationAck"
+      ],
+      "reception_groups": [
+        "F",
+        "H"
+      ]
+    },
+    {
+      "id": "routing.volatile.selected",
+      "machine": "Routing",
+      "state_class": "Idle",
+      "event_class": "PublishQos0",
+      "guard": "The complete selected destination set fits its target/reference/byte budgets before any volatile record or emission is reserved.",
+      "next_state_class": "Queued",
+      "required_actions": [
+        "ReserveCompleteAttemptSet"
+      ],
+      "forbidden_actions": [
+        "PersistVolatilePublication",
+        "DuplicateDestination"
+      ],
+      "reception_groups": [
+        "A",
+        "C",
+        "F"
+      ]
+    },
+    {
+      "id": "routing.volatile.overflow",
+      "machine": "Routing",
+      "state_class": "Idle",
+      "event_class": "PublishQos0",
+      "guard": "The distinct eligible target set exceeds the complete decision budget.",
+      "next_state_class": "Dropped",
+      "required_actions": [
+        "ObserveCapacityDrop"
+      ],
+      "forbidden_actions": [
+        "PartialEmission",
+        "SilentTruncation"
+      ],
+      "reception_groups": [
+        "F",
+        "H"
+      ]
+    },
+    {
+      "id": "subscription.options.committed",
+      "machine": "SubscriptionMutation",
+      "state_class": "ChangePending",
+      "event_class": "KnownCommit",
+      "guard": "The same correlated UpdateSubscriptions commits a literal replacement or removal. Install all QoS/options changes before the ordered positive acknowledgement becomes eligible.",
+      "next_state_class": "Committed",
+      "required_actions": [
+        "InstallRouteProjection",
+        "EligibleSubscriptionAck"
+      ],
+      "forbidden_actions": [
+        "LoseNoLocal",
+        "RemoveOtherOverlaps",
+        "RewriteExistingObligation"
+      ],
+      "reception_groups": [
+        "B",
+        "D",
+        "G"
+      ]
+    }
+  ]
+}

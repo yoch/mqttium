@@ -67,7 +67,8 @@ const KIND_SUBSCRIPTION_OPTIONS: u8 = 9;
 /// Why an obligation exists. The cause stays inspectable by the oracle.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeliveryCause {
-    /// A live publication matched an exact-topic route.
+    /// A live publication selected the committed routing cut. The historical
+    /// name and byte value also cover aggregated hierarchical subscriptions.
     LiveExact = 1,
 }
 
