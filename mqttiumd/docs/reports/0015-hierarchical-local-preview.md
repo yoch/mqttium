@@ -144,8 +144,8 @@ New contract digest:
 this identity. No historical fingerprint is bypassed.
 
 Local integrated checks: formatting, strict workspace Clippy,995 normal Rust
-and1010 instrumented Rust tests (sequential),228 oracle tests,112 system-pilot
-tests after the event-name regression, corpus/trace regeneration and both schema
+and1010 instrumented Rust tests (sequential),228 oracle tests,114 system-pilot
+tests after the event-name and fresh-Cargo-cache regressions, corpus/trace regeneration and both schema
 readers. Boundary purity checks pass and proof-protected/French-archive files are
 unchanged. Final CI repeats its full gates, K1/K2b/K3 qualifying campaigns,
 receipt/PI/pubsub/session/expiry receptions and all97 model outcomes on its exact
@@ -167,3 +167,9 @@ persistent sessions are not evicted to free capacity. Clock-domain continuity
 remains conservatively unrecognized in current test environments; no new
 wall-clock expiry guarantee is claimed. The single next functional increment is
 [durable retained messages](../reception/retained-next-increment.md).
+
+The initial22425eb8 CI package failed before network reception because fresh
+Cargo download progress on stderr was merged into metadata JSON stdout. The
+subprocess regression requires valid JSON despite progress and keeps diagnostics
+on failure; the fix separates the streams. That tool failure is not counted
+as a negative control. Fresh publication artifacts identify their corrected SHA.

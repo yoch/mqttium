@@ -47,3 +47,10 @@
 - Next: publish with expected remote365af34d SHA lease, verify remote HEAD/tree,
   receive the final exact-SHA CI and fresh K1/K2b/K3/archive evidence, and put
   downloadable normal-preview links and checksums in PR648. Keep draft/unmerged.
+
+- First publication22425eb82343d24c174a5d2623217eff3fdb11be read back with full
+  tree21f9c6d43eb74f93a05ea9df7d39491994663faf; draft retained. CI normal
+  packaging on a fresh cache exposed Cargo download progress merged into
+  metadata stdout. The failed artifact14315990899 belongs to22425, not a
+  routing-invariant detection. A subprocess RED/GREEN separates stderr from
+  machine-readable JSON and retains failure diagnostics; final CI reruns fresh.

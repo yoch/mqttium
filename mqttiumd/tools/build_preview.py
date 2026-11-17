@@ -14,7 +14,7 @@ import tempfile
 
 
 def command(*args: str, cwd: Path | None = None) -> str:
-    return subprocess.check_output(args, cwd=cwd, text=True, stderr=subprocess.STDOUT)
+    return subprocess.check_output(args, cwd=cwd, text=True, stderr=subprocess.PIPE)
 
 
 def build(out: Path, target: Path) -> Path:
