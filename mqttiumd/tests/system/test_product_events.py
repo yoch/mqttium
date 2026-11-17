@@ -33,6 +33,14 @@ class ProductEventStreamTests(unittest.TestCase):
         self.assertEqual(result["files"][0]["sha256"], digest)
         self.assertEqual(result["qualification"], "none")
 
+    def test_qos0_event_name_is_valid_but_a_leading_digit_is_not(self):
+        result, _ = self.run_stream([self.event(kind="qos0_dropped",
+            details={"origin": "volatile/1/1/3", "reason": "no_subscribers", "target": ""})])
+        self.assertEqual(result["status"], "PASS", "qos0_event_name_rejected_by_schema")
+        result, _ = self.run_stream([self.event(kind="0qos_dropped")])
+        self.assertEqual(result["failure"]["code"], "product_event_schema_mismatch")
+        self.assertEqual(result["failure"]["pointer"], "/kind")
+
     def test_generic_lifecycle_command_observations_use_the_published_vocabulary(self):
         event = self.event(kind="command_submitted", command_kind="SessionLifecycle",
                            operation={"incarnation": "1", "epoch": "1", "owner": "0", "sequence": "1"},
