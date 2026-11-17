@@ -1870,11 +1870,12 @@ impl Owner {
         if !self.receipts.enabled
             || self.release_continuation.is_some()
             || !self.receipts.control_available()
-            || !self
+            || !(self
                 .slots
                 .as_slice()
                 .iter()
                 .any(|slot| matches!(slot.state, SlotState::ReleaseRetry(_)))
+                || self.pubsub.has_control_work(self.message_now))
         {
             return Ok(None);
         }
@@ -1908,7 +1909,9 @@ impl Owner {
                         _ => None,
                     })
             else {
-                return Err(IMPOSSIBLE);
+                return Ok(self
+                    .plan_pubsub_control_work(None, draft)?
+                    .unwrap_or(Change::ReleaseYield));
             };
             return self.plan_release(slot, Some(refused), draft);
         }
@@ -2553,7 +2556,10 @@ impl Owner {
             Change::Receipts(change) => self.receipts.apply(change)?,
             Change::Pubsub(change) => self.apply_pubsub(change, input)?,
             Change::Nothing => {}
-            Change::MessageClock(now) => self.message_now = Some(now),
+            Change::MessageClock(now) => {
+                self.message_now = Some(now);
+                self.pubsub.evict_expired_cache(now);
+            }
             Change::Recover => {
                 let Input::Recovery { facts, last } = input else {
                     return Err(STALE);
