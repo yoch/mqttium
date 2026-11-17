@@ -1329,6 +1329,177 @@ pub mod expiry {
         );
     }
 
+    pub fn timed_commands_require_the_current_boot_authority<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        let mut w = World::with_limits(make, limits());
+        clock(&mut w.store, at(0));
+        let foreign = MessageTime {
+            domain: [9; 32],
+            tick: 0,
+        };
+        let bad = expiring(
+            admitted(&w, 1, b"expiry/foreign", b"bad", Qos::AtLeastOnce, &[]),
+            MessageExpiry {
+                observed: foreign,
+                interval: 10,
+            },
+        );
+        assert_eq!(
+            w.store.apply(&bad).reply,
+            StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                RejectReason::PreconditionFailed
+            )),
+            "foreign_admission_authority_was_not_refused"
+        );
+        let good = admitted(&w, 2, b"expiry/value", b"current", Qos::AtLeastOnce, &[]);
+        commit(&mut w.store, &good);
+        let before = w.store.snapshot().unwrap();
+        let bad = timed(
+            subscribe(&w, 3, w.b, 1000, &[(b"expiry/#", Qos::AtMostOnce, 0)]),
+            foreign,
+        );
+        assert_eq!(
+            w.store.apply(&bad).reply,
+            StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                RejectReason::PreconditionFailed
+            )),
+            "foreign_replay_authority_was_not_refused"
+        );
+        let after = w.store.snapshot().unwrap();
+        assert_eq!(before.retained, after.retained);
+        assert_eq!(before.routes, after.routes);
+        assert_eq!(before.obligations, after.obligations);
+    }
+
+    pub fn timed_replay_rejection_reserves_the_full_identity_range<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        let mut l = limits();
+        l.references = References::new(1);
+        let mut w = World::with_limits(make, l);
+        clock(&mut w.store, at(0));
+        let old = expiring(
+            admitted(&w, 1, b"expiry/value", b"old", Qos::AtLeastOnce, &[]),
+            lifetime(100),
+        );
+        let facts = commit(&mut w.store, &old);
+        let before = w.store.snapshot().unwrap();
+        let replay = timed(
+            subscribe(&w, 2, w.b, 1000, &[(b"expiry/#", Qos::AtMostOnce, 0)]),
+            at(1),
+        );
+        assert!(matches!(
+            w.store.apply(&replay).reply,
+            StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                RejectReason::CapacityExceeded(_)
+            ))
+        ));
+        let after = w.store.snapshot().unwrap();
+        assert_eq!(before.routes, after.routes);
+        assert_eq!(before.retained, after.retained);
+        assert_eq!(before.accounts.references, after.accounts.references);
+        let mut collision = expiring(
+            admitted(&w, 3, b"expiry/collision", b"new", Qos::AtLeastOnce, &[]),
+            lifetime(100),
+        );
+        let mut raw = Vec::new();
+        collision.recipe.get().encode_canonical(&mut raw).unwrap();
+        let Recipe::ExpiringPublication(mut value) =
+            Recipe::decode_canonical(&raw, 16, 65535).unwrap()
+        else {
+            panic!()
+        };
+        let ExpiringAdmission::Qos12(a) = &mut value.admission else {
+            panic!()
+        };
+        a.admission.publication = publication_id(w.epoch, 1255);
+        collision.recipe = FrozenRecipe::freeze(Recipe::ExpiringPublication(value)).unwrap();
+        assert_eq!(
+            w.store.apply(&collision).reply,
+            StoreReply::Outcome(StoreOutcome::RejectedCertain(
+                RejectReason::PreconditionFailed
+            )),
+            "rejected_timed_replay_range_reused"
+        );
+        let closure = ReceiptClosure {
+            origin: ReceiptOrigin::of(operation_id(w.epoch, 1)),
+            through: operation_id(w.epoch, 3).sequence(),
+            publication_through: publication_id(w.epoch, 1254).sequence(),
+            payload_through: PayloadSeq::new(3),
+        };
+        assert!(
+            matches!(
+                w.store
+                    .collect_receipts(ReceiptCollection {
+                        closure,
+                        limit: 128
+                    })
+                    .unwrap(),
+                ReceiptCollectionReply::Refused(_)
+            ),
+            "timed_replay_full_range_not_guarded_before_receipt_gc"
+        );
+        assert_eq!(
+            w.store.apply(&old).reply,
+            StoreReply::Outcome(StoreOutcome::Committed(facts))
+        );
+        let closure = ReceiptClosure {
+            publication_through: publication_id(w.epoch, 1255).sequence(),
+            ..closure
+        };
+        assert!(matches!(
+            w.store
+                .collect_receipts(ReceiptCollection {
+                    closure,
+                    limit: 128
+                })
+                .unwrap(),
+            ReceiptCollectionReply::Applied { .. }
+        ));
+        assert_eq!(
+            w.store.apply(&replay).reply,
+            StoreReply::Outcome(StoreOutcome::RetiredOutcomeUnavailable)
+        );
+        assert_eq!(
+            w.store.apply(&old).reply,
+            StoreReply::Outcome(StoreOutcome::RetiredOutcomeUnavailable)
+        );
+        assert_eq!(
+            w.store.snapshot().unwrap().retained,
+            before.retained,
+            "retired_timed_receipt_remutated"
+        );
+    }
+
+    pub fn empty_retained_clear_still_creates_its_live_publication<S: DurableStore>(
+        make: &dyn Fn(StoreIncarnation, Limits) -> S,
+    ) {
+        let mut w = World::with_limits(make, limits());
+        clock(&mut w.store, at(0));
+        let old = admitted(&w, 1, b"expiry/value", b"old", Qos::AtLeastOnce, &[]);
+        commit(&mut w.store, &old);
+        let clear = expiring(
+            admitted(&w, 2, b"expiry/value", b"", Qos::AtLeastOnce, &[w.b]),
+            lifetime(10),
+        );
+        commit(&mut w.store, &clear);
+        let state = w.store.snapshot().unwrap();
+        assert!(state.retained.is_empty());
+        assert_eq!(state.accounts.references.get(), 1);
+        let page = w.store.read_work(w.b, None, 8).unwrap();
+        assert_eq!(
+            page.items.len(),
+            1,
+            "empty_retained_clear_lost_live_delivery"
+        );
+        assert!(page.items.as_slice()[0].payload.is_empty());
+        assert_eq!(page.items.as_slice()[0].expiry, Some(lifetime(10)));
+        let result = w.store.expire_messages(at(10), None, 4).unwrap();
+        assert_eq!(result.removed.len(), 1);
+        assert_eq!(w.store.snapshot().unwrap().accounts.references.get(), 0);
+    }
+
     #[cfg(test)]
     pub fn deterministic_maintenance_respects_the_publication_budget() {
         let mut w = World::with_limits(&MemoryStore::create, limits());
@@ -1373,6 +1544,9 @@ pub mod expiry {
     }
 
     pub fn all<S: DurableStore>(make: &dyn Fn(StoreIncarnation, Limits) -> S) {
+        timed_commands_require_the_current_boot_authority(make);
+        timed_replay_rejection_reserves_the_full_identity_range(make);
+        empty_retained_clear_still_creates_its_live_publication(make);
         expired_retained_values_are_skipped_without_maintenance(make);
         offline_expiry_removes_pending_copies(make);
         frozen_observations_may_precede_latest_checkpoint(make);

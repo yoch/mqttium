@@ -266,3 +266,16 @@ fn maintenance_does_not_read_past_its_publication_budget() {
         "selected_corrupt_expiry_was_hidden"
     );
 }
+
+#[test]
+fn timed_commands_require_the_current_boot_authority() {
+    expiry::timed_commands_require_the_current_boot_authority(&sqlite);
+}
+#[test]
+fn timed_replay_rejection_reserves_the_full_identity_range() {
+    expiry::timed_replay_rejection_reserves_the_full_identity_range(&sqlite);
+}
+#[test]
+fn empty_retained_clear_still_creates_its_live_publication() {
+    expiry::empty_retained_clear_still_creates_its_live_publication(&sqlite);
+}
