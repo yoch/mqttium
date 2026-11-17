@@ -59,6 +59,7 @@ pub(super) struct Delivery {
     target: SessionId,
     revision: Revision,
     qos: Qos,
+    retain: bool,
     claim: Option<DeliveryClaim>,
     topic: Option<SharedBytes>,
     payload: Option<SharedBytes>,
@@ -107,6 +108,7 @@ impl Delivery {
             target,
             revision,
             qos,
+            retain: false,
             claim,
             topic: None,
             payload: None,
@@ -701,6 +703,7 @@ impl Owner {
         let effect = draft.emit(Effect::EmitQos0 {
             connection,
             origin: v.origin,
+            retain: false,
             topic: v.topic.clone(),
             payload: v.payload.clone(),
         })?;
@@ -1367,6 +1370,7 @@ impl Owner {
                 if known.target != item.target
                     || known.revision != item.target_revision
                     || known.qos != item.qos
+                    || (known.topic.is_some() && known.retain != item.retain)
                     || known
                         .topic
                         .as_ref()
@@ -1473,6 +1477,7 @@ impl Owner {
             topic: topic.clone(),
             payload: payload.clone(),
             dup: delivery.may_have_started,
+            retain: delivery.retain,
         })?;
         Ok(Some((effect, connection)))
     }
@@ -1625,6 +1630,7 @@ impl Owner {
                             draft.emit(Effect::EmitQos0 {
                                 connection,
                                 origin,
+                                retain: d.retain,
                                 topic: topic.clone(),
                                 payload: payload.clone(),
                             })?,
@@ -1999,7 +2005,9 @@ impl Owner {
                         if let Some(i) = self.pubsub.delivery(item.delivery) {
                             let d = &mut self.pubsub.deliveries.as_mut_slice()[i];
                             if d.topic.is_none() {
-                                d.topic = Some(item.topic.clone());
+                                d.retain = item.retain;
+                                d.retain = item.retain;
+                            d.topic = Some(item.topic.clone());
                                 d.payload = Some(item.payload.clone());
                             }
                         } else {

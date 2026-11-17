@@ -3227,6 +3227,7 @@ mod tests {
                 | Recipe::ClaimDelivery(_)
                 | Recipe::FinishDelivery(_) => panic!("pubsub command needs its own facts"),
                 Recipe::SessionLifecycle(_) => panic!("lifecycle command needs its own facts"),
+                Recipe::RetainedPublication(_) | Recipe::RetainedQos0(_) | Recipe::ReplaySubscriptions(_) => panic!("retained command needs its own facts"),
                 Recipe::AdmitPublication(admit) => {
                     assert!(command.payload.is_some());
                     CommitFacts::PublicationAdmitted {
@@ -3260,7 +3261,7 @@ mod tests {
                 | CommitFacts::SubscriptionsChanged { .. }
                 | CommitFacts::DeliveryClaimed { .. }
                 | CommitFacts::DeliveryFinished { .. } => RejectReason::PreconditionFailed,
-                CommitFacts::SessionLifecycle(_) => RejectReason::PreconditionFailed,
+                CommitFacts::SessionLifecycle(_) | CommitFacts::RetainedQos0Stored { .. } => RejectReason::PreconditionFailed,
                 CommitFacts::InboundReleased { .. } => RejectReason::Fenced,
                 CommitFacts::PublicationAdmitted { .. } => {
                     RejectReason::CapacityExceeded(Resource::PayloadBytes)
@@ -6913,6 +6914,7 @@ mod tests {
 
     fn work_item(index: u32) -> crate::contract::pubsub::WorkItem {
         crate::contract::pubsub::WorkItem {
+            retain: false,
             delivery: DeliveryId {
                 publication: PublicationId::new(
                     StoreIncarnation::new(INCARNATION),
@@ -7063,6 +7065,9 @@ mod tests {
                 delivery: c.delivery,
                 target: c.target,
             },
+            Recipe::ReplaySubscriptions(c) => CommitFacts::SubscriptionsChanged { session:c.update.session, route_revision:c.update.route_revision.checked_next().unwrap() },
+            Recipe::RetainedQos0(c) => CommitFacts::RetainedQos0Stored { publication:c.publication },
+            Recipe::RetainedPublication(c) => CommitFacts::PublicationAdmitted { publication:c.admission.publication, exchange:c.admission.source.exchange },
             Recipe::UpdateSubscriptions(c) => CommitFacts::SubscriptionsChanged {
                 session: c.session,
                 route_revision: c.route_revision.checked_next().unwrap(),
@@ -9046,4 +9051,18 @@ mod tests {
             "other destinations remain owned"
         );
     }
+    #[test]
+    fn a_product_retained_publish_is_a_durable_admission_even_without_live_subscribers() {
+        let mut world = World::connected();
+        world.owner.lifecycle_enabled = true;
+        let mut input = publish_with(CONN, 7, Qos::AtLeastOnce, b"retained");
+        if let Input::Packet { packet: InboundPacket::Publish { topic, retain, .. }, .. } = &mut input {
+            *topic = bytes(b"retained/new");
+            *retain = true;
+        }
+        world.applied(input);
+        let effects = world.drain();
+        assert!(effects.iter().any(|(_,effect)| matches!(effect,Effect::Persist {command} if matches!(command.recipe.get(),Recipe::RetainedPublication(value) if value.admission.targets.is_empty() && value.admission.retain))), "retained_publish_did_not_enter_durable_admission");
+    }
+
 }
