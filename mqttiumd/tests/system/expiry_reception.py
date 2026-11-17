@@ -50,6 +50,49 @@ def temporal_snapshot(broker):
     return state
 
 
+CLOCK_ORIGIN_STATUSES = frozenset((
+    'boottime_origin_recognized', 'boottime_namespace_unavailable',
+    'boottime_namespace_mismatch', 'boottime_namespace_changed',
+    'boottime_origin_unavailable', 'boottime_origin_limit',
+    'boottime_boot_invalid', 'boottime_boot_changed',
+    'boottime_offset_invalid', 'boottime_offset_missing',
+))
+
+
+def retained_clock_origin(broker, ready):
+    """A startup observation must name the actual committed time authority."""
+    anchors = [event for event in broker.events() if event['kind'] == 'session_clock_anchor']
+    require(len(anchors) == 1, 'expiry_clock_anchor_not_observed')
+    event = anchors[0]
+    require(event['pid'] == broker.process.pid and int(event['seq']) < int(ready['seq']),
+            'expiry_clock_anchor_wrong_startup')
+    durable = temporal_snapshot(broker)['session_clock']
+    details = event.get('details', {})
+    require(all(details.get(key) == durable[key] for key in ('domain', 'tick', 'logical')),
+            'expiry_clock_anchor_not_durable')
+    status = details.get('origin_status')
+    require(isinstance(status, str) and status in CLOCK_ORIGIN_STATUSES,
+            'expiry_clock_origin_status_missing')
+    evidence = {'event': event, 'durable': durable,
+                'origin_recognized': status == 'boottime_origin_recognized',
+                'continuity': 'recognized-domain' if status == 'boottime_origin_recognized'
+                              else 'conservative-process-domain'}
+    broker.observations.record('clock_origin_retained', **evidence)
+    return evidence
+
+
+async def startup_clock_origin(binary, case):
+    broker = Broker(binary, case)
+    try:
+        ready = broker.ready()
+        evidence = retained_clock_origin(broker, ready)
+        broker.stop(); writer_available(broker.db)
+        return {'criterion': 'B-clock-origin', 'status': 'PASS', 'ready': ready,
+                'clock_origin': evidence, 'stop_status': broker.process.returncode}
+    finally:
+        broker.cleanup()
+
+
 def check_policy(row, requested):
     code = 0 if requested in (None, 0) else 1 if requested == INFINITE else 2 + requested
     require(row.get('expiry') == code, 'expiry_policy_not_durable', str(requested))
@@ -114,6 +157,7 @@ async def public_paths(binary, case):
     clients, paths = [], []
     try:
         ready = broker.ready(); cursor = EventCursor(broker)
+        clock_origin = retained_clock_origin(broker, ready)
         for implementation, constructor in (('mqttium', MqttiumSession), ('paho', PahoSession)):
             name = 'expiry-active-' + implementation
             client = constructor(broker.address, name, expiry=1,
@@ -235,7 +279,7 @@ async def public_paths(binary, case):
                 'public_expiry_metadata_not_drained')
         write_json(case / 'durable-final.json', final)
         broker.stop()
-        return {'criterion': 'B', 'status': 'PASS', 'ready': ready, 'paths': paths,
+        return {'criterion': 'B', 'status': 'PASS', 'ready': ready, 'clock_origin': clock_origin, 'paths': paths,
                 'clients': [client.result for client in clients], 'final': final,
                 'stop_status': broker.process.returncode}
     finally:
@@ -705,7 +749,7 @@ def main():
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--binary-source-head', required=True)
-    parser.add_argument('--case', choices=('normal', 'faults', 'B', 'E', 'F', 'unknown', 'crashes', 'corruption'), default='normal')
+    parser.add_argument('--case', choices=('normal', 'faults', 'B', 'E', 'F', 'unknown', 'crashes', 'corruption', 'origin'), default='normal')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     source = Path(__file__).resolve().parents[3]
@@ -722,7 +766,7 @@ def main():
         selected = {'normal': ('B', 'E', 'F', 'corruption'), 'faults': ('unknown', 'crashes')}.get(args.case, (args.case,))
         functions = {'B': public_paths, 'E': shared_responsibilities, 'F': capacity_and_rearming,
                      'unknown': unknown_results, 'crashes': product_crashes,
-                     'corruption': invalid_temporal_image}
+                     'corruption': invalid_temporal_image, 'origin': startup_clock_origin}
         for name in selected:
             receipt['cases'].append(asyncio.run(functions[name](args.binary.resolve(), args.out / name)))
         receipt['status'] = 'PASS'
