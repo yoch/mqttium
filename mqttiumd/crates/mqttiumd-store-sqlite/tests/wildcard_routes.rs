@@ -367,3 +367,25 @@ fn schema_six_is_refused_before_any_existing_content_is_modified() {
     ));
     assert_eq!(std::fs::read(directory.db()).unwrap(), before);
 }
+
+#[test]
+fn oversized_durable_filter_preserves_the_limit_diagnostic_in_both_stores() {
+    use mqttiumd_lab::store::conformance::World;
+    use mqttiumd_lab::store::durable::MemoryStore;
+    use mqttiumd_store_api::{ReadError,RecoveryRefused};
+    let oversized=vec![b'a';limits().max_topic_bytes+1];
+    let directory=Directory::new();
+    let (mut store,session)=setup(&directory.db());
+    assert!(store.apply(&update(session,1,Revision::new(0),b"sensor/+",Some(Qos::AtLeastOnce),0)).committed_now);
+    let raw=rusqlite::Connection::open(directory.db()).unwrap();
+    raw.execute("UPDATE routes SET topic=?1",[oversized.as_slice()]).unwrap();
+    assert_eq!(store.snapshot(),Err(ReadError::LimitExceeded));
+    assert_eq!(store.recover(None,8),Err(RecoveryRefused::Read(ReadError::LimitExceeded)));
+    let world=World::with_limits(&MemoryStore::create,limits());
+    let mut state=world.store.snapshot().unwrap();
+    let targets=state.routes.pop_first().unwrap().1;
+    state.routes.insert(oversized,targets);
+    let store=MemoryStore::reopen(state);
+    assert!(matches!(store.snapshot(),Err(ReadError::LimitExceeded)),"oversized_filter_was_misclassified_as_invalid_data");
+    assert_eq!(store.recover(None,8),Err(RecoveryRefused::Read(ReadError::LimitExceeded)));
+}
