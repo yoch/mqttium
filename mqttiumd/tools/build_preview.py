@@ -107,7 +107,7 @@ def build_pinned(out: Path, target: Path, root: Path, source: str) -> Path:
         "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
         "runtime_dependencies": runtime.splitlines(),
         "execution_verification": "Separate extraction receipt names this exact archive hash",
-        "execution_receipt": "See the separately identified archive extraction smoke and retained reception.",
+        "execution_receipt": "See the separately identified archive extraction smoke and Message Expiry/retained receptions.",
     }
     (package / "BUILD.json").write_text(json.dumps(build_record, indent=2) + "\n")
     sums = []

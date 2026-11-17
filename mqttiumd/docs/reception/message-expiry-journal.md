@@ -107,3 +107,35 @@ refuses regression/domain changes without comparing an old queued observation
 to a newer global watermark. Its122 normal/130hook product tests and both
 Clippy configurations pass in its private worktree. Final source-pinned whole
 reception and workspace gates must now be regenerated on the corrected content.
+
+## Integrated gate and network reception checkpoint
+
+The root default workspace at aa8efdcf passes strict Clippy and1102 Rust tests.
+The subsequent d635dffb instrumented workspace passes strict Clippy and1117tests,
+run after the normal suite. Validator confirms the digest above and16documents.
+Corpus577, second-reader600documents, historical405traces and255oracle tests
+pass without rewriting historical evidence. Independent read-only review of
+d635dffb finds no concrete safety defect in the frozen ingress, early PUBACK,
+Started/uncertain-claim and sweep chain; it explicitly retains the documented
+pre-write sample/physical-departure limitation.
+
+Source-pinned d635dffb receives all9 normal groups (120live matrix cells,
+24offline cells,32valid replay, capacity recovery), its normal restart and all11
+separate own-run SIGKILL cases. Three wildcard and9retained boundary receptions
+also pass at that exact pin, independently under
+`/workspace/message-expiry-old-boundaries-d635-169`. These are system tests.
+The full expiry receipt remains FAIL: its held-admission harness waits8seconds
+while the unchanged product resolution delay is10seconds; its original client
+waiter also expires at5seconds. RED47501ec8/GREEN09a380b3 forwards a bounded15s
+completion budget to the same receipt and waits12s for the same operation's
+real resolution. This is a harness correction, not a broker defect or timeout
+mutation detection. The failed output is preserved at
+`/workspace/message-expiry-final-candidate`.
+
+Strict legacy recipe readers exposed incomplete test fixtures (missing retained
+bitmap/replay identity suffix). Fixture-only9dc8cd49 keeps those readers strict
+and the targeted identity rejection; the full pilot discovery passes169tests
+in that private worktree. Root must run the corrected full expiry reception,
+including held outcome, certain-unsent control and six compiled mutations,
+before recording its reception. All119finite model configurations are being
+checked separately at d635dffb; no final whole-model verdict is claimed yet.
