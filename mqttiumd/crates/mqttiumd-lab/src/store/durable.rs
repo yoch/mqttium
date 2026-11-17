@@ -455,8 +455,10 @@ fn check_inventory_bound(state: &DurableState) -> Result<(), ReadError> {
         rows = rows.checked_add(size).ok_or(ReadError::LimitExceeded)?;
     }
     for (filter, targets) in &state.routes {
-        if filter.len() > state.limits.max_topic_bytes
-            || !mqttiumd_contract::topic::valid_filter(filter)
+        if filter.len() > state.limits.max_topic_bytes {
+            return Err(ReadError::LimitExceeded);
+        }
+        if !mqttiumd_contract::topic::valid_filter(filter)
             || targets.iter().any(|target| {
                 SubscriptionOptions::from_bits(target.options.bits()) != Some(target.options)
             })
