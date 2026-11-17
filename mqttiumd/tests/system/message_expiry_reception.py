@@ -59,7 +59,21 @@ def snapshot(broker, label):
 
 def physically_drained(state):
     require(all(name in state['counts'] for name in BUSINESS), 'message_expiry_business_table_missing')
-    return all(state['counts'][name] == 0 for name in BUSINESS)
+    if not all(state['counts'][name] == 0 for name in BUSINESS):
+        return False
+    meta = state['tables']['meta'][0]
+    return all(meta[name] == '0000000000000000' for name in
+               ('used_payload_bytes', 'used_references', 'used_exchange_slots'))
+
+
+def expiry_stamp(publication):
+    domain = publication.get('expiry_domain')
+    tick = publication.get('expiry_tick')
+    interval = publication.get('expiry_interval')
+    require(isinstance(domain, str) and len(domain) == 64 and int(domain, 16) > 0 and
+            isinstance(tick, str) and len(tick) == 16 and type(interval) is int and
+            0 <= interval <= INFINITE, 'message_expiry_original_stamp_missing')
+    return {'domain': domain, 'tick': str(int(tick, 16)), 'interval': interval}
 
 
 async def until_state(broker, predicate, code, timeout=8):
@@ -267,9 +281,14 @@ async def original_ttl(binary, case):
         peers.append((source, source_tap))
         payload = b'one-original-expiry-for-offline-and-retained'
         started = time.monotonic_ns()
+        marker = max(int(event['seq']) for event in broker.events())
         await source.publish('message-expiry/original/value', payload, 2, retain=True, message_expiry=2)
+        ingress = await received_ingress(broker, 'message-expiry/original/value', marker)
         admitted = await until_state(broker, lambda state: state['counts']['obligations'] == 1 and
                                     state['counts']['retained'] == 1, 'message_expiry_original_not_admitted')
+        stamp = expiry_stamp(admitted['tables']['publications'][0])
+        require(stamp == {key: ingress['details'][key] for key in ('domain', 'tick', 'interval')},
+                'message_expiry_first_ingress_stamp_changed')
         write_json(case / 'original-admitted.sql.json', admitted)
         await asyncio.sleep(1.1)
         target, target_tap = await peer('paho', broker, case, 'original-resumed',
@@ -282,6 +301,10 @@ async def original_ttl(binary, case):
         await newcomer.subscribe((Subscription('message-expiry/original/#', 1),))
         retained_row = await newcomer.receive(payload, 1, True)
         retained_wire = one_delivery(newcomer_tap, payload, 1, True, 1)
+        replayed = snapshot(broker, 'original-after-replays')
+        require(len(replayed['tables']['publications']) == 1 and
+                expiry_stamp(replayed['tables']['publications'][0]) == stamp,
+                'message_expiry_replay_changed_original_stamp')
         final = await until_state(broker, physically_drained, 'message_expiry_original_deadline_was_reset')
         elapsed = time.monotonic_ns() - started
         require(elapsed < 3_000_000_000, 'message_expiry_original_deadline_was_reset', str(elapsed))
@@ -294,6 +317,7 @@ async def original_ttl(binary, case):
         writer_available(broker.db)
         return {'criterion': 'original-ttl', 'status': 'PASS', 'ready': ready,
                 'original_ttl': 2, 'delay_before_replay_seconds': 1.1, 'elapsed_ns': str(elapsed),
+                'ingress': ingress, 'original_durable_stamp': stamp,
                 'offline_delivery': offline_row, 'offline_wire': offline_wire,
                 'retained_delivery': retained_row, 'retained_wire': retained_wire,
                 'expired_counts': final['counts'], 'process_status': broker.process.returncode}

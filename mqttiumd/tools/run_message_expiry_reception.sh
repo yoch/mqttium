@@ -114,6 +114,7 @@ msgexp_run() {
     fi
 }
 msgexp_run normal "$msgexp_python" tests/system/message_expiry_reception.py --binary "$msgexp_out/binaries/mqttiumd-normal" --out "$msgexp_out/normal" --binary-source-head "$msgexp_sha"
+msgexp_run normal-restart "$msgexp_python" tests/system/message_expiry_boundaries.py --case restart --binary "$msgexp_out/binaries/mqttiumd-normal" --out "$msgexp_out/normal-restart" --binary-source-head "$msgexp_sha"
 msgexp_run boundaries "$msgexp_python" tests/system/message_expiry_boundaries.py --binary "$msgexp_out/binaries/mqttiumd-hooks" --out "$msgexp_out/boundaries" --binary-source-head "$msgexp_sha"
 msgexp_run preview-smoke "$msgexp_python" tools/check_preview.py "${msgexp_archives[0]}" "$msgexp_out/preview-smoke"
 msgexp_demo_package=("$msgexp_out"/preview-smoke/extracted/mqttiumd-preview-*)
@@ -127,17 +128,22 @@ PY
 msgexp_run package-demo env MQTTIUMD_DEMO_PORT="$msgexp_demo_port" \
     PATH="${MQTTIUMD_MOSQUITTO_BIN_DIR:+$MQTTIUMD_MOSQUITTO_BIN_DIR:}$PATH" \
     "${msgexp_demo_package[0]}/demo.sh" "$msgexp_out/package-demo"
-msgexp_record product-event-schema-check "$msgexp_python" tools/check_product_event_stream.py "$msgexp_out/normal" "$msgexp_out/boundaries" "$msgexp_out/preview-smoke" "$msgexp_out/package-demo" --out "$msgexp_out/product-event-streams.json"
-"$msgexp_python" tools/check_product_event_stream.py "$msgexp_out/normal" "$msgexp_out/boundaries" "$msgexp_out/preview-smoke" "$msgexp_out/package-demo" --out "$msgexp_out/product-event-streams.json" >"$msgexp_out/product-event-streams.log" 2>&1
+msgexp_record product-event-schema-check "$msgexp_python" tools/check_product_event_stream.py "$msgexp_out/normal" "$msgexp_out/normal-restart" "$msgexp_out/boundaries" "$msgexp_out/preview-smoke" "$msgexp_out/package-demo" --out "$msgexp_out/product-event-streams.json"
+"$msgexp_python" tools/check_product_event_stream.py "$msgexp_out/normal" "$msgexp_out/normal-restart" "$msgexp_out/boundaries" "$msgexp_out/preview-smoke" "$msgexp_out/package-demo" --out "$msgexp_out/product-event-streams.json" >"$msgexp_out/product-event-streams.log" 2>&1
+msgexp_record compiled-negative-controls "$msgexp_python" tests/system/message_expiry_mutants.py "$msgexp_out/mutants"
+MQTTIUMD_MESSAGE_EXPIRY_MUTANT_TARGET_ROOT="${MQTTIUMD_MESSAGE_EXPIRY_MUTANT_TARGET_ROOT:-$msgexp_targets/mutants}" \
+    "$msgexp_python" tests/system/message_expiry_mutants.py "$msgexp_out/mutants" >"$msgexp_out/mutants.log" 2>&1
 "$msgexp_python" - "$msgexp_out" "$msgexp_sha" "${#msgexp_trace[@]}" <<'PY'
 from pathlib import Path
-import hashlib,json,sys
+import hashlib,json,re,sys
 out=Path(sys.argv[1]);source=sys.argv[2]
 normal=json.loads((out/'normal/receipt.json').read_text())
 boundaries=json.loads((out/'boundaries/receipt.json').read_text())
+restart=json.loads((out/'normal-restart/receipt.json').read_text())
+mutants=json.loads((out/'mutants/result.json').read_text())
 smoke=json.loads((out/'preview-smoke/receipt.json').read_text())
 streams=json.loads((out/'product-event-streams.json').read_text())
-for name,receipt in [('normal',normal),('boundaries',boundaries)]:
+for name,receipt in [('normal',normal),('normal-restart',restart),('boundaries',boundaries)]:
     if receipt['status']!='PASS' or receipt['source_head']!=source or receipt['harness_source_head']!=source:
         raise SystemExit(f'{name} source/verdict differs')
     if hashlib.sha256(Path(receipt['binary']['path']).read_bytes()).hexdigest()!=receipt['binary']['sha256']:
@@ -149,8 +155,33 @@ if len(cases['matrix']['cells'])!=120 or len(cases['offline']['cells'])!=24 or c
     raise SystemExit('Message Expiry matrix, offline cells or valid replay incomplete')
 if len(cases['late-puback']['cases'])!=2 or len(cases['malformed']['cases'])!=24:
     raise SystemExit('real late PUBACK or malformed-property coverage incomplete')
-if not boundaries['cases'] or not any(row.get('kill_status')==-9 for row in boundaries['cases']):
-    raise SystemExit('own SIGKILL boundary evidence required')
+required={'transfer-claim','transfer-prepared','transfer-committed','sweep-prepared','sweep-committed',
+          'normal-restart',*(f'recipe-{kind}-{phase}' for kind in ('qos1','qos0','replay')
+                             for phase in ('prepared','committed'))}
+if {row['criterion'] for row in boundaries['cases']}!=required:
+    raise SystemExit('timed admission/replay, claim/start, physical sweep and restart boundaries required')
+kills=[row for row in boundaries['cases'] if row.get('kill_status')==-9]
+if len(kills)!=11 or len({row['killed_pid'] for row in kills})!=11:
+    raise SystemExit('eleven distinct own SIGKILL boundary runs required')
+kernel_kills=[]
+if int(sys.argv[3]):
+    trace=(out/'boundaries.strace').read_text()
+    for row in kills:
+        pid=row['killed_pid']
+        if re.search(rf'kill\({pid}, SIGKILL\)\s+= 0',trace) is None:
+            raise SystemExit(f'own SIGKILL for {pid} not present in the same-run kernel witness')
+        kernel_kills.append({'criterion':row['criterion'],'pid':pid,'signal':'SIGKILL'})
+if (restart['cases'][0]['criterion']!='normal-restart' or restart['binary']['sha256']!=normal['binary']['sha256']):
+    raise SystemExit('normal restart must execute the exact normal package bytes')
+expected_controls={'replay-refreshes-ttl','stale-retained-emission','expiry-frees-started-payload',
+                   'offline-expiry-ignored','outgoing-expiry-property-corrupt','unknown-continuity-fresh'}
+if (mutants['status']!='PASS' or mutants['source_head']!=source or not mutants['restored']
+        or len(mutants['controls'])!=6 or {row['name'] for row in mutants['controls']}!=expected_controls
+        or not all(row['detected'] and row['restored'] and row['positive_executed'] and row['mutant_executed']
+            and row['positive_binary']['sha256']!=row['mutant_binary']['sha256'] and row['positive_status']==0
+            and row['mutant_status']==101 and row['observed_reason']==row['expected_reason']
+            for row in mutants['controls'])):
+    raise SystemExit('six compiled controls must detect their stated properties and restore source')
 if (smoke['status']!='PASS' or smoke['source_sha']!=source
         or smoke['binary_sha256']!=normal['binary']['sha256']):
     raise SystemExit('archive smoke and Message Expiry reception must execute identical normal bytes')
@@ -163,11 +194,15 @@ index={'format':'mqttiumd.message-expiry-system-reception-index','schema_version
                 'original-deadline-and-decremented-wire-property','RH-RAP-NoLocal',
                 '32-valid-retained-values-replayed','real-started-Q1-PUBACK-after-TTL',
                 'duplicate-and-malformed-property-rejection','own-SIGKILL-boundaries',
-                'normal-preview-archive-and-packaged-public-demo'],
+                'normal-preview-archive-and-packaged-public-demo','six-compiled-negative-controls'],
        'source_pin':json.loads((out/'source-pin.json').read_text()),
        'source_archive':{'path':'source.tar','sha256':hashlib.sha256((out/'source.tar').read_bytes()).hexdigest()},
        'normal':{'receipt':'normal/receipt.json','binary':normal['binary']},
+       'normal_restart':{'receipt':'normal-restart/receipt.json','same_normal_binary':True},
        'boundaries':{'receipt':'boundaries/receipt.json','binary':boundaries['binary']},
+       'own_sigkill':{'count':len(kills),'same_run_kernel_kills':kernel_kills},
+       'negative_controls':{'result':'mutants/result.json','restored':True,
+                            'reasons':[row['expected_reason'] for row in mutants['controls']]},
        'product_event_schema':{'result':'product-event-streams.json','product_events':streams['product_events'],
                                'stream_files':len(streams['files']),'scope':'strict-json-and-schema-only'},
        'preview':{'receipt':'preview-smoke/receipt.json','archive_sha256':smoke['archive_sha256'],

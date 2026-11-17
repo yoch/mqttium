@@ -63,13 +63,20 @@ class IndependentMessageExpiryFrames(unittest.TestCase):
                 publish_packet('t', b'v', **options)
 
     def test_absence_requires_every_physical_business_reference_to_be_reclaimed(self):
-        state = {'counts': dict.fromkeys(BUSINESS, 0)}
+        accounts = dict.fromkeys(('used_payload_bytes', 'used_references', 'used_exchange_slots'),
+                                 '0000000000000000')
+        state = {'counts': dict.fromkeys(BUSINESS, 0), 'tables': {'meta': [accounts]}}
         self.assertTrue(physically_drained(state))
         for name in BUSINESS:
             with self.subTest(name=name):
                 state['counts'][name] = 1
                 self.assertFalse(physically_drained(state))
                 state['counts'][name] = 0
+        for name in accounts:
+            with self.subTest(account=name):
+                accounts[name] = '0000000000000001'
+                self.assertFalse(physically_drained(state))
+                accounts[name] = '0000000000000000'
         del state['counts']['retained']
         with self.assertRaisesRegex(ReceiptFailure, 'message_expiry_business_table_missing'):
             physically_drained(state)
