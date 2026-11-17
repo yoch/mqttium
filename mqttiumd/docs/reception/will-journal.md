@@ -47,3 +47,20 @@ session, no invented publication), retaining a separate valid unsupported0x80
 reason refusal. The public normal matrix was actually rerun and passed.
 New digest: sha256:57b2d617cf8369b2c6fe14325f328b6378aafc98155f47a3568da20528448151.
 Final source must run fresh campaigns after this reader identity change.
+
+The clean96db7b34 Will launcher and CI Will job both passed: normal7 groups,
+six own-process SIGKILL cuts, four genuine unknown-result cases, six compiled
+negative controls and the extracted Mosquitto sensor demo. Two other CI gates
+exposed test tooling issues, retained as failures rather than detections:
+the old detachment mutant no longer applied around EndWill, and an external
+corruption UPDATE raced the writer's maintenance transaction. The mutant now
+changes only the same deadline predicate on the current source. The corruption
+probe arms a one-shot work.read.before barrier on the actual writer, outside
+any SQLite transaction; normal builds expose neither this option nor the hook.
+Its real run reached the barrier, observed quick_check=ok, refused InvalidData
+in Work, exited2, released the writer, and refused the same file on restart
+with InvalidData in Snapshot. No Unavailable/SQLITE_BUSY result is accepted.
+The new injection point is documented and included in the derived example.
+Contract digest: sha256:65345f213724ab31e29e5d5b24bbb310ba6e7d2b346a91d9d7c6cb741fec012f.
+Next: receive the four finite-expiry compiled controls, publish this correction
+with an expected96db7b34 lease, then download and execute the final CI preview.

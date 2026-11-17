@@ -48,6 +48,7 @@ fn parse_arguments(mut args: impl Iterator<Item = String>) -> Result<Config, &'s
                         "message.expire.committed",
                         "receipt.close.prepared",
                         "receipt.close.committed",
+                        "work.read.before",
                         "will.admission.prepared",
                         "will.admission.committed",
                         "will.end.prepared",
@@ -121,6 +122,7 @@ mod tests {
             "session.detach.committed",
             "session.expire.prepared",
             "session.expire.committed",
+            "work.read.before",
         ];
         let arguments = |value: String| {
             [

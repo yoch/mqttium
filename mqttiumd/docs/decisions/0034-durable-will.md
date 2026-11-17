@@ -72,3 +72,10 @@ historical structured OperationId form. Infinite detachment omits the deadline;
 legacy null is readable. Finite detachment still requires its checked deadline.
 This extends diagnostic representation, not canonical command meaning, the
 40-field record limit, or independent fixture qualification.
+
+The instrumented product additionally declares `work.read.before`: a one-shot,
+explicitly armed barrier outside any SQLite transaction in the exclusive writer,
+used solely for the inherited live-corruption regression. The parent commits
+its artificial invalid row before releasing the actual bounded Work read.
+This prevents SQLITE_BUSY from being mistaken for the required InvalidData
+proof. Normal builds expose neither the control option nor the hook.

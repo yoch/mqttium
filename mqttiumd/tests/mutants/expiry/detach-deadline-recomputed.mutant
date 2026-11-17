@@ -1,10 +1,8 @@
-diff --git a/mqttiumd/crates/mqttiumd-core/src/owner/sessions.rs b/mqttiumd/crates/mqttiumd-core/src/owner/sessions.rs
-index 6ae4e5a0..f60bd4bd 100644
 --- a/mqttiumd/crates/mqttiumd-core/src/owner/sessions.rs
 +++ b/mqttiumd/crates/mqttiumd-core/src/owner/sessions.rs
-@@ -673,7 +673,7 @@ impl Owner {
-             ) => {
+@@ -797,7 +797,7 @@
                  session == guard.session
+                     && *expiry != SessionExpiry::OnDisconnect
                      && reported == *expiry
 -                    && expiry.deadline(*observed_at) == Some(detached.deadline)
 +                    && expiry.deadline(*observed_at).is_some()

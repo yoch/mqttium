@@ -700,7 +700,7 @@ def credits(binary: Path, case: Path) -> dict:
 
 
 def corrupt_live_work(binary: Path, case: Path) -> dict:
-    broker = Broker(binary, case)
+    broker = Broker(binary, case, pauses=("work.read.before",))
     restarted = None
     topic = "reception/qos0/corrupt-work"
     try:
@@ -714,15 +714,18 @@ def corrupt_live_work(binary: Path, case: Path) -> dict:
         publish(broker, case, "corrupt-source", "mqttium", topic, b"durable-before-corruption", 1)
         before = durable(broker.db)
         require(len(obligations(before)) == 1 and not before["tables"]["outbound"], "corruption_requires_unclaimed_obligation")
-        with sqlite3.connect(broker.db, timeout=.25) as db:
-            changed = db.execute("UPDATE obligations SET qos=99").rowcount
-            db.commit()
-            require(changed == 1 and db.execute("PRAGMA quick_check").fetchone()[0] == "ok", "corruption_image_not_physically_sound")
+        (broker.control / "arm-work-read").touch(exist_ok=False)
         with PubsubWire(broker.address, broker.observations, "corrupt-resumed") as subscriber:
-            try:
-                subscriber.connect("corrupt-subscriber", session_present=True)
-            except ReceiptFailure as error:
-                require(error.code in ("peer_closed", "probe_truncated"), "unexpected_corruption_connect_failure", error.code)
+            subscriber.connect("corrupt-subscriber", session_present=True)
+            barrier = broker.wait_event("barrier_hit", point="work.read.before")
+            # The actual writer acknowledges an outside-transaction read
+            # boundary. Commit the artificial mutation before releasing it;
+            # SQLite BUSY is never counted as InvalidData detection.
+            with sqlite3.connect(broker.db, timeout=.25) as db:
+                changed = db.execute("UPDATE obligations SET qos=99").rowcount
+                db.commit()
+                require(changed == 1 and db.execute("PRAGMA quick_check").fetchone()[0] == "ok", "corruption_image_not_physically_sound")
+            broker.release("work.read.before")
             deadline = time.monotonic() + 2
             while broker.process.poll() is None and time.monotonic() < deadline:
                 time.sleep(.005)
@@ -750,6 +753,7 @@ def corrupt_live_work(binary: Path, case: Path) -> dict:
         writer_available(broker.db)
         return {"criterion": "R-read-domain", "status": "PASS", "quick_check": "ok",
                 "intervention": "isolated after-readiness obligations.qos=99 without a claim",
+                "writer_read_barrier": barrier,
                 "runtime_failure": failure[-1], "runtime_exit": status,
                 "startup_failure": errors[-1], "startup_exit": restarted_status,
                 "writer_released": True}

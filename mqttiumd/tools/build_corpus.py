@@ -4011,6 +4011,8 @@ for point in ("will.admission.prepared", "will.admission.committed", "will.end.p
     ok("product-hook-" + point.replace(".", "-") + ".json", env("mqttiumd.product-event", seq="1", pid=1,
         kind="barrier_hit", operation=will_id, point=point,
         command_kind="WillAdmission" if ".admission." in point else "WillEnd"))
+ok("product-hook-work-read-before.json", env("mqttiumd.product-event", seq="1", pid=1,
+    kind="barrier_hit", point="work.read.before", details={"session":"4", "effect":"1/0/26"}))
 for field in ("will", "will_qos", "will_retain", "will_delay_interval", "will_message_expiry",
               "max_will_intents", "max_will_bytes", "max_will_topic_bytes", "max_will_payload_bytes"):
     bad("product-profile-wrong-" + field + ".json", "schema-violation", "/" + field,

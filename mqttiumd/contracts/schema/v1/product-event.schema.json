@@ -98,7 +98,8 @@
         "will.admission.prepared",
         "will.admission.committed",
         "will.end.prepared",
-        "will.end.committed"
+        "will.end.committed",
+        "work.read.before"
       ]
     },
     "command_kind": {

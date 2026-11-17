@@ -191,6 +191,7 @@
     "contracts/examples/v1/valid/product-hook-will-admission-committed.json",
     "contracts/examples/v1/valid/product-hook-will-end-prepared.json",
     "contracts/examples/v1/valid/product-hook-will-end-committed.json",
+    "contracts/examples/v1/valid/product-hook-work-read-before.json",
     "contracts/examples/v1/valid/product-will-detached-infinite-diagnostic.json",
     "contracts/examples/v1/valid/product-will-detached-finite-diagnostic.json"
   ],

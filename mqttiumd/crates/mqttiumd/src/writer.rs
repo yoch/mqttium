@@ -684,11 +684,42 @@ fn business_response(
                     session,
                     after,
                     limit,
-                } => Response::Work {
-                    effect,
-                    session,
-                    result: store.read_work(session, after, limit as usize),
-                },
+                } => {
+                    // A one-shot corruption-control barrier, before any read
+                    // transaction. The exclusive writer is idle here: an
+                    // external test mutation cannot race maintenance's BEGIN.
+                    #[cfg(feature = "test-hooks")]
+                    {
+                        let armed = hooks.directory.as_ref().is_some_and(|directory| {
+                            consume_file(&directory.join("arm-work-read"))
+                        });
+                        if armed
+                            && hooks
+                                .barrier_fields(
+                                    "work.read.before",
+                                    json!({"point":"work.read.before","details":{
+                                        "session":session.get().to_string(),
+                                        "effect":format!("{}/{}/{}",effect.epoch.get(),effect.owner.get(),effect.sequence.get())
+                                    }}),
+                                    events,
+                                    cancel,
+                                )
+                                .is_err()
+                        {
+                            cancel.store(true, Ordering::Relaxed);
+                            return Response::Work {
+                                effect,
+                                session,
+                                result: Err(ReadError::Unavailable),
+                            };
+                        }
+                    }
+                    Response::Work {
+                        effect,
+                        session,
+                        result: store.read_work(session, after, limit as usize),
+                    }
+                }
                 _ => {
                     cancel.store(true, Ordering::Relaxed);
                     Response::Stopped
