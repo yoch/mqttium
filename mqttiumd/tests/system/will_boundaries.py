@@ -87,11 +87,14 @@ async def seed(binary, case):
         wire = WillWire(setup.address, setup.observations, 'setup-dashboard')
         wire.session_connect(TARGET, expected_present=False)
         wire.subscribe_options(1, (Subscription('will/cut/#', 1),))
+        marker = max(int(row['seq']) for row in setup.events())
         wire.send(b'\xe0\x00')
         wire.close()
-        state = await until_state(setup, lambda value: any(
-            row['client_id'] == TARGET.encode().hex() and row['detached_by'] is not None
-            for row in value['tables']['sessions']), 'will_setup_dashboard_not_detached')
+        await fact(setup, 'connection_closed', after=marker,
+                   predicate=lambda row: row.get('details', {}).get('code') == 'client_disconnect')
+        state = durable(setup.db)
+        require(state['counts']['sessions'] == state['counts']['routes'] == 1,
+                'will_setup_dashboard_session_or_subscription_missing')
         write_json(case / 'setup.sql.json', state)
         setup.stop()
         writer_available(setup.db)

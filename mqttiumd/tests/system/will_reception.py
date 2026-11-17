@@ -360,6 +360,165 @@ async def takeover(binary, case):
             broker.cleanup()
 
 
+async def fanout_pressure(binary, case):
+    """Seventeen eligible sessions defer the complete Will; sixteen later progress."""
+    broker = Broker(binary, case)
+    targets, source = [], None
+    levels = [f'level{index:02}' for index in range(16)]
+    payload, topic = b'pending-will-survives-fanout-pressure', 'will/pressure/' + '/'.join(levels)
+    try:
+        broker.ready()
+        for index in range(17):
+            wire = WillWire(broker.address, broker.observations, f'pressure-target-{index:02}')
+            targets.append(wire)
+            wire.session_connect(f'pressure-target-{index:02}', expected_present=False)
+            # The per-literal-filter cap16 remains useful. Distinct overlapping
+            # filters exercise the aggregate fanout limit without evading it.
+            pattern = 'will/pressure/#' if index == 16 else 'will/pressure/' + '/'.join(
+                '+' if at == index else level for at, level in enumerate(levels))
+            wire.subscribe_options(1, (Subscription(pattern, 1),))
+            marker = max(int(event['seq']) for event in broker.events())
+            wire.send(b'\xe0\x00')
+            wire.close()
+            await asyncio.to_thread(broker.wait_event, 'connection_closed', after=marker)
+        source = WillWire(broker.address, broker.observations, 'pressure-source')
+        source.will_connect('pressure-source', topic, payload, expiry=0)
+        source.close()
+        pending = await until_state(broker, lambda state: len(state['tables']['wills']) == 1
+                                   and state['tables']['wills'][0]['state'] == 2,
+                                   'will_pressure_intent_was_lost')
+        pending_will = pending['tables']['wills'][0]
+        deferred_fact = await asyncio.to_thread(broker.wait_event, 'will_deferred')
+        require(operation_hex(deferred_fact['operation']) == pending_will['id']
+                and deferred_fact['details'].get('code') == 'fanout_capacity'
+                and deferred_fact['details'].get('durable_intention_preserved') is True,
+                'will_pressure_refusal_not_observable')
+        pending = durable(broker.db)
+        require(all(pending['counts'][name] == 0 for name in
+                    ('obligations', 'outbound', 'publications', 'payloads')),
+                'will_fanout_was_silently_truncated')
+        # Existing connection quota16 is unchanged. Most destinations remain
+        # offline; one independently resumed client proves control progress.
+        control = WillWire(broker.address, broker.observations, 'pressure-control')
+        targets.append(control)
+        control.session_connect('pressure-target-00', expected_present=True)
+        control.no_publication(.05, code='will_partial_fanout_before_capacity')
+        control.send(b'\xc0\x00')
+        require(control.wait(0xD0).body == b'', 'will_pressure_blocked_ping')
+        still_pending = durable(broker.db)
+        require(still_pending['tables']['wills'] == [pending_will]
+                and not still_pending['tables']['obligations'],
+                'will_pressure_changed_or_discarded_intent')
+        write_json(case / 'fanout17-pending.sql.json', still_pending)
+        unsubscribe = WillWire(broker.address, broker.observations, 'pressure-unsubscribe')
+        targets.append(unsubscribe)
+        unsubscribe.session_connect('pressure-target-16', expected_present=True)
+        unsubscribe.unsubscribe(2, ['will/pressure/#'])
+        unsubscribe.no_publication(.04, code='will_unsubscribed_target_selected')
+        unsubscribe.send(b'\xe0\x00')
+        unsubscribe.close()
+        deliveries = []
+        for index in range(16):
+            wire = control
+            if index:
+                wire = WillWire(broker.address, broker.observations, f'pressure-resumed-{index:02}')
+                targets.append(wire)
+                wire.session_connect(f'pressure-target-{index:02}', expected_present=True)
+            value = wire.next_publication(timeout=8)
+            deliveries.append(assert_will_frame(value, topic, payload))
+            wire.acknowledge(value)
+            wire.send(b'\xe0\x00')
+            wire.close()
+        final = await drained(broker)
+        require(final['counts']['wills'] == 0 and all(final['counts'][name] == 0
+                for name in ('publications', 'payloads')), 'will_pressure_resources_not_reclaimed')
+        admitted = [event for event in broker.events() if event['kind'] == 'will_admitted']
+        require(len(admitted) == 1 and operation_hex(admitted[0]['will']) == pending_will['id']
+                and admitted[0]['details']['targets'] == 16,
+                'will_pressure_recovery_changed_occurrence_or_fanout')
+        deferred = [event for event in broker.events() if event['kind'] == 'will_deferred']
+        require(deferred and any(operation_hex(event['operation']) == pending_will['id']
+                and event['details'].get('code') == 'fanout_capacity'
+                and event['details'].get('durable_intention_preserved') is True for event in deferred),
+                'will_pressure_refusal_not_observable')
+        write_json(case / 'durable-final.json', final)
+        for wire in targets:
+            wire.close()
+        broker.stop()
+        return {'group': 'E-fanout-pressure', 'status': 'PASS', 'initial_destinations': 17,
+                'final_destinations': 16, 'pending_will': pending_will['id'],
+                'retained_pending_counts': still_pending['counts'], 'deferred': deferred,
+                'admitted': admitted[0], 'deliveries': deliveries, 'final_counts': final['counts'],
+                'broker_pid': broker.process.pid, 'broker_status': broker.process.returncode}
+    finally:
+        for wire in [*targets, source]:
+            if wire:
+                wire.close()
+        broker.cleanup()
+
+
+async def no_local(binary, case):
+    """No Local filters contributions, preserving an eligible QoS0 overlap."""
+    broker = Broker(binary, case)
+    clients, wires = [], []
+    try:
+        broker.ready()
+        dashboard, tap = await peer('paho', broker, case, 'options-dashboard')
+        clients.append((dashboard, tap))
+        await dashboard.subscribe((Subscription('will/options/#', 1),))
+        rows = []
+        for overlap in (False, True):
+            label = 'scope' if overlap else 'excluded'
+            client_id = 'will-options-' + label
+            topic, payload = 'will/options/' + label, ('offline-' + label).encode()
+            source = WillWire(broker.address, broker.observations, client_id)
+            wires.append(source)
+            source.will_connect(client_id, topic, payload)
+            values = [Subscription('will/options/#', 1, no_local=True)]
+            if overlap:
+                values.append(Subscription(topic, 0, no_local=False))
+            source.subscribe_options(1, tuple(values))
+            state = durable(broker.db)
+            source_id = session_key(state, client_id)
+            source.close()
+            other_received = await dashboard.receive(payload, 1, False)
+            pending = await until_state(broker, lambda state: state['counts']['wills'] == 0
+                                        and not state['tables']['outbound'],
+                                        'will_no_local_admission_not_finished')
+            own = [row for row in pending['tables']['obligations'] if row['target'] == source_id]
+            require(len(own) == int(overlap) and all(row['qos'] == 0 for row in own),
+                    'will_no_local_contribution_or_max_qos_wrong')
+            resumed = WillWire(broker.address, broker.observations, client_id + '-resumed')
+            wires.append(resumed)
+            resumed.session_connect(client_id, expected_present=True)
+            own_received = None
+            if overlap:
+                value = resumed.next_publication(timeout=8)
+                require(value.payload == payload and value.qos == 0 and not value.retain,
+                        'will_no_local_applied_to_entire_session')
+                own_received = value.observation()
+            resumed.no_publication(.1, code='will_no_local_ignored')
+            resumed.send(b'\xe0\x00')
+            resumed.close()
+            final = await drained(broker)
+            rows.append({'overlapping_eligible_qos0': overlap, 'source_session': source_id,
+                         'other_received': other_received, 'own_received': own_received,
+                         'own_pending': own, 'counts': final['counts']})
+        write_json(case / 'durable-final.json', final)
+        await close_peers(clients)
+        clients.clear()
+        broker.stop()
+        return {'group': 'E-no-local', 'status': 'PASS', 'cases': rows,
+                'broker_pid': broker.process.pid, 'broker_status': broker.process.returncode}
+    finally:
+        for wire in wires:
+            wire.close()
+        try:
+            await close_peers(clients)
+        finally:
+            broker.cleanup()
+
+
 async def public_sensor(binary, case, sensor_kind, dashboard_kind):
     """The first end-to-end milestone, with explicit client and wire facts."""
     broker = Broker(binary, case)
@@ -447,12 +606,14 @@ async def main_async(arguments):
     require(binary.is_file(), 'will_broker_binary_missing')
     result = {'source_revision': arguments.source, 'binary_path': str(binary),
               'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
-              'features': [], 'scope': 'normal product system test; not qualifying',
+              'features': ['test-hooks'] if arguments.instrumented else [],
+              'scope': ('instrumented' if arguments.instrumented else 'normal') +
+                       ' product system test; not qualifying',
               'client_source': client_identity(), 'cases': [], 'status': 'RUNNING'}
     try:
         groups = arguments.groups.split(',')
         require(groups and len(groups) == len(set(groups))
-                and set(groups) <= {'public', 'triggers', 'responsibilities', 'takeover'},
+                and set(groups) <= {'public', 'triggers', 'responsibilities', 'takeover', 'capacity', 'options'},
                 'will_unknown_or_repeated_group')
         if 'public' in groups:
             roles = [('mqttium', 'paho'), ('paho', 'mqttium')]
@@ -464,7 +625,7 @@ async def main_async(arguments):
                 write_json(case / 'result.json', value)
                 result['cases'].append(value)
         for group, action in (('triggers', triggers), ('responsibilities', shared_responsibilities),
-                              ('takeover', takeover)):
+                              ('takeover', takeover), ('capacity', fanout_pressure), ('options', no_local)):
             if group in groups:
                 case = arguments.output / group
                 value = await action(binary, case)
@@ -487,7 +648,9 @@ def main():
     parser.add_argument('--source', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--roles', choices=('both', 'mqttium-sensor', 'paho-sensor'), default='both')
-    parser.add_argument('--groups', default='public,triggers,responsibilities,takeover')
+    parser.add_argument('--groups', default='public,triggers,responsibilities,takeover,capacity,options')
+    parser.add_argument('--instrumented', action='store_true',
+                        help='record test-hooks for an explicitly supplied development binary')
     arguments = parser.parse_args()
     return asyncio.run(main_async(arguments))
 
