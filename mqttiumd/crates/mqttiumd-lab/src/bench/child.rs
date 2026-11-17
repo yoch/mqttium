@@ -137,6 +137,21 @@ pub(crate) struct KillAttempt {
 /// dropped, whether the child started or not.
 struct SocketDirectory(PathBuf);
 
+impl SocketDirectory {
+    fn create(rank: u64, records: u64) -> Result<Self, Stop> {
+        let path = std::env::temp_dir().join(format!(
+            "mqttiumd-child-{}-{rank}-{records}",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|error| stop(format!("{}: {error}", path.display())))?;
+        Ok(Self(path))
+    }
+}
+
 impl Drop for SocketDirectory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -249,17 +264,7 @@ impl Child {
         collector: &mut Collector,
         books: &mut Books,
     ) -> Result<(Self, Vec<String>), Stop> {
-        let sockets = std::env::temp_dir().join(format!(
-            "mqttiumd-child-{}-{rank}-{}",
-            std::process::id(),
-            collector.count()
-        ));
-        let _ = std::fs::remove_dir_all(&sockets);
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&sockets)
-            .map_err(|error| stop(format!("{}: {error}", sockets.display())))?;
-        let sockets = SocketDirectory(sockets);
+        let sockets = SocketDirectory::create(rank, collector.count())?;
         let mut listeners = Vec::new();
         for origin in CHILD_ORIGINS {
             let path = sockets.0.join(format!("{}.sock", origin.name()));
@@ -1572,5 +1577,38 @@ pub fn serve(arguments: &Arguments) -> Result<(), String> {
         if stopping {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod socket_directory_tests {
+    use super::*;
+
+    #[test]
+    fn factories_with_the_same_rank_and_record_count_keep_independent_socket_directories() {
+        // Two factories have the same parent process, rank and initial trace
+        // count even when their Config/campaigns and children are independent.
+        // These are precisely the naming inputs Child::spawn supplies.
+        let first = SocketDirectory::create(0, 1).unwrap();
+        let first_socket = first.0.join("broker-core.sock");
+        let _first_listener = UnixListener::bind(&first_socket).unwrap();
+        let second = SocketDirectory::create(0, 1).unwrap();
+        let second_socket = second.0.join("broker-core.sock");
+        let _second_listener = UnixListener::bind(&second_socket).unwrap();
+        assert!(first_socket.exists(), "second_factory_removed_first_socket");
+        assert_ne!(first.0, second.0, "factories_reused_socket_directory");
+        let second_path = second.0.clone();
+        drop(first);
+        assert!(
+            second_path.is_dir(),
+            "first_cleanup_removed_second_directory"
+        );
+        UnixStream::connect(&second_socket)
+            .expect("the second factory's socket survives first cleanup");
+        drop(second);
+        assert!(
+            !second_path.exists(),
+            "owned_socket_directory_was_not_cleaned"
+        );
     }
 }
