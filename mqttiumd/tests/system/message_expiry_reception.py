@@ -11,6 +11,7 @@ import subprocess
 import time
 
 from external_message_expiry import MqttiumMessageExpiry, PahoMessageExpiry, PacketTap
+from external_mqttium import client_identity
 from external_sessions import INFINITE
 from external_wildcard import Subscription
 from pubsub_probe import durable
@@ -34,12 +35,20 @@ async def peer(kind, broker, case, label, *, client_id=None, present=False, sess
     return client, tap
 
 
-async def close_peers(values):
+async def close_peers(values, *, cleanup=False):
+    failures = []
     for client, tap in values:
         try:
             await client.disconnect()
+        except Exception as error:
+            failures.append(error)
         finally:
-            tap.close()
+            try:
+                tap.close()
+            except Exception as error:
+                failures.append(error)
+    if failures and not cleanup:
+        raise failures[0]
 
 
 def snapshot(broker, label):
@@ -76,6 +85,458 @@ def one_delivery(tap, payload, qos, retain, expiry):
             value.message_expiry_interval is not None and 0 < value.message_expiry_interval <= expiry,
             'message_expiry_wire_interval_wrong', repr(value.observation()))
     return value.observation()
+
+
+def ingress_events(broker, *, after=-1, topic=None):
+    values = [event for event in broker.events() if event['kind'] == 'message_expiry_received'
+              and int(event['seq']) > after]
+    return values if topic is None else [event for event in values if event['details'].get('topic') == topic]
+
+
+async def received_ingress(broker, topic, after):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        values = ingress_events(broker, after=after, topic=topic)
+        if values:
+            require(len(values) == 1, 'message_expiry_ingress_not_unique')
+            return values[0]
+        require(broker.process.poll() is None, 'message_expiry_broker_exited')
+        await asyncio.sleep(.005)
+    raise ReceiptFailure('message_expiry_ingress_not_observed', topic)
+
+
+def pending_drained(state):
+    return all(state['counts'][name] == 0 for name in ('obligations', 'outbound', 'inbound'))
+
+
+async def matrix(binary, case):
+    """Both public client directions; every Q0/1/2 × Q0/1 expiry boundary."""
+    broker = Broker(binary, case)
+    peers, cells = [], []
+    try:
+        ready = broker.ready()
+        directions = (('mqttium', 'paho'), ('paho', 'mqttium'))
+        for direction, (publisher, receiver) in enumerate(directions):
+            for qos in (0, 1, 2):
+                for granted in (0, 1):
+                    for retain in (False, True):
+                        label = f'matrix-{direction}-{qos}-{granted}-{int(retain)}'
+                        source, source_tap = await peer(publisher, broker, case, label + '-source', session_expiry=0)
+                        target, target_tap = await peer(receiver, broker, case, label + '-target', session_expiry=0)
+                        peers.extend(((source, source_tap), (target, target_tap)))
+                        for expiry in (None, 0, 1, 2, INFINITE):
+                            topic = f'message-expiry/{label}/{expiry}'
+                            payload = f'expiry-cell:{len(cells):03}'.encode()
+                            await target.subscribe((Subscription(topic, granted, retain_as_published=True,
+                                                                retain_handling=2),))
+                            marker = max(int(event['seq']) for event in broker.events())
+                            await source.publish(topic, payload, qos, retain=retain, message_expiry=expiry)
+                            received = await received_ingress(broker, topic, marker) if expiry is not None else None
+                            effective = min(qos, granted)
+                            if expiry == 0:
+                                await target.no_message(.04)
+                                require(not target_tap.publications(payload), 'message_expiry_zero_forwarded')
+                                delivery = wire = None
+                            else:
+                                delivery = await target.receive(payload, effective, retain)
+                                wire = one_delivery(target_tap, payload, effective, retain, expiry)
+                                require(delivery['message_expiry_interval'] == wire['message_expiry_interval'],
+                                        'message_expiry_client_wire_disagreed')
+                            await target.unsubscribe((topic,))
+                            if retain and expiry != 0:
+                                await source.publish(topic, b'', 1, retain=True)
+                            # A QoS0 local write is corroborated by the ingress
+                            # event above, and by the timed admission commit or
+                            # explicit message_expired drop below for TTL0.
+                            if qos == 0 and expiry == 0:
+                                deadline = time.monotonic() + 5
+                                processed = []
+                                while time.monotonic() < deadline:
+                                    processed = [event for event in broker.events() if int(event['seq']) > marker and
+                                        ((event['kind'] == 'qos0_dropped' and
+                                          event.get('details', {}).get('reason') == 'message_expired') or
+                                         (retain and event['kind'] == 'store_result' and
+                                          event.get('command_kind') == 'RetainedQoS0' and
+                                          event.get('details', {}).get('outcome') == 'Committed'))]
+                                    if processed:
+                                        break
+                                    await asyncio.sleep(.005)
+                                require(bool(processed), 'message_expiry_zero_qos0_processing_unproved')
+                            final = await until_state(broker, physically_drained, 'message_expiry_matrix_reference_leak')
+                            cells.append({'publisher': publisher, 'receiver': receiver, 'published_qos': qos,
+                                          'granted_qos': granted, 'effective_qos': effective, 'retain': retain,
+                                          'requested_expiry': expiry, 'ingress': received, 'delivery': delivery,
+                                          'wire': wire, 'final_counts': final['counts']})
+                        await close_peers(peers)
+                        peers = []
+        write_json(case / 'final.sql.json', durable(broker.db))
+        broker.stop()
+        writer_available(broker.db)
+        return {'criterion': 'matrix', 'status': 'PASS', 'ready': ready, 'cells': cells,
+                'cells_per_direction': 60, 'process_status': broker.process.returncode}
+    finally:
+        if broker.db.is_file():
+            snapshot(broker, 'last-observed')
+        await close_peers(peers, cleanup=True)
+        broker.cleanup()
+
+
+async def offline(binary, case):
+    """Expired pending work is physically reclaimed before session resumption."""
+    broker = Broker(binary, case)
+    peers, targets, cells = [], [], []
+    try:
+        ready = broker.ready()
+        for direction, (publisher, receiver) in enumerate((('mqttium', 'paho'), ('paho', 'mqttium'))):
+            for granted in (0, 1):
+                name = f'offline-{direction}-{granted}'
+                client, tap = await peer(receiver, broker, case, name)
+                await client.subscribe((Subscription(f'message-expiry/offline/{direction}/{granted}/#', granted,
+                                                    retain_handling=2),))
+                await close_peers(((client, tap),))
+                await until_state(broker, lambda state: any(row['client_id'] == name.encode().hex() and
+                                  row.get('detached_by') is not None for row in state['tables']['sessions']),
+                                  'message_expiry_offline_session_not_detached')
+                targets.append((receiver, name, granted, direction))
+            source, source_tap = await peer(publisher, broker, case, f'offline-source-{direction}', session_expiry=0)
+            peers.append((source, source_tap))
+            for granted in (0, 1):
+                for qos in (0, 1, 2):
+                    for retain in (False, True):
+                        topic = f'message-expiry/offline/{direction}/{granted}/{qos}/{int(retain)}'
+                        payload = f'expired-offline-cell:{len(cells):02}'.encode()
+                        marker = max(int(event['seq']) for event in broker.events())
+                        await source.publish(topic, payload, qos, retain=retain, message_expiry=2)
+                        received = await received_ingress(broker, topic, marker)
+                        cells.append({'publisher': publisher, 'receiver': receiver, 'published_qos': qos,
+                                      'granted_qos': granted, 'retain': retain, 'topic': topic,
+                                      'payload_sha256': hashlib.sha256(payload).hexdigest(), 'ingress': received})
+        admitted = snapshot(broker, 'offline-admitted')
+        require(admitted['counts']['obligations'] == 8 and admitted['counts']['retained'] == 12,
+                'message_expiry_offline_positive_inventory_missing', repr(admitted['counts']))
+        require(admitted['counts']['outbound'] == 0, 'message_expiry_offline_work_started_without_recipient')
+        final = await until_state(broker, physically_drained, 'message_expiry_offline_references_not_reclaimed')
+        write_json(case / 'offline-expired.sql.json', final)
+        resumed = []
+        for receiver, name, granted, direction in targets:
+            client, tap = await peer(receiver, broker, case, name + '-resumed', client_id=name, present=True)
+            peers.append((client, tap))
+            await client.no_message(.08)
+            require(not tap.publications(), 'message_expiry_offline_expired_work_replayed')
+            witness, witness_tap = await peer('mqttium', broker, case, name + '-witness', session_expiry=0)
+            peers.append((witness, witness_tap))
+            payload = ('timeless-after-offline-expiry:' + name).encode()
+            await witness.publish(f'message-expiry/offline/{direction}/{granted}/witness', payload, 1)
+            delivery = await client.receive(payload, granted, False)
+            wire = one_delivery(tap, payload, granted, False, None)
+            resumed.append({'client': receiver, 'session_present': True, 'grant': granted,
+                            'delivery': delivery, 'wire': wire})
+        newcomer, tap = await peer('paho', broker, case, 'offline-new-wildcard', session_expiry=0)
+        peers.append((newcomer, tap))
+        await newcomer.subscribe((Subscription('message-expiry/offline/#', 1),))
+        await newcomer.no_message(.08)
+        require(not tap.publications(), 'message_expiry_offline_expired_current_replayed')
+        await until_state(broker, physically_drained, 'message_expiry_offline_witness_not_finished')
+        await close_peers(peers)
+        peers = []
+        broker.stop()
+        writer_available(broker.db)
+        return {'criterion': 'offline', 'status': 'PASS', 'ready': ready, 'cells': cells,
+                'admitted_counts': admitted['counts'], 'expired_counts': final['counts'],
+                'resumed_sessions': resumed, 'process_status': broker.process.returncode}
+    finally:
+        if broker.db.is_file():
+            snapshot(broker, 'last-observed')
+        await close_peers(peers, cleanup=True)
+        broker.cleanup()
+
+
+async def original_ttl(binary, case):
+    """Offline delivery and retained replay share the original ingress deadline."""
+    broker = Broker(binary, case)
+    peers = []
+    try:
+        ready = broker.ready()
+        target, tap = await peer('paho', broker, case, 'original-offline')
+        await target.subscribe((Subscription('message-expiry/original/#', 1, retain_handling=2),))
+        await close_peers(((target, tap),))
+        await until_state(broker, lambda state: any(row['client_id'] == b'original-offline'.hex() and
+                          row.get('detached_by') is not None for row in state['tables']['sessions']),
+                          'message_expiry_original_session_not_detached')
+        source, source_tap = await peer('mqttium', broker, case, 'original-source', session_expiry=0)
+        peers.append((source, source_tap))
+        payload = b'one-original-expiry-for-offline-and-retained'
+        started = time.monotonic_ns()
+        await source.publish('message-expiry/original/value', payload, 2, retain=True, message_expiry=2)
+        admitted = await until_state(broker, lambda state: state['counts']['obligations'] == 1 and
+                                    state['counts']['retained'] == 1, 'message_expiry_original_not_admitted')
+        write_json(case / 'original-admitted.sql.json', admitted)
+        await asyncio.sleep(1.1)
+        target, target_tap = await peer('paho', broker, case, 'original-resumed',
+                                       client_id='original-offline', present=True)
+        peers.append((target, target_tap))
+        offline_row = await target.receive(payload, 1, False)
+        offline_wire = one_delivery(target_tap, payload, 1, False, 1)
+        newcomer, newcomer_tap = await peer('mqttium', broker, case, 'original-replay', session_expiry=0)
+        peers.append((newcomer, newcomer_tap))
+        await newcomer.subscribe((Subscription('message-expiry/original/#', 1),))
+        retained_row = await newcomer.receive(payload, 1, True)
+        retained_wire = one_delivery(newcomer_tap, payload, 1, True, 1)
+        final = await until_state(broker, physically_drained, 'message_expiry_original_deadline_was_reset')
+        elapsed = time.monotonic_ns() - started
+        require(elapsed < 3_000_000_000, 'message_expiry_original_deadline_was_reset', str(elapsed))
+        await target.no_message(.04)
+        await newcomer.no_message(.04)
+        write_json(case / 'original-expired.sql.json', final)
+        await close_peers(peers)
+        peers = []
+        broker.stop()
+        writer_available(broker.db)
+        return {'criterion': 'original-ttl', 'status': 'PASS', 'ready': ready,
+                'original_ttl': 2, 'delay_before_replay_seconds': 1.1, 'elapsed_ns': str(elapsed),
+                'offline_delivery': offline_row, 'offline_wire': offline_wire,
+                'retained_delivery': retained_row, 'retained_wire': retained_wire,
+                'expired_counts': final['counts'], 'process_status': broker.process.returncode}
+    finally:
+        if broker.db.is_file():
+            snapshot(broker, 'last-observed')
+        await close_peers(peers, cleanup=True)
+        broker.cleanup()
+
+
+async def replay32(binary, case):
+    """All 32 valid expiring retained values replay to one durable target."""
+    broker = Broker(binary, case)
+    peers = []
+    try:
+        ready = broker.ready()
+        source, source_tap = await peer('mqttium', broker, case, 'replay32-source', session_expiry=0)
+        peers.append((source, source_tap))
+        payloads = {f'message-expiry/replay32/{index:02}': f'expiring-current:{index:02}'.encode()
+                    for index in range(32)}
+        for topic, payload in payloads.items():
+            await source.publish(topic, payload, 1, retain=True, message_expiry=INFINITE)
+        before = snapshot(broker, 'replay32-before')
+        require(before['counts']['retained'] == before['counts']['publications'] == before['counts']['payloads'] == 32,
+                'message_expiry_replay32_inventory_incomplete')
+        target, tap = await peer('paho', broker, case, 'replay32-target', session_expiry=0)
+        peers.append((target, tap))
+        await target.subscribe((Subscription('message-expiry/replay32/#', 1),))
+        received = [await target.receive(qos=1, retain=True) for _ in range(32)]
+        require(len({row['topic'] for row in received}) == 32 and
+                all(row['topic'] in payloads and row['payload_sha256'] == hashlib.sha256(payloads[row['topic']]).hexdigest()
+                    and row['message_expiry_interval'] is not None and
+                    0 < row['message_expiry_interval'] <= INFINITE for row in received),
+                'message_expiry_replay32_wrong_inventory')
+        wire = [one_delivery(tap, payload, 1, True, INFINITE) for payload in payloads.values()]
+        await target.no_message(.08)
+        await until_state(broker, pending_drained, 'message_expiry_replay32_not_durably_finished')
+        await target.unsubscribe(('message-expiry/replay32/#',))
+        for topic in payloads:
+            await source.publish(topic, b'', 1, retain=True)
+        final = await until_state(broker, physically_drained, 'message_expiry_replay32_clear_leaked')
+        write_json(case / 'replay32-final.sql.json', final)
+        await close_peers(peers)
+        peers = []
+        broker.stop()
+        writer_available(broker.db)
+        return {'criterion': 'replay32', 'status': 'PASS', 'ready': ready, 'count': 32,
+                'received': received, 'wire': wire, 'final_counts': final['counts'],
+                'process_status': broker.process.returncode}
+    finally:
+        if broker.db.is_file():
+            snapshot(broker, 'last-observed')
+        await close_peers(peers, cleanup=True)
+        broker.cleanup()
+
+
+async def options(binary, case):
+    """RH, RAP and No Local eligibility are applied to expiring values."""
+    broker = Broker(binary, case)
+    peers, decisions = [], []
+    topic, payload = 'message-expiry/options/value', b'expiring-retained-options'
+    try:
+        ready = broker.ready()
+        source, source_tap = await peer('mqttium', broker, case, 'options-first-source',
+                                       client_id='options-producer-name', session_expiry=0)
+        await source.publish(topic, payload, 2, retain=True, message_expiry=INFINITE)
+        await close_peers(((source, source_tap),))
+        await until_state(broker, lambda state: all(row['client_id'] != b'options-producer-name'.hex()
+                          for row in state['tables']['sessions']), 'message_expiry_options_source_not_terminated')
+        source, source_tap = await peer('paho', broker, case, 'options-same-producer-new-session',
+                                       client_id='options-producer-name', session_expiry=0)
+        peers.append((source, source_tap))
+        await source.subscribe((Subscription('message-expiry/options/#', 1, no_local=True,
+                                             retain_as_published=True),))
+        await source.no_message(.04)
+        require(not source_tap.publications(payload), 'message_expiry_no_local_retained_name_lost')
+        await source.subscribe((Subscription(topic, 0),))
+        self_replay = await source.receive(payload, 0, True)
+        one_delivery(source_tap, payload, 0, True, INFINITE)
+        target, tap = await peer('mqttium', broker, case, 'options-other-target', session_expiry=0)
+        peers.append((target, tap))
+        requests = (
+            ((Subscription('message-expiry/options/#', 1, retain_handling=1),) * 2, 1, 'RH1-ordered-duplicate'),
+            ((Subscription('message-expiry/options/#', 1),) * 2, 2, 'RH0-duplicate-occurrences'),
+            ((Subscription('message-expiry/options/#', 1, retain_handling=2),), 0, 'RH2-suppressed'),
+            ((Subscription('message-expiry/options/#', 1, retain_handling=1),), 0, 'RH1-existing-suppressed'),
+            ((Subscription('message-expiry/options/#', 1), Subscription(topic, 1)), 2, 'overlap-replays'),
+        )
+        for filters, count, label in requests:
+            prior = len(tap.publications(payload))
+            await target.subscribe(filters)
+            received = [await target.receive(payload, 1, True) for _ in range(count)]
+            await target.no_message(.04)
+            wire = tap.publications(payload)[prior:]
+            require(len(wire) == count and all(row.retain and row.message_expiry_interval is not None and
+                    0 < row.message_expiry_interval <= INFINITE for row in wire),
+                    'message_expiry_options_replay_count_or_property')
+            await until_state(broker, pending_drained, 'message_expiry_options_replay_not_finished')
+            decisions.append({'case': label, 'expected_replays': count, 'received': received,
+                              'wire': [row.observation() for row in wire]})
+        first = b'no-local-excluded-rap-and-higher-qos'
+        await source.publish(topic, first, 1, retain=True, message_expiry=INFINITE)
+        excluded = await source.receive(first, 0, False)
+        excluded_wire = one_delivery(source_tap, first, 0, False, INFINITE)
+        other_first = await target.receive(first, 1, False)
+        one_delivery(tap, first, 1, False, INFINITE)
+        await source.subscribe((Subscription('message-expiry/options/#', 1, no_local=False,
+                                             retain_as_published=True, retain_handling=2),))
+        second = b'eligible-overlap-contributes-rap-and-higher-qos'
+        await source.publish(topic, second, 2, retain=True, message_expiry=INFINITE)
+        eligible = await source.receive(second, 1, True)
+        eligible_wire = one_delivery(source_tap, second, 1, True, INFINITE)
+        other_second = await target.receive(second, 1, False)
+        one_delivery(tap, second, 1, False, INFINITE)
+        await until_state(broker, pending_drained, 'message_expiry_options_live_not_finished')
+        await source.unsubscribe(('message-expiry/options/#', topic))
+        await target.unsubscribe(('message-expiry/options/#', topic))
+        await source.publish(topic, b'', 1, retain=True)
+        final = await until_state(broker, physically_drained, 'message_expiry_options_clear_leaked')
+        write_json(case / 'options-final.sql.json', final)
+        await close_peers(peers)
+        peers = []
+        broker.stop()
+        writer_available(broker.db)
+        return {'criterion': 'options', 'status': 'PASS', 'ready': ready, 'ordered_replays': decisions,
+                'producer_name_after_session_end': True, 'eligible_self_replay': self_replay,
+                'excluded_contribution': excluded, 'excluded_wire': excluded_wire,
+                'eligible_contribution': eligible, 'eligible_wire': eligible_wire,
+                'other_live_deliveries': [other_first, other_second], 'process_status': broker.process.returncode}
+    finally:
+        if broker.db.is_file():
+            snapshot(broker, 'last-observed')
+        await close_peers(peers, cleanup=True)
+        broker.cleanup()
+
+
+async def late_puback(binary, case):
+    """A real started QoS1 transfer completes when its PUBACK arrives after TTL."""
+    broker = Broker(binary, case)
+    peers, results = [], []
+    try:
+        ready = broker.ready()
+        for retain in (False, True):
+            label = f'late-{int(retain)}'
+            source, source_tap = await peer('mqttium', broker, case, label + '-source', session_expiry=0)
+            target, tap = await peer('paho', broker, case, label + '-target', session_expiry=0)
+            peers.extend(((source, source_tap), (target, tap)))
+            topic, payload = f'message-expiry/{label}/value', f'late-puback:{int(retain)}'.encode()
+            await target.subscribe((Subscription(topic, 1, retain_as_published=True, retain_handling=2),))
+            marker = max(int(event['seq']) for event in broker.events())
+            started = time.monotonic_ns()
+            await source.publish(topic, payload, 1, retain=retain, message_expiry=2)
+            row = await target.receive(payload, 1, retain, acknowledge=False)
+            wire = one_delivery(tap, payload, 1, retain, 2)
+            held = await until_state(broker, lambda state: state['counts']['outbound'] == 1 and
+                state['counts']['obligations'] == 1, 'message_expiry_late_puback_not_held')
+            write_json(case / f'{label}-held.sql.json', held)
+            # The actual receiving application has deliberately retained its
+            # manual ACK; this is not a sleep used to infer an unobserved ACK.
+            await asyncio.sleep(2.15)
+            expired = snapshot(broker, f'{label}-past-ttl')
+            require(expired['counts']['outbound'] == expired['counts']['obligations'] == 1 and
+                    expired['counts']['publications'] == expired['counts']['payloads'] == 1 and
+                    expired['counts']['retained'] == 0,
+                    'message_expiry_started_transfer_expired_before_puback', repr(expired['counts']))
+            proof = [event for event in broker.events() if int(event['seq']) > marker and
+                     event['kind'] == 'store_result' and event.get('command_kind') == 'DeliveryStarted' and
+                     event.get('details', {}).get('outcome') == 'Committed']
+            require(len(proof) == 1, 'message_expiry_started_proof_not_committed', str(len(proof)))
+            await target.no_message(.04)
+            await target.acknowledge(row)
+            elapsed = time.monotonic_ns() - started
+            require(elapsed > 2_000_000_000, 'message_expiry_puback_was_not_after_ttl')
+            final = await until_state(broker, physically_drained, 'message_expiry_late_puback_did_not_finish')
+            write_json(case / f'{label}-finished.sql.json', final)
+            results.append({'retain': retain, 'delivered': row, 'wire': wire,
+                            'started_commit': proof[0], 'elapsed_before_puback_ns': str(elapsed),
+                            'pending_past_ttl': expired['counts'], 'final_counts': final['counts']})
+            await close_peers(peers)
+            peers = []
+        broker.stop()
+        writer_available(broker.db)
+        return {'criterion': 'late-puback', 'status': 'PASS', 'ready': ready, 'cases': results,
+                'process_status': broker.process.returncode}
+    finally:
+        if broker.db.is_file():
+            snapshot(broker, 'last-observed')
+        await close_peers(peers, cleanup=True)
+        broker.cleanup()
+
+
+async def malformed(binary, case):
+    """Duplicate and truncated 0x02 properties are rejected before mutation."""
+    from message_expiry_probe import MessageExpiryWire, publish_packet
+    from retained_reception import business_state
+    from tcp_reception import expect_rejection
+    broker = Broker(binary, case)
+    peer_wire = None
+    results = []
+    try:
+        ready = broker.ready()
+        properties = (
+            ('duplicate-zero', b'\x02\x00\x00\x00\x00' * 2),
+            ('duplicate-finite', b'\x02\x00\x00\x00\x02' * 2),
+            ('missing-four-byte-value', b'\x02'),
+            ('short-four-byte-value', b'\x02\x00\x00\x02'),
+        )
+        for qos in (0, 1, 2):
+            for retain in (False, True):
+                for name, props in properties:
+                    label = f'malformed-{qos}-{int(retain)}-{name}'
+                    peer_wire = MessageExpiryWire(broker.address, broker.observations, label)
+                    peer_wire.session_connect(label, expiry=0, expected_present=False)
+                    before = snapshot(broker, label + '-before')
+                    marker = max(int(event['seq']) for event in broker.events())
+                    sent = publish_packet('message-expiry/malformed/value', b'', 7 if qos else None,
+                                          qos=qos, retain=retain, property_bytes=props)
+                    peer_wire.send(sent)
+                    expect_rejection(peer_wire)
+                    peer_wire.close()
+                    peer_wire = None
+                    after = await until_state(broker, lambda state: physically_drained(state) and
+                        all(row['client_id'] != label.encode().hex() for row in state['tables']['sessions']),
+                        'message_expiry_malformed_connection_not_terminated')
+                    require(business_state(after) == business_state(before),
+                            'message_expiry_malformed_properties_partially_mutated')
+                    commits = [event for event in broker.events() if int(event['seq']) > marker and
+                               event['kind'] == 'store_result' and
+                               event.get('command_kind') in ('Admission', 'RetainedQoS0') and
+                               event.get('details', {}).get('outcome') == 'Committed']
+                    require(not commits, 'message_expiry_malformed_properties_admitted')
+                    results.append({'case': name, 'qos': qos, 'retain': retain, 'frame_hex': sent.hex(),
+                                    'business_unchanged': True})
+        broker.stop()
+        writer_available(broker.db)
+        return {'criterion': 'malformed', 'status': 'PASS', 'ready': ready, 'cases': results,
+                'process_status': broker.process.returncode}
+    finally:
+        if peer_wire is not None:
+            peer_wire.close()
+        if broker.db.is_file():
+            snapshot(broker, 'last-observed')
+        broker.cleanup()
 
 
 async def minimal(binary, case):
@@ -125,7 +586,7 @@ async def minimal(binary, case):
     finally:
         if broker.db.is_file():
             snapshot(broker, 'last-observed')
-        await close_peers(peers)
+        await close_peers(peers, cleanup=True)
         broker.cleanup()
 
 
@@ -134,18 +595,24 @@ def main():
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--binary-source-head', required=True)
-    parser.add_argument('--case', choices=('minimal',), default='minimal')
+    functions = {'minimal': minimal, 'matrix': matrix, 'offline': offline,
+                 'original-ttl': original_ttl, 'replay32': replay32, 'options': options,
+                 'late-puback': late_puback, 'malformed': malformed}
+    parser.add_argument('--case', choices=('normal', *functions), default='normal')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
     root = Path(__file__).resolve().parents[3]
     head = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD']).decode().strip()
     receipt = {'format': 'mqttiumd.message-expiry-system-reception', 'schema_version': 1,
                'status': 'FAIL', 'qualification': 'system-test-only', 'source_head': args.binary_source_head,
-               'harness_source_head': head, 'binary': {'path': str(args.binary.resolve()),
+               'harness_source_head': head, 'client_identity': client_identity(),
+               'binary': {'path': str(args.binary.resolve()),
                'sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest()}, 'cases': []}
     try:
         require(head == args.binary_source_head, 'message_expiry_source_mismatch')
-        receipt['cases'].append(asyncio.run(minimal(args.binary.resolve(), args.out / 'minimal')))
+        selected = tuple(functions) if args.case == 'normal' else (args.case,)
+        for name in selected:
+            receipt['cases'].append(asyncio.run(functions[name](args.binary.resolve(), args.out / name)))
         receipt['status'] = 'PASS'
     except Exception as error:
         receipt['failure'] = {'code': getattr(error, 'code', type(error).__name__), 'detail': str(error)[:512]}

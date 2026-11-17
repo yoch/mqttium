@@ -4,7 +4,9 @@ import unittest
 from external_message_expiry import MqttiumMessageExpiry, PahoMessageExpiry
 from external_wildcard import Subscription
 from message_expiry_probe import decode_publish, publish_packet
-from tcp_probe import Frame, FrameDecoder, ReceiptFailure
+from message_expiry_reception import BUSINESS, physically_drained, one_delivery
+from message_expiry_boundaries import canonical_timed, continuous, _positive
+from tcp_probe import Frame, FrameDecoder, ReceiptFailure, operation_hex
 from test_external_clients import ScriptedBroker, read_packet
 from test_session_reception import accept
 
@@ -59,6 +61,66 @@ class IndependentMessageExpiryFrames(unittest.TestCase):
                         {'qos': 1}, {'qos': True}, {'qos': 1, 'identifier': 0}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 publish_packet('t', b'v', **options)
+
+    def test_absence_requires_every_physical_business_reference_to_be_reclaimed(self):
+        state = {'counts': dict.fromkeys(BUSINESS, 0)}
+        self.assertTrue(physically_drained(state))
+        for name in BUSINESS:
+            with self.subTest(name=name):
+                state['counts'][name] = 1
+                self.assertFalse(physically_drained(state))
+                state['counts'][name] = 0
+        del state['counts']['retained']
+        with self.assertRaisesRegex(ReceiptFailure, 'message_expiry_business_table_missing'):
+            physically_drained(state)
+
+    def test_wire_witness_does_not_invent_or_drop_expiry(self):
+        class Tap:
+            def __init__(self, value):
+                raw = publish_packet('t', b'v', 1, expiry=value)
+                self.value = decode_publish(FrameDecoder().feed(raw)[0])
+
+            def publications(self, _payload):
+                return [self.value]
+
+        self.assertIsNone(one_delivery(Tap(None), b'v', 1, False, None)['message_expiry_interval'])
+        self.assertEqual(one_delivery(Tap(1), b'v', 1, False, 2)['message_expiry_interval'], 1)
+        for observed, requested in ((0, 2), (None, 2), (3, 2), (1, None)):
+            with self.subTest(observed=observed, requested=requested), self.assertRaises(ReceiptFailure):
+                one_delivery(Tap(observed), b'v', 1, False, requested)
+
+    def test_timed_wrapped_recipe_correlates_original_operation_and_frozen_clock(self):
+        event = {'operation': {'incarnation': '1', 'epoch': '2', 'owner': '3', 'sequence': '4'}}
+        identity = operation_hex(event['operation'])
+        clock = b'd' * 32 + (123456789).to_bytes(8, 'big')
+        for tag, inner_tags in ((13, (1,)), (13, (10, 1)), (13, (11,)), (14, (12, 9))):
+            raw = b'MQDR\x00\x01' + bytes([inner_tags[-1]]) + bytes.fromhex(identity)
+            for inner in reversed(inner_tags[:-1]):
+                raw = b'MQDR\x00\x01' + bytes([inner]) + len(raw).to_bytes(4, 'big') + raw
+            raw = b'MQDR\x00\x01' + bytes([tag]) + len(raw).to_bytes(4, 'big') + raw + clock
+            if tag == 13:
+                raw += (2).to_bytes(4, 'big')
+            state = {'tables': {'operations': [{'id': identity, 'recipe': raw.hex()}]}}
+            with self.subTest(tag=tag, inner=inner_tags):
+                result = canonical_timed(state, event, tag)
+                self.assertEqual(result['tick'], '123456789')
+                self.assertEqual(result['domain'], (b'd' * 32).hex())
+                self.assertEqual(result['nested_tags'], [tag, *inner_tags])
+                altered = raw.replace(bytes.fromhex(identity), b'\xff' * 32, 1)
+                state['tables']['operations'][0]['recipe'] = altered.hex()
+                with self.assertRaisesRegex(ReceiptFailure, 'message_expiry_timed_canonical_identity_changed'):
+                    canonical_timed(state, event, tag)
+
+    def test_clock_continuity_requires_recognized_equal_domains_and_positive_quarantine(self):
+        known = {'domain': 'a' * 64, 'origin_status': 'boottime_origin_recognized'}
+        self.assertTrue(continuous(known, dict(known)))
+        self.assertFalse(continuous(known, dict(known, domain='b' * 64)))
+        unknown = dict(known, origin_status='boottime_namespace_unavailable')
+        self.assertFalse(continuous(unknown, dict(unknown)))
+        for value in (0, '0', [], {}, None, False):
+            self.assertFalse(_positive(value))
+        for value in (1, '1', ['claim'], {'claim': '1'}):
+            self.assertTrue(_positive(value))
 
 
 class PublicMessageExpiryAPIs(unittest.IsolatedAsyncioTestCase):
