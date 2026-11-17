@@ -4,7 +4,9 @@ use crate::session_time::{SessionClock, SystemClock};
 use mqttiumd_contract::capacity::{ExchangeSlots, PayloadBytes, ReceiptSlots, References};
 use mqttiumd_contract::command::{Recipe, StartupNonce};
 use mqttiumd_contract::effects::{Effect, OwnedEffect};
-use mqttiumd_contract::ids::{EffectId, OperationId, Revision, SessionId, StoreIncarnation};
+use mqttiumd_contract::ids::{
+    ConnectionGeneration, EffectId, OperationId, Revision, SessionId, StoreIncarnation,
+};
 use mqttiumd_contract::message_expiry::MessageTime;
 use mqttiumd_contract::outcome::{
     EpochGrant, EpochOpening, OpeningReply, OpeningStage, StoreReply,
@@ -15,8 +17,9 @@ use mqttiumd_contract::receipts::{
 };
 use mqttiumd_contract::session::{SessionAction, SessionDetachment, SessionExpiry};
 use mqttiumd_store_api::{
-    AdminCommand, AdminDone, DurableStore, Limits, ReadError, ReadPhase, RecoveryCursor,
-    RecoveryPage, RecoveryRefused, SessionClockAnchor, SessionClockReading, SessionState, WorkPage,
+    AdminCommand, AdminDone, DurableStore, Limits, ReadBudget, ReadError, ReadPhase,
+    RecoveryCursor, RecoveryPage, RecoveryRefused, SessionClockAnchor, SessionClockReading,
+    SessionState, WillPage, WorkPage,
 };
 use mqttiumd_store_sqlite::SqliteStore;
 use serde_json::json;
@@ -66,8 +69,12 @@ pub fn limits() -> Limits {
 }
 pub fn recipe_kind(recipe: &Recipe) -> &'static str {
     match recipe {
+        Recipe::WillPublication(_) => "WillAdmission",
         Recipe::SessionLifecycle(change) => match change.action {
-            SessionAction::Open { .. } | SessionAction::OpenAt { .. } => "SessionOpen",
+            SessionAction::Open { .. }
+            | SessionAction::OpenAt { .. }
+            | SessionAction::OpenWillAt { .. } => "SessionOpen",
+            SessionAction::EndWill { .. } => "WillEnd",
             SessionAction::Detach { .. } => "SessionDetach",
             SessionAction::Expire { .. } => "SessionExpire",
             SessionAction::Close { .. } => "SessionClose",
@@ -140,6 +147,10 @@ pub enum Request {
 }
 /// A reserved lane: maintenance never waits for a network/business slot.
 pub enum ControlRequest {
+    WillBarrier {
+        connection: ConnectionGeneration,
+        client: SharedBytes,
+    },
     MessageExpiry {
         now: MessageTime,
         after: Option<mqttiumd_contract::ids::PublicationId>,
@@ -158,6 +169,10 @@ pub enum ControlRequest {
 }
 #[derive(Clone)]
 pub enum ControlResponse {
+    WillBarrier {
+        connection: ConnectionGeneration,
+        result: Result<bool, Failure>,
+    },
     MessageExpiryUnknown {
         now: MessageTime,
         after: Option<mqttiumd_contract::ids::PublicationId>,
@@ -189,6 +204,10 @@ pub enum ControlResponse {
     },
 }
 pub enum Response {
+    Wills {
+        effect: EffectId,
+        result: Result<WillPage, ReadError>,
+    },
     Recovery(Result<RecoveryPage, RecoveryRefused>),
     Session {
         request: u64,
@@ -420,6 +439,10 @@ impl Writer {
 #[derive(Default)]
 struct BusinessState {
     #[cfg(feature = "test-hooks")]
+    held_will_admission: Option<OperationId>,
+    #[cfg(feature = "test-hooks")]
+    held_will_end: Option<OperationId>,
+    #[cfg(feature = "test-hooks")]
     held_session_open: Option<OperationId>,
     #[cfg(feature = "test-hooks")]
     held_session_close: Option<OperationId>,
@@ -459,7 +482,9 @@ fn business_response(
                     let id = command.recipe.operation();
                     let kind = recipe_kind(command.recipe.get());
                     let recipe = command.recipe.get();
-                    let targets = if let Some(a) = recipe.admission() {
+                    let targets = if let Recipe::WillPublication(a) = recipe {
+                        a.targets.as_slice().iter().map(|t| t.session).collect()
+                    } else if let Some(a) = recipe.admission() {
                         a.targets.as_slice().iter().map(|t| t.session).collect()
                     } else if let Some(a) = recipe.retained_qos0() {
                         a.targets.as_slice().iter().map(|t| t.session).collect()
@@ -475,6 +500,8 @@ fn business_response(
                         let stop = cancel.clone();
                         let point = match kind {
                             "SessionOpen" => "session.open.prepared",
+                            "WillAdmission" => "will.admission.prepared",
+                            "WillEnd" => "will.end.prepared",
                             "SessionClose" => "session.close.prepared",
                             "SessionDetach" => "session.detach.prepared",
                             "SessionExpire" => "session.expire.prepared",
@@ -518,6 +545,8 @@ fn business_response(
                         let _ = store.set_kill_hook(None);
                         let point = match kind {
                             "SessionOpen" => Some("session.open.committed"),
+                            "WillAdmission" => Some("will.admission.committed"),
+                            "WillEnd" => Some("will.end.committed"),
                             "SessionClose" => Some("session.close.committed"),
                             "SessionDetach" => Some("session.detach.committed"),
                             "SessionExpire" => Some("session.expire.committed"),
@@ -538,6 +567,44 @@ fn business_response(
                             cancel.store(true, Ordering::Relaxed);
                         }
                     }
+                    if applied.committed_now {
+                        use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome};
+                        let will_event = match (recipe, applied.reply) {
+                            (
+                                Recipe::SessionLifecycle(change),
+                                StoreReply::Outcome(StoreOutcome::Committed(
+                                    CommitFacts::SessionLifecycle(_),
+                                )),
+                            ) => match &change.action {
+                                SessionAction::OpenWillAt {
+                                    will: Some(spec), ..
+                                } => Some((
+                                    "will_installed",
+                                    json!({"operation":operation(id),"will":operation(id),"details":{"topic_bytes":spec.topic.len(),"payload_bytes":spec.payload.len(),"authority":"durable_open_commit"}}),
+                                )),
+                                SessionAction::EndWill { guard, publish, .. } => Some((
+                                    "will_decided",
+                                    json!({"operation":operation(id),"will":guard.opened_by.map(operation),"details":{"publish":publish,"session":guard.session.get().to_string(),"authority":"durable_end_commit"}}),
+                                )),
+                                _ => None,
+                            },
+                            (
+                                Recipe::WillPublication(value),
+                                StoreReply::Outcome(StoreOutcome::Committed(
+                                    CommitFacts::WillPublished { will, publication },
+                                )),
+                            ) => Some((
+                                "will_admitted",
+                                json!({"operation":operation(id),"will":operation(will),"details":{"publication":format!("{}/{}/{}/{}",publication.incarnation().get(),publication.epoch().get(),publication.owner().get(),publication.sequence().get()),"targets":value.targets.len(),"authority":"durable_admission_commit"}}),
+                            )),
+                            _ => None,
+                        };
+                        if let Some((name, fields)) = will_event
+                            && events.emit(name, fields).is_err()
+                        {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
                     if events.emit("store_result",json!({"operation":operation(id),"command_kind":kind,"details":{"committed_now":applied.committed_now,"wrote":applied.wrote,"outcome":outcome_name(applied.reply)}})).is_err(){cancel.store(true,Ordering::Relaxed);}
                     #[cfg(not(feature = "test-hooks"))]
                     let reply = applied.reply;
@@ -547,7 +614,9 @@ fn business_response(
                     if applied.committed_now
                         && matches!(
                             kind,
-                            "Claim"
+                            "WillAdmission"
+                                | "WillEnd"
+                                | "Claim"
                                 | "Admission"
                                 | "RetainedQoS0"
                                 | "Subscriptions"
@@ -563,6 +632,8 @@ fn business_response(
                         && let Some(dir) = &hooks.directory
                     {
                         let file_name = match kind {
+                            "WillAdmission" => "drop-next-will-admission-result".to_owned(),
+                            "WillEnd" => "drop-next-will-end-result".to_owned(),
                             "SessionOpen" => "drop-next-session-open-result".to_owned(),
                             "SessionClose" => "drop-next-session-close-result".to_owned(),
                             "SessionDetach" => "drop-next-session-detach-result".to_owned(),
@@ -605,6 +676,10 @@ fn business_response(
                         targets: Vec::new(),
                     }
                 }
+                Effect::LoadWills { after, limit } => Response::Wills {
+                    effect,
+                    result: store.read_wills(after, limit as usize, ReadBudget::PAGE),
+                },
                 Effect::LoadWork {
                     session,
                     after,
@@ -634,6 +709,12 @@ fn hold_business_reply(
 ) -> StoreReply {
     let reply = hold_admission_reply(state, hooks, id, kind, reply, events);
     for (name, file, held) in [
+        (
+            "WillAdmission",
+            "hold-will-admission-result",
+            &mut state.held_will_admission,
+        ),
+        ("WillEnd", "hold-will-end-result", &mut state.held_will_end),
         (
             "SessionOpen",
             "hold-session-open-result",
@@ -893,6 +974,12 @@ fn control_response(
 ) -> ControlResponse {
     let _ = hooks;
     match request {
+        ControlRequest::WillBarrier { connection, client } => ControlResponse::WillBarrier {
+            connection,
+            result: store
+                .has_will_for_client(client.as_slice())
+                .map_err(|error| Failure::read(error, ReadPhase::Lookup)),
+        },
         ControlRequest::MessageExpiry { now, after, limit } => {
             #[cfg(feature = "test-hooks")]
             {
@@ -1101,6 +1188,12 @@ fn consume_file(path: &Path) -> bool {
 }
 #[cfg(feature = "test-hooks")]
 fn recipe_identity_highwater(recipe: &Recipe) -> Result<(u64, u64), Failure> {
+    if let Recipe::WillPublication(value) = recipe {
+        return Ok((
+            value.publication.sequence().get(),
+            value.payload.id.sequence().get(),
+        ));
+    }
     if let Some(a) = recipe.admission() {
         return Ok((
             a.publication.sequence().get(),
@@ -1318,6 +1411,282 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::time::Instant;
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    #[test]
+    fn real_will_install_cancel_pending_and_read_barriers_are_correlated() {
+        use mqttiumd_contract::command::{Command, FrozenRecipe};
+        use mqttiumd_contract::ids::{OperationSeq, RunEpoch};
+        use mqttiumd_contract::outcome::{CommitFacts, StoreOutcome};
+        use mqttiumd_contract::session::{SessionChange, SessionGuard, SessionLifecycle};
+        use mqttiumd_contract::will::{WillSpec, WillState};
+        let dir = std::env::temp_dir().join(format!(
+            "mqttiumd-will-writer-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let (mut store, boot) = bootstrap(&dir.join("store.sqlite")).unwrap();
+        let events = Events::open(&dir.join("events.jsonl")).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let hooks = Hooks::default();
+        let mut state = BusinessState::default();
+        let connection = ConnectionGeneration::new(7);
+        let client = SharedBytes::copy_from(b"sensor", MAX_CLIENT).unwrap();
+        let operation = |n| {
+            OperationId::new(
+                boot.grant.incarnation(),
+                boot.grant.epoch(),
+                LogicalOwnerId::new(0),
+                OperationSeq::new(n),
+            )
+        };
+        let effect = |n| EffectId {
+            epoch: boot.grant.epoch(),
+            owner: LogicalOwnerId::new(0),
+            sequence: EffectSeq::new(n),
+        };
+        let lifecycle = |id, action| {
+            OwnedEffect::new(
+                effect(id),
+                Effect::Persist {
+                    command: Command {
+                        recipe: FrozenRecipe::freeze(Recipe::SessionLifecycle(SessionLifecycle {
+                            operation: operation(id),
+                            action,
+                        }))
+                        .unwrap(),
+                        payload: None,
+                    },
+                },
+            )
+        };
+        let spec = WillSpec {
+            topic: SharedBytes::copy_from(b"status", MAX_TOPIC).unwrap(),
+            payload: SharedBytes::copy_from(b"SECRET-WILL", MAX_PAYLOAD).unwrap(),
+        };
+        let open = |spec| SessionAction::OpenWillAt {
+            client_id: client.clone(),
+            expected: None,
+            clean_start: false,
+            expiry: SessionExpiry::OnDisconnect,
+            now: 0,
+            will: Some(spec),
+        };
+        let first = control_response(
+            &mut store,
+            ControlRequest::Lifecycle(lifecycle(1, open(spec.clone()))),
+            &events,
+            &hooks,
+            &cancel,
+            &mut state,
+        );
+        let session = match first {
+            ControlResponse::Lifecycle {
+                operation: id,
+                reply:
+                    StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                        SessionChange::Opened { session, .. },
+                    ))),
+                ..
+            } if id == operation(1) => session,
+            _ => panic!("real Will Open did not commit"),
+        };
+        let barrier = control_response(
+            &mut store,
+            ControlRequest::WillBarrier {
+                connection,
+                client: client.clone(),
+            },
+            &events,
+            &hooks,
+            &cancel,
+            &mut state,
+        );
+        assert!(
+            matches!(barrier,ControlResponse::WillBarrier {connection:c,result:Ok(true)} if c==connection),
+            "installed Will must hold successor Open barrier"
+        );
+        let end = |guard, publish| SessionAction::EndWill {
+            guard,
+            expiry: SessionExpiry::OnDisconnect,
+            observed_at: 1,
+            publish,
+        };
+        let normal = control_response(
+            &mut store,
+            ControlRequest::Lifecycle(lifecycle(
+                2,
+                end(
+                    SessionGuard {
+                        session,
+                        opened_by: Some(operation(1)),
+                    },
+                    false,
+                ),
+            )),
+            &events,
+            &hooks,
+            &cancel,
+            &mut state,
+        );
+        assert!(
+            matches!(
+                normal,
+                ControlResponse::Lifecycle {
+                    reply: StoreReply::Outcome(StoreOutcome::Committed(
+                        CommitFacts::SessionLifecycle(SessionChange::Closed { .. })
+                    )),
+                    ..
+                }
+            ),
+            "normal Will cancellation must commit with cleanup"
+        );
+        assert!(
+            matches!(
+                control_response(
+                    &mut store,
+                    ControlRequest::WillBarrier {
+                        connection,
+                        client: client.clone()
+                    },
+                    &events,
+                    &hooks,
+                    &cancel,
+                    &mut state
+                ),
+                ControlResponse::WillBarrier {
+                    result: Ok(false),
+                    ..
+                }
+            ),
+            "cancelled intention must release successor barrier"
+        );
+        let second = control_response(
+            &mut store,
+            ControlRequest::Lifecycle(lifecycle(3, open(spec))),
+            &events,
+            &hooks,
+            &cancel,
+            &mut state,
+        );
+        let next_session = match second {
+            ControlResponse::Lifecycle {
+                reply:
+                    StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                        SessionChange::Opened { session, .. },
+                    ))),
+                ..
+            } => session,
+            _ => panic!("second real Will Open did not commit"),
+        };
+        assert_ne!(
+            session, next_session,
+            "ClientID reuse must not reuse durable incarnation"
+        );
+        let _ = control_response(
+            &mut store,
+            ControlRequest::Lifecycle(lifecycle(
+                4,
+                end(
+                    SessionGuard {
+                        session: next_session,
+                        opened_by: Some(operation(3)),
+                    },
+                    true,
+                ),
+            )),
+            &events,
+            &hooks,
+            &cancel,
+            &mut state,
+        );
+        let pending = business_response(
+            &mut store,
+            Request::Effect(OwnedEffect::new(
+                effect(5),
+                Effect::LoadWills {
+                    after: None,
+                    limit: 1,
+                },
+            )),
+            &events,
+            &hooks,
+            &cancel,
+            &mut state,
+        );
+        let Response::Wills {
+            effect: read,
+            result: Ok(page),
+        } = pending
+        else {
+            panic!("bounded pending Will read failed")
+        };
+        assert_eq!(read, effect(5));
+        assert_eq!(page.items.len(), 1);
+        let intent = &page.items.as_slice()[0];
+        assert_eq!(intent.id, operation(3));
+        assert_eq!(intent.state, WillState::Pending);
+        assert_eq!(intent.session, next_session);
+        assert!(
+            !store
+                .snapshot()
+                .unwrap()
+                .sessions
+                .contains_key(&next_session),
+            "pending Will must survive source expiry0"
+        );
+        // Old normal close cannot cancel the newer occurrence.
+        let _ = control_response(
+            &mut store,
+            ControlRequest::Lifecycle(lifecycle(
+                6,
+                end(
+                    SessionGuard {
+                        session,
+                        opened_by: Some(operation(1)),
+                    },
+                    false,
+                ),
+            )),
+            &events,
+            &hooks,
+            &cancel,
+            &mut state,
+        );
+        assert_eq!(
+            store
+                .read_wills(None, 1, ReadBudget::PAGE)
+                .unwrap()
+                .items
+                .as_slice()[0]
+                .id,
+            operation(3)
+        );
+        assert!(matches!(
+            control_response(
+                &mut store,
+                ControlRequest::WillBarrier { connection, client },
+                &events,
+                &hooks,
+                &cancel,
+                &mut state
+            ),
+            ControlResponse::WillBarrier {
+                result: Ok(true),
+                ..
+            }
+        ));
+        let diagnostics = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        assert!(
+            !diagnostics.contains("SECRET-WILL"),
+            "Will bytes must not enter product events"
+        );
+        assert!(diagnostics.contains("will_installed"));
+        assert!(diagnostics.contains("will_decided"));
+        assert_eq!(boot.grant.epoch(), RunEpoch::new(1));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(feature = "test-hooks")]
     #[test]
     fn retired_probe_respects_the_entire_reserved_replay_range() {
