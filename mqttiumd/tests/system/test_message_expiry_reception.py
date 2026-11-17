@@ -1,4 +1,5 @@
 """Independent 0x02 wire discriminants and public API property checks."""
+import copy
 import unittest
 
 from external_message_expiry import MqttiumMessageExpiry, PahoMessageExpiry
@@ -6,13 +7,43 @@ from external_wildcard import Subscription
 from message_expiry_probe import decode_publish, publish_packet
 from message_expiry_reception import (BUSINESS, physically_drained, one_delivery, closed_connection,
                                        original_copies, negative_puback)
-from message_expiry_boundaries import canonical_timed, canonical_expire, continuous, _positive
+from message_expiry_boundaries import (canonical_timed, canonical_expire, continuous, _positive,
+                                       recipe_quarantine_inventory)
 from tcp_probe import Frame, FrameDecoder, ReceiptFailure, operation_hex
 from test_external_clients import ScriptedBroker, read_packet
 from test_session_reception import accept
 
 
+def frozen_quarantine_fixture():
+    original_id, replay_id, payload_id = '22' * 32, '44' * 32, '11' * 32
+    original = {'id': original_id, 'operation': '33' * 32, 'payload': payload_id,
+                'source': '0000000000000001', 'qos': 1, 'retain': 1, 'topic': b'q'.hex(),
+                'retained_version': None, 'expiry_domain': '61' * 32,
+                'expiry_tick': '000000000000007b', 'expiry_interval': 2}
+    replay = dict(original, id=replay_id, operation='55' * 32, retained_version=original_id)
+    tables = {'publications': [original, replay],
+              'payloads': [{'id': payload_id, 'bytes': b'expired'.hex(),
+                            'length': '0000000000000007', 'refs': '0000000000000002'}],
+              'retained': [{'topic': b'q'.hex(), 'publication': original_id,
+                            'producer_client_id': b'source'.hex()}],
+              'obligations': [{'publication': replay_id, 'idx': 0, 'target': '0000000000000002',
+                               'target_revision': '0000000000000001', 'qos': 1,
+                               'cause': 2, 'retain': 1, 'phase': 1}], 'inbound': [], 'outbound': [],
+              'meta': [{'used_payload_bytes': '0000000000000007', 'used_references': '0000000000000002',
+                        'used_exchange_slots': '0000000000000000'}]}
+    before = {'tables': tables, 'counts': {name: len(rows) for name, rows in tables.items()}}
+    return before, copy.deepcopy(before)
+
+
 class IndependentMessageExpiryFrames(unittest.TestCase):
+    def test_unknown_domain_keeps_exact_original_and_frozen_replay_inventory(self):
+        before, after = frozen_quarantine_fixture()
+        value = recipe_quarantine_inventory(before, after, 'replay', True, '55' * 32)
+        self.assertEqual(value['original_publication'], '22' * 32)
+        self.assertEqual(value['publication_ids'], ['22' * 32, '44' * 32])
+        self.assertEqual(value['payload'], '11' * 32)
+        self.assertEqual(value['references'], 2)
+
     def test_property_identifier_and_four_byte_width_have_literal_witnesses(self):
         self.assertEqual(publish_packet('t', b'v', qos=0, retain=True, expiry=2),
                          b'\x31\x0a\x00\x01t\x05\x02\x00\x00\x00\x02v')

@@ -129,6 +129,15 @@ def canonical_expire(state, event, claim, stamp):
             'sha256': hashlib.sha256(raw).hexdigest(), 'original': original, 'observed': observed}
 
 
+def recipe_quarantine_inventory(before, after, kind, committed, command_operation):
+    require(after['counts']['retained'] == after['counts']['publications'] ==
+            after['counts']['payloads'] == 1, 'message_expiry_recipe_uncertain_value_not_retained')
+    return {'original_publication': after['tables']['retained'][0]['publication'],
+            'publication_ids': [row['id'] for row in after['tables']['publications']],
+            'payload': after['tables']['payloads'][0]['id'],
+            'references': int(after['tables']['payloads'][0]['refs'], 16)}
+
+
 async def settle(task):
     if task is None:
         return None
@@ -456,8 +465,7 @@ async def recipe_cut(binary, case, value):
         else:
             quarantined = await until_quarantined(restart)
             final = snapshot(restart, 'recipe-quarantined')
-            require(final['counts']['retained'] == final['counts']['publications'] ==
-                    final['counts']['payloads'] == 1, 'message_expiry_recipe_uncertain_value_not_retained')
+            recipe_quarantine_inventory(held, final, kind, committed, identity)
             outcome = 'quarantined-unproved-domain'
         target, tap = await peer('paho', restart, case, 'recipe-resumed-target',
                                  client_id='recipe-target', present=True)
