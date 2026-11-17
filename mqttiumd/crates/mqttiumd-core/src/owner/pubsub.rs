@@ -1077,6 +1077,7 @@ impl Owner {
                             .try_push(GrantedSubscriptionChange {
                                 topic: item.filter.clone(),
                                 granted: Some(item.qos.min(Qos::AtLeastOnce)),
+                                options: item.options,
                             })
                             .map_err(|_| IMPOSSIBLE)?;
                     }
@@ -1108,6 +1109,7 @@ impl Owner {
                             .try_push(GrantedSubscriptionChange {
                                 topic: topic.clone(),
                                 granted: None,
+                                options: crate::contract::pubsub::SubscriptionOptions::DEFAULT,
                             })
                             .map_err(|_| IMPOSSIBLE)?;
                     }
@@ -1158,6 +1160,7 @@ impl Owner {
                     target: session,
                     target_revision: revision,
                     max_qos: change.granted.ok_or(IMPOSSIBLE)?,
+                    options: change.options,
                 })
                 .map_err(|_| {
                     Stop::Need(CapacityNeed {

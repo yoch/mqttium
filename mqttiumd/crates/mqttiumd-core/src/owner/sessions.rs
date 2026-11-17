@@ -1223,6 +1223,7 @@ mod tests {
                 target: SessionId::new(1),
                 target_revision: Revision::new(1),
                 max_qos: Qos::AtLeastOnce,
+                options: crate::contract::pubsub::SubscriptionOptions::DEFAULT,
             })
             .unwrap();
         let resume = submit(&mut owner, 2, b"persistent", SessionExpiry::OnDisconnect);
@@ -1497,6 +1498,7 @@ mod tests {
                     target: SessionId::new(target),
                     target_revision: Revision::new(1),
                     max_qos: Qos::AtLeastOnce,
+                    options: crate::contract::pubsub::SubscriptionOptions::DEFAULT,
                 })
                 .unwrap();
         }

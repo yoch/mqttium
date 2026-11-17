@@ -56,6 +56,7 @@ use crate::leases::{LeaseRefused, LeaseTable};
 
 mod pubsub;
 mod receipts;
+mod routing;
 mod sessions;
 pub use sessions::SessionStatus;
 
@@ -244,6 +245,7 @@ struct Route {
     target: SessionId,
     target_revision: Revision,
     max_qos: Qos,
+    options: crate::contract::pubsub::SubscriptionOptions,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2683,12 +2685,14 @@ impl Owner {
                 target,
                 target_revision,
                 max_qos,
+                options,
             } => {
                 let route = Route {
                     topic: topic.clone(),
                     target: *target,
                     target_revision: *target_revision,
                     max_qos: *max_qos,
+                    options: *options,
                 };
                 self.routes.try_push(route).map_err(|_| STALE)?;
             }
@@ -2930,6 +2934,7 @@ mod tests {
 
     fn route_fact(topic: &[u8], target: u64) -> RecoveredFact {
         RecoveredFact::Route {
+            options: crate::contract::pubsub::SubscriptionOptions::DEFAULT,
             topic: bytes(topic),
             target: SessionId::new(target),
             target_revision: Revision::new(target + 10),
@@ -6868,6 +6873,7 @@ mod tests {
             packet: InboundPacket::Subscribe {
                 packet_id: packet_id(packet),
                 filters: FilterList::copy_from(&[SubscriptionFilter {
+                    options: crate::contract::pubsub::SubscriptionOptions::DEFAULT,
                     filter: bytes(topic),
                     qos: Qos::AtLeastOnce,
                 }])
@@ -7160,6 +7166,7 @@ mod tests {
         {
             *filters = crate::contract::pubsub::FilterList::copy_from(&[
                 crate::contract::pubsub::SubscriptionFilter {
+                    options: crate::contract::pubsub::SubscriptionOptions::DEFAULT,
                     filter: bytes(b"fresh"),
                     qos: Qos::AtMostOnce,
                 },
@@ -7602,6 +7609,7 @@ mod tests {
             {
                 *filters = crate::contract::pubsub::FilterList::copy_from(&[
                     crate::contract::pubsub::SubscriptionFilter {
+                        options: crate::contract::pubsub::SubscriptionOptions::DEFAULT,
                         filter: bytes(b"fresh"),
                         qos: new,
                     },
@@ -7824,10 +7832,12 @@ mod tests {
             };
             *filters = crate::contract::pubsub::FilterList::copy_from(&[
                 crate::contract::pubsub::SubscriptionFilter {
+                    options: crate::contract::pubsub::SubscriptionOptions::DEFAULT,
                     filter: bytes(b"fresh"),
                     qos,
                 },
                 crate::contract::pubsub::SubscriptionFilter {
+                    options: crate::contract::pubsub::SubscriptionOptions::DEFAULT,
                     filter: bytes(b"fresh"),
                     qos,
                 },
