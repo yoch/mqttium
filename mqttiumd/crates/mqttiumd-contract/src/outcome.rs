@@ -15,6 +15,9 @@ use crate::ids::{
 /// The durable facts established by a committed command.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CommitFacts {
+    RetainedQos0Stored {
+        publication: PublicationId,
+    },
     SessionLifecycle(crate::session::SessionChange),
     DeliveryConsumed {
         delivery: DeliveryId,

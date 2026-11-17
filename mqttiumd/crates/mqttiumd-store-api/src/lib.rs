@@ -270,6 +270,8 @@ pub struct OperationRecord {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PublicationRecord {
+    /// Frozen retained version for a distinct replay occurrence.
+    pub retained_version: Option<PublicationId>,
     pub operation: OperationId,
     pub source: SessionId,
     pub topic: Vec<u8>,
@@ -281,8 +283,8 @@ pub struct PublicationRecord {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PayloadRecord {
     pub bytes: Vec<u8>,
-    /// Live obligations that still refer to the payload. Never zero: a
-    /// payload no obligation refers to is not kept, and its bytes are
+    /// Live obligations plus the current retained entry. Never zero: a
+    /// payload with no responsibility is not kept, and its bytes are
     /// not charged.
     pub references: u64,
 }
@@ -296,6 +298,7 @@ pub enum ObligationPhase {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ObligationRecord {
+    pub retain: bool,
     pub target: SessionId,
     pub target_revision: Revision,
     pub qos: Qos,
@@ -332,6 +335,12 @@ pub struct WorkPage {
 /// two stores in the same durable state compare equal, and every
 /// collection is ordered by its key.
 #[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RetainedRecord {
+    pub publication: PublicationId,
+    pub producer_client_id: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DurableState {
     pub ledger: EpochLedger,
     /// Closed epochs up to this one had their receipts collected; zero
@@ -354,6 +363,7 @@ pub struct DurableState {
     pub fences: BTreeSet<OperationId>,
     /// Compact non-execution guards, distinct from physical retained rows.
     pub receipt_frontiers: BTreeMap<ReceiptOrigin, ReceiptClosure>,
+    pub retained: BTreeMap<Vec<u8>, RetainedRecord>,
     pub publications: BTreeMap<PublicationId, PublicationRecord>,
     pub payloads: BTreeMap<PayloadId, PayloadRecord>,
     pub obligations: BTreeMap<DeliveryId, ObligationRecord>,

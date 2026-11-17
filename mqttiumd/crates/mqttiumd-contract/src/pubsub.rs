@@ -156,13 +156,13 @@ pub struct WorkItem {
     pub target: SessionId,
     pub target_revision: Revision,
     pub qos: Qos,
+    pub retain: bool,
     pub topic: SharedBytes,
     pub payload: SharedBytes,
     pub claim: Option<DeliveryClaim>,
 }
 
-/// MQTT 5 subscription options excluding QoS. Retained messages are unsupported,
-/// so RAP/RH are preserved but never cause retained replay or a retained output.
+/// MQTT 5 subscription options excluding QoS.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct SubscriptionOptions(u8);
 impl SubscriptionOptions {
@@ -178,6 +178,14 @@ impl SubscriptionOptions {
     #[must_use]
     pub const fn bits(self) -> u8 {
         self.0
+    }
+    #[must_use]
+    pub const fn retain_as_published(self) -> bool {
+        self.0 & 8 != 0
+    }
+    #[must_use]
+    pub const fn retain_handling(self) -> u8 {
+        (self.0 >> 4) & 3
     }
     #[must_use]
     pub const fn no_local(self) -> bool {

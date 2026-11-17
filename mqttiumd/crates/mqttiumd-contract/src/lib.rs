@@ -30,3 +30,5 @@ pub mod session;
 pub mod step;
 
 pub mod topic;
+
+pub mod retained;

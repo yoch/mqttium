@@ -368,6 +368,7 @@ pub enum Effect {
     EmitQos0 {
         connection: ConnectionKey,
         origin: Qos0Origin,
+        retain: bool,
         topic: SharedBytes,
         payload: SharedBytes,
     },
@@ -396,6 +397,7 @@ pub enum Effect {
         topic: SharedBytes,
         payload: SharedBytes,
         dup: bool,
+        retain: bool,
     },
     /// Emit one precise frame on one connection generation.
     EmitFrame {

@@ -70,6 +70,7 @@ pub enum DeliveryCause {
     /// A live publication selected the committed routing cut. The historical
     /// name and byte value also cover aggregated hierarchical subscriptions.
     LiveExact = 1,
+    RetainedReplay = 2,
 }
 
 /// The inbound exchange a publication came from.
@@ -252,6 +253,9 @@ impl Eq for UpdateSubscriptions {}
 /// The closed set of durable recipes of the received perimeter.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Recipe {
+    RetainedPublication(crate::retained::RetainedPublication),
+    RetainedQos0(crate::retained::RetainedQos0),
+    ReplaySubscriptions(crate::retained::ReplaySubscriptions),
     SessionLifecycle(crate::session::SessionLifecycle),
     AdmitPublication(AdmitPublication),
     ReleaseInbound(ReleaseInbound),
@@ -314,6 +318,9 @@ impl Recipe {
     #[must_use]
     pub fn operation(&self) -> OperationId {
         match self {
+            Self::RetainedPublication(value) => value.admission.operation,
+            Self::RetainedQos0(value) => value.operation,
+            Self::ReplaySubscriptions(value) => value.update.operation,
             Self::SessionLifecycle(change) => change.operation,
             Self::AdmitPublication(admit) => admit.operation,
             Self::ReleaseInbound(release) => release.operation,
@@ -328,26 +335,11 @@ impl Recipe {
     /// Checks the internal consistency the canonical layout relies on.
     pub fn check(&self) -> Result<(), RecipeError> {
         match self {
-            Self::SessionLifecycle(change) => change.check(),
-            Self::UpdateSubscriptions(change) => {
-                if change.changes.is_empty() || change.changes.len() > MAX_FILTERS {
-                    return Err(RecipeError::InvalidField("subscription_count"));
-                }
-                for entry in change.changes.as_slice() {
-                    if entry.granted == Some(Qos::ExactlyOnce) {
-                        return Err(RecipeError::InvalidField("granted_qos"));
-                    }
-                    if !crate::topic::valid_filter(entry.topic.as_slice()) {
-                        return Err(RecipeError::InvalidField("topic_filter"));
-                    }
-                    if entry.granted.is_none()
-                        && entry.options != crate::pubsub::SubscriptionOptions::DEFAULT
-                    {
-                        return Err(RecipeError::InvalidField("unsubscribe_options"));
-                    }
-                }
-                Ok(())
+            Self::RetainedPublication(_) | Self::RetainedQos0(_) | Self::ReplaySubscriptions(_) => {
+                crate::retained::check(self)
             }
+            Self::SessionLifecycle(change) => change.check(),
+            Self::UpdateSubscriptions(change) => change.check_retained(),
             Self::ChangeSubscriptions(change) => {
                 if change.changes.is_empty() || change.changes.len() > MAX_FILTERS {
                     return Err(RecipeError::InvalidField("subscription_count"));
@@ -368,29 +360,7 @@ impl Recipe {
                 Ok(())
             }
             Self::ClaimDelivery(_) | Self::FinishDelivery(_) | Self::ConsumeDelivery(_) => Ok(()),
-            Self::AdmitPublication(admit) => {
-                if admit.source.exchange.session != admit.source.session {
-                    return Err(RecipeError::ForeignExchange);
-                }
-                if admit.topic.len() > usize::from(u16::MAX) {
-                    return Err(RecipeError::TopicTooLong(admit.topic.len()));
-                }
-                if admit.targets.len() > usize::from(u16::MAX) {
-                    return Err(RecipeError::TooManyTargets {
-                        count: admit.targets.len(),
-                        max: usize::from(u16::MAX),
-                    });
-                }
-                if admit
-                    .targets
-                    .as_slice()
-                    .iter()
-                    .any(|target| target.delivery.publication != admit.publication)
-                {
-                    return Err(RecipeError::ForeignDelivery);
-                }
-                Ok(())
-            }
+            Self::AdmitPublication(admit) => admit.check_retained(),
             Self::ReleaseInbound(release) => {
                 if release.exchange.session != release.source_session {
                     return Err(RecipeError::ForeignExchange);
@@ -408,6 +378,9 @@ impl Recipe {
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
         match self {
+            Self::RetainedPublication(_) | Self::RetainedQos0(_) | Self::ReplaySubscriptions(_) => {
+                crate::retained::encode(self, out)?
+            }
             Self::SessionLifecycle(change) => {
                 out.push(8);
                 change.encode(out);
@@ -421,36 +394,9 @@ impl Recipe {
                 out.extend_from_slice(&consume.target_revision.to_be_bytes());
             }
             Self::UpdateSubscriptions(change) => {
-                let with_options = change
-                    .changes
-                    .as_slice()
-                    .iter()
-                    .any(|c| c.options != crate::pubsub::SubscriptionOptions::DEFAULT);
-                out.push(if with_options {
-                    KIND_SUBSCRIPTION_OPTIONS
-                } else {
-                    KIND_UPDATE_SUBSCRIPTIONS
-                });
-                out.extend_from_slice(&change.operation.to_be_bytes());
-                out.extend_from_slice(&change.session.to_be_bytes());
-                out.extend_from_slice(&change.session_revision.to_be_bytes());
-                out.extend_from_slice(&change.route_revision.to_be_bytes());
-                out.push(change.changes.len() as u8);
-                for entry in change.changes.as_slice() {
-                    out.push(match entry.granted {
-                        None => 0,
-                        Some(Qos::AtMostOnce) => 1,
-                        Some(Qos::AtLeastOnce) => 2,
-                        Some(Qos::ExactlyOnce) => {
-                            return Err(RecipeError::InvalidField("granted_qos"));
-                        }
-                    });
-                    if with_options {
-                        out.push(entry.options.bits());
-                    }
-                    out.extend_from_slice(&(entry.topic.len() as u16).to_be_bytes());
-                    out.extend_from_slice(entry.topic.as_slice());
-                }
+                let mut nested = Vec::new();
+                change.encode_retained(&mut nested)?;
+                out.extend_from_slice(&nested[6..]);
             }
             Self::ChangeSubscriptions(change) => {
                 out.push(KIND_CHANGE_SUBSCRIPTIONS);
@@ -489,34 +435,9 @@ impl Recipe {
                 out.extend_from_slice(&finish.claim.to_be_bytes());
             }
             Self::AdmitPublication(admit) => {
-                out.push(KIND_ADMIT_PUBLICATION);
-                out.extend_from_slice(&admit.operation.to_be_bytes());
-                out.extend_from_slice(&admit.request.to_be_bytes());
-                out.extend_from_slice(&admit.publication.to_be_bytes());
-                out.extend_from_slice(&admit.source.session.to_be_bytes());
-                out.extend_from_slice(&admit.source.session_revision.to_be_bytes());
-                out.extend_from_slice(&admit.source.packet_id.get().to_be_bytes());
-                put_exchange_generation(out, admit.source.exchange);
-                out.extend_from_slice(&admit.route_revision.to_be_bytes());
-                out.push(admit.qos.to_wire());
-                out.push(u8::from(admit.retain));
-                // Both lengths were bounded by `check` above.
-                out.extend_from_slice(&(admit.topic.len() as u16).to_be_bytes());
-                out.extend_from_slice(admit.topic.as_slice());
-                out.extend_from_slice(&admit.payload.id.to_be_bytes());
-                out.extend_from_slice(&admit.payload.length.get().to_be_bytes());
-                out.extend_from_slice(&admit.costs.payload_bytes.get().to_be_bytes());
-                out.extend_from_slice(&admit.costs.references.get().to_be_bytes());
-                out.extend_from_slice(&admit.costs.exchange_slots.get().to_be_bytes());
-                out.extend_from_slice(&admit.costs.receipt_slots.get().to_be_bytes());
-                out.extend_from_slice(&(admit.targets.len() as u16).to_be_bytes());
-                for target in admit.targets.as_slice() {
-                    out.extend_from_slice(&target.session.to_be_bytes());
-                    out.extend_from_slice(&target.session_revision.to_be_bytes());
-                    out.extend_from_slice(&target.delivery.index.to_be_bytes());
-                    out.push(target.effective_qos.to_wire());
-                    out.push(target.cause as u8);
-                }
+                let mut nested = Vec::new();
+                admit.encode_retained(&mut nested)?;
+                out.extend_from_slice(&nested[6..]);
             }
             Self::ReleaseInbound(release) => {
                 out.push(KIND_RELEASE_INBOUND);
@@ -546,6 +467,9 @@ impl Recipe {
             return Err(RecipeError::UnknownFormat(format));
         }
         let recipe = match reader.u8()? {
+            kind @ (10..=12) => {
+                crate::retained::decode(kind, &mut reader.bytes, max_targets, max_topic_len)?
+            }
             8 => {
                 Self::SessionLifecycle(crate::session::SessionLifecycle::decode(&mut reader.bytes)?)
             }
@@ -781,12 +705,12 @@ impl Recipe {
     }
 }
 
-struct Reader<'a> {
-    bytes: &'a [u8],
+pub(crate) struct Reader<'a> {
+    pub(crate) bytes: &'a [u8],
 }
 
 impl<'a> Reader<'a> {
-    fn delivery(
+    pub(crate) fn delivery(
         &mut self,
     ) -> Result<
         (
@@ -811,7 +735,7 @@ impl<'a> Reader<'a> {
             .ok_or(RecipeError::InvalidField("outbound_packet_id"))?;
         Ok((operation, delivery, target, revision, packet))
     }
-    fn take(&mut self, len: usize) -> Result<&'a [u8], RecipeError> {
+    pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8], RecipeError> {
         if self.bytes.len() < len {
             return Err(RecipeError::Truncated);
         }
@@ -820,41 +744,41 @@ impl<'a> Reader<'a> {
         Ok(head)
     }
 
-    fn u8(&mut self) -> Result<u8, RecipeError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, RecipeError> {
         Ok(self.take(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, RecipeError> {
+    pub(crate) fn u16(&mut self) -> Result<u16, RecipeError> {
         let mut array = [0u8; 2];
         array.copy_from_slice(self.take(2)?);
         Ok(u16::from_be_bytes(array))
     }
 
-    fn u32(&mut self) -> Result<u32, RecipeError> {
+    pub(crate) fn u32(&mut self) -> Result<u32, RecipeError> {
         let mut array = [0u8; 4];
         array.copy_from_slice(self.take(4)?);
         Ok(u32::from_be_bytes(array))
     }
 
-    fn u64(&mut self) -> Result<u64, RecipeError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, RecipeError> {
         let mut array = [0u8; 8];
         array.copy_from_slice(self.take(8)?);
         Ok(u64::from_be_bytes(array))
     }
 
-    fn operation(&mut self) -> Result<OperationId, RecipeError> {
+    pub(crate) fn operation(&mut self) -> Result<OperationId, RecipeError> {
         OperationId::from_be_slice(self.take(32)?).map_err(|_| RecipeError::Truncated)
     }
 
-    fn packet_id(&mut self) -> Result<InboundPacketId, RecipeError> {
+    pub(crate) fn packet_id(&mut self) -> Result<InboundPacketId, RecipeError> {
         InboundPacketId::new(self.u16()?).ok_or(RecipeError::InvalidField("packet_id"))
     }
 
-    fn qos(&mut self) -> Result<Qos, RecipeError> {
+    pub(crate) fn qos(&mut self) -> Result<Qos, RecipeError> {
         Qos::from_wire(self.u8()?).ok_or(RecipeError::InvalidField("qos"))
     }
 
-    fn boolean(&mut self, field: &'static str) -> Result<bool, RecipeError> {
+    pub(crate) fn boolean(&mut self, field: &'static str) -> Result<bool, RecipeError> {
         match self.u8()? {
             0 => Ok(false),
             1 => Ok(true),
@@ -1034,6 +958,32 @@ mod tests {
                 Err(RecipeError::TrailingBytes)
             );
         }
+    }
+
+    #[test]
+    fn retained_extension_preserves_legacy_bytes_and_bounds_nesting() {
+        let Recipe::AdmitPublication(mut admit) = admission(&[target(2, 0)]) else {
+            panic!()
+        };
+        admit.retain = true;
+        let recipe = Recipe::RetainedPublication(crate::retained::RetainedPublication {
+            admission: admit,
+            retain_targets: 1,
+        });
+        let bytes = encode(&recipe);
+        assert_eq!(bytes[6], 10);
+        assert_eq!(Recipe::decode_canonical(&bytes, 16, 1024).unwrap(), recipe);
+        for length in 0..bytes.len() {
+            assert!(Recipe::decode_canonical(&bytes[..length], 16, 1024).is_err());
+        }
+        let mut nested = bytes.clone();
+        nested[17] = 10;
+        assert!(Recipe::decode_canonical(&nested, 16, 1024).is_err());
+        let Recipe::RetainedPublication(mut invalid) = recipe else {
+            panic!()
+        };
+        invalid.retain_targets = 2;
+        assert!(Recipe::RetainedPublication(invalid).check().is_err());
     }
 
     #[test]
@@ -1322,5 +1272,124 @@ mod tests {
         assert_eq!(kept, frozen);
         assert_eq!(kept.operation(), frozen.get().operation());
         assert_eq!(encode(kept.get()), encode(frozen.get()));
+    }
+}
+
+impl AdmitPublication {
+    pub(crate) fn check_retained(&self) -> Result<(), RecipeError> {
+        if self.source.exchange.session != self.source.session {
+            return Err(RecipeError::ForeignExchange);
+        }
+        if self.topic.len() > usize::from(u16::MAX) {
+            return Err(RecipeError::TopicTooLong(self.topic.len()));
+        }
+        if self.targets.len() > usize::from(u16::MAX) {
+            return Err(RecipeError::TooManyTargets {
+                count: self.targets.len(),
+                max: usize::from(u16::MAX),
+            });
+        }
+        if self
+            .targets
+            .as_slice()
+            .iter()
+            .any(|target| target.delivery.publication != self.publication)
+        {
+            return Err(RecipeError::ForeignDelivery);
+        }
+        Ok(())
+    }
+}
+impl AdmitPublication {
+    pub(crate) fn encode_retained(&self, out: &mut Vec<u8>) -> Result<(), RecipeError> {
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
+        out.push(KIND_ADMIT_PUBLICATION);
+        out.extend_from_slice(&self.operation.to_be_bytes());
+        out.extend_from_slice(&self.request.to_be_bytes());
+        out.extend_from_slice(&self.publication.to_be_bytes());
+        out.extend_from_slice(&self.source.session.to_be_bytes());
+        out.extend_from_slice(&self.source.session_revision.to_be_bytes());
+        out.extend_from_slice(&self.source.packet_id.get().to_be_bytes());
+        put_exchange_generation(out, self.source.exchange);
+        out.extend_from_slice(&self.route_revision.to_be_bytes());
+        out.push(self.qos.to_wire());
+        out.push(u8::from(self.retain));
+        // Both lengths were bounded by `check` above.
+        out.extend_from_slice(&(self.topic.len() as u16).to_be_bytes());
+        out.extend_from_slice(self.topic.as_slice());
+        out.extend_from_slice(&self.payload.id.to_be_bytes());
+        out.extend_from_slice(&self.payload.length.get().to_be_bytes());
+        out.extend_from_slice(&self.costs.payload_bytes.get().to_be_bytes());
+        out.extend_from_slice(&self.costs.references.get().to_be_bytes());
+        out.extend_from_slice(&self.costs.exchange_slots.get().to_be_bytes());
+        out.extend_from_slice(&self.costs.receipt_slots.get().to_be_bytes());
+        out.extend_from_slice(&(self.targets.len() as u16).to_be_bytes());
+        for target in self.targets.as_slice() {
+            out.extend_from_slice(&target.session.to_be_bytes());
+            out.extend_from_slice(&target.session_revision.to_be_bytes());
+            out.extend_from_slice(&target.delivery.index.to_be_bytes());
+            out.push(target.effective_qos.to_wire());
+            out.push(target.cause as u8);
+        }
+        Ok(())
+    }
+}
+impl UpdateSubscriptions {
+    pub(crate) fn check_retained(&self) -> Result<(), RecipeError> {
+        if self.changes.is_empty() || self.changes.len() > MAX_FILTERS {
+            return Err(RecipeError::InvalidField("subscription_count"));
+        }
+        for entry in self.changes.as_slice() {
+            if entry.granted == Some(Qos::ExactlyOnce) {
+                return Err(RecipeError::InvalidField("granted_qos"));
+            }
+            if !crate::topic::valid_filter(entry.topic.as_slice()) {
+                return Err(RecipeError::InvalidField("topic_filter"));
+            }
+            if entry.granted.is_none()
+                && entry.options != crate::pubsub::SubscriptionOptions::DEFAULT
+            {
+                return Err(RecipeError::InvalidField("unsubscribe_options"));
+            }
+        }
+        Ok(())
+    }
+}
+impl UpdateSubscriptions {
+    pub(crate) fn encode_retained(&self, out: &mut Vec<u8>) -> Result<(), RecipeError> {
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&RECIPE_FORMAT.to_be_bytes());
+        let with_options = self
+            .changes
+            .as_slice()
+            .iter()
+            .any(|c| c.options != crate::pubsub::SubscriptionOptions::DEFAULT);
+        out.push(if with_options {
+            KIND_SUBSCRIPTION_OPTIONS
+        } else {
+            KIND_UPDATE_SUBSCRIPTIONS
+        });
+        out.extend_from_slice(&self.operation.to_be_bytes());
+        out.extend_from_slice(&self.session.to_be_bytes());
+        out.extend_from_slice(&self.session_revision.to_be_bytes());
+        out.extend_from_slice(&self.route_revision.to_be_bytes());
+        out.push(self.changes.len() as u8);
+        for entry in self.changes.as_slice() {
+            out.push(match entry.granted {
+                None => 0,
+                Some(Qos::AtMostOnce) => 1,
+                Some(Qos::AtLeastOnce) => 2,
+                Some(Qos::ExactlyOnce) => {
+                    return Err(RecipeError::InvalidField("granted_qos"));
+                }
+            });
+            if with_options {
+                out.push(entry.options.bits());
+            }
+            out.extend_from_slice(&(entry.topic.len() as u16).to_be_bytes());
+            out.extend_from_slice(entry.topic.as_slice());
+        }
+        Ok(())
     }
 }
