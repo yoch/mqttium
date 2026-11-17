@@ -14,7 +14,7 @@ from external_message_expiry import MqttiumMessageExpiry, PahoMessageExpiry, Pac
 from external_mqttium import client_identity
 from external_sessions import INFINITE
 from external_wildcard import Subscription
-from pubsub_probe import durable
+from pubsub_probe import durable, session_key
 from tcp_probe import Observations, ReceiptFailure, require, write_json
 from tcp_reception import Broker, writer_available
 
@@ -88,6 +88,29 @@ async def until_state(broker, predicate, code, timeout=8):
     if state is not None:
         write_json(broker.case / f'{code}.sql.json', state)
     raise ReceiptFailure(code, repr(state['counts'] if state else None))
+
+
+def closed_connection(state, events, client_id):
+    identity = str(int(session_key(state, client_id), 16))
+    opened = [event for event in events if event['kind'] == 'session_established' and
+              event['details'].get('session') == identity]
+    require(bool(opened), 'message_expiry_session_connection_not_observed', client_id)
+    latest = max(opened, key=lambda event: int(event['seq']))
+    values = [event for event in events if event['kind'] == 'connection_closed' and
+              event.get('connection') == latest['connection'] and int(event['seq']) > int(latest['seq'])]
+    return values[-1] if values else None
+
+
+async def until_connection_closed(broker, client_id):
+    """Infinite sessions need no durable detach command; observe exact transport."""
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        value = closed_connection(durable(broker.db), broker.events(), client_id)
+        if value is not None:
+            return value
+        require(broker.process.poll() is None, 'message_expiry_broker_exited')
+        await asyncio.sleep(.005)
+    raise ReceiptFailure('message_expiry_offline_connection_not_closed', client_id)
 
 
 def one_delivery(tap, payload, qos, retain, expiry):
@@ -208,9 +231,7 @@ async def offline(binary, case):
                 await client.subscribe((Subscription(f'message-expiry/offline/{direction}/{granted}/#', granted,
                                                     retain_handling=2),))
                 await close_peers(((client, tap),))
-                await until_state(broker, lambda state: any(row['client_id'] == name.encode().hex() and
-                                  row.get('detached_by') is not None for row in state['tables']['sessions']),
-                                  'message_expiry_offline_session_not_detached')
+                await until_connection_closed(broker, name)
                 targets.append((receiver, name, granted, direction))
             source, source_tap = await peer(publisher, broker, case, f'offline-source-{direction}', session_expiry=0)
             peers.append((source, source_tap))
@@ -274,9 +295,7 @@ async def original_ttl(binary, case):
         target, tap = await peer('paho', broker, case, 'original-offline')
         await target.subscribe((Subscription('message-expiry/original/#', 1, retain_handling=2),))
         await close_peers(((target, tap),))
-        await until_state(broker, lambda state: any(row['client_id'] == b'original-offline'.hex() and
-                          row.get('detached_by') is not None for row in state['tables']['sessions']),
-                          'message_expiry_original_session_not_detached')
+        await until_connection_closed(broker, 'original-offline')
         source, source_tap = await peer('mqttium', broker, case, 'original-source', session_expiry=0)
         peers.append((source, source_tap))
         payload = b'one-original-expiry-for-offline-and-retained'

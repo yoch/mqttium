@@ -4,7 +4,7 @@ import unittest
 from external_message_expiry import MqttiumMessageExpiry, PahoMessageExpiry
 from external_wildcard import Subscription
 from message_expiry_probe import decode_publish, publish_packet
-from message_expiry_reception import BUSINESS, physically_drained, one_delivery
+from message_expiry_reception import BUSINESS, physically_drained, one_delivery, closed_connection
 from message_expiry_boundaries import canonical_timed, continuous, _positive
 from tcp_probe import Frame, FrameDecoder, ReceiptFailure, operation_hex
 from test_external_clients import ScriptedBroker, read_packet
@@ -128,6 +128,20 @@ class IndependentMessageExpiryFrames(unittest.TestCase):
             self.assertFalse(_positive(value))
         for value in (1, '1', ['claim'], {'claim': '1'}):
             self.assertTrue(_positive(value))
+
+    def test_infinite_offline_session_uses_its_exact_observed_connection_close(self):
+        state = {'tables': {'sessions': [{'id': '0000000000000001', 'client_id': b'forever'.hex(),
+                                         'expiry': 1, 'detached_by': None}]}}
+        events = [{'kind': 'session_established', 'seq': '1', 'connection': '7',
+                   'details': {'session': '1'}},
+                  {'kind': 'connection_closed', 'seq': '2', 'connection': '9', 'details': {}}]
+        self.assertIsNone(closed_connection(state, events, 'forever'))
+        expected = {'kind': 'connection_closed', 'seq': '3', 'connection': '7', 'details': {}}
+        events.append(expected)
+        self.assertEqual(closed_connection(state, events, 'forever'), expected)
+        events.append({'kind': 'session_established', 'seq': '4', 'connection': '10',
+                       'details': {'session': '1'}})
+        self.assertIsNone(closed_connection(state, events, 'forever'))
 
 
 class PublicMessageExpiryAPIs(unittest.IsolatedAsyncioTestCase):

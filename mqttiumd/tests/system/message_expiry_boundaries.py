@@ -12,7 +12,7 @@ import time
 
 from external_wildcard import Subscription
 from message_expiry_reception import (close_peers, peer, physically_drained, received_ingress,
-                                       snapshot, until_state, one_delivery)
+                                       snapshot, until_state, one_delivery, until_connection_closed)
 from pubsub_probe import durable
 from tcp_probe import ReceiptFailure, operation_hex, require, write_json
 from tcp_reception import Broker, writer_available
@@ -314,9 +314,7 @@ async def restart_offline(binary, case):
         target, tap = await peer('paho', broker, case, 'restart-target', client_id='restart-target')
         await target.subscribe((Subscription('message-expiry/cut/#', 1, retain_handling=2),))
         await close_peers(((target, tap),))
-        await until_state(broker, lambda state: any(row['client_id'] == b'restart-target'.hex() and
-                          row.get('detached_by') is not None for row in state['tables']['sessions']),
-                          'message_expiry_restart_target_not_detached')
+        await until_connection_closed(broker, 'restart-target')
         source, source_tap = await peer('mqttium', broker, case, 'restart-source', session_expiry=0)
         peers.append((source, source_tap))
         marker = max(int(event['seq']) for event in broker.events())
@@ -484,9 +482,7 @@ async def held_admission(binary, case):
         target, tap = await peer('paho', broker, case, 'held-target', client_id='held-target')
         await target.subscribe((Subscription('message-expiry/cut/#', 1, retain_handling=2),))
         await close_peers(((target, tap),))
-        await until_state(broker, lambda state: any(row['client_id'] == b'held-target'.hex() and
-                          row.get('detached_by') is not None for row in state['tables']['sessions']),
-                          'message_expiry_held_target_not_detached')
+        await until_connection_closed(broker, 'held-target')
         source, source_tap = await peer('mqttium', broker, case, 'held-source', session_expiry=0)
         peers.append((source, source_tap))
         hold.touch(exist_ok=False)
