@@ -334,6 +334,20 @@ async def exchange(host, port, client_id, *, implementation='mqttium', clean_sta
         await session.disconnect(disconnect_expiry)
 
 
+def expiry_argument(value):
+    if value == 'absent':
+        return None
+    if value == 'infinite':
+        return INFINITE
+    try:
+        parsed = int(value, 10)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError('expiry must be absent, infinite or a decimal MQTT interval') from error
+    if not 0 <= parsed <= INFINITE:
+        raise argparse.ArgumentTypeError('expiry must be in 0..4294967295')
+    return parsed
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--client', choices=('mqttium', 'paho'), default='mqttium')
@@ -341,18 +355,17 @@ def main():
     parser.add_argument('--port', type=int, required=True)
     parser.add_argument('--client-id', required=True)
     parser.add_argument('--clean-start', type=int, choices=(0, 1), required=True)
-    parser.add_argument('--expiry', choices=('absent', '0', 'infinite'), required=True)
-    parser.add_argument('--disconnect-expiry', choices=('absent', '0', 'infinite'), default='absent')
+    parser.add_argument('--expiry', type=expiry_argument, required=True)
+    parser.add_argument('--disconnect-expiry', type=expiry_argument, default=None)
     parser.add_argument('--expected-session-present', type=int, choices=(0, 1))
     parser.add_argument('--topic')
     parser.add_argument('--payload', default='lifecycle')
     parser.add_argument('--qos', type=int, choices=(1, 2), default=1)
     parser.add_argument('--events', type=Path)
     args = parser.parse_args()
-    value = {'absent': None, '0': 0, 'infinite': INFINITE}
     result = asyncio.run(exchange(args.host, args.port, args.client_id,
                                  implementation=args.client, clean_start=bool(args.clean_start),
-                                 expiry=value[args.expiry], disconnect_expiry=value[args.disconnect_expiry],
+                                 expiry=args.expiry, disconnect_expiry=args.disconnect_expiry,
                                  topic=args.topic, payload=args.payload.encode(), qos=args.qos,
                                  expected_session_present=None if args.expected_session_present is None else
                                  bool(args.expected_session_present), events_path=args.events))

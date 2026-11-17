@@ -386,7 +386,7 @@ async def protocol_matrix(broker, cursor, case):
         original = session_row(session_snapshot(broker), 'protocol-owner')
         duplicate = b'\x11\xff\xff\xff\xff' * 2
         for name, command, reason in (
-            ('finite_connect', connect_bytes('protocol-owner', clean_start=True, expiry=1), 0x83),
+            ('response_information', connect_packet('protocol-owner', flags=2, properties=b'\x19\x01'), 0x83),
             ('duplicate_connect_expiry', connect_packet('protocol-owner', flags=2, properties=duplicate), 0x82),
             ('truncated_connect_expiry', connect_packet('protocol-owner', flags=2, properties=b'\x11\0\0\0'), 0x81),
         ):
@@ -394,13 +394,13 @@ async def protocol_matrix(broker, cursor, case):
             try:
                 cursor.read();before = cursor.last
                 wire.send(command)
-                response = rejected(wire, 0x20, reason, allow_clean_close=name != 'finite_connect')
+                response = rejected(wire, 0x20, reason, allow_clean_close=name != 'response_information')
                 cursor.read()
                 refusals = [event for event in cursor.recent if int(event['seq']) > before
                             and event['kind'] == 'packet_refused']
                 require(len(refusals) == 1, 'session_protocol_cause_missing')
                 event = refusals[0]
-                expected = {'finite_connect': 'ConnectOutsideProfile',
+                expected = {'response_information': 'ConnectOutsideProfile',
                             'duplicate_connect_expiry': 'DuplicateProperty',
                             'truncated_connect_expiry': 'TruncatedField'}[name]
                 require(event['details']['reason'] == reason and event['details']['code'] == expected,
@@ -429,7 +429,7 @@ async def protocol_matrix(broker, cursor, case):
         await gone(broker, cursor, name)
     for name, properties, reason in (
         ('duplicate_disconnect', b'\x11\0\0\0\0' * 2, 0x82),
-        ('finite_disconnect', b'\x11\0\0\0\x01', 0x83),
+        ('disconnect_with_will', b'', 0x83),
         ('truncated_disconnect', b'\x11\0\0\0', 0x81),
     ):
         wire = SessionWire(broker.address, observations, name)
@@ -437,7 +437,7 @@ async def protocol_matrix(broker, cursor, case):
             wire.session_connect(name, expiry=INFINITE, expected_present=False)
             old = session_row(session_snapshot(broker), name)
             declared = len(properties) + (name == 'truncated_disconnect')
-            wire.send(packet(0xE0, b'\x00' + bytes([declared]) + properties))
+            wire.send(packet(0xE0, bytes([4 if name == 'disconnect_with_will' else 0, declared]) + properties))
             observed.append({'case': name, 'response': rejected(wire, 0xE0, reason)})
         finally:
             wire.close()

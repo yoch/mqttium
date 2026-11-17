@@ -216,8 +216,8 @@ def framing(binary: Path, case: Path) -> dict:
         # A valid MQTT feature outside the narrow profile must not be confused
         # with a syntactically malformed fixed header.
         start = len(broker.events())
-        with Wire(broker.address, broker.observations, "unsupported-finite-expiry") as wire:
-            wire.send(connect_packet("unsupported", properties=b"\x11\x00\x00\x00\x01"))
+        with Wire(broker.address, broker.observations, "unsupported-response-information") as wire:
+            wire.send(connect_packet("unsupported", properties=b"\x19\x01"))
             expect_rejection(wire, before_connect=True)
         unsupported = broker.wait_event("packet_refused", after=start - 1)
         require(unsupported["details"]["code"] == "ConnectOutsideProfile",
