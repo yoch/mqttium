@@ -61,13 +61,26 @@ class Broker:
 
     def wait_event(self, kind: str, *, point: str | None = None, timeout: float = 8,
                    after: int = -1) -> dict:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        def retained() -> dict | None:
             for event in self.events():
                 if int(event["seq"]) > after and event["kind"] == kind and (point is None or event.get("point") == point):
                     self.observations.record("event_retained", event=event)
                     return event
+            return None
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            event = retained()
+            if event is not None:
+                return event
             if self.process.poll() is not None:
+                # The process can append its last fact and exit between the
+                # previous scan and poll. After observed death, its completed
+                # writes precede this final bounded scan. Preserve that fact;
+                # only a genuinely absent event becomes a process-exit failure.
+                event = retained()
+                if event is not None:
+                    return event
                 raise ReceiptFailure("broker_exited_before_event", f"{kind}: exit {self.process.returncode}; {self.stderr_path}")
             time.sleep(.005)
         raise ReceiptFailure("event_not_reached", kind if point is None else f"{kind}/{point}")

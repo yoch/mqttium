@@ -890,10 +890,13 @@ def retired_replays(binary: Path, case: Path) -> dict:
                 (broker.control / f"replay-retired-{mode}").touch(exist_ok=False)
                 observed = broker.wait_event("receipt_replay_result", after=last)
                 require(observed["details"]["mode"] == mode, "wrong_replay_probe")
-                after = durable(broker.db)
-                write_json(case / f"replay-{mode}-state.json", after)
+                # A known incorrect terminal result establishes the violation.
+                # A later read failure or mutation-induced shutdown cannot
+                # replace it with an unrelated collection diagnostic.
                 require(observed["details"]["outcome"] == expected, failure,
                         str(observed["details"]["outcome"]))
+                after = durable(broker.db)
+                write_json(case / f"replay-{mode}-state.json", after)
                 require(all(after["counts"][name] == 0
                             for name in ("publications", "payloads", "obligations", "inbound", "outbound")),
                         failure, "a replay recreated a live business object")
