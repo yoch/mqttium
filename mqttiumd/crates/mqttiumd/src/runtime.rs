@@ -4503,15 +4503,8 @@ fn run_inner(
             .local_addr()
             .map_err(|_| Failure::plain("listen_address"))?;
         check_startup_cancel(&cancel)?;
-        let mut readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":10,"retained_available":true,"retained_topics":32,"retained_bytes":1048576,"max_replay_candidates":256,"profile":"tcp-will-pubsub-v1"}});
-        readiness["details"]["will"] = json!(true);
-        readiness["details"]["will_qos"] = json!(1);
-        readiness["details"]["will_retain"] = json!(false);
-        readiness["details"]["will_delay_interval"] = json!(0);
-        readiness["details"]["will_message_expiry"] = json!(false);
-        readiness["details"]["max_will_intents"] = json!(256);
-        readiness["details"]["max_will_bytes"] = json!(8388608);
-        readiness["details"]["max_will_receipt_bytes"] = json!(8388608);
+        let readiness = json!({"details":{"address":address.to_string(),"epoch":epoch.get().to_string(),"incarnation":incarnation.get().to_string(),"max_connections":16,"max_sessions":128,"max_packet_bytes":65536,"max_client_id_bytes":1024,"max_topic_bytes":1024,"max_payload_bytes":32768,"receive_maximum":8,"max_exchange_slots":128,"input_slots":4,"output_slots":4,"writer_slots":32,"commands_in_flight":16,"max_timers":512,"receipt_slots":8192,"partial_packet_ms":5000,"connect_ms":3000,"write_ms":250,"remembered_connections":8,"max_subscriptions":128,"max_targets":16,"outgoing_per_connection":8,"outgoing_metadata":128,"outgoing_packet_identifier_max":65535,"outgoing_packet_identifier_probe_limit":129,"outgoing_payload_bytes":4194304,"work_page_items":8,"work_scan_ms":100,"wildcard_subscriptions":true,"no_local":true,"shared_subscriptions":false,"subscription_identifiers":false,"sqlite_schema":10,"retained_available":true,"retained_topics":32,"retained_bytes":1048576,"max_replay_candidates":256,"profile":"tcp-will-pubsub-v1"}});
+        events.emit("will_capabilities",json!({"details":{"will":true,"will_qos":1,"will_retain":false,"will_delay_interval":0,"will_message_expiry":false,"max_will_intents":256,"max_will_bytes":8388608,"max_will_receipt_bytes":8388608}})).map_err(event_failure)?;
         events.emit("ready", readiness).map_err(event_failure)?;
         println!(
             "mqttiumd ready {address} (local MQTT 5 retained pub/sub with Message Expiry and durable Will)"

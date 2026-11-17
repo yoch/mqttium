@@ -1,6 +1,6 @@
 # 0034 — Durable zero-delay QoS1 Will
 
-Status: Proposed
+Status: **Proposed**
 
 A successful MQTT5 CONNECT may install a non-retained QoS1 Will with delay
 absent or zero. All other Will properties, including Message Expiry, are
