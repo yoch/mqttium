@@ -1021,6 +1021,56 @@ impl Outbox {
         DispatchReport { accepted, blocked }
     }
 
+    /// Bounded independent Will work also bypasses a blocked network effect.
+    pub fn dispatch_will_controls(
+        &mut self,
+        sink: &mut dyn EffectSink,
+        flight: Option<(OperationId, DeadlineToken)>,
+    ) -> DispatchReport {
+        let mut waiting = flight.is_some_and(|(operation, _)| self.queue.iter().any(|e| {
+            matches!(e.effect(), Effect::Persist {command} if command.recipe.operation() == operation)
+        }));
+        let mut accepted = 0;
+        let mut blocked = None;
+        let count = self.queue.len();
+        for _ in 0..count {
+            let Some(effect) = self.queue.pop_front() else {
+                break;
+            };
+            let lifecycle_persist = matches!(effect.effect(), Effect::Persist {command} if matches!(command.recipe.get(), crate::command::Recipe::WillPublication(_)));
+            let lifecycle_resolve = !waiting
+                && matches!(effect.effect(), Effect::ResolveAndFence {operation} if flight.is_some_and(|(current,_)| *operation == current));
+            let lifecycle_deadline = !waiting
+                && matches!(effect.effect(), Effect::ArmDeadline {token,..} if flight.is_some_and(|(_,current)| *token == current));
+            let selected = lifecycle_persist
+                || lifecycle_resolve
+                || lifecycle_deadline
+                || matches!(effect.effect(), Effect::LoadWills { .. });
+            let restore = if selected && blocked.is_none() {
+                match sink.try_submit(effect) {
+                    SubmitResult::Accepted => {
+                        accepted += 1;
+                        if lifecycle_persist {
+                            waiting = false;
+                        }
+                        None
+                    }
+                    SubmitResult::NotSubmitted { effect, reason } => {
+                        blocked = Some(reason);
+                        Some(effect)
+                    }
+                }
+            } else {
+                Some(effect)
+            };
+            if let Some(effect) = restore {
+                let restored = self.queue.try_push_back(effect);
+                debug_assert!(restored.is_ok(), "the scanned slot was taken");
+            }
+        }
+        DispatchReport { accepted, blocked }
+    }
+
     /// Moves effects to `sink` in order until one is refused. The refused
     /// effect returns to the head of the box with the same identity.
     pub fn dispatch(&mut self, sink: &mut dyn EffectSink) -> DispatchReport {
