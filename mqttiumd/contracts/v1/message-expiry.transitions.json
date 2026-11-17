@@ -1,0 +1,222 @@
+{
+  "format": "mqttiumd.product-transition-registry",
+  "schema_version": 1,
+  "id": "tcp-message-expiry-v1",
+  "decision": "0033",
+  "status": "Proposed",
+  "scope": "product-system-tests",
+  "partition_complete": false,
+  "description": "Implemented Message Expiry subset for retained and nonretained QoS0/1/2 inputs and QoS0/1 outputs. Descriptive system evidence; the historical fixture oracle does not qualify expiry, retained replay, transmission start or temporal quarantine.",
+  "authority": "The adapter supplies bounded clock observations; the pure owner preserves exact recipes and frame/claim identities; the durable writer owns atomic mutation and cleanup; only positive socket bytes can establish transmission start. Timers and queued effects grant no delivery or credit authority.",
+  "time": {
+    "clock": "CLOCK_BOOTTIME",
+    "unit": "nanoseconds",
+    "wire_unit": "seconds",
+    "unknown_origin_policy": "quarantine-on-unknown-origin"
+  },
+  "limitations": [
+    "Unknown or unrecognized restart continuity quarantines old expiring values and unsent work, retaining bounded references. This sacrifices availability and does not claim strict cross-restart lifetime compliance in that environment.",
+    "A recovered claim without durable Started may already have sent bytes. After established freshness is lost it is quarantined; claim existence never proves transmission or certain nontransmission.",
+    "Outgoing QoS2, Will, migration, universal clock continuity, performance and power-loss claims remain outside this subset. Product, model and historical oracle evidence retain their separate scopes."
+  ],
+  "rules": [
+    {
+      "id": "message.expiry.receive.freeze",
+      "machine": "MessageExpiry",
+      "state_class": "Idle",
+      "event_class": "Publish",
+      "guard": "Absent property means no lifetime. Present u32 is finite, including0 and0xffffffff; reception fixes domain/tick before input deferral and checked deadline arithmetic.",
+      "next_state_class": "Fresh",
+      "required_actions": [
+        "FreezeReceptionOrigin",
+        "CommitOriginalExpiryWithAdmission"
+      ],
+      "forbidden_actions": [
+        "RenewLifetimeOnRetry",
+        "UseUtcForDeletion"
+      ],
+      "reception_groups": [
+        "A",
+        "B",
+        "G"
+      ]
+    },
+    {
+      "id": "message.expiry.replay.original",
+      "machine": "MessageExpiry",
+      "state_class": "Fresh",
+      "event_class": "Subscribe",
+      "guard": "One admissible frozen observation selects only established-fresh retained versions. Each replay inherits the original expiry, payload and version.",
+      "next_state_class": "Queued",
+      "required_actions": [
+        "PreserveOriginalExpiry",
+        "SelectCompleteOrderedReplay"
+      ],
+      "forbidden_actions": [
+        "ResetTtlAtSubscription",
+        "ReplayExpiredOrUncertainValue"
+      ],
+      "reception_groups": [
+        "B",
+        "C"
+      ]
+    },
+    {
+      "id": "message.expiry.unknown.quarantine",
+      "machine": "MessageExpiry",
+      "state_class": "Fresh",
+      "event_class": "DomainChanged",
+      "guard": "An expiring value and current reading have different domains. No elapsed time or renewed origin can be established.",
+      "next_state_class": "Quarantined",
+      "required_actions": [
+        "PreserveBoundedResponsibilities",
+        "BlockNewTransmission"
+      ],
+      "forbidden_actions": [
+        "InventDowntime",
+        "DeleteAsEstablishedExpired",
+        "AssignNewOrigin"
+      ],
+      "reception_groups": [
+        "D",
+        "E"
+      ]
+    },
+    {
+      "id": "message.expiry.send.gate",
+      "machine": "MessageExpiry",
+      "state_class": "TransmissionPending",
+      "event_class": "ZeroProgressWrite",
+      "guard": "Before every zero-progress write attempt, matching nonregressed time establishes freshness. Patch remaining seconds rounded upward inside the original interval.",
+      "next_state_class": "TransmissionPending",
+      "required_actions": [
+        "CheckOriginalDeadline",
+        "PatchRemainingInterval"
+      ],
+      "forbidden_actions": [
+        "TreatClaimAsStarted",
+        "UseQueueAdmissionAsWireTime"
+      ],
+      "reception_groups": [
+        "A",
+        "D",
+        "G"
+      ]
+    },
+    {
+      "id": "message.expiry.send.first.byte",
+      "machine": "MessageExpiry",
+      "state_class": "TransmissionPending",
+      "event_class": "PositiveWrite",
+      "guard": "A positive-byte observation matches the exact frame, connection and claim. The frame now completes or closes; a separately guarded writer operation records Started.",
+      "next_state_class": "StartPending",
+      "required_actions": [
+        "CorrelateFirstPositiveWrite",
+        "CompleteFrameOrClose",
+        "PersistStarted"
+      ],
+      "forbidden_actions": [
+        "TruncateFrameOnExpiry",
+        "RetargetDelayedObservation"
+      ],
+      "reception_groups": [
+        "D",
+        "F"
+      ]
+    },
+    {
+      "id": "message.expiry.started.complete",
+      "machine": "MessageExpiry",
+      "state_class": "Started",
+      "event_class": "ExpiredLifetime",
+      "guard": "Known Started retains payload, Packet Identifier and exact claim through PUBACK and known Finish. Replay after expiry carries remaining zero.",
+      "next_state_class": "AwaitPuback",
+      "required_actions": [
+        "PreserveProtocolExchange",
+        "ReportRemainingZeroAfterExpiry"
+      ],
+      "forbidden_actions": [
+        "FreeStartedIdentifierOnTimer",
+        "RenewLifetimeOnReconnect"
+      ],
+      "reception_groups": [
+        "D",
+        "E"
+      ]
+    },
+    {
+      "id": "message.expiry.never.started.expire",
+      "machine": "MessageExpiry",
+      "state_class": "TransmissionPending",
+      "event_class": "NotStarted",
+      "guard": "This exact frame certainly wrote no bytes and no earlier attempt remains uncertain. Established expiry and exact claim guards authorize one normal durable ExpireDelivery operation.",
+      "next_state_class": "ExpirePending",
+      "required_actions": [
+        "PersistExactGuardedExpiry",
+        "ResolveSameOperationWhenUnknown"
+      ],
+      "forbidden_actions": [
+        "ReleaseFromUncorrelatedCallback",
+        "ExpireUncertainClaim"
+      ],
+      "reception_groups": [
+        "A",
+        "D",
+        "E"
+      ]
+    },
+    {
+      "id": "message.expiry.maintenance.bounded",
+      "machine": "MessageExpiry",
+      "state_class": "Expired",
+      "event_class": "Sweep",
+      "guard": "One writer request visits at most four publication keys, returns absolute removed identities, and advances only a received live cursor. Remove retained and unclaimed expired references; preserve inbound QoS2 and every outbound claim.",
+      "next_state_class": "Terminal",
+      "required_actions": [
+        "BoundScanAndReply",
+        "ReleaseOnlyOwnedReferences",
+        "ReconcileExactRemovedDeliveries"
+      ],
+      "forbidden_actions": [
+        "CreateHistoricalCursorRows",
+        "FreeClaimedCopies",
+        "ReleaseCreditsFromTimer"
+      ],
+      "reception_groups": [
+        "B",
+        "C",
+        "F"
+      ]
+    },
+    {
+      "id": "message.expiry.sweep.reply.lost",
+      "machine": "MessageExpiry",
+      "state_class": "Expired",
+      "event_class": "ReceiptlessResultLost",
+      "guard": "One maintenance reply is deliberately dropped after a real SQLite transaction. The retry keeps the same domain/tick and key cursor; no OperationId or historical cursor row is created.",
+      "next_state_class": "Expired",
+      "required_actions": [
+        "RetrySameObservationAndCursor",
+        "ReconcileAbsoluteRemovedIdentities"
+      ],
+      "forbidden_actions": [
+        "AdvanceCursorOnLostReply",
+        "InventMaintenanceOperationId",
+        "ReleaseCreditsTwice"
+      ],
+      "reception_groups": [
+        "D",
+        "F"
+      ]
+    }
+  ],
+  "hooks": [
+    "delivery.started.prepared",
+    "delivery.started.committed",
+    "message.delivery.expire.prepared",
+    "message.delivery.expire.committed",
+    "message.expire.prepared",
+    "message.expire.committed",
+    "publish.emission"
+  ]
+}

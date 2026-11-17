@@ -104,7 +104,9 @@
         "SessionDetach",
         "SessionExpire",
         "SessionLifecycle",
-        "RetainedQoS0"
+        "RetainedQoS0",
+        "DeliveryStarted",
+        "MessageExpire"
       ]
     },
     "cause": {

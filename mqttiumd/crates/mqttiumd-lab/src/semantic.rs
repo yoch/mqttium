@@ -182,7 +182,17 @@ pub fn check(workspace: &Workspace, document: &Value, report: &mut Report) {
             }
             if matches!(
                 text(document, "kind"),
-                "session_changed" | "session_clock_checkpoint" | "session_clock_degraded"
+                "session_changed"
+                    | "session_clock_checkpoint"
+                    | "session_clock_degraded"
+                    | "message_expiry_received"
+                    | "message_expiry_sweep"
+                    | "message_expiry_clock"
+                    | "message_transmission_started"
+                    | "message_transmission_not_started"
+                    | "message_expiry_quarantined"
+                    | "message_expiry_applied"
+                    | "message_expiry_result_dropped"
             ) {
                 for member in ["deadline", "logical", "tick", "age_ms"] {
                     let pointer = format!("/details/{member}");
@@ -1583,6 +1593,7 @@ fn trace_record(document: &Value, out: &mut Vec<Diagnostic>) {
         );
     }
     decimal_strings(document.get("payload"), "/payload", out);
+    message_expiries(document.get("payload"), "/payload", out);
     if matches!(
         document.get("kind").and_then(Value::as_str),
         Some("RecoveryPageRead" | "RecoveryPageDelivered")
@@ -1833,6 +1844,7 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
         ),
     ];
     decimal_strings(Some(document), "", out);
+    message_expiries(Some(document), "", out);
     for (table, key, suffix) in TABLES {
         let rows = document
             .pointer(table)
@@ -1869,6 +1881,42 @@ fn store_snapshot(document: &Value, out: &mut Vec<Diagnostic>) {
                 previous = Some(parts);
             }
         }
+    }
+}
+
+/// Message deadlines must fit the durable nanosecond domain. This checks only
+/// their representation, without deciding freshness or inventing clock authority.
+fn message_expiries(value: Option<&Value>, pointer: &str, out: &mut Vec<Diagnostic>) {
+    match value {
+        Some(Value::Object(members)) => {
+            if let (Some(tick), Some(interval)) = (
+                members
+                    .get("observed")
+                    .and_then(|v| v.get("tick"))
+                    .and_then(Value::as_str),
+                members.get("interval").and_then(Value::as_u64),
+            ) && let Ok(tick) = parse_u64(tick)
+                && interval
+                    .checked_mul(1_000_000_000)
+                    .and_then(|n| tick.checked_add(n))
+                    .is_none()
+            {
+                out.push(Diagnostic::new(
+                    code::U64_OUT_OF_RANGE,
+                    pointer,
+                    "the message expiry deadline exceeds 18446744073709551615 nanoseconds",
+                ));
+            }
+            for (name, member) in members {
+                message_expiries(Some(member), &format!("{pointer}/{name}"), out);
+            }
+        }
+        Some(Value::Array(values)) => {
+            for (index, member) in values.iter().enumerate() {
+                message_expiries(Some(member), &format!("{pointer}/{index}"), out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1990,6 +2038,22 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn message_deadline_overflow_is_not_freshness_or_expiration() {
+        let mut value = serde_json::json!({"expiry": {
+            "observed": {"domain_hex": "ab".repeat(32), "tick": "100"},
+            "interval": u32::MAX,
+        }});
+        let mut out = Vec::new();
+        message_expiries(Some(&value), "", &mut out);
+        assert!(out.is_empty());
+        value["expiry"]["observed"]["tick"] = Value::String(u64::MAX.to_string());
+        message_expiries(Some(&value), "", &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].code, code::U64_OUT_OF_RANGE);
+        assert_eq!(out[0].pointer, "/expiry");
+    }
 
     #[test]
     fn expiry_deadlines_and_anchor_ticks_are_canonical_u64_strings() {

@@ -29,7 +29,8 @@
         "tcp-session-lifecycle-v1",
         "tcp-session-expiry-v1",
         "tcp-hierarchical-routing-v1",
-        "tcp-durable-retained-v1"
+        "tcp-durable-retained-v1",
+        "tcp-message-expiry-v1"
       ]
     },
     "decision": {
@@ -40,7 +41,8 @@
         "0029",
         "0030",
         "0031",
-        "0032"
+        "0032",
+        "0033"
       ]
     },
     "scope": {
@@ -87,7 +89,8 @@
               "SessionLifecycle",
               "SessionExpiry",
               "Routing",
-              "RetainedStore"
+              "RetainedStore",
+              "MessageExpiry"
             ]
           },
           "state_class": {
@@ -126,7 +129,13 @@
               "DetachedFinite",
               "ExpirePending",
               "ClockAnchorPending",
-              "ClockReady"
+              "ClockReady",
+              "Fresh",
+              "Expired",
+              "Quarantined",
+              "TransmissionPending",
+              "Started",
+              "StartPending"
             ]
           },
           "event_class": {
@@ -173,7 +182,13 @@
               "DetachedFinite",
               "ExpirePending",
               "ClockAnchorPending",
-              "ClockReady"
+              "ClockReady",
+              "Fresh",
+              "Expired",
+              "Quarantined",
+              "TransmissionPending",
+              "Started",
+              "StartPending"
             ]
           },
           "required_actions": {
@@ -211,6 +226,56 @@
             }
           }
         }
+      }
+    },
+    "status": {
+      "const": "Proposed"
+    },
+    "authority": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "time": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clock",
+        "unit",
+        "wire_unit",
+        "unknown_origin_policy"
+      ],
+      "properties": {
+        "clock": {
+          "const": "CLOCK_BOOTTIME"
+        },
+        "unit": {
+          "const": "nanoseconds"
+        },
+        "wire_unit": {
+          "const": "seconds"
+        },
+        "unknown_origin_policy": {
+          "const": "quarantine-on-unknown-origin"
+        }
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512
+      }
+    },
+    "hooks": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "primitives.schema.json#/$defs/dotted_name"
       }
     }
   },
@@ -344,6 +409,31 @@
         "properties": {
           "decision": {
             "const": "0032"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "const": "tcp-message-expiry-v1"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "status",
+          "authority",
+          "time",
+          "limitations"
+        ],
+        "properties": {
+          "decision": {
+            "const": "0033"
           }
         }
       }

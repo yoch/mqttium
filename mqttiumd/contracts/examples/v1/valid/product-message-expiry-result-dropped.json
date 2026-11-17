@@ -1,0 +1,11 @@
+{
+  "format": "mqttiumd.product-event",
+  "schema_version": 1,
+  "seq": "8",
+  "pid": 1,
+  "kind": "message_expiry_result_dropped",
+  "details": {
+    "tick": "100",
+    "code": "format_example"
+  }
+}

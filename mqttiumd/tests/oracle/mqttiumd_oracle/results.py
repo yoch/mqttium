@@ -169,6 +169,7 @@ FIXTURE_RECEIPT_SCOPE = "the fixture-based qualifier does not cover live receipt
 FIXTURE_SESSION_SCOPE = "the fixture-based qualifier does not cover product session lifecycle"
 FIXTURE_ROUTING_SCOPE = "the fixture-based qualifier does not cover hierarchical or No Local routing"
 FIXTURE_RETAINED_SCOPE = "the fixture-based qualifier does not cover retained storage or replay"
+FIXTURE_MESSAGE_EXPIRY_SCOPE = "the fixture-based qualifier does not cover message expiry, transmission start or temporal quarantine"
 
 
 def _product_session(row):
@@ -205,6 +206,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
     receipt_retirement = False
     session_lifecycle = False
     retained = False
+    message_expiry = False
     # The independent fixture assertions intentionally retain their exact-topic
     # semantics. New readable route/options evidence must not broaden them.
     hierarchical_routing = any(
@@ -214,6 +216,8 @@ def _scope_unmet(contracts, scenario_path, trace_path):
     )
     for _, snapshot in run.snapshots.values():
         retained |= bool(snapshot.get("retained", ()))
+        message_expiry |= any(row.get("expiry") is not None for row in snapshot.get("publications", ()))
+        message_expiry |= any(row.get("started", False) for row in snapshot.get("outbound", ()))
         retained |= any(row.get("retain", False) or row.get("retained_version") is not None
                         for row in snapshot.get("publications", ()))
         retained |= any(row.get("retain", False) or row.get("cause") == "RetainedReplay"
@@ -239,6 +243,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
                 qos0_delivery |= recipe[6] == 6
                 session_lifecycle |= recipe[6] == 8
                 retained |= recipe[6] in (10, 11, 12)
+                message_expiry |= recipe[6] in (13, 14, 15, 16)
             try:
                 decoded = recipes.decode(recipe)
             except recipes.RecipeError:
@@ -252,6 +257,7 @@ def _scope_unmet(contracts, scenario_path, trace_path):
             qos0_delivery |= facts.get("kind") == "DeliveryConsumed"
             session_lifecycle |= facts.get("kind") == "SessionLifecycle"
             retained |= facts.get("kind") == "RetainedQos0Stored"
+            message_expiry |= facts.get("kind") in {"DeliveryStarted", "DeliveryExpired"}
     for record in run.trace.records:
         payload = record.payload
         unsupported |= payload.get("command_kind") in {
@@ -260,6 +266,12 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         qos0_delivery |= payload.get("command_kind") == "ConsumeDelivery"
         session_lifecycle |= payload.get("command_kind") == "SessionLifecycle"
         retained |= payload.get("command_kind") in {"RetainedPublication", "RetainedQos0", "ReplaySubscriptions"}
+        message_expiry |= payload.get("command_kind") in {
+            "ExpiringPublication", "TimedReplaySubscriptions", "MarkDeliveryStarted", "ExpireDelivery",
+            "DeliveryStarted", "MessageExpire"}
+        message_expiry |= payload.get("expiry") is not None or payload.get("message_expiry_interval") is not None
+        if record.kind in {"PeerPacketSent", "ClientBytesReceived"}:
+            message_expiry |= _wire_message_expiry(payload.get("bytes_hex", ""))
         retained |= record.kind == "ClientBytesReceived" and payload.get("retain", False)
         non_qos2 |= (record.kind == "ClientBytesReceived"
                      and payload.get("packet_kind") == "PUBLISH"
@@ -282,6 +294,8 @@ def _scope_unmet(contracts, scenario_path, trace_path):
             if fact["kind"] != "OutboundDelivery":
                 continue
             qos0_delivery |= fact.get("qos", 1) == 0
+            message_expiry |= fact.get("expiry") is not None or fact.get("started", False)
+            message_expiry |= bool(fact.get("claim") and fact["claim"].get("started", False))
             if fact["claim"] is not None:
                 unsupported = True
                 continue
@@ -307,7 +321,67 @@ def _scope_unmet(contracts, scenario_path, trace_path):
         [FIXTURE_SESSION_SCOPE] if session_lifecycle else []
     ) + ([FIXTURE_ROUTING_SCOPE] if hierarchical_routing else []) + (
         [FIXTURE_RETAINED_SCOPE] if retained else []
+    ) + (
+        [FIXTURE_MESSAGE_EXPIRY_SCOPE] if message_expiry else []
     )
+
+
+def _wire_message_expiry(raw_hex):
+    """Scope guard only: detect property0x02 in a bounded MQTT5 PUBLISH.
+
+    This does not judge temporal semantics. Reading wire evidence closes the
+    scope gap when a timed message expires before leaving any durable row.
+    """
+    if not isinstance(raw_hex, str) or len(raw_hex) > 2 * 65536:
+        return False
+    try:
+        data = bytes.fromhex(raw_hex)
+    except (ValueError, TypeError):
+        return False
+    if not data or data[0] >> 4 != 3 or len(data) > 65536:
+        return False
+    def variable(at):
+        value = 0
+        for shift in (0, 7, 14, 21):
+            if at >= len(data):
+                raise ValueError
+            byte = data[at]
+            at += 1
+            value |= (byte & 127) << shift
+            if not byte & 128:
+                return value, at
+        raise ValueError
+    try:
+        length, at = variable(1)
+        if at + length != len(data) or at + 2 > len(data):
+            return False
+        topic_length = int.from_bytes(data[at:at+2], "big")
+        at += 2 + topic_length + (2 if (data[0] >> 1) & 3 else 0)
+        length, at = variable(at)
+        end = at + length
+        if end > len(data):
+            return False
+        while at < end:
+            prop, at = variable(at)
+            if prop == 2:
+                return True
+            if prop == 1:
+                at += 1
+            elif prop == 0x23:
+                at += 2
+            elif prop == 0x0b:
+                _, at = variable(at)
+            elif prop in (3, 8, 9, 0x26):
+                for _ in range(2 if prop == 0x26 else 1):
+                    if at + 2 > end:
+                        return False
+                    count = int.from_bytes(data[at:at+2], "big")
+                    at += 2 + count
+            else:
+                return False
+        return False
+    except ValueError:
+        return False
 
 
 def _broker_unmet(contracts, manifest, trace_path):

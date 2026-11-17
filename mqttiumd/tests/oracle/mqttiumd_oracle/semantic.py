@@ -981,8 +981,28 @@ class InventoryOrder:
         return None
 
 
+def _message_expiries(value, pointer, out):
+    """Read checked deadline shape without asserting age or clock continuity."""
+    if isinstance(value, list):
+        for index, member in enumerate(value):
+            _message_expiries(member, f"{pointer}/{index}", out)
+    elif isinstance(value, dict):
+        if "observed" in value and "interval" in value:
+            try:
+                tick = u64(value["observed"]["tick"])
+            except (KeyError, ValueError, TypeError):
+                pass  # The schema/decimal reader already reports the bad field.
+            else:
+                if tick + value["interval"] * 1_000_000_000 > 2**64 - 1:
+                    out.append(Diagnostic("u64-out-of-range", pointer,
+                        "the message expiry deadline exceeds 18446744073709551615 nanoseconds"))
+        for name, member in value.items():
+            _message_expiries(member, f"{pointer}/{name}", out)
+
+
 def _trace_record(contracts, document, out):
     _by_schema(contracts, document, out)
+    _message_expiries(document.get("payload"), "/payload", out)
     if document["kind"] in ("RecoveryPageRead", "RecoveryPageDelivered"):
         order = InventoryOrder()
         for index, fact in enumerate(document["payload"]["facts"]):
@@ -1048,6 +1068,7 @@ def _sort_key(value, kind):
 
 def _store_snapshot(contracts, document, out):
     _by_schema(contracts, document, out)
+    _message_expiries(document, "", out)
     for table, members, suffix in _SNAPSHOT_KEYS:
         previous = None
         for index, row in enumerate(_get(document, table) or ()):
@@ -1103,7 +1124,10 @@ def _product_event(contracts, document, out):
             _u64(document, f"/details/returned_{member}", out)
     if document["kind"] == "command_submitted" and "expected_session" in document.get("details", {}):
         _u64(document, "/details/expected_session", out)
-    if document["kind"] in {"session_changed", "session_clock_checkpoint", "session_clock_degraded"}:
+    if document["kind"] in {"session_changed", "session_clock_checkpoint", "session_clock_degraded",
+            "message_expiry_received", "message_expiry_sweep", "message_expiry_clock",
+            "message_transmission_started", "message_transmission_not_started",
+            "message_expiry_quarantined", "message_expiry_applied", "message_expiry_result_dropped"}:
         for member in ("deadline", "logical", "tick", "age_ms"):
             if member in document.get("details", {}):
                 _u64(document, f"/details/{member}", out)

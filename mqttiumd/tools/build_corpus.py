@@ -3450,7 +3450,7 @@ for kind_name, origin in [
 # Product system evidence is separate from fixture-based qualifying campaigns.
 ok("product-profile.json", json.loads((V1 / "product-profile.json").read_text()))
 product_profile = json.loads((V1 / "product-profile.json").read_text())
-for field, expected in (("closing_input_slots", 32), ("terminal_input_slots", 336),
+for field, expected in (("closing_input_slots", 32), ("terminal_input_slots", 544),
                         ("frame_registration_slots", 208), ("pre_connack_packet_slots", 1),
                         ("session_shutdown_timeout_ms", 2000)):
     bad(f"product-profile-wrong-{field}.json", "schema-violation", f"/{field}",
@@ -3804,7 +3804,7 @@ for name, options in (("qos-bits", 1), ("rh3", 48), ("boolean", True)):
         edited(options_snapshot, lambda v, bits=options: v["route_table"]["routes"][0]["targets"][0].update(options=bits)))
 capabilities = env("mqttiumd.product-event", seq="1", kind="ready", pid=1, details={
     "wildcard_subscriptions": True, "no_local": True, "shared_subscriptions": False,
-    "subscription_identifiers": False, "sqlite_schema": 8, "profile": "tcp-retained-pubsub-v1",
+    "subscription_identifiers": False, "sqlite_schema": 9, "profile": "tcp-message-expiry-pubsub-v1",
     "retained_available": True, "retained_topics": 32, "retained_bytes": 1048576, "max_replay_candidates": 256,
 })
 ok("product-hierarchical-capabilities.json", capabilities)
@@ -3812,6 +3812,88 @@ bad("product-details-over-budget.json", "schema-violation", "/details",
     "Product diagnostics remain bounded even with the six new startup capabilities.",
     env("mqttiumd.product-event", seq="1", kind="starting", pid=1,
         details={"field" + str(index): 0 for index in range(41)}))
+
+# Descriptive Proposed0033 examples. These are generated format fixtures, never
+# a fabricated product run, clock-continuity proof or qualifying expiry result.
+message_transitions = json.loads((V1 / "message-expiry.transitions.json").read_text())
+ok("product-message-expiry-transitions.json", message_transitions)
+bad("product-message-expiry-transitions-wrong-decision.json", "schema-violation", "/decision",
+    "Message lifetime is the explicitly Proposed0033 product subset.",
+    {**message_transitions, "decision": "0032"})
+message_time = {"domain_hex": "ab" * 32, "tick": "100"}
+message_expiry = {"observed": message_time, "interval": 2}
+message_time_hex = "ab" * 32 + be(100)
+message_expiry_hex = message_time_hex + be(2, 4)
+message_snapshot = copy.deepcopy(snapshot)
+message_snapshot["publications"][0]["expiry"] = copy.deepcopy(message_expiry)
+message_snapshot["operations"][0]["recipe_hex"] = (
+    b"MQDR".hex() + be(1, 2) + be(13, 1) + be(len(RECIPE_HEX) // 2, 4)
+    + RECIPE_HEX + message_expiry_hex)
+message_snapshot["meta"]["session_clock"] = {
+    "reading": {"domain": "ab" * 32, "tick": "100"}, "logical": "100"}
+ok("store-snapshot-message-expiry.json", message_snapshot)
+for suffix, interval in (("zero", 0), ("maximum", 4294967295)):
+    ok(f"store-snapshot-message-expiry-{suffix}.json",
+       edited(message_snapshot, lambda v, interval=interval:
+           (v["publications"][0]["expiry"].update(interval=interval),
+            v["operations"][0].update(recipe_hex=v["operations"][0]["recipe_hex"][:-8] + be(interval, 4)))))
+for suffix, pointer, edit in (
+    ("interval-overflow", "/publications/0/expiry/interval", lambda v: v["publications"][0]["expiry"].update(interval=4294967296)),
+    ("interval-boolean", "/publications/0/expiry/interval", lambda v: v["publications"][0]["expiry"].update(interval=True)),
+    ("invalid-domain", "/publications/0/expiry/observed/domain_hex", lambda v: v["publications"][0]["expiry"]["observed"].update(domain_hex="AB" * 32)),
+    ("utc-authority", "/publications/0/expiry", lambda v: v["publications"][0]["expiry"].update(utc="2026-01-01")),
+):
+    bad(f"store-snapshot-message-expiry-{suffix}.json", "schema-violation", pointer,
+        "Message expiry preserves a typed, bounded original domain/tick and finite u32 seconds.",
+        edited(message_snapshot, edit))
+bad("store-snapshot-message-expiry-tick-overflow.json", "u64-out-of-range", "/publications/0/expiry/observed/tick",
+    "Reception ticks are canonical checked nanoseconds.",
+    edited(message_snapshot, lambda v: v["publications"][0]["expiry"]["observed"].update(tick=OVER)))
+bad("store-snapshot-message-expiry-deadline-overflow.json", "u64-out-of-range", "/publications/0/expiry",
+    "A valid u64 reception tick cannot make a finite lifetime overflow its deadline.",
+    edited(message_snapshot, lambda v: v["publications"][0]["expiry"]["observed"].update(tick="18446744073709551615")))
+started_snapshot = copy.deepcopy(claimed_snapshot)
+started_snapshot["publications"][0]["expiry"] = copy.deepcopy(message_expiry)
+started_snapshot["operations"][0]["recipe_hex"] = message_snapshot["operations"][0]["recipe_hex"]
+started_snapshot["meta"]["session_clock"] = copy.deepcopy(message_snapshot["meta"]["session_clock"])
+started_snapshot["outbound"][0]["started"] = True
+started_snapshot["operations"].append(product_operation(26, 15, delivery_body + scoped(21), {
+    **claim_operation["decision"]["facts"], "kind": "DeliveryStarted"}))
+started_snapshot["account"]["used"]["receipt_slots"] = "3"
+ok("store-snapshot-delivery-started.json", started_snapshot)
+expired_snapshot = copy.deepcopy(finished_snapshot)
+expired_snapshot["publications"][0]["expiry"] = copy.deepcopy(message_expiry)
+expired_snapshot["operations"][0]["recipe_hex"] = message_snapshot["operations"][0]["recipe_hex"]
+expired_snapshot["meta"]["session_clock"] = copy.deepcopy(message_snapshot["meta"]["session_clock"])
+expired_snapshot["operations"][-1] = product_operation(26, 16,
+    delivery_body + scoped(21) + message_expiry_hex + "ab" * 32 + be(2_000_000_100), {
+        **claim_operation["decision"]["facts"], "kind": "DeliveryExpired"})
+ok("store-snapshot-delivery-expired.json", expired_snapshot)
+message_recovery = copy.deepcopy(PAGE_READ)
+message_recovery["payload"]["facts"] = [{
+    "kind": "OutboundDelivery", "delivery_id": OUTBOUND_SLOT["delivery_id"],
+    "target_session": "2", "target_revision": "1", "qos": 1,
+    "expiry": copy.deepcopy(message_expiry), "started": True,
+    "claim": {"operation_id": OP, "packet_id": 1, "started": True},
+}]
+ok("trace-record-message-expiry-recovered-started.json", message_recovery)
+bad("trace-record-message-expiry-start-contradiction.json", "schema-violation", "/payload/facts/0/claim/started",
+    "Recovered start facts and their exact claim cannot disagree.",
+    edited(message_recovery, lambda v: v["payload"]["facts"][0]["claim"].update(started=False)))
+for index, kind in enumerate(("message_expiry_received", "message_expiry_sweep", "message_expiry_clock",
+        "message_transmission_started", "message_transmission_not_started", "message_expiry_quarantined", "message_expiry_applied",
+        "message_expiry_result_dropped")):
+    ok(f"product-{kind.replace('_', '-')}.json", env("mqttiumd.product-event", seq=str(index + 1), pid=1, kind=kind,
+        details={"tick": "100", "code": "format_example"}))
+for index, command in enumerate(("DeliveryStarted", "MessageExpire")):
+    ok(f"product-command-{command}.json", env("mqttiumd.product-event", seq=str(index + 1), pid=1,
+        kind="command_submitted", operation=OP, command_kind=command, details={}))
+for field in ("message_expiry", "message_expiry_interval", "message_expiry_scan_ms", "message_expiry_batch",
+        "message_expiry_policy", "message_expiry_time_unit", "sqlite_schema_version"):
+    invalid_profile = copy.deepcopy(product_profile)
+    invalid_profile[field] = False if field == "message_expiry" else "unsupported"
+    bad(f"product-profile-wrong-{field}.json", "schema-violation", f"/{field}",
+        "The profile declares the actual bounded Message Expiry implementation and quarantine policy.", invalid_profile)
 
 dump(EX / "index.json", env("mqttiumd.example-index", valid=valid, invalid=invalid))
 

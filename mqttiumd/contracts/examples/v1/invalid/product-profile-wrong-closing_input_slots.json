@@ -1,7 +1,7 @@
 {
   "format": "mqttiumd.product-profile",
   "schema_version": 1,
-  "id": "tcp-retained-pubsub-v1",
+  "id": "tcp-message-expiry-pubsub-v1",
   "mqtt_version": 5,
   "client_id": "explicit",
   "clean_start": [
@@ -72,7 +72,7 @@
   },
   "lifecycle_transition_effect_slots": 3,
   "closing_input_slots": 33,
-  "terminal_input_slots": 336,
+  "terminal_input_slots": 544,
   "frame_registration_slots": 208,
   "pre_connack_packet_slots": 1,
   "session_shutdown_timeout_ms": 2000,
@@ -82,7 +82,7 @@
   "session_clock_degraded_after_ms": 31000,
   "max_session_expiry_timers": 128,
   "session_expiry_batch": 4,
-  "sqlite_schema_version": 8,
+  "sqlite_schema_version": 9,
   "wildcard_subscriptions": true,
   "no_local": true,
   "shared_subscriptions": false,
@@ -97,5 +97,14 @@
   "max_retained_bytes": 1048576,
   "max_replay_candidates": 256,
   "live_overlap_policy": "one-per-session",
-  "retained_replay_overlap_policy": "one-per-filter-occurrence-and-topic"
+  "retained_replay_overlap_policy": "one-per-filter-occurrence-and-topic",
+  "message_expiry": true,
+  "message_expiry_interval": {
+    "minimum": 0,
+    "maximum": 4294967295
+  },
+  "message_expiry_scan_ms": 100,
+  "message_expiry_batch": 4,
+  "message_expiry_policy": "quarantine-on-unknown-origin",
+  "message_expiry_time_unit": "nanoseconds"
 }

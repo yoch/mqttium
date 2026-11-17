@@ -78,7 +78,13 @@
     "max_retained_bytes",
     "max_replay_candidates",
     "live_overlap_policy",
-    "retained_replay_overlap_policy"
+    "retained_replay_overlap_policy",
+    "message_expiry",
+    "message_expiry_interval",
+    "message_expiry_scan_ms",
+    "message_expiry_batch",
+    "message_expiry_policy",
+    "message_expiry_time_unit"
   ],
   "properties": {
     "format": {
@@ -88,7 +94,7 @@
       "const": 1
     },
     "id": {
-      "const": "tcp-retained-pubsub-v1"
+      "const": "tcp-message-expiry-pubsub-v1"
     },
     "mqtt_version": {
       "const": 5
@@ -265,7 +271,7 @@
       "const": 32
     },
     "terminal_input_slots": {
-      "const": 336
+      "const": 544
     },
     "frame_registration_slots": {
       "const": 208
@@ -295,7 +301,7 @@
       "const": 4
     },
     "sqlite_schema_version": {
-      "const": 8
+      "const": 9
     },
     "wildcard_subscriptions": {
       "const": true
@@ -333,6 +339,27 @@
     },
     "retained_replay_overlap_policy": {
       "const": "one-per-filter-occurrence-and-topic"
+    },
+    "message_expiry": {
+      "const": true
+    },
+    "message_expiry_interval": {
+      "const": {
+        "minimum": 0,
+        "maximum": 4294967295
+      }
+    },
+    "message_expiry_scan_ms": {
+      "const": 100
+    },
+    "message_expiry_batch": {
+      "const": 4
+    },
+    "message_expiry_policy": {
+      "const": "quarantine-on-unknown-origin"
+    },
+    "message_expiry_time_unit": {
+      "const": "nanoseconds"
     }
   }
 }

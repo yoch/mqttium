@@ -652,6 +652,44 @@
         40,
         44
       ]
+    },
+    "message_time": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "domain_hex",
+        "tick"
+      ],
+      "properties": {
+        "domain_hex": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "tick": {
+          "$ref": "primitives.schema.json#/$defs/u64"
+        }
+      }
+    },
+    "message_expiry": {
+      "description": "Original reception origin and finite MQTT seconds, including zero and 0xffffffff. A changed domain is uncertainty; UTC and renewed observations cannot extend lifetime. Deadline overflow is refused by the semantic readers.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observed",
+        "interval"
+      ],
+      "properties": {
+        "observed": {
+          "$ref": "primitives.schema.json#/$defs/message_time"
+        },
+        "interval": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
     }
   }
 }

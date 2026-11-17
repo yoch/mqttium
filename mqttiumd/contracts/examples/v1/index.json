@@ -152,7 +152,24 @@
     "contracts/examples/v1/valid/product-expiry-inventory.json",
     "contracts/examples/v1/valid/trace-record-recovery-page-hierarchical-options.json",
     "contracts/examples/v1/valid/store-snapshot-subscription-options-receipt.json",
-    "contracts/examples/v1/valid/product-hierarchical-capabilities.json"
+    "contracts/examples/v1/valid/product-hierarchical-capabilities.json",
+    "contracts/examples/v1/valid/product-message-expiry-transitions.json",
+    "contracts/examples/v1/valid/store-snapshot-message-expiry.json",
+    "contracts/examples/v1/valid/store-snapshot-message-expiry-zero.json",
+    "contracts/examples/v1/valid/store-snapshot-message-expiry-maximum.json",
+    "contracts/examples/v1/valid/store-snapshot-delivery-started.json",
+    "contracts/examples/v1/valid/store-snapshot-delivery-expired.json",
+    "contracts/examples/v1/valid/trace-record-message-expiry-recovered-started.json",
+    "contracts/examples/v1/valid/product-message-expiry-received.json",
+    "contracts/examples/v1/valid/product-message-expiry-sweep.json",
+    "contracts/examples/v1/valid/product-message-expiry-clock.json",
+    "contracts/examples/v1/valid/product-message-transmission-started.json",
+    "contracts/examples/v1/valid/product-message-transmission-not-started.json",
+    "contracts/examples/v1/valid/product-message-expiry-quarantined.json",
+    "contracts/examples/v1/valid/product-message-expiry-applied.json",
+    "contracts/examples/v1/valid/product-message-expiry-result-dropped.json",
+    "contracts/examples/v1/valid/product-command-DeliveryStarted.json",
+    "contracts/examples/v1/valid/product-command-MessageExpire.json"
   ],
   "invalid": [
     {
@@ -2494,6 +2511,96 @@
       "code": "schema-violation",
       "pointer": "/details",
       "why": "Product diagnostics remain bounded even with the six new startup capabilities."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-message-expiry-transitions-wrong-decision.json",
+      "code": "schema-violation",
+      "pointer": "/decision",
+      "why": "Message lifetime is the explicitly Proposed0033 product subset."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-message-expiry-interval-overflow.json",
+      "code": "schema-violation",
+      "pointer": "/publications/0/expiry/interval",
+      "why": "Message expiry preserves a typed, bounded original domain/tick and finite u32 seconds."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-message-expiry-interval-boolean.json",
+      "code": "schema-violation",
+      "pointer": "/publications/0/expiry/interval",
+      "why": "Message expiry preserves a typed, bounded original domain/tick and finite u32 seconds."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-message-expiry-invalid-domain.json",
+      "code": "schema-violation",
+      "pointer": "/publications/0/expiry/observed/domain_hex",
+      "why": "Message expiry preserves a typed, bounded original domain/tick and finite u32 seconds."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-message-expiry-utc-authority.json",
+      "code": "schema-violation",
+      "pointer": "/publications/0/expiry",
+      "why": "Message expiry preserves a typed, bounded original domain/tick and finite u32 seconds."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-message-expiry-tick-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/publications/0/expiry/observed/tick",
+      "why": "Reception ticks are canonical checked nanoseconds."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/store-snapshot-message-expiry-deadline-overflow.json",
+      "code": "u64-out-of-range",
+      "pointer": "/publications/0/expiry",
+      "why": "A valid u64 reception tick cannot make a finite lifetime overflow its deadline."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/trace-record-message-expiry-start-contradiction.json",
+      "code": "schema-violation",
+      "pointer": "/payload/facts/0/claim/started",
+      "why": "Recovered start facts and their exact claim cannot disagree."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-message_expiry.json",
+      "code": "schema-violation",
+      "pointer": "/message_expiry",
+      "why": "The profile declares the actual bounded Message Expiry implementation and quarantine policy."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-message_expiry_interval.json",
+      "code": "schema-violation",
+      "pointer": "/message_expiry_interval",
+      "why": "The profile declares the actual bounded Message Expiry implementation and quarantine policy."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-message_expiry_scan_ms.json",
+      "code": "schema-violation",
+      "pointer": "/message_expiry_scan_ms",
+      "why": "The profile declares the actual bounded Message Expiry implementation and quarantine policy."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-message_expiry_batch.json",
+      "code": "schema-violation",
+      "pointer": "/message_expiry_batch",
+      "why": "The profile declares the actual bounded Message Expiry implementation and quarantine policy."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-message_expiry_policy.json",
+      "code": "schema-violation",
+      "pointer": "/message_expiry_policy",
+      "why": "The profile declares the actual bounded Message Expiry implementation and quarantine policy."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-message_expiry_time_unit.json",
+      "code": "schema-violation",
+      "pointer": "/message_expiry_time_unit",
+      "why": "The profile declares the actual bounded Message Expiry implementation and quarantine policy."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-profile-wrong-sqlite_schema_version.json",
+      "code": "schema-violation",
+      "pointer": "/sqlite_schema_version",
+      "why": "The profile declares the actual bounded Message Expiry implementation and quarantine policy."
     }
   ]
 }

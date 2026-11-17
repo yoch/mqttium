@@ -215,7 +215,7 @@ class FinalLifecycleObservations(unittest.TestCase):
 
     def test_runtime_resource_limits_are_explicit_profile_fields(self):
         profile = json.loads((ROOT / "contracts/v1/product-profile.json").read_text())
-        for key, value in (("closing_input_slots", 32), ("terminal_input_slots", 336),
+        for key, value in (("closing_input_slots", 32), ("terminal_input_slots", 544),
                            ("frame_registration_slots", 208), ("pre_connack_packet_slots", 1),
                            ("session_shutdown_timeout_ms", 2000)):
             with self.subTest(key=key):

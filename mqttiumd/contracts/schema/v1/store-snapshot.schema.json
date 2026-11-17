@@ -271,7 +271,9 @@
                             "DeliveryFinished",
                             "DeliveryConsumed",
                             "SessionLifecycle",
-                            "RetainedQos0Stored"
+                            "RetainedQos0Stored",
+                            "DeliveryStarted",
+                            "DeliveryExpired"
                           ]
                         }
                       },
@@ -535,6 +537,86 @@
                               }
                             }
                           }
+                        },
+                        {
+                          "if": {
+                            "required": [
+                              "kind"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "DeliveryStarted"
+                              }
+                            }
+                          },
+                          "then": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "kind",
+                              "delivery_id",
+                              "target_session",
+                              "packet_id",
+                              "claim_operation_id"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "DeliveryStarted"
+                              },
+                              "delivery_id": {
+                                "$ref": "primitives.schema.json#/$defs/delivery_id"
+                              },
+                              "target_session": {
+                                "$ref": "primitives.schema.json#/$defs/u64"
+                              },
+                              "packet_id": {
+                                "$ref": "primitives.schema.json#/$defs/packet_id"
+                              },
+                              "claim_operation_id": {
+                                "$ref": "primitives.schema.json#/$defs/operation_id"
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "if": {
+                            "required": [
+                              "kind"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "DeliveryExpired"
+                              }
+                            }
+                          },
+                          "then": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "kind",
+                              "delivery_id",
+                              "target_session",
+                              "packet_id",
+                              "claim_operation_id"
+                            ],
+                            "properties": {
+                              "kind": {
+                                "const": "DeliveryExpired"
+                              },
+                              "delivery_id": {
+                                "$ref": "primitives.schema.json#/$defs/delivery_id"
+                              },
+                              "target_session": {
+                                "$ref": "primitives.schema.json#/$defs/u64"
+                              },
+                              "packet_id": {
+                                "$ref": "primitives.schema.json#/$defs/packet_id"
+                              },
+                              "claim_operation_id": {
+                                "$ref": "primitives.schema.json#/$defs/operation_id"
+                              }
+                            }
+                          }
                         }
                       ]
                     }
@@ -704,6 +786,9 @@
                 "$ref": "primitives.schema.json#/$defs/publication_id"
               }
             ]
+          },
+          "expiry": {
+            "$ref": "primitives.schema.json#/$defs/message_expiry"
           }
         }
       },
@@ -871,7 +956,7 @@
       }
     },
     "outbound": {
-      "description": "Durable outgoing QoS 1 claims, by DeliveryId. MayHaveStarted is a conservative durable emission intent, not proof that bytes reached a client.",
+      "description": "Durable outgoing QoS1 claims. MayHaveStarted is an intent; only started=true records a positive-byte observation. An unmarked recovered claim remains uncertain. Absent started means false.",
       "type": "array",
       "maxItems": 65536,
       "items": {
@@ -907,6 +992,9 @@
           },
           "emission": {
             "const": "MayHaveStarted"
+          },
+          "started": {
+            "type": "boolean"
           }
         }
       }

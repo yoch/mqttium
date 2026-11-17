@@ -2021,6 +2021,9 @@
                       },
                       "packet_id": {
                         "$ref": "primitives.schema.json#/$defs/packet_id"
+                      },
+                      "started": {
+                        "type": "boolean"
                       }
                     }
                   }
@@ -2028,6 +2031,12 @@
               },
               "qos": {
                 "$ref": "primitives.schema.json#/$defs/qos"
+              },
+              "expiry": {
+                "$ref": "primitives.schema.json#/$defs/message_expiry"
+              },
+              "started": {
+                "type": "boolean"
               }
             },
             "allOf": [
@@ -2048,6 +2057,55 @@
                   "properties": {
                     "claim": {
                       "type": "null"
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "required": [
+                    "started"
+                  ],
+                  "properties": {
+                    "started": {
+                      "const": true
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "qos": {
+                      "const": 1
+                    },
+                    "claim": {
+                      "type": "object",
+                      "required": [
+                        "started"
+                      ],
+                      "properties": {
+                        "started": {
+                          "const": true
+                        }
+                      }
+                    }
+                  }
+                },
+                "else": {
+                  "properties": {
+                    "claim": {
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "started": {
+                              "const": false
+                            }
+                          }
+                        }
+                      ]
                     }
                   }
                 }

@@ -24,6 +24,10 @@ SUBSCRIPTION_OPTIONS = 9
 RETAINED_PUBLICATION = 10
 RETAINED_QOS0 = 11
 REPLAY_SUBSCRIPTIONS = 12
+EXPIRING_PUBLICATION = 13
+TIMED_REPLAY_SUBSCRIPTIONS = 14
+MARK_DELIVERY_STARTED = 15
+EXPIRE_DELIVERY = 16
 MAX_RETAINED_REPLAYS = 256
 MAX_RETAINED_TARGETS = 16
 MAX_SESSION_CLIENT_BYTES = 1024
@@ -181,6 +185,64 @@ class ReplaySubscriptions:
 
 
 @dataclass(frozen=True)
+class MessageTime:
+    domain: bytes
+    tick: int
+
+
+@dataclass(frozen=True)
+class MessageExpiry:
+    observed: MessageTime
+    interval: int
+
+    @property
+    def deadline(self) -> int:
+        return self.observed.tick + self.interval * 1_000_000_000
+
+
+@dataclass(frozen=True)
+class ExpiringPublication:
+    admission: Admit | RetainedPublication | RetainedQos0
+    expiry: MessageExpiry
+
+    kind = "ExpiringPublication"
+
+    @property
+    def operation(self) -> tuple:
+        return self.admission.operation
+
+
+@dataclass(frozen=True)
+class TimedReplaySubscriptions:
+    replay: ReplaySubscriptions
+    observed: MessageTime
+
+    kind = "TimedReplaySubscriptions"
+
+    @property
+    def operation(self) -> tuple:
+        return self.replay.operation
+
+
+@dataclass(frozen=True)
+class MarkDeliveryStarted(Finish):
+    kind = "MarkDeliveryStarted"
+
+
+@dataclass(frozen=True)
+class ExpireDelivery:
+    finish: Finish
+    expiry: MessageExpiry
+    observed: MessageTime
+
+    kind = "ExpireDelivery"
+
+    @property
+    def operation(self) -> tuple:
+        return self.finish.operation
+
+
+@dataclass(frozen=True)
 class SessionOpen:
     operation: tuple
     clean_start: bool
@@ -294,6 +356,15 @@ class _Reader:
             raise RecipeError("invalid ClientID")
         return client
 
+    def message_time(self) -> MessageTime:
+        return MessageTime(self.take(32), self.number(8))
+
+    def message_expiry(self) -> MessageExpiry:
+        value = MessageExpiry(self.message_time(), self.number(4))
+        if value.deadline > 0xFFFF_FFFF_FFFF_FFFF:
+            raise RecipeError("message expiry deadline overflow")
+        return value
+
 
 def _valid_filter(topic: bytes) -> bool:
     # This independent format reader validates grammar, never computes fanout.
@@ -325,8 +396,9 @@ def _retained_mask(mask: int, count: int) -> None:
 
 
 def _nested(reader: _Reader, allowed: tuple[int, ...]):
-    # Inspect the child tag before calling decode: extensions cannot nest and
-    # attacker-controlled recursive headers cannot consume Python stack space.
+    # Inspect every child tag before calling decode. A temporal envelope may
+    # contain one legacy envelope, whose own child is strictly a base recipe;
+    # no attacker-controlled temporal recursion can consume Python stack space.
     nested = reader.take(reader.number(4))
     if len(nested) < 7 or nested[6] not in allowed:
         raise RecipeError("invalid retained nested kind")
@@ -341,7 +413,17 @@ def decode(data: bytes, *, _target_limit: int | None = None):
     if reader.number(2) != FORMAT:
         raise RecipeError("unknown format")
     kind = reader.number(1)
-    if kind == RETAINED_PUBLICATION:
+    if kind == EXPIRING_PUBLICATION:
+        admission = _nested(reader, (ADMIT_PUBLICATION, RETAINED_PUBLICATION, RETAINED_QOS0))
+        if isinstance(admission, Admit):
+            if admission.retain or admission.qos not in (1, 2):
+                raise RecipeError("noncanonical expiring admission")
+            if any(target.effective_qos > 2 or target.cause != 1 for target in admission.targets):
+                raise RecipeError("invalid expiring admission cause")
+        recipe = ExpiringPublication(admission, reader.message_expiry())
+    elif kind == TIMED_REPLAY_SUBSCRIPTIONS:
+        recipe = TimedReplaySubscriptions(_nested(reader, (REPLAY_SUBSCRIPTIONS,)), reader.message_time())
+    elif kind == RETAINED_PUBLICATION:
         admission = _nested(reader, (ADMIT_PUBLICATION,))
         mask = reader.number(2)
         if admission.qos not in (1, 2) or not admission.retain:
@@ -451,12 +533,26 @@ def decode(data: bytes, *, _target_limit: int | None = None):
             raise RecipeError("noncanonical subscription options")
         cls = Subscriptions if kind == CHANGE_SUBSCRIPTIONS else UpdateSubscriptions
         recipe = cls(operation, session, revision, route_revision, tuple(changes))
-    elif kind in (CLAIM_DELIVERY, FINISH_DELIVERY):
+    elif kind in (CLAIM_DELIVERY, FINISH_DELIVERY, MARK_DELIVERY_STARTED, EXPIRE_DELIVERY):
         fields = (reader.scoped(), reader.scoped(), reader.number(4),
                   reader.number(8), reader.number(8), reader.number(2))
         if fields[-1] == 0:
             raise RecipeError("invalid outbound packet identifier")
-        recipe = Claim(*fields) if kind == CLAIM_DELIVERY else Finish(*fields, reader.scoped())
+        if kind == CLAIM_DELIVERY:
+            recipe = Claim(*fields)
+        elif kind == MARK_DELIVERY_STARTED:
+            recipe = MarkDeliveryStarted(*fields, reader.scoped())
+        else:
+            finish = Finish(*fields, reader.scoped())
+            if kind == FINISH_DELIVERY:
+                recipe = finish
+            else:
+                expiry, observed = reader.message_expiry(), reader.message_time()
+                if observed.domain != expiry.observed.domain:
+                    raise RecipeError("message time is uncertain")
+                if observed.tick < expiry.deadline:
+                    raise RecipeError("message is not established expired")
+                recipe = ExpireDelivery(finish, expiry, observed)
     elif kind == CONSUME_DELIVERY:
         recipe = Consume(reader.scoped(), reader.scoped(), reader.number(4),
                          reader.number(8), reader.number(8))
