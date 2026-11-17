@@ -724,6 +724,38 @@ mod tests {
     }
 
     #[test]
+    fn expired_retained_publication_never_reaches_the_first_socket_attempt() {
+        let (_, expiry) = timed_frame();
+        let encoded = codec::encode_qos0_expiring(
+            &SharedBytes::copy_from(b"t", 1).unwrap(),
+            &SharedBytes::copy_from(b"retained", 8).unwrap(),
+            true,
+            Some(2),
+        )
+        .unwrap();
+        let mut bytes = encoded.bytes;
+        assert_eq!(bytes[0] & 1, 1, "retained fixture must preserve RETAIN");
+        let expiry = WriteExpiry {
+            value_offset: encoded.expiry_value_offset.unwrap(),
+            ..expiry
+        };
+        let clock = FakeClock::new(reading(expiry.expiry.deadline().unwrap()));
+        let result = write_attempts(
+            &mut bytes,
+            Some(expiry),
+            &control(),
+            &clock,
+            |_, _| panic!("expired_retained_reached_socket"),
+            || panic!("expired_retained_reported_started"),
+        );
+        assert_eq!(
+            result,
+            Err(WriteFailure::NotStarted(MessageExpiryBlock::Expired)),
+            "expired_retained_missing_certain_disposal"
+        );
+    }
+
+    #[test]
     fn first_positive_progress_freezes_the_value_and_finishes_after_expiry() {
         let clock = FakeClock::new(reading(1_000_000_100));
         let (mut bytes, expiry) = timed_frame();

@@ -1159,7 +1159,7 @@ mod tests {
                     decode(header.first, &encoded.bytes[header.encoded_len..], BOUNDS).unwrap();
                 match (remaining, encoded.expiry_value_offset, decoded) {
                     (Some(value), Some(offset), Packet::TimedPublish { interval, .. }) => {
-                        assert_eq!(interval, value);
+                        assert_eq!(interval, value, "outgoing_message_expiry_remaining_wrong");
                         assert_eq!(&encoded.bytes[offset - 2..offset], &[5, 0x02]);
                         assert_eq!(&encoded.bytes[offset..offset + 4], &value.to_be_bytes());
                         assert_eq!(&encoded.bytes[offset + 4..], b"p");
