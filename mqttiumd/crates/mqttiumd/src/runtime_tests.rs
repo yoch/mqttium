@@ -4286,3 +4286,178 @@ fn simultaneous_expiration_is_batched_while_an_independent_connection_pings() {
         assert!(state.sessions.contains_key(&retained));
     });
 }
+
+fn will_connect(name: &[u8], expiry: SessionExpiry) -> codec::Connect {
+    let mut connect = connect_packet(name);
+    connect.expiry = expiry;
+    connect.will = Some(mqttiumd_contract::will::WillSpec {
+        topic: SharedBytes::copy_from(b"atelier/sensor/status", 1024).unwrap(),
+        payload: SharedBytes::copy_from(b"offline-private", 32768).unwrap(),
+    });
+    connect
+}
+
+#[test]
+fn normal_disconnect_during_real_will_open_result_drain_cancels_exact_intention() {
+    with_runtime(128, |runtime, directory| {
+        let (generation, _client) = peer(runtime);
+        runtime
+            .connect(
+                generation,
+                will_connect(b"will-early-normal", SessionExpiry::Never),
+            )
+            .unwrap();
+        let actual = next_control_reply(runtime);
+        assert!(matches!(
+            actual,
+            ControlResponse::Lifecycle {
+                reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(
+                    SessionChange::Opened { .. }
+                ))),
+                ..
+            }
+        ));
+        let before =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert_eq!(before.wills.len(), 1, "will_not_durable_before_open_result");
+        relay_control_reply(runtime, actual);
+        // No intervening drain: this is the authentic CONNECT-result race.
+        runtime.packet(generation, 0xe0, vec![]).unwrap();
+        until(runtime, |r| {
+            !r.owner.session_status().lifecycle_pending
+                && r.lifecycle_inflight.is_empty()
+                && r.closing_inputs.is_empty()
+        });
+        let after =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert!(
+            after.wills.is_empty(),
+            "normal_disconnect_did_not_cancel_exact_will"
+        );
+        assert_eq!(
+            after.sessions.len(),
+            1,
+            "normal_disconnect_erased_infinite_session"
+        );
+        assert!(
+            after.operations.values().all(|row| !matches!(
+                row.decision,
+                mqttiumd_store_api::Decision::Committed(CommitFacts::WillPublished { .. })
+            )),
+            "will_admitted_after_normal_disconnect"
+        );
+        let events = std::fs::read_to_string(directory.join("events.jsonl")).unwrap();
+        assert!(
+            !events.contains("offline-private"),
+            "will_bytes_in_product_diagnostics"
+        );
+    });
+}
+
+#[test]
+fn disconnect_four_before_real_open_reply_survives_source_cleanup_and_admits_once() {
+    with_runtime(128, |runtime, directory| {
+        let (generation, _client) = peer(runtime);
+        runtime
+            .connect(
+                generation,
+                will_connect(b"will-early-publish", SessionExpiry::OnDisconnect),
+            )
+            .unwrap();
+        let actual = next_control_reply(runtime);
+        let ControlResponse::Lifecycle {
+            operation: opening, ..
+        } = actual
+        else {
+            panic!("authentic Will Open reply")
+        };
+        // The writer committed, but neither owner nor transport has its result.
+        runtime.packet(generation, 0xe0, vec![4, 0]).unwrap();
+        assert!(!runtime.peers.contains_key(&generation));
+        relay_control_reply(runtime, actual);
+        until(runtime, |r| {
+            r.sessions.is_empty()
+                && !r.owner.session_status().lifecycle_pending
+                && r.closing_inputs.is_empty()
+        });
+        runtime.queue(Input::DiscoverWills).unwrap();
+        runtime.drain_inputs().unwrap();
+        until(runtime, |r| {
+            !r.owner.will_status().reading
+                && !r.owner.will_status().admission_pending
+                && r.will_reads.is_none()
+                && r.owner.outbox().unwrap().is_empty()
+        });
+        let after =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert!(
+            after.sessions.is_empty() && after.wills.is_empty(),
+            "early_explicit_will_lost_after_source_cleanup"
+        );
+        let wills: Vec<_> = after
+            .operations
+            .values()
+            .filter_map(|row| match row.decision {
+                mqttiumd_store_api::Decision::Committed(CommitFacts::WillPublished {
+                    will,
+                    publication,
+                }) => Some((will, publication)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(wills.len(), 1, "closure_created_wrong_will_admission_count");
+        assert_eq!(wills[0].0, opening, "closure_rebound_will_occurrence");
+    });
+}
+
+#[test]
+fn takeover_waits_for_old_will_admission_and_old_close_cannot_publish_new_will() {
+    with_runtime(128, |runtime, directory| {
+        let (old, mut old_client) = peer(runtime);
+        runtime
+            .connect(old, will_connect(b"will-takeover", SessionExpiry::Never))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut old_client).0, 0x20);
+        let old_open = runtime.peers[&old].opened_by.unwrap();
+        let (new, mut new_client) = peer(runtime);
+        runtime
+            .connect(new, will_connect(b"will-takeover", SessionExpiry::Never))
+            .unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(read_frame(&mut new_client).0, 0x20);
+        let new_open = runtime.peers[&new].opened_by.unwrap();
+        assert_ne!(old_open, new_open);
+        runtime.close(old, "delayed_old_close").unwrap();
+        runtime.drain_inputs().unwrap();
+        let state =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert_eq!(state.wills.len(), 1, "old_close_changed_new_will");
+        assert_eq!(
+            state.wills[&new_open].state,
+            mqttiumd_contract::will::WillState::Armed
+        );
+        let admitted = state
+            .operations
+            .iter()
+            .find_map(|(id, row)| match row.decision {
+                mqttiumd_store_api::Decision::Committed(CommitFacts::WillPublished {
+                    will,
+                    ..
+                }) if will == old_open => Some(*id),
+                _ => None,
+            })
+            .expect("old Will admitted before replacing Open");
+        assert!(
+            admitted.sequence() < new_open.sequence(),
+            "new_open_preceded_zero_delay_old_will_admission"
+        );
+        runtime.packet(new, 0xe0, vec![]).unwrap();
+        until(runtime, |r| {
+            !r.owner.session_status().lifecycle_pending && r.closing_inputs.is_empty()
+        });
+        let state =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert!(state.wills.is_empty(), "new_normal_close_failed_to_cancel");
+    });
+}

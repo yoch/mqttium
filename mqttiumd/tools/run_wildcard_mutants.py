@@ -32,7 +32,7 @@ MUTANTS = (
      'if selected.count == limit {\n                return Ok(selected);\n            }'),
     ('no-local-global-self-suppression', 'no_local_excludes_only_its_matching_contribution',
      'no_local_applied_after_aggregation',
-     'if route.options.no_local() && route.target == source {', 'if route.target == source {'),
+     'if route.options.no_local() && source == Some(target_session.client_id.as_slice()) {', 'if source == Some(target_session.client_id.as_slice()) {'),
 )
 
 def digest(path: Path) -> str:
