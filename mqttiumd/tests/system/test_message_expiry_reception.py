@@ -5,7 +5,7 @@ from external_message_expiry import MqttiumMessageExpiry, PahoMessageExpiry
 from external_wildcard import Subscription
 from message_expiry_probe import decode_publish, publish_packet
 from message_expiry_reception import (BUSINESS, physically_drained, one_delivery, closed_connection,
-                                       original_copies)
+                                       original_copies, negative_puback)
 from message_expiry_boundaries import canonical_timed, canonical_expire, continuous, _positive
 from tcp_probe import Frame, FrameDecoder, ReceiptFailure, operation_hex
 from test_external_clients import ScriptedBroker, read_packet
@@ -96,6 +96,23 @@ class IndependentMessageExpiryFrames(unittest.TestCase):
         for observed, requested in ((0, 2), (None, 2), (3, 2), (1, None)):
             with self.subTest(observed=observed, requested=requested), self.assertRaises(ReceiptFailure):
                 one_delivery(Tap(observed), b'v', 1, False, requested)
+
+    def test_negative_ack_is_scoped_to_its_publication_when_identifier_one_is_reused(self):
+        class Tap:
+            def server_frames(self):
+                return self.frames
+        tap = Tap()
+        tap.frames = (Frame(0x20, b'\x00\x00\x00'),) + (Frame(0x40, b'\x00\x01'),) * 32
+        cursor = len(tap.frames)
+        expected = Frame(0x40, b'\x00\x01\x97')
+        tap.frames += (expected,)
+        self.assertEqual(negative_puback(tap, 1, after=cursor), expected)
+        with self.assertRaisesRegex(ReceiptFailure, 'message_expiry_capacity_negative_puback_not_observed'):
+            negative_puback(tap, 1, after=0)
+        cursor = len(tap.frames)
+        tap.frames += (Frame(0x40, b'\x00\x01'),)
+        with self.assertRaisesRegex(ReceiptFailure, 'message_expiry_capacity_negative_puback_not_observed'):
+            negative_puback(tap, 1, after=cursor)
 
     def test_timed_wrapped_recipe_correlates_original_operation_and_frozen_clock(self):
         event = {'operation': {'incarnation': '1', 'epoch': '2', 'owner': '3', 'sequence': '4'}}

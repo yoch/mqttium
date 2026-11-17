@@ -160,6 +160,16 @@ def one_delivery(tap, payload, qos, retain, expiry):
     return value.observation()
 
 
+def negative_puback(tap, identifier, *, after):
+    """A Packet Identifier can be reused after each completed publication."""
+    frames = tap.server_frames()
+    require(type(after) is int and 0 <= after <= len(frames), 'message_expiry_ack_cursor_invalid')
+    values = [frame for frame in frames[after:] if frame.kind == 0x40 and frame.ack()[0] == identifier]
+    require(len(values) == 1 and values[0].ack() == (identifier, 0x97),
+            'message_expiry_capacity_negative_puback_not_observed')
+    return values[0]
+
+
 def ingress_events(broker, *, after=-1, topic=None):
     values = [event for event in broker.events() if event['kind'] == 'message_expiry_received'
               and int(event['seq']) > after]
@@ -689,12 +699,10 @@ async def capacity(binary, case):
                 and pending_drained(full) and int(full['tables']['meta'][0]['used_references'], 16) == 32,
                 'message_expiry_capacity_was_not_full', repr(full['counts']))
         before = business_state(full)
+        ack_cursor = len(source_tap.server_frames())
         refused = await source.publish_rejected('message-expiry/capacity/overflow', b'no-room-before-expiry',
                                                  reason=0x97, retain=True, message_expiry=2)
-        negative = [frame for frame in source_tap.server_frames() if frame.kind == 0x40 and
-                    frame.ack()[0] == refused['packet_id']]
-        require(len(negative) == 1 and negative[0].ack() == (refused['packet_id'], 0x97),
-                'message_expiry_capacity_negative_puback_not_observed')
+        negative = negative_puback(source_tap, refused['packet_id'], after=ack_cursor)
         after_refusal = snapshot(broker, 'capacity-after-refusal')
         require(business_state(after_refusal) == before, 'message_expiry_capacity_refusal_partially_mutated')
         expired = await until_state(broker, physically_drained, 'message_expiry_capacity_not_physically_reclaimed')
@@ -722,8 +730,9 @@ async def capacity(binary, case):
         writer_available(broker.db)
         return {'criterion': 'capacity', 'status': 'PASS', 'ready': ready, 'full_retained_topics': 32,
                 'ttl_seconds': 2, 'elapsed_before_reclamation_ns': str(elapsed),
-                'overflow': refused, 'negative_wire': {'header': negative[0].header,
-                    'body_hex': negative[0].body.hex()}, 'refusal_business_unchanged': True,
+                'overflow': refused, 'negative_wire': {'header': negative.header,
+                    'body_hex': negative.body.hex(), 'tap_frame_cursor': ack_cursor},
+                'refusal_business_unchanged': True,
                 'full_counts': full['counts'], 'expired_counts': expired['counts'],
                 'new_accepted_counts': accepted['counts'], 'delivery': delivered, 'wire': wire,
                 'final_counts': final['counts'], 'process_status': broker.process.returncode}
