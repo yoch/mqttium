@@ -59,7 +59,7 @@ OFFLINE_SKIPPED = ('AND NOT EXISTS(SELECT 1 FROM outbound c '
 ELIGIBILITY = '''                        (Some(expiry), Some(now)) => matches!(
                             expiry
                                 .state(now)
-                                .map_err(|_| Abort::Read(ReadError::InvalidData))?,
+                                .map_err(|_| Abort::Refused(RejectReason::PreconditionFailed))?,
                             ExpiryState::Fresh { .. }
                         ),'''
 UNKNOWN_FRESH = ELIGIBILITY.replace('ExpiryState::Fresh { .. }',
