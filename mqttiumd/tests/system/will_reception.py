@@ -9,6 +9,8 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -16,10 +18,10 @@ import time
 from external_mqttium import client_identity
 from external_will import MqttiumWill, PahoWill, PacketTap
 from external_wildcard import Subscription
-from pubsub_probe import durable
-from tcp_probe import FrameDecoder, Observations, ReceiptFailure, require, write_json
-from tcp_reception import Broker, writer_available
-from will_probe import assert_will_frame, decode_will_connect
+from pubsub_probe import durable, session_key
+from tcp_probe import FrameDecoder, Observations, ReceiptFailure, packet, require, write_json
+from tcp_reception import Broker, expect_rejection, writer_available
+from will_probe import WillWire, assert_will_frame, decode_will_connect, will_connect_packet
 
 
 async def peer(kind, broker, case, label, *, will=None, expiry=0xFFFFFFFF,
@@ -139,6 +141,215 @@ async def drained(broker, *, timeout=5):
     raise ReceiptFailure('will_obligations_not_durably_finished')
 
 
+async def until_state(broker, predicate, code, *, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = durable(broker.db)
+        if predicate(state):
+            return state
+        await asyncio.sleep(.005)
+    raise ReceiptFailure(code)
+
+
+async def triggers(binary, case):
+    """Independent TCP EOF/RST/KeepAlive/protocol and DISCONNECT witnesses."""
+    broker = Broker(binary, case)
+    clients, wires = [], []
+    try:
+        broker.ready()
+        dashboard, tap = await peer('mqttium', broker, case, 'trigger-dashboard')
+        clients.append((dashboard, tap))
+        await dashboard.subscribe((Subscription('will/triggers/+', 1),))
+        await tap.subscribed(1, (1,))
+        rows = []
+        for name in ('eof', 'rst', 'keep_alive', 'protocol_error', 'disconnect04', 'disconnect00'):
+            topic = 'will/triggers/' + name
+            payload = ('offline:' + name).encode()
+            wire = WillWire(broker.address, broker.observations, 'trigger-' + name)
+            wires.append(wire)
+            await asyncio.to_thread(wire.will_connect, 'trigger-' + name, topic, payload,
+                                    expiry=0, keep_alive=1 if name == 'keep_alive' else 10)
+            observed = {'case': name, 'connected_monotonic_ns': str(time.monotonic_ns()),
+                        'requested_expiry': 0}
+            if name == 'eof':
+                wire.close()
+            elif name == 'rst':
+                wire.socket.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+                wire.close()
+            elif name == 'protocol_error':
+                wire.send(b'\xc1\x00')  # PINGREQ's reserved flag is invalid.
+                await asyncio.to_thread(expect_rejection, wire)
+            elif name == 'disconnect04':
+                wire.send(packet(0xE0, b'\x04\x00'))
+            elif name == 'disconnect00':
+                wire.send(b'\xe0\x00')
+            # keep_alive deliberately sends nothing after its accepted CONNECT.
+            if name == 'disconnect00':
+                state = await until_state(broker, lambda value: not any(
+                    row['client_id'] == ('trigger-' + name).encode().hex()
+                    for row in value['tables']['sessions']), 'will_normal_session_not_closed')
+                await dashboard.no_message(.2)
+                require(not tap.publications(payload), 'will_published_despite_normal_disconnect')
+                observed['no_publication'] = True
+            else:
+                received = await dashboard.receive(payload, 1, False)
+                frames = tap.publications(payload)
+                require(len(frames) == 1, 'will_trigger_missing_or_duplicate', name)
+                observed['received'] = received
+                observed['wire'] = assert_will_frame(frames[0], topic, payload)
+                state = await drained(broker)
+            observed['completed_monotonic_ns'] = str(time.monotonic_ns())
+            observed['counts'] = state['counts']
+            rows.append(observed)
+            wire.close()
+
+        # All refusals happen before establishment; none may arm a Will.
+        refusals = []
+        for name, options in (('qos0', {'qos': 0}), ('qos2', {'qos': 2}),
+                              ('retained', {'retain': True}), ('delay1', {'delay': 1}),
+                              ('expiry', {'will_properties': b'\x02\0\0\0\x01'})):
+            wire = WillWire(broker.address, broker.observations, 'unsupported-' + name)
+            wires.append(wire)
+            wire.send(will_connect_packet('unsupported-' + name, 'will/triggers/refused',
+                                          ('refused:' + name).encode(), **options))
+            await asyncio.to_thread(expect_rejection, wire, before_connect=True)
+            wire.close()
+            await dashboard.no_message(.08)
+            require(not tap.publications(('refused:' + name).encode()),
+                    'will_published_for_refused_connection', name)
+            refusals.append(name)
+        # This independent client keeps progressing after all closure paths.
+        await dashboard.publish('will/control', b'control-after-trigger-matrix', 1, retain=False)
+        state = await drained(broker)
+        write_json(case / 'durable-final.json', state)
+        await close_peers(clients)
+        clients.clear()
+        broker.stop()
+        writer_available(broker.db)
+        return {'group': 'B-triggers', 'status': 'PASS', 'cases': rows,
+                'refused_profiles': refusals, 'durable_counts': state['counts'],
+                'broker_pid': broker.process.pid, 'broker_status': broker.process.returncode}
+    finally:
+        for wire in wires:
+            wire.close()
+        try:
+            await close_peers(clients)
+        finally:
+            broker.cleanup()
+
+
+async def shared_responsibilities(binary, case):
+    """A producer's expiry0 cleanup preserves both recipients, including offline."""
+    broker, restarted = Broker(binary, case), None
+    clients, source = [], None
+    try:
+        broker.ready()
+        dashboard, dashboard_tap = await peer('mqttium', broker, case, 'shared-dashboard')
+        clients.append((dashboard, dashboard_tap))
+        await dashboard.subscribe((Subscription('will/shared/#', 1),))
+        offline, offline_tap = await peer('paho', broker, case, 'shared-offline')
+        await offline.subscribe((Subscription('will/shared/#', 1),))
+        await offline_tap.subscribed(1, (1,))
+        await close_peers(((offline, offline_tap),))
+        before = durable(broker.db)
+        offline_id = session_key(before, 'shared-offline')
+        source = WillWire(broker.address, broker.observations, 'shared-source')
+        source.will_connect('shared-source', 'will/shared/status', b'shared-offline', expiry=0)
+        source.close()
+        received = await dashboard.receive(b'shared-offline', 1, False)
+        retained = await until_state(broker, lambda state: len(state['tables']['obligations']) == 1
+                                    and not state['tables']['outbound'] and not any(
+                                        row['client_id'] == b'shared-source'.hex()
+                                        for row in state['tables']['sessions']),
+                                    'will_source_cleanup_destroyed_other_responsibility')
+        obligation = retained['tables']['obligations'][0]
+        require(obligation['target'] == offline_id, 'will_offline_obligation_wrong_target')
+        require(len(retained['tables']['publications']) == len(retained['tables']['payloads']) == 1,
+                'will_shared_payload_missing_or_duplicated')
+        write_json(case / 'durable-before-restart.json', retained)
+        await close_peers(clients)
+        clients.clear()
+        broker.stop(killed=True)
+        restarted = Broker(binary, case, db=broker.db, label='restarted')
+        restarted.ready()
+        resumed, tap = await peer('paho', restarted, case, 'shared-resumed',
+                                  client_id='shared-offline', present=True)
+        clients.append((resumed, tap))
+        # No SUBSCRIBE: the recovered durable session is the only routing fact.
+        restored = await resumed.receive(b'shared-offline', 1, False)
+        frames = tap.publications(b'shared-offline')
+        require(len(frames) == 1, 'will_offline_replay_missing_or_duplicate')
+        assert_will_frame(frames[0], 'will/shared/status', b'shared-offline')
+        final = await drained(restarted)
+        require(all(final['counts'][name] == 0 for name in ('publications', 'payloads')),
+                'will_last_reference_not_released')
+        write_json(case / 'durable-final.json', final)
+        await close_peers(clients)
+        clients.clear()
+        restarted.stop()
+        writer_available(broker.db)
+        return {'group': 'D-shared-responsibilities', 'status': 'PASS',
+                'online_received': received, 'offline_received': restored,
+                'offline_session': offline_id, 'obligation_before_restart': obligation,
+                'source_session_deleted': True, 'before_counts': retained['counts'],
+                'final_counts': final['counts'], 'original_broker_pid': broker.process.pid,
+                'original_broker_status': broker.process.returncode,
+                'restarted_broker_pid': restarted.process.pid,
+                'restarted_broker_status': restarted.process.returncode}
+    finally:
+        if source:
+            source.close()
+        try:
+            await close_peers(clients)
+        finally:
+            broker.cleanup()
+            if restarted:
+                restarted.cleanup()
+
+
+async def takeover(binary, case):
+    """Delay0 publishes the old occurrence; its late physical Close cannot fire B."""
+    broker = Broker(binary, case)
+    clients, wires = [], []
+    try:
+        broker.ready()
+        dashboard, tap = await peer('paho', broker, case, 'takeover-dashboard')
+        clients.append((dashboard, tap))
+        await dashboard.subscribe((Subscription('will/takeover/#', 1),))
+        first = WillWire(broker.address, broker.observations, 'takeover-old')
+        wires.append(first)
+        first.will_connect('takeover-sensor', 'will/takeover/old', b'old-attachment')
+        second = WillWire(broker.address, broker.observations, 'takeover-new')
+        wires.append(second)
+        second.will_connect('takeover-sensor', 'will/takeover/new', b'new-attachment',
+                            expected_present=True)
+        old_received = await dashboard.receive(b'old-attachment', 1, False)
+        first.close()
+        # The replacement transport remains usable despite old socket cleanup.
+        second.send(b'\xc0\x00')
+        require(second.wait(0xD0).body == b'', 'will_takeover_new_transport_not_progressing')
+        second.send(b'\xe0\x00')
+        await dashboard.no_message(.2)
+        require(len(tap.publications(b'old-attachment')) == 1 and not tap.publications(b'new-attachment'),
+                'will_old_close_fired_new_attachment')
+        state = await drained(broker)
+        write_json(case / 'durable-final.json', state)
+        await close_peers(clients)
+        clients.clear()
+        broker.stop()
+        return {'group': 'E-takeover', 'status': 'PASS', 'old_received': old_received,
+                'old_occurrences': 1, 'new_normal_disconnect_occurrences': 0,
+                'durable_counts': state['counts'], 'broker_pid': broker.process.pid,
+                'broker_status': broker.process.returncode}
+    finally:
+        for wire in wires:
+            wire.close()
+        try:
+            await close_peers(clients)
+        finally:
+            broker.cleanup()
+
+
 async def public_sensor(binary, case, sensor_kind, dashboard_kind):
     """The first end-to-end milestone, with explicit client and wire facts."""
     broker = Broker(binary, case)
@@ -229,14 +440,26 @@ async def main_async(arguments):
               'features': [], 'scope': 'normal product system test; not qualifying',
               'client_source': client_identity(), 'cases': [], 'status': 'RUNNING'}
     try:
-        roles = [('mqttium', 'paho'), ('paho', 'mqttium')]
-        if arguments.roles != 'both':
-            roles = [roles[0 if arguments.roles == 'mqttium-sensor' else 1]]
-        for sensor_kind, dashboard_kind in roles:
-            case = arguments.output / f'A-{sensor_kind}-to-{dashboard_kind}'
-            value = await public_sensor(binary, case, sensor_kind, dashboard_kind)
-            write_json(case / 'result.json', value)
-            result['cases'].append(value)
+        groups = arguments.groups.split(',')
+        require(groups and len(groups) == len(set(groups))
+                and set(groups) <= {'public', 'triggers', 'responsibilities', 'takeover'},
+                'will_unknown_or_repeated_group')
+        if 'public' in groups:
+            roles = [('mqttium', 'paho'), ('paho', 'mqttium')]
+            if arguments.roles != 'both':
+                roles = [roles[0 if arguments.roles == 'mqttium-sensor' else 1]]
+            for sensor_kind, dashboard_kind in roles:
+                case = arguments.output / f'A-{sensor_kind}-to-{dashboard_kind}'
+                value = await public_sensor(binary, case, sensor_kind, dashboard_kind)
+                write_json(case / 'result.json', value)
+                result['cases'].append(value)
+        for group, action in (('triggers', triggers), ('responsibilities', shared_responsibilities),
+                              ('takeover', takeover)):
+            if group in groups:
+                case = arguments.output / group
+                value = await action(binary, case)
+                write_json(case / 'result.json', value)
+                result['cases'].append(value)
         result['status'] = 'PASS'
         return 0
     except Exception as error:
@@ -254,6 +477,7 @@ def main():
     parser.add_argument('--source', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--roles', choices=('both', 'mqttium-sensor', 'paho-sensor'), default='both')
+    parser.add_argument('--groups', default='public,triggers,responsibilities,takeover')
     arguments = parser.parse_args()
     return asyncio.run(main_async(arguments))
 
