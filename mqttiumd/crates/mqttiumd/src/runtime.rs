@@ -1,4 +1,5 @@
 //! One bounded owner reactor, independent socket tasks and a single SQLite writer.
+use crate::session_time::{SessionClock, logical_now};
 use crate::{
     codec::{self, Bounds, Packet},
     events::{Events, operation},
@@ -22,12 +23,14 @@ use mqttiumd_contract::pubsub::{PubackTarget, Qos0DropReason, Qos0Origin};
 use mqttiumd_contract::receipts::{
     ClosedReceiptCollection, ClosedReceiptReply, ReceiptCollectionReply,
 };
-use mqttiumd_contract::session::{SessionAction, SessionChange, SessionEndReason, SessionExpiry};
+use mqttiumd_contract::session::{
+    SessionAction, SessionChange, SessionDetachment, SessionEndReason, SessionExpiry, SessionGuard,
+};
 use mqttiumd_contract::step::{StepOutcome, TurnGrant};
 #[cfg(feature = "test-hooks")]
 use mqttiumd_contract::{ids::DeliveryId, pubsub::WorkItem};
 use mqttiumd_core::owner::{Owner, OwnerConfig};
-use mqttiumd_store_api::{ReadError, ReadPhase};
+use mqttiumd_store_api::{ReadError, ReadPhase, SessionClockAnchor, SessionClockReading};
 use serde_json::json;
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{SocketAddr, TcpListener};
@@ -97,6 +100,7 @@ struct Peer {
     opened_by: Option<OperationId>,
     connect_expiry: SessionExpiry,
     disconnect_expiry: Option<SessionExpiry>,
+    close_observed_at: Option<u64>,
     handshake_packet: Option<(u8, Vec<u8>)>,
     pending: bool,
     keep_alive: u16,
@@ -122,7 +126,18 @@ struct PendingFrame {
 struct PendingSession {
     connection: ConnectionGeneration,
     operation: Option<OperationId>,
-    disconnect_expiry: Option<SessionExpiry>,
+    close_intent: Option<CloseIntent>,
+}
+#[derive(Clone, Copy)]
+struct CloseIntent {
+    expiry: SessionExpiry,
+    observed_at: u64,
+    explicit: bool,
+}
+struct ExpiryTimer {
+    guard: SessionGuard,
+    detached: SessionDetachment,
+    queued: bool,
 }
 #[derive(Clone)]
 struct AppliedSessionChange {
@@ -132,6 +147,14 @@ struct AppliedSessionChange {
     change: SessionChange,
 }
 struct Runtime<'a> {
+    clock: Arc<dyn SessionClock>,
+    clock_anchor: SessionClockAnchor,
+    clock_checkpoint: Option<(SessionClockReading, Instant)>,
+    last_clock_checkpoint: Instant,
+    checkpoint_degraded: bool,
+    expiry_timers: BTreeMap<SessionId, ExpiryTimer>,
+    expiry_inputs: VecDeque<Input>,
+    last_expiry_inventory: Option<(usize, bool)>,
     owner: Owner,
     _authority: OwnerAuthority,
     writer: &'a mut Writer,
@@ -190,6 +213,108 @@ struct Runtime<'a> {
     copied_session_close: Option<SessionCloseObservation>,
 }
 impl Runtime<'_> {
+    fn session_now(&self) -> Result<u64, Failure> {
+        let reading = self.clock.read().map_err(|e| Failure::plain(e.code()))?;
+        logical_now(self.clock_anchor, reading).map_err(|e| Failure::plain(e.code()))
+    }
+
+    fn closure_input(
+        session: SessionId,
+        generation: ConnectionGeneration,
+        opened_by: Option<OperationId>,
+        intent: CloseIntent,
+    ) -> Option<Input> {
+        let connection = ConnectionKey {
+            session,
+            generation,
+        };
+        match intent.expiry {
+            SessionExpiry::OnDisconnect => Some(Input::EndSession {
+                connection,
+                opened_by,
+                reason: if intent.explicit {
+                    SessionEndReason::Disconnect
+                } else {
+                    SessionEndReason::TransportLost
+                },
+            }),
+            SessionExpiry::After(_) => Some(Input::DetachSession {
+                connection,
+                opened_by,
+                expiry: intent.expiry,
+                observed_at: intent.observed_at,
+            }),
+            SessionExpiry::Never if intent.explicit => Some(Input::DetachSession {
+                connection,
+                opened_by,
+                expiry: intent.expiry,
+                observed_at: intent.observed_at,
+            }),
+            SessionExpiry::Never => None,
+        }
+    }
+
+    /// One keyed wakeup per live detached session, four due inputs per turn.
+    /// The periodic work scan and socket controls retain their own budgets.
+    fn expire_sessions(&mut self) -> Result<(), Failure> {
+        let now = self.session_now()?;
+        let mut budget = 4;
+        for timer in self.expiry_timers.values_mut() {
+            if budget == 0 {
+                break;
+            }
+            if !timer.queued
+                && timer
+                    .detached
+                    .deadline
+                    .is_some_and(|deadline| now >= deadline)
+            {
+                if self.expiry_inputs.len() >= crate::writer::SESSIONS {
+                    return Err(Failure::plain("expiry_input_budget"));
+                }
+                self.expiry_inputs.push_back(Input::ExpireSession {
+                    guard: timer.guard,
+                    detached: timer.detached,
+                    now,
+                });
+                timer.queued = true;
+                budget -= 1;
+            }
+        }
+        if !self.expiry_timers.is_empty()
+            && self.last_clock_checkpoint.elapsed() >= Duration::from_secs(30)
+        {
+            if self.clock_checkpoint.is_none() {
+                let reading = self.clock.read().map_err(|e| Failure::plain(e.code()))?;
+                match self
+                    .writer
+                    .control_sender
+                    .try_send(ControlRequest::ClockCheckpoint {
+                        expected: self.clock_anchor,
+                        reading,
+                    }) {
+                    Ok(()) => self.clock_checkpoint = Some((reading, Instant::now())),
+                    Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Disconnected(_)) => {
+                        return Err(Failure::plain("writer_control_disconnected"));
+                    }
+                }
+            }
+            if self.last_clock_checkpoint.elapsed() > Duration::from_secs(31)
+                && !self.checkpoint_degraded
+            {
+                self.checkpoint_degraded = true;
+                self.events.emit("session_clock_degraded", json!({"details":{"code":"checkpoint_late","age_ms":self.last_clock_checkpoint.elapsed().as_millis().to_string()}})).map_err(event_failure)?;
+            }
+        }
+        let inventory = (self.expiry_timers.len(), self.clock_checkpoint.is_some());
+        if self.last_expiry_inventory != Some(inventory) {
+            self.events.emit("expiry_inventory", json!({"details":{"finite_timers":inventory.0,"checkpoint_inflight":inventory.1,"queued":self.expiry_inputs.len(),"period_ms":30000}})).map_err(event_failure)?;
+            self.last_expiry_inventory = Some(inventory);
+        }
+        Ok(())
+    }
+
     fn accept(&mut self, stream: std::net::TcpStream) -> Result<bool, Failure> {
         // Retiring threads count against the same hard connection budget.
         let close_reserved = self
@@ -229,6 +354,7 @@ impl Runtime<'_> {
                 opened_by: None,
                 connect_expiry: SessionExpiry::OnDisconnect,
                 disconnect_expiry: None,
+                close_observed_at: None,
                 handshake_packet: None,
                 pending: false,
                 keep_alive: 0,
@@ -243,6 +369,15 @@ impl Runtime<'_> {
         Ok(true)
     }
     fn queue(&mut self, input: Input) -> Result<(), Failure> {
+        if matches!(input, Input::ExpireSession { .. }) {
+            if !self.expiry_inputs.iter().any(|old| old == &input) {
+                if self.expiry_inputs.len() >= crate::writer::SESSIONS {
+                    return Err(Failure::plain("expiry_input_budget"));
+                }
+                self.expiry_inputs.push_back(input);
+            }
+            return Ok(());
+        }
         if Self::terminal_input(&input) {
             if self.terminal_inputs.iter().any(|queued| queued == &input) {
                 return Ok(());
@@ -289,7 +424,7 @@ impl Runtime<'_> {
     fn closing_input(input: &Input) -> bool {
         matches!(
             input,
-            Input::EndSession { .. } | Input::ConnectionClosed { .. }
+            Input::EndSession { .. } | Input::DetachSession { .. } | Input::ConnectionClosed { .. }
         )
     }
     fn maintenance_input(&self, input: &Input) -> bool {
@@ -324,25 +459,31 @@ impl Runtime<'_> {
                     .map_err(event_failure)?;
                 self.copied_session_close = Some(observation);
             }
-            // Frame failure can unbind the core before ConnectionClosed is
-            // applied. Preserve this transport's confirmed zero-expiry guard
-            // independently; neither a cache lookup nor its current binding
-            // can recover that authority afterwards.
-            if peer.disconnect_expiry.unwrap_or(peer.connect_expiry) == SessionExpiry::OnDisconnect
-                && let Some(session) = peer.session
+            // Freeze the observation before any delayed Open/COMMIT result.
+            let observed_at = match peer.close_observed_at {
+                Some(value) => value,
+                None => self.session_now()?,
+            };
+            let intent = CloseIntent {
+                expiry: peer.disconnect_expiry.unwrap_or(peer.connect_expiry),
+                observed_at,
+                explicit: peer.disconnect_expiry.is_some(),
+            };
+            for pending in self
+                .session_requests
+                .values_mut()
+                .filter(|p| p.connection == generation)
             {
-                self.queue(Input::EndSession {
-                    connection: ConnectionKey {
-                        session,
-                        generation,
-                    },
-                    opened_by: peer.opened_by,
-                    reason: if code == "client_disconnect" {
-                        SessionEndReason::Disconnect
-                    } else {
-                        SessionEndReason::TransportLost
-                    },
-                })?;
+                if pending.close_intent.is_none() {
+                    pending.close_intent = Some(intent);
+                }
+            }
+            if let Some(session) = peer.session {
+                if let Some(input) =
+                    Self::closure_input(session, generation, peer.opened_by, intent)
+                {
+                    self.queue(input)?;
+                }
             }
             self.session_requests.retain(|_, pending| {
                 pending.connection != generation || pending.operation.is_some()
@@ -417,13 +558,16 @@ impl Runtime<'_> {
             let status = self.owner.session_status();
             let complete = !status.lifecycle_pending
                 && status.retired_flights == 0
-                && self
-                    .sessions
-                    .values()
-                    .all(|session| session.expiry == SessionExpiry::Never)
+                && self.sessions.values().all(|session| {
+                    session.expiry == SessionExpiry::Never
+                        || (matches!(session.expiry, SessionExpiry::After(_))
+                            && session.detached.is_some())
+                })
                 && self.inputs.is_empty()
                 && self.deferred_inputs.is_empty()
                 && self.control_inputs.is_empty()
+                && self.clock_checkpoint.is_none()
+                && self.expiry_inputs.is_empty()
                 && self.closing_inputs.is_empty()
                 && self.terminal_inputs.is_empty()
                 && self.session_requests.is_empty()
@@ -517,14 +661,15 @@ impl Runtime<'_> {
                         present: session_present,
                         expiry,
                         opened_by: Some(changed_by),
+                        detached: None,
                     },
                 );
                 if let Some(generation) = connection {
-                    let disconnect_expiry = self
+                    let close_intent = self
                         .session_requests
                         .values()
                         .find(|pending| pending.connection == generation)
-                        .and_then(|pending| pending.disconnect_expiry);
+                        .and_then(|pending| pending.close_intent);
                     self.session_requests
                         .retain(|_, pending| pending.connection != generation);
                     if let Some(peer) = self.peers.get_mut(&generation) {
@@ -537,30 +682,35 @@ impl Runtime<'_> {
                         }
                         peer.session = Some(session);
                         peer.opened_by = Some(changed_by);
-                        peer.disconnect_expiry = disconnect_expiry.or(peer.disconnect_expiry);
+                        if let Some(intent) = close_intent {
+                            peer.disconnect_expiry = Some(intent.expiry);
+                            peer.close_observed_at = Some(intent.observed_at);
+                        }
                         peer.connected = true;
                         // The ordered CONNACK, not cache installation, releases
                         // the bounded pre-CONNACK ingress gate.
                         peer.pending = true;
-                    } else if disconnect_expiry.unwrap_or(expiry) == SessionExpiry::OnDisconnect {
-                        self.queue(Input::EndSession {
-                            connection: ConnectionKey {
-                                session,
-                                generation,
-                            },
-                            opened_by: Some(changed_by),
-                            reason: if disconnect_expiry.is_some() {
-                                SessionEndReason::Disconnect
-                            } else {
-                                SessionEndReason::TransportLost
-                            },
-                        })?;
                     } else {
+                        if let Some(intent) = close_intent.or_else(|| {
+                            (expiry == SessionExpiry::OnDisconnect).then_some(CloseIntent {
+                                expiry,
+                                observed_at: 0,
+                                explicit: false,
+                            })
+                        }) {
+                            if let Some(input) =
+                                Self::closure_input(session, generation, Some(changed_by), intent)
+                            {
+                                self.queue(input)?;
+                            }
+                        }
                         self.queue(Input::ConnectionClosed {
                             connection: generation,
                         })?;
                     }
                 }
+                self.expiry_timers.remove(&session);
+
                 let mut fields = json!({"operation":operation(changed_by),"details":{"session":session.get().to_string(),"session_present":session_present,"expiry":expiry.to_wire(),"source":"lifecycle_commit"}});
                 if let Some(generation) = connection {
                     fields["connection"] = json!(generation.get().to_string());
@@ -571,6 +721,34 @@ impl Runtime<'_> {
                 self.rearm_ready_work(session, true);
             }
             SessionChange::Closed { session, .. } => self.retire_session(session)?,
+            SessionChange::Detached {
+                session,
+                expiry,
+                detached,
+            } => {
+                let value = self
+                    .sessions
+                    .values_mut()
+                    .find(|s| s.id == session)
+                    .ok_or_else(|| Failure::plain("detached_session_missing"))?;
+                value.expiry = expiry;
+                value.detached = Some(detached);
+                if detached.deadline.is_some() {
+                    self.expiry_timers.insert(
+                        session,
+                        ExpiryTimer {
+                            guard: SessionGuard {
+                                session,
+                                opened_by: value.opened_by,
+                            },
+                            detached,
+                            queued: false,
+                        },
+                    );
+                } else {
+                    self.expiry_timers.remove(&session);
+                }
+            }
         }
         self.last_session_change = Some(changed_by);
         let mut details = match change {
@@ -588,6 +766,13 @@ impl Runtime<'_> {
                 "retired_session":retired.map(|id|id.get().to_string()),"route_revision":route_revision.get().to_string(),
                 "cancelled_inbound":cancelled.inbound,"cancelled_deliveries":cancelled.deliveries,"cancelled_routes":cancelled.routes
             }),
+            SessionChange::Detached {
+                session,
+                expiry,
+                detached,
+            } => {
+                json!({"action":"Detached","session":session.get().to_string(),"expiry":expiry.to_wire(),"detached_by":operation(detached.operation),"deadline":detached.deadline.map(|n|n.to_string())})
+            }
             SessionChange::Closed {
                 session,
                 route_revision,
@@ -666,7 +851,9 @@ impl Runtime<'_> {
         let input = self.closing_inputs.pop_front()?;
         let generation = match &input {
             Input::ConnectionClosed { connection } => *connection,
-            Input::EndSession { connection, .. } => connection.generation,
+            Input::EndSession { connection, .. } | Input::DetachSession { connection, .. } => {
+                connection.generation
+            }
             _ => unreachable!("closing lane classification"),
         };
         if self
@@ -683,6 +870,9 @@ impl Runtime<'_> {
     }
 
     fn retire_session(&mut self, retired: SessionId) -> Result<(), Failure> {
+        self.expiry_timers.remove(&retired);
+        self.expiry_inputs
+            .retain(|i| !matches!(i, Input::ExpireSession {guard,..} if guard.session == retired));
         self.session_cardinality_dirty = true;
         self.sessions.retain(|_, cached| cached.id != retired);
         self.outgoing_bindings
@@ -704,9 +894,13 @@ impl Runtime<'_> {
         let mut control_budget = crate::writer::CONTROL_QUEUE;
         let mut closing_budget = self.closing_inputs.len().min(CONNECTIONS);
         let mut terminal_budget = self.terminal_inputs.len().min(CONNECTIONS);
-        for _ in
-            0..(self.inputs.len() + self.control_inputs.len() + closing_budget + terminal_budget)
-                .min(64)
+        let mut expiry_budget = self.expiry_inputs.len().min(4);
+        for _ in 0..(self.inputs.len()
+            + self.control_inputs.len()
+            + closing_budget
+            + terminal_budget
+            + expiry_budget)
+            .min(64)
         {
             let control = if control_budget > 0 {
                 self.control_inputs.pop_front()
@@ -727,6 +921,14 @@ impl Runtime<'_> {
                     if terminal_budget > 0 {
                         terminal_budget -= 1;
                         self.terminal_inputs.pop_front()
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    if expiry_budget > 0 {
+                        expiry_budget -= 1;
+                        self.expiry_inputs.pop_front()
                     } else {
                         None
                     }
@@ -832,6 +1034,27 @@ impl Runtime<'_> {
                         expiry,
                     }
                 }
+                Input::OpenSessionAt {
+                    connection,
+                    client_id,
+                    clean_start,
+                    expiry,
+                    now: _,
+                } => {
+                    if !self.peers.contains_key(&connection) {
+                        self.session_requests
+                            .retain(|_, pending| pending.connection != connection);
+                        continue;
+                    }
+                    let now = self.session_now()?;
+                    Input::OpenSessionAt {
+                        connection,
+                        client_id,
+                        clean_start,
+                        expiry,
+                        now,
+                    }
+                }
                 Input::SessionEstablished {
                     connection,
                     session,
@@ -881,7 +1104,9 @@ impl Runtime<'_> {
             };
             let ready_work = self.work_progress_hint(&input);
             let opening = match &input {
-                Input::OpenSession { connection, .. } => Some(*connection),
+                Input::OpenSession { connection, .. } | Input::OpenSessionAt { connection, .. } => {
+                    Some(*connection)
+                }
                 _ => None,
             };
             let lifecycle_result = match &input {
@@ -1168,6 +1393,26 @@ impl Runtime<'_> {
                         self.events.emit("session_result_ignored", json!({"operation":crate::events::operation(operation),"details":{"effect":effect_text(effect),"code":"stale_lifecycle_result"}})).map_err(event_failure)?;
                     }
                 }
+                ControlResponse::ClockCheckpoint {
+                    expected,
+                    reading,
+                    result,
+                } => {
+                    if self.clock_checkpoint.map(|(r, _)| r) != Some(reading)
+                        || expected != self.clock_anchor
+                    {
+                        return Err(Failure::plain("clock_checkpoint_correlation"));
+                    }
+                    self.clock_anchor = result?;
+                    self.clock_checkpoint = None;
+                    if self.clock_anchor.reading.domain == reading.domain
+                        && self.clock_anchor.reading.tick >= reading.tick
+                    {
+                        self.last_clock_checkpoint = Instant::now();
+                        self.checkpoint_degraded = false;
+                    }
+                    self.events.emit("session_clock_checkpoint", json!({"details":{"logical":self.clock_anchor.logical.to_string(),"tick":self.clock_anchor.reading.tick.to_string()}})).map_err(event_failure)?;
+                }
                 ControlResponse::Failed(failure) => return Err(failure),
                 ControlResponse::Closed { .. } => {
                     return Err(Failure::plain("unexpected_closed_collection"));
@@ -1447,14 +1692,16 @@ impl Runtime<'_> {
             PendingSession {
                 connection: generation,
                 operation: None,
-                disconnect_expiry: None,
+                close_intent: None,
             },
         );
         if let Some(peer) = self.peers.get_mut(&generation) {
             peer.pending = true;
             peer.connect_expiry = connect.expiry;
         }
-        self.queue(Input::OpenSession {
+        let now = self.session_now()?;
+        self.queue(Input::OpenSessionAt {
+            now,
             connection: generation,
             client_id: connect.client_id,
             clean_start: connect.clean_start,
@@ -1506,6 +1753,7 @@ impl Runtime<'_> {
                 return self.close(generation, "packet_refused");
             }
         };
+        let observed_at = self.session_now()?;
         let p = self
             .peers
             .get_mut(&generation)
@@ -1515,7 +1763,7 @@ impl Runtime<'_> {
             Packet::Connect(connect) => self.connect(generation, connect),
             Packet::Disconnect { expiry } => {
                 if p.connect_expiry == SessionExpiry::OnDisconnect
-                    && expiry == Some(SessionExpiry::Never)
+                    && expiry.is_some_and(|value| value != SessionExpiry::OnDisconnect)
                 {
                     let bytes = codec::disconnect_reason(0x82);
                     self.events.emit("packet_refused", json!({"connection":generation.get().to_string(),"details":{"code":"SessionExpiryIncreaseForbidden","reason":0x82}})).map_err(event_failure)?;
@@ -1534,32 +1782,22 @@ impl Runtime<'_> {
                     return self.close(generation, "packet_refused");
                 }
                 p.disconnect_expiry = expiry;
+                p.close_observed_at = Some(observed_at);
                 if let Some(pending) = self
                     .session_requests
                     .values_mut()
                     .find(|pending| pending.connection == generation)
                 {
-                    pending.disconnect_expiry = expiry;
+                    pending.close_intent = Some(CloseIntent {
+                        expiry: expiry.unwrap_or(p.connect_expiry),
+                        observed_at,
+                        explicit: expiry.is_some(),
+                    });
                 }
-                let end = if expiry == Some(SessionExpiry::OnDisconnect) {
-                    p.session.map(|session| Input::EndSession {
-                        connection: ConnectionKey {
-                            session,
-                            generation,
-                        },
-                        opened_by: p.opened_by,
-                        reason: SessionEndReason::Disconnect,
-                    })
-                } else {
-                    None
-                };
                 // Earlier decoded packets precede this close in the TCP stream.
                 // Apply their facts while this generation is authoritative;
                 // accepted durable work then outlives its transport.
                 self.drain_inputs()?;
-                if let Some(end) = end {
-                    self.queue(end)?;
-                }
                 self.close(generation, "client_disconnect")
             }
             Packet::Core(packet) => {
@@ -2218,6 +2456,7 @@ impl AppliedSessionChange {
         let (action, session) = match self.change {
             SessionChange::Opened { session, .. } => ("Opened", session),
             SessionChange::Closed { session, .. } => ("Closed", session),
+            SessionChange::Detached { session, .. } => ("Detached", session),
         };
         let mut fields = json!({"operation":operation(self.operation),"details":{"action":action,"session":session.get().to_string()}});
         if let Some(connection) = self.connection {
@@ -2571,6 +2810,10 @@ impl EffectSink for Sink<'_> {
             {
                 if let Recipe::SessionLifecycle(lifecycle) = command.recipe.get()
                     && let SessionAction::Open {
+                        expected: Some(guard),
+                        ..
+                    }
+                    | SessionAction::OpenAt {
                         expected: Some(guard),
                         ..
                     } = &lifecycle.action
@@ -3088,8 +3331,28 @@ fn recipe_details(recipe: &Recipe) -> serde_json::Value {
                 clean_start,
                 expiry,
                 ..
+            }
+            | SessionAction::OpenAt {
+                expected,
+                clean_start,
+                expiry,
+                ..
             } => {
                 json!({"action":"Open","clean_start":clean_start,"expiry":format!("{expiry:?}"),"expected_session":expected.map(|g|g.session.get().to_string())})
+            }
+            SessionAction::Detach {
+                guard,
+                expiry,
+                observed_at,
+            } => {
+                json!({"action":"Detach","session":guard.session.get().to_string(),"expiry":expiry.to_wire(),"observed_at":observed_at.to_string()})
+            }
+            SessionAction::Expire {
+                guard,
+                detached,
+                now,
+            } => {
+                json!({"action":"Expire","session":guard.session.get().to_string(),"detached_by":operation(detached.operation),"deadline":detached.deadline.map(|n|n.to_string()),"now":now.to_string()})
             }
             SessionAction::Close { guard, reason } => {
                 json!({"action":"Close","session":guard.session.get().to_string(),"opened_by":guard.opened_by.map(operation_text).unwrap_or_default(),"reason":format!("{reason:?}")})
@@ -3270,7 +3533,34 @@ fn run_inner(
     )
     .map_err(|_| Failure::plain("owner_creation"))?;
     // The worker handle stays in outer run for cleanup even if recovery fails.
+    let expiry_timers = boot
+        .sessions
+        .values()
+        .filter_map(|s| {
+            s.detached.filter(|d| d.deadline.is_some()).map(|detached| {
+                (
+                    s.id,
+                    ExpiryTimer {
+                        guard: SessionGuard {
+                            session: s.id,
+                            opened_by: s.opened_by,
+                        },
+                        detached,
+                        queued: false,
+                    },
+                )
+            })
+        })
+        .collect();
     let mut runtime = Runtime {
+        clock: boot.clock,
+        clock_anchor: boot.clock_anchor,
+        clock_checkpoint: None,
+        last_clock_checkpoint: Instant::now(),
+        checkpoint_degraded: false,
+        expiry_timers,
+        expiry_inputs: VecDeque::new(),
+        last_expiry_inventory: None,
         owner,
         _authority: authority,
         writer,
@@ -3492,6 +3782,7 @@ fn run_inner(
             runtime.writer_results()?;
             runtime.connections()?;
             runtime.discover_work();
+            runtime.expire_sessions()?;
             runtime.due_deadlines()?;
             #[cfg(feature = "test-hooks")]
             runtime.controls()?;

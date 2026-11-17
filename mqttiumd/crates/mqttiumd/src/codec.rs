@@ -72,8 +72,8 @@ impl Error {
         self.peer_maximum
     }
     /// The packet was structurally validated before profile refusal. MQTT's
-    /// CONNECT0→DISCONNECTnonzero context rule takes precedence over a finite
-    /// interval being outside this implementation's profile.
+    /// CONNECT0→DISCONNECTnonzero context rule also applies to an otherwise
+    /// unsupported DISCONNECT feature.
     pub fn in_session(self, connect_expiry: SessionExpiry) -> Self {
         if connect_expiry == SessionExpiry::OnDisconnect
             && self.disconnect_expiry.is_some_and(|value| value != 0)
@@ -1080,6 +1080,11 @@ mod tests {
                 (&[][..], SessionExpiry::OnDisconnect),
                 (&[0x11, 0, 0, 0, 0][..], SessionExpiry::OnDisconnect),
                 (EXPIRY, SessionExpiry::Never),
+                (&[0x11, 0, 0, 0, 1][..], SessionExpiry::After(1)),
+                (
+                    &[0x11, 255, 255, 255, 254][..],
+                    SessionExpiry::After(u32::MAX - 1),
+                ),
             ] {
                 let mut body = connect(properties, b"lifecycle-client");
                 body[7] = if clean_start { 2 } else { 0 };
@@ -1111,10 +1116,10 @@ mod tests {
             }
         );
         assert_eq!(
-            decode(0xe0, &[0, 5, 0x11, 0, 0, 0, 7], BOUNDS)
-                .unwrap_err()
-                .kind(),
-            ErrorKind::Unsupported
+            decode(0xe0, &[0, 5, 0x11, 0, 0, 0, 7], BOUNDS).unwrap(),
+            Packet::Disconnect {
+                expiry: Some(SessionExpiry::After(7))
+            }
         );
         assert_eq!(
             decode(0xe0, &[0, 10, 0x11, 0, 0, 0, 0, 0x11, 0, 0, 0, 0], BOUNDS)
@@ -1138,7 +1143,7 @@ mod tests {
 
     #[test]
     fn zero_connect_context_rejects_any_nonzero_disconnect_before_profile_refusal() {
-        let error = decode(0xe0, &[0, 5, 0x11, 0, 0, 0, 7], BOUNDS).unwrap_err();
+        let error = decode(0xe0, &[4, 5, 0x11, 0, 0, 0, 7], BOUNDS).unwrap_err();
         assert_eq!(
             error.in_session(SessionExpiry::OnDisconnect).code(),
             "SessionExpiryIncreaseForbidden"
@@ -1220,10 +1225,10 @@ mod tests {
 
     #[test]
     fn an_unsupported_connect_retains_its_validated_response_limit() {
-        let mut props = vec![0x11, 0, 0, 0, 7];
+        let mut props = vec![0x11, 0, 0, 0, 7, 0x19, 1];
         props.extend_from_slice(&[0x27, 0, 0, 0, 3]);
         let mut clean = connect(&props, b"small-refusal");
-        clean[7] = 2; // Clean Start is supported; a finite interval is not.
+        clean[7] = 2; // Request Response Information remains outside this profile.
         let error = decode(0x10, &clean, BOUNDS).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Unsupported);
         assert_eq!(error.peer_maximum(), Some(3));
@@ -1231,7 +1236,7 @@ mod tests {
 
         let finite = decode(
             0x10,
-            &connect(&[0x11, 0, 0, 0, 7], b"unsupported-expiry"),
+            &connect(&[0x11, 0, 0, 0, 7, 0x19, 1], b"unsupported-response-info"),
             BOUNDS,
         )
         .unwrap_err();
@@ -1254,7 +1259,11 @@ mod tests {
     #[test]
     fn profile_refusals_differ_from_malformed_or_contradictory_properties() {
         kind(
-            decode(0x10, &connect(&[0x11, 0, 0, 0, 7], b"client"), BOUNDS),
+            decode(
+                0x10,
+                &connect(&[0x11, 0, 0, 0, 7, 0x19, 1], b"client"),
+                BOUNDS,
+            ),
             ErrorKind::Unsupported,
         );
         let mut duplicate = EXPIRY.to_vec();

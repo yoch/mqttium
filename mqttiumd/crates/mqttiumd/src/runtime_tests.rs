@@ -31,14 +31,26 @@ impl Drop for Directory {
 /// Build the real worker and fully recover the owner before handing it to a
 /// test. Cleanup also runs when a regression assertion panics.
 fn with_runtime(max_exchanges: u32, test: impl FnOnce(&mut Runtime<'_>, &Path)) {
+    with_runtime_clock(
+        max_exchanges,
+        Arc::new(crate::session_time::SystemClock::new().unwrap()),
+        test,
+    );
+}
+fn with_runtime_clock(
+    max_exchanges: u32,
+    clock: Arc<dyn SessionClock>,
+    test: impl FnOnce(&mut Runtime<'_>, &Path),
+) {
     let directory = Directory::new();
     let events = Events::open(&directory.0.join("events.jsonl")).unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut writer = Writer::spawn(
+    let mut writer = Writer::spawn_with_clock(
         directory.0.join("store.sqlite"),
         events.clone(),
         Hooks::default(),
         cancel.clone(),
+        clock,
     )
     .unwrap();
     let boot = writer
@@ -69,6 +81,14 @@ fn with_runtime(max_exchanges: u32, test: impl FnOnce(&mut Runtime<'_>, &Path)) 
     )
     .unwrap();
     let mut runtime = Runtime {
+        clock: boot.clock,
+        clock_anchor: boot.clock_anchor,
+        clock_checkpoint: None,
+        last_clock_checkpoint: Instant::now(),
+        checkpoint_degraded: false,
+        expiry_timers: BTreeMap::new(),
+        expiry_inputs: VecDeque::new(),
+        last_expiry_inventory: None,
         owner,
         _authority: authority,
         writer: &mut writer,
@@ -204,6 +224,7 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             opened_by: None,
             connect_expiry: SessionExpiry::OnDisconnect,
             disconnect_expiry: None,
+            close_observed_at: None,
             handshake_packet: None,
             pending: false,
             keep_alive: 0,
@@ -831,7 +852,7 @@ fn closing_transport_reconciles_late_commit_without_acknowledging_after_disconne
 
 fn unsupported_connect_with_cap(cap: u32) -> Vec<u8> {
     let mut body = vec![
-        0, 4, b'M', b'Q', b'T', b'T', 5, 2, 0, 10, 10, 0x11, 0, 0, 0, 1, 0x27,
+        0, 4, b'M', b'Q', b'T', b'T', 5, 2, 0, 10, 12, 0x19, 1, 0x11, 0, 0, 0, 1, 0x27,
     ];
     body.extend_from_slice(&cap.to_be_bytes());
     body.extend_from_slice(&[0, 4, b't', b'i', b'n', b'y']);
@@ -1303,13 +1324,13 @@ fn concatenated_subscription_waits_for_connack(known: bool) {
             .write_all(&connect_then_subscribe(client_id))
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !runtime.inputs.iter().any(|input| matches!(input, Input::OpenSession { connection, .. } if *connection == generation))
+        while !runtime.inputs.iter().any(|input| matches!(input, Input::OpenSession { connection, .. } | Input::OpenSessionAt {connection,..} if *connection == generation))
             && Instant::now() < deadline
         {
             runtime.connections().unwrap();
             thread::sleep(Duration::from_millis(1));
         }
-        assert!(runtime.inputs.iter().any(|input| matches!(input, Input::OpenSession { connection, .. } if *connection == generation)), "every fresh or known CONNECT reaches the correlated owner lifecycle path");
+        assert!(runtime.inputs.iter().any(|input| matches!(input, Input::OpenSession { connection, .. } | Input::OpenSessionAt {connection,..} if *connection == generation)), "every fresh or known CONNECT reaches the correlated owner lifecycle path");
         assert!(runtime.peers[&generation].pending);
         assert!(
             !runtime.peers[&generation].connected,
@@ -2632,7 +2653,9 @@ fn disconnect_zero_before_connack_ends_the_exact_committed_infinite_open() {
                 .session_requests
                 .values()
                 .any(|pending| pending.operation == Some(operation)
-                    && pending.disconnect_expiry == Some(SessionExpiry::OnDisconnect)),
+                    && pending
+                        .close_intent
+                        .is_some_and(|i| i.expiry == SessionExpiry::OnDisconnect)),
             "late exact Open result retains the observed DISCONNECT policy"
         );
         relay_control_reply(runtime, response.clone());
@@ -3126,5 +3149,129 @@ fn an_actual_held_work_page_cannot_repopulate_a_retired_session_cache() {
         runtime.packet(current, 0xc0, vec![]).unwrap();
         runtime.drain_inputs().unwrap();
         assert_eq!(read_frame(&mut current_client).0, 0xd0);
+    });
+}
+
+#[test]
+fn finite_expiry_uses_exact_clock_boundary_and_never_expires_an_active_transport() {
+    use crate::session_time::testing::FakeClock;
+    let sample = |tick| SessionClockReading {
+        domain: [42; 32],
+        tick,
+    };
+    let clock = Arc::new(FakeClock::new(sample(100)));
+    with_runtime_clock(128, clock.clone(), |runtime, directory| {
+        let (generation, mut client) = peer(runtime);
+        let mut connect = connect_packet(b"finite-boundary");
+        connect.expiry = SessionExpiry::After(1);
+        runtime.connect(generation, connect).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(&read_frame(&mut client).1[..2], &[0, 0]);
+        clock.set(sample(2_000_000_100));
+        runtime.expire_sessions().unwrap();
+        assert!(runtime.expiry_timers.is_empty(), "active_session_expired");
+        runtime.close(generation, "test_lost").unwrap();
+        until(runtime, |r| {
+            !r.owner.session_status().lifecycle_pending
+                && r.closing_inputs.is_empty()
+                && r.lifecycle_inflight.is_empty()
+        });
+        let timer = runtime.expiry_timers.values().next().unwrap();
+        assert_eq!(timer.detached.deadline, Some(3_000_000_000));
+        clock.set(sample(3_000_000_099));
+        runtime.expire_sessions().unwrap();
+        assert!(runtime.expiry_inputs.is_empty(), "expiry_before_deadline");
+        clock.set(sample(3_000_000_100));
+        runtime.expire_sessions().unwrap();
+        until(runtime, |r| {
+            r.sessions.is_empty() && r.lifecycle_inflight.is_empty()
+        });
+        assert!(runtime.expiry_timers.is_empty());
+        assert!(
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite"))
+                .unwrap()
+                .sessions
+                .is_empty()
+        );
+    });
+}
+
+#[test]
+fn due_connect_cannot_resume_while_the_expiration_timer_is_deliberately_unpolled() {
+    use crate::session_time::testing::FakeClock;
+    let sample = |tick| SessionClockReading {
+        domain: [43; 32],
+        tick,
+    };
+    let clock = Arc::new(FakeClock::new(sample(0)));
+    with_runtime_clock(128, clock.clone(), |runtime, _| {
+        let (old, mut old_client) = peer(runtime);
+        let mut connect = connect_packet(b"late-connect");
+        connect.expiry = SessionExpiry::After(1);
+        runtime.connect(old, connect.clone()).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        read_frame(&mut old_client);
+        let original = runtime.peers[&old].session.unwrap();
+        runtime.close(old, "test_lost").unwrap();
+        until(runtime, |r| {
+            !r.owner.session_status().lifecycle_pending
+                && r.closing_inputs.is_empty()
+                && r.lifecycle_inflight.is_empty()
+        });
+        assert_eq!(runtime.expiry_timers.len(), 1);
+        clock.set(sample(1_000_000_000));
+        let (current, mut client) = peer(runtime);
+        runtime.connect(current, connect).unwrap();
+        until(runtime, |r| r.session_requests.is_empty());
+        assert_eq!(
+            &read_frame(&mut client).1[..2],
+            &[0, 0],
+            "late_open_resumed_without_timer"
+        );
+        assert_ne!(runtime.peers[&current].session, Some(original));
+        assert!(runtime.expiry_timers.is_empty());
+    });
+}
+
+#[test]
+fn early_finite_disconnect_keeps_observed_time_when_open_result_is_already_relayed() {
+    use crate::session_time::testing::FakeClock;
+    let sample = |tick| SessionClockReading {
+        domain: [44; 32],
+        tick,
+    };
+    let clock = Arc::new(FakeClock::new(sample(0)));
+    with_runtime_clock(128, clock.clone(), |runtime, directory| {
+        let (generation, _client) = peer(runtime);
+        runtime
+            .connect(generation, connect_packet(b"finite-early-end"))
+            .unwrap();
+        runtime.drain_inputs().unwrap();
+        let response = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        relay_control_reply(runtime, response);
+        clock.set(sample(2_000_000_000));
+        runtime
+            .packet(generation, 0xe0, vec![0, 5, 0x11, 0, 0, 0, 1])
+            .unwrap();
+        clock.set(sample(9_000_000_000));
+        until(runtime, |r| {
+            !r.owner.session_status().lifecycle_pending
+                && r.closing_inputs.is_empty()
+                && r.lifecycle_inflight.is_empty()
+        });
+        let state =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        let detached = state.sessions.values().next().unwrap().detached.unwrap();
+        assert_eq!(
+            detached.deadline,
+            Some(3_000_000_000),
+            "detach_deadline_rearmed_after_observation"
+        );
+        runtime.expire_sessions().unwrap();
+        until(runtime, |r| r.sessions.is_empty());
     });
 }
