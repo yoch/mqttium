@@ -1,4 +1,4 @@
-//! Exact subscriptions and outgoing QoS 1 under the same owner authority.
+//! Hierarchical subscriptions and outgoing QoS 1 under the same owner authority.
 use super::*;
 use crate::contract::command::{
     ClaimDelivery, ConsumeDelivery, FinishDelivery, UpdateSubscriptions,
@@ -440,12 +440,6 @@ fn blocked() -> Stop {
         wake: WakeCondition::ResultDelivered,
     })
 }
-fn exact(topic: &SharedBytes) -> bool {
-    !topic.is_empty()
-        && !topic.as_slice().contains(&b'+')
-        && !topic.as_slice().contains(&b'#')
-        && !topic.as_slice().starts_with(b"$share/")
-}
 
 impl Owner {
     /// Whether a bounded work wake-up can advance already known online work.
@@ -544,12 +538,19 @@ impl Owner {
             ingress_order,
         };
         let origin = Qos0Origin::Volatile { publication };
-        let count = self
-            .routes
-            .as_slice()
-            .iter()
-            .filter(|r| r.topic == *topic)
-            .count();
+        let selected = match super::routing::select(
+            self.routes.as_slice(),
+            self.sessions.as_slice(),
+            publication.source.session,
+            topic.as_slice(),
+            Qos::AtMostOnce,
+            limits.max_targets,
+        ) {
+            Ok(selected) => Some(selected),
+            Err(super::routing::Refusal::Capacity) => None,
+            Err(super::routing::Refusal::Revision) => return Err(IMPOSSIBLE),
+        };
+        let count = selected.as_ref().map_or(0, super::routing::Selection::len);
         let used = self
             .pubsub
             .volatile
@@ -557,7 +558,8 @@ impl Owner {
             .iter()
             .try_fold(0u64, |sum, v| sum.checked_add(v.payload.len() as u64))
             .ok_or(IMPOSSIBLE)?;
-        let fits = count <= self.pubsub.volatile.capacity() - self.pubsub.volatile.len()
+        let fits = selected.is_some()
+            && count <= self.pubsub.volatile.capacity() - self.pubsub.volatile.len()
             && (payload.len() as u64)
                 .checked_mul(count as u64)
                 .and_then(|n| n.checked_add(used))
@@ -566,7 +568,7 @@ impl Owner {
             draft.emit(Effect::Qos0Dropped {
                 origin,
                 target: None,
-                reason: if count == 0 {
+                reason: if count == 0 && selected.is_some() {
                     Qos0DropReason::NoSubscribers
                 } else {
                     Qos0DropReason::CapacityExceeded
@@ -580,17 +582,17 @@ impl Owner {
             }));
         }
         let mut records = BoundedVec::with_capacity(count)?;
-        for route in self.routes.as_slice().iter().filter(|r| r.topic == *topic) {
+        for target in selected.ok_or(IMPOSSIBLE)?.iter() {
             let connection = self
-                .connection_of(route.target)
+                .connection_of(target.session)
                 .map(|generation| ConnectionKey {
-                    session: route.target,
+                    session: target.session,
                     generation,
                 });
             records
                 .try_push(Volatile {
                     origin,
-                    target: route.target,
+                    target: target.session,
                     connection,
                     topic: topic.clone(),
                     payload: payload.clone(),
@@ -1061,15 +1063,13 @@ impl Owner {
         match packet {
             InboundPacket::Subscribe { filters, .. } => {
                 for item in filters.as_slice() {
-                    let allowed = exact(&item.filter);
+                    let allowed = crate::contract::topic::valid_filter(item.filter.as_slice());
                     codes[len] = if allowed {
                         item.qos.min(Qos::AtLeastOnce).to_wire()
                     } else if item.filter.as_slice().starts_with(b"$share/") {
                         0x9e
-                    } else if !exact(&item.filter) {
-                        0xa2
                     } else {
-                        0x83
+                        0x8f
                     };
                     len += 1;
                     if allowed {
@@ -1085,7 +1085,7 @@ impl Owner {
             }
             InboundPacket::Unsubscribe { filters, .. } => {
                 for topic in filters.as_slice() {
-                    let allowed = exact(topic);
+                    let allowed = crate::contract::topic::valid_filter(topic.as_slice());
                     let removed_before = changes
                         .as_slice()
                         .iter()
@@ -1097,7 +1097,7 @@ impl Owner {
                             .iter()
                             .any(|r| r.target == session && r.topic == *topic);
                     codes[len] = if !allowed {
-                        0x83
+                        0x8f
                     } else if present {
                         0
                     } else {

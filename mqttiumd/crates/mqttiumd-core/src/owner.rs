@@ -1062,6 +1062,7 @@ impl Owner {
             return WorkUnits::new(
                 1u64.saturating_add(self.pubsub.work_bound(input, self.routes.capacity()))
                     .saturating_add(self.session_work_bound(input))
+                    .saturating_add(self.routing_work_bound(input))
                     .saturating_add(self.receipts.work(input))
                     .saturating_add(
                         if self.receipts.enabled
@@ -1643,7 +1644,7 @@ impl Owner {
         ))
     }
 
-    /// A new PUBLISH: identities, exact-topic routing from the recovered
+    /// A new PUBLISH: identities, hierarchical routing from the recovered
     /// routes, a frozen recipe, `Persist`.
     fn plan_admission(
         &self,
@@ -1678,13 +1679,19 @@ impl Owner {
         let source = &self.sessions.as_slice()[session];
         let length = u64::try_from(payload.len()).unwrap_or(u64::MAX);
         let fits = |len: usize, max: u32| u32::try_from(len).is_ok_and(|len| len <= max);
-        let routed = || {
-            self.routes
-                .as_slice()
-                .iter()
-                .filter(|route| route.topic == *topic)
+        let selected = match routing::select(
+            self.routes.as_slice(),
+            self.sessions.as_slice(),
+            source.id,
+            topic.as_slice(),
+            qos,
+            limits.max_targets,
+        ) {
+            Ok(selected) => selected,
+            Err(routing::Refusal::Capacity) => return never(draft),
+            Err(routing::Refusal::Revision) => return Err(IMPOSSIBLE),
         };
-        let targets = routed().count();
+        let targets = selected.len();
         if !fits(topic.len(), limits.max_topic_bytes)
             || length > limits.max_payload_bytes.get()
             || !fits(targets, limits.max_targets)
@@ -1744,15 +1751,15 @@ impl Owner {
             owner,
             draw(&mut draft.counters.payload, PayloadSeq::checked_next)?,
         );
-        for (index, route) in routed().enumerate() {
+        for (index, selected) in selected.iter().enumerate() {
             let target = Target {
-                session: route.target,
-                session_revision: route.target_revision,
+                session: selected.session,
+                session_revision: selected.revision,
                 delivery: DeliveryId {
                     publication,
                     index: u32::try_from(index).map_err(|_| IMPOSSIBLE)?,
                 },
-                effective_qos: route.max_qos.min(qos),
+                effective_qos: selected.qos,
                 cause: DeliveryCause::LiveExact,
             };
             list.try_push(target).map_err(|_| IMPOSSIBLE)?;
@@ -2323,6 +2330,7 @@ impl Owner {
                     // A route twice would freeze a recipe with the same
                     // target twice: one delivery would be owed twice.
                     route_table
+                        && crate::contract::topic::valid_filter(topic.as_slice())
                         && self.routes.len() + same.len() < self.routes.capacity()
                         && !self
                             .routes
