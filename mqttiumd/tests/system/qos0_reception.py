@@ -775,9 +775,13 @@ def main() -> int:
     require(not any(args.out.iterdir()), "output_not_empty")
     cases = [("A", matrix), ("B", pure_no_commit), ("C", bounds_and_abandon),
              ("E-after", lambda b, p: crash(b, p, "after")), ("F-capacity", atomic_capacity),
-             ("G-recovery", subscription_recovery), ("H", credits), ("R-read-domain", corrupt_live_work)]
+             ("G-recovery", subscription_recovery), ("H", credits)]
     if args.mode == "complete" or args.case:
-        cases += [("D-consume", consumption_barrier), ("D-resolution", consumption_resolution),
+        # The corruption control pauses the real writer before its read and
+        # requires test-hooks, just like the transaction-boundary controls.
+        # All seven functional groups above still execute on normal bytes.
+        cases += [("R-read-domain", corrupt_live_work),
+                  ("D-consume", consumption_barrier), ("D-resolution", consumption_resolution),
                   ("E-before", lambda b, p: crash(b, p, "before")),
                   ("E-between", lambda b, p: crash(b, p, "between")),
                   ("E-takeover", consumed_takeover), ("F", mixed_fanout),

@@ -64,3 +64,17 @@ The new injection point is documented and included in the derived example.
 Contract digest: sha256:65345f213724ab31e29e5d5b24bbb310ba6e7d2b346a91d9d7c6cb741fec012f.
 Next: receive the four finite-expiry compiled controls, publish this correction
 with an expected96db7b34 lease, then download and execute the final CI preview.
+
+Published3f010697 with an exact96db7b34 lease; connector HEAD/base/draft and
+the full fetched tree matched. Normal1138, strict normal/instrumented Clippy,
+268 oracle tests,637 second-reader documents,185 pilot tests and all four
+compiled expiry controls passed. A local instrumented invocation first enabled
+SQLite kill-points without the lab feature and was correctly refused; rerun
+uses mqttiumd-lab/kill-points plus mqttiumd/test-hooks. This invocation error is
+not a regression or a negative-control detection.
+The3f QoS0 CI gate then caught the new read barrier being requested in its
+normal pass. Its seven functional groups remain normal; the precise corruption
+control is now selected in the instrumented pass alongside the other barriers.
+InvalidData/Work, same-file InvalidData/Snapshot, quick_check and writer-release
+assertions remain unchanged. Next: execute the complete QoS0 launcher before
+the guarded follow-up publication and final archive download.
