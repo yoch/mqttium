@@ -169,15 +169,26 @@ if {row['criterion'] for row in boundaries['cases']}!=cuts|{'lost-end','held-end
 kills=[row for row in boundaries['cases'] if row.get('kill_status')==-9]
 if len(kills)!=6 or len({row['killed_pid'] for row in kills})!=6 or any(not row['same_file'] for row in kills):
     raise SystemExit('six distinct own-process SIGKILL cuts on same files required')
-kernel_kills=[]
+shared=next(row for row in normal['cases'] if row['group']=='D-shared-responsibilities')
+finite=next(row for row in normal['cases'] if row['group']=='E-takeover')['finite_source_expiry']
+if shared['original_broker_status']!=-9 or finite['kill_status']!=-9 or not finite['same_file']:
+    raise SystemExit('shared and finite-source responsibility cases require their own broker SIGKILL')
+normal_kills=[{'criterion':'sensor-'+row['sensor_client'], 'pid':row['sigkill']['pid']} for row in public]
+normal_kills += [{'criterion':'shared-responsibilities','pid':shared['original_broker_pid']},
+                 {'criterion':'finite-source-expiry','pid':finite['killed_pid']}]
+if len({row['pid'] for row in normal_kills}|{row['killed_pid'] for row in kills})!=10:
+    raise SystemExit('ten distinct normal and boundary process kills required')
+kernel_kills=[];normal_kernel_kills=[]
 if int(sys.argv[3]):
     observed=successful_sigkill_targets((out/'boundaries.strace').read_text())
     for row in kills:
         if row['killed_pid'] not in observed: raise SystemExit('boundary SIGKILL missing in own kernel witness')
         kernel_kills.append({'criterion':row['criterion'],'pid':row['killed_pid']})
     observed=successful_sigkill_targets((out/'normal.strace').read_text())
-    for row in public:
-        if row['sigkill']['pid'] not in observed: raise SystemExit('sensor SIGKILL missing in own kernel witness')
+    for row in normal_kills:
+        if row['pid'] not in observed:
+            raise SystemExit(f"normal SIGKILL for {row['criterion']} missing in its own kernel witness")
+        normal_kernel_kills.append(row)
 if (not core['passed'] or not core['restored'] or not core['cache_restored'] or core['source_revision']!=source
         or len(core['mutants'])!=4 or not all(row['detected'] and row['restored'] for row in core['mutants'])
         or store['status']!='PASS' or store['source_sha']!=source or len(store['results'])!=2
@@ -194,7 +205,8 @@ index={'format':'mqttiumd.will-system-reception-index','schema_version':1,'statu
     'source_archive':{'path':'source.tar','sha256':hashlib.sha256((out/'source.tar').read_bytes()).hexdigest()},
     'normal':{'receipt':'normal/result.json','binary_sha256':normal_hash,'features':[]},
     'boundaries':{'receipt':'boundaries/receipt.json','binary_sha256':hooks_hash,'features':['test-hooks']},
-    'own_sigkill':{'count':6,'same_run_kernel_kills':kernel_kills},
+    'own_sigkill':{'boundary_count':6,'normal_sensor_count':2,'normal_broker_count':2,'total_count':10,
+                   'same_run_kernel_boundaries':kernel_kills,'same_run_kernel_normal':normal_kernel_kills},
     'negative_controls':{'core':'core-mutants/result.json','store':'store-mutants/result.json','count':6},
     'preview':{'receipt':'preview-smoke/receipt.json','archive_sha256':smoke['archive_sha256'],
                'public_demo':'package-demo/will-demo.json','same_normal_binary':True},
