@@ -1675,6 +1675,93 @@ mod tests {
                 ..
             }
         ));
+        let publication = mqttiumd_contract::ids::PublicationId::new(
+            boot.grant.incarnation(),
+            boot.grant.epoch(),
+            LogicalOwnerId::new(0),
+            mqttiumd_contract::ids::PublicationSeq::new(7),
+        );
+        let frozen = Command {
+            recipe: FrozenRecipe::freeze(Recipe::WillPublication(
+                mqttiumd_contract::will::WillPublication {
+                    operation: operation(7),
+                    will: operation(3),
+                    publication,
+                    route_revision: store.snapshot().unwrap().route_revision,
+                    topic: intent.spec.topic.clone(),
+                    payload: mqttiumd_contract::command::PayloadRef {
+                        id: mqttiumd_contract::ids::PayloadId::new(
+                            boot.grant.incarnation(),
+                            boot.grant.epoch(),
+                            LogicalOwnerId::new(0),
+                            mqttiumd_contract::ids::PayloadSeq::new(7),
+                        ),
+                        length: PayloadBytes::new(intent.spec.payload.len() as u64),
+                    },
+                    costs: mqttiumd_contract::command::Costs {
+                        payload_bytes: PayloadBytes::new(0),
+                        references: References::new(0),
+                        exchange_slots: ExchangeSlots::new(0),
+                        receipt_slots: ReceiptSlots::new(1),
+                    },
+                    targets: mqttiumd_contract::capacity::BoundedVec::with_capacity(0).unwrap(),
+                },
+            ))
+            .unwrap(),
+            payload: Some(intent.spec.payload.clone()),
+        };
+        let admission = control_response(
+            &mut store,
+            ControlRequest::Lifecycle(OwnedEffect::new(
+                effect(7),
+                Effect::Persist {
+                    command: frozen.clone(),
+                },
+            )),
+            &events,
+            &hooks,
+            &cancel,
+            &mut state,
+        );
+        assert!(
+            matches!(admission,ControlResponse::Lifecycle {operation:id,reply:StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::WillPublished {will,publication:p})),..} if id==operation(7) && will==operation(3) && p==publication),
+            "Will must admit through reserved control lane without source session"
+        );
+        assert!(
+            store
+                .read_wills(None, 1, ReadBudget::PAGE)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let resolved = control_response(
+            &mut store,
+            ControlRequest::Lifecycle(OwnedEffect::new(
+                effect(8),
+                Effect::ResolveAndFence {
+                    operation: operation(7),
+                },
+            )),
+            &events,
+            &hooks,
+            &cancel,
+            &mut state,
+        );
+        assert!(
+            matches!(resolved,ControlResponse::Lifecycle {reply:StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::WillPublished {will,publication:p})),..} if will==operation(3) && p==publication),
+            "resolution must retain same admitted occurrence after intent removal"
+        );
+        let before = store.snapshot().unwrap();
+        let duplicate = store.apply(&frozen);
+        assert!(
+            !duplicate.committed_now,
+            "same operation must never repeat Will mutation"
+        );
+        assert_eq!(
+            store.snapshot().unwrap(),
+            before,
+            "repeated Will command must preserve exact durable state"
+        );
         let diagnostics = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
         assert!(
             !diagnostics.contains("SECRET-WILL"),
