@@ -82,6 +82,14 @@ class FiniteSessionFormats(unittest.TestCase):
             "reading": {"domain": "ab" * 32, "tick": "100"}, "logical": "100"}
         return value
 
+    def test_actual_generic_lifecycle_submission_is_described_by_the_product_schema(self):
+        value = {"format": "mqttiumd.product-event", "schema_version": 1,
+                 "seq": "15", "pid": 1, "kind": "command_submitted",
+                 "operation": OPERATION, "command_kind": "SessionLifecycle",
+                 "details": {"action": "Open", "clean_start": False,
+                             "expected_session": None, "expiry": {"After": 1}}}
+        self.assertEqual(self.contracts.check_value(value), [], "actual_lifecycle_event_not_described")
+
     def test_finite_policy_detachment_and_one_anchor_are_readable(self):
         self.assertEqual(self.contracts.check_value(self.finite_snapshot()), [])
 
