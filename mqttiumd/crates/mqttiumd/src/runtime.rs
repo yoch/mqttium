@@ -3657,7 +3657,7 @@ impl EffectSink for Sink<'_> {
                     }
                     Err(TrySendError::Full(_)) => {
                         self.outgoing_bindings.remove(&binding_key);
-                        self.close.push((generation, "outgoing_queue_full"));
+                        if self.events.emit("effect_retained",json!({"connection":generation.get().to_string(),"details":{"code":"output_queue_full","effect":effect_text(id),"packet_kind":"PUBLISH"}})).is_err(){self.error=Some(Failure::plain("events_unavailable"));}
                         refused(effect, SubmitBlock::QueueFull)
                     }
                     Err(TrySendError::Disconnected(_)) => {
