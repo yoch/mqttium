@@ -38,11 +38,55 @@ def frozen_quarantine_fixture():
 class IndependentMessageExpiryFrames(unittest.TestCase):
     def test_unknown_domain_keeps_exact_original_and_frozen_replay_inventory(self):
         before, after = frozen_quarantine_fixture()
-        value = recipe_quarantine_inventory(before, after, 'replay', True, '55' * 32)
+        value = recipe_quarantine_inventory(before, after, 'replay', True, '55' * 32,
+            expected_payload=b'expired', expected_stamp={'domain': '61' * 32, 'tick': '123', 'interval': 2})
         self.assertEqual(value['original_publication'], '22' * 32)
         self.assertEqual(value['publication_ids'], ['22' * 32, '44' * 32])
         self.assertEqual(value['payload'], '11' * 32)
         self.assertEqual(value['references'], 2)
+
+    def test_single_publication_quarantine_stays_exact_for_other_recipe_cuts(self):
+        for kind, committed in (('qos0', True), ('qos1', True), ('replay', False)):
+            before, _ = frozen_quarantine_fixture()
+            before['tables']['publications'].pop()
+            before['counts']['publications'] = 1
+            original = before['tables']['publications'][0]
+            if kind == 'qos0':
+                original['qos'] = 0
+            if committed:
+                owed = before['tables']['obligations'][0]
+                owed.update(publication=original['id'], qos=original['qos'], cause=1, retain=0)
+                operation = original['operation']
+            else:
+                before['tables']['obligations'] = []
+                before['counts']['obligations'] = 0
+                before['tables']['payloads'][0]['refs'] = '0000000000000001'
+                before['tables']['meta'][0]['used_references'] = '0000000000000001'
+                operation = '55' * 32
+            with self.subTest(kind=kind, committed=committed):
+                value = recipe_quarantine_inventory(before, copy.deepcopy(before), kind, committed, operation,
+                    expected_payload=b'expired', expected_stamp={'domain': '61' * 32, 'tick': '123', 'interval': 2})
+                self.assertEqual(value['publication_ids'], ['22' * 32])
+                self.assertEqual(value['references'], 1 + int(committed))
+
+    def test_quarantine_rejects_mutated_identity_clock_payload_or_reference(self):
+        mutations = (
+            ('clock', lambda tables: tables['publications'][1].update(expiry_tick='000000000000007c')),
+            ('version', lambda tables: tables['publications'][1].update(retained_version='99' * 32)),
+            ('owed', lambda tables: tables['obligations'][0].update(publication='22' * 32)),
+            ('payload', lambda tables: tables['payloads'][0].update(bytes=b'changed'.hex())),
+            ('reference', lambda tables: tables['payloads'][0].update(refs='0000000000000001')),
+            ('account', lambda tables: tables['meta'][0].update(used_references='0000000000000001')),
+        )
+        for label, mutate in mutations:
+            for both in (False, True):
+                before, after = frozen_quarantine_fixture()
+                mutate(after['tables'])
+                if both:
+                    mutate(before['tables'])
+                with self.subTest(field=label, changed_before_and_after=both), self.assertRaises(ReceiptFailure):
+                    recipe_quarantine_inventory(before, after, 'replay', True, '55' * 32,
+                        expected_payload=b'expired', expected_stamp={'domain': '61' * 32, 'tick': '123', 'interval': 2})
 
     def test_property_identifier_and_four_byte_width_have_literal_witnesses(self):
         self.assertEqual(publish_packet('t', b'v', qos=0, retain=True, expiry=2),

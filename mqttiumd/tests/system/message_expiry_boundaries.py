@@ -129,13 +129,60 @@ def canonical_expire(state, event, claim, stamp):
             'sha256': hashlib.sha256(raw).hexdigest(), 'original': original, 'observed': observed}
 
 
-def recipe_quarantine_inventory(before, after, kind, committed, command_operation):
-    require(after['counts']['retained'] == after['counts']['publications'] ==
-            after['counts']['payloads'] == 1, 'message_expiry_recipe_uncertain_value_not_retained')
-    return {'original_publication': after['tables']['retained'][0]['publication'],
-            'publication_ids': [row['id'] for row in after['tables']['publications']],
-            'payload': after['tables']['payloads'][0]['id'],
-            'references': int(after['tables']['payloads'][0]['refs'], 16)}
+def recipe_quarantine_inventory(before, after, kind, committed, command_operation, *,
+                                expected_payload, expected_stamp):
+    replay = kind == 'replay' and committed
+    require(kind in ('qos0', 'qos1', 'replay') and (committed or kind == 'replay'),
+            'message_expiry_recipe_quarantine_context_invalid')
+    expected = {'retained': 1, 'publications': 2 if replay else 1, 'payloads': 1,
+                'obligations': int(committed), 'outbound': 0, 'inbound': 0}
+    require(all(after['counts'][name] == count == len(after['tables'][name])
+                for name, count in expected.items()), 'message_expiry_recipe_uncertain_value_not_retained')
+    for name in expected:
+        require(sorted(json.dumps(row, sort_keys=True) for row in before['tables'][name]) ==
+                sorted(json.dumps(row, sort_keys=True) for row in after['tables'][name]),
+                'message_expiry_recipe_quarantine_inventory_changed', name)
+    tables = after['tables']
+    retained = tables['retained'][0]
+    publications = {row['id']: row for row in tables['publications']}
+    require(len(publications) == expected['publications'] and retained['publication'] in publications,
+            'message_expiry_recipe_quarantine_publication_identity_wrong')
+    original = publications[retained['publication']]
+    stamp = expiry_stamp(original)
+    require(original['retained_version'] is None and original['topic'] == retained['topic'] and
+            original['retain'] == 1 and original['qos'] == (0 if kind == 'qos0' else 1) and
+            stamp == expected_stamp and stamp['interval'] == 2,
+            'message_expiry_recipe_quarantine_original_wrong')
+    frozen = None
+    if replay:
+        frozen = next(row for row in tables['publications'] if row['id'] != original['id'])
+        same = ('source', 'topic', 'qos', 'retain', 'payload', 'expiry_domain', 'expiry_tick', 'expiry_interval')
+        require(frozen['retained_version'] == original['id'] and
+                all(frozen[name] == original[name] for name in same) and
+                frozen['operation'] == command_operation != original['operation'],
+                'message_expiry_recipe_frozen_copy_changed')
+    elif committed:
+        require(original['operation'] == command_operation,
+                'message_expiry_recipe_quarantine_admission_identity_changed')
+    if committed:
+        owed = tables['obligations'][0]
+        require(owed['publication'] == (frozen or original)['id'] and owed['idx'] == 0 and
+                owed['phase'] == 1 and owed['qos'] == (0 if kind == 'qos0' else 1) and
+                owed['cause'] == (2 if replay else 1) and owed['retain'] == int(replay),
+                'message_expiry_recipe_quarantine_owed_identity_wrong')
+    payload = tables['payloads'][0]
+    refs = 1 + len(tables['obligations'])
+    raw = bytes.fromhex(payload['bytes'])
+    require(raw == expected_payload and payload['id'] == original['payload'] and payload['length'] == f'{len(raw):016x}' and
+            payload['refs'] == f'{refs:016x}', 'message_expiry_recipe_quarantine_payload_or_refs_wrong')
+    accounts = {'used_payload_bytes': len(raw), 'used_references': refs, 'used_exchange_slots': 0}
+    require(all(before['tables']['meta'][0][name] == tables['meta'][0][name] == f'{value:016x}'
+                for name, value in accounts.items()), 'message_expiry_recipe_quarantine_accounts_changed')
+    return {'original_publication': original['id'], 'publication_ids': sorted(publications),
+            'frozen_publication': frozen['id'] if frozen is not None else None,
+            'payload': payload['id'], 'payload_sha256': hashlib.sha256(raw).hexdigest(),
+            'payload_bytes': len(raw), 'references': refs, 'original_expiry': stamp,
+            'owed': tables['obligations']}
 
 
 async def settle(task):
@@ -424,6 +471,7 @@ async def recipe_cut(binary, case, value):
         source, source_tap = await peer('mqttium', broker, case, 'recipe-source', session_expiry=0)
         target, tap = await peer('paho', broker, case, 'recipe-target', client_id='recipe-target')
         peers.extend(((source, source_tap), (target, tap)))
+        ingress_after = max(int(event['seq']) for event in broker.events())
         if kind == 'replay':
             await source.publish('message-expiry/cut/value', payload, 1, retain=True, message_expiry=2)
             action = asyncio.create_task(target.subscribe((Subscription('message-expiry/cut/#', 1),)))
@@ -432,6 +480,8 @@ async def recipe_cut(binary, case, value):
             action = asyncio.create_task(source.publish('message-expiry/cut/value', payload,
                                         0 if kind == 'qos0' else 1, retain=True, message_expiry=2))
         hit = await asyncio.to_thread(broker.wait_event, 'barrier_hit', point=point)
+        ingress = await received_ingress(broker, 'message-expiry/cut/value', ingress_after)
+        stamp = {key: ingress['details'][key] for key in ('domain', 'tick', 'interval')}
         expected_kind = {'qos1': 'Admission', 'qos0': 'RetainedQoS0', 'replay': 'Subscriptions'}[kind]
         require(hit.get('command_kind') == expected_kind, 'message_expiry_recipe_cut_wrong_command')
         held = snapshot(broker, 'recipe-barrier-held')
@@ -458,6 +508,7 @@ async def recipe_cut(binary, case, value):
         after_clock = startup_clock(restart)
         same_domain = continuous(before_clock, after_clock)
         has_value = kind == 'replay' or committed
+        quarantined_inventory = None
         if same_domain or not has_value:
             final = await until_state(restart, physically_drained, 'message_expiry_recipe_original_deadline_reset')
             quarantined = []
@@ -465,7 +516,8 @@ async def recipe_cut(binary, case, value):
         else:
             quarantined = await until_quarantined(restart)
             final = snapshot(restart, 'recipe-quarantined')
-            recipe_quarantine_inventory(held, final, kind, committed, identity)
+            quarantined_inventory = recipe_quarantine_inventory(held, final, kind, committed, identity,
+                expected_payload=payload, expected_stamp=stamp)
             outcome = 'quarantined-unproved-domain'
         target, tap = await peer('paho', restart, case, 'recipe-resumed-target',
                                  client_id='recipe-target', present=True)
@@ -474,16 +526,26 @@ async def recipe_cut(binary, case, value):
         await target.no_message(.08)
         require(not tap.publications(payload), 'message_expiry_recipe_recovered_as_fresh')
         fresh = await witness(restart, case, peers, target, tap, kind + '-' + phase)
+        if quarantined_inventory is not None:
+            final = await until_state(restart, lambda state: set(row['id'] for row in
+                state['tables']['publications']) == set(quarantined_inventory['publication_ids']) and
+                state['counts']['obligations'] == len(quarantined_inventory['owed']) and
+                state['counts']['outbound'] == state['counts']['inbound'] == 0,
+                'message_expiry_recipe_quarantine_changed_after_witness')
+            require(recipe_quarantine_inventory(held, final, kind, committed, identity,
+                    expected_payload=payload, expected_stamp=stamp) == quarantined_inventory,
+                    'message_expiry_recipe_quarantine_changed_after_witness')
         write_json(case / 'recipe-recovered.sql.json', final)
         await close_peers(peers)
         peers = []
         restart.stop()
         writer_available(restart.db)
         return {'criterion': f'recipe-{kind}-{phase}', 'status': 'PASS', 'ready': ready,
-                'barrier': hit, 'canonical': canonical, 'killed_pid': broker.process.pid,
+                'barrier': hit, 'canonical': canonical, 'ingress': ingress, 'killed_pid': broker.process.pid,
                 'kill_status': kill_status, 'same_sqlite_inode': inode, 'same_database': str(broker.db),
                 'action_original_receipt': action_result, 'clocks': [before_clock, after_clock],
                 'recognized_continuity': same_domain, 'recovery_outcome': outcome, 'quarantine': quarantined,
+                'quarantined_inventory': quarantined_inventory,
                 'final_counts': final['counts'], 'fresh_timeless_witness': fresh,
                 'restart_status': restart.process.returncode}
     finally:
