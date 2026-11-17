@@ -112,6 +112,14 @@ class ProbeTests(unittest.TestCase):
             path.write_text(json.dumps(event) + "\n")
             return read_events(path)
 
+    def test_ready_capabilities_have_a_bounded_forty_field_budget(self):
+        details = {f"field_{i}": i for i in range(40)}
+        self.assertEqual(self.read_product_event("ready", details)[0]["details"], details)
+        details["field_40"] = 40
+        with self.assertRaises(ReceiptFailure) as failure:
+            self.read_product_event("ready", details)
+        self.assertEqual(failure.exception.code, "product_event_details")
+
     def test_lifecycle_optional_identity_nulls_keep_their_exact_context(self):
         for kind, details in (
                 ("command_submitted", {"recipe_kind": "SessionOpen", "action": "Open",

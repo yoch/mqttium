@@ -333,7 +333,7 @@ def read_events(path: Path) -> list[dict]:
         require(isinstance(event.get("kind"), str) and len(event["kind"]) <= 48, "product_event_kind")
         require(isinstance(event.get("pid"), int) and event["pid"] > 0, "product_event_pid")
         details = event.get("details", {})
-        require(isinstance(details, dict) and len(details) <= 32, "product_event_details")
+        require(isinstance(details, dict) and len(details) <= 40, "product_event_details")
         # Only these typed optional identities admit null. A missing old or
         # expected incarnation is a fact, not an empty diagnostic string.
         nullable = {("command_submitted", "expected_session"),
