@@ -1984,6 +1984,7 @@ impl SqliteStore {
                     target,
                     target_revision: Revision::new(blob_u64(&revision)?),
                     max_qos,
+                    options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
                 }))
             },
         )?;
@@ -2223,6 +2224,7 @@ fn read_snapshot(conn: &Connection, budget: ReadBudget) -> Result<DurableState, 
                         session: SessionId::from_be_slice(reader::borrow_blob(row, 1, 8)?)
                             .map_err(|_| Fault::Corrupt)?,
                         qos: code_qos(row.get(2)?)?,
+                        options: mqttiumd_contract::pubsub::SubscriptionOptions::DEFAULT,
                     });
             }
         }
