@@ -203,6 +203,7 @@ fn peer(runtime: &mut Runtime<'_>) -> (ConnectionGeneration, TcpStream) {
             session: None,
             opened_by: None,
             connect_expiry: SessionExpiry::OnDisconnect,
+            disconnect_expiry: None,
             handshake_packet: None,
             pending: false,
             keep_alive: 0,
@@ -2537,26 +2538,52 @@ fn relay_control_reply(runtime: &mut Runtime<'_>, response: ControlResponse) {
 fn disconnect_zero_applies_open_already_relayed_during_its_own_drain() {
     with_runtime(128, |runtime, directory| {
         let (generation, _client) = peer(runtime);
-        runtime.connect(generation, connect_packet(b"draining-end")).unwrap();
+        runtime
+            .connect(generation, connect_packet(b"draining-end"))
+            .unwrap();
         runtime.drain_inputs().unwrap();
-        let response = runtime.writer.control_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(matches!(&response, ControlResponse::Lifecycle {
-            reply: StoreReply::Outcome(StoreOutcome::Committed(CommitFacts::SessionLifecycle(SessionChange::Opened { .. }))), ..
-        }), "the writer must really commit Open");
+        let response = runtime
+            .writer
+            .control_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            matches!(
+                &response,
+                ControlResponse::Lifecycle {
+                    reply: StoreReply::Outcome(StoreOutcome::Committed(
+                        CommitFacts::SessionLifecycle(SessionChange::Opened { .. })
+                    )),
+                    ..
+                }
+            ),
+            "the writer must really commit Open"
+        );
         relay_control_reply(runtime, response);
         assert!(runtime.peers[&generation].session.is_none());
         assert!(!runtime.control_inputs.is_empty());
         // No drain between the authentic reply and this DISCONNECT. Its own
         // drain installs the attachment while the transport is still present.
-        runtime.packet(generation, 0xe0, vec![0, 5, 0x11, 0, 0, 0, 0]).unwrap();
-        until(runtime, |r| !r.owner.session_status().lifecycle_pending
-            && r.lifecycle_inflight.is_empty() && r.closing_inputs.is_empty());
-        let state = mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
-        assert!(state.sessions.is_empty(), "disconnect_zero_during_open_drain_retained_durable_session");
+        runtime
+            .packet(generation, 0xe0, vec![0, 5, 0x11, 0, 0, 0, 0])
+            .unwrap();
+        until(runtime, |r| {
+            !r.owner.session_status().lifecycle_pending
+                && r.lifecycle_inflight.is_empty()
+                && r.closing_inputs.is_empty()
+        });
+        let state =
+            mqttiumd_store_sqlite::SqliteStore::inspect(&directory.join("store.sqlite")).unwrap();
+        assert!(
+            state.sessions.is_empty(),
+            "disconnect_zero_during_open_drain_retained_durable_session"
+        );
         assert!(runtime.sessions.is_empty());
         assert_eq!(runtime.owner.session_status().sessions, 0);
         let (next, mut client) = peer(runtime);
-        runtime.connect(next, connect_packet(b"draining-end")).unwrap();
+        runtime
+            .connect(next, connect_packet(b"draining-end"))
+            .unwrap();
         until(runtime, |r| r.session_requests.is_empty());
         assert_eq!(&read_frame(&mut client).1[..2], &[0, 0]);
     });
@@ -2604,7 +2631,8 @@ fn disconnect_zero_before_connack_ends_the_exact_committed_infinite_open() {
             runtime
                 .session_requests
                 .values()
-                .any(|pending| pending.operation == Some(operation) && pending.zero_end),
+                .any(|pending| pending.operation == Some(operation)
+                    && pending.disconnect_expiry == Some(SessionExpiry::OnDisconnect)),
             "late exact Open result retains the observed DISCONNECT policy"
         );
         relay_control_reply(runtime, response.clone());

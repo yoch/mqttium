@@ -96,6 +96,7 @@ struct Peer {
     session: Option<SessionId>,
     opened_by: Option<OperationId>,
     connect_expiry: SessionExpiry,
+    disconnect_expiry: Option<SessionExpiry>,
     handshake_packet: Option<(u8, Vec<u8>)>,
     pending: bool,
     keep_alive: u16,
@@ -121,7 +122,7 @@ struct PendingFrame {
 struct PendingSession {
     connection: ConnectionGeneration,
     operation: Option<OperationId>,
-    zero_end: bool,
+    disconnect_expiry: Option<SessionExpiry>,
 }
 #[derive(Clone)]
 struct AppliedSessionChange {
@@ -227,6 +228,7 @@ impl Runtime<'_> {
                 session: None,
                 opened_by: None,
                 connect_expiry: SessionExpiry::OnDisconnect,
+                disconnect_expiry: None,
                 handshake_packet: None,
                 pending: false,
                 keep_alive: 0,
@@ -326,7 +328,7 @@ impl Runtime<'_> {
             // applied. Preserve this transport's confirmed zero-expiry guard
             // independently; neither a cache lookup nor its current binding
             // can recover that authority afterwards.
-            if peer.connect_expiry == SessionExpiry::OnDisconnect
+            if peer.disconnect_expiry.unwrap_or(peer.connect_expiry) == SessionExpiry::OnDisconnect
                 && let Some(session) = peer.session
             {
                 self.queue(Input::EndSession {
@@ -518,10 +520,11 @@ impl Runtime<'_> {
                     },
                 );
                 if let Some(generation) = connection {
-                    let zero_end = self
+                    let disconnect_expiry = self
                         .session_requests
                         .values()
-                        .any(|pending| pending.connection == generation && pending.zero_end);
+                        .find(|pending| pending.connection == generation)
+                        .and_then(|pending| pending.disconnect_expiry);
                     self.session_requests
                         .retain(|_, pending| pending.connection != generation);
                     if let Some(peer) = self.peers.get_mut(&generation) {
@@ -534,18 +537,19 @@ impl Runtime<'_> {
                         }
                         peer.session = Some(session);
                         peer.opened_by = Some(changed_by);
+                        peer.disconnect_expiry = disconnect_expiry.or(peer.disconnect_expiry);
                         peer.connected = true;
                         // The ordered CONNACK, not cache installation, releases
                         // the bounded pre-CONNACK ingress gate.
                         peer.pending = true;
-                    } else if expiry == SessionExpiry::OnDisconnect || zero_end {
+                    } else if disconnect_expiry.unwrap_or(expiry) == SessionExpiry::OnDisconnect {
                         self.queue(Input::EndSession {
                             connection: ConnectionKey {
                                 session,
                                 generation,
                             },
                             opened_by: Some(changed_by),
-                            reason: if zero_end {
+                            reason: if disconnect_expiry.is_some() {
                                 SessionEndReason::Disconnect
                             } else {
                                 SessionEndReason::TransportLost
@@ -1443,7 +1447,7 @@ impl Runtime<'_> {
             PendingSession {
                 connection: generation,
                 operation: None,
-                zero_end: false,
+                disconnect_expiry: None,
             },
         );
         if let Some(peer) = self.peers.get_mut(&generation) {
@@ -1529,13 +1533,13 @@ impl Runtime<'_> {
                     }
                     return self.close(generation, "packet_refused");
                 }
-                if expiry == Some(SessionExpiry::OnDisconnect)
-                    && let Some(pending) = self
-                        .session_requests
-                        .values_mut()
-                        .find(|pending| pending.connection == generation)
+                p.disconnect_expiry = expiry;
+                if let Some(pending) = self
+                    .session_requests
+                    .values_mut()
+                    .find(|pending| pending.connection == generation)
                 {
-                    pending.zero_end = true;
+                    pending.disconnect_expiry = expiry;
                 }
                 let end = if expiry == Some(SessionExpiry::OnDisconnect) {
                     p.session.map(|session| Input::EndSession {
