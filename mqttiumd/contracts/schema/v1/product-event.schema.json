@@ -22,7 +22,7 @@
     },
     "kind": {
       "type": "string",
-      "pattern": "^[a-z][a-z_]{0,47}$"
+      "pattern": "^[a-z][a-z0-9_]{0,47}$"
     },
     "pid": {
       "type": "integer",

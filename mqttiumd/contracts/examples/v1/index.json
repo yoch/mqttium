@@ -109,6 +109,7 @@
     "contracts/examples/v1/valid/product-pi-transitions.json",
     "contracts/examples/v1/valid/product-session-transitions.json",
     "contracts/examples/v1/valid/product-event.json",
+    "contracts/examples/v1/valid/product-qos0-drop-event.json",
     "contracts/examples/v1/valid/product-puback-observed.json",
     "contracts/examples/v1/valid/product-puback-no-target.json",
     "contracts/examples/v1/valid/product-puback-ignored-historical-target.json",
@@ -2036,6 +2037,12 @@
       "code": "duplicate-name",
       "pointer": "/rules/1/id",
       "why": "Each documented product transition has one stable identifier."
+    },
+    {
+      "file": "contracts/examples/v1/invalid/product-event-leading-digit.json",
+      "code": "schema-violation",
+      "pointer": "/kind",
+      "why": "An event name starts with a letter; QoS digits are allowed only after it."
     },
     {
       "file": "contracts/examples/v1/invalid/product-puback-missing-observation.json",

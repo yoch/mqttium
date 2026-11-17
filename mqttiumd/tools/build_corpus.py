@@ -3490,6 +3490,12 @@ bad("product-transitions-duplicate-rule.json", "duplicate-name", "/rules/1/id",
 product_event = env("mqttiumd.product-event", seq="1", kind="startup_refused", pid=1,
                     cause="InvalidData", phase="Snapshot", details={"code": "durable_read"})
 ok("product-event.json", product_event)
+qos0_drop_event = env("mqttiumd.product-event", seq="2", kind="qos0_dropped", pid=1,
+    details={"origin": "volatile/1/1/3", "reason": "no_subscribers", "target": ""})
+ok("product-qos0-drop-event.json", qos0_drop_event)
+bad("product-event-leading-digit.json", "schema-violation", "/kind",
+    "An event name starts with a letter; QoS digits are allowed only after it.",
+    {**qos0_drop_event, "kind": "0qos_dropped"})
 puback_target = {
     "delivery_id": {"publication_id": PUBLICATION, "index": 0},
     "claim_operation_id": {"incarnation": "1", "epoch": "2", "owner": "0", "sequence": "3"},
