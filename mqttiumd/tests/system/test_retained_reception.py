@@ -1,0 +1,96 @@
+"""Public API and independent frame discriminants for retained evidence."""
+import unittest
+
+from external_retained import MqttiumRetained, PahoRetained
+from external_wildcard import Subscription
+from retained_probe import decode_publish, retained_publish_packet
+from tcp_probe import Frame, ReceiptFailure
+from test_external_clients import ScriptedBroker, read_packet
+from test_session_reception import accept
+
+
+class IndependentRetainedFrames(unittest.TestCase):
+    def test_qos0_has_retain_without_an_invented_packet_identifier(self):
+        wire = retained_publish_packet('a/b', b'value', qos=0)
+        self.assertEqual(wire, b'\x31\x0b\x00\x03a/b\x00value')
+        decoded = decode_publish(Frame(wire[0], wire[2:]))
+        self.assertEqual((decoded.qos, decoded.packet_id, decoded.retain), (0, None, True))
+
+    def test_qos1_retained_and_live_flags_are_independently_observed(self):
+        retained = decode_publish(Frame(0x33, b'\x00\x01t\x00\x08\x00v'))
+        live = decode_publish(Frame(0x32, b'\x00\x01t\x00\x08\x00v'))
+        self.assertTrue(retained.retain)
+        self.assertFalse(live.retain)
+        self.assertEqual(retained.observation()['packet_id'], 8)
+
+    def test_invalid_qos0_dup_and_zero_qos1_identifier_are_rejected(self):
+        for frame in (Frame(0x39, b'\x00\x01t\x00v'), Frame(0x33, b'\x00\x01t\x00\x00\x00v')):
+            with self.subTest(frame=frame), self.assertRaises(ReceiptFailure):
+                decode_publish(frame)
+        with self.assertRaises(ValueError):
+            retained_publish_packet('a', b'b', 1, qos=0)
+
+
+class PublicRetainedAPIs(unittest.IsolatedAsyncioTestCase):
+    async def public_publish(self, constructor):
+        async def script(reader, writer, _connection):
+            await accept(reader, writer)
+            for qos in (0, 1, 2):
+                header, body = await read_packet(reader)
+                self.assertEqual(header, 0x31 | (qos << 1))
+                self.assertEqual(body[:3], b'\x00\x01t')
+                if qos:
+                    identifier = body[3:5]
+                    writer.write(bytes([0x40 if qos == 1 else 0x50, 2]) + identifier)
+                    await writer.drain()
+                    if qos == 2:
+                        rel_header, rel_body = await read_packet(reader)
+                        self.assertEqual((rel_header, rel_body[:2]), (0x62, identifier))
+                        writer.write(b'\x70\x02' + identifier)
+                        await writer.drain()
+            self.assertEqual(await read_packet(reader), (0xE0, b''))
+        async with ScriptedBroker(script) as broker:
+            client = constructor(('127.0.0.1', broker.port), 'retained-public-publisher')
+            try:
+                await client.open(False)
+                for qos in (0, 1, 2):
+                    await client.publish('t', b'value', qos=qos)
+            finally:
+                await client.disconnect()
+
+    async def public_receive(self, constructor):
+        async def script(reader, writer, _connection):
+            await accept(reader, writer)
+            header, body = await read_packet(reader)
+            self.assertEqual(header, 0x82)
+            writer.write(b'\x90\x04' + body[:2] + b'\x00\x01')
+            writer.write(retained_publish_packet('t', b'value', 9, qos=1))
+            await writer.drain()
+            header, body = await read_packet(reader)
+            self.assertEqual((header, body[:2]), (0x40, b'\x00\x09'))
+            self.assertEqual(await read_packet(reader), (0xE0, b''))
+        async with ScriptedBroker(script) as broker:
+            client = constructor(('127.0.0.1', broker.port), 'retained-public-subscriber')
+            try:
+                await client.open(False)
+                await client.subscribe((Subscription('t', 1),))
+                row = await client.receive(b'value', 1, True)
+                self.assertTrue(row['retain'])
+            finally:
+                await client.disconnect()
+
+    async def test_mqttium_public_retained_publishes_all_three_qos(self):
+        await self.public_publish(MqttiumRetained)
+
+    async def test_paho_public_retained_publishes_all_three_qos(self):
+        await self.public_publish(PahoRetained)
+
+    async def test_mqttium_reports_actual_retained_delivery(self):
+        await self.public_receive(MqttiumRetained)
+
+    async def test_paho_reports_actual_retained_delivery(self):
+        await self.public_receive(PahoRetained)
+
+
+if __name__ == '__main__':
+    unittest.main()
